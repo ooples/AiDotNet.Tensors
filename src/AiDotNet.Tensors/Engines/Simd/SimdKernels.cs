@@ -5724,7 +5724,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         [MethodImpl(HotInline)]
-        private static void WriteVector256(Span<float> data, int offset, Vector256<float> value)
+        internal static void WriteVector256(Span<float> data, int offset, Vector256<float> value)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
             ref float element = ref Unsafe.Add(ref start, offset);

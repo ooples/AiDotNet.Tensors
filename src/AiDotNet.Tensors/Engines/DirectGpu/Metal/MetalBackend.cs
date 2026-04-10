@@ -1582,4 +1582,73 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     }
 
     #endregion
+
+    // --- Split-buffer native Complex<T> operations (Metal dispatch) ---
+
+    private IntPtr _complexLibrary;
+    private readonly object _complexLibraryLock = new();
+    private void EnsureComplexLibrary()
+    {
+        if (_complexLibrary != IntPtr.Zero) return;
+        lock (_complexLibraryLock)
+        {
+            if (_complexLibrary == IntPtr.Zero)
+                _complexLibrary = _shaderLibrary.CompileLibrary("Complex", MetalComplexKernels.GetSource());
+        }
+    }
+    private static MetalGpuBuffer AsMetal(IGpuBuffer buf) => (MetalGpuBuffer)buf;
+
+    private void DispatchComplexMetal(string kernel, MetalGpuBuffer[] bufs, int n, float? scalar = null)
+    {
+        ThrowIfDisposed(); EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, kernel);
+        var (tg, tpg) = pipeline.Calculate1DDispatch(n);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        for (int i = 0; i < bufs.Length; i++) enc.SetBuffer(bufs[i], i);
+        int next = bufs.Length;
+        if (scalar.HasValue) enc.SetBytes(scalar.Value, (ulong)next++);
+        enc.SetBytes((uint)n, (ulong)next);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_multiply", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
+    public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_conjugate", [AsMetal(iR), AsMetal(iI), AsMetal(oR), AsMetal(oI)], n); }
+    public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }
+    public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude_squared", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }
+    public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_phase", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }
+    public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_from_polar", [AsMetal(m), AsMetal(p), AsMetal(oR), AsMetal(oI)], n); }
+    public void SplitComplexScale(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, float s, int n) { if (n > 0) DispatchComplexMetal("split_complex_scale", [AsMetal(iR), AsMetal(iI), AsMetal(oR), AsMetal(oI)], n, s); }
+    public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_add", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
+    public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_cross_spectral", [AsMetal(xR), AsMetal(xI), AsMetal(yR), AsMetal(yI), AsMetal(oR), AsMetal(oI)], n); }
+
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        if (n <= 0 || k <= 0) return;
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
+            DispatchComplexMetal("split_complex_topk", [AsMetal(inReal), AsMetal(inImag), AsMetal(outReal), AsMetal(outImag)], n, threshold);
+        }
+        finally { magBuf.Dispose(); }
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, "softmax_rows");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(rows);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(input), 0);
+        enc.SetBuffer(AsMetal(output), 1);
+        enc.SetBytes((uint)rows, (ulong)2);
+        enc.SetBytes((uint)cols, (ulong)3);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
 }

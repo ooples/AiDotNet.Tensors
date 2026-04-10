@@ -1578,4 +1578,114 @@ public sealed unsafe partial class VulkanBackend
     }
 
     #endregion
+
+    // --- Split-buffer native Complex<T> operations (Vulkan) ---
+    // Composes from existing GPU primitives with cached scratch buffers.
+
+    private IGpuBuffer[]? _complexScratch;
+    private int _complexScratchSize;
+
+    private void EnsureComplexScratch(int n)
+    {
+        if (_complexScratch is not null && _complexScratchSize >= n) return;
+        // Dispose old scratch
+        if (_complexScratch is not null)
+            foreach (var b in _complexScratch) b?.Dispose();
+        _complexScratchSize = n;
+        _complexScratch = new[] { AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n) };
+    }
+
+    public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        EnsureComplexScratch(n);
+        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+        Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
+        Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
+    }
+
+    public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        Copy(iR, 0, oR, 0, n);
+        Negate(iI, oI, n);
+    }
+
+    public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexMagnitude(iR, iI, o, n);
+    public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
+    {
+        if (n <= 0) return;
+        EnsureComplexScratch(n);
+        Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
+        Add(_complexScratch[0], _complexScratch[1], o, n);
+    }
+    public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
+    public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
+
+    public void SplitComplexScale(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, float s, int n)
+    {
+        if (n <= 0) return;
+        Scale(iR, oR, s, n); Scale(iI, oI, s, n);
+    }
+
+    public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        Add(aR, bR, oR, n); Add(aI, bI, oI, n);
+    }
+
+    public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        EnsureComplexScratch(n);
+        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+        Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
+        Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
+    }
+
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        if (n <= 0 || k <= 0) return;
+        // GPU mag computation + CPU threshold + GPU mask
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            var rData = DownloadBuffer(inReal);
+            var iData = DownloadBuffer(inImag);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
+            for (int i = 0; i < n; i++)
+            {
+                float ms = rData[i] * rData[i] + iData[i] * iData[i];
+                if (ms < threshold) { rData[i] = 0; iData[i] = 0; }
+            }
+            var rBuf = AllocateBuffer(rData); var iBuf = AllocateBuffer(iData);
+            try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
+            finally { rBuf.Dispose(); iBuf.Dispose(); }
+        }
+        finally { magBuf.Dispose(); }
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        var data = DownloadBuffer(input);
+        var result = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            float mx = float.MinValue;
+            for (int c = 0; c < cols; c++) mx = Math.Max(mx, data[off + c]);
+            float se = 0;
+            for (int c = 0; c < cols; c++) { result[off + c] = MathF.Exp(data[off + c] - mx); se += result[off + c]; }
+            for (int c = 0; c < cols; c++) result[off + c] /= se;
+        }
+        var rb = AllocateBuffer(result);
+        try { Copy(rb, 0, output, 0, rows * cols); }
+        finally { rb.Dispose(); }
+    }
 }

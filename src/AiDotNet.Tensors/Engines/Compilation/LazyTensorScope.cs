@@ -53,6 +53,21 @@ internal sealed class LazyTensorScope : IDisposable
         return output;
     }
 
+    /// <summary>Records a cross-type operation (input type differs from output type).</summary>
+    internal Tensor<TOut> RecordCrossType<TIn, TOut>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<TIn> input,
+        int[] outputShape,
+        Action<IEngine, Tensor<TOut>> execute)
+    {
+        var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
+        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute);
+        output.LazySource = node;
+        _nodes.Add(node);
+        return output;
+    }
+
     /// <summary>Records a binary operation as a lazy node.</summary>
     internal Tensor<T> RecordBinary<T>(
         LazyNodeType opType,

@@ -2821,6 +2821,51 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Complex magnitude — sqrt(re^2+im^2) per pair. Output length = numPairs.</summary>
     void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs);
 
+    // --- Split-buffer complex operations ---
+    // These use separate real/imag GPU buffers (struct-of-arrays layout) for
+    // coalesced GPU memory access. The IEngine layer auto-converts between
+    // Tensor<Complex<T>> (array-of-structs) and split buffers at the GPU boundary.
+    // Callers of IEngine never see the split format — it's an internal GPU optimization.
+
+    /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
+    void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Complex conjugate with split buffers: (re, -im).</summary>
+    void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Complex magnitude with split buffers: sqrt(re^2 + im^2).</summary>
+    void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n);
+
+    /// <summary>Complex magnitude squared with split buffers: re^2 + im^2 (no sqrt).</summary>
+    void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n);
+
+    /// <summary>Complex phase with split buffers: atan2(im, re).</summary>
+    void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n);
+
+    /// <summary>Construct complex from polar with split buffers.</summary>
+    void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Scale complex by real scalar with split buffers.</summary>
+    void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n);
+
+    /// <summary>Element-wise complex addition with split buffers.</summary>
+    void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Cross-spectral density: X * conj(Y) with split buffers (fused for performance).</summary>
+    void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Top-K by magnitude: zero all but the K elements with largest sqrt(re^2+im^2).</summary>
+    void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k);
+
+    /// <summary>Per-row softmax on a 2D buffer: output[r][c] = exp(input[r][c]-max) / sum(exp).</summary>
+    void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols);
+
     #endregion
 }
 

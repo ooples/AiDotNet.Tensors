@@ -512,6 +512,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _programs.Add(softmaxVarProgram);
                 foreach (var name in SoftmaxVariantKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
+
+                // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
+                var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
+                _programs.Add(complexProgram);
+                foreach (var name in ComplexKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, complexProgram, name);
             }
             catch (Exception ex)
             {
@@ -10414,6 +10420,89 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
         kernel.SetArg(2u, numPairs);
         kernel.Execute1D(numPairs, localSize);
+    }
+
+    // --- Split-buffer native Complex<T> operations (OpenCL dispatch) ---
+
+    private void DispatchSplitComplex(string kernelName, IGpuBuffer[] buffers, int n, float? scalar = null)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}. Register ComplexKernels.");
+        int localSize = CalculateOptimalWorkGroupSize1D(n);
+        uint argIdx = 0;
+        foreach (var buf in buffers)
+            kernel.SetArg(argIdx++, ((DirectOpenClGpuBuffer)buf).Buffer.Handle);
+        if (scalar.HasValue)
+            kernel.SetArg(argIdx++, scalar.Value);
+        kernel.SetArg(argIdx, n);
+        kernel.Execute1D(n, localSize);
+    }
+
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_multiply", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_conjugate", [inReal, inImag, outReal, outImag], n);
+
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n)
+        => DispatchSplitComplex("split_complex_magnitude", [inReal, inImag, outMag], n);
+
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n)
+        => DispatchSplitComplex("split_complex_magnitude_squared", [inReal, inImag, outMagSq], n);
+
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n)
+        => DispatchSplitComplex("split_complex_phase", [inReal, inImag, outPhase], n);
+
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_from_polar", [mag, phase, outReal, outImag], n);
+
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n)
+        => DispatchSplitComplex("split_complex_scale", [inReal, inImag, outReal, outImag], n, scalar);
+
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_add", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_cross_spectral", [xReal, xImag, yReal, yImag, outReal, outImag], n);
+
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        if (n <= 0 || k <= 0) return;
+        // GPU magnitude + CPU threshold + GPU kernel
+        if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: split_complex_topk");
+        // Compute magnitudes squared on GPU
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
+            int localSize = CalculateOptimalWorkGroupSize1D(n);
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)inImag).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+            kernel.SetArg(4u, threshold);
+            kernel.SetArg(5u, n);
+            kernel.Execute1D(n, localSize);
+        }
+        finally { magBuf.Dispose(); }
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: softmax_rows");
+        int localSize = CalculateOptimalWorkGroupSize1D(rows);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, rows);
+        kernel.SetArg(3u, cols);
+        kernel.Execute1D(rows, localSize);
     }
 
     #endregion

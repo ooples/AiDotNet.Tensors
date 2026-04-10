@@ -80,6 +80,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _softmaxVarModule;
     private IntPtr _fusedLinearModule;
     private IntPtr _iouModule;
+    private IntPtr _complexModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -519,6 +520,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             CompileKernelModule(Kernels.HipShapeKernels.GetSource(), "shape", ref _shapeModule, Kernels.HipShapeKernels.GetKernelNames());
             CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref _lossModule, Kernels.HipLossForwardKernels.GetKernelNames());
             CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref _softmaxVarModule, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
+
+            // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
+            CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
@@ -10055,12 +10059,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = _complexModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

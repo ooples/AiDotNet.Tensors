@@ -1056,6 +1056,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Dispose transfer
         _transfer?.Dispose();
 
+        // Dispose cached complex scratch buffers
+        if (_complexScratch is not null)
+        {
+            foreach (var buf in _complexScratch) buf?.Dispose();
+            _complexScratch = null;
+        }
+
         // Note: VulkanDevice is a singleton, don't dispose it here
         _initialized = false;
     }

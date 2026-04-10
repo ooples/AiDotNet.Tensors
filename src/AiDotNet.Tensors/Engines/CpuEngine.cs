@@ -27338,6 +27338,654 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // --- Native Complex<T> Tensor Operations ---
+
+    private static void ValidatePowerOfTwo(int n, string paramName)
+    {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new ArgumentException(
+                $"FFT requires input length to be a power of 2, got {n}.", paramName);
+    }
+
+    /// <summary>Decompose Complex tensor to split float arrays for SIMD processing.</summary>
+    private static (float[] real, float[] imag) DecomposeToFloat<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = tensor.Length;
+        var real = new float[n];
+        var imag = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = (float)ops.ToDouble(tensor[i].Real);
+            imag[i] = (float)ops.ToDouble(tensor[i].Imaginary);
+        }
+        return (real, imag);
+    }
+
+    /// <summary>Recompose float arrays back to Complex tensor.</summary>
+    private static Tensor<Complex<T>> RecomposeFromFloat<T>(float[] real, float[] imag, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = real.Length;
+        var result = new Tensor<Complex<T>>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(ops.FromDouble(real[i]), ops.FromDouble(imag[i]));
+        return result;
+    }
+
+    /// <summary>Recompose float array to real Tensor.</summary>
+    private static Tensor<T> RecomposeRealFromFloat<T>(float[] data, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = data.Length;
+        var result = new Tensor<T>(shape);
+        for (int i = 0; i < n; i++) result[i] = ops.FromDouble(data[i]);
+        return result;
+    }
+
+    /// <summary>
+    /// Computes batch count and last-axis size for batched FFT.
+    /// For 1D: batch=1, fftSize=length. For multi-D: batch=product of leading dims, fftSize=last dim.
+    /// </summary>
+    private static (int batchCount, int fftSize) GetBatchedFFTDims(int[] shape)
+    {
+        int fftSize = shape[^1]; // Last axis
+        int batchCount = 1;
+        for (int i = 0; i < shape.Length - 1; i++)
+            batchCount *= shape[i];
+        return (batchCount, fftSize);
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        // Transform along last axis, batch over leading dimensions
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++)
+                slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+
+            NativeFFTInPlace(slice, false, ops);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = slice[i];
+        }
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(fftSize);
+        var result = new Tensor<T>(input._shape);
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, true, ops);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = ops.Divide(slice[i].Real, scale);
+        }
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexIFFTReal", result, eng => eng.NativeComplexIFFTReal(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(fftSize);
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, true, ops);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = new Complex<T>(
+                    ops.Divide(slice[i].Real, scale),
+                    ops.Divide(slice[i].Imaginary, scale));
+        }
+
+        { var ci2 = input; AutoTracer.RecordOp("NativeComplexIFFT", result, eng => eng.NativeComplexIFFT(ci2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, false, ops);
+
+            for (int i = 0; i < fftSize; i++) result[offset + i] = slice[i];
+        }
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexFFTComplex", result, eng => eng.NativeComplexFFTComplex(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape, paramHash: k); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = input.Length;
+        k = Math.Min(k, n);
+
+        // Compute magnitudes squared (avoid sqrt for ranking)
+        var magSq = new (double mag, int idx)[n];
+        for (int i = 0; i < n; i++)
+        {
+            var re = ops.ToDouble(input[i].Real);
+            var im = ops.ToDouble(input[i].Imaginary);
+            magSq[i] = (re * re + im * im, i);
+        }
+
+        // Partial sort: find top-K by magnitude
+        Array.Sort(magSq, (a, b) => b.mag.CompareTo(a.mag));
+
+        var topKIndices = new HashSet<int>();
+        for (int i = 0; i < k; i++) topKIndices.Add(magSq[i].idx);
+
+        // Build sparse output
+        var zero = new Complex<T>(ops.Zero, ops.Zero);
+        var result = new Tensor<Complex<T>>(input._shape);
+        for (int i = 0; i < n; i++)
+            result[i] = topKIndices.Contains(i) ? input[i] : zero;
+
+        { var ci = input; var ck = k; AutoTracer.RecordOp("NativeComplexTopK", result, eng => eng.NativeComplexTopK(ci, ck), paramHash: k); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 2) throw new ArgumentException("TensorSoftmaxRows requires a 2D tensor.", nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSoftmaxRows", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int rows = input._shape[0];
+        int cols = input._shape[1];
+        var result = new Tensor<T>(input._shape);
+
+        for (int r = 0; r < rows; r++)
+        {
+            int offset = r * cols;
+
+            // Max for numerical stability
+            T maxVal = input[offset];
+            for (int c = 1; c < cols; c++)
+            {
+                var val = input[offset + c];
+                if (ops.ToDouble(val) > ops.ToDouble(maxVal)) maxVal = val;
+            }
+
+            // Exp and sum
+            T sumExp = ops.Zero;
+            for (int c = 0; c < cols; c++)
+            {
+                var expVal = ops.FromDouble(Math.Exp(ops.ToDouble(ops.Subtract(input[offset + c], maxVal))));
+                result[offset + c] = expVal;
+                sumExp = ops.Add(sumExp, expVal);
+            }
+
+            // Normalize
+            for (int c = 0; c < cols; c++)
+                result[offset + c] = ops.Divide(result[offset + c], sumExp);
+        }
+
+        { var ci = input; AutoTracer.RecordOp("TensorSoftmaxRows", result, eng => eng.TensorSoftmaxRows(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexMultiply", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>(a._shape);
+
+        // SIMD fast path for float
+        if (typeof(T) == typeof(float))
+        {
+            var aR = new float[n]; var aI = new float[n];
+            var bR = new float[n]; var bI = new float[n];
+            var oR = new float[n]; var oI = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                aR[i] = (float)(object)a[i].Real!; aI[i] = (float)(object)a[i].Imaginary!;
+                bR[i] = (float)(object)b[i].Real!; bI[i] = (float)(object)b[i].Imaginary!;
+            }
+            Simd.SimdComplexKernels.ComplexMultiply(aR, aI, bR, bI, oR, oI);
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(ops.FromDouble(oR[i]), ops.FromDouble(oI[i]));
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var ar = a[i].Real; var ai = a[i].Imaginary;
+                var br = b[i].Real; var bi = b[i].Imaginary;
+                result[i] = new Complex<T>(
+                    ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi)),
+                    ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
+            }
+        }
+
+        { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexMultiply", result, eng => eng.NativeComplexMultiply(ca2, cb2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexConjugate", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexConjugate(aR, aI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
+        }
+
+        { var ca2 = a; AutoTracer.RecordOp("NativeComplexConjugate", result, eng => eng.NativeComplexConjugate(ca2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitude", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexMagnitude(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var reSq = ops.Multiply(a[i].Real, a[i].Real);
+                var imSq = ops.Multiply(a[i].Imaginary, a[i].Imaginary);
+                result[i] = ops.Sqrt(ops.Add(reSq, imSq));
+            }
+        }
+
+        { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitude", result, eng => eng.NativeComplexMagnitude(ca)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitudeSquared", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeSquared(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = ops.Add(
+                    ops.Multiply(a[i].Real, a[i].Real),
+                    ops.Multiply(a[i].Imaginary, a[i].Imaginary));
+        }
+
+        { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitudeSquared", result, eng => eng.NativeComplexMagnitudeSquared(ca)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexPhase", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexPhase(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = ops.FromDouble(Math.Atan2(
+                    ops.ToDouble(a[i].Imaginary),
+                    ops.ToDouble(a[i].Real)));
+        }
+
+        { var ca = a; AutoTracer.RecordOp("NativeComplexPhase", result, eng => eng.NativeComplexPhase(ca)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    {
+        if (magnitudes is null) throw new ArgumentNullException(nameof(magnitudes));
+        if (phases is null) throw new ArgumentNullException(nameof(phases));
+        if (magnitudes.Length != phases.Length)
+            throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = magnitudes.Length;
+        var result = new Tensor<Complex<T>>(magnitudes._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var magF = new float[n];
+            var phaseF = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                magF[i] = (float)ops.ToDouble(magnitudes[i]);
+                phaseF[i] = (float)ops.ToDouble(phases[i]);
+            }
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexFromPolar(magF, phaseF, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, magnitudes._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var mag = ops.ToDouble(magnitudes[i]);
+                var phase = ops.ToDouble(phases[i]);
+                result[i] = new Complex<T>(
+                    ops.FromDouble(mag * Math.Cos(phase)),
+                    ops.FromDouble(mag * Math.Sin(phase)));
+            }
+        }
+
+        { var cm = magnitudes; var cp = phases; AutoTracer.RecordOp("NativeComplexFromPolar", result, eng => eng.NativeComplexFromPolar(cm, cp)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexScale", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexScale(aR, aI, oR, oI, (float)ops.ToDouble(scalar));
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(
+                    ops.Multiply(a[i].Real, scalar),
+                    ops.Multiply(a[i].Imaginary, scalar));
+        }
+
+        { var ca2 = a; var cs2 = scalar; AutoTracer.RecordOp("NativeComplexScale", result, eng => eng.NativeComplexScale(ca2, cs2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        if (x.Length != y.Length)
+            throw new ArgumentException($"Tensor lengths must match: {x.Length} vs {y.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexCrossSpectral", x._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = x.Length;
+        var result = new Tensor<Complex<T>>(x._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (xR, xI) = DecomposeToFloat(x);
+            var (yR, yI) = DecomposeToFloat(y);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexCrossSpectral(xR, xI, yR, yI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, x._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var xr = x[i].Real; var xi = x[i].Imaginary;
+                var yr = y[i].Real; var yi = y[i].Imaginary;
+                result[i] = new Complex<T>(
+                    ops.Add(ops.Multiply(xr, yr), ops.Multiply(xi, yi)),
+                    ops.Subtract(ops.Multiply(xi, yr), ops.Multiply(xr, yi)));
+            }
+        }
+
+        { var cx2 = x; var cy2 = y; AutoTracer.RecordOp("NativeComplexCrossSpectral", result, eng => eng.NativeComplexCrossSpectral(cx2, cy2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexAdd", a._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>(a._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var (bR, bI) = DecomposeToFloat(b);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexAdd(aR, aI, bR, bI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(
+                    ops.Add(a[i].Real, b[i].Real),
+                    ops.Add(a[i].Imaginary, b[i].Imaginary));
+        }
+
+        { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexAdd", result, eng => eng.NativeComplexAdd(ca2, cb2)); }
+        return result;
+    }
+
+    /// <summary>
+    /// In-place iterative Cooley-Tukey FFT on a Complex&lt;T&gt; array.
+    /// Input length must be a power of 2 (validated by callers).
+    /// </summary>
+    // Cache twiddle factors across FFT calls — key is (n, inverse)
+    [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<double>[]>? _twiddleCache;
+
+    private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
+        INumericOperations<T> ops)
+    {
+        int n = data.Length;
+        // Integer log2 — avoids floating-point rounding errors from Math.Log
+        int bits = 0;
+        for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
+
+        // Bit-reversal permutation
+        for (int i = 0; i < n; i++)
+        {
+            int j = BitReverse(i, bits);
+            if (j > i)
+                (data[i], data[j]) = (data[j], data[i]);
+        }
+
+        // Get or create cached twiddle table for this (n, inverse) pair
+        _twiddleCache ??= new Dictionary<(int, bool), Complex<double>[]>();
+        var cacheKey = (n, inverse);
+        if (!_twiddleCache.TryGetValue(cacheKey, out var cachedTwiddles))
+        {
+            // Precompute all twiddle factors for all stages at once
+            // Total count = 1 + 2 + 4 + ... + n/2 = n - 1
+            cachedTwiddles = new Complex<double>[n - 1];
+            int idx = 0;
+            for (int size = 2; size <= n; size *= 2)
+            {
+                int halfSize = size / 2;
+                double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
+                for (int k = 0; k < halfSize; k++)
+                    cachedTwiddles[idx++] = new Complex<double>(Math.Cos(baseAngle * k), Math.Sin(baseAngle * k));
+            }
+            _twiddleCache[cacheKey] = cachedTwiddles;
+        }
+
+        // Butterfly stages using cached twiddle factors — zero allocations
+        int twiddleIdx = 0;
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+
+            for (int start = 0; start < n; start += size)
+            {
+                for (int k = 0; k < halfSize; k++)
+                {
+                    var tw = cachedTwiddles[twiddleIdx + k];
+                    // Inline complex multiply to avoid Complex<T> construction per iteration:
+                    // twiddle * data[bot] = (tw.re*d.re - tw.im*d.im, tw.re*d.im + tw.im*d.re)
+                    var d = data[start + k + halfSize];
+                    var twRe = ops.FromDouble(tw.Real);
+                    var twIm = ops.FromDouble(tw.Imaginary);
+                    var tRe = ops.Subtract(ops.Multiply(twRe, d.Real), ops.Multiply(twIm, d.Imaginary));
+                    var tIm = ops.Add(ops.Multiply(twRe, d.Imaginary), ops.Multiply(twIm, d.Real));
+                    var u = data[start + k];
+                    data[start + k] = new Complex<T>(ops.Add(u.Real, tRe), ops.Add(u.Imaginary, tIm));
+                    data[start + k + halfSize] = new Complex<T>(ops.Subtract(u.Real, tRe), ops.Subtract(u.Imaginary, tIm));
+                }
+            }
+            twiddleIdx += halfSize;
+        }
+    }
+
     #endregion
 
     #region CTC Loss

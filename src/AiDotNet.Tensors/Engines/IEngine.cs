@@ -7432,6 +7432,132 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorComplexMagnitude<T>(Tensor<T> a);
 
+    // --- Native Complex<T> Tensor Operations ---
+    // These operate on Tensor<Complex<T>> directly, avoiding interleaved format conversion overhead.
+    // For maximum performance in spectral processing (FFT, filtering, HRE).
+    //
+    // CPU path: Operates on Tensor<Complex<T>> directly with no conversion.
+    // GPU path: DirectGpuTensorEngine decomposes Tensor<Complex<T>> to split
+    // real/imag float[] arrays, uploads to GPU, dispatches via
+    // IDirectGpuBackend.SplitComplex* methods, downloads and recomposes.
+    // FFT/IFFT dispatch through existing backend.FFT() with split buffers.
+
+    /// <summary>
+    /// Forward 1D FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.
+    /// Transforms along the last axis. Output has the same shape as input, with each element
+    /// being a complex frequency bin.
+    /// </summary>
+    /// <param name="input">Real-valued input signal. Length along last axis must be a power of 2.</param>
+    /// <returns>Complex-valued frequency domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
+    Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning real-valued tensor.
+    /// Extracts only the real component of the inverse transform. Use this when the original
+    /// signal was real-valued (Hermitian symmetry assumed). Applies 1/N normalization.
+    /// </summary>
+    /// <param name="input">Complex-valued frequency domain tensor. Length must be a power of 2.</param>
+    /// <returns>Real-valued time domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
+    Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning Complex&lt;T&gt; tensor.
+    /// General complex-to-complex IFFT with 1/N normalization. Use this when the time-domain
+    /// signal may have nonzero imaginary components (e.g., intermediate results in spectral
+    /// filtering chains, or Hilbert transform output).
+    /// </summary>
+    /// <param name="input">Complex-valued frequency domain tensor. Length must be a power of 2.</param>
+    /// <returns>Complex-valued time domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
+    Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Forward 1D FFT on a complex-valued tensor, returning Complex&lt;T&gt; tensor.
+    /// Complex-to-complex FFT — use when input already has nonzero imaginary components
+    /// (e.g., intermediate results in spectral filtering chains).
+    /// </summary>
+    /// <param name="input">Complex-valued input tensor. Last axis length must be a power of 2.</param>
+    /// <returns>Complex-valued frequency domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if last axis length is not a power of 2.</exception>
+    Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Selects the top-K elements by complex magnitude, zeroing all others.
+    /// Used for spectral sparsity masking — retains the K strongest frequency components.
+    /// </summary>
+    /// <param name="input">Complex tensor to apply sparsity mask to.</param>
+    /// <param name="k">Number of elements to retain.</param>
+    /// <returns>Sparse complex tensor with only K non-zero elements (by magnitude).</returns>
+    Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k);
+
+    /// <summary>
+    /// Applies softmax independently to each row of a 2D real tensor.
+    /// Each row is normalized to sum to 1. For attention weight computation.
+    /// </summary>
+    /// <param name="input">2D tensor of shape [M, N].</param>
+    /// <returns>2D tensor of same shape with softmax applied per row.</returns>
+    /// <exception cref="ArgumentException">Thrown if input is not 2D.</exception>
+    Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Element-wise multiplication of two Complex&lt;T&gt; tensors (spectral filtering).
+    /// (a.re*b.re - a.im*b.im) + i*(a.re*b.im + a.im*b.re) per element.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
+    Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
+
+    /// <summary>
+    /// Element-wise conjugate of a Complex&lt;T&gt; tensor: (re, -im) per element.
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract magnitudes from Complex&lt;T&gt; tensor: sqrt(re^2 + im^2) per element.
+    /// For performance-sensitive code where only ordering matters, use NativeComplexMagnitudeSquared instead.
+    /// </summary>
+    Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract squared magnitudes from Complex&lt;T&gt; tensor: re^2 + im^2 per element.
+    /// Avoids the sqrt for better performance when magnitude ordering is sufficient.
+    /// </summary>
+    Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract phases from Complex&lt;T&gt; tensor: atan2(im, re) per element.
+    /// Result is in radians, range [-pi, pi].
+    /// </summary>
+    Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Construct Complex&lt;T&gt; tensor from magnitude and phase tensors.
+    /// result[i] = Complex(mag[i]*cos(phase[i]), mag[i]*sin(phase[i]))
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
+    Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases);
+
+    /// <summary>
+    /// Scale all elements of a Complex&lt;T&gt; tensor by a real scalar.
+    /// result[i] = Complex(a[i].re * scalar, a[i].im * scalar)
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar);
+
+    /// <summary>
+    /// Cross-spectral density: X * conj(Y), fused for performance.
+    /// Computes element-wise: result.re = x.re*y.re + x.im*y.im, result.im = x.im*y.re - x.re*y.im.
+    /// Used in Hebbian learning and coherence analysis.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
+    Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y);
+
+    /// <summary>
+    /// Element-wise addition of two Complex&lt;T&gt; tensors.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
+    Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
+
     #endregion
 
     #region CTC Loss
