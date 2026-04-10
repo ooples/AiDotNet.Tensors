@@ -49,8 +49,21 @@ internal static class HerumiExp256
     /// 256-entry table exp: 8 floats at a time via vpgatherdd.
     /// Best on Intel CPUs where gather is fast (4-8 cycles).
     /// </summary>
+    /// <summary>
+    /// Convenience wrapper that pins the table internally. Use ExpArray for bulk work.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe Vector256<float> Exp8(Vector256<float> x)
+    {
+        fixed (float* tablePtr = Table)
+            return Exp8(x, tablePtr);
+    }
+
+    /// <summary>
+    /// Core SIMD exp: takes a pre-pinned table pointer to avoid per-vector pinning overhead.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe Vector256<float> Exp8(Vector256<float> x, float* tablePtr)
     {
         // Detect out-of-range lanes BEFORE clamping so we can fix them after
         var vMin = Vector256.Create(ClampMin);
@@ -62,83 +75,70 @@ internal static class HerumiExp256
         // Clamp for the polynomial path (safe values for table index and 2^n)
         var xClamped = Avx.Max(vMin, Avx.Min(vMax, x));
 
-        // z = x * (256 / ln2)
         var z = Avx.Multiply(xClamped, Vector256.Create(LOverLn2));
-
-        // n = floor(z)
         var nFloat = Avx.Floor(z);
         var nInt = Avx.ConvertToVector256Int32(nFloat);
-
-        // k = n & 0xFF — table index
         var kInt = Avx2.And(nInt, Vector256.Create(LMask));
-
-        // int_part = n >> 8 — integer exponent
         var intPart = Avx2.ShiftRightArithmetic(nInt, LShift);
 
-        fixed (float* tablePtr = Table)
+        // Table lookup via AVX2 gather (tablePtr already pinned by caller)
+        var tableVal = Avx2.GatherVector256(tablePtr, kInt, 4);
+
+        var r = Fma.MultiplyAddNegated(nFloat, Vector256.Create(Ln2OverL), xClamped);
+        var poly = Fma.MultiplyAdd(Vector256.Create(0.5f), r, Vector256.Create(1.0f));
+        poly = Fma.MultiplyAdd(poly, r, Vector256.Create(1.0f));
+
+        var combined = Avx.Multiply(tableVal, poly);
+        var pow2n = Avx2.ShiftLeftLogical(
+            Avx2.Add(intPart, Vector256.Create(127)), 23).AsSingle();
+
+        var result = Avx.Multiply(combined, pow2n);
+
+        // For any out-of-range lanes: compute exact MathF.Exp per lane
+        if (!Avx.TestZ(outOfRange, outOfRange))
         {
-            // Table lookup via AVX2 gather
-            var tableVal = Avx2.GatherVector256(tablePtr, kInt, 4);
-
-            // r = xClamped - n * (ln2/256) — tiny remainder in [0, 0.00271)
-            var r = Fma.MultiplyAddNegated(nFloat, Vector256.Create(Ln2OverL), xClamped);
-
-            // For [0, 0.00271), exp(r) ≈ 1 + r is within 2 ULP
-            // Use 2nd order for extra safety: (0.5*r + 1)*r + 1
-            var poly = Fma.MultiplyAdd(Vector256.Create(0.5f), r, Vector256.Create(1.0f));
-            poly = Fma.MultiplyAdd(poly, r, Vector256.Create(1.0f));
-
-            // Combine: table[k] * poly * 2^int_part
-            var combined = Avx.Multiply(tableVal, poly);
-            var pow2n = Avx2.ShiftLeftLogical(
-                Avx2.Add(intPart, Vector256.Create(127)), 23).AsSingle();
-
-            var result = Avx.Multiply(combined, pow2n);
-
-            // For any out-of-range lanes: compute exact MathF.Exp per lane
-            // to preserve subnormals, exact 0, +inf, NaN — matching scalar Exp()
-            if (!Avx.TestZ(outOfRange, outOfRange))
+            float* scratch = stackalloc float[8];
+            Avx.Store(scratch, x);
+            float* rBuf = stackalloc float[8];
+            Avx.Store(rBuf, result);
+            int mask = Avx.MoveMask(outOfRange);
+            for (int lane = 0; lane < 8; lane++)
             {
-                float* scratch = stackalloc float[8];
-                Avx.Store(scratch, x);       // original unclamped x
-                float* rBuf = stackalloc float[8];
-                Avx.Store(rBuf, result);     // fast-path result
-                int mask = Avx.MoveMask(outOfRange);
-                for (int lane = 0; lane < 8; lane++)
-                {
-                    if ((mask & (1 << lane)) != 0)
-                        rBuf[lane] = MathF.Exp(scratch[lane]);
-                }
-                result = Avx.LoadVector256(rBuf);
+                if ((mask & (1 << lane)) != 0)
+                    rBuf[lane] = MathF.Exp(scratch[lane]);
             }
-
-            return result;
+            result = Avx.LoadVector256(rBuf);
         }
+
+        return result;
     }
 
     /// <summary>
-    /// Process array using 256-entry table exp. 4x unrolled.
+    /// Process array using 256-entry table exp. Pins the table ONCE for the entire array.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void ExpArray(float* input, float* output, int length)
     {
         int i = 0;
-        if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+        fixed (float* tablePtr = Table)
         {
-            int simdLen = length & ~31;
-            for (; i < simdLen; i += 32)
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                Avx.Store(output + i, Exp8(Avx.LoadVector256(input + i)));
-                Avx.Store(output + i + 8, Exp8(Avx.LoadVector256(input + i + 8)));
-                Avx.Store(output + i + 16, Exp8(Avx.LoadVector256(input + i + 16)));
-                Avx.Store(output + i + 24, Exp8(Avx.LoadVector256(input + i + 24)));
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    Avx.Store(output + i, Exp8(Avx.LoadVector256(input + i), tablePtr));
+                    Avx.Store(output + i + 8, Exp8(Avx.LoadVector256(input + i + 8), tablePtr));
+                    Avx.Store(output + i + 16, Exp8(Avx.LoadVector256(input + i + 16), tablePtr));
+                    Avx.Store(output + i + 24, Exp8(Avx.LoadVector256(input + i + 24), tablePtr));
+                }
             }
-        }
-        if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
-        {
-            int simdLen = i + ((length - i) & ~7);
-            for (; i < simdLen; i += 8)
-                Avx.Store(output + i, Exp8(Avx.LoadVector256(input + i)));
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                int simdLen = i + ((length - i) & ~7);
+                for (; i < simdLen; i += 8)
+                    Avx.Store(output + i, Exp8(Avx.LoadVector256(input + i), tablePtr));
+            }
         }
         for (; i < length; i++)
             output[i] = Exp(input[i]);
