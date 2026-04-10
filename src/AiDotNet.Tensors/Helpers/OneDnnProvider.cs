@@ -1789,9 +1789,11 @@ internal static class OneDnnProvider
             }
 
             // Create memory objects (must happen BEFORE destroying descriptors)
-            IntPtr srcMem, dstMem;
-            dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
-            dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+            IntPtr srcMem = IntPtr.Zero, dstMem = IntPtr.Zero;
+            rc = dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
+            if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); dnnl_memory_desc_destroy(dstDesc); dnnl_primitive_destroy(prim); return false; }
+            rc = dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+            if (rc != 0) { dnnl_memory_destroy(srcMem); dnnl_memory_desc_destroy(srcDesc); dnnl_memory_desc_destroy(dstDesc); dnnl_primitive_destroy(prim); return false; }
 
             // Now safe to destroy descriptors
             dnnl_memory_desc_destroy(srcDesc);
@@ -1868,17 +1870,34 @@ internal static class OneDnnProvider
             IntPtr scaleDesc;
             dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, DnnlF32, cStrides);
 
-            IntPtr srcMem, dstMem, meanMem, varMem, scaleMem, shiftMem;
-            dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
-            dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+            IntPtr srcMem = IntPtr.Zero, dstMem = IntPtr.Zero;
+            IntPtr meanMem = IntPtr.Zero, varMem = IntPtr.Zero;
+            IntPtr scaleMem = IntPtr.Zero, shiftMem = IntPtr.Zero;
+
+            rc = dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
+            if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); dnnl_memory_desc_destroy(dstDesc); dnnl_memory_desc_destroy(scaleDesc); dnnl_primitive_destroy(prim); return false; }
+            rc = dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+            if (rc != 0) { dnnl_memory_destroy(srcMem); dnnl_memory_desc_destroy(srcDesc); dnnl_memory_desc_destroy(dstDesc); dnnl_memory_desc_destroy(scaleDesc); dnnl_primitive_destroy(prim); return false; }
 
             // Now safe to destroy 4D descriptors
             dnnl_memory_desc_destroy(srcDesc);
             dnnl_memory_desc_destroy(dstDesc);
-            dnnl_memory_create(out meanMem, scaleDesc, _engine, (IntPtr)runningMean);
-            dnnl_memory_create(out varMem, scaleDesc, _engine, (IntPtr)runningVar);
-            dnnl_memory_create(out scaleMem, scaleDesc, _engine, (IntPtr)gamma);
-            dnnl_memory_create(out shiftMem, scaleDesc, _engine, (IntPtr)beta);
+
+            // Scale/shift/mean/var use 1D channel descriptor — check each rc
+            if (dnnl_memory_create(out meanMem, scaleDesc, _engine, (IntPtr)runningMean) != 0 ||
+                dnnl_memory_create(out varMem, scaleDesc, _engine, (IntPtr)runningVar) != 0 ||
+                dnnl_memory_create(out scaleMem, scaleDesc, _engine, (IntPtr)gamma) != 0 ||
+                dnnl_memory_create(out shiftMem, scaleDesc, _engine, (IntPtr)beta) != 0)
+            {
+                dnnl_memory_desc_destroy(scaleDesc);
+                if (meanMem != IntPtr.Zero) dnnl_memory_destroy(meanMem);
+                if (varMem != IntPtr.Zero) dnnl_memory_destroy(varMem);
+                if (scaleMem != IntPtr.Zero) dnnl_memory_destroy(scaleMem);
+                if (shiftMem != IntPtr.Zero) dnnl_memory_destroy(shiftMem);
+                dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
+                dnnl_primitive_destroy(prim);
+                return false;
+            }
             dnnl_memory_desc_destroy(scaleDesc);
 
             DnnlExecArg* args = stackalloc DnnlExecArg[6];
@@ -1886,8 +1905,8 @@ internal static class OneDnnProvider
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
             args[2] = new DnnlExecArg { Arg = DnnlArgMean, Memory = meanMem };
             args[3] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = varMem };
-            args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem }; // BN scale uses WEIGHTS arg
-            args[5] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = shiftMem }; // BN shift uses VARIANCE+1
+            args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem };
+            args[5] = new DnnlExecArg { Arg = DnnlArgBias, Memory = shiftMem };
             rc = dnnl_primitive_execute(prim, _stream, 6, args);
             dnnl_stream_wait(_stream);
 

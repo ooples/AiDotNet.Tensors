@@ -4,17 +4,20 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Optimization;
 
 /// <summary>
-/// Phase 7.3: Mixed precision compilation — quantize fp16-safe forward ops
-/// for 2x memory bandwidth reduction while preserving fp32 for backward.
+/// Mixed precision compilation pass — currently disabled.
 ///
-/// Strategy: save original fp32 values -> quantize to Half -> execute -> restore.
-/// All quantization/restore is exception-safe via try/finally.
+/// The in-place fp32→Half→fp32 round-trip approach does not actually reduce memory
+/// bandwidth (data remains fp32 throughout) and corrupts shared input tensors.
+/// A proper implementation would use separate Half-precision intermediate buffers
+/// with Half-precision SIMD kernels. Kept as opt-in placeholder for future work.
 /// </summary>
 internal sealed class MixedPrecisionPass : ICpuOptimizationPass
 {
     public string Name => "MixedPrecision";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableMixedPrecision;
+    // Disabled: current implementation doesn't reduce bandwidth and corrupts shared data.
+    // See class doc for details. Enable only after implementing real Half-precision buffers.
+    public bool IsEnabled => false;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

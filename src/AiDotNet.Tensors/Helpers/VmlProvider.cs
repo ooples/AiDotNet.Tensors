@@ -332,9 +332,13 @@ internal static class VmlProvider
                             var nativeDir = Path.GetDirectoryName(dllPath);
                             if (nativeDir != null)
                             {
+                                // Add to PATH so dependent DLLs can be found.
+                                // Uses OS-appropriate separator.
+                                var pathSep = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                                    System.Runtime.InteropServices.OSPlatform.Windows) ? ";" : ":";
                                 var path = Environment.GetEnvironmentVariable("PATH") ?? "";
                                 if (!path.Contains(nativeDir))
-                                    Environment.SetEnvironmentVariable("PATH", nativeDir + ";" + path);
+                                    Environment.SetEnvironmentVariable("PATH", nativeDir + pathSep + path);
                             }
                             if (NativeLibrary.TryLoad(dllPath, out var handle))
                             {

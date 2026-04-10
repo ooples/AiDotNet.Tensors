@@ -208,8 +208,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         bool hasConvOrAttention = false;
         for (int i = 0; i < steps.Length && !hasConvOrAttention; i++)
         {
-            if (steps[i].OpType is OpType.Conv2D or OpType.DepthwiseConv2D
-                or OpType.BatchNorm or OpType.TensorMatMul && steps.Length >= 8)
+            bool isHeavyOp = steps[i].OpType is OpType.Conv2D or OpType.DepthwiseConv2D
+                or OpType.BatchNorm or OpType.TensorMatMul;
+            if (isHeavyOp && steps.Length >= 8)
                 hasConvOrAttention = true;
         }
 

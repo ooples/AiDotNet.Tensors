@@ -53,19 +53,41 @@ internal static class CpuFeatures
         _hasAVX2 = Avx2.IsSupported;
         _hasFMA = Fma.IsSupported;
 
-        // Detect vendor from CPU brand string or ISA hints
+        // Detect vendor from multiple sources for cross-platform support
         try
         {
-            // On .NET, we can check the processor name
-            var processorName = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "";
-            if (processorName.Contains("Intel", StringComparison.OrdinalIgnoreCase))
+            // Try Windows PROCESSOR_IDENTIFIER first, then /proc/cpuinfo on Linux
+            string cpuInfo = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "";
+
+            if (string.IsNullOrEmpty(cpuInfo) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Linux))
+            {
+                try
+                {
+                    // Read /proc/cpuinfo model name on Linux
+                    foreach (var line in System.IO.File.ReadLines("/proc/cpuinfo"))
+                    {
+                        if (line.StartsWith("model name", StringComparison.OrdinalIgnoreCase)
+                            || line.StartsWith("vendor_id", StringComparison.OrdinalIgnoreCase))
+                        {
+                            cpuInfo += " " + line;
+                        }
+                        if (cpuInfo.Length > 200) break;
+                    }
+                }
+                catch { /* /proc/cpuinfo not available */ }
+            }
+
+            if (cpuInfo.Contains("Intel", StringComparison.OrdinalIgnoreCase)
+                || cpuInfo.Contains("GenuineIntel", StringComparison.OrdinalIgnoreCase))
             {
                 _isIntel = true;
                 _hasFastGather = true;
             }
-            else if (processorName.Contains("AMD", StringComparison.OrdinalIgnoreCase)
-                  || processorName.Contains("Ryzen", StringComparison.OrdinalIgnoreCase)
-                  || processorName.Contains("EPYC", StringComparison.OrdinalIgnoreCase))
+            else if (cpuInfo.Contains("AMD", StringComparison.OrdinalIgnoreCase)
+                  || cpuInfo.Contains("AuthenticAMD", StringComparison.OrdinalIgnoreCase)
+                  || cpuInfo.Contains("Ryzen", StringComparison.OrdinalIgnoreCase)
+                  || cpuInfo.Contains("EPYC", StringComparison.OrdinalIgnoreCase))
             {
                 _isAMD = true;
                 _hasFastGather = false; // Zen 1-4 all have slow gather

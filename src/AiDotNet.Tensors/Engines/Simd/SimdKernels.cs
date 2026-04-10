@@ -7870,15 +7870,12 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Fused GELU: computes GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
         /// in a single inline AVX2 pass, eliminating the FastTanh→FastSigmoid→FastExp call chain.
         /// </summary>
-        [MethodImpl(HotInline)]
         /// <summary>
         /// Fused GELU using Padé sigmoid: GELU(x) = x * sigmoid(arg)
         /// where arg = 2 * sqrt(2/pi) * (x + 0.044715*x^3).
-        ///
-        /// Mathematical simplification: GELU = 0.5*x*(1+tanh(s)) = 0.5*x*(1+2*sig(2s)-1) = x*sig(2s)
-        /// This eliminates the tanh→sigmoid→exp chain entirely.
-        /// Uses Padé [3,3] sigmoid with parallel even/odd computation.
+        /// Mathematical simplification: GELU = 0.5*x*(1+tanh(s)) = x*sig(2s).
         /// </summary>
+        [MethodImpl(HotInline)]
         public static unsafe void FusedGELUUnsafe(float* input, float* output, int length)
         {
             int i = 0;

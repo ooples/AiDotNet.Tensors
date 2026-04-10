@@ -6271,11 +6271,14 @@ public class CpuEngine : ITensorLevelEngine
             return Conv2D(input, kernel, stride, padding, dilation);
 
         if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input.Rank != 4 || kernel.Rank != 4)
             return Conv2D(input, kernel, stride, padding, dilation);
 
         int batch = input._shape[0], inC = input._shape[1], h = input._shape[2], w = input._shape[3];
         int outC = kernel._shape[0], kH = kernel._shape[2], kW = kernel._shape[3];
+        if (kernel._shape[1] != inC)
+            throw new ArgumentException($"Kernel channel dim {kernel._shape[1]} != input channels {inC}");
         int effKH = dilation * (kH - 1) + 1, effKW = dilation * (kW - 1) + 1;
         int outH = (h + 2 * padding - effKH) / stride + 1;
         int outW = (w + 2 * padding - effKW) / stride + 1;
