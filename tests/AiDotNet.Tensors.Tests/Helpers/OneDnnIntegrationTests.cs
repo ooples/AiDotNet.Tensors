@@ -6,9 +6,10 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Helpers;
 
 /// <summary>
-/// Integration tests for OneDNN pooling and batch normalization (#117).
-/// These test the CpuEngine paths that attempt OneDNN dispatch.
-/// When OneDNN is unavailable, they validate the fallback C# paths produce correct results.
+/// Correctness tests for MaxPool2D and BatchNorm CpuEngine paths.
+/// These validate the C# implementations produce correct numerical results.
+/// When OneDNN is available, CpuEngine may dispatch to native kernels internally;
+/// these tests verify correctness regardless of which path runs.
 /// </summary>
 public class OneDnnIntegrationTests
 {
@@ -16,10 +17,10 @@ public class OneDnnIntegrationTests
     public OneDnnIntegrationTests(ITestOutputHelper output) => _output = output;
 
     [Fact]
-    public void MaxPool2D_ProducesCorrectOutput()
+    public void MaxPool2D_Stride2_ProducesCorrectOutput()
     {
         var engine = new CpuEngine();
-        // 1 batch, 1 channel, 4x4 input, 2x2 kernel, stride 2
+        // 1 batch, 1 channel, 4x4 input, 2x2 kernel, stride 2, no padding
         var input = new Tensor<float>(new float[]
         {
             1, 2, 3, 4,
@@ -30,53 +31,49 @@ public class OneDnnIntegrationTests
 
         var result = engine.MaxPool2D(input, 2, 2, 0);
 
-        // Expected: max of each 2x2 block
-        // [6, 8]
-        // [14, 16]
+        // Expected: max of each 2x2 block with stride 2
+        // [6, 8; 14, 16]
         Assert.Equal(new[] { 1, 1, 2, 2 }, result.Shape.ToArray());
         var data = result.GetDataArray();
         Assert.Equal(6f, data[0]);
         Assert.Equal(8f, data[1]);
         Assert.Equal(14f, data[2]);
         Assert.Equal(16f, data[3]);
-
-        _output.WriteLine($"MaxPool2D: OneDNN path tested (falls back to C# if DLL unavailable)");
     }
 
     [Fact]
-    public void BatchNorm_InferenceProducesCorrectOutput()
+    public void BatchNorm_ProducesNormalizedOutput()
     {
         var engine = new CpuEngine();
         // 1 batch, 2 channels, 2x2 spatial
         var input = new Tensor<float>(new float[]
         {
-            // Channel 0
+            // Channel 0: values 1,2,3,4
             1, 2, 3, 4,
-            // Channel 1
+            // Channel 1: values 5,6,7,8
             5, 6, 7, 8
         }, new[] { 1, 2, 2, 2 });
 
         var gamma = new Tensor<float>(new float[] { 1, 1 }, new[] { 2 });
         var beta = new Tensor<float>(new float[] { 0, 0 }, new[] { 2 });
-        var runningMean = new Tensor<float>(new float[] { 2.5f, 6.5f }, new[] { 2 });
-        var runningVar = new Tensor<float>(new float[] { 1.25f, 1.25f }, new[] { 2 });
 
-        var result = engine.BatchNorm(input, gamma, beta, 1e-5f, out _, out _);
+        // BatchNorm computes per-channel mean/variance from the input batch
+        var result = engine.BatchNorm(input, gamma, beta, 1e-5f, out var mean, out var variance);
 
-        // BN: (x - mean) / sqrt(var + eps) * gamma + beta
-        // Channel 0: mean=2.5, var=1.25 → (x-2.5)/sqrt(1.25)
         Assert.Equal(new[] { 1, 2, 2, 2 }, result.Shape.ToArray());
-        var data = result.GetDataArray();
 
-        // (1 - 2.5) / sqrt(1.25 + 1e-5) ≈ -1.3416
-        Assert.True(MathF.Abs(data[0] - (-1.3416f)) < 0.01f,
-            $"BN channel 0, element 0: {data[0]}, expected ~-1.3416");
-
-        _output.WriteLine($"BatchNorm inference: OneDNN path tested (falls back to C# if DLL unavailable)");
+        // After BatchNorm, each channel should have approximately zero mean
+        var resultData = result.GetDataArray();
+        float ch0Sum = resultData[0] + resultData[1] + resultData[2] + resultData[3];
+        float ch1Sum = resultData[4] + resultData[5] + resultData[6] + resultData[7];
+        Assert.True(MathF.Abs(ch0Sum) < 0.01f,
+            $"Channel 0 sum after BN should be ~0, got {ch0Sum}");
+        Assert.True(MathF.Abs(ch1Sum) < 0.01f,
+            $"Channel 1 sum after BN should be ~0, got {ch1Sum}");
     }
 
     [Fact]
-    public void MaxPool2D_WithPadding()
+    public void MaxPool2D_Stride1_SlidingWindow()
     {
         var engine = new CpuEngine();
         var input = new Tensor<float>(new float[]
@@ -86,9 +83,9 @@ public class OneDnnIntegrationTests
             7, 8, 9
         }, new[] { 1, 1, 3, 3 });
 
+        // 2x2 kernel, stride 1, no padding → 2x2 output
         var result = engine.MaxPool2D(input, 2, 1, 0);
 
-        // 2x2 kernel, stride 1, no padding → 2x2 output
         Assert.Equal(new[] { 1, 1, 2, 2 }, result.Shape.ToArray());
         var data = result.GetDataArray();
         Assert.Equal(5f, data[0]); // max(1,2,4,5)

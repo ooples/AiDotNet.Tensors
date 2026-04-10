@@ -52,6 +52,8 @@ internal static class HerumiExp256
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe Vector256<float> Exp8(Vector256<float> x)
     {
+        // Clamp to valid range — values outside produce 0 (underflow) or +inf (overflow)
+        // via the 2^int_part reconstruction naturally reaching denorm/inf IEEE values.
         x = Avx.Max(Vector256.Create(ClampMin), Avx.Min(Vector256.Create(ClampMax), x));
 
         // z = x * (256 / ln2)
@@ -114,15 +116,17 @@ internal static class HerumiExp256
                 Avx.Store(output + i, Exp8(Avx.LoadVector256(input + i)));
         }
         for (; i < length; i++)
-            output[i] = MathF.Exp(input[i]);
+            output[i] = Exp(input[i]);
     }
 #endif
 
-    /// <summary>Scalar fallback using the table.</summary>
+    /// <summary>Scalar table-driven exp matching SIMD semantics.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Exp(float x)
     {
-        x = MathF.Max(ClampMin, MathF.Min(ClampMax, x));
+        // Match IEEE 754 semantics: underflow → 0, overflow → +inf
+        if (x < ClampMin) return 0f;
+        if (x > ClampMax) return float.PositiveInfinity;
         float z = x * LOverLn2;
         int n = (int)MathF.Floor(z);
         int k = n & LMask;
