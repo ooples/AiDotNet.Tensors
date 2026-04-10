@@ -27354,6 +27354,8 @@ public class CpuEngine : ITensorLevelEngine
         int n = input.Length;
         ValidatePowerOfTwo(n, nameof(input));
 
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
 
@@ -27365,6 +27367,8 @@ public class CpuEngine : ITensorLevelEngine
 
         var result = new Tensor<Complex<T>>([n]);
         for (int i = 0; i < n; i++) result[i] = data[i];
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
         return result;
     }
 
@@ -27374,6 +27378,8 @@ public class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         int n = input.Length;
         ValidatePowerOfTwo(n, nameof(input));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
@@ -27387,6 +27393,8 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>([n]);
         for (int i = 0; i < n; i++)
             result[i] = ops.Divide(data[i].Real, scale);
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexIFFTReal", result, eng => eng.NativeComplexIFFTReal(ci)); }
         return result;
     }
 
@@ -27396,6 +27404,9 @@ public class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         int n = input.Length;
         ValidatePowerOfTwo(n, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
@@ -27411,6 +27422,8 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = new Complex<T>(
                 ops.Divide(data[i].Real, scale),
                 ops.Divide(data[i].Imaginary, scale));
+
+        { var ci2 = input; AutoTracer.RecordOp("NativeComplexIFFT", result, eng => eng.NativeComplexIFFT(ci2)); }
         return result;
     }
 
@@ -27421,6 +27434,9 @@ public class CpuEngine : ITensorLevelEngine
         if (b is null) throw new ArgumentNullException(nameof(b));
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexMultiply", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
@@ -27435,6 +27451,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
         }
 
+        { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexMultiply", result, eng => eng.NativeComplexMultiply(ca2, cb2)); }
         return result;
     }
 
@@ -27442,6 +27459,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexConjugate", a._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<Complex<T>>([n]);
@@ -27449,6 +27470,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < n; i++)
             result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
 
+        { var ca2 = a; AutoTracer.RecordOp("NativeComplexConjugate", result, eng => eng.NativeComplexConjugate(ca2)); }
         return result;
     }
 
@@ -27456,18 +27478,21 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitude", a._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
 
         for (int i = 0; i < n; i++)
         {
-            // Use ops.Sqrt for type-consistent precision (reviewer feedback)
             var reSq = ops.Multiply(a[i].Real, a[i].Real);
             var imSq = ops.Multiply(a[i].Imaginary, a[i].Imaginary);
             result[i] = ops.Sqrt(ops.Add(reSq, imSq));
         }
 
+        { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitude", result, eng => eng.NativeComplexMagnitude(ca)); }
         return result;
     }
 
@@ -27475,6 +27500,9 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitudeSquared", a._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
@@ -27484,6 +27512,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.Multiply(a[i].Real, a[i].Real),
                 ops.Multiply(a[i].Imaginary, a[i].Imaginary));
 
+        { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitudeSquared", result, eng => eng.NativeComplexMagnitudeSquared(ca)); }
         return result;
     }
 
@@ -27491,6 +27520,9 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexPhase", a._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
@@ -27500,6 +27532,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.ToDouble(a[i].Imaginary),
                 ops.ToDouble(a[i].Real)));
 
+        { var ca = a; AutoTracer.RecordOp("NativeComplexPhase", result, eng => eng.NativeComplexPhase(ca)); }
         return result;
     }
 
@@ -27510,6 +27543,11 @@ public class CpuEngine : ITensorLevelEngine
         if (phases is null) throw new ArgumentNullException(nameof(phases));
         if (magnitudes.Length != phases.Length)
             throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
+
+        // NativeComplexFromPolar is a cross-type operation (T -> Complex<T>).
+        // GraphMode recording uses the magnitude tensor for tracing since it's the primary input.
+        // AutoTracer uses magnitude shape since output matches it.
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = magnitudes.Length;
@@ -27524,6 +27562,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.FromDouble(mag * Math.Sin(phase)));
         }
 
+        { var cm = magnitudes; var cp = phases; AutoTracer.RecordOp("NativeComplexFromPolar", result, eng => eng.NativeComplexFromPolar(cm, cp)); }
         return result;
     }
 
@@ -27531,6 +27570,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexScale", a._shape); if (ac is not null) return ac.Execute(); }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<Complex<T>>([n]);
@@ -27550,6 +27593,9 @@ public class CpuEngine : ITensorLevelEngine
         if (b is null) throw new ArgumentNullException(nameof(b));
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexAdd", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
