@@ -158,7 +158,7 @@ internal static class OneDnnProvider
     private const int DnnlArgWeights = 33;
     private const int DnnlArgVariance = 34; // BatchNorm running variance
     private const int DnnlArgScratchpad = 80;
-    private const int DnnlPropForwardInference = 1; // forward_inference propagation kind
+    // Removed: DnnlPropForwardInference = 1 was incorrect. Use DnnlForwardInference = 96.
     private const int DnnlPoolingMax = 1; // max pooling algorithm
 
     // Query types
@@ -1764,7 +1764,7 @@ internal static class OneDnnProvider
 
             // Create pooling primitive descriptor
             rc = dnnl_pooling_forward_primitive_desc_create(
-                out var primDesc, _engine, DnnlPropForwardInference,
+                out var primDesc, _engine, DnnlForwardInference,
                 DnnlPoolingMax,
                 srcDesc, dstDesc,
                 (IntPtr)strides, (IntPtr)kernel, (IntPtr)dilations,
@@ -1845,7 +1845,7 @@ internal static class OneDnnProvider
             // Flags: use global stats (inference) + scale + shift
             uint flags = DnnlUseGlobalStats | DnnlUseScale | DnnlUseShift;
             rc = dnnl_batch_normalization_forward_primitive_desc_create(
-                out var primDesc, _engine, DnnlPropForwardInference,
+                out var primDesc, _engine, DnnlForwardInference,
                 srcDesc, dstDesc, epsilon, flags, IntPtr.Zero);
 
             if (rc != 0)

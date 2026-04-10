@@ -109,9 +109,10 @@ internal static class TableDrivenSigmoid
                     var b = Avx.Multiply(vHalf,
                         Avx.Add(Fma.MultiplyAdd(vNeg3, y0, Avx.Multiply(vFour, y1)),
                             Avx.Subtract(vZero, y2)));
-                    // c = (y0 - 2*y1 + y2) * 0.5
+                    // c = (y0 - 2*y1 + y2) * 0.5 (second finite difference)
+                    var twoY1 = Avx.Add(y1, y1);
                     var c = Avx.Multiply(vHalf,
-                        Avx.Add(Avx.Subtract(y0, Avx.Multiply(vNeg2, y1)), y2));
+                        Avx.Add(Avx.Subtract(y0, twoY1), y2));
 
                     // result = y0 + frac * (b + frac * c)
                     var result = Fma.MultiplyAdd(frac, Fma.MultiplyAdd(frac, c, b), y0);
