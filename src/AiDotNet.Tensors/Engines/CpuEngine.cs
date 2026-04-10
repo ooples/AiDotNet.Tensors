@@ -27583,6 +27583,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.Multiply(a[i].Real, scalar),
                 ops.Multiply(a[i].Imaginary, scalar));
 
+        { var ca2 = a; var cs2 = scalar; AutoTracer.RecordOp("NativeComplexScale", result, eng => eng.NativeComplexScale(ca2, cs2)); }
         return result;
     }
 
@@ -27606,6 +27607,7 @@ public class CpuEngine : ITensorLevelEngine
                 ops.Add(a[i].Real, b[i].Real),
                 ops.Add(a[i].Imaginary, b[i].Imaginary));
 
+        { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexAdd", result, eng => eng.NativeComplexAdd(ca2, cb2)); }
         return result;
     }
 
@@ -27617,7 +27619,9 @@ public class CpuEngine : ITensorLevelEngine
         INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)
     {
         int n = data.Length;
-        int bits = (int)(Math.Log(n) / Math.Log(2));
+        // Integer log2 — avoids floating-point rounding errors from Math.Log
+        int bits = 0;
+        for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
         // Bit-reversal permutation
         for (int i = 0; i < n; i++)
