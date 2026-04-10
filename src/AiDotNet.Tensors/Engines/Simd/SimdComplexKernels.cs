@@ -4,15 +4,15 @@ using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-using System.Runtime.Intrinsics.Arm;
+// ARM NEON not yet implemented — AVX-only for now
 #endif
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
 /// <summary>
 /// SIMD-accelerated kernels for split real/imaginary complex operations.
-/// Uses AVX/SSE on x86 and NEON on ARM for vectorized complex arithmetic.
-/// Falls back to scalar for platforms without intrinsics.
+/// Uses AVX (256-bit) on x86 with FMA when available.
+/// Falls back to scalar on non-AVX platforms (including ARM).
 /// </summary>
 public static class SimdComplexKernels
 {
@@ -362,8 +362,12 @@ public static class SimdComplexKernels
                     : Avx.Add(Avx.Multiply(p2, sinPoly), one);
                 var sinVal = Avx.Multiply(p, sinPoly);
 
-                // cos(p) = sin(p + pi/2)
+                // cos(p) = sin(p + pi/2) — must range-reduce pCos back to [-pi, pi]
                 var pCos = Avx.Add(p, halfPi);
+                // If pCos > pi, subtract 2pi to bring back into range
+                var piVec = Vector256.Create(MathF.PI);
+                var gtPi = Avx.Compare(pCos, piVec, FloatComparisonMode.OrderedGreaterThanSignaling);
+                pCos = Avx.BlendVariable(pCos, Avx.Subtract(pCos, twoPi), gtPi);
                 var pCos2 = Avx.Multiply(pCos, pCos);
                 var cosPoly = Fma.IsSupported
                     ? Fma.MultiplyAdd(pCos2, s3, s2)

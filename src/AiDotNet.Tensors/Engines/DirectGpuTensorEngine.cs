@@ -15005,7 +15005,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (a is null || b is null || a.Length != b.Length)
+            return base.NativeComplexMultiply(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMultiply(a, b);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
@@ -15187,7 +15189,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (a is null || b is null || a.Length != b.Length)
+            return base.NativeComplexAdd(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexAdd(a, b);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
