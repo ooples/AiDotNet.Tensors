@@ -4217,6 +4217,18 @@ public class CpuEngine : ITensorLevelEngine
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.ExpUnsafe);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var iMem = AsDoubleMemory(tensor.Data);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            double* pI = (double*)pinI.Pointer;
+            double* pR = (double*)pinR.Pointer;
+            // Try VML first (MKL native), fall back to our SIMD
+            if (!Helpers.VmlProvider.TryExp(pI, pR, length))
+                SimdKernels.ExpUnsafe(pI, pR, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -6896,6 +6908,17 @@ public class CpuEngine : ITensorLevelEngine
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(tensor.Data);
+            var dstMem = AsDoubleMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+            if (!Helpers.VmlProvider.TryTanh(pSrc, pDst, tensor.Length))
+                SimdKernels.TanhUnsafe(pSrc, pDst, tensor.Length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -7529,6 +7552,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(tensor.Data);
+            var dstMem = AsDoubleMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
         }
         else
         {

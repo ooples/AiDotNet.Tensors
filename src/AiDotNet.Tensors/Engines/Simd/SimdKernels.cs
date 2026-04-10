@@ -5037,6 +5037,117 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>Pointer-based Exp for double — 4x unrolled AVX2 Cephes polynomial.</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void ExpUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                int simdLen = length & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    Avx.Store(output + i, FastExpDouble256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4, FastExpDouble256(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8, FastExpDouble256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, FastExpDouble256(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
+            {
+                int simdLen = i + ((length - i) & ~3);
+                for (; i < simdLen; i += 4)
+                    Avx.Store(output + i, FastExpDouble256(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Exp(input[i]);
+        }
+
+        /// <summary>Pointer-based Tanh for double — tanh(x) = 2*sigmoid(2x) - 1.</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void TanhUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                var one = Vector256.Create(1.0);
+                var two = Vector256.Create(2.0);
+                var negOne = Vector256.Create(-1.0);
+                int simdLen = length & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var x1 = Avx.LoadVector256(input + i + 4);
+                    var x2 = Avx.LoadVector256(input + i + 8);
+                    var x3 = Avx.LoadVector256(input + i + 12);
+                    // sigmoid(-2x) = 1/(1+exp(2x)), tanh = 1 - 2*sigmoid(-2x)
+                    var e0 = FastExpDouble256(Avx.Multiply(two, x0));
+                    var e1 = FastExpDouble256(Avx.Multiply(two, x1));
+                    var e2 = FastExpDouble256(Avx.Multiply(two, x2));
+                    var e3 = FastExpDouble256(Avx.Multiply(two, x3));
+                    Avx.Store(output + i, Avx.Divide(Avx.Subtract(e0, one), Avx.Add(e0, one)));
+                    Avx.Store(output + i + 4, Avx.Divide(Avx.Subtract(e1, one), Avx.Add(e1, one)));
+                    Avx.Store(output + i + 8, Avx.Divide(Avx.Subtract(e2, one), Avx.Add(e2, one)));
+                    Avx.Store(output + i + 12, Avx.Divide(Avx.Subtract(e3, one), Avx.Add(e3, one)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
+            {
+                var one = Vector256.Create(1.0);
+                var two = Vector256.Create(2.0);
+                int simdLen = i + ((length - i) & ~3);
+                for (; i < simdLen; i += 4)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var e0 = FastExpDouble256(Avx.Multiply(two, x0));
+                    Avx.Store(output + i, Avx.Divide(Avx.Subtract(e0, one), Avx.Add(e0, one)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Tanh(input[i]);
+        }
+
+        /// <summary>Pointer-based GELU for double — 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))).</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void GELUUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 4)
+            {
+                var vSqrt2OverPi = Vector256.Create(0.7978845608028654);
+                var vCoeff = Vector256.Create(0.044715);
+                var vHalf = Vector256.Create(0.5);
+                var vOne = Vector256.Create(1.0);
+                var vTwo = Vector256.Create(2.0);
+
+                int simdLen = length & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
+                    var inner = Fma.MultiplyAdd(vCoeff, x3, x);
+                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    // tanh(z) = (exp(2z)-1)/(exp(2z)+1)
+                    var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
+                    var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
+                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanhVal))));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                double x = input[i];
+                double inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+                double tanhVal = Math.Tanh(inner);
+                output[i] = 0.5 * x * (1.0 + tanhVal);
+            }
+        }
+
         /// <summary>Pointer-based VectorSubtract for double — zero bounds-checking overhead.</summary>
         [MethodImpl(HotInline)]
         public static unsafe void VectorSubtractUnsafe(double* a, double* b, double* result, int length)

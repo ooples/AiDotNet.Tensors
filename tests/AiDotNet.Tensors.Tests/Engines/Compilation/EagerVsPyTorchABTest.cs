@@ -146,4 +146,97 @@ public class EagerVsPyTorchABTest
         _output.WriteLine($"  PyTorch BDN: {pytorchMs}ms");
         _output.WriteLine($"  Ratio:       {bestEager / pytorchMs:F3}x");
     }
+
+    [Fact]
+    public unsafe void DoubleExp_1M_EagerVsPyTorch()
+    {
+        const double pytorchMs = 0.282; // BDN Run 1 (Run 2 was noisy at 11.5ms)
+        var engine = new CpuEngine();
+        int n = 1_000_000;
+        var rng = new Random(42);
+        var data = new double[n];
+        for (int i = 0; i < n; i++) data[i] = rng.NextDouble() * 20 - 10;
+        var tensor = new Tensor<double>(data, new[] { n });
+
+        for (int w = 0; w < 20; w++)
+            engine.TensorExp(tensor);
+
+        double bestEager = double.MaxValue;
+        for (int trial = 0; trial < 10; trial++)
+        {
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < 100; iter++)
+                engine.TensorExp(tensor);
+            sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds / 100;
+            if (ms < bestEager) bestEager = ms;
+        }
+
+        _output.WriteLine($"Double Exp 1M (best of 10):");
+        _output.WriteLine($"  Eager:       {bestEager:F4}ms");
+        _output.WriteLine($"  PyTorch BDN: {pytorchMs}ms");
+        _output.WriteLine($"  Ratio:       {bestEager / pytorchMs:F3}x");
+    }
+
+    [Fact]
+    public unsafe void DoubleTanh_1M_EagerVsPyTorch()
+    {
+        const double pytorchMs = 1.025;
+        var engine = new CpuEngine();
+        int n = 1_000_000;
+        var rng = new Random(42);
+        var data = new double[n];
+        for (int i = 0; i < n; i++) data[i] = rng.NextDouble() * 10 - 5;
+        var tensor = new Tensor<double>(data, new[] { n });
+
+        for (int w = 0; w < 20; w++)
+            engine.TensorTanh(tensor);
+
+        double bestEager = double.MaxValue;
+        for (int trial = 0; trial < 10; trial++)
+        {
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < 100; iter++)
+                engine.TensorTanh(tensor);
+            sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds / 100;
+            if (ms < bestEager) bestEager = ms;
+        }
+
+        _output.WriteLine($"Double Tanh 1M (best of 10):");
+        _output.WriteLine($"  Eager:       {bestEager:F4}ms");
+        _output.WriteLine($"  PyTorch BDN: {pytorchMs}ms");
+        _output.WriteLine($"  Ratio:       {bestEager / pytorchMs:F3}x");
+    }
+
+    [Fact]
+    public unsafe void DoubleGELU_1M_EagerVsPyTorch()
+    {
+        const double pytorchMs = 1.393;
+        var engine = new CpuEngine();
+        int n = 1_000_000;
+        var rng = new Random(42);
+        var data = new double[n];
+        for (int i = 0; i < n; i++) data[i] = rng.NextDouble() * 10 - 5;
+        var tensor = new Tensor<double>(data, new[] { n });
+
+        for (int w = 0; w < 20; w++)
+            engine.TensorGELU(tensor);
+
+        double bestEager = double.MaxValue;
+        for (int trial = 0; trial < 10; trial++)
+        {
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < 100; iter++)
+                engine.TensorGELU(tensor);
+            sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds / 100;
+            if (ms < bestEager) bestEager = ms;
+        }
+
+        _output.WriteLine($"Double GELU 1M (best of 10):");
+        _output.WriteLine($"  Eager:       {bestEager:F4}ms");
+        _output.WriteLine($"  PyTorch BDN: {pytorchMs}ms");
+        _output.WriteLine($"  Ratio:       {bestEager / pytorchMs:F3}x");
+    }
 }
