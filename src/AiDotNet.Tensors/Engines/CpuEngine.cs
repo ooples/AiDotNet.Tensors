@@ -27338,6 +27338,191 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <inheritdoc />
+    public Tensor<T> TensorComplexPhase<T>(Tensor<T> a)
+    {
+        if (a.Length % 2 != 0)
+            throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int pairs = a.Length / 2;
+        var result = new Tensor<T>([pairs]);
+
+        for (int i = 0; i < pairs; i++)
+        {
+            var re = ops.ToDouble(a[i * 2]);
+            var im = ops.ToDouble(a[i * 2 + 1]);
+            result[i] = ops.FromDouble(Math.Atan2(im, re));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> TensorComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    {
+        if (magnitudes.Length != phases.Length)
+            throw new ArgumentException("Magnitude and phase tensors must have the same length.");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = magnitudes.Length;
+        var result = new Tensor<T>([n * 2]);
+
+        for (int i = 0; i < n; i++)
+        {
+            var mag = ops.ToDouble(magnitudes[i]);
+            var phase = ops.ToDouble(phases[i]);
+            result[i * 2] = ops.FromDouble(mag * Math.Cos(phase));
+            result[i * 2 + 1] = ops.FromDouble(mag * Math.Sin(phase));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Vector<Complex<T>> TensorFFTNative<T>(Vector<T> input)
+    {
+        int n = input.Length;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+
+        // Convert real input to complex
+        var data = new Vector<Complex<T>>(n);
+        for (int i = 0; i < n; i++)
+            data[i] = new Complex<T>(input[i], ops.Zero);
+
+        return FFTIterative(data, false, ops, complexOps);
+    }
+
+    /// <inheritdoc />
+    public Vector<T> TensorIFFTNative<T>(Vector<Complex<T>> input)
+    {
+        int n = input.Length;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+
+        var result = FFTIterative(input, true, ops, complexOps);
+
+        // Extract real parts and scale by 1/N
+        var scale = ops.FromDouble(n);
+        var output = new Vector<T>(n);
+        for (int i = 0; i < n; i++)
+            output[i] = ops.Divide(result[i].Real, scale);
+
+        return output;
+    }
+
+    /// <summary>
+    /// Iterative Cooley-Tukey FFT — better cache performance than recursive version.
+    /// </summary>
+    private static Vector<Complex<T>> FFTIterative<T>(Vector<Complex<T>> input, bool inverse,
+        INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)
+    {
+        int n = input.Length;
+        var data = new Vector<Complex<T>>(n);
+        for (int i = 0; i < n; i++) data[i] = input[i];
+
+        // Bit-reversal permutation
+        int bits = (int)(Math.Log(n) / Math.Log(2));
+        for (int i = 0; i < n; i++)
+        {
+            int j = BitReverse(i, bits);
+            if (j > i)
+            {
+                (data[i], data[j]) = (data[j], data[i]);
+            }
+        }
+
+        // Butterfly operations
+        T angleSign = inverse ? ops.One : ops.Negate(ops.One);
+
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+            T angle = ops.Multiply(angleSign, ops.FromDouble(2.0 * Math.PI / size));
+
+            for (int start = 0; start < n; start += size)
+            {
+                for (int k = 0; k < halfSize; k++)
+                {
+                    T theta = ops.Multiply(angle, ops.FromDouble(k));
+                    var twiddle = Complex<T>.FromPolarCoordinates(ops.One, theta);
+                    var t = complexOps.Multiply(twiddle, data[start + k + halfSize]);
+                    var u = data[start + k];
+                    data[start + k] = complexOps.Add(u, t);
+                    data[start + k + halfSize] = complexOps.Subtract(u, t);
+                }
+            }
+        }
+
+        return data;
+    }
+
+    /// <inheritdoc />
+    public Vector<Complex<T>> VectorComplexMultiply<T>(Vector<Complex<T>> a, Vector<Complex<T>> b)
+    {
+        if (a.Length != b.Length)
+            throw new ArgumentException("Vectors must have the same length.");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+        int n = a.Length;
+        var result = new Vector<Complex<T>>(n);
+
+        for (int i = 0; i < n; i++)
+        {
+            result[i] = complexOps.Multiply(a[i], b[i]);
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Vector<Complex<T>> VectorComplexConjugate<T>(Vector<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Vector<Complex<T>>(n);
+
+        for (int i = 0; i < n; i++)
+        {
+            result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Vector<T> VectorComplexMagnitude<T>(Vector<Complex<T>> a)
+    {
+        int n = a.Length;
+        var result = new Vector<T>(n);
+
+        for (int i = 0; i < n; i++)
+        {
+            result[i] = a[i].Magnitude;
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Vector<T> VectorComplexPhase<T>(Vector<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Vector<T>(n);
+
+        for (int i = 0; i < n; i++)
+        {
+            var re = ops.ToDouble(a[i].Real);
+            var im = ops.ToDouble(a[i].Imaginary);
+            result[i] = ops.FromDouble(Math.Atan2(im, re));
+        }
+
+        return result;
+    }
+
     #endregion
 
     #region CTC Loss

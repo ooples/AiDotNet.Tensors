@@ -7432,6 +7432,58 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorComplexMagnitude<T>(Tensor<T> a);
 
+    /// <summary>
+    /// Complex phase extraction on interleaved real/imaginary tensors.
+    /// Computes atan2(im, re) per complex pair.
+    /// Output length is half the input length.
+    /// </summary>
+    Tensor<T> TensorComplexPhase<T>(Tensor<T> a);
+
+    /// <summary>
+    /// Constructs an interleaved complex tensor from separate magnitude and phase tensors.
+    /// Output[2k] = magnitude[k] * cos(phase[k]), Output[2k+1] = magnitude[k] * sin(phase[k]).
+    /// Output length is double the input length.
+    /// </summary>
+    Tensor<T> TensorComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases);
+
+    /// <summary>
+    /// Forward FFT on a real-valued tensor using native Complex&lt;T&gt; output.
+    /// Returns Vector&lt;Complex&lt;T&gt;&gt; directly, avoiding interleaved format conversion overhead.
+    /// </summary>
+    /// <param name="input">Real-valued input signal. Length should be power of 2.</param>
+    /// <returns>Complex-valued frequency domain representation.</returns>
+    Vector<Complex<T>> TensorFFTNative<T>(Vector<T> input);
+
+    /// <summary>
+    /// Inverse FFT returning a real-valued tensor from native Complex&lt;T&gt; input.
+    /// Avoids interleaved format conversion overhead.
+    /// </summary>
+    /// <param name="input">Complex-valued frequency domain representation.</param>
+    /// <returns>Real-valued time domain signal.</returns>
+    Vector<T> TensorIFFTNative<T>(Vector<Complex<T>> input);
+
+    /// <summary>
+    /// Element-wise multiply of two Complex&lt;T&gt; vectors (spectral filtering).
+    /// H(k) * X(k) for each frequency bin k.
+    /// </summary>
+    Vector<Complex<T>> VectorComplexMultiply<T>(Vector<Complex<T>> a, Vector<Complex<T>> b);
+
+    /// <summary>
+    /// Element-wise conjugate of a Complex&lt;T&gt; vector: (re, -im) for each element.
+    /// Used in cross-spectral density computation.
+    /// </summary>
+    Vector<Complex<T>> VectorComplexConjugate<T>(Vector<Complex<T>> a);
+
+    /// <summary>
+    /// Extract magnitudes from a Complex&lt;T&gt; vector: sqrt(re^2 + im^2) for each element.
+    /// </summary>
+    Vector<T> VectorComplexMagnitude<T>(Vector<Complex<T>> a);
+
+    /// <summary>
+    /// Extract phases from a Complex&lt;T&gt; vector: atan2(im, re) for each element.
+    /// </summary>
+    Vector<T> VectorComplexPhase<T>(Vector<Complex<T>> a);
+
     #endregion
 
     #region CTC Loss
