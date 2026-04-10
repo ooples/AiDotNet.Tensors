@@ -5,6 +5,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
 public static class ComplexKernels
 {
+    public static string[] GetKernelNames() => new[]
+    {
+        "split_complex_multiply", "split_complex_conjugate",
+        "split_complex_magnitude", "split_complex_magnitude_squared",
+        "split_complex_phase", "split_complex_from_polar",
+        "split_complex_scale", "split_complex_add",
+        "split_complex_cross_spectral"
+    };
+
     public static string GetSource() => @"
 __kernel void split_complex_multiply(
     __global const float* aReal, __global const float* aImag,

@@ -27340,12 +27340,22 @@ public class CpuEngine : ITensorLevelEngine
 
     // --- Native Complex<T> Tensor Operations ---
 
+    private static void ValidatePowerOfTwo(int n, string paramName)
+    {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new ArgumentException(
+                $"FFT requires input length to be a power of 2, got {n}.", paramName);
+    }
+
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        int n = input.Length;
+        ValidatePowerOfTwo(n, nameof(input));
+
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
-        int n = input.Length;
 
         var data = new Complex<T>[n];
         for (int i = 0; i < n; i++)
@@ -27359,11 +27369,14 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<T> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    public Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        int n = input.Length;
+        ValidatePowerOfTwo(n, nameof(input));
+
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
-        int n = input.Length;
 
         var data = new Complex<T>[n];
         for (int i = 0; i < n; i++) data[i] = input[i];
@@ -27378,8 +27391,34 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        int n = input.Length;
+        ValidatePowerOfTwo(n, nameof(input));
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+
+        var data = new Complex<T>[n];
+        for (int i = 0; i < n; i++) data[i] = input[i];
+
+        NativeFFTInPlace(data, true, ops, complexOps);
+
+        var scale = ops.FromDouble(n);
+        var result = new Tensor<Complex<T>>([n]);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(
+                ops.Divide(data[i].Real, scale),
+                ops.Divide(data[i].Imaginary, scale));
+        return result;
+    }
+
+    /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
@@ -27402,6 +27441,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<Complex<T>>([n]);
@@ -27415,15 +27455,17 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
 
         for (int i = 0; i < n; i++)
         {
-            var re = ops.ToDouble(a[i].Real);
-            var im = ops.ToDouble(a[i].Imaginary);
-            result[i] = ops.FromDouble(Math.Sqrt(re * re + im * im));
+            // Use ops.Sqrt for type-consistent precision (reviewer feedback)
+            var reSq = ops.Multiply(a[i].Real, a[i].Real);
+            var imSq = ops.Multiply(a[i].Imaginary, a[i].Imaginary);
+            result[i] = ops.Sqrt(ops.Add(reSq, imSq));
         }
 
         return result;
@@ -27432,6 +27474,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
@@ -27447,6 +27490,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<T>([n]);
@@ -27462,8 +27506,10 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
+        if (magnitudes is null) throw new ArgumentNullException(nameof(magnitudes));
+        if (phases is null) throw new ArgumentNullException(nameof(phases));
         if (magnitudes.Length != phases.Length)
-            throw new ArgumentException("Magnitude and phase tensors must have the same length.");
+            throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = magnitudes.Length;
@@ -27484,6 +27530,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
         var result = new Tensor<Complex<T>>([n]);
@@ -27499,6 +27546,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
@@ -27516,6 +27565,7 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// In-place iterative Cooley-Tukey FFT on a Complex&lt;T&gt; array.
+    /// Input length must be a power of 2 (validated by callers).
     /// </summary>
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)

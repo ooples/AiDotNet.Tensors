@@ -7435,26 +7435,47 @@ public interface IEngine
     // --- Native Complex<T> Tensor Operations ---
     // These operate on Tensor<Complex<T>> directly, avoiding interleaved format conversion overhead.
     // For maximum performance in spectral processing (FFT, filtering, HRE).
+    //
+    // GPU acceleration: On GPU paths, Tensor<Complex<T>> (array-of-structs) is automatically
+    // decomposed to split real/imaginary buffers for coalesced GPU memory access, then
+    // recomposed on download. This conversion is transparent to callers.
 
     /// <summary>
-    /// Forward FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.
-    /// No interleaved format conversion needed — Complex&lt;T&gt; elements stored directly.
+    /// Forward 1D FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.
+    /// Transforms along the last axis. Output has the same shape as input, with each element
+    /// being a complex frequency bin.
     /// </summary>
-    /// <param name="input">Real-valued input signal. Length should be power of 2.</param>
-    /// <returns>Complex-valued frequency domain tensor of same length.</returns>
+    /// <param name="input">Real-valued input signal. Length along last axis must be a power of 2.</param>
+    /// <returns>Complex-valued frequency domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
     Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input);
 
     /// <summary>
-    /// Inverse FFT from native Complex&lt;T&gt; tensor back to real-valued tensor.
+    /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning real-valued tensor.
+    /// Extracts only the real component of the inverse transform. Use this when the original
+    /// signal was real-valued (Hermitian symmetry assumed). Applies 1/N normalization.
     /// </summary>
-    /// <param name="input">Complex-valued frequency domain tensor.</param>
-    /// <returns>Real-valued time domain tensor.</returns>
-    Tensor<T> NativeComplexIFFT<T>(Tensor<Complex<T>> input);
+    /// <param name="input">Complex-valued frequency domain tensor. Length must be a power of 2.</param>
+    /// <returns>Real-valued time domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
+    Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning Complex&lt;T&gt; tensor.
+    /// General complex-to-complex IFFT with 1/N normalization. Use this when the time-domain
+    /// signal may have nonzero imaginary components (e.g., intermediate results in spectral
+    /// filtering chains, or Hilbert transform output).
+    /// </summary>
+    /// <param name="input">Complex-valued frequency domain tensor. Length must be a power of 2.</param>
+    /// <returns>Complex-valued time domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if input length is not a power of 2.</exception>
+    Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input);
 
     /// <summary>
     /// Element-wise multiplication of two Complex&lt;T&gt; tensors (spectral filtering).
     /// (a.re*b.re - a.im*b.im) + i*(a.re*b.im + a.im*b.re) per element.
     /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
     Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
 
     /// <summary>
@@ -7464,6 +7485,7 @@ public interface IEngine
 
     /// <summary>
     /// Extract magnitudes from Complex&lt;T&gt; tensor: sqrt(re^2 + im^2) per element.
+    /// For performance-sensitive code where only ordering matters, use NativeComplexMagnitudeSquared instead.
     /// </summary>
     Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a);
 
@@ -7475,6 +7497,7 @@ public interface IEngine
 
     /// <summary>
     /// Extract phases from Complex&lt;T&gt; tensor: atan2(im, re) per element.
+    /// Result is in radians, range [-pi, pi].
     /// </summary>
     Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a);
 
@@ -7482,6 +7505,7 @@ public interface IEngine
     /// Construct Complex&lt;T&gt; tensor from magnitude and phase tensors.
     /// result[i] = Complex(mag[i]*cos(phase[i]), mag[i]*sin(phase[i]))
     /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
     Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases);
 
     /// <summary>
@@ -7493,6 +7517,7 @@ public interface IEngine
     /// <summary>
     /// Element-wise addition of two Complex&lt;T&gt; tensors.
     /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
     Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
 
     #endregion

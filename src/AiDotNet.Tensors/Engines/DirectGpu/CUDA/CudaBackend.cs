@@ -9814,10 +9814,20 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     // --- Split-buffer native Complex<T> operations ---
 
+    private static void ValidateSplitBuffers(int n, string opName, params IGpuBuffer[] buffers)
+    {
+        foreach (var buf in buffers)
+        {
+            if (buf is null) throw new ArgumentNullException(opName, "GPU buffer cannot be null.");
+            if (n > buf.Size) throw new ArgumentException($"{opName}: n ({n}) exceeds buffer size ({buf.Size}).");
+        }
+    }
+
     public unsafe void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexMultiply), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_multiply. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9834,6 +9844,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexConjugate), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_conjugate", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_conjugate. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9847,6 +9858,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexMagnitude), inReal, inImag, outMag);
         if (!_kernelCache.TryGetValue("split_complex_magnitude", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9860,6 +9872,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexMagnitudeSquared), inReal, inImag, outMagSq);
         if (!_kernelCache.TryGetValue("split_complex_magnitude_squared", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude_squared. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9873,6 +9886,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexPhase), inReal, inImag, outPhase);
         if (!_kernelCache.TryGetValue("split_complex_phase", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_phase. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9887,6 +9901,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexFromPolar), mag, phase, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_from_polar", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_from_polar. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9901,6 +9916,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexScale), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_scale", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_scale. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9915,6 +9931,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexAdd), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_add", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_add. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -9931,6 +9948,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(SplitComplexCrossSpectral), xReal, xImag, yReal, yImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_cross_spectral", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_cross_spectral. Register CudaComplexKernels.");
         using var _ = PushContext();

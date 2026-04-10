@@ -2821,9 +2821,11 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Complex magnitude — sqrt(re^2+im^2) per pair. Output length = numPairs.</summary>
     void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs);
 
-    // --- Split-buffer complex operations (native Complex<T> support) ---
-    // These use separate real/imag GPU buffers for coalesced memory access,
-    // matching the Tensor<Complex<T>> layout in the IEngine interface.
+    // --- Split-buffer complex operations ---
+    // These use separate real/imag GPU buffers (struct-of-arrays layout) for
+    // coalesced GPU memory access. The IEngine layer auto-converts between
+    // Tensor<Complex<T>> (array-of-structs) and split buffers at the GPU boundary.
+    // Callers of IEngine never see the split format — it's an internal GPU optimization.
 
     /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
     void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
