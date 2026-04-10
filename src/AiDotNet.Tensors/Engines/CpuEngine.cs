@@ -6260,16 +6260,12 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Performs 2D convolution with explicit memory format.
-    /// When format is ChannelsLast (NHWC), uses the NHWC im2col+GEMM kernel which
-    /// has better SIMD utilization for channel-contiguous data.
-    /// Input/output are in NCHW format — conversion is handled internally.
+    /// Performs 2D convolution with explicit memory format hint.
+    /// Delegates to the standard Conv2D which handles autodiff recording, GraphMode,
+    /// tracing, and already selects the optimal kernel (OneDNN, SIMD, or generic).
     /// </summary>
     public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation, MemoryFormat format)
     {
-        // Delegate to standard Conv2D which handles GraphMode, autodiff, and tracing.
-        // The NHWC optimization is only a hint — the standard path already selects
-        // the best kernel (OneDNN, NHWC im2col, or generic) based on hardware.
         return Conv2D(input, kernel, stride, padding, dilation);
     }
 

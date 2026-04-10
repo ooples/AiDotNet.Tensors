@@ -66,6 +66,39 @@ extern ""C"" __global__ __launch_bounds__(256) void set_slice_last_axis(
 }
 
 // ============================================================================
+// Slice along any axis: select one index, producing rank-1 output.
+// out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
+// ============================================================================
+
+extern ""C"" __global__ __launch_bounds__(256) void slice_axis(
+    const float* __restrict__ input, float* __restrict__ output,
+    int outerSize, int axisSize, int stride, int index)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * stride;
+    if (idx >= total) return;
+
+    int outer = idx / stride;
+    int s = idx % stride;
+    output[idx] = input[outer * axisSize * stride + index * stride + s];
+}
+
+// Set slice along any axis: inverse of slice_axis
+extern ""C"" __global__ __launch_bounds__(256) void set_slice_axis(
+    float* __restrict__ output,
+    const float* __restrict__ values,
+    int outerSize, int axisSize, int stride, int index)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * stride;
+    if (idx >= total) return;
+
+    int outer = idx / stride;
+    int s = idx % stride;
+    output[outer * axisSize * stride + index * stride + s] = values[idx];
+}
+
+// ============================================================================
 // Stack: interleave N same-shape tensors along a new axis
 // For 2 tensors: output[2*i] = a[i], output[2*i+1] = b[i]
 // ============================================================================
@@ -374,6 +407,8 @@ extern ""C"" __global__ __launch_bounds__(256) void index_select(
             "concat_axis",
             "slice_last_axis",
             "set_slice_last_axis",
+            "slice_axis",
+            "set_slice_axis",
             "stack_2",
             "pad_2d",
             "pad_2d_backward",
