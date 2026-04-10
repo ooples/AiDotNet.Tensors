@@ -7437,10 +7437,10 @@ public interface IEngine
     // For maximum performance in spectral processing (FFT, filtering, HRE).
     //
     // CPU path: Operates on Tensor<Complex<T>> directly with no conversion.
-    // GPU path: Not yet wired — these ops currently execute on CPU only.
-    // When GPU support is added, DirectGpuTensorEngine will decompose
-    // Tensor<Complex<T>> to split real/imag buffers, dispatch via
-    // IDirectGpuBackend.SplitComplex* methods, and recompose on download.
+    // GPU path: DirectGpuTensorEngine decomposes Tensor<Complex<T>> to split
+    // real/imag float[] arrays, uploads to GPU, dispatches via
+    // IDirectGpuBackend.SplitComplex* methods, downloads and recomposes.
+    // FFT/IFFT dispatch through existing backend.FFT() with split buffers.
 
     /// <summary>
     /// Forward 1D FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.

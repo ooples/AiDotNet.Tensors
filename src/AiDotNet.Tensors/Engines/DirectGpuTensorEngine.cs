@@ -14964,4 +14964,309 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { }
         return base.TensorCIoULoss(predicted, target);
     }
+
+    // --- Native Complex<T> GPU overrides ---
+    // Decomposes Tensor<Complex<T>> to split real/imag GPU buffers,
+    // dispatches via IDirectGpuBackend.SplitComplex*, recomposes result.
+
+    private static (float[] real, float[] imag) DecomposeComplex<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = tensor.Length;
+        var real = new float[n];
+        var imag = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = (float)ops.ToDouble(tensor[i].Real);
+            imag[i] = (float)ops.ToDouble(tensor[i].Imaginary);
+        }
+        return (real, imag);
+    }
+
+    private static Tensor<Complex<T>> RecomposeComplex<T>(float[] real, float[] imag, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = real.Length;
+        var result = new Tensor<Complex<T>>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(ops.FromDouble(real[i]), ops.FromDouble(imag[i]));
+        return result;
+    }
+
+    private static Tensor<T> RecomposeReal<T>(float[] data, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = data.Length;
+        var result = new Tensor<T>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = ops.FromDouble(data[i]);
+        return result;
+    }
+
+    public new Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexMultiply(a, b);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+            var (bR, bI) = DecomposeComplex(b);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var bRBuf = new OwnedBuffer(backend.AllocateBuffer(bR), true);
+            using var bIBuf = new OwnedBuffer(backend.AllocateBuffer(bI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexMultiply(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
+                oRBuf.Buffer, oIBuf.Buffer, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexMultiply(a, b); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexConjugate(a);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexConjugate(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexConjugate(a); }
+    }
+
+    public new Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexMagnitude(a);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var oBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexMagnitude(aRBuf.Buffer, aIBuf.Buffer, oBuf.Buffer, n);
+
+            return RecomposeReal<T>(backend.DownloadBuffer(oBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexMagnitude(a); }
+    }
+
+    public new Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexMagnitudeSquared(a);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var oBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexMagnitudeSquared(aRBuf.Buffer, aIBuf.Buffer, oBuf.Buffer, n);
+
+            return RecomposeReal<T>(backend.DownloadBuffer(oBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexMagnitudeSquared(a); }
+    }
+
+    public new Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexPhase(a);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var oBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexPhase(aRBuf.Buffer, aIBuf.Buffer, oBuf.Buffer, n);
+
+            return RecomposeReal<T>(backend.DownloadBuffer(oBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexPhase(a); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexFromPolar(magnitudes, phases);
+
+        try
+        {
+            int n = magnitudes.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var magF = new float[n];
+            var phaseF = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                magF[i] = (float)ops.ToDouble(magnitudes[i]);
+                phaseF[i] = (float)ops.ToDouble(phases[i]);
+            }
+
+            using var magBuf = new OwnedBuffer(backend.AllocateBuffer(magF), true);
+            using var phaseBuf = new OwnedBuffer(backend.AllocateBuffer(phaseF), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexFromPolar(magBuf.Buffer, phaseBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), magnitudes._shape);
+        }
+        catch { return base.NativeComplexFromPolar(magnitudes, phases); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexScale(a, scalar);
+
+        try
+        {
+            int n = a.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var (aR, aI) = DecomposeComplex(a);
+            float scalarF = (float)ops.ToDouble(scalar);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexScale(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, scalarF, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexScale(a, scalar); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexAdd(a, b);
+
+        try
+        {
+            int n = a.Length;
+            var (aR, aI) = DecomposeComplex(a);
+            var (bR, bI) = DecomposeComplex(b);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aR), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aI), true);
+            using var bRBuf = new OwnedBuffer(backend.AllocateBuffer(bR), true);
+            using var bIBuf = new OwnedBuffer(backend.AllocateBuffer(bI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexAdd(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
+                oRBuf.Buffer, oIBuf.Buffer, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), a._shape);
+        }
+        catch { return base.NativeComplexAdd(a, b); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFT(input);
+
+        try
+        {
+            int n = input.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var inputF = new float[n];
+            for (int i = 0; i < n; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+
+            // Use existing GPU FFT which works with split real/imag buffers
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true); // zeros for imaginary
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: false);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
+                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexFFT(input); }
+    }
+
+    public new Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexIFFTReal(input);
+
+        try
+        {
+            int n = input.Length;
+            var (inR, inI) = DecomposeComplex(input);
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(inI), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: true);
+
+            // Extract real part only (IFFT normalization done by GPU kernel)
+            return RecomposeReal<T>(backend.DownloadBuffer(outRBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexIFFTReal(input); }
+    }
+
+    public new Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexIFFT(input);
+
+        try
+        {
+            int n = input.Length;
+            var (inR, inI) = DecomposeComplex(input);
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(inI), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: true);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
+                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexIFFT(input); }
+    }
 }
