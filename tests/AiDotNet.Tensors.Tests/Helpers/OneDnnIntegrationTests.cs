@@ -1,5 +1,4 @@
 using AiDotNet.Tensors.Engines;
-using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -52,20 +51,18 @@ public class OneDnnIntegrationTests
 
         Assert.Equal(new[] { 1, 2, 2, 2 }, result.Shape.ToArray());
         var resultData = result.GetDataArray();
-        var numOps = MathHelper.GetNumericOperations<float>();
-
         // Verify computed mean
         var meanData = mean.GetDataArray();
-        Assert.True(MathF.Abs(numOps.ToDouble(meanData[0]) - 2.5) < 0.01,
+        Assert.True(MathF.Abs(meanData[0] - 2.5f) < 0.01f,
             $"Channel 0 mean should be 2.5, got {meanData[0]}");
-        Assert.True(MathF.Abs(numOps.ToDouble(meanData[1]) - 6.5) < 0.01,
+        Assert.True(MathF.Abs(meanData[1] - 6.5f) < 0.01f,
             $"Channel 1 mean should be 6.5, got {meanData[1]}");
 
         // Verify computed variance
         var varData = variance.GetDataArray();
-        Assert.True(MathF.Abs(numOps.ToDouble(varData[0]) - 1.25) < 0.1,
+        Assert.True(MathF.Abs(varData[0] - 1.25f) < 0.1f,
             $"Channel 0 variance should be ~1.25, got {varData[0]}");
-        Assert.True(MathF.Abs(numOps.ToDouble(varData[1]) - 1.25) < 0.1,
+        Assert.True(MathF.Abs(varData[1] - 1.25f) < 0.1f,
             $"Channel 1 variance should be ~1.25, got {varData[1]}");
 
         // Verify element-level normalization: (x - mean) / sqrt(var + eps) * gamma + beta
