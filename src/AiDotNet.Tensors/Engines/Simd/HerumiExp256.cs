@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.Simd;
 ///   where n = integer exponent, f = fractional index into 256-entry table.
 ///
 /// The 256-entry table makes the remainder range [0, ln2/256) = [0, 0.00271)
-/// so tiny that a 1st-order polynomial (1 + r) suffices for float32 precision.
+/// so tiny that a 2nd-order polynomial (1 + r + 0.5*r^2) suffices for float32 precision.
 ///
 /// Total: clamp + mul + floor + and + shift + gather + FMA + mul + shift = ~9 ops
 /// Accuracy: max relative error ~4.2e-7 (within 2 ULP for float32)
@@ -46,10 +46,6 @@ internal static class HerumiExp256
 
 #if NET5_0_OR_GREATER
     /// <summary>
-    /// 256-entry table exp: 8 floats at a time via vpgatherdd.
-    /// Best on Intel CPUs where gather is fast (4-8 cycles).
-    /// </summary>
-    /// <summary>
     /// Convenience wrapper that pins the table internally. Use ExpArray for bulk work.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -68,8 +64,8 @@ internal static class HerumiExp256
         // Detect out-of-range lanes BEFORE clamping so we can fix them after
         var vMin = Vector256.Create(ClampMin);
         var vMax = Vector256.Create(ClampMax);
-        var underflow = Avx.Compare(x, vMin, FloatComparisonMode.OrderedLessThanSignaling);
-        var overflow = Avx.Compare(x, vMax, FloatComparisonMode.OrderedGreaterThanSignaling);
+        var underflow = Avx.Compare(x, vMin, FloatComparisonMode.OrderedLessThanNonSignaling);
+        var overflow = Avx.Compare(x, vMax, FloatComparisonMode.OrderedGreaterThanNonSignaling);
         var outOfRange = Avx.Or(underflow, overflow);
 
         // Clamp for the polynomial path (safe values for table index and 2^n)

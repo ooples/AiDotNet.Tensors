@@ -74,10 +74,22 @@ public class OneDnnIntegrationTests
         Assert.True(MathF.Abs(resultData[3] - expectedLast) < 0.05f,
             $"Last ch0 element should be ~{expectedLast:F4}, got {resultData[3]}");
 
+        // Verify channel 1 element-level normalization
+        float expectedCh1First = (5f - 6.5f) / MathF.Sqrt(1.25f + 1e-5f);
+        Assert.True(MathF.Abs(resultData[4] - expectedCh1First) < 0.05f,
+            $"Ch1 first element should be ~{expectedCh1First:F4}, got {resultData[4]}");
+
+        float expectedCh1Last = (8f - 6.5f) / MathF.Sqrt(1.25f + 1e-5f);
+        Assert.True(MathF.Abs(resultData[7] - expectedCh1Last) < 0.05f,
+            $"Ch1 last element should be ~{expectedCh1Last:F4}, got {resultData[7]}");
+
         // Verify zero-mean per channel
         float ch0Sum = resultData[0] + resultData[1] + resultData[2] + resultData[3];
+        float ch1Sum = resultData[4] + resultData[5] + resultData[6] + resultData[7];
         Assert.True(MathF.Abs(ch0Sum) < 0.01f,
             $"Channel 0 sum after BN should be ~0, got {ch0Sum}");
+        Assert.True(MathF.Abs(ch1Sum) < 0.01f,
+            $"Channel 1 sum after BN should be ~0, got {ch1Sum}");
     }
 
     [Fact]
