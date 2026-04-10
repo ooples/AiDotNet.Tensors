@@ -12248,6 +12248,42 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Double SIMD fast path for last-axis softmax
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                for (int row = 0; row < outerSize; row++)
+                {
+                    double* rIn = pIn + row * axisSize;
+                    double* rOut = pOut + row * axisSize;
+                    // Find max
+                    double maxVal = double.NegativeInfinity;
+                    for (int j = 0; j < axisSize; j++)
+                        if (rIn[j] > maxVal) maxVal = rIn[j];
+                    // Exp(x - max) and sum
+                    double sumExp = 0;
+                    for (int j = 0; j < axisSize; j++)
+                    {
+                        rOut[j] = Math.Exp(rIn[j] - maxVal);
+                        sumExp += rOut[j];
+                    }
+                    // Normalize
+                    double invSum = 1.0 / sumExp;
+                    for (int j = 0; j < axisSize; j++)
+                        rOut[j] *= invSum;
+                }
+            }
+            DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            return result;
+        }
+
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
