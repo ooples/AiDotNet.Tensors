@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Performance tests measuring gradient tape recording overhead.
 /// These run as xUnit tests (not BenchmarkDotNet) for quick CI validation.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class TapePerformanceTests
 {
     private readonly ITestOutputHelper _output;
