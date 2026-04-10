@@ -1622,6 +1622,33 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_add", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
     public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_cross_spectral", [AsMetal(xR), AsMetal(xI), AsMetal(yR), AsMetal(yI), AsMetal(oR), AsMetal(oI)], n); }
 
-    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) { /* CPU fallback - threshold computed host-side */ throw new NotSupportedException("SplitComplexTopK requires host-side threshold computation. Use CpuEngine."); }
-    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) { throw new NotSupportedException("SoftmaxRows not yet dispatched for this backend."); }
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        if (n <= 0 || k <= 0) return;
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k < n ? magData[k] : 0f;
+            DispatchComplexMetal("split_complex_topk", [AsMetal(inReal), AsMetal(inImag), AsMetal(outReal), AsMetal(outImag)], n, threshold);
+        }
+        finally { magBuf.Dispose(); }
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, "softmax_rows");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(rows);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(input), 0);
+        enc.SetBuffer(AsMetal(output), 1);
+        enc.SetBytes((uint)rows, (ulong)2);
+        enc.SetBytes((uint)cols, (ulong)3);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
 }

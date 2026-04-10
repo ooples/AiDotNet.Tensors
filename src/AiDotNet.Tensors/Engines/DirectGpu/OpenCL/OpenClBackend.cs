@@ -10468,8 +10468,28 @@ KERNEL VARIANTS (A/B testing):
 
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {
-        // TopK requires host-side threshold computation
-        throw new NotSupportedException("SplitComplexTopK requires host-side sorting. Use CpuEngine path.");
+        if (n <= 0 || k <= 0) return;
+        // GPU magnitude + CPU threshold + GPU kernel
+        if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: split_complex_topk");
+        // Compute magnitudes squared on GPU
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k < n ? magData[k] : 0f;
+            int localSize = CalculateOptimalWorkGroupSize1D(n);
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)inImag).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+            kernel.SetArg(4u, threshold);
+            kernel.SetArg(5u, n);
+            kernel.Execute1D(n, localSize);
+        }
+        finally { magBuf.Dispose(); }
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)

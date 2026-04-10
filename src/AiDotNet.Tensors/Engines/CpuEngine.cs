@@ -27347,6 +27347,42 @@ public class CpuEngine : ITensorLevelEngine
                 $"FFT requires input length to be a power of 2, got {n}.", paramName);
     }
 
+    /// <summary>Decompose Complex tensor to split float arrays for SIMD processing.</summary>
+    private static (float[] real, float[] imag) DecomposeToFloat<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = tensor.Length;
+        var real = new float[n];
+        var imag = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = (float)ops.ToDouble(tensor[i].Real);
+            imag[i] = (float)ops.ToDouble(tensor[i].Imaginary);
+        }
+        return (real, imag);
+    }
+
+    /// <summary>Recompose float arrays back to Complex tensor.</summary>
+    private static Tensor<Complex<T>> RecomposeFromFloat<T>(float[] real, float[] imag, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = real.Length;
+        var result = new Tensor<Complex<T>>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(ops.FromDouble(real[i]), ops.FromDouble(imag[i]));
+        return result;
+    }
+
+    /// <summary>Recompose float array to real Tensor.</summary>
+    private static Tensor<T> RecomposeRealFromFloat<T>(float[] data, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = data.Length;
+        var result = new Tensor<T>(shape);
+        for (int i = 0; i < n; i++) result[i] = ops.FromDouble(data[i]);
+        return result;
+    }
+
     /// <summary>
     /// Computes batch count and last-axis size for batched FFT.
     /// For 1D: batch=1, fftSize=length. For multi-D: batch=product of leading dims, fftSize=last dim.
@@ -27623,8 +27659,18 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<Complex<T>>(a._shape);
 
-        for (int i = 0; i < n; i++)
-            result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexConjugate(aR, aI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
+        }
 
         { var ca2 = a; AutoTracer.RecordOp("NativeComplexConjugate", result, eng => eng.NativeComplexConjugate(ca2)); }
         return result;
@@ -27642,11 +27688,21 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<T>(a._shape);
 
-        for (int i = 0; i < n; i++)
+        if (typeof(T) == typeof(float))
         {
-            var reSq = ops.Multiply(a[i].Real, a[i].Real);
-            var imSq = ops.Multiply(a[i].Imaginary, a[i].Imaginary);
-            result[i] = ops.Sqrt(ops.Add(reSq, imSq));
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexMagnitude(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var reSq = ops.Multiply(a[i].Real, a[i].Real);
+                var imSq = ops.Multiply(a[i].Imaginary, a[i].Imaginary);
+                result[i] = ops.Sqrt(ops.Add(reSq, imSq));
+            }
         }
 
         { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitude", result, eng => eng.NativeComplexMagnitude(ca)); }
@@ -27665,10 +27721,20 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<T>(a._shape);
 
-        for (int i = 0; i < n; i++)
-            result[i] = ops.Add(
-                ops.Multiply(a[i].Real, a[i].Real),
-                ops.Multiply(a[i].Imaginary, a[i].Imaginary));
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeSquared(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = ops.Add(
+                    ops.Multiply(a[i].Real, a[i].Real),
+                    ops.Multiply(a[i].Imaginary, a[i].Imaginary));
+        }
 
         { var ca = a; AutoTracer.RecordOp("NativeComplexMagnitudeSquared", result, eng => eng.NativeComplexMagnitudeSquared(ca)); }
         return result;
@@ -27735,10 +27801,20 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<Complex<T>>(a._shape);
 
-        for (int i = 0; i < n; i++)
-            result[i] = new Complex<T>(
-                ops.Multiply(a[i].Real, scalar),
-                ops.Multiply(a[i].Imaginary, scalar));
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexScale(aR, aI, oR, oI, (float)ops.ToDouble(scalar));
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(
+                    ops.Multiply(a[i].Real, scalar),
+                    ops.Multiply(a[i].Imaginary, scalar));
+        }
 
         { var ca2 = a; var cs2 = scalar; AutoTracer.RecordOp("NativeComplexScale", result, eng => eng.NativeComplexScale(ca2, cs2)); }
         return result;
@@ -27759,10 +27835,21 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<Complex<T>>(a._shape);
 
-        for (int i = 0; i < n; i++)
-            result[i] = new Complex<T>(
-                ops.Add(a[i].Real, b[i].Real),
-                ops.Add(a[i].Imaginary, b[i].Imaginary));
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var (bR, bI) = DecomposeToFloat(b);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexAdd(aR, aI, bR, bI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(
+                    ops.Add(a[i].Real, b[i].Real),
+                    ops.Add(a[i].Imaginary, b[i].Imaginary));
+        }
 
         { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexAdd", result, eng => eng.NativeComplexAdd(ca2, cb2)); }
         return result;

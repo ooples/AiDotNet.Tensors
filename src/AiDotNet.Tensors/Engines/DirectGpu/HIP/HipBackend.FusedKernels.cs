@@ -164,6 +164,41 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
 
-    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) { /* CPU fallback - threshold computed host-side */ throw new NotSupportedException("SplitComplexTopK requires host-side threshold computation. Use CpuEngine."); }
-    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) { throw new NotSupportedException("SoftmaxRows not yet dispatched for this backend."); }
+    public unsafe void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        if (n <= 0 || k <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexTopK), inReal, inImag, outReal, outImag);
+        if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: split_complex_topk");
+        // Compute threshold on CPU
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k < n ? magData[k] : 0f;
+            uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
+            void** args = stackalloc void*[6];
+            args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &threshold; args[5] = &n;
+            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        }
+        finally { magBuf.Dispose(); }
+    }
+
+    public unsafe void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: softmax_rows");
+        uint grid = (uint)rows;
+        int blockSize = Math.Min(256, cols);
+        int sharedMem = blockSize * sizeof(float);
+        IntPtr pI = input.Handle, pO = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pI; args[1] = &pO; args[2] = &rows; args[3] = &cols;
+        HipNativeBindings.hipModuleLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
+            (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+    }
 }

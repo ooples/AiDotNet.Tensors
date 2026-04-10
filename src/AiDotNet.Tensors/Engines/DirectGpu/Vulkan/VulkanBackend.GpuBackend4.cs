@@ -1647,15 +1647,45 @@ public sealed unsafe partial class VulkanBackend
 
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {
-        // TopK requires host-side sorting for threshold — fall back to CPU
-        throw new NotSupportedException("SplitComplexTopK requires host-side sorting. Use CpuEngine.");
+        if (n <= 0 || k <= 0) return;
+        // GPU mag computation + CPU threshold + GPU mask
+        var magBuf = AllocateBuffer(n);
+        try
+        {
+            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
+            var magData = DownloadBuffer(magBuf);
+            var rData = DownloadBuffer(inReal);
+            var iData = DownloadBuffer(inImag);
+            Array.Sort(magData); Array.Reverse(magData);
+            float threshold = k < n ? magData[k] : 0f;
+            for (int i = 0; i < n; i++)
+            {
+                float ms = rData[i] * rData[i] + iData[i] * iData[i];
+                if (ms < threshold) { rData[i] = 0; iData[i] = 0; }
+            }
+            var rBuf = AllocateBuffer(rData); var iBuf = AllocateBuffer(iData);
+            try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
+            finally { rBuf.Dispose(); iBuf.Dispose(); }
+        }
+        finally { magBuf.Dispose(); }
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
-        // Per-row softmax via existing GPU ops
         if (rows <= 0 || cols <= 0) return;
-        // Fall back to CPU for now — shared-memory reduction needed for efficient GPU softmax
-        throw new NotSupportedException("SoftmaxRows requires shared-memory reduction. Use CpuEngine.");
+        var data = DownloadBuffer(input);
+        var result = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            float mx = float.MinValue;
+            for (int c = 0; c < cols; c++) mx = Math.Max(mx, data[off + c]);
+            float se = 0;
+            for (int c = 0; c < cols; c++) { result[off + c] = MathF.Exp(data[off + c] - mx); se += result[off + c]; }
+            for (int c = 0; c < cols; c++) result[off + c] /= se;
+        }
+        var rb = AllocateBuffer(result);
+        try { Copy(rb, 0, output, 0, rows * cols); }
+        finally { rb.Dispose(); }
     }
 }
