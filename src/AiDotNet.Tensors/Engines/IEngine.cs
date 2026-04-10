@@ -7436,9 +7436,10 @@ public interface IEngine
     // These operate on Tensor<Complex<T>> directly, avoiding interleaved format conversion overhead.
     // For maximum performance in spectral processing (FFT, filtering, HRE).
     //
-    // GPU acceleration: On GPU paths, Tensor<Complex<T>> (array-of-structs) is automatically
-    // decomposed to split real/imaginary buffers for coalesced GPU memory access, then
-    // recomposed on download. This conversion is transparent to callers.
+    // GPU acceleration: On GPU paths, the DirectGpuTensorEngine decomposes
+    // Tensor<Complex<T>> (array-of-structs) to split real/imaginary GPU buffers
+    // for coalesced memory access, dispatches via IDirectGpuBackend.SplitComplex*
+    // methods, then recomposes on download. CPU path operates on Complex<T> directly.
 
     /// <summary>
     /// Forward 1D FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.

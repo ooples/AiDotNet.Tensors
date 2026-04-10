@@ -27365,7 +27365,7 @@ public class CpuEngine : ITensorLevelEngine
 
         NativeFFTInPlace(data, false, ops, complexOps);
 
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(input._shape);
         for (int i = 0; i < n; i++) result[i] = data[i];
 
         { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
@@ -27390,7 +27390,7 @@ public class CpuEngine : ITensorLevelEngine
         NativeFFTInPlace(data, true, ops, complexOps);
 
         var scale = ops.FromDouble(n);
-        var result = new Tensor<T>([n]);
+        var result = new Tensor<T>(input._shape);
         for (int i = 0; i < n; i++)
             result[i] = ops.Divide(data[i].Real, scale);
 
@@ -27417,7 +27417,7 @@ public class CpuEngine : ITensorLevelEngine
         NativeFFTInPlace(data, true, ops, complexOps);
 
         var scale = ops.FromDouble(n);
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(input._shape);
         for (int i = 0; i < n; i++)
             result[i] = new Complex<T>(
                 ops.Divide(data[i].Real, scale),

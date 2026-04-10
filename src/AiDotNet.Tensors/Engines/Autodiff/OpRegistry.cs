@@ -101,6 +101,11 @@ internal static class OpRegistry
         "TensorConstantPad",
         "TensorCosineSimilarityLoss",
         "TensorUpsampleBilinear",
+
+        // Native Complex<T> differentiable operations
+        "NativeComplexFFT", "NativeComplexIFFT", "NativeComplexIFFTReal",
+        "NativeComplexMultiply", "NativeComplexConjugate",
+        "NativeComplexScale", "NativeComplexAdd",
     };
 
     /// <summary>
@@ -191,6 +196,10 @@ internal static class OpRegistry
 
         // Signal processing (non-differentiable spectral ops)
         "ISTFT", "MelSpectrogram", "GriffinLim",
+
+        // Native Complex<T> operations (non-differentiable extraction ops)
+        "NativeComplexMagnitude", "NativeComplexMagnitudeSquared",
+        "NativeComplexPhase", "NativeComplexFromPolar",
 
         // Rounding (non-differentiable, STE would need explicit annotation)
         "TensorFloor", "TensorCeiling", "TensorRound",
