@@ -31,7 +31,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             finally { AutoTracer.Enabled = wasEnabled; }
         }
 
-        [Theory(Skip = "Performance benchmark — run manually")]
+        [Theory]
         [InlineData(8, 64, 32, 10, 500)]     // Tiny
         [InlineData(32, 128, 64, 10, 500)]    // Small (main benchmark)
         [InlineData(64, 256, 128, 32, 200)]   // Medium
@@ -98,7 +98,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 m, k, h, n, eagerMs, compiledMs, speedupVsEager, phaseBMs, phaseBVsEager);
         }
 
-        [Theory(Skip = "Performance benchmark — run manually")]
+        [Theory]
         [InlineData(100000, 500)]    // 100K elements
         [InlineData(1000000, 200)]   // 1M elements
         public void ElementwiseOps_CompiledVsEager(int size, int iters)
@@ -147,7 +147,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Sigmoid: Eager {0:F4}ms", eagerSigMs);
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void AllActivations_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -185,7 +185,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void AllBinaryOps_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -222,7 +222,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void MatMul_VaryingSizes_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -260,7 +260,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void CNN_Conv2D_ReLU_Pool_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -293,7 +293,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void TransformerBlock_MatMul_Softmax_MatMul_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -328,7 +328,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Theory(Skip = "Performance benchmark — run manually")]
+        [Theory]
         [InlineData("ReLU")]
         [InlineData("Tanh")]
         [InlineData("GELU")]
@@ -381,7 +381,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Theory(Skip = "Performance benchmark — run manually")]
+        [Theory]
         [InlineData(32, 512, 256, 128, 64, 10, 100)]    // Wide MLP
         [InlineData(128, 256, 128, 64, 32, 10, 100)]     // Large batch
         [InlineData(32, 1024, 512, 256, 128, 10, 50)]    // Very deep/wide
@@ -424,7 +424,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 eagerMs, compiledMs, eagerMs / compiledMs);
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void RealisticTraining_MLP_MSELoss_CompiledVsEager()
         {
             var engine = new CpuEngine();

@@ -2245,7 +2245,7 @@ public class CpuEngine : ITensorLevelEngine
             if (subChunks >= 2)
             {
                 int chunkSize = (length + subChunks - 1) / subChunks;
-                chunkSize = (chunkSize + 15) & ~15; // Align to AVX double boundary (4 doubles)
+                chunkSize = (chunkSize + 15) & ~15;
                 IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                 int totalLength = length;
                 Parallel.For(0, subChunks, chunk =>
@@ -4216,6 +4216,18 @@ public class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.ExpUnsafe);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var iMem = AsDoubleMemory(tensor.Data);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            double* pI = (double*)pinI.Pointer;
+            double* pR = (double*)pinR.Pointer;
+            // Try VML first (MKL native), fall back to our SIMD
+            if (!Helpers.VmlProvider.TryExp(pI, pR, length))
+                SimdKernels.ExpUnsafe(pI, pR, length);
         }
         else
         {
@@ -6248,6 +6260,17 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Performs 2D convolution with explicit memory format hint.
+    /// Delegates to the standard Conv2D which handles autodiff, GraphMode, tracing,
+    /// and internal kernel dispatch (OneDNN, NHWC im2col, or generic).
+    /// The format hint may be used by future optimizations.
+    /// </summary>
+    public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation, MemoryFormat format)
+    {
+        return Conv2D(input, kernel, stride, padding, dilation);
+    }
+
+    /// <summary>
     /// Performs 2D convolution, storing result in pre-allocated output tensor. Zero allocation.
     /// </summary>
     /// <param name="output">Pre-allocated output tensor with correct shape [batch, out_channels, output_height, output_width].</param>
@@ -6851,6 +6874,17 @@ public class CpuEngine : ITensorLevelEngine
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(tensor.Data);
+            var dstMem = AsDoubleMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+            if (!Helpers.VmlProvider.TryTanh(pSrc, pDst, tensor.Length))
+                SimdKernels.TanhUnsafe(pSrc, pDst, tensor.Length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -6965,27 +6999,8 @@ public class CpuEngine : ITensorLevelEngine
                 return result;
             }
 
-            // SIMD fallback
-            int fallbackChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
-            if (fallbackChunks >= 2)
-            {
-                int chunkSize = (length + fallbackChunks - 1) / fallbackChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, fallbackChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.SigmoidUnsafe(pSrc + start, pDst + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
-            }
+            // SIMD fallback — direct call (Padé [3,3] fused sigmoid)
+            SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
@@ -7376,27 +7391,7 @@ public class CpuEngine : ITensorLevelEngine
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
-            // Bandwidth-bound: parallel only helps above ~2M elements
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
-            if (numChunks >= 2)
-            {
-                int chunkSize = (length + numChunks - 1) / numChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, numChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.ReLUUnsafe(p + start, p + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.ReLUUnsafe(p, p, length);
-            }
+            SimdKernels.ReLUUnsafe(p, p, length);
             return;
         }
 
@@ -7523,6 +7518,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(tensor.Data);
+            var dstMem = AsDoubleMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
         }
         else
         {
@@ -12211,6 +12214,42 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Double SIMD fast path for last-axis softmax
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                for (int row = 0; row < outerSize; row++)
+                {
+                    double* rIn = pIn + row * axisSize;
+                    double* rOut = pOut + row * axisSize;
+                    // Find max
+                    double maxVal = double.NegativeInfinity;
+                    for (int j = 0; j < axisSize; j++)
+                        if (rIn[j] > maxVal) maxVal = rIn[j];
+                    // Exp(x - max) and sum
+                    double sumExp = 0;
+                    for (int j = 0; j < axisSize; j++)
+                    {
+                        rOut[j] = Math.Exp(rIn[j] - maxVal);
+                        sumExp += rOut[j];
+                    }
+                    // Normalize
+                    double invSum = 1.0 / sumExp;
+                    for (int j = 0; j < axisSize; j++)
+                        rOut[j] *= invSum;
+                }
+            }
+            DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            return result;
+        }
+
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
@@ -16556,6 +16595,61 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
+        // GraphMode: record lazy node for compiled plan
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Compute output shape
+                var effectiveAxes = axes ?? Enumerable.Range(0, input.Rank).ToArray();
+                var normAxes = new HashSet<int>(effectiveAxes.Select(a => a < 0 ? input.Rank + a : a));
+                var outShapeList = new List<int>();
+                for (int d = 0; d < input.Rank; d++)
+                {
+                    if (normAxes.Contains(d)) { if (keepDims) outShapeList.Add(1); }
+                    else outShapeList.Add(input._shape[d]);
+                }
+                var outShape = outShapeList.Count > 0 ? outShapeList.ToArray() : new[] { 1 };
+
+                var capturedInput = input;
+                var capturedAxes = axes;
+                bool capturedKeepDims = keepDims;
+                // For backward, we need maxIndices. Compute via the execute delegate
+                // at replay time (avoids recursive call during GraphMode recording).
+                maxIndices = Array.Empty<int>();
+                var capturedEffectiveAxes = effectiveAxes.ToArray();
+                // savedState[0] will be populated with maxIndices at execute time.
+                // The execute delegate must bypass GraphMode to avoid infinite recursion.
+                var savedStateArr = new object[] { Array.Empty<int>() };
+                var capturedSelf = this;
+                return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
+                    (eng, output) =>
+                    {
+                        // Call ReduceMax on captured 'this' after GraphMode check has already
+                        // been handled — the lazy node's execute runs outside scope.Current.
+                        // Use the eager path by materializing input first.
+                        var materializedInput = capturedInput.IsContiguous ? capturedInput : capturedInput.Contiguous();
+                        var numOps = MathHelper.GetNumericOperations<T>();
+                        var inputData = materializedInput.GetFlattenedData();
+                        T maxVal = inputData[0];
+                        int maxIdx = 0;
+                        for (int k = 1; k < inputData.Length; k++)
+                        {
+                            if (numOps.ToDouble(inputData[k]) > numOps.ToDouble(maxVal))
+                            {
+                                maxVal = inputData[k];
+                                maxIdx = k;
+                            }
+                        }
+                        output.GetDataArray()[0] = maxVal;
+                        savedStateArr[0] = new[] { maxIdx };
+                    },
+                    BackwardFunctions<T>.ReduceMaxBackward,
+                    savedStateArr);
+            }
+        }
+
         // Stride-aware single-axis max
         if (!input.IsContiguous && axes.Length == 1)
         {
@@ -16743,8 +16837,16 @@ public class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("ReduceMean", earlyResult, eng => earlyResult);
             return earlyResult;
         }
-        // Fast path: reduce all axes (axes == null) — just sum/count
-        if ((axes == null || axes.Length == 0) && input.IsContiguous)
+        // Fast path: reduce all axes — just sum/count
+        // Also catches 1D tensors with axes=[0] since that's equivalent to full reduction
+        bool isFullReduction = axes == null || axes.Length == 0;
+        if (!isFullReduction && input.IsContiguous && axes is not null)
+        {
+            var axisSet = new HashSet<int>();
+            foreach (int a in axes) axisSet.Add(a < 0 ? input.Rank + a : a);
+            isFullReduction = axisSet.Count == input.Rank;
+        }
+        if (isFullReduction && input.IsContiguous)
         {
             if (typeof(T) == typeof(float))
             {
@@ -20355,7 +20457,16 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (tensor.Rank != 3) throw new ArgumentException("TensorSliceAxis currently only supports 3D tensors.");
+        if (tensor.Rank < 1) throw new ArgumentException("Cannot slice a scalar tensor.", nameof(tensor));
+        if (axis < 0 || axis >= tensor.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {tensor.Rank}.");
+        if (index < 0 || index >= tensor._shape[axis])
+            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {tensor._shape[axis]}.");
+
+        // Output shape: original shape with shape[axis] removed
+        var outShape = new int[tensor.Rank - 1];
+        for (int d = 0, j = 0; d < tensor.Rank; d++)
+            if (d != axis) outShape[j++] = tensor._shape[d];
 
         if (GraphMode.IsActive)
         {
@@ -20364,11 +20475,6 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 int capAxis = axis, capIndex = index;
-                // Output shape: remove the sliced axis dimension
-                var outShape = new int[2];
-                int idx = 0;
-                for (int d = 0; d < 3; d++)
-                    if (d != axis) outShape[idx++] = tensor._shape[d];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSliceAxis", tensor, outShape,
                     (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
@@ -20377,51 +20483,47 @@ public class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSliceAxis", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        int dim0 = tensor._shape[0];
-        int dim1 = tensor._shape[1];
-        int dim2 = tensor._shape[2];
+        // Save original for autodiff — Contiguous() creates a clone for non-contiguous views
+        var originalTensor = tensor;
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var tensorData = tensor.GetDataArray();
 
-        Tensor<T> result;
-        var tensorData = tensor.GetFlattenedData();
+        // Generic N-D slice: select index along axis, producing rank-1 output.
+        // stride = product(shape[axis+1:]) — contiguous elements per index along axis
+        // outerCount = product(shape[:axis]) — number of outer blocks
+        int stride = 1;
+        for (int d = axis + 1; d < tensor.Rank; d++)
+            stride *= tensor._shape[d];
 
-        switch (axis)
+        int outerCount = 1;
+        for (int d = 0; d < axis; d++)
+            outerCount *= tensor._shape[d];
+
+        int axisSize = tensor._shape[axis];
+
+        var result = TensorAllocator.Rent<T>(outShape);
+        var resultData = result.GetDataArray();
+
+        if (outerCount > 64)
         {
-            case 0:
-                // Slice along first axis: result[j,k] = tensor[index, j, k]
-                result = TensorAllocator.Rent<T>([dim1, dim2]);
-                // tensor flat: index * dim1 * dim2 + j * dim2 + k => contiguous block
-                Array.Copy(tensorData, index * dim1 * dim2, result.GetDataArray(), 0, dim1 * dim2);
-                break;
-
-            case 1:
-                // Slice along second axis: result[i,k] = tensor[i, index, k]
-                result = TensorAllocator.Rent<T>([dim0, dim2]);
-                var resultData1 = result.GetDataArray();
-                Parallel.For(0, dim0, i =>
-                {
-                    int srcOffset = i * dim1 * dim2 + index * dim2;
-                    Array.Copy(tensorData, srcOffset, resultData1, i * dim2, dim2);
-                });
-                break;
-
-            case 2:
-                // Slice along third axis: result[i,j] = tensor[i, j, index]
-                result = TensorAllocator.Rent<T>([dim0, dim1]);
-                var resultData2 = result.GetDataArray();
-                Parallel.For(0, dim0, i =>
-                {
-                    for (int j = 0; j < dim1; j++)
-                    {
-                        resultData2[i * dim1 + j] = tensorData[i * dim1 * dim2 + j * dim2 + index];
-                    }
-                });
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException(nameof(axis), "Axis must be 0, 1, or 2 for 3D tensors.");
+            Parallel.For(0, outerCount, outer =>
+            {
+                int srcOffset = outer * axisSize * stride + index * stride;
+                int dstOffset = outer * stride;
+                Array.Copy(tensorData, srcOffset, resultData, dstOffset, stride);
+            });
+        }
+        else
+        {
+            for (int outer = 0; outer < outerCount; outer++)
+            {
+                int srcOffset = outer * axisSize * stride + index * stride;
+                int dstOffset = outer * stride;
+                Array.Copy(tensorData, srcOffset, resultData, dstOffset, stride);
+            }
         }
 
-        DifferentiableOps.RecordUnary("TensorSliceAxis", result, tensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
+        DifferentiableOps.RecordUnary("TensorSliceAxis", result, originalTensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
         AutoTracer.RecordOp("TensorSliceAxis", result, eng => result);
         return result;
     }
@@ -20524,54 +20626,46 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        if (axis < 0 || axis >= destination.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
+        if (index < 0 || index >= destination._shape[axis])
+            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
 
-        // For 3D tensors
-        if (destination.Rank == 3)
+        if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var dstData = destination.GetDataArray();
+        var srcData = source.GetDataArray();
+
+        // Generic N-D set-slice: write source into destination at [... , index, ...] along axis.
+        // Same stride/outerCount algorithm as TensorSliceAxis but reversed (src→dst).
+        int stride = 1;
+        for (int d = axis + 1; d < destination.Rank; d++)
+            stride *= destination._shape[d];
+
+        int outerCount = 1;
+        for (int d = 0; d < axis; d++)
+            outerCount *= destination._shape[d];
+
+        int axisSize = destination._shape[axis];
+
+        if (outerCount > 64)
         {
-            int dim0 = destination._shape[0];
-            int dim1 = destination._shape[1];
-            int dim2 = destination._shape[2];
-
-            switch (axis)
+            Parallel.For(0, outerCount, outer =>
             {
-                case 0:
-                    // Set destination[index, :, :] = source
-                    Parallel.For(0, dim1, j =>
-                    {
-                        for (int k = 0; k < dim2; k++)
-                        {
-                            destination[index, j, k] = source[j, k];
-                        }
-                    });
-                    break;
-
-                case 1:
-                    Parallel.For(0, dim0, i =>
-                    {
-                        for (int k = 0; k < dim2; k++)
-                        {
-                            destination[i, index, k] = source[i, k];
-                        }
-                    });
-                    break;
-
-                case 2:
-                    Parallel.For(0, dim0, i =>
-                    {
-                        for (int j = 0; j < dim1; j++)
-                        {
-                            destination[i, j, index] = source[i, j];
-                        }
-                    });
-                    break;
-
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(axis));
-            }
+                int dstOffset = outer * axisSize * stride + index * stride;
+                int srcOffset = outer * stride;
+                Array.Copy(srcData, srcOffset, dstData, dstOffset, stride);
+            });
         }
         else
         {
-            throw new NotSupportedException("TensorSetSliceAxis currently only supports 3D tensors.");
+            for (int outer = 0; outer < outerCount; outer++)
+            {
+                int dstOffset = outer * axisSize * stride + index * stride;
+                int srcOffset = outer * stride;
+                Array.Copy(srcData, srcOffset, dstData, dstOffset, stride);
+            }
         }
     }
 
@@ -25086,29 +25180,25 @@ public class CpuEngine : ITensorLevelEngine
 
     private static unsafe void ParallelComputeBound(float* input, float* output, int length, UnsafeUnaryKernel kernel)
     {
-        // For compute-bound ops, parallelize at 256K+ elements
-        const int parallelThreshold = 256 * 1024;
-        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-        int chunks = Math.Min(maxThreads, Math.Max(1, length / parallelThreshold));
-
-        if (chunks >= 2)
+        // Use PersistentParallelExecutor for near-zero dispatch overhead
+        // (pre-spawned threads, ManualResetEventSlim) vs Parallel.For (~50us per call)
+        const int parallelThreshold = 262144; // 1MB
+        if (length >= parallelThreshold)
         {
-            int chunkSize = (length + chunks - 1) / chunks;
-            chunkSize = (chunkSize + 31) & ~31; // Align to AVX boundary
+            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
+            int chunkSize = (length + nChunks - 1) / nChunks;
+            chunkSize = (chunkSize + 31) & ~31;
 
-            // Can't capture float* in lambda — use IntPtr
             IntPtr pIn = (IntPtr)input;
             IntPtr pOut = (IntPtr)output;
             int totalLength = length;
 
-            Parallel.For(0, chunks, chunk =>
+            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, totalLength - start);
                 if (count > 0)
-                {
                     kernel((float*)pIn + start, (float*)pOut + start, count);
-                }
             });
         }
         else

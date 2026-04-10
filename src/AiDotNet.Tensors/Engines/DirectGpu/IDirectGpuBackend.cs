@@ -2900,6 +2900,16 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int aInnerSize, int bInnerSize);
     void SliceLastAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int inputInnerSize, int start, int sliceSize);
     void SetSliceLastAxis(IGpuBuffer output, IGpuBuffer values, int outerSize, int outputInnerSize, int start, int sliceSize);
+
+    /// <summary>
+    /// Slices a tensor along any axis by selecting a single index.
+    /// </summary>
+    void SliceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int stride, int index);
+
+    /// <summary>
+    /// Sets a slice of a tensor along any axis. Inverse of SliceAxis.
+    /// </summary>
+    void SetSliceAxis(IGpuBuffer output, IGpuBuffer values, int outerSize, int axisSize, int stride, int index);
     void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
     void Pad2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW, int padTop, int padLeft, float padValue);
     void Pad2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int padTop, int padLeft);

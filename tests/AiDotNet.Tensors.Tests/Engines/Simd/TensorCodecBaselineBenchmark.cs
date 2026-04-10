@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
     /// Complete A/B test matrix: every approach measured on the SAME workload.
     /// Every new phase must add its row to this benchmark.
     /// </summary>
+    [Trait("Category", "Benchmark")]
     public class TensorCodecBaselineBenchmark
     {
         private readonly ITestOutputHelper _output;
@@ -60,7 +61,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             return sw.Elapsed.TotalMilliseconds / iters;
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void FullMatrix_AllApproaches_MLP_Training()
         {
             var engine = new CpuEngine();
@@ -170,7 +171,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("================================================================");
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void FullMatrix_AllApproaches_Inference_SingleMatMul()
         {
             int m = 32, k = 128, n = 64;

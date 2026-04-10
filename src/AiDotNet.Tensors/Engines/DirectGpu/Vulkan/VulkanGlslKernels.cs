@@ -503,6 +503,36 @@ void main() {
     b[idx] = a[(idx / sliceSize) * inputInnerSize + start + (idx % sliceSize)];
 }";
 
+    /// <summary>
+    /// General axis slice: out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
+    /// Works for any axis, not just the last one.
+    /// </summary>
+    public static string SliceAxisGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint axisSize; uint stride; uint index; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * stride;
+    if (idx >= total) return;
+    uint outer = idx / stride;
+    uint s = idx % stride;
+    b[idx] = a[outer * axisSize * stride + index * stride + s];
+}";
+
+    /// <summary>
+    /// General axis set-slice: out[outer * axisSize * stride + index * stride + s] = in[outer * stride + s]
+    /// Inverse of SliceAxisGlsl.
+    /// </summary>
+    public static string SetSliceAxisGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint axisSize; uint stride; uint index; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * stride;
+    if (idx >= total) return;
+    uint outer = idx / stride;
+    uint s = idx % stride;
+    b[outer * axisSize * stride + index * stride + s] = a[idx];
+}";
+
     public static string Pad2DGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint outH; uint outW; uint padTop; uint padLeft; };
 void main() {

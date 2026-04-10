@@ -289,18 +289,66 @@ internal static class VmlProvider
                 }
             }
 
-            // Try loading from the MKL.NET package's native directory
+            // Try loading from the MKL.NET package's managed DLL directory
             var mklDir = Path.GetDirectoryName(typeof(MKLNET.Blas).Assembly.Location);
             if (mklDir != null)
             {
-                foreach (var dllPath in Directory.GetFiles(mklDir, "mkl_rt*"))
+                // Search managed DLL directory and runtimes/win-x64/native/ subdirectory
+                var searchDirs = new List<string> { mklDir };
+                // Search the app's base directory (test host copies natives here)
+                var appBase = AppContext.BaseDirectory;
+                if (!string.IsNullOrEmpty(appBase))
                 {
-                    if (NativeLibrary.TryLoad(dllPath, out var handle))
+                    searchDirs.Add(appBase);
+                    var appRuntimeNative = Path.Combine(appBase, "runtimes", "win-x64", "native");
+                    if (Directory.Exists(appRuntimeNative))
+                        searchDirs.Add(appRuntimeNative);
+                }
+                // NuGet packages store native DLLs in runtimes/<rid>/native/
+                var runtimeNative = Path.Combine(mklDir, "..", "..", "runtimes", "win-x64", "native");
+                if (Directory.Exists(runtimeNative))
+                    searchDirs.Add(Path.GetFullPath(runtimeNative));
+                // Also search NuGet cache directly
+                var nugetCache = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".nuget", "packages", "mkl.net.win-x64");
+                if (Directory.Exists(nugetCache))
+                {
+                    foreach (var versionDir in Directory.GetDirectories(nugetCache))
                     {
-                        if (TryLoadSymbols(handle))
-                            return true;
-                        NativeLibrary.Free(handle);
+                        var nativeDir = Path.Combine(versionDir, "runtimes", "win-x64", "native");
+                        if (Directory.Exists(nativeDir))
+                            searchDirs.Add(nativeDir);
                     }
+                }
+
+                foreach (var dir in searchDirs)
+                {
+                    try
+                    {
+                        foreach (var dllPath in Directory.GetFiles(dir, "mkl_rt*"))
+                        {
+                            // Add native directory to PATH so mkl_rt can find dependencies
+                            var nativeDir = Path.GetDirectoryName(dllPath);
+                            if (nativeDir != null)
+                            {
+                                // Add to PATH so dependent DLLs can be found.
+                                // Uses OS-appropriate separator.
+                                var pathSep = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                                    System.Runtime.InteropServices.OSPlatform.Windows) ? ";" : ":";
+                                var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+                                if (!path.Contains(nativeDir))
+                                    Environment.SetEnvironmentVariable("PATH", nativeDir + pathSep + path);
+                            }
+                            if (NativeLibrary.TryLoad(dllPath, out var handle))
+                            {
+                                if (TryLoadSymbols(handle))
+                                    return true;
+                                NativeLibrary.Free(handle);
+                            }
+                        }
+                    }
+                    catch { /* directory access error */ }
                 }
             }
         }

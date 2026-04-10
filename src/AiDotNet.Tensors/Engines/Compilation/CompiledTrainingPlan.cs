@@ -560,6 +560,75 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Concat forward: direct Buffer.BlockCopy for axis=0 contiguous tensors
+        if ((step.OpName == "Concatenate" || step.OpName == "Concat")
+            && step.Inputs.Length >= 2 && typeof(T) == typeof(float))
+        {
+            // Check all inputs are contiguous
+            bool allContiguous = true;
+            for (int j = 0; j < step.Inputs.Length; j++)
+                if (!step.Inputs[j].IsContiguous) { allContiguous = false; break; }
+
+            if (allContiguous)
+            {
+                // Check if axis=0 (SavedState[0] should be the axis)
+                int axis = 0;
+                if (step.SavedState is { Length: > 0 } && step.SavedState[0] is int a)
+                    axis = a;
+
+                if (axis == 0)
+                {
+                    // Pre-pin all input arrays + output array
+                    var inputArrays = new float[step.Inputs.Length][];
+                    var inputLengths = new int[step.Inputs.Length];
+                    for (int j = 0; j < step.Inputs.Length; j++)
+                    {
+                        inputArrays[j] = (float[])(object)step.Inputs[j].GetDataArray();
+                        inputLengths[j] = step.Inputs[j].Length;
+                    }
+                    var outArr = (float[])(object)step.OutputBuffer.GetDataArray();
+                    var capturedInputArrays = inputArrays;
+                    var capturedLengths = inputLengths;
+
+                    return eng =>
+                    {
+                        int offset = 0;
+                        for (int j = 0; j < capturedInputArrays.Length; j++)
+                        {
+                            Buffer.BlockCopy(capturedInputArrays[j], 0, outArr, offset * 4, capturedLengths[j] * 4);
+                            offset += capturedLengths[j];
+                        }
+                    };
+                }
+            }
+        }
+
+        // ReduceMax forward: pinned SIMD for single-output max
+        if (step.OpName == "ReduceMax" && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1 && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            int len = input.Length;
+            float[]? cOut = null;
+
+            return eng =>
+            {
+                cOut ??= (float[])(object)output.GetDataArray();
+                unsafe
+                {
+                    float* p = (float*)inH.AddrOfPinnedObject();
+                    if (len == 0) { cOut[0] = float.MinValue; return; }
+                    float maxVal = p[0];
+                    for (int j = 1; j < len; j++)
+                        if (p[j] > maxVal) maxVal = p[j];
+                    cOut[0] = maxVal;
+                }
+            };
+        }
+
         // TensorAdd forward: pinned SIMD VectorAddUnsafe
         if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
@@ -677,7 +746,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Sigmoid forward: pinned SigmoidUnsafe — bypass EnsureMaterialized
+        // Sigmoid forward: direct Padé [3,3] — bypass SigmoidUnsafe dispatch overhead
         if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -689,7 +758,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int len = inp.Length;
             return eng =>
             {
-                unsafe { SimdKernels.SigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+                unsafe { PadeSigmoid.SigmoidArray((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
         // Sigmoid non-float fallback
@@ -715,7 +784,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     float* pIn = (float*)inHandle.AddrOfPinnedObject();
                     float* pOut = (float*)outHandle.AddrOfPinnedObject();
-                    SimdKernels.GELUUnsafe(pIn, pOut, len);
+                    SimdKernels.FusedGELUUnsafe(pIn, pOut, len);
                 }
             };
         }
@@ -925,9 +994,89 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // BatchNorm/LayerNorm: don't specialize — the generic execute delegate
-        // (from the lazy node) already handles these correctly. Specializing adds
-        // an extra allocate+copy on top of what the generic path already does.
+        // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
+        // Lazy node records: Inputs = [input, gamma, beta], SavedState = [mean, variance, epsilon]
+        if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
+            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
+            && step.SavedState is { Length: >= 2 }
+            && step.SavedState[0] is Tensor<T> meanTensor
+            && step.SavedState[1] is Tensor<T> varTensor)
+        {
+            var input = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var mean = meanTensor;
+            var variance = varTensor;
+            var output = step.OutputBuffer;
+            int channels = gamma.Length;
+            float eps = 1e-5f;
+            if (step.SavedState.Length >= 3 && step.SavedState[2] is double epsD)
+                eps = (float)epsD;
+
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
+            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
+            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
+            var meanH = PinAndTrack(((Tensor<float>)(object)mean).GetDataArray(), handleTracker);
+            var varH = PinAndTrack(((Tensor<float>)(object)variance).GetDataArray(), handleTracker);
+            int length = input.Length;
+            float capturedEps = eps;
+
+            return eng =>
+            {
+                unsafe
+                {
+                    Simd.FusedKernels.BatchNormInferenceUnsafe(
+                        (float*)inH.AddrOfPinnedObject(),
+                        (float*)outH.AddrOfPinnedObject(),
+                        length, channels,
+                        (float*)gammaH.AddrOfPinnedObject(),
+                        (float*)betaH.AddrOfPinnedObject(),
+                        (float*)meanH.AddrOfPinnedObject(),
+                        (float*)varH.AddrOfPinnedObject(),
+                        capturedEps);
+                }
+            };
+        }
+
+        // LayerNorm: use FusedKernels.LayerNormUnsafe for direct SIMD
+        if (step.OpType == OpType.LayerNorm && typeof(T) == typeof(float)
+            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var output = step.OutputBuffer;
+            int normSize = gamma.Length;
+            float eps = 1e-5f;
+            if (step.SavedState is { Length: > 0 } && step.SavedState[0] is double epsD)
+                eps = (float)epsD;
+
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
+            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
+            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
+            int batchSize = input.Length / normSize;
+            float capturedEps = eps;
+
+            return eng =>
+            {
+                unsafe
+                {
+                    // LayerNorm per batch element
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    float* pG = (float*)gammaH.AddrOfPinnedObject();
+                    float* pB = (float*)betaH.AddrOfPinnedObject();
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        Simd.FusedKernels.LayerNormUnsafe(
+                            pIn + b * normSize, pG, pB,
+                            pOut + b * normSize, normSize, capturedEps);
+                    }
+                }
+            };
+        }
 
         // TensorDivide forward: pinned SIMD VectorDivideUnsafe
         if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
@@ -976,31 +1125,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     float* pIn = (float*)inH.AddrOfPinnedObject();
                     float* pOut = (float*)outH.AddrOfPinnedObject();
                     for (int r = 0; r < rows; r++)
-                    {
-                        float* rowIn = pIn + r * cols;
-                        float* rowOut = pOut + r * cols;
-                        // Find max
-                        float maxVal = rowIn[0];
-                        for (int c = 1; c < cols; c++)
-                            if (rowIn[c] > maxVal) maxVal = rowIn[c];
-                        // Compute shifted values into output, then exp in-place
-                        for (int c = 0; c < cols; c++)
-                            rowOut[c] = rowIn[c] - maxVal;
-                        // Vectorized exp: try VML first, then SIMD fallback
-                        if (!Helpers.VmlProvider.TryExp(rowOut, rowOut, cols))
-                            SimdKernels.ExpUnsafe(rowOut, rowOut, cols);
-                        // Sum + log
-                        float sumExp = SimdKernels.SumUnsafe(rowOut, cols);
-                        float logSumExp = MathF.Log(sumExp);
-                        // Final: log_softmax = shifted - log(sumExp)
-                        for (int c = 0; c < cols; c++)
-                            rowOut[c] = (rowIn[c] - maxVal) - logSumExp;
-                    }
+                        SimdKernels.FusedLogSoftmaxRow(pIn + r * cols, pOut + r * cols, cols);
                 }
             };
         }
 
-        // Mean forward: pinned SumUnsafe + divide, zero allocation
+        // Mean forward: pinned SumUnsafe + divide
+        // A/B tested: Parallel.For overhead (0.43ms) exceeds single-thread (0.16ms) for 1M.
+        // PyTorch likely uses SIMD sum with wider parallelism (internal thread pool).
         if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -1016,6 +1148,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     float* pIn = (float*)inHandle.AddrOfPinnedObject();
                     cOut[0] = SimdKernels.SumUnsafe(pIn, len) / len;
                 }
+            };
+        }
+
+        // Exp forward: pinned ExpUnsafe SIMD
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ExpUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 

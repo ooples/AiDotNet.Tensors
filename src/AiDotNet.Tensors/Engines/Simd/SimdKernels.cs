@@ -357,12 +357,18 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // Note: VML TrySigmoid (negate+exp+reciprocal) is SLOWER than polynomial
-            // FastSigmoid256 for float due to the 3-pass overhead. Keep polynomial path.
+            // CPU-adaptive dispatch:
+            // Intel (fast gather): use table-driven sigmoid (no exp, no divide)
+            // AMD (slow gather): use polynomial FastSigmoid256 (exp + divide)
+            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                TableDrivenSigmoid.SigmoidArray(input, output, length);
+                return;
+            }
 
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                // 4x unrolled FastSigmoid256: consistent approximation across all SIMD paths
+                // 4x unrolled FastSigmoid256: optimal for AMD Zen (polynomial path)
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
@@ -992,7 +998,27 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
+            {
+                var three = Vector256.Create(3.0f);
+                var zero = Vector256<float>.Zero;
+                var six = Vector256.Create(6.0f);
+                var inv6 = Vector256.Create(1.0f / 6.0f);
+                // 4x unrolled for better ILP
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var x1 = Avx.LoadVector256(input + i + 8);
+                    var x2 = Avx.LoadVector256(input + i + 16);
+                    var x3 = Avx.LoadVector256(input + i + 24);
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x0, Avx.Min(Avx.Max(Avx.Add(x0, three), zero), six)), inv6));
+                    Avx.Store(output + i + 8, Avx.Multiply(Avx.Multiply(x1, Avx.Min(Avx.Max(Avx.Add(x1, three), zero), six)), inv6));
+                    Avx.Store(output + i + 16, Avx.Multiply(Avx.Multiply(x2, Avx.Min(Avx.Max(Avx.Add(x2, three), zero), six)), inv6));
+                    Avx.Store(output + i + 24, Avx.Multiply(Avx.Multiply(x3, Avx.Min(Avx.Max(Avx.Add(x3, three), zero), six)), inv6));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
             {
                 var three = Vector256.Create(3.0f);
                 var zero = Vector256<float>.Zero;
@@ -1002,8 +1028,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 8)
                 {
                     var x = Avx.LoadVector256(input + i);
-                    var clip = Avx.Min(Avx.Max(Avx.Add(x, three), zero), six);
-                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, clip), inv6));
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, Avx.Min(Avx.Max(Avx.Add(x, three), zero), six)), inv6));
                 }
             }
 #endif
@@ -1334,45 +1359,76 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Unsafe pointer-based sum with 4-way accumulation. Eliminates Span bounds-checking.
+        /// Unsafe pointer-based sum with 8-way accumulation for maximum memory pipeline utilization.
+        /// 8 independent accumulators keep the CPU's out-of-order execution engine fully fed
+        /// while waiting for memory, hiding latency better than 4-way for large arrays.
+        /// No software prefetch — Zen 2/3+ hardware prefetcher handles sequential patterns optimally.
         /// </summary>
+        // Pre-allocated partial sums buffer to avoid per-call allocation in SumUnsafe
+        [ThreadStatic] private static float[]? _sumPartials;
+
         [MethodImpl(HotInline)]
         public static unsafe float SumUnsafe(float* data, int length)
+        {
+            // For large arrays, use PersistentParallelExecutor to saturate memory bandwidth
+            // across all CPU cores — matching PyTorch's OpenMP approach with near-zero
+            // dispatch overhead (pre-spawned threads, spin-wait barrier).
+            if (length >= 262144) // 1MB threshold
+            {
+                var executor = Helpers.PersistentParallelExecutor.Instance;
+                int nChunks = Math.Min(Environment.ProcessorCount, 16);
+                int chunkSize = length / nChunks;
+                var partials = _sumPartials;
+                if (partials == null || partials.Length < nChunks)
+                    _sumPartials = partials = new float[nChunks];
+                var capturedData = data;
+                executor.Execute(nChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = (chunk == nChunks - 1) ? length - start : chunkSize;
+                    if (count > 0) partials[chunk] = SumUnsafeCore(capturedData + start, count);
+                });
+                float total = 0f;
+                for (int c = 0; c < nChunks; c++) total += partials[c];
+                return total;
+            }
+            return SumUnsafeCore(data, length);
+        }
+
+        /// <summary>
+        /// Core single-threaded SIMD sum with 8-way accumulation.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static unsafe float SumUnsafeCore(float* data, int length)
         {
             int i = 0;
             float sum = 0f;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+            if (Avx.IsSupported && length >= 64)
             {
                 var vsum0 = Vector256<float>.Zero;
                 var vsum1 = Vector256<float>.Zero;
                 var vsum2 = Vector256<float>.Zero;
                 var vsum3 = Vector256<float>.Zero;
-                int simdLength = length & ~31;
-                if (Sse.IsSupported && length >= 131072)
+                var vsum4 = Vector256<float>.Zero;
+                var vsum5 = Vector256<float>.Zero;
+                var vsum6 = Vector256<float>.Zero;
+                var vsum7 = Vector256<float>.Zero;
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
                 {
-                    const int prefetchDistance = 256;
-                    for (; i < simdLength; i += 32)
-                    {
-                        if (i + prefetchDistance < length)
-                            Sse.Prefetch0(data + i + prefetchDistance);
-                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
-                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
-                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
-                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
-                    }
-                }
-                else
-                {
-                    for (; i < simdLength; i += 32)
-                    {
-                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
-                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
-                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
-                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
-                    }
+                    vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
+                    vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
+                    vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
+                    vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                    vsum4 = Avx.Add(vsum4, Avx.LoadVector256(data + i + 32));
+                    vsum5 = Avx.Add(vsum5, Avx.LoadVector256(data + i + 40));
+                    vsum6 = Avx.Add(vsum6, Avx.LoadVector256(data + i + 48));
+                    vsum7 = Avx.Add(vsum7, Avx.LoadVector256(data + i + 56));
                 }
                 vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                vsum4 = Avx.Add(Avx.Add(vsum4, vsum5), Avx.Add(vsum6, vsum7));
+                vsum0 = Avx.Add(vsum0, vsum4);
                 sum += HorizontalSum(vsum0);
             }
             if (Avx.IsSupported && length - i >= 8)
@@ -2473,22 +2529,30 @@ namespace AiDotNet.Tensors.Engines.Simd
             var r = Fma.MultiplyAddNegated(n, ln2hi, x);
             r = Fma.MultiplyAddNegated(n, ln2lo, r);
 
-            // Polynomial: exp(r) = 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720
-            // Horner's form: ((((c6*r + c5)*r + c4)*r + c3)*r + c2)*r + c1)*r + c0
-            var c0 = Vector256.Create(1.0f);
-            var c1 = Vector256.Create(1.0f);
+            // Polynomial: exp(r) ≈ c0 + c1*r + c2*r² + c3*r³ + c4*r⁴ + c5*r⁵ + c6*r⁶
+            // Estrin's scheme: group into pairs evaluated in parallel,
+            // reducing serial chain from 6 FMAs to 4.
+            // P(r) = (c0 + c1*r) + (c2 + c3*r)*r² + (c4 + c5*r)*r⁴ + c6*r⁶
+            var r2 = Avx.Multiply(r, r);  // r²
+
             var c2 = Vector256.Create(0.5f);
             var c3 = Vector256.Create(0.166666666666f);  // 1/6
             var c4 = Vector256.Create(0.041666666666f);  // 1/24
             var c5 = Vector256.Create(0.008333333333f);  // 1/120
             var c6 = Vector256.Create(0.001388888888f);  // 1/720
 
-            var poly = Fma.MultiplyAdd(c6, r, c5);
-            poly = Fma.MultiplyAdd(poly, r, c4);
-            poly = Fma.MultiplyAdd(poly, r, c3);
-            poly = Fma.MultiplyAdd(poly, r, c2);
-            poly = Fma.MultiplyAdd(poly, r, c1);
-            poly = Fma.MultiplyAdd(poly, r, c0);
+            // Level 1: independent pairs
+            var p01 = Fma.MultiplyAdd(Vector256.Create(1.0f), r, Vector256.Create(1.0f)); // c1*r + c0
+            var p23 = Fma.MultiplyAdd(c3, r, c2);    // c3*r + c2
+            var p45 = Fma.MultiplyAdd(c5, r, c4);    // c5*r + c4
+
+            // Level 2: combine with r²
+            var r4 = Avx.Multiply(r2, r2); // r⁴
+            var lo = Fma.MultiplyAdd(p23, r2, p01);    // (c3*r+c2)*r² + (c1*r+c0)
+            var hi = Fma.MultiplyAdd(c6, r2, p45);     // c6*r² + (c5*r+c4)
+
+            // Level 3: final
+            var poly = Fma.MultiplyAdd(hi, r4, lo);    // hi*r⁴ + lo
 
             // Reconstruct: exp(x) = 2^n * exp(r)
             // 2^n via IEEE 754: add n to the exponent bits of 1.0f (bias = 127)
@@ -2754,19 +2818,17 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         internal static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
-            // sigmoid(x) = 1 / (1 + exp(-x))
-            var negX = Avx.Subtract(Vector256<float>.Zero, x);
-            var expNegX = FastExp256(negX);
-            return Avx.Divide(Vector256.Create(1.0f), Avx.Add(Vector256.Create(1.0f), expNegX));
+            // Padé [3,3] fused sigmoid: single divide, parallel P/Q computation
+            return PadeSigmoid.Sigmoid8(x);
         }
 
-        /// <summary>Fast vectorized tanh via 2*sigmoid(2x) - 1.</summary>
+        /// <summary>Fast vectorized tanh via 2*PadeSigmoid(2x) - 1.</summary>
         [MethodImpl(HotInline)]
         internal static Vector256<float> FastTanh256(Vector256<float> x)
         {
             var two = Vector256.Create(2f);
             var one = Vector256.Create(1f);
-            return Avx.Subtract(Avx.Multiply(two, FastSigmoid256(Avx.Multiply(two, x))), one);
+            return Avx.Subtract(Avx.Multiply(two, PadeSigmoid.Sigmoid8(Avx.Multiply(two, x))), one);
         }
 
         /// <summary>
@@ -4977,6 +5039,117 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
+            }
+        }
+
+        /// <summary>Pointer-based Exp for double — 4x unrolled AVX2 Cephes polynomial.</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void ExpUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                int simdLen = length & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    Avx.Store(output + i, FastExpDouble256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4, FastExpDouble256(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8, FastExpDouble256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, FastExpDouble256(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
+            {
+                int simdLen = i + ((length - i) & ~3);
+                for (; i < simdLen; i += 4)
+                    Avx.Store(output + i, FastExpDouble256(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Exp(input[i]);
+        }
+
+        /// <summary>Pointer-based Tanh for double — tanh(x) = 2*sigmoid(2x) - 1.</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void TanhUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                var one = Vector256.Create(1.0);
+                var two = Vector256.Create(2.0);
+                var negOne = Vector256.Create(-1.0);
+                int simdLen = length & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var x1 = Avx.LoadVector256(input + i + 4);
+                    var x2 = Avx.LoadVector256(input + i + 8);
+                    var x3 = Avx.LoadVector256(input + i + 12);
+                    // sigmoid(-2x) = 1/(1+exp(2x)), tanh = 1 - 2*sigmoid(-2x)
+                    var e0 = FastExpDouble256(Avx.Multiply(two, x0));
+                    var e1 = FastExpDouble256(Avx.Multiply(two, x1));
+                    var e2 = FastExpDouble256(Avx.Multiply(two, x2));
+                    var e3 = FastExpDouble256(Avx.Multiply(two, x3));
+                    Avx.Store(output + i, Avx.Divide(Avx.Subtract(e0, one), Avx.Add(e0, one)));
+                    Avx.Store(output + i + 4, Avx.Divide(Avx.Subtract(e1, one), Avx.Add(e1, one)));
+                    Avx.Store(output + i + 8, Avx.Divide(Avx.Subtract(e2, one), Avx.Add(e2, one)));
+                    Avx.Store(output + i + 12, Avx.Divide(Avx.Subtract(e3, one), Avx.Add(e3, one)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
+            {
+                var one = Vector256.Create(1.0);
+                var two = Vector256.Create(2.0);
+                int simdLen = i + ((length - i) & ~3);
+                for (; i < simdLen; i += 4)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var e0 = FastExpDouble256(Avx.Multiply(two, x0));
+                    Avx.Store(output + i, Avx.Divide(Avx.Subtract(e0, one), Avx.Add(e0, one)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Tanh(input[i]);
+        }
+
+        /// <summary>Pointer-based GELU for double — 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))).</summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void GELUUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 4)
+            {
+                var vSqrt2OverPi = Vector256.Create(0.7978845608028654);
+                var vCoeff = Vector256.Create(0.044715);
+                var vHalf = Vector256.Create(0.5);
+                var vOne = Vector256.Create(1.0);
+                var vTwo = Vector256.Create(2.0);
+
+                int simdLen = length & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
+                    var inner = Fma.MultiplyAdd(vCoeff, x3, x);
+                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    // tanh(z) = (exp(2z)-1)/(exp(2z)+1)
+                    var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
+                    var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
+                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanhVal))));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                double x = input[i];
+                double inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+                double tanhVal = Math.Tanh(inner);
+                output[i] = 0.5 * x * (1.0 + tanhVal);
             }
         }
 
@@ -7687,6 +7860,149 @@ namespace AiDotNet.Tensors.Engines.Simd
                     LayerNormBackwardUnsafe(gop, ip, gap, mp, vp, epsilon, gip, ggp, gbp, batchSize, normSize);
             }
             ConvertToHalf(gif, gradInput); ConvertToHalf(ggf, gradGamma); ConvertToHalf(gbf, gradBeta);
+        }
+
+    #endregion
+
+    #region Fused GELU
+
+        /// <summary>
+        /// Fused GELU: computes GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+        /// in a single inline AVX2 pass, eliminating the FastTanh→FastSigmoid→FastExp call chain.
+        /// </summary>
+        /// <summary>
+        /// Fused GELU using Padé sigmoid: GELU(x) = x * sigmoid(arg)
+        /// where arg = 2 * sqrt(2/pi) * (x + 0.044715*x^3).
+        /// Mathematical simplification: GELU = 0.5*x*(1+tanh(s)) = x*sig(2s).
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void FusedGELUUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                // 2 * sqrt(2/pi) = 1.5957691216...
+                var vScale = Vector256.Create(1.5957691216057308f);
+                var vCoeff = Vector256.Create(0.044715f);
+
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var x1 = Avx.LoadVector256(input + i + 8);
+                    var x2 = Avx.LoadVector256(input + i + 16);
+                    var x3 = Avx.LoadVector256(input + i + 24);
+
+                    // arg = 2*sqrt(2/pi) * (x + 0.044715*x^3)
+                    var arg0 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x0, x0), x0), x0));
+                    var arg1 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x1, x1), x1), x1));
+                    var arg2 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x2, x2), x2), x2));
+                    var arg3 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x3, x3), x3), x3));
+
+                    // GELU = x * sigmoid(arg) — single Padé sigmoid call, no tanh
+                    Avx.Store(output + i, Avx.Multiply(x0, PadeSigmoid.Sigmoid8(arg0)));
+                    Avx.Store(output + i + 8, Avx.Multiply(x1, PadeSigmoid.Sigmoid8(arg1)));
+                    Avx.Store(output + i + 16, Avx.Multiply(x2, PadeSigmoid.Sigmoid8(arg2)));
+                    Avx.Store(output + i + 24, Avx.Multiply(x3, PadeSigmoid.Sigmoid8(arg3)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var vScale = Vector256.Create(1.5957691216057308f);
+                var vCoeff = Vector256.Create(0.044715f);
+                int simdLen = i + ((length - i) & ~7);
+                for (; i < simdLen; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var arg = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x, x), x), x));
+                    Avx.Store(output + i, Avx.Multiply(x, PadeSigmoid.Sigmoid8(arg)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float arg = 1.5957691216057308f * (x + 0.044715f * x * x * x);
+                output[i] = x * PadeSigmoid.Sigmoid(arg);
+            }
+        }
+
+    #endregion
+
+    #region Fused LogSoftmax
+
+        /// <summary>
+        /// Fused LogSoftmax for a single row: max + shift + exp + sum + log + subtract
+        /// all inlined with AVX2. Eliminates per-row function call overhead from
+        /// calling ExpUnsafe/SumUnsafe separately.
+        ///
+        /// log_softmax(x_i) = x_i - max(x) - log(sum(exp(x - max(x))))
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void FusedLogSoftmaxRow(float* input, float* output, int cols)
+        {
+            // Pass 1: find max
+            float maxVal = input[0];
+            int c = 1;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && cols >= 8)
+            {
+                var vmax = Avx.LoadVector256(input);
+                int simdCols = cols & ~7;
+                for (c = 8; c < simdCols; c += 8)
+                    vmax = Avx.Max(vmax, Avx.LoadVector256(input + c));
+                // Horizontal max
+                // Horizontal max: reduce 256 → 128 → scalar
+                maxVal = HorizontalMax(vmax);
+                // Scalar remainder
+                for (; c < cols; c++)
+                    if (input[c] > maxVal) maxVal = input[c];
+            }
+            else
+#endif
+            {
+                for (; c < cols; c++)
+                    if (input[c] > maxVal) maxVal = input[c];
+            }
+
+            // Pass 2: fused shift + exp + sum (single scan over data)
+            float sumExp = 0f;
+            c = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && cols >= 8)
+            {
+                var vMax = Vector256.Create(maxVal);
+                var vSum = Vector256<float>.Zero;
+                int simdCols = cols & ~7;
+                for (; c < simdCols; c += 8)
+                {
+                    var shifted = Avx.Subtract(Avx.LoadVector256(input + c), vMax);
+                    vSum = Avx.Add(vSum, FastExp256(shifted));
+                }
+                sumExp = HorizontalSum(vSum);
+            }
+#endif
+            for (; c < cols; c++)
+                sumExp += MathF.Exp(input[c] - maxVal);
+
+            float logSumExp = MathF.Log(sumExp);
+
+            // Pass 3: final output = x - max - logSumExp
+            c = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && cols >= 8)
+            {
+                var vMax = Vector256.Create(maxVal);
+                var vLSE = Vector256.Create(logSumExp);
+                var vOffset = Avx.Add(vMax, vLSE); // max + logSumExp
+                int simdCols = cols & ~7;
+                for (; c < simdCols; c += 8)
+                    Avx.Store(output + c, Avx.Subtract(Avx.LoadVector256(input + c), vOffset));
+            }
+#endif
+            for (; c < cols; c++)
+                output[c] = input[c] - maxVal - logSumExp;
         }
 
     #endregion

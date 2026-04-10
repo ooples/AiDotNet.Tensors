@@ -398,11 +398,11 @@ internal static class BackwardFunctions<T>
             }
         }
 
-        // Fallback: materialize transposes (works for all types and ranks)
-        var bT = engine.TensorTranspose(inputs[1]);
+        // Fallback: transpose last two dims (works for all ranks)
+        var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
-        var aT = engine.TensorTranspose(inputs[0]);
+        var aT = TransposeLastTwoDims(inputs[0], engine);
         var gradBFallback = engine.TensorMatMul(aT, gradOutput);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
@@ -414,7 +414,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.TensorTranspose(gradOutput);
+        var grad = TransposeLastTwoDims(gradOutput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -1087,9 +1087,9 @@ internal static class BackwardFunctions<T>
         else
         {
             // 2D case
-            var bT = engine.TensorTranspose(inputs[1]);
+            var bT = TransposeLastTwoDims(inputs[1], engine);
             var gradA = engine.TensorMatMul(gradOutput, bT);
-            var aT = engine.TensorTranspose(inputs[0]);
+            var aT = TransposeLastTwoDims(inputs[0], engine);
             var gradB = engine.TensorMatMul(aT, gradOutput);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
@@ -1945,9 +1945,9 @@ internal static class BackwardFunctions<T>
         // Fallback: separate ops (non-float, non-2D, or BLAS refused)
         fusedReluFallback:
         var maskedGrad = engine.ReluBackward(gradOutput, preActivation);
-        var bT = engine.TensorTranspose(inputs[1]);
+        var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradA = engine.TensorMatMul(maskedGrad, bT);
-        var aT = engine.TensorTranspose(inputs[0]);
+        var aT = TransposeLastTwoDims(inputs[0], engine);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
         var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
         var gradBiasFallback = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
@@ -2012,9 +2012,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> maskedGrad, Tensor<T>[] inputs,
         Dictionary<Tensor<T>, Tensor<T>> grads, IEngine engine)
     {
-        var bT = engine.TensorTranspose(inputs[1]);
+        var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradA = engine.TensorMatMul(maskedGrad, bT);
-        var aT = engine.TensorTranspose(inputs[0]);
+        var aT = TransposeLastTwoDims(inputs[0], engine);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
         var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
         var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
@@ -2411,6 +2411,24 @@ internal static class BackwardFunctions<T>
     }
 
     // Helper: max of two scalars
+    /// <summary>
+    /// Transposes the last two dimensions of an ND tensor.
+    /// For 2D: standard transpose. For 3D+: swaps dims[-2] and dims[-1].
+    /// </summary>
+    private static Tensor<T> TransposeLastTwoDims(Tensor<T> tensor, IEngine engine)
+    {
+        if (tensor.Rank <= 2)
+            return engine.TensorTranspose(tensor);
+
+        // Build permutation: [0, 1, ..., rank-3, rank-1, rank-2]
+        int rank = tensor.Rank;
+        var perm = new int[rank];
+        for (int i = 0; i < rank - 2; i++) perm[i] = i;
+        perm[rank - 2] = rank - 1;
+        perm[rank - 1] = rank - 2;
+        return engine.TensorPermute(tensor, perm);
+    }
+
     private static T MaxVal(T a, T b, INumericOperations<T> ops) =>
         ops.ToDouble(a) >= ops.ToDouble(b) ? a : b;
 
@@ -3282,11 +3300,11 @@ internal static class BackwardFunctions<T>
 
         // Fallback: engine calls (non-float or non-2D, or BLAS refused)
         fusedFallback:
-        var weightT = engine.TensorTranspose(inputs[1]);
+        var weightT = TransposeLastTwoDims(inputs[1], engine);
         var inputGradFb = engine.TensorMatMul(gradOutput, weightT);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFb, engine);
 
-        var inputT = engine.TensorTranspose(inputs[0]);
+        var inputT = TransposeLastTwoDims(inputs[0], engine);
         var weightGradFb = engine.TensorMatMul(inputT, gradOutput);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFb, engine);
 
