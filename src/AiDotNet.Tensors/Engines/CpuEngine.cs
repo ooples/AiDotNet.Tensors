@@ -27347,26 +27347,46 @@ public class CpuEngine : ITensorLevelEngine
                 $"FFT requires input length to be a power of 2, got {n}.", paramName);
     }
 
+    /// <summary>
+    /// Computes batch count and last-axis size for batched FFT.
+    /// For 1D: batch=1, fftSize=length. For multi-D: batch=product of leading dims, fftSize=last dim.
+    /// </summary>
+    private static (int batchCount, int fftSize) GetBatchedFFTDims(int[] shape)
+    {
+        int fftSize = shape[^1]; // Last axis
+        int batchCount = 1;
+        for (int i = 0; i < shape.Length - 1; i++)
+            batchCount *= shape[i];
+        return (batchCount, fftSize);
+    }
+
     /// <inheritdoc />
     public Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        int n = input.Length;
-        ValidatePowerOfTwo(n, nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
-
-        var data = new Complex<T>[n];
-        for (int i = 0; i < n; i++)
-            data[i] = new Complex<T>(input[i], ops.Zero);
-
-        NativeFFTInPlace(data, false, ops, complexOps);
-
         var result = new Tensor<Complex<T>>(input._shape);
-        for (int i = 0; i < n; i++) result[i] = data[i];
+
+        // Transform along last axis, batch over leading dimensions
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++)
+                slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+
+            NativeFFTInPlace(slice, false, ops, complexOps);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = slice[i];
+        }
 
         { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
         return result;
@@ -27376,23 +27396,28 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        int n = input.Length;
-        ValidatePowerOfTwo(n, nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
-
-        var data = new Complex<T>[n];
-        for (int i = 0; i < n; i++) data[i] = input[i];
-
-        NativeFFTInPlace(data, true, ops, complexOps);
-
-        var scale = ops.FromDouble(n);
+        var scale = ops.FromDouble(fftSize);
         var result = new Tensor<T>(input._shape);
-        for (int i = 0; i < n; i++)
-            result[i] = ops.Divide(data[i].Real, scale);
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, true, ops, complexOps);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = ops.Divide(slice[i].Real, scale);
+        }
 
         { var ci = input; AutoTracer.RecordOp("NativeComplexIFFTReal", result, eng => eng.NativeComplexIFFTReal(ci)); }
         return result;
@@ -27402,26 +27427,30 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        int n = input.Length;
-        ValidatePowerOfTwo(n, nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
 
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
-
-        var data = new Complex<T>[n];
-        for (int i = 0; i < n; i++) data[i] = input[i];
-
-        NativeFFTInPlace(data, true, ops, complexOps);
-
-        var scale = ops.FromDouble(n);
+        var scale = ops.FromDouble(fftSize);
         var result = new Tensor<Complex<T>>(input._shape);
-        for (int i = 0; i < n; i++)
-            result[i] = new Complex<T>(
-                ops.Divide(data[i].Real, scale),
-                ops.Divide(data[i].Imaginary, scale));
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, true, ops, complexOps);
+
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = new Complex<T>(
+                    ops.Divide(slice[i].Real, scale),
+                    ops.Divide(slice[i].Imaginary, scale));
+        }
 
         { var ci2 = input; AutoTracer.RecordOp("NativeComplexIFFT", result, eng => eng.NativeComplexIFFT(ci2)); }
         return result;
@@ -27479,6 +27508,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitude", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27501,6 +27531,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitudeSquared", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27521,6 +27552,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexPhase", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27640,7 +27672,8 @@ public class CpuEngine : ITensorLevelEngine
         if (!_twiddleCache.TryGetValue(cacheKey, out var cachedTwiddles))
         {
             // Precompute all twiddle factors for all stages at once
-            cachedTwiddles = new Complex<double>[n / 2];
+            // Total count = 1 + 2 + 4 + ... + n/2 = n - 1
+            cachedTwiddles = new Complex<double>[n - 1];
             int idx = 0;
             for (int size = 2; size <= n; size *= 2)
             {
