@@ -449,8 +449,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Exp — tries MKL VML first (SVML microcode, zero-overhead function pointer),
-        /// falls back to Cephes FastExp256 polynomial approximation.
+        /// Pointer-based Exp with 3-tier dispatch:
+        /// 1. MKL VML (native SVML microcode, fastest when available)
+        /// 2. HerumiExp256 (256-entry table + short poly, Intel CPUs with fast gather)
+        /// 3. Estrin polynomial (FastExp256, AMD CPUs and fallback)
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void ExpUnsafe(float* input, float* output, int length)
@@ -459,6 +461,15 @@ namespace AiDotNet.Tensors.Engines.Simd
             // MKL VML path: SVML microcode exp, ~3x faster than our polynomial
             if (VmlProvider.TryExp(input, output, length))
                 return;
+
+            // CPU-adaptive dispatch:
+            // Intel (fast gather): 256-entry herumi table exp (fewer ops, table fits L1)
+            // AMD (slow gather): Estrin polynomial exp (no gather instruction)
+            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                HerumiExp256.ExpArray(input, output, length);
+                return;
+            }
 #endif
 
             int i = 0;
