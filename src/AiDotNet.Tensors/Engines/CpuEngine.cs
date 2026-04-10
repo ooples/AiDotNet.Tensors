@@ -16614,16 +16614,16 @@ public class CpuEngine : ITensorLevelEngine
                 var capturedInput = input;
                 var capturedAxes = axes;
                 bool capturedKeepDims = keepDims;
-                maxIndices = Array.Empty<int>(); // Indices not available in lazy mode
+                // Compute maxIndices eagerly so backward has correct argmax indices
+                var eagerResult = ReduceMax(input, effectiveAxes.ToArray(), keepDims, out var eagerIndices);
+                maxIndices = eagerIndices;
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
                     (eng, output) =>
                     {
-                        var effectiveA = capturedAxes ?? Enumerable.Range(0, capturedInput.Rank).ToArray();
-                        var eager = eng.ReduceMax(capturedInput, effectiveA, capturedKeepDims, out _);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        eagerResult.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.ReduceMaxBackward,
-                    new object[] { effectiveAxes.ToArray(), keepDims });
+                    new object[] { eagerIndices });
             }
         }
 
@@ -20460,6 +20460,8 @@ public class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSliceAxis", tensor._shape); if (ac is not null) return ac.Execute(); }
 
+        // Save original for autodiff — Contiguous() creates a clone for non-contiguous views
+        var originalTensor = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var tensorData = tensor.GetDataArray();
 
@@ -20498,7 +20500,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("TensorSliceAxis", result, tensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
+        DifferentiableOps.RecordUnary("TensorSliceAxis", result, originalTensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
         AutoTracer.RecordOp("TensorSliceAxis", result, eng => result);
         return result;
     }

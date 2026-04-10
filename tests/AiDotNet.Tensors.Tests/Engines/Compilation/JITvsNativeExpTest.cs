@@ -7,9 +7,9 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
-/// Proves the Sigmoid gap is JIT overhead, not algorithm.
-/// Our Estrin polynomial uses the SAME algorithm as SLEEF (PyTorch's exp).
-/// The difference is native C compilation vs .NET JIT.
+/// Measures sigmoid kernel breakdown (exp vs divide vs memory bandwidth).
+/// Note: actual kernel dispatched depends on CPU vendor (Intel vs AMD) and
+/// available providers (VML/MKL). Results are machine-specific.
 /// </summary>
 [Trait("Category", "Benchmark")]
 public class JITvsNativeExpTest
@@ -28,6 +28,8 @@ public class JITvsNativeExpTest
 
         var hIn = GCHandle.Alloc(input, GCHandleType.Pinned);
         var hOut = GCHandle.Alloc(output, GCHandleType.Pinned);
+        try
+        {
         float* pIn = (float*)hIn.AddrOfPinnedObject();
         float* pOut = (float*)hOut.AddrOfPinnedObject();
 
@@ -60,8 +62,6 @@ public class JITvsNativeExpTest
         sw.Stop();
         double mulMs = sw.Elapsed.TotalMilliseconds / 200;
 
-        hIn.Free(); hOut.Free();
-
         double divideOverhead = sigmoidMs - expMs; // time spent on divide + 1+exp assembly
         double expOverhead = expMs - mulMs; // time spent on polynomial vs memory access
 
@@ -78,5 +78,11 @@ public class JITvsNativeExpTest
         _output.WriteLine($"  Our exp ratio: {expMs / 0.488:F3}x vs PyTorch sigmoid");
         _output.WriteLine($"  Divide fraction: {divideOverhead / sigmoidMs * 100:F1}% of total");
         _output.WriteLine($"  Exp fraction: {expOverhead / sigmoidMs * 100:F1}% of total");
+        }
+        finally
+        {
+            hIn.Free();
+            hOut.Free();
+        }
     }
 }

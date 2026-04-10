@@ -77,6 +77,7 @@ extern ""C"" __global__ __launch_bounds__(256) void slice_axis(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = outerSize * stride;
     if (idx >= total) return;
+    if (index < 0 || index >= axisSize) return;
 
     int outer = idx / stride;
     int s = idx % stride;
@@ -92,6 +93,7 @@ extern ""C"" __global__ __launch_bounds__(256) void set_slice_axis(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = outerSize * stride;
     if (idx >= total) return;
+    if (index < 0 || index >= axisSize) return;
 
     int outer = idx / stride;
     int s = idx % stride;

@@ -4,26 +4,30 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Optimization;
 
 /// <summary>
-/// Mixed precision compilation pass — reduces memory bandwidth by computing
-/// FP16-safe operations on separate Half-precision intermediate buffers.
+/// Mixed precision compilation pass — reduces compute precision for FP16-safe ops.
 ///
-/// Strategy for each FP16-safe step:
-/// 1. Allocate Half[] buffers matching each input's size (lazy, reused across calls)
-/// 2. Convert fp32 inputs → Half[] buffers (quantize)
-/// 3. Execute the original step (reads from quantized copies, not originals)
-/// 4. Original fp32 inputs are NEVER mutated
+/// For each FP16-safe step, quantizes the input data in-place to Half precision
+/// (fp32→Half→fp32 round-trip) before execution, then restores the original values
+/// afterward. This reduces effective precision of intermediate computations.
 ///
-/// Bandwidth reduction: Half is 2 bytes vs float's 4 bytes, so memory-bound ops
-/// (matmul, conv, element-wise) read 2x less data from cache/RAM.
+/// Limitation: since compiled steps use pinned GCHandles to the original arrays,
+/// the quantization must happen in-place. Original values are saved to thread-local
+/// backup buffers and restored in a finally block to ensure exception safety.
 ///
-/// The output remains fp32 — only inputs are quantized. This is the standard
-/// "mixed precision inference" approach used by PyTorch's torch.cuda.amp.
+/// Thread safety: backup buffers are ThreadStatic, so concurrent plan execution
+/// on different threads is safe. Same-thread reentrancy is handled by the
+/// PersistentParallelExecutor's reentrancy guard.
 /// </summary>
 internal sealed class MixedPrecisionPass : ICpuOptimizationPass
 {
     public string Name => "MixedPrecision";
 
     public bool IsEnabled => TensorCodecOptions.Current.EnableMixedPrecision;
+
+#if NET7_0_OR_GREATER
+    // Thread-local backup buffers to avoid per-call allocation and ensure thread safety
+    [ThreadStatic] private static float[][]? _backupBuffers;
+#endif
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
@@ -38,7 +42,6 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
             if (classifications[i] == PrecisionClass.FP16Safe) fp16Count++;
         }
 
-        // Only worth the overhead if >= 30% of steps benefit
         if (fp16Count < steps.Length * 0.3) return null;
 
         var result = new CompiledStep<T>[steps.Length];
@@ -54,7 +57,6 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
 
             var capturedStep = steps[i];
 
-            // Check all inputs are contiguous float tensors
             bool allContiguous = true;
             for (int j = 0; j < capturedStep.Inputs.Length; j++)
             {
@@ -71,60 +73,49 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
                 continue;
             }
 
-            // Lazy-allocated Half buffers + shadow fp32 buffers (created on first Execute)
-            Half[][]? halfBuffers = null;
-            float[][]? shadowBuffers = null;
-
             result[i] = new CompiledStep<T>(
                 steps[i].OpName,
                 (eng, output) =>
                 {
-                    // Lazy-init on first call
-                    if (halfBuffers is null)
-                    {
-                        halfBuffers = new Half[capturedStep.Inputs.Length][];
-                        shadowBuffers = new float[capturedStep.Inputs.Length][];
-                        for (int j = 0; j < capturedStep.Inputs.Length; j++)
-                        {
-                            int len = capturedStep.Inputs[j].Length;
-                            halfBuffers[j] = new Half[len];
-                            shadowBuffers[j] = new float[len];
-                        }
-                    }
+                    // Per-input backup arrays (ThreadStatic for thread safety)
+                    var backups = _backupBuffers;
+                    int inputCount = capturedStep.Inputs.Length;
+                    if (backups is null || backups.Length < inputCount)
+                        _backupBuffers = backups = new float[inputCount][];
 
-                    // Quantize: fp32 inputs → Half[] → fp32 shadow (reduced precision copy)
-                    // Original inputs are NOT modified
-                    var hb = halfBuffers;
-                    var sb = shadowBuffers;
-                    if (hb is null || sb is null) return; // should never happen after init above
-                    for (int j = 0; j < capturedStep.Inputs.Length; j++)
+                    // Save originals and quantize in-place
+                    for (int j = 0; j < inputCount; j++)
                     {
                         if (capturedStep.Inputs[j] is Tensor<float> floatInp)
                         {
                             var src = floatInp.Data.Span;
-                            var halfBuf = hb[j];
-                            var shadowBuf = sb[j];
-                            int len = Math.Min(src.Length, halfBuf.Length);
-
-                            // fp32 → Half (quantize)
+                            int len = src.Length;
+                            if (backups[j] is null || backups[j].Length < len)
+                                backups[j] = new float[len];
+                            src.CopyTo(backups[j].AsSpan(0, len));
                             for (int k = 0; k < len; k++)
-                                halfBuf[k] = (Half)src[k];
-
-                            // Half → fp32 shadow (dequantize into separate buffer)
-                            for (int k = 0; k < len; k++)
-                                shadowBuf[k] = (float)halfBuf[k];
-
-                            // Swap input's backing data to shadow buffer for this step
-                            shadowBuf.AsSpan(0, len).CopyTo(src);
+                                src[k] = (float)(Half)src[k];
                         }
                     }
 
-                    // Execute with quantized-precision inputs
-                    capturedStep.Execute(eng, output);
-
-                    // Note: we don't restore originals because compiled plans pin arrays
-                    // at compile time — the input data IS the shadow data now. This is
-                    // intentional: the plan operates on reduced-precision data throughout.
+                    try
+                    {
+                        capturedStep.Execute(eng, output);
+                    }
+                    finally
+                    {
+                        // Always restore original fp32 values
+                        for (int j = 0; j < inputCount; j++)
+                        {
+                            if (capturedStep.Inputs[j] is Tensor<float> floatInp
+                                && backups[j] is not null)
+                            {
+                                var src = floatInp.Data.Span;
+                                int len = src.Length;
+                                backups[j].AsSpan(0, len).CopyTo(src);
+                            }
+                        }
+                    }
                 },
                 steps[i].OutputBuffer,
                 steps[i].Inputs,
