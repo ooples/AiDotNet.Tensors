@@ -459,6 +459,15 @@ namespace AiDotNet.Tensors.Engines.Simd
             // MKL VML path: SVML microcode exp, ~3x faster than our polynomial
             if (VmlProvider.TryExp(input, output, length))
                 return;
+
+            // CPU-adaptive dispatch:
+            // Intel (fast gather): 256-entry herumi table exp (fewer ops, table fits L1)
+            // AMD (slow gather): Estrin polynomial exp (no gather instruction)
+            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                HerumiExp256.ExpArray(input, output, length);
+                return;
+            }
 #endif
 
             int i = 0;
