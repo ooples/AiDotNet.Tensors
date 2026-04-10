@@ -149,9 +149,10 @@ internal static class HerumiExp256
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Exp(float x)
     {
-        // Outside approximation range: fall back to MathF.Exp which correctly
-        // produces subnormals, exact zero, +Infinity, and NaN.
-        if (x < ClampMin || x > ClampMax) return MathF.Exp(x);
+        // Outside approximation range or non-finite: fall back to MathF.Exp which
+        // correctly produces subnormals, exact zero, +Infinity, and NaN.
+        // Note: !(x >= ClampMin && x <= ClampMax) catches NaN (NaN fails all comparisons).
+        if (!(x >= ClampMin && x <= ClampMax)) return MathF.Exp(x);
         float z = x * LOverLn2;
         int n = (int)MathF.Floor(z);
         int k = n & LMask;
