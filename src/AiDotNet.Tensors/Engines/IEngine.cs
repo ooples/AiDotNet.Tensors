@@ -7545,6 +7545,14 @@ public interface IEngine
     Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar);
 
     /// <summary>
+    /// Cross-spectral density: X * conj(Y), fused for performance.
+    /// Computes element-wise: result.re = x.re*y.re + x.im*y.im, result.im = x.im*y.re - x.re*y.im.
+    /// Used in Hebbian learning and coherence analysis.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
+    Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y);
+
+    /// <summary>
     /// Element-wise addition of two Complex&lt;T&gt; tensors.
     /// </summary>
     /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>

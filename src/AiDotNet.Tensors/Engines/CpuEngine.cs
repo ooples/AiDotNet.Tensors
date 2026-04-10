@@ -27752,10 +27752,20 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<T>(a._shape);
 
-        for (int i = 0; i < n; i++)
-            result[i] = ops.FromDouble(Math.Atan2(
-                ops.ToDouble(a[i].Imaginary),
-                ops.ToDouble(a[i].Real)));
+        if (typeof(T) == typeof(float))
+        {
+            var (aR, aI) = DecomposeToFloat(a);
+            var output = new float[n];
+            Simd.SimdComplexKernels.ComplexPhase(aR, aI, output);
+            result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                result[i] = ops.FromDouble(Math.Atan2(
+                    ops.ToDouble(a[i].Imaginary),
+                    ops.ToDouble(a[i].Real)));
+        }
 
         { var ca = a; AutoTracer.RecordOp("NativeComplexPhase", result, eng => eng.NativeComplexPhase(ca)); }
         return result;
@@ -27776,13 +27786,29 @@ public class CpuEngine : ITensorLevelEngine
         int n = magnitudes.Length;
         var result = new Tensor<Complex<T>>(magnitudes._shape);
 
-        for (int i = 0; i < n; i++)
+        if (typeof(T) == typeof(float))
         {
-            var mag = ops.ToDouble(magnitudes[i]);
-            var phase = ops.ToDouble(phases[i]);
-            result[i] = new Complex<T>(
-                ops.FromDouble(mag * Math.Cos(phase)),
-                ops.FromDouble(mag * Math.Sin(phase)));
+            var magF = new float[n];
+            var phaseF = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                magF[i] = (float)ops.ToDouble(magnitudes[i]);
+                phaseF[i] = (float)ops.ToDouble(phases[i]);
+            }
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexFromPolar(magF, phaseF, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, magnitudes._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var mag = ops.ToDouble(magnitudes[i]);
+                var phase = ops.ToDouble(phases[i]);
+                result[i] = new Complex<T>(
+                    ops.FromDouble(mag * Math.Cos(phase)),
+                    ops.FromDouble(mag * Math.Sin(phase)));
+            }
         }
 
         { var cm = magnitudes; var cp = phases; AutoTracer.RecordOp("NativeComplexFromPolar", result, eng => eng.NativeComplexFromPolar(cm, cp)); }
@@ -27817,6 +27843,45 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         { var ca2 = a; var cs2 = scalar; AutoTracer.RecordOp("NativeComplexScale", result, eng => eng.NativeComplexScale(ca2, cs2)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        if (x.Length != y.Length)
+            throw new ArgumentException($"Tensor lengths must match: {x.Length} vs {y.Length}");
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexCrossSpectral", x._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = x.Length;
+        var result = new Tensor<Complex<T>>(x._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            var (xR, xI) = DecomposeToFloat(x);
+            var (yR, yI) = DecomposeToFloat(y);
+            var oR = new float[n]; var oI = new float[n];
+            Simd.SimdComplexKernels.ComplexCrossSpectral(xR, xI, yR, yI, oR, oI);
+            result = RecomposeFromFloat<T>(oR, oI, x._shape);
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var xr = x[i].Real; var xi = x[i].Imaginary;
+                var yr = y[i].Real; var yi = y[i].Imaginary;
+                result[i] = new Complex<T>(
+                    ops.Add(ops.Multiply(xr, yr), ops.Multiply(xi, yi)),
+                    ops.Subtract(ops.Multiply(xi, yr), ops.Multiply(xr, yi)));
+            }
+        }
+
+        { var cx2 = x; var cy2 = y; AutoTracer.RecordOp("NativeComplexCrossSpectral", result, eng => eng.NativeComplexCrossSpectral(cx2, cy2)); }
         return result;
     }
 

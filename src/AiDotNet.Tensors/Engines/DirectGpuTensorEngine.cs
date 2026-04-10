@@ -15005,7 +15005,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMultiply(a, b);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
@@ -15034,7 +15034,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexConjugate(a);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexConjugate(a);
@@ -15059,7 +15059,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMagnitude(a);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitude(a);
@@ -15082,7 +15082,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMagnitudeSquared(a);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitudeSquared(a);
@@ -15105,7 +15105,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexPhase(a);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexPhase(a);
@@ -15128,7 +15128,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFromPolar(magnitudes, phases);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexFromPolar(magnitudes, phases);
@@ -15160,7 +15160,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexScale(a, scalar);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexScale(a, scalar);
@@ -15187,7 +15187,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-                if (typeof(T) != typeof(float))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexAdd(a, b);
 if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
@@ -15216,17 +15216,17 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float))
-            return base.NativeComplexFFTComplex(input);
-        if (input.Rank > 1)
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFFTComplex(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFFTComplex(input);
 
         try
         {
+            int fftSize = input._shape[^1];
+            int batchCount = input.Length / fftSize;
             int n = input.Length;
-            if (n <= 0 || (n & (n - 1)) != 0)
+            if (fftSize <= 0 || (fftSize & (fftSize - 1)) != 0)
                 return base.NativeComplexFFTComplex(input);
 
             var (inR, inI) = DecomposeComplex(input);
@@ -15236,7 +15236,10 @@ if (!TryGetBackend(out var backend))
             using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
-            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: false);
+            if (batchCount > 1)
+                backend.BatchedFFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: false);
+            else
+                backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: false);
 
             return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
                 backend.DownloadBuffer(outIBuf.Buffer), input._shape);
@@ -15244,30 +15247,54 @@ if (!TryGetBackend(out var backend))
         catch { return base.NativeComplexFFTComplex(input); }
     }
 
-    // NativeComplexTopK and TensorSoftmaxRows: CPU-only (no GPU kernel needed for top-K/softmax)
-    // These are already virtual and fall through to CpuEngine.
+    public override Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexCrossSpectral(x, y);
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexCrossSpectral(x, y);
+
+        try
+        {
+            int n = x.Length;
+            var (xR, xI) = DecomposeComplex(x);
+            var (yR, yI) = DecomposeComplex(y);
+
+            using var xRBuf = new OwnedBuffer(backend.AllocateBuffer(xR), true);
+            using var xIBuf = new OwnedBuffer(backend.AllocateBuffer(xI), true);
+            using var yRBuf = new OwnedBuffer(backend.AllocateBuffer(yR), true);
+            using var yIBuf = new OwnedBuffer(backend.AllocateBuffer(yI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexCrossSpectral(xRBuf.Buffer, xIBuf.Buffer, yRBuf.Buffer, yIBuf.Buffer,
+                oRBuf.Buffer, oIBuf.Buffer, n);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), x._shape);
+        }
+        catch { return base.NativeComplexCrossSpectral(x, y); }
+    }
 
     public override Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
-        if (typeof(T) != typeof(float))
-            return base.NativeComplexFFT(input);
-        // GPU FFT is 1D only; multi-D batching handled by CPU
-        if (input.Rank > 1)
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFFT(input);
 
         try
         {
+            int fftSize = input._shape[^1]; // Last axis
+            int batchCount = input.Length / fftSize;
             int n = input.Length;
-            if (n <= 0 || (n & (n - 1)) != 0)
+            if (fftSize <= 0 || (fftSize & (fftSize - 1)) != 0)
                 return base.NativeComplexFFT(input);
 
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[n];
             for (int i = 0; i < n; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Imaginary input must be zeroed — AllocateBuffer(int) may not zero-initialize
             var zerosF = new float[n]; // C# arrays are zero-initialized
 
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
@@ -15275,7 +15302,10 @@ if (!TryGetBackend(out var backend))
             using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
-            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: false);
+            if (batchCount > 1)
+                backend.BatchedFFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: false);
+            else
+                backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: false);
 
             return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
                 backend.DownloadBuffer(outIBuf.Buffer), input._shape);
@@ -15285,17 +15315,17 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float))
-            return base.NativeComplexIFFTReal(input);
-        if (input.Rank > 1)
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexIFFTReal(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFTReal(input);
 
         try
         {
+            int fftSize = input._shape[^1];
+            int batchCount = input.Length / fftSize;
             int n = input.Length;
-            if (n <= 0 || (n & (n - 1)) != 0)
+            if (fftSize <= 0 || (fftSize & (fftSize - 1)) != 0)
                 return base.NativeComplexIFFTReal(input);
             var (inR, inI) = DecomposeComplex(input);
 
@@ -15304,7 +15334,10 @@ if (!TryGetBackend(out var backend))
             using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
-            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: true);
+            if (batchCount > 1)
+                backend.BatchedFFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: true);
+            else
+                backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
 
             // Extract real part only (IFFT normalization done by GPU kernel)
             return RecomposeReal<T>(backend.DownloadBuffer(outRBuf.Buffer), input._shape);
@@ -15314,17 +15347,17 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float))
-            return base.NativeComplexIFFT(input);
-        if (input.Rank > 1)
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexIFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFT(input);
 
         try
         {
+            int fftSize = input._shape[^1];
+            int batchCount = input.Length / fftSize;
             int n = input.Length;
-            if (n <= 0 || (n & (n - 1)) != 0)
+            if (fftSize <= 0 || (fftSize & (fftSize - 1)) != 0)
                 return base.NativeComplexIFFT(input);
             var (inR, inI) = DecomposeComplex(input);
 
@@ -15333,7 +15366,10 @@ if (!TryGetBackend(out var backend))
             using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
-            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: true);
+            if (batchCount > 1)
+                backend.BatchedFFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: true);
+            else
+                backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
 
             return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
                 backend.DownloadBuffer(outIBuf.Buffer), input._shape);
@@ -15343,7 +15379,7 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
     {
-        if (typeof(T) != typeof(float))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.TensorSoftmaxRows(input);
         if (input.Rank != 2)
             return base.TensorSoftmaxRows(input);
