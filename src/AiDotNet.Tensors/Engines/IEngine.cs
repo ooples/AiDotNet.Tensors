@@ -7432,6 +7432,69 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorComplexMagnitude<T>(Tensor<T> a);
 
+    // --- Native Complex<T> Tensor Operations ---
+    // These operate on Tensor<Complex<T>> directly, avoiding interleaved format conversion overhead.
+    // For maximum performance in spectral processing (FFT, filtering, HRE).
+
+    /// <summary>
+    /// Forward FFT on a real-valued tensor, returning native Complex&lt;T&gt; tensor.
+    /// No interleaved format conversion needed — Complex&lt;T&gt; elements stored directly.
+    /// </summary>
+    /// <param name="input">Real-valued input signal. Length should be power of 2.</param>
+    /// <returns>Complex-valued frequency domain tensor of same length.</returns>
+    Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Inverse FFT from native Complex&lt;T&gt; tensor back to real-valued tensor.
+    /// </summary>
+    /// <param name="input">Complex-valued frequency domain tensor.</param>
+    /// <returns>Real-valued time domain tensor.</returns>
+    Tensor<T> NativeComplexIFFT<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Element-wise multiplication of two Complex&lt;T&gt; tensors (spectral filtering).
+    /// (a.re*b.re - a.im*b.im) + i*(a.re*b.im + a.im*b.re) per element.
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
+
+    /// <summary>
+    /// Element-wise conjugate of a Complex&lt;T&gt; tensor: (re, -im) per element.
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract magnitudes from Complex&lt;T&gt; tensor: sqrt(re^2 + im^2) per element.
+    /// </summary>
+    Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract squared magnitudes from Complex&lt;T&gt; tensor: re^2 + im^2 per element.
+    /// Avoids the sqrt for better performance when magnitude ordering is sufficient.
+    /// </summary>
+    Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Extract phases from Complex&lt;T&gt; tensor: atan2(im, re) per element.
+    /// </summary>
+    Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a);
+
+    /// <summary>
+    /// Construct Complex&lt;T&gt; tensor from magnitude and phase tensors.
+    /// result[i] = Complex(mag[i]*cos(phase[i]), mag[i]*sin(phase[i]))
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases);
+
+    /// <summary>
+    /// Scale all elements of a Complex&lt;T&gt; tensor by a real scalar.
+    /// result[i] = Complex(a[i].re * scalar, a[i].im * scalar)
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar);
+
+    /// <summary>
+    /// Element-wise addition of two Complex&lt;T&gt; tensors.
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
+
     #endregion
 
     #region CTC Loss

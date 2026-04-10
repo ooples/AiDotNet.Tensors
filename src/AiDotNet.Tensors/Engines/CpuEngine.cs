@@ -27338,6 +27338,220 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // --- Native Complex<T> Tensor Operations ---
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+        int n = input.Length;
+
+        var data = new Complex<T>[n];
+        for (int i = 0; i < n; i++)
+            data[i] = new Complex<T>(input[i], ops.Zero);
+
+        NativeFFTInPlace(data, false, ops, complexOps);
+
+        var result = new Tensor<Complex<T>>([n]);
+        for (int i = 0; i < n; i++) result[i] = data[i];
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+        int n = input.Length;
+
+        var data = new Complex<T>[n];
+        for (int i = 0; i < n; i++) data[i] = input[i];
+
+        NativeFFTInPlace(data, true, ops, complexOps);
+
+        var scale = ops.FromDouble(n);
+        var result = new Tensor<T>([n]);
+        for (int i = 0; i < n; i++)
+            result[i] = ops.Divide(data[i].Real, scale);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>([n]);
+
+        for (int i = 0; i < n; i++)
+        {
+            var ar = a[i].Real; var ai = a[i].Imaginary;
+            var br = b[i].Real; var bi = b[i].Imaginary;
+            result[i] = new Complex<T>(
+                ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi)),
+                ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>([n]);
+
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>([n]);
+
+        for (int i = 0; i < n; i++)
+        {
+            var re = ops.ToDouble(a[i].Real);
+            var im = ops.ToDouble(a[i].Imaginary);
+            result[i] = ops.FromDouble(Math.Sqrt(re * re + im * im));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>([n]);
+
+        for (int i = 0; i < n; i++)
+            result[i] = ops.Add(
+                ops.Multiply(a[i].Real, a[i].Real),
+                ops.Multiply(a[i].Imaginary, a[i].Imaginary));
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<T>([n]);
+
+        for (int i = 0; i < n; i++)
+            result[i] = ops.FromDouble(Math.Atan2(
+                ops.ToDouble(a[i].Imaginary),
+                ops.ToDouble(a[i].Real)));
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    {
+        if (magnitudes.Length != phases.Length)
+            throw new ArgumentException("Magnitude and phase tensors must have the same length.");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = magnitudes.Length;
+        var result = new Tensor<Complex<T>>([n]);
+
+        for (int i = 0; i < n; i++)
+        {
+            var mag = ops.ToDouble(magnitudes[i]);
+            var phase = ops.ToDouble(phases[i]);
+            result[i] = new Complex<T>(
+                ops.FromDouble(mag * Math.Cos(phase)),
+                ops.FromDouble(mag * Math.Sin(phase)));
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>([n]);
+
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(
+                ops.Multiply(a[i].Real, scalar),
+                ops.Multiply(a[i].Imaginary, scalar));
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    {
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = a.Length;
+        var result = new Tensor<Complex<T>>([n]);
+
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(
+                ops.Add(a[i].Real, b[i].Real),
+                ops.Add(a[i].Imaginary, b[i].Imaginary));
+
+        return result;
+    }
+
+    /// <summary>
+    /// In-place iterative Cooley-Tukey FFT on a Complex&lt;T&gt; array.
+    /// </summary>
+    private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
+        INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)
+    {
+        int n = data.Length;
+        int bits = (int)(Math.Log(n) / Math.Log(2));
+
+        // Bit-reversal permutation
+        for (int i = 0; i < n; i++)
+        {
+            int j = BitReverse(i, bits);
+            if (j > i)
+                (data[i], data[j]) = (data[j], data[i]);
+        }
+
+        // Butterfly stages
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+            double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
+
+            for (int start = 0; start < n; start += size)
+            {
+                for (int k = 0; k < halfSize; k++)
+                {
+                    var twiddle = Complex<T>.FromPolarCoordinates(
+                        ops.One, ops.FromDouble(baseAngle * k));
+                    var t = complexOps.Multiply(twiddle, data[start + k + halfSize]);
+                    var u = data[start + k];
+                    data[start + k] = complexOps.Add(u, t);
+                    data[start + k + halfSize] = complexOps.Subtract(u, t);
+                }
+            }
+        }
+    }
+
     #endregion
 
     #region CTC Loss
