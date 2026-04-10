@@ -1645,4 +1645,17 @@ public sealed unsafe partial class VulkanBackend
         Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
     }
 
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        // TopK requires host-side sorting for threshold — fall back to CPU
+        throw new NotSupportedException("SplitComplexTopK requires host-side sorting. Use CpuEngine.");
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        // Per-row softmax via existing GPU ops
+        if (rows <= 0 || cols <= 0) return;
+        // Fall back to CPU for now — shared-memory reduction needed for efficient GPU softmax
+        throw new NotSupportedException("SoftmaxRows requires shared-memory reduction. Use CpuEngine.");
+    }
 }

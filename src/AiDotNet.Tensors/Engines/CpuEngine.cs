@@ -27457,6 +27457,115 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+
+            NativeFFTInPlace(slice, false, ops, complexOps);
+
+            for (int i = 0; i < fftSize; i++) result[offset + i] = slice[i];
+        }
+
+        { var ci = input; AutoTracer.RecordOp("NativeComplexFFTComplex", result, eng => eng.NativeComplexFFTComplex(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = input.Length;
+        k = Math.Min(k, n);
+
+        // Compute magnitudes squared (avoid sqrt for ranking)
+        var magSq = new (double mag, int idx)[n];
+        for (int i = 0; i < n; i++)
+        {
+            var re = ops.ToDouble(input[i].Real);
+            var im = ops.ToDouble(input[i].Imaginary);
+            magSq[i] = (re * re + im * im, i);
+        }
+
+        // Partial sort: find top-K by magnitude
+        Array.Sort(magSq, (a, b) => b.mag.CompareTo(a.mag));
+
+        var topKIndices = new HashSet<int>();
+        for (int i = 0; i < k; i++) topKIndices.Add(magSq[i].idx);
+
+        // Build sparse output
+        var zero = new Complex<T>(ops.Zero, ops.Zero);
+        var result = new Tensor<Complex<T>>(input._shape);
+        for (int i = 0; i < n; i++)
+            result[i] = topKIndices.Contains(i) ? input[i] : zero;
+
+        { var ci = input; var ck = k; AutoTracer.RecordOp("NativeComplexTopK", result, eng => eng.NativeComplexTopK(ci, ck)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 2) throw new ArgumentException("TensorSoftmaxRows requires a 2D tensor.", nameof(input));
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSoftmaxRows", input._shape); if (ac is not null) return ac.Execute(); }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int rows = input._shape[0];
+        int cols = input._shape[1];
+        var result = new Tensor<T>(input._shape);
+
+        for (int r = 0; r < rows; r++)
+        {
+            int offset = r * cols;
+
+            // Max for numerical stability
+            T maxVal = input[offset];
+            for (int c = 1; c < cols; c++)
+            {
+                var val = input[offset + c];
+                if (ops.ToDouble(val) > ops.ToDouble(maxVal)) maxVal = val;
+            }
+
+            // Exp and sum
+            T sumExp = ops.Zero;
+            for (int c = 0; c < cols; c++)
+            {
+                var expVal = ops.FromDouble(Math.Exp(ops.ToDouble(ops.Subtract(input[offset + c], maxVal))));
+                result[offset + c] = expVal;
+                sumExp = ops.Add(sumExp, expVal);
+            }
+
+            // Normalize
+            for (int c = 0; c < cols; c++)
+                result[offset + c] = ops.Divide(result[offset + c], sumExp);
+        }
+
+        { var ci = input; AutoTracer.RecordOp("TensorSoftmaxRows", result, eng => eng.TensorSoftmaxRows(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
     public virtual Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

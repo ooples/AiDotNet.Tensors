@@ -10466,6 +10466,25 @@ KERNEL VARIANTS (A/B testing):
     public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_cross_spectral", [xReal, xImag, yReal, yImag, outReal, outImag], n);
 
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
+    {
+        // TopK requires host-side threshold computation
+        throw new NotSupportedException("SplitComplexTopK requires host-side sorting. Use CpuEngine path.");
+    }
+
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: softmax_rows");
+        int localSize = CalculateOptimalWorkGroupSize1D(rows);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, rows);
+        kernel.SetArg(3u, cols);
+        kernel.Execute1D(rows, localSize);
+    }
+
     #endregion
 
     #region Quantum Computing Operations

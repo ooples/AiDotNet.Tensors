@@ -164,4 +164,6 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
 
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) { /* CPU fallback - threshold computed host-side */ throw new NotSupportedException("SplitComplexTopK requires host-side threshold computation. Use CpuEngine."); }
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) { throw new NotSupportedException("SoftmaxRows not yet dispatched for this backend."); }
 }

@@ -7474,6 +7474,34 @@ public interface IEngine
     Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input);
 
     /// <summary>
+    /// Forward 1D FFT on a complex-valued tensor, returning Complex&lt;T&gt; tensor.
+    /// Complex-to-complex FFT — use when input already has nonzero imaginary components
+    /// (e.g., intermediate results in spectral filtering chains).
+    /// </summary>
+    /// <param name="input">Complex-valued input tensor. Last axis length must be a power of 2.</param>
+    /// <returns>Complex-valued frequency domain tensor of same shape.</returns>
+    /// <exception cref="ArgumentException">Thrown if last axis length is not a power of 2.</exception>
+    Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// Selects the top-K elements by complex magnitude, zeroing all others.
+    /// Used for spectral sparsity masking — retains the K strongest frequency components.
+    /// </summary>
+    /// <param name="input">Complex tensor to apply sparsity mask to.</param>
+    /// <param name="k">Number of elements to retain.</param>
+    /// <returns>Sparse complex tensor with only K non-zero elements (by magnitude).</returns>
+    Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k);
+
+    /// <summary>
+    /// Applies softmax independently to each row of a 2D real tensor.
+    /// Each row is normalized to sum to 1. For attention weight computation.
+    /// </summary>
+    /// <param name="input">2D tensor of shape [M, N].</param>
+    /// <returns>2D tensor of same shape with softmax applied per row.</returns>
+    /// <exception cref="ArgumentException">Thrown if input is not 2D.</exception>
+    Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input);
+
+    /// <summary>
     /// Element-wise multiplication of two Complex&lt;T&gt; tensors (spectral filtering).
     /// (a.re*b.re - a.im*b.im) + i*(a.re*b.im + a.im*b.re) per element.
     /// </summary>

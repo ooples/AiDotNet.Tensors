@@ -133,5 +133,37 @@ kernel void split_complex_cross_spectral(
     outReal[idx] = xr * yr + xi * yi;
     outImag[idx] = xi * yr - xr * yi;
 }
+
+kernel void split_complex_topk(
+    device const float* inReal [[buffer(0)]],
+    device const float* inImag [[buffer(1)]],
+    device float* outReal [[buffer(2)]],
+    device float* outImag [[buffer(3)]],
+    constant float& thresholdMagSq [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= n) return;
+    float re = inReal[idx], im = inImag[idx];
+    float magSq = re * re + im * im;
+    outReal[idx] = (magSq >= thresholdMagSq) ? re : 0.0f;
+    outImag[idx] = (magSq >= thresholdMagSq) ? im : 0.0f;
+}
+
+kernel void softmax_rows(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row >= rows) return;
+    uint offset = row * cols;
+    float maxVal = -1e30f;
+    for (uint c = 0; c < cols; c++) maxVal = max(maxVal, input[offset + c]);
+    float sumExp = 0.0f;
+    for (uint c = 0; c < cols; c++) { float e = exp(input[offset + c] - maxVal); output[offset + c] = e; sumExp += e; }
+    for (uint c = 0; c < cols; c++) output[offset + c] /= sumExp;
+}
 ";
 }

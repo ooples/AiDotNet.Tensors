@@ -353,4 +353,128 @@ public class NativeComplexOpsTests
         for (int i = 0; i < n; i++)
             Assert.Equal(input[i], recovered[i], 4);
     }
+
+    // ================================================================
+    // FFT Complex-to-Complex
+    // ================================================================
+
+    [Fact]
+    public void FFTComplex_RoundTrip()
+    {
+        int n = 32;
+        var input = new Tensor<Complex<double>>([n]);
+        for (int i = 0; i < n; i++)
+            input[i] = new Complex<double>(Math.Cos(2 * Math.PI * 3 * i / n), Math.Sin(2 * Math.PI * 5 * i / n));
+
+        var spectrum = _engine.NativeComplexFFTComplex(input);
+        var recovered = _engine.NativeComplexIFFT(spectrum);
+
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal(input[i].Real, recovered[i].Real, 5);
+            Assert.Equal(input[i].Imaginary, recovered[i].Imaginary, 5);
+        }
+    }
+
+    [Fact]
+    public void FFTComplex_NonPowerOfTwo_Throws()
+    {
+        var input = new Tensor<Complex<double>>([10]);
+        Assert.Throws<ArgumentException>(() => _engine.NativeComplexFFTComplex(input));
+    }
+
+    // ================================================================
+    // TopK Complex
+    // ================================================================
+
+    [Fact]
+    public void TopKComplex_RetainsTopK()
+    {
+        int n = 8;
+        int k = 3;
+        var input = new Tensor<Complex<double>>([n]);
+        // Set known magnitudes: indices 2, 5, 7 have largest
+        input[0] = new Complex<double>(0.1, 0);
+        input[1] = new Complex<double>(0.2, 0);
+        input[2] = new Complex<double>(5.0, 3.0);  // mag ~5.83
+        input[3] = new Complex<double>(0.3, 0);
+        input[4] = new Complex<double>(0.1, 0.1);
+        input[5] = new Complex<double>(4.0, 4.0);  // mag ~5.66
+        input[6] = new Complex<double>(0.5, 0);
+        input[7] = new Complex<double>(6.0, 0);     // mag = 6.0
+
+        var result = _engine.NativeComplexTopK(input, k);
+
+        // Top-3 by magnitude: indices 7 (6.0), 2 (5.83), 5 (5.66)
+        Assert.Equal(6.0, result[7].Real, 10);
+        Assert.Equal(5.0, result[2].Real, 10);
+        Assert.Equal(4.0, result[5].Real, 10);
+
+        // Others should be zeroed
+        Assert.Equal(0.0, result[0].Real, 10);
+        Assert.Equal(0.0, result[1].Real, 10);
+        Assert.Equal(0.0, result[3].Real, 10);
+        Assert.Equal(0.0, result[4].Real, 10);
+        Assert.Equal(0.0, result[6].Real, 10);
+    }
+
+    [Fact]
+    public void TopKComplex_KLargerThanN_ReturnsAll()
+    {
+        int n = 4;
+        var input = new Tensor<Complex<double>>([n]);
+        for (int i = 0; i < n; i++) input[i] = new Complex<double>(i + 1, 0);
+
+        var result = _engine.NativeComplexTopK(input, 100);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(input[i].Real, result[i].Real, 10);
+    }
+
+    // ================================================================
+    // SoftmaxRows
+    // ================================================================
+
+    [Fact]
+    public void SoftmaxRows_RowsSumToOne()
+    {
+        var input = new Tensor<double>([3, 4]);
+        var rng = new Random(42);
+        for (int i = 0; i < 12; i++) input[i] = rng.NextDouble() * 10;
+
+        var result = _engine.TensorSoftmaxRows(input);
+
+        for (int r = 0; r < 3; r++)
+        {
+            double rowSum = 0;
+            for (int c = 0; c < 4; c++)
+            {
+                double val = result[r * 4 + c];
+                Assert.True(val >= 0, $"Softmax output should be non-negative, got {val}");
+                Assert.True(val <= 1, $"Softmax output should be <= 1, got {val}");
+                rowSum += val;
+            }
+            Assert.Equal(1.0, rowSum, 6);
+        }
+    }
+
+    [Fact]
+    public void SoftmaxRows_1D_Throws()
+    {
+        var input = new Tensor<double>([10]);
+        Assert.Throws<ArgumentException>(() => _engine.TensorSoftmaxRows(input));
+    }
+
+    [Fact]
+    public void SoftmaxRows_LargerInputGetsLargerWeight()
+    {
+        var input = new Tensor<double>([1, 3]);
+        input[0] = 1.0; input[1] = 5.0; input[2] = 2.0;
+
+        var result = _engine.TensorSoftmaxRows(input);
+
+        // Index 1 (value 5) should have largest softmax weight
+        Assert.True(result[1] > result[0]);
+        Assert.True(result[1] > result[2]);
+    }
 }

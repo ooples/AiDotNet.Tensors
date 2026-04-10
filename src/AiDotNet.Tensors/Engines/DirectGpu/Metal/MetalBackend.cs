@@ -1622,4 +1622,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_add", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
     public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_cross_spectral", [AsMetal(xR), AsMetal(xI), AsMetal(yR), AsMetal(yI), AsMetal(oR), AsMetal(oI)], n); }
 
+    public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) { /* CPU fallback - threshold computed host-side */ throw new NotSupportedException("SplitComplexTopK requires host-side threshold computation. Use CpuEngine."); }
+    public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) { throw new NotSupportedException("SoftmaxRows not yet dispatched for this backend."); }
 }

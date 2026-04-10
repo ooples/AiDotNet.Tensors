@@ -15214,6 +15214,39 @@ if (!TryGetBackend(out var backend))
         catch { return base.NativeComplexAdd(a, b); }
     }
 
+    public override Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
+    {
+        if (typeof(T) != typeof(float))
+            return base.NativeComplexFFTComplex(input);
+        if (input.Rank > 1)
+            return base.NativeComplexFFTComplex(input);
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFTComplex(input);
+
+        try
+        {
+            int n = input.Length;
+            if (n <= 0 || (n & (n - 1)) != 0)
+                return base.NativeComplexFFTComplex(input);
+
+            var (inR, inI) = DecomposeComplex(input);
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(inI), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, n, inverse: false);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
+                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexFFTComplex(input); }
+    }
+
+    // NativeComplexTopK and TensorSoftmaxRows: CPU-only (no GPU kernel needed for top-K/softmax)
+    // These are already virtual and fall through to CpuEngine.
+
     public override Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
         if (typeof(T) != typeof(float))

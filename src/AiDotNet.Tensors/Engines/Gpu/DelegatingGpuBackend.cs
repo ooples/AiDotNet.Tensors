@@ -1753,4 +1753,6 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexAdd(aReal, aImag, bReal, bImag, outReal, outImag, n);
     public virtual void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexCrossSpectral(xReal, xImag, yReal, yImag, outReal, outImag, n);
 
+    public virtual void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) => Inner.SplitComplexTopK(inReal, inImag, outReal, outImag, n, k);
+    public virtual void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) => Inner.SoftmaxRows(input, output, rows, cols);
 }

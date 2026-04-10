@@ -11,7 +11,8 @@ public static class ComplexKernels
         "split_complex_magnitude", "split_complex_magnitude_squared",
         "split_complex_phase", "split_complex_from_polar",
         "split_complex_scale", "split_complex_add",
-        "split_complex_cross_spectral"
+        "split_complex_cross_spectral",
+        "split_complex_topk", "softmax_rows"
     };
 
     public static string GetSource() => @"
@@ -111,6 +112,33 @@ __kernel void split_complex_cross_spectral(
     float yr = yReal[idx], yi = yImag[idx];
     outReal[idx] = xr * yr + xi * yi;
     outImag[idx] = xi * yr - xr * yi;
+}
+
+__kernel void split_complex_topk(
+    __global const float* inReal, __global const float* inImag,
+    __global float* outReal, __global float* outImag,
+    const float thresholdMagSq, const int n)
+{
+    int idx = get_global_id(0);
+    if (idx >= n) return;
+    float re = inReal[idx], im = inImag[idx];
+    float magSq = re * re + im * im;
+    outReal[idx] = (magSq >= thresholdMagSq) ? re : 0.0f;
+    outImag[idx] = (magSq >= thresholdMagSq) ? im : 0.0f;
+}
+
+__kernel void softmax_rows(
+    __global const float* input, __global float* output,
+    const int rows, const int cols)
+{
+    int row = get_global_id(0);
+    if (row >= rows) return;
+    int offset = row * cols;
+    float maxVal = -1e30f;
+    for (int c = 0; c < cols; c++) maxVal = fmax(maxVal, input[offset + c]);
+    float sumExp = 0.0f;
+    for (int c = 0; c < cols; c++) { float e = exp(input[offset + c] - maxVal); output[offset + c] = e; sumExp += e; }
+    for (int c = 0; c < cols; c++) output[offset + c] /= sumExp;
 }
 ";
 }
