@@ -120,13 +120,13 @@ internal static class HerumiExp256
     }
 #endif
 
-    /// <summary>Scalar table-driven exp matching SIMD semantics.</summary>
+    /// <summary>Scalar table-driven exp with full-precision fallback for extremes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Exp(float x)
     {
-        // Match IEEE 754 semantics: underflow → 0, overflow → +inf
-        if (x < ClampMin) return 0f;
-        if (x > ClampMax) return float.PositiveInfinity;
+        // Outside approximation range: fall back to MathF.Exp which correctly
+        // produces subnormals, exact zero, +Infinity, and NaN.
+        if (x < ClampMin || x > ClampMax) return MathF.Exp(x);
         float z = x * LOverLn2;
         int n = (int)MathF.Floor(z);
         int k = n & LMask;
