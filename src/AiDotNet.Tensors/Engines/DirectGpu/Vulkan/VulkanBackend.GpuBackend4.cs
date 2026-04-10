@@ -1580,8 +1580,9 @@ public sealed unsafe partial class VulkanBackend
     #endregion
 
     // --- Split-buffer native Complex<T> operations (Vulkan) ---
-    // Delegates to existing split-buffer GPU ops where available,
-    // composes from primitives where dedicated kernels don't exist yet.
+    // Composes from existing GPU primitives (Multiply, Add, Subtract, etc.).
+    // Temp buffers are allocated per call — for high-frequency spectral workloads,
+    // consider adding a GpuBufferPool or dedicated SPIR-V compute pipelines.
 
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {

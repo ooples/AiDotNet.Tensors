@@ -10059,12 +10059,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = _complexModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

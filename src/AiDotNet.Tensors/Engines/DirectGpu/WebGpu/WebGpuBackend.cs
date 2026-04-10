@@ -1086,7 +1086,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     }
 
     // --- Split-buffer native Complex<T> operations (WebGPU) ---
-    // Composes from existing GPU primitive ops (Add, Multiply, Subtract, etc.)
+    // Composes from existing GPU primitives. Temp buffers allocated per call —
+    // for high-frequency spectral workloads, consider buffer pooling or
+    // dedicated WGSL compute pipelines.
 
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
