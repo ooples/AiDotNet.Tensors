@@ -1578,4 +1578,16 @@ public sealed unsafe partial class VulkanBackend
     }
 
     #endregion
+
+    // --- Split-buffer native Complex<T> operations ---
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+
 }

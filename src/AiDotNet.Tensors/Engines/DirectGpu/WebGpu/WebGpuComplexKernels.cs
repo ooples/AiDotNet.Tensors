@@ -17,7 +17,7 @@ struct ComplexParams { size: u32, }
 @group(0) @binding(6) var<uniform> cparams: ComplexParams;
 
 @compute @workgroup_size(256)
-fn complex_multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= cparams.size) { return; }
     let ar = aReal[idx]; let ai = aImag[idx];
@@ -28,7 +28,7 @@ fn complex_multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Complex conjugate: (re, -im)
 @compute @workgroup_size(256)
-fn complex_conjugate(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_conjugate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= cparams.size) { return; }
     outReal[idx] = aReal[idx];
@@ -43,7 +43,7 @@ struct MagParams { size: u32, }
 @group(1) @binding(3) var<uniform> mparams: MagParams;
 
 @compute @workgroup_size(256)
-fn complex_magnitude(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_magnitude(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= mparams.size) { return; }
     let re = mInReal[idx]; let im = mInImag[idx];
@@ -51,7 +51,7 @@ fn complex_magnitude(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
-fn complex_magnitude_squared(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_magnitude_squared(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= mparams.size) { return; }
     let re = mInReal[idx]; let im = mInImag[idx];
@@ -59,7 +59,7 @@ fn complex_magnitude_squared(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
-fn complex_phase(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_phase(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= mparams.size) { return; }
     mOut[idx] = atan2(mInImag[idx], mInReal[idx]);
@@ -67,7 +67,7 @@ fn complex_phase(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Complex from polar: (mag*cos(phase), mag*sin(phase))
 @compute @workgroup_size(256)
-fn complex_from_polar(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_from_polar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= cparams.size) { return; }
     let m = aReal[idx]; let p = aImag[idx];  // reusing bindings: mag in aReal, phase in aImag
@@ -77,7 +77,7 @@ fn complex_from_polar(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Complex add: (a.re+b.re, a.im+b.im)
 @compute @workgroup_size(256)
-fn complex_add(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_add(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= cparams.size) { return; }
     outReal[idx] = aReal[idx] + bReal[idx];
@@ -86,7 +86,7 @@ fn complex_add(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Cross-spectral density: X * conj(Y)
 @compute @workgroup_size(256)
-fn complex_cross_spectral(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_complex_cross_spectral(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= cparams.size) { return; }
     let xr = aReal[idx]; let xi = aImag[idx];

@@ -1741,4 +1741,16 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => Inner.GIoULossBackward(gradOutput, predicted, target, gradPredicted, numBoxes);
     public virtual void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => Inner.DIoULossBackward(gradOutput, predicted, target, gradPredicted, numBoxes);
     public virtual void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => Inner.CIoULossBackward(gradOutput, predicted, target, gradPredicted, numBoxes);
+
+    // --- Split-buffer native Complex<T> operations ---
+    public virtual void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexMultiply(aReal, aImag, bReal, bImag, outReal, outImag, n);
+    public virtual void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexConjugate(inReal, inImag, outReal, outImag, n);
+    public virtual void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => Inner.SplitComplexMagnitude(inReal, inImag, outMag, n);
+    public virtual void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => Inner.SplitComplexMagnitudeSquared(inReal, inImag, outMagSq, n);
+    public virtual void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => Inner.SplitComplexPhase(inReal, inImag, outPhase, n);
+    public virtual void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexFromPolar(mag, phase, outReal, outImag, n);
+    public virtual void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => Inner.SplitComplexScale(inReal, inImag, outReal, outImag, scalar, n);
+    public virtual void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexAdd(aReal, aImag, bReal, bImag, outReal, outImag, n);
+    public virtual void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexCrossSpectral(xReal, xImag, yReal, yImag, outReal, outImag, n);
+
 }

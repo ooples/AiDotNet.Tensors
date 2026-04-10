@@ -44,4 +44,16 @@ public sealed partial class HipBackend
             }
         }
     }
+
+    // --- Split-buffer native Complex<T> operations ---
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for HIP.");
+
 }

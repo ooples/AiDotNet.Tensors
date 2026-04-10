@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 public static class ComplexKernels
 {
     public static string GetSource() => @"
-__kernel void complex_multiply(
+__kernel void split_complex_multiply(
     __global const float* aReal, __global const float* aImag,
     __global const float* bReal, __global const float* bImag,
     __global float* outReal, __global float* outImag, const int n)
@@ -19,7 +19,7 @@ __kernel void complex_multiply(
     outImag[idx] = ar * bi + ai * br;
 }
 
-__kernel void complex_conjugate(
+__kernel void split_complex_conjugate(
     __global const float* inReal, __global const float* inImag,
     __global float* outReal, __global float* outImag, const int n)
 {
@@ -29,7 +29,7 @@ __kernel void complex_conjugate(
     outImag[idx] = -inImag[idx];
 }
 
-__kernel void complex_magnitude(
+__kernel void split_complex_magnitude(
     __global const float* inReal, __global const float* inImag,
     __global float* outMag, const int n)
 {
@@ -39,7 +39,7 @@ __kernel void complex_magnitude(
     outMag[idx] = sqrt(re * re + im * im);
 }
 
-__kernel void complex_magnitude_squared(
+__kernel void split_complex_magnitude_squared(
     __global const float* inReal, __global const float* inImag,
     __global float* outMagSq, const int n)
 {
@@ -49,7 +49,7 @@ __kernel void complex_magnitude_squared(
     outMagSq[idx] = re * re + im * im;
 }
 
-__kernel void complex_phase(
+__kernel void split_complex_phase(
     __global const float* inReal, __global const float* inImag,
     __global float* outPhase, const int n)
 {
@@ -58,7 +58,7 @@ __kernel void complex_phase(
     outPhase[idx] = atan2(inImag[idx], inReal[idx]);
 }
 
-__kernel void complex_from_polar(
+__kernel void split_complex_from_polar(
     __global const float* mag, __global const float* phase,
     __global float* outReal, __global float* outImag, const int n)
 {
@@ -69,7 +69,7 @@ __kernel void complex_from_polar(
     outImag[idx] = m * sin(p);
 }
 
-__kernel void complex_scale(
+__kernel void split_complex_scale(
     __global const float* inReal, __global const float* inImag,
     __global float* outReal, __global float* outImag,
     const float scalar, const int n)
@@ -80,7 +80,7 @@ __kernel void complex_scale(
     outImag[idx] = inImag[idx] * scalar;
 }
 
-__kernel void complex_add(
+__kernel void split_complex_add(
     __global const float* aReal, __global const float* aImag,
     __global const float* bReal, __global const float* bImag,
     __global float* outReal, __global float* outImag, const int n)
@@ -91,7 +91,7 @@ __kernel void complex_add(
     outImag[idx] = aImag[idx] + bImag[idx];
 }
 
-__kernel void complex_cross_spectral(
+__kernel void split_complex_cross_spectral(
     __global const float* xReal, __global const float* xImag,
     __global const float* yReal, __global const float* yImag,
     __global float* outReal, __global float* outImag, const int n)

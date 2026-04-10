@@ -1084,5 +1084,17 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     {
         return $"WebGpuBackend[Available={IsAvailable}, Device={DeviceName}]";
     }
+
+    // --- Split-buffer native Complex<T> operations ---
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for this backend.");
+
 }
 #endif

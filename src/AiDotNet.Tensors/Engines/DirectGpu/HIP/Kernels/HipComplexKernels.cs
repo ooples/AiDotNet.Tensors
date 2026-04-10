@@ -8,9 +8,9 @@ internal static class HipComplexKernels
 {
     public static string[] GetKernelNames() => new[]
     {
-        "complex_multiply", "complex_conjugate", "complex_magnitude",
-        "complex_magnitude_squared", "complex_phase", "complex_from_polar",
-        "complex_scale", "complex_add", "complex_cross_spectral"
+        "split_complex_multiply", "split_complex_conjugate", "split_complex_magnitude",
+        "split_complex_magnitude_squared", "split_complex_phase", "split_complex_from_polar",
+        "split_complex_scale", "split_complex_add", "split_complex_cross_spectral"
     };
 
     public static string GetSource()
@@ -21,7 +21,7 @@ internal static class HipComplexKernels
 
 #define PI 3.14159265358979323846f
 
-extern ""C"" __global__ void complex_multiply(
+extern ""C"" __global__ void split_complex_multiply(
     const float* aReal, const float* aImag,
     const float* bReal, const float* bImag,
     float* outReal, float* outImag, int n)
@@ -34,7 +34,7 @@ extern ""C"" __global__ void complex_multiply(
     outImag[idx] = ar * bi + ai * br;
 }
 
-extern ""C"" __global__ void complex_conjugate(
+extern ""C"" __global__ void split_complex_conjugate(
     const float* inReal, const float* inImag,
     float* outReal, float* outImag, int n)
 {
@@ -44,7 +44,7 @@ extern ""C"" __global__ void complex_conjugate(
     outImag[idx] = -inImag[idx];
 }
 
-extern ""C"" __global__ void complex_magnitude(
+extern ""C"" __global__ void split_complex_magnitude(
     const float* inReal, const float* inImag,
     float* outMag, int n)
 {
@@ -54,7 +54,7 @@ extern ""C"" __global__ void complex_magnitude(
     outMag[idx] = sqrtf(re * re + im * im);
 }
 
-extern ""C"" __global__ void complex_magnitude_squared(
+extern ""C"" __global__ void split_complex_magnitude_squared(
     const float* inReal, const float* inImag,
     float* outMagSq, int n)
 {
@@ -64,7 +64,7 @@ extern ""C"" __global__ void complex_magnitude_squared(
     outMagSq[idx] = re * re + im * im;
 }
 
-extern ""C"" __global__ void complex_phase(
+extern ""C"" __global__ void split_complex_phase(
     const float* inReal, const float* inImag,
     float* outPhase, int n)
 {
@@ -73,7 +73,7 @@ extern ""C"" __global__ void complex_phase(
     outPhase[idx] = atan2f(inImag[idx], inReal[idx]);
 }
 
-extern ""C"" __global__ void complex_from_polar(
+extern ""C"" __global__ void split_complex_from_polar(
     const float* mag, const float* phase,
     float* outReal, float* outImag, int n)
 {
@@ -84,7 +84,7 @@ extern ""C"" __global__ void complex_from_polar(
     outImag[idx] = m * sinf(p);
 }
 
-extern ""C"" __global__ void complex_scale(
+extern ""C"" __global__ void split_complex_scale(
     const float* inReal, const float* inImag,
     float* outReal, float* outImag, float scalar, int n)
 {
@@ -94,7 +94,7 @@ extern ""C"" __global__ void complex_scale(
     outImag[idx] = inImag[idx] * scalar;
 }
 
-extern ""C"" __global__ void complex_add(
+extern ""C"" __global__ void split_complex_add(
     const float* aReal, const float* aImag,
     const float* bReal, const float* bImag,
     float* outReal, float* outImag, int n)
@@ -105,7 +105,7 @@ extern ""C"" __global__ void complex_add(
     outImag[idx] = aImag[idx] + bImag[idx];
 }
 
-extern ""C"" __global__ void complex_cross_spectral(
+extern ""C"" __global__ void split_complex_cross_spectral(
     const float* xReal, const float* xImag,
     const float* yReal, const float* yImag,
     float* outReal, float* outImag, int n)

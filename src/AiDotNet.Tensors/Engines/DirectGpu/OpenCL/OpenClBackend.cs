@@ -10416,6 +10416,17 @@ KERNEL VARIANTS (A/B testing):
         kernel.Execute1D(numPairs, localSize);
     }
 
+    // --- Split-buffer native Complex<T> operations ---
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops: kernel source in ComplexKernels, dispatch not yet wired for OpenCL.");
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+
     #endregion
 
     #region Quantum Computing Operations

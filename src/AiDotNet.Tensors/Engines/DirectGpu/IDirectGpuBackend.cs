@@ -2821,6 +2821,43 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Complex magnitude — sqrt(re^2+im^2) per pair. Output length = numPairs.</summary>
     void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs);
 
+    // --- Split-buffer complex operations (native Complex<T> support) ---
+    // These use separate real/imag GPU buffers for coalesced memory access,
+    // matching the Tensor<Complex<T>> layout in the IEngine interface.
+
+    /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
+    void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Complex conjugate with split buffers: (re, -im).</summary>
+    void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Complex magnitude with split buffers: sqrt(re^2 + im^2).</summary>
+    void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n);
+
+    /// <summary>Complex magnitude squared with split buffers: re^2 + im^2 (no sqrt).</summary>
+    void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n);
+
+    /// <summary>Complex phase with split buffers: atan2(im, re).</summary>
+    void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n);
+
+    /// <summary>Construct complex from polar with split buffers.</summary>
+    void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Scale complex by real scalar with split buffers.</summary>
+    void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n);
+
+    /// <summary>Element-wise complex addition with split buffers.</summary>
+    void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
+    /// <summary>Cross-spectral density: X * conj(Y) with split buffers (fused for performance).</summary>
+    void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n);
+
     #endregion
 }
 

@@ -9,7 +9,7 @@ internal static class MetalComplexKernels
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void complex_multiply(
+kernel void split_complex_multiply(
     device const float* aReal [[buffer(0)]],
     device const float* aImag [[buffer(1)]],
     device const float* bReal [[buffer(2)]],
@@ -26,7 +26,7 @@ kernel void complex_multiply(
     outImag[idx] = ar * bi + ai * br;
 }
 
-kernel void complex_conjugate(
+kernel void split_complex_conjugate(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],
     device float* outReal [[buffer(2)]],
@@ -39,7 +39,7 @@ kernel void complex_conjugate(
     outImag[idx] = -inImag[idx];
 }
 
-kernel void complex_magnitude(
+kernel void split_complex_magnitude(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],
     device float* outMag [[buffer(2)]],
@@ -51,7 +51,7 @@ kernel void complex_magnitude(
     outMag[idx] = sqrt(re * re + im * im);
 }
 
-kernel void complex_magnitude_squared(
+kernel void split_complex_magnitude_squared(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],
     device float* outMagSq [[buffer(2)]],
@@ -63,7 +63,7 @@ kernel void complex_magnitude_squared(
     outMagSq[idx] = re * re + im * im;
 }
 
-kernel void complex_phase(
+kernel void split_complex_phase(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],
     device float* outPhase [[buffer(2)]],
@@ -74,7 +74,7 @@ kernel void complex_phase(
     outPhase[idx] = atan2(inImag[idx], inReal[idx]);
 }
 
-kernel void complex_from_polar(
+kernel void split_complex_from_polar(
     device const float* mag [[buffer(0)]],
     device const float* phase [[buffer(1)]],
     device float* outReal [[buffer(2)]],
@@ -88,7 +88,7 @@ kernel void complex_from_polar(
     outImag[idx] = m * sin(p);
 }
 
-kernel void complex_scale(
+kernel void split_complex_scale(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],
     device float* outReal [[buffer(2)]],
@@ -102,7 +102,7 @@ kernel void complex_scale(
     outImag[idx] = inImag[idx] * scalar;
 }
 
-kernel void complex_add(
+kernel void split_complex_add(
     device const float* aReal [[buffer(0)]],
     device const float* aImag [[buffer(1)]],
     device const float* bReal [[buffer(2)]],
@@ -117,7 +117,7 @@ kernel void complex_add(
     outImag[idx] = aImag[idx] + bImag[idx];
 }
 
-kernel void complex_cross_spectral(
+kernel void split_complex_cross_spectral(
     device const float* xReal [[buffer(0)]],
     device const float* xImag [[buffer(1)]],
     device const float* yReal [[buffer(2)]],

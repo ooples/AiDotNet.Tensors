@@ -9812,6 +9812,137 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // --- Split-buffer native Complex<T> operations ---
+
+    public unsafe void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_multiply", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_multiply. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle;
+        IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pAR; args[1] = &pAI; args[2] = &pBR; args[3] = &pBI;
+        args[4] = &pOR; args[5] = &pOI; args[6] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_conjugate", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_conjugate. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_magnitude", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMag.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_magnitude_squared", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude_squared. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMagSq.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_phase", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_phase. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outPhase.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_from_polar", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_from_polar. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pM = mag.Handle, pP = phase.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pM; args[1] = &pP; args[2] = &pOR; args[3] = &pOI; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_scale", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_scale. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &scalar; args[5] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_add", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_add. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle;
+        IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pAR; args[1] = &pAI; args[2] = &pBR; args[3] = &pBI;
+        args[4] = &pOR; args[5] = &pOI; args[6] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("split_complex_cross_spectral", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: split_complex_cross_spectral. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pXR = xReal.Handle, pXI = xImag.Handle, pYR = yReal.Handle, pYI = yImag.Handle;
+        IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pXR; args[1] = &pXI; args[2] = &pYR; args[3] = &pYI;
+        args[4] = &pOR; args[5] = &pOI; args[6] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     #endregion
 
     #region Quantum Computing Operations
