@@ -11,7 +11,6 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Performance tests measuring gradient tape recording overhead.
 /// These run as xUnit tests (not BenchmarkDotNet) for quick CI validation.
 /// </summary>
-[Trait("Category", "Benchmark")]
 public class TapePerformanceTests
 {
     private readonly ITestOutputHelper _output;
@@ -271,6 +270,7 @@ public class TapePerformanceTests
     }
 
     [Fact]
+    [Trait("Category", "Benchmark")]
     public void MLP_TrainStep_StepsPerSecond()
     {
         // Measure training throughput and compare against PyTorch CPU expectations.
