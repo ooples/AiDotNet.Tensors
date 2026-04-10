@@ -15340,4 +15340,32 @@ if (!TryGetBackend(out var backend))
         }
         catch { return base.NativeComplexIFFT(input); }
     }
+
+    public override Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
+    {
+        if (typeof(T) != typeof(float))
+            return base.TensorSoftmaxRows(input);
+        if (input.Rank != 2)
+            return base.TensorSoftmaxRows(input);
+        if (!TryGetBackend(out var backend))
+            return base.TensorSoftmaxRows(input);
+
+        try
+        {
+            var ops = MathHelper.GetNumericOperations<T>();
+            int rows = input._shape[0];
+            int cols = input._shape[1];
+            int total = rows * cols;
+            var inputF = new float[total];
+            for (int i = 0; i < total; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+
+            backend.SoftmaxRows(inBuf.Buffer, outBuf.Buffer, rows, cols);
+
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), input._shape);
+        }
+        catch { return base.TensorSoftmaxRows(input); }
+    }
 }
