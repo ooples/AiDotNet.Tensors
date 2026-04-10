@@ -47,9 +47,19 @@ public sealed partial class HipBackend
 
     // --- Split-buffer native Complex<T> operations (HIP dispatch) ---
 
+    private static void ValidateHipSplitBuffers(int n, string opName, params IGpuBuffer[] buffers)
+    {
+        foreach (var buf in buffers)
+        {
+            if (buf is null) throw new ArgumentNullException(opName, "GPU buffer cannot be null.");
+            if (n > buf.Size) throw new ArgumentException($"{opName}: n ({n}) exceeds buffer size ({buf.Size}).");
+        }
+    }
+
     public unsafe void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexMultiply), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_multiply", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_multiply. Register HipComplexKernels.");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -61,6 +71,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexConjugate), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_conjugate", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_conjugate");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -72,6 +83,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexMagnitude), inReal, inImag, outMag);
         if (!_kernelCache.TryGetValue("split_complex_magnitude", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_magnitude");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -83,6 +95,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexMagnitudeSquared), inReal, inImag, outMagSq);
         if (!_kernelCache.TryGetValue("split_complex_magnitude_squared", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_magnitude_squared");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -94,6 +107,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexPhase), inReal, inImag, outPhase);
         if (!_kernelCache.TryGetValue("split_complex_phase", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_phase");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -105,6 +119,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexFromPolar), mag, phase, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_from_polar", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_from_polar");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -116,6 +131,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexScale), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_scale", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_scale");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -127,6 +143,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexAdd), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_add", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_add");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -138,6 +155,7 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexCrossSpectral), xReal, xImag, yReal, yImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_cross_spectral", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_cross_spectral");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);

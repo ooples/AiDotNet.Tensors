@@ -27631,19 +27631,22 @@ public class CpuEngine : ITensorLevelEngine
                 (data[i], data[j]) = (data[j], data[i]);
         }
 
-        // Butterfly stages
+        // Butterfly stages with precomputed twiddle factors per stage
         for (int size = 2; size <= n; size *= 2)
         {
             int halfSize = size / 2;
             double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
 
+            // Precompute twiddle factors once per stage (not per butterfly)
+            var twiddles = new Complex<T>[halfSize];
+            for (int k = 0; k < halfSize; k++)
+                twiddles[k] = Complex<T>.FromPolarCoordinates(ops.One, ops.FromDouble(baseAngle * k));
+
             for (int start = 0; start < n; start += size)
             {
                 for (int k = 0; k < halfSize; k++)
                 {
-                    var twiddle = Complex<T>.FromPolarCoordinates(
-                        ops.One, ops.FromDouble(baseAngle * k));
-                    var t = complexOps.Multiply(twiddle, data[start + k + halfSize]);
+                    var t = complexOps.Multiply(twiddles[k], data[start + k + halfSize]);
                     var u = data[start + k];
                     data[start + k] = complexOps.Add(u, t);
                     data[start + k + halfSize] = complexOps.Subtract(u, t);
