@@ -325,7 +325,14 @@ public class NativeComplexOpsTests
         Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexMultiply<double>(null!, new Tensor<Complex<double>>([1])));
         Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexConjugate<double>(null!));
         Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexMagnitude<double>(null!));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexMagnitudeSquared<double>(null!));
         Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexPhase<double>(null!));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexFromPolar<double>(null!, new Tensor<double>([1])));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexFromPolar<double>(new Tensor<double>([1]), null!));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexScale<double>(null!, 1.0));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexAdd<double>(null!, new Tensor<Complex<double>>([1])));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexMultiply<double>(new Tensor<Complex<double>>([1]), null!));
+        Assert.Throws<ArgumentNullException>(() => _engine.NativeComplexAdd<double>(new Tensor<Complex<double>>([1]), null!));
     }
 
     // ================================================================

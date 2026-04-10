@@ -27576,9 +27576,7 @@ public class CpuEngine : ITensorLevelEngine
         if (magnitudes.Length != phases.Length)
             throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
 
-        // NativeComplexFromPolar is a cross-type operation (T -> Complex<T>).
-        // GraphMode recording uses the magnitude tensor for tracing since it's the primary input.
-        // AutoTracer uses magnitude shape since output matches it.
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27696,11 +27694,16 @@ public class CpuEngine : ITensorLevelEngine
                 for (int k = 0; k < halfSize; k++)
                 {
                     var tw = cachedTwiddles[twiddleIdx + k];
-                    var twiddle = new Complex<T>(ops.FromDouble(tw.Real), ops.FromDouble(tw.Imaginary));
-                    var t = complexOps.Multiply(twiddle, data[start + k + halfSize]);
+                    // Inline complex multiply to avoid Complex<T> construction per iteration:
+                    // twiddle * data[bot] = (tw.re*d.re - tw.im*d.im, tw.re*d.im + tw.im*d.re)
+                    var d = data[start + k + halfSize];
+                    var twRe = ops.FromDouble(tw.Real);
+                    var twIm = ops.FromDouble(tw.Imaginary);
+                    var tRe = ops.Subtract(ops.Multiply(twRe, d.Real), ops.Multiply(twIm, d.Imaginary));
+                    var tIm = ops.Add(ops.Multiply(twRe, d.Imaginary), ops.Multiply(twIm, d.Real));
                     var u = data[start + k];
-                    data[start + k] = complexOps.Add(u, t);
-                    data[start + k + halfSize] = complexOps.Subtract(u, t);
+                    data[start + k] = new Complex<T>(ops.Add(u.Real, tRe), ops.Add(u.Imaginary, tIm));
+                    data[start + k + halfSize] = new Complex<T>(ops.Subtract(u.Real, tRe), ops.Subtract(u.Imaginary, tIm));
                 }
             }
             twiddleIdx += halfSize;
