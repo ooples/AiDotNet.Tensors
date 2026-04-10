@@ -1579,15 +1579,60 @@ public sealed unsafe partial class VulkanBackend
 
     #endregion
 
-    // --- Split-buffer native Complex<T> operations ---
-    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
-    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex: not yet wired for Vulkan.");
+    // --- Split-buffer native Complex<T> operations (Vulkan) ---
+    // Delegates to existing split-buffer GPU ops where available,
+    // composes from primitives where dedicated kernels don't exist yet.
+
+    public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        // (aR*bR - aI*bI, aR*bI + aI*bR) — compose from element-wise ops
+        if (n <= 0) return;
+        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
+        var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
+        Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
+        Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
+        t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose();
+    }
+
+    public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        Copy(iR, 0, oR, 0, n);
+        Negate(iI, oI, n);
+    }
+
+    public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexMagnitude(iR, iI, o, n);
+    public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
+    {
+        if (n <= 0) return;
+        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
+        Multiply(iR, iR, t1, n); Multiply(iI, iI, t2, n); Add(t1, t2, o, n);
+        t1.Dispose(); t2.Dispose();
+    }
+    public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
+    public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
+
+    public void SplitComplexScale(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, float s, int n)
+    {
+        if (n <= 0) return;
+        Scale(iR, oR, s, n); Scale(iI, oI, s, n);
+    }
+
+    public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        if (n <= 0) return;
+        Add(aR, bR, oR, n); Add(aI, bI, oI, n);
+    }
+
+    public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
+    {
+        // X * conj(Y) = (xR*yR + xI*yI, xI*yR - xR*yI)
+        if (n <= 0) return;
+        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
+        var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
+        Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
+        Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
+        t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose();
+    }
 
 }

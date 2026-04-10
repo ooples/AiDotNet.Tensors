@@ -10416,16 +10416,49 @@ KERNEL VARIANTS (A/B testing):
         kernel.Execute1D(numPairs, localSize);
     }
 
-    // --- Split-buffer native Complex<T> operations ---
-    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops: kernel source in ComplexKernels, dispatch not yet wired for OpenCL.");
-    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
-    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => throw new NotSupportedException("SplitComplex ops not yet wired for OpenCL.");
+    // --- Split-buffer native Complex<T> operations (OpenCL dispatch) ---
+
+    private void DispatchSplitComplex(string kernelName, IGpuBuffer[] buffers, int n, float? scalar = null)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}. Register ComplexKernels.");
+        int localSize = CalculateOptimalWorkGroupSize1D(n);
+        uint argIdx = 0;
+        foreach (var buf in buffers)
+            kernel.SetArg(argIdx++, ((DirectOpenClGpuBuffer)buf).Buffer.Handle);
+        if (scalar.HasValue)
+            kernel.SetArg(argIdx++, scalar.Value);
+        kernel.SetArg(argIdx, n);
+        kernel.Execute1D(n, localSize);
+    }
+
+    public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_multiply", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_conjugate", [inReal, inImag, outReal, outImag], n);
+
+    public void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n)
+        => DispatchSplitComplex("split_complex_magnitude", [inReal, inImag, outMag], n);
+
+    public void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n)
+        => DispatchSplitComplex("split_complex_magnitude_squared", [inReal, inImag, outMagSq], n);
+
+    public void SplitComplexPhase(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outPhase, int n)
+        => DispatchSplitComplex("split_complex_phase", [inReal, inImag, outPhase], n);
+
+    public void SplitComplexFromPolar(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_from_polar", [mag, phase, outReal, outImag], n);
+
+    public void SplitComplexScale(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, float scalar, int n)
+        => DispatchSplitComplex("split_complex_scale", [inReal, inImag, outReal, outImag], n, scalar);
+
+    public void SplitComplexAdd(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_add", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
+        => DispatchSplitComplex("split_complex_cross_spectral", [xReal, xImag, yReal, yImag, outReal, outImag], n);
 
     #endregion
 
