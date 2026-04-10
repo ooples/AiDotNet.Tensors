@@ -270,6 +270,7 @@ public class TapePerformanceTests
     }
 
     [Fact]
+    [Trait("Category", "Benchmark")]
     public void MLP_TrainStep_StepsPerSecond()
     {
         // Measure training throughput and compare against PyTorch CPU expectations.
