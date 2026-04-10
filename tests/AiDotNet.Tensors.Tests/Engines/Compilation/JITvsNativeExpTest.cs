@@ -26,10 +26,12 @@ public class JITvsNativeExpTest
         for (int i = 0; i < length; i++) input[i] = (float)(rng.NextDouble() * 20 - 10);
         var output = new float[length];
 
-        var hIn = GCHandle.Alloc(input, GCHandleType.Pinned);
-        var hOut = GCHandle.Alloc(output, GCHandleType.Pinned);
+        var hIn = default(GCHandle);
+        var hOut = default(GCHandle);
         try
         {
+        hIn = GCHandle.Alloc(input, GCHandleType.Pinned);
+        hOut = GCHandle.Alloc(output, GCHandleType.Pinned);
         float* pIn = (float*)hIn.AddrOfPinnedObject();
         float* pOut = (float*)hOut.AddrOfPinnedObject();
 
@@ -81,8 +83,8 @@ public class JITvsNativeExpTest
         }
         finally
         {
-            hIn.Free();
-            hOut.Free();
+            if (hIn.IsAllocated) hIn.Free();
+            if (hOut.IsAllocated) hOut.Free();
         }
     }
 }

@@ -16656,16 +16656,21 @@ public class CpuEngine : ITensorLevelEngine
                 var capturedInput = input;
                 var capturedAxes = axes;
                 bool capturedKeepDims = keepDims;
-                // Compute maxIndices eagerly so backward has correct argmax indices
-                var eagerResult = ReduceMax(input, effectiveAxes.ToArray(), keepDims, out var eagerIndices);
-                maxIndices = eagerIndices;
+                // For backward, we need maxIndices. Compute via the execute delegate
+                // at replay time (avoids recursive call during GraphMode recording).
+                maxIndices = Array.Empty<int>();
+                var capturedEffectiveAxes = effectiveAxes.ToArray();
+                // savedState[0] will be populated with maxIndices at execute time
+                var savedStateArr = new object[] { Array.Empty<int>() };
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
                     (eng, output) =>
                     {
-                        eagerResult.AsSpan().CopyTo(output.AsWritableSpan());
+                        var eager = eng.ReduceMax(capturedInput, capturedEffectiveAxes, capturedKeepDims, out var indices);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        savedStateArr[0] = indices; // update for backward pass
                     },
                     BackwardFunctions<T>.ReduceMaxBackward,
-                    new object[] { eagerIndices });
+                    savedStateArr);
             }
         }
 
