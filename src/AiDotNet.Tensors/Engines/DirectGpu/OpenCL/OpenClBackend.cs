@@ -512,6 +512,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _programs.Add(softmaxVarProgram);
                 foreach (var name in SoftmaxVariantKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
+
+                // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
+                var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
+                _programs.Add(complexProgram);
+                foreach (var name in ComplexKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, complexProgram, name);
             }
             catch (Exception ex)
             {

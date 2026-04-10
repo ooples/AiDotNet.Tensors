@@ -1093,9 +1093,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         if (n <= 0) return;
         var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
         var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
-        Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
-        Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
-        t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose();
+        try
+        {
+            Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
+            Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
+        }
+        finally { t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose(); }
     }
 
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
@@ -1110,8 +1113,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     {
         if (n <= 0) return;
         var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
-        Multiply(iR, iR, t1, n); Multiply(iI, iI, t2, n); Add(t1, t2, o, n);
-        t1.Dispose(); t2.Dispose();
+        try { Multiply(iR, iR, t1, n); Multiply(iI, iI, t2, n); Add(t1, t2, o, n); }
+        finally { t1.Dispose(); t2.Dispose(); }
     }
     public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
     public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
@@ -1133,9 +1136,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         if (n <= 0) return;
         var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
         var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
-        Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
-        Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
-        t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose();
+        try
+        {
+            Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
+            Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
+        }
+        finally { t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose(); }
     }
 
 }

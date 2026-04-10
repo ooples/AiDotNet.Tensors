@@ -1586,7 +1586,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     // --- Split-buffer native Complex<T> operations (Metal dispatch) ---
 
     private IntPtr _complexLibrary;
-    private void EnsureComplexLibrary() { if (_complexLibrary == IntPtr.Zero) _complexLibrary = _shaderLibrary.CompileLibrary("Complex", MetalComplexKernels.GetSource()); }
+    private readonly object _complexLibraryLock = new();
+    private void EnsureComplexLibrary()
+    {
+        if (_complexLibrary != IntPtr.Zero) return;
+        lock (_complexLibraryLock)
+        {
+            if (_complexLibrary == IntPtr.Zero)
+                _complexLibrary = _shaderLibrary.CompileLibrary("Complex", MetalComplexKernels.GetSource());
+        }
+    }
     private static MetalGpuBuffer AsMetal(IGpuBuffer buf) => (MetalGpuBuffer)buf;
 
     private void DispatchComplexMetal(string kernel, MetalGpuBuffer[] bufs, int n, float? scalar = null)

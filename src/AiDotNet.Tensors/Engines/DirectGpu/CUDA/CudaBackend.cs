@@ -677,6 +677,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 _hasWmmaSupport = false;
             }
         }
+
+        // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
+        CompileKernelModule(device, Kernels.CudaComplexKernels.GetSource(), "complex_kernels", Kernels.CudaComplexKernels.GetKernelNames());
     }
 
     private static string GetNvrtcLog(IntPtr program)
