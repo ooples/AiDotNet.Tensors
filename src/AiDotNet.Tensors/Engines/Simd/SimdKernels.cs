@@ -1364,18 +1364,23 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// while waiting for memory, hiding latency better than 4-way for large arrays.
         /// No software prefetch — Zen 2/3+ hardware prefetcher handles sequential patterns optimally.
         /// </summary>
+        // Pre-allocated partial sums buffer to avoid per-call allocation in SumUnsafe
+        [ThreadStatic] private static float[]? _sumPartials;
+
         [MethodImpl(HotInline)]
         public static unsafe float SumUnsafe(float* data, int length)
         {
             // For large arrays, use PersistentParallelExecutor to saturate memory bandwidth
-            // across all CPU cores — matching PyTorch's OpenMP approach with zero-allocation,
-            // near-zero dispatch overhead (pre-spawned threads, spin-wait barrier).
+            // across all CPU cores — matching PyTorch's OpenMP approach with near-zero
+            // dispatch overhead (pre-spawned threads, spin-wait barrier).
             if (length >= 262144) // 1MB threshold
             {
                 var executor = Helpers.PersistentParallelExecutor.Instance;
                 int nChunks = Math.Min(Environment.ProcessorCount, 16);
                 int chunkSize = length / nChunks;
-                var partials = new float[nChunks];
+                var partials = _sumPartials;
+                if (partials == null || partials.Length < nChunks)
+                    _sumPartials = partials = new float[nChunks];
                 var capturedData = data;
                 executor.Execute(nChunks, chunk =>
                 {

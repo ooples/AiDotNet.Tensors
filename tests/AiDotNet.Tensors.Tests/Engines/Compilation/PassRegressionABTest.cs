@@ -157,7 +157,7 @@ public class PassRegressionABTest
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(opts is not null ? null : prev);
+            TensorCodecOptions.SetCurrent(prev);
         }
     }
 

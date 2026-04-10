@@ -14214,7 +14214,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis >= 0 && axis < tensor.Rank)
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis >= 0 && axis < tensor.Rank
+            && index >= 0 && index < tensor.Shape._dims[axis])
         {
             try
             {

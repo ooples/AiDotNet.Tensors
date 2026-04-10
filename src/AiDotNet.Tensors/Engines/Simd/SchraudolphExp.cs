@@ -42,15 +42,9 @@ internal static class SchraudolphExp
 
 #if NET5_0_OR_GREATER
     /// <summary>
-    /// Schraudolph exp with 2nd-order correction: ~0.05% max error.
-    /// </summary>
-    /// <summary>
     /// Schraudolph exp with 5th-order Chebyshev-optimized mantissa correction.
     /// Max relative error: 4.82e-5 (sufficient for ML, exceeds float16 precision).
     /// Total: 10 SIMD operations per 8 floats (vs 12 Estrin, 14 Horner+div).
-    ///
-    /// The correction polynomial C(f) satisfies (1+f)*C(f) = 2^f for f in [0,1).
-    /// Coefficients computed via Remez-optimal least-squares fit.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Vector256<float> Exp8Corrected(Vector256<float> x)

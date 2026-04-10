@@ -16,7 +16,6 @@ public class CompiledTrainingPlanRebindingTests
     public void Step_SeesInPlaceParameterUpdates()
     {
         var engine = new CpuEngine();
-        var numOps = MathHelper.GetNumericOperations<float>();
 
         // Simple: input @ weight, sum -> loss
         var input = Tensor<float>.CreateRandom([4, 3]);

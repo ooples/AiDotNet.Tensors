@@ -620,6 +620,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 unsafe
                 {
                     float* p = (float*)inH.AddrOfPinnedObject();
+                    if (len == 0) { cOut[0] = float.NegativeInfinity; return; }
                     float maxVal = p[0];
                     for (int j = 1; j < len; j++)
                         if (p[j] > maxVal) maxVal = p[j];

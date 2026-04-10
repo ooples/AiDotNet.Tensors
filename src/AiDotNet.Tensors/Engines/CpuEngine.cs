@@ -7033,7 +7033,7 @@ public class CpuEngine : ITensorLevelEngine
                 return result;
             }
 
-            // SIMD fallback — use PersistentParallelExecutor for near-zero dispatch
+            // SIMD fallback — direct call (Padé [3,3] fused sigmoid)
             SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }

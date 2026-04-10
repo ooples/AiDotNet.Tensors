@@ -7,36 +7,28 @@ using System.Runtime.Intrinsics.X86;
 namespace AiDotNet.Tensors.Engines.Simd;
 
 /// <summary>
-/// Padé [2,2] rational approximation for sigmoid — fuses exp and divide into one.
+/// Padé [3,3] rational approximation for sigmoid — fuses exp and divide into one.
 ///
 /// Mathematical foundation:
-///   exp(x) ≈ P(x)/Q(x) where P(x) = 1 + x/2 + x²/12, Q(x) = 1 - x/2 + x²/12
+///   exp(x) ≈ P(x)/Q(x), sigmoid = Q(-r) / (Q(-r) + 2^n * P(-r))
 ///
-///   sigmoid(x) = 1 / (1 + exp(-x))
-///              = 1 / (1 + P(-r)/Q(-r))   [after range reduction: x = n*ln2 + r]
-///              = Q(-r) / (Q(-r) + P(-r))  [single divide!]
-///              = Q(r') / (Q(r') + P(r'))  [where r' = -r, using symmetry]
+///   P(r) = 1 + r/2 + r²/10 + r³/120
+///   Q(r) = 1 - r/2 + r²/10 - r³/120
+///   Even/odd splitting: even = 1 + r²/10, odd = r/2 + r³/120
+///   P = even + odd, Q = even - odd (parallel FMA chains)
 ///
-/// For the reduced range r' in [0, ln2):
-///   Numerator:   Q(r') = 1 + r'/2 + r'²/12       (2 FMA)
-///   Denominator: Q(r') + P(r') = 2 + r'²/6       (1 FMA)
-///   Plus range reduction: 3 ops
-///   Plus 2^n scaling: 1 op
-///   Total: ~8 ops + 1 divide = 9 ops (vs current 12 ops + 1 divide = 13 ops)
+///   Range reduction: x = n*ln2 + r, then 2^n via IEEE bit manipulation.
+///   n is clamped to [-20, 20] off the critical path to prevent overflow.
 ///
-/// Accuracy: Padé [2,2] gives 4.57e-4 max error on [0, ln2) for the exp component.
-/// After sigmoid composition, the error is further reduced because sigmoid clamps.
+/// Accuracy: 1.19e-7 max error (float32 exact precision).
 /// </summary>
 internal static class PadeSigmoid
 {
 #if NET5_0_OR_GREATER
     /// <summary>
-    /// Padé sigmoid: 8 floats at a time, single divide, no exp.
-    /// </summary>
-    /// <summary>
-    /// Padé [3,3] fused sigmoid. P and Q numerator/denominator computed IN PARALLEL
-    /// (independent FMA chains) reducing effective latency from 6 serial FMAs to 4.
-    /// Max error: 1.45e-9 (exceeds float32 precision — essentially exact).
+    /// Padé [3,3] fused sigmoid: 8 floats at a time, single divide, no exp call.
+    /// P and Q computed in parallel via even/odd splitting.
+    /// Max error: 1.19e-7 (float32 exact precision).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Vector256<float> Sigmoid8(Vector256<float> x)
