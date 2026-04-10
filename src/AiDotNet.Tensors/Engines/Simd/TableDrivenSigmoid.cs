@@ -77,13 +77,11 @@ internal static class TableDrivenSigmoid
         {
             var vXMin = Vector256.Create(XMin);
             var vInvStep = Vector256.Create(InvStep);
-            var vMaxIdx = Vector256.Create(TableSize - 2);
             var vZero = Vector256<float>.Zero;
             var vOne = Vector256.Create(1.0f);
             var vHalf = Vector256.Create(0.5f);
             var vNeg3 = Vector256.Create(-3.0f);
             var vFour = Vector256.Create(4.0f);
-            var vNeg2 = Vector256.Create(-2.0f);
 
             fixed (float* tablePtr = Table)
             {

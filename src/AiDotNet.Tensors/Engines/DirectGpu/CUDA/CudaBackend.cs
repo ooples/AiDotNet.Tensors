@@ -10699,12 +10699,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // General case: each thread copies one element from the correct strided position
         // GPU kernel: out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
         if (!_kernelCache.TryGetValue("slice_axis", out var kernel))
-        {
-            // Kernel not compiled yet — fall back to last-axis specialization or CPU
-            // This shouldn't happen after shape kernels are loaded
-            SliceLastAxis(input, output, outerSize, axisSize, index, stride);
-            return;
-        }
+            throw new InvalidOperationException("CUDA slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -10721,10 +10716,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             return;
         }
         if (!_kernelCache.TryGetValue("set_slice_axis", out var kernel))
-        {
-            SetSliceLastAxis(output, values, outerSize, axisSize, index, stride);
-            return;
-        }
+            throw new InvalidOperationException("CUDA set_slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle, valPtr = values.Handle;
         void** args = stackalloc void*[6];
