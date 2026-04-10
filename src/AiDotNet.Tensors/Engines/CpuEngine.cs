@@ -6260,13 +6260,55 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Performs 2D convolution with explicit memory format hint.
-    /// Delegates to the standard Conv2D which handles autodiff recording, GraphMode,
-    /// tracing, and already selects the optimal kernel (OneDNN, SIMD, or generic).
+    /// Performs 2D convolution with explicit memory format.
+    /// ChannelsLast routes through the NHWC im2col+GEMM kernel for better SIMD
+    /// utilization. All other formats delegate to the standard NCHW Conv2D.
+    /// Autodiff recording is handled by the standard Conv2D path.
     /// </summary>
     public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation, MemoryFormat format)
     {
-        return Conv2D(input, kernel, stride, padding, dilation);
+        if (format != MemoryFormat.ChannelsLast || typeof(T) != typeof(float)
+            || input.Rank != 4 || kernel.Rank != 4)
+            return Conv2D(input, kernel, stride, padding, dilation);
+
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+
+        int batch = input._shape[0], inC = input._shape[1], h = input._shape[2], w = input._shape[3];
+        int outC = kernel._shape[0], kH = kernel._shape[2], kW = kernel._shape[3];
+        if (kernel._shape[1] != inC)
+            return Conv2D(input, kernel, stride, padding, dilation);
+
+        int effKH = dilation * (kH - 1) + 1, effKW = dilation * (kW - 1) + 1;
+        int outH = (h + 2 * padding - effKH) / stride + 1;
+        int outW = (w + 2 * padding - effKW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            return Conv2D(input, kernel, stride, padding, dilation);
+
+        var inputArr = (float[])(object)input.GetDataArray();
+        var nhwcInput = new float[inputArr.Length];
+        Simd.NhwcConv.NchwToNhwc(inputArr, nhwcInput, batch, inC, h, w);
+
+        var kernelArr = (float[])(object)kernel.GetDataArray();
+        var nhwcOutput = new float[batch * outH * outW * outC];
+        Simd.NhwcConv.Conv2DNhwc(nhwcInput, kernelArr, nhwcOutput,
+            batch, inC, h, w, outC, kH, kW,
+            stride, stride, padding, padding, dilation, dilation, outH, outW);
+
+        var nchwOutput = new float[nhwcOutput.Length];
+        Simd.NhwcConv.NhwcToNchw(nhwcOutput, nchwOutput, batch, outC, outH, outW);
+
+        var result = new Tensor<float>(nchwOutput, new[] { batch, outC, outH, outW });
+
+        // Record for autodiff (same backward as standard Conv2D)
+        DifferentiableOps.RecordBinary("Conv2D",
+            (Tensor<T>)(object)result, input, kernel,
+            Autodiff.BackwardFunctions<T>.Conv2DBackward,
+            new object[] { stride, padding, dilation });
+        AutoTracer.RecordOp("Conv2D", (Tensor<T>)(object)result,
+            eng => (Tensor<T>)(object)result);
+
+        return (Tensor<T>)(object)result;
     }
 
     /// <summary>

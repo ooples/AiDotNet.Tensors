@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
     /// Complete A/B test matrix: every approach measured on the SAME workload.
     /// Every new phase must add its row to this benchmark.
     /// </summary>
+    [Trait("Category", "Benchmark")]
     public class TensorCodecBaselineBenchmark
     {
         private readonly ITestOutputHelper _output;
