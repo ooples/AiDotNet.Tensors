@@ -9979,7 +9979,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         var magData = DownloadBuffer(magBuf);
         Array.Sort(magData);
         Array.Reverse(magData);
-        float threshold = k < n ? magData[k] : 0f;
+        float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);

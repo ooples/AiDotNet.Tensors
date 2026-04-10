@@ -10479,7 +10479,7 @@ KERNEL VARIANTS (A/B testing):
             SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
             var magData = DownloadBuffer(magBuf);
             Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k < n ? magData[k] : 0f;
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
             int localSize = CalculateOptimalWorkGroupSize1D(n);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)inImag).Buffer.Handle);

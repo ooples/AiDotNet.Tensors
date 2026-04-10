@@ -1631,7 +1631,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
             SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
             var magData = DownloadBuffer(magBuf);
             Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k < n ? magData[k] : 0f;
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
             DispatchComplexMetal("split_complex_topk", [AsMetal(inReal), AsMetal(inImag), AsMetal(outReal), AsMetal(outImag)], n, threshold);
         }
         finally { magBuf.Dispose(); }

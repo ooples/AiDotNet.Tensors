@@ -15249,6 +15249,8 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y)
     {
+        if (x is null || y is null || x.Length != y.Length)
+            return base.NativeComplexCrossSpectral(x ?? throw new ArgumentNullException(nameof(x)), y ?? throw new ArgumentNullException(nameof(y)));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexCrossSpectral(x, y);
         if (!TryGetBackend(out var backend))

@@ -39,13 +39,13 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
         // Realize input first if it's also lazy
         if (Input is { LazySource: ILazyNode inputNode } && !inputNode.IsRealized)
             inputNode.Realize(engine);
 
         Execute(engine, Output);
-        IsRealized = true;
     }
 
     public ILazyNode[] GetInputNodes()

@@ -1169,7 +1169,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
             var rData = DownloadBuffer(inReal);
             var iData = DownloadBuffer(inImag);
             Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k < n ? magData[k] : 0f;
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
             for (int i = 0; i < n; i++)
             {
                 float ms = rData[i] * rData[i] + iData[i] * iData[i];

@@ -177,7 +177,7 @@ public sealed partial class HipBackend
             SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
             var magData = DownloadBuffer(magBuf);
             Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k < n ? magData[k] : 0f;
+            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
             uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
             IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
             void** args = stackalloc void*[6];

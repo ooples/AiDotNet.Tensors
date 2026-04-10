@@ -27407,7 +27407,6 @@ public class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
         var result = new Tensor<Complex<T>>(input._shape);
 
         // Transform along last axis, batch over leading dimensions
@@ -27418,7 +27417,7 @@ public class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < fftSize; i++)
                 slice[i] = new Complex<T>(input[offset + i], ops.Zero);
 
-            NativeFFTInPlace(slice, false, ops, complexOps);
+            NativeFFTInPlace(slice, false, ops);
 
             for (int i = 0; i < fftSize; i++)
                 result[offset + i] = slice[i];
@@ -27439,7 +27438,6 @@ public class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
         var scale = ops.FromDouble(fftSize);
         var result = new Tensor<T>(input._shape);
 
@@ -27449,7 +27447,7 @@ public class CpuEngine : ITensorLevelEngine
             int offset = b * fftSize;
             for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
 
-            NativeFFTInPlace(slice, true, ops, complexOps);
+            NativeFFTInPlace(slice, true, ops);
 
             for (int i = 0; i < fftSize; i++)
                 result[offset + i] = ops.Divide(slice[i].Real, scale);
@@ -27470,7 +27468,6 @@ public class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
         var scale = ops.FromDouble(fftSize);
         var result = new Tensor<Complex<T>>(input._shape);
 
@@ -27480,7 +27477,7 @@ public class CpuEngine : ITensorLevelEngine
             int offset = b * fftSize;
             for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
 
-            NativeFFTInPlace(slice, true, ops, complexOps);
+            NativeFFTInPlace(slice, true, ops);
 
             for (int i = 0; i < fftSize; i++)
                 result[offset + i] = new Complex<T>(
@@ -27503,7 +27500,6 @@ public class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var complexOps = MathHelper.GetNumericOperations<Complex<T>>();
         var result = new Tensor<Complex<T>>(input._shape);
 
         var slice = new Complex<T>[fftSize];
@@ -27512,7 +27508,7 @@ public class CpuEngine : ITensorLevelEngine
             int offset = b * fftSize;
             for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
 
-            NativeFFTInPlace(slice, false, ops, complexOps);
+            NativeFFTInPlace(slice, false, ops);
 
             for (int i = 0; i < fftSize; i++) result[offset + i] = slice[i];
         }
@@ -27527,7 +27523,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
-        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape); if (ac is not null) return ac.Execute(); }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape, paramHash: k); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
@@ -27554,7 +27550,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < n; i++)
             result[i] = topKIndices.Contains(i) ? input[i] : zero;
 
-        { var ci = input; var ck = k; AutoTracer.RecordOp("NativeComplexTopK", result, eng => eng.NativeComplexTopK(ci, ck)); }
+        { var ci = input; var ck = k; AutoTracer.RecordOp("NativeComplexTopK", result, eng => eng.NativeComplexTopK(ci, ck), paramHash: k); }
         return result;
     }
 
@@ -27564,6 +27560,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 2) throw new ArgumentException("TensorSoftmaxRows requires a 2D tensor.", nameof(input));
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSoftmaxRows", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27779,7 +27776,7 @@ public class CpuEngine : ITensorLevelEngine
         if (magnitudes.Length != phases.Length)
             throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27928,7 +27925,7 @@ public class CpuEngine : ITensorLevelEngine
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<double>[]>? _twiddleCache;
 
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
-        INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)
+        INumericOperations<T> ops)
     {
         int n = data.Length;
         // Integer log2 — avoids floating-point rounding errors from Math.Log
