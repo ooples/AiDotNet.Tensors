@@ -1076,6 +1076,14 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         _disposed = true;
         _sharedDummyBuffer?.Dispose();
         _sharedDummyBuffer = null;
+
+        // Dispose cached complex scratch buffers
+        if (_complexScratch is not null)
+        {
+            foreach (var buf in _complexScratch) buf?.Dispose();
+            _complexScratch = null;
+        }
+
         _shaderLibrary.Dispose();
         _pipelineCache.Clear();
     }

@@ -27615,6 +27615,9 @@ public class CpuEngine : ITensorLevelEngine
     /// In-place iterative Cooley-Tukey FFT on a Complex&lt;T&gt; array.
     /// Input length must be a power of 2 (validated by callers).
     /// </summary>
+    // Cache twiddle factors across FFT calls — key is (n, inverse)
+    [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<double>[]>? _twiddleCache;
+
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops, INumericOperations<Complex<T>> complexOps)
     {
@@ -27631,27 +27634,43 @@ public class CpuEngine : ITensorLevelEngine
                 (data[i], data[j]) = (data[j], data[i]);
         }
 
-        // Butterfly stages with precomputed twiddle factors per stage
+        // Get or create cached twiddle table for this (n, inverse) pair
+        _twiddleCache ??= new Dictionary<(int, bool), Complex<double>[]>();
+        var cacheKey = (n, inverse);
+        if (!_twiddleCache.TryGetValue(cacheKey, out var cachedTwiddles))
+        {
+            // Precompute all twiddle factors for all stages at once
+            cachedTwiddles = new Complex<double>[n / 2];
+            int idx = 0;
+            for (int size = 2; size <= n; size *= 2)
+            {
+                int halfSize = size / 2;
+                double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
+                for (int k = 0; k < halfSize; k++)
+                    cachedTwiddles[idx++] = new Complex<double>(Math.Cos(baseAngle * k), Math.Sin(baseAngle * k));
+            }
+            _twiddleCache[cacheKey] = cachedTwiddles;
+        }
+
+        // Butterfly stages using cached twiddle factors — zero allocations
+        int twiddleIdx = 0;
         for (int size = 2; size <= n; size *= 2)
         {
             int halfSize = size / 2;
-            double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
-
-            // Precompute twiddle factors once per stage (not per butterfly)
-            var twiddles = new Complex<T>[halfSize];
-            for (int k = 0; k < halfSize; k++)
-                twiddles[k] = Complex<T>.FromPolarCoordinates(ops.One, ops.FromDouble(baseAngle * k));
 
             for (int start = 0; start < n; start += size)
             {
                 for (int k = 0; k < halfSize; k++)
                 {
-                    var t = complexOps.Multiply(twiddles[k], data[start + k + halfSize]);
+                    var tw = cachedTwiddles[twiddleIdx + k];
+                    var twiddle = new Complex<T>(ops.FromDouble(tw.Real), ops.FromDouble(tw.Imaginary));
+                    var t = complexOps.Multiply(twiddle, data[start + k + halfSize]);
                     var u = data[start + k];
                     data[start + k] = complexOps.Add(u, t);
                     data[start + k + halfSize] = complexOps.Subtract(u, t);
                 }
             }
+            twiddleIdx += halfSize;
         }
     }
 
