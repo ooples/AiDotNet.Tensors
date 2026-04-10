@@ -1402,16 +1402,33 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentException(
                 $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
+        Tensor<T> result;
         if (IsContiguous)
         {
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+            result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        }
+        else
+        {
+            // Non-contiguous view: must materialize first, then reshape the contiguous result
+            result = Contiguous().Reshape(newShape);
         }
 
-        // Non-contiguous view: must materialize first, then reshape the contiguous result
-        return Contiguous().Reshape(newShape);
+        // Propagate gradient chain: if a GradientTape is active, set GradFn on the
+        // result so gradients flow through Reshape during backward pass.
+        // Without this, any layer using tensor.Reshape() silently breaks the gradient tape.
+        if (Engines.Autodiff.GradientTape<T>.Current != null)
+        {
+            var originalShape = _shape.ToArray();
+            result.GradFn = new Engines.Autodiff.GradNode<T>(
+                Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward,
+                result, this,
+                savedState: new object[] { originalShape });
+        }
+
+        return result;
     }
 
     /// <summary>
