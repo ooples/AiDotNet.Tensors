@@ -27580,13 +27580,31 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         var result = new Tensor<Complex<T>>(a._shape);
 
-        for (int i = 0; i < n; i++)
+        // SIMD fast path for float
+        if (typeof(T) == typeof(float))
         {
-            var ar = a[i].Real; var ai = a[i].Imaginary;
-            var br = b[i].Real; var bi = b[i].Imaginary;
-            result[i] = new Complex<T>(
-                ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi)),
-                ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
+            var aR = new float[n]; var aI = new float[n];
+            var bR = new float[n]; var bI = new float[n];
+            var oR = new float[n]; var oI = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                aR[i] = (float)(object)a[i].Real!; aI[i] = (float)(object)a[i].Imaginary!;
+                bR[i] = (float)(object)b[i].Real!; bI[i] = (float)(object)b[i].Imaginary!;
+            }
+            Simd.SimdComplexKernels.ComplexMultiply(aR, aI, bR, bI, oR, oI);
+            for (int i = 0; i < n; i++)
+                result[i] = new Complex<T>(ops.FromDouble(oR[i]), ops.FromDouble(oI[i]));
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var ar = a[i].Real; var ai = a[i].Imaginary;
+                var br = b[i].Real; var bi = b[i].Imaginary;
+                result[i] = new Complex<T>(
+                    ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi)),
+                    ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
+            }
         }
 
         { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexMultiply", result, eng => eng.NativeComplexMultiply(ca2, cb2)); }
