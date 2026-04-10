@@ -52,12 +52,18 @@ internal static class HerumiExp256
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe Vector256<float> Exp8(Vector256<float> x)
     {
-        // Clamp to valid range — values outside produce 0 (underflow) or +inf (overflow)
-        // via the 2^int_part reconstruction naturally reaching denorm/inf IEEE values.
-        x = Avx.Max(Vector256.Create(ClampMin), Avx.Min(Vector256.Create(ClampMax), x));
+        // Detect out-of-range lanes BEFORE clamping so we can fix them after
+        var vMin = Vector256.Create(ClampMin);
+        var vMax = Vector256.Create(ClampMax);
+        var underflow = Avx.Compare(x, vMin, FloatComparisonMode.OrderedLessThanSignaling);
+        var overflow = Avx.Compare(x, vMax, FloatComparisonMode.OrderedGreaterThanSignaling);
+        var outOfRange = Avx.Or(underflow, overflow);
+
+        // Clamp for the polynomial path (safe values for table index and 2^n)
+        var xClamped = Avx.Max(vMin, Avx.Min(vMax, x));
 
         // z = x * (256 / ln2)
-        var z = Avx.Multiply(x, Vector256.Create(LOverLn2));
+        var z = Avx.Multiply(xClamped, Vector256.Create(LOverLn2));
 
         // n = floor(z)
         var nFloat = Avx.Floor(z);
@@ -74,8 +80,8 @@ internal static class HerumiExp256
             // Table lookup via AVX2 gather
             var tableVal = Avx2.GatherVector256(tablePtr, kInt, 4);
 
-            // r = x - n * (ln2/256) — tiny remainder in [0, 0.00271)
-            var r = Fma.MultiplyAddNegated(nFloat, Vector256.Create(Ln2OverL), x);
+            // r = xClamped - n * (ln2/256) — tiny remainder in [0, 0.00271)
+            var r = Fma.MultiplyAddNegated(nFloat, Vector256.Create(Ln2OverL), xClamped);
 
             // For [0, 0.00271), exp(r) ≈ 1 + r is within 2 ULP
             // Use 2nd order for extra safety: (0.5*r + 1)*r + 1
@@ -87,7 +93,26 @@ internal static class HerumiExp256
             var pow2n = Avx2.ShiftLeftLogical(
                 Avx2.Add(intPart, Vector256.Create(127)), 23).AsSingle();
 
-            return Avx.Multiply(combined, pow2n);
+            var result = Avx.Multiply(combined, pow2n);
+
+            // For any out-of-range lanes: compute exact MathF.Exp per lane
+            // to preserve subnormals, exact 0, +inf, NaN — matching scalar Exp()
+            if (!Avx.TestZ(outOfRange, outOfRange))
+            {
+                float* scratch = stackalloc float[8];
+                Avx.Store(scratch, x);       // original unclamped x
+                float* rBuf = stackalloc float[8];
+                Avx.Store(rBuf, result);     // fast-path result
+                int mask = Avx.MoveMask(outOfRange);
+                for (int lane = 0; lane < 8; lane++)
+                {
+                    if ((mask & (1 << lane)) != 0)
+                        rBuf[lane] = MathF.Exp(scratch[lane]);
+                }
+                result = Avx.LoadVector256(rBuf);
+            }
+
+            return result;
         }
     }
 
