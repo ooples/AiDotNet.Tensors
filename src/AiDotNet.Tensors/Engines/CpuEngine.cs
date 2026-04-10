@@ -27361,7 +27361,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
+    public virtual Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
@@ -27393,7 +27393,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
+    public virtual Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
@@ -27424,7 +27424,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    public virtual Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
@@ -27457,7 +27457,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    public virtual Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -27485,7 +27485,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
+    public virtual Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
@@ -27504,7 +27504,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
+    public virtual Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
@@ -27527,7 +27527,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
+    public virtual Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
@@ -27548,7 +27548,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
+    public virtual Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
@@ -27569,7 +27569,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    public virtual Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
         if (magnitudes is null) throw new ArgumentNullException(nameof(magnitudes));
         if (phases is null) throw new ArgumentNullException(nameof(phases));
@@ -27599,7 +27599,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
+    public virtual Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
@@ -27620,7 +27620,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    public virtual Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));

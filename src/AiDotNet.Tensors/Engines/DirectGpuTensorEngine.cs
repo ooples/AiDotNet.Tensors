@@ -15003,9 +15003,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
-    public new Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    public override Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexMultiply(a, b);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
 
         try
@@ -15030,9 +15032,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexMultiply(a, b); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
+    public override Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexConjugate(a);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexConjugate(a);
 
         try
@@ -15053,9 +15057,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexConjugate(a); }
     }
 
-    public new Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
+    public override Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexMagnitude(a);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitude(a);
 
         try
@@ -15074,9 +15080,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexMagnitude(a); }
     }
 
-    public new Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
+    public override Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexMagnitudeSquared(a);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitudeSquared(a);
 
         try
@@ -15095,9 +15103,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexMagnitudeSquared(a); }
     }
 
-    public new Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
+    public override Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexPhase(a);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexPhase(a);
 
         try
@@ -15116,9 +15126,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexPhase(a); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
+    public override Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexFromPolar(magnitudes, phases);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexFromPolar(magnitudes, phases);
 
         try
@@ -15146,9 +15158,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexFromPolar(magnitudes, phases); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
+    public override Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexScale(a, scalar);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexScale(a, scalar);
 
         try
@@ -15171,9 +15185,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexScale(a, scalar); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
+    public override Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
-        if (!TryGetBackend(out var backend))
+                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexAdd(a, b);
+if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
 
         try
@@ -15198,21 +15214,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexAdd(a, b); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
+    public override Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
+        // GPU kernels are float-only; fall back to CPU for other types
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFFT(input);
 
         try
         {
             int n = input.Length;
+            // Validate power of 2 (GPU FFT kernels assume this)
+            if (n <= 0 || (n & (n - 1)) != 0)
+                return base.NativeComplexFFT(input);
+
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[n];
             for (int i = 0; i < n; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Use existing GPU FFT which works with split real/imag buffers
+            // Imaginary input must be zeroed — AllocateBuffer(int) may not zero-initialize
+            var zerosF = new float[n]; // C# arrays are zero-initialized
+
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
-            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true); // zeros for imaginary
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(zerosF), true);
             using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
@@ -15224,14 +15249,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexFFT(input); }
     }
 
-    public new Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
+    public override Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexIFFTReal(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFTReal(input);
 
         try
         {
             int n = input.Length;
+            if (n <= 0 || (n & (n - 1)) != 0)
+                return base.NativeComplexIFFTReal(input);
             var (inR, inI) = DecomposeComplex(input);
 
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
@@ -15247,14 +15276,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexIFFTReal(input); }
     }
 
-    public new Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
+    public override Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexIFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFT(input);
 
         try
         {
             int n = input.Length;
+            if (n <= 0 || (n & (n - 1)) != 0)
+                return base.NativeComplexIFFT(input);
             var (inR, inI) = DecomposeComplex(input);
 
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
