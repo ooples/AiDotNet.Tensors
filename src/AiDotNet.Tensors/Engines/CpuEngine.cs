@@ -27440,7 +27440,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(a._shape);
 
         for (int i = 0; i < n; i++)
         {
@@ -27465,7 +27465,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(a._shape);
 
         for (int i = 0; i < n; i++)
             result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
@@ -27483,7 +27483,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<T>([n]);
+        var result = new Tensor<T>(a._shape);
 
         for (int i = 0; i < n; i++)
         {
@@ -27505,7 +27505,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<T>([n]);
+        var result = new Tensor<T>(a._shape);
 
         for (int i = 0; i < n; i++)
             result[i] = ops.Add(
@@ -27525,7 +27525,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<T>([n]);
+        var result = new Tensor<T>(a._shape);
 
         for (int i = 0; i < n; i++)
             result[i] = ops.FromDouble(Math.Atan2(
@@ -27551,7 +27551,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = magnitudes.Length;
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(magnitudes._shape);
 
         for (int i = 0; i < n; i++)
         {
@@ -27576,7 +27576,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(a._shape);
 
         for (int i = 0; i < n; i++)
             result[i] = new Complex<T>(
@@ -27600,7 +27600,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = a.Length;
-        var result = new Tensor<Complex<T>>([n]);
+        var result = new Tensor<Complex<T>>(a._shape);
 
         for (int i = 0; i < n; i++)
             result[i] = new Complex<T>(
