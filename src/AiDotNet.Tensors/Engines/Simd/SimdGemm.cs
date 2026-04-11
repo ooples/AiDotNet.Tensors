@@ -244,13 +244,15 @@ internal static class SimdGemm
         //     to justify col-sub parallelism OR when numRowBlocks already matches the
         //     target core count.
         //   - 2D parallel (SgemmTiledParallel2D): (row block × col sub) grid, when
-        //     numRowBlocks alone doesn't saturate available cores. Breaks past the
-        //     numRowBlocks ceiling that limited iter 1-3 at 1024² on 16-core machines.
+        //     either M or N alone doesn't saturate available cores. Handles row-heavy
+        //     problems (1024²) by splitting columns too, AND col-heavy problems
+        //     (LM-head [64, 128]x[128, 50257]) by parallelizing the 1 row block across
+        //     many col subs.
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = UseParallelGemm
             && maxThreads > 1
-            && numRowBlocks >= 2
+            && numRowBlocks >= 1
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
             && (long)m * k * n >= ParallelWorkThreshold;
 
@@ -272,38 +274,38 @@ internal static class SimdGemm
                 {
                     int kc = Math.Min(Kc, k - pc);
 
-                    if (canParallelize)
-                    {
-                        // Adaptive col-sub count: we want numRowBlocks * numColSubs ≈
-                        // logical core count so the parallel dispatch fills the machine.
-                        // Iter 5 (2026-04-11): use maxThreads (logical cores) instead of
-                        // physical — at 1024² this gives 8 row blocks × 4 col subs = 32
-                        // tiles, one per logical core on the 32-core Ryzen. SMT siblings
-                        // help here because the work is load-port-limited rather than
-                        // FMA-port-limited in blocked GEMM.
-                        int desiredColSubs = Math.Max(1, maxThreads / numRowBlocks);
-                        int maxColSubs = Math.Max(1, nc / (Nr * 4));
-                        int numColSubs = Math.Min(desiredColSubs, maxColSubs);
+                    // Decide per-tile parallel dispatch. numColSubs is adaptive to
+                    // logical core count so numRowBlocks * numColSubs ≈ maxThreads.
+                    // Iter 5: logical cores, not physical — SMT siblings help because
+                    // blocked GEMM is load-port-limited not FMA-port-limited.
+                    // Iter 7: allow numRowBlocks=1 through the 2D path so col-heavy
+                    // problems like LM-head [64,128]x[128,50257] get parallelism.
+                    int desiredColSubs = canParallelize ? Math.Max(1, maxThreads / numRowBlocks) : 1;
+                    int maxColSubs = Math.Max(1, nc / (Nr * 4));
+                    int numColSubs = Math.Min(desiredColSubs, maxColSubs);
+                    int totalTiles = numRowBlocks * numColSubs;
 
-                        if (numColSubs >= 2)
-                        {
-                            SgemmTiledParallel2D(
-                                a, b, c,
-                                m, k, n,
-                                jc, nc, pc, kc,
-                                numRowBlocks, numColSubs);
-                        }
-                        else
-                        {
-                            // 1D parallel-M: each worker owns a disjoint row block with its
-                            // own packed-A, B is packed once and shared read-only. Output
-                            // row ranges are disjoint so no synchronization on C is needed.
-                            SgemmTiledParallelM(
-                                a, b, c,
-                                m, k, n,
-                                jc, nc, pc, kc,
-                                numRowBlocks, packedBBuf);
-                        }
+                    bool used2D = canParallelize && numColSubs >= 2 && totalTiles >= 2;
+                    bool used1D = canParallelize && !used2D && numRowBlocks >= 2;
+
+                    if (used2D)
+                    {
+                        SgemmTiledParallel2D(
+                            a, b, c,
+                            m, k, n,
+                            jc, nc, pc, kc,
+                            numRowBlocks, numColSubs);
+                    }
+                    else if (used1D)
+                    {
+                        // 1D parallel-M: each worker owns a disjoint row block with its
+                        // own packed-A, B is packed once and shared read-only. Output
+                        // row ranges are disjoint so no synchronization on C is needed.
+                        SgemmTiledParallelM(
+                            a, b, c,
+                            m, k, n,
+                            jc, nc, pc, kc,
+                            numRowBlocks, packedBBuf);
                     }
                     else
                     {
