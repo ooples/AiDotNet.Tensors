@@ -373,7 +373,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU execution context, or null if GPU is not available.</returns>
     public GpuExecutionContext? BeginGpuContext(GpuExecutionOptions? options = null)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
         {
             return null;
         }
@@ -1215,7 +1215,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
@@ -1250,7 +1250,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
             return null;
@@ -1288,7 +1288,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Legacy T[] overloads kept for backward compatibility with IEngine explicit implementations
     private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
@@ -1307,7 +1307,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
             return null;
@@ -1329,7 +1329,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
@@ -1351,7 +1351,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[]? TryRunBinarySpan<T>(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
             return null;
@@ -1376,7 +1376,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[]? TryRunScalarSpan<T>(ReadOnlySpan<T> input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return null;
 
         using var bufferA = AllocateBufferFromSpan(backend, input);
@@ -1445,7 +1445,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(count),
                 $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.StridedGather(source, offset, stride, count);
 
         try
@@ -1465,7 +1465,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
         {
             base.StridedScatter(destination, source, offset, stride);
             return;
@@ -2243,7 +2243,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return false;
 
         var aData = a.GetDataArray();
@@ -2269,7 +2269,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private bool TryRunUnaryInPlace<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return false;
 
         var data = tensor.GetDataArray();
@@ -2374,7 +2374,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
@@ -2385,7 +2385,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
@@ -2396,7 +2396,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
@@ -2414,7 +2414,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FusedLinear(input, weights, bias, activation);
 
         if (input.Rank < 1 || weights.Rank != 2)
@@ -2515,7 +2515,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     public Tensor<T> FusedLinearGpu<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedLinearGpu");
 
         if (input.Rank < 1 || weights.Rank != 2)
@@ -2727,7 +2727,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     public Tensor<T> UploadToGpu<T>(Tensor<T> tensor, GpuTensorRole role)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UploadToGpu");
 
         // Convert tensor data to float and allocate GPU buffer
@@ -2749,7 +2749,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
     public Tensor<T> UploadToGpu<T>(float[] data, int[] shape, GpuTensorRole role)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UploadToGpu");
 
         var buffer = backend.AllocateBuffer(data);
@@ -2774,7 +2774,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <exception cref="ArgumentException">Thrown when an unsupported role is passed (e.g., General, Activation, Gradient).</exception>
     public Tensor<T> GetOrCacheWeightsGpu<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.Weight)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GetOrCacheWeightsGpu");
 
         var persistentRole = role switch
@@ -2846,7 +2846,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     public Tensor<T> ActivationGpu<T>(Tensor<T> input, FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ActivationGpu");
 
         // Allocate output buffer
@@ -2883,7 +2883,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool isTraining,
         ulong seed)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DropoutGpu");
 
         int size = input.Length;
@@ -2916,7 +2916,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> mask,
         float dropoutRate)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DropoutBackwardGpu");
 
         int size = gradOutput.Length;
@@ -2942,7 +2942,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] stride,
         out IGpuBuffer gpuIndices)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool2DGpu");
 
         if (input.Shape._dims.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -2992,7 +2992,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] poolSize,
         int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool2DBackwardGpu");
 
         if (gradOutput.Shape._dims.Length != 4 || inputShape.Length != 4)
@@ -3030,7 +3030,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] stride,
         out IGpuBuffer gpuIndices)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool3DGpu");
 
         if (input.Shape._dims.Length != 5 || poolSize.Length != 3 || stride.Length != 3)
@@ -3081,7 +3081,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] poolSize,
         int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool3DBackwardGpu");
 
         if (gradOutput.Shape._dims.Length != 5 || inputShape.Length != 5)
@@ -3119,7 +3119,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int scaleHeight,
         int scaleWidth)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for NearestNeighborUpsample3DGpu");
 
         if (input.Shape._dims.Length != 5)
@@ -3167,7 +3167,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int scaleHeight,
         int scaleWidth)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for NearestNeighborUpsample3DBackwardGpu");
 
         if (gradOutput.Shape._dims.Length != 5 || inputShape.Length != 5)
@@ -3203,7 +3203,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] poolSize,
         int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AvgPool2DGpu");
 
         if (input.Shape._dims.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -3249,7 +3249,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] poolSize,
         int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AvgPool2DBackwardGpu");
 
         if (gradOutput.Shape._dims.Length != 4 || inputShape.Length != 4)
@@ -3287,7 +3287,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationH, int dilationW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -3423,7 +3423,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationH, int dilationW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedConv2DGpu");
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -3504,7 +3504,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationD, int dilationH, int dilationW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
 
         // Expected input shape: [batch, inChannels, depth, height, width]
@@ -3642,7 +3642,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationD, int dilationH, int dilationW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedConv3DGpu");
 
         // Expected input shape: [batch, inChannels, depth, height, width]
@@ -3728,7 +3728,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outputPadH, int outputPadW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -3856,7 +3856,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outputPadH, int outputPadW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedConvTranspose2DGpu");
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -3929,7 +3929,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (stride == 0) stride = poolSize;
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.MaxPool2D(input, poolSize, stride, padding);
 
         // Expected input shape: [batch, channels, height, width]
@@ -3980,7 +3980,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.MaxPool2DWithIndices(input, poolSize, stride, out maxIndices);
 
         if (input.Rank != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -4050,7 +4050,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.MaxPool2DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
 
         if (gradOutput.Rank != 4 || inputShape.Length != 4)
@@ -4117,7 +4117,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (stride == 0) stride = poolSize;
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride, padding);
 
         // Expected input shape: [batch, channels, height, width]
@@ -4168,7 +4168,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride);
 
         if (input.Rank != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -4217,7 +4217,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
 
         if (gradOutput.Rank != 4 || inputShape.Length != 4)
@@ -4262,7 +4262,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DepthwiseConv2D(input, kernel, stride, padding);
 
         // Expected input shape: [batch, channels, height, width]
@@ -4337,7 +4337,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int padH, int padW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DepthwiseConv2DGpu");
 
         // Expected input shape: [batch, channels, height, width]
@@ -4408,7 +4408,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> LocallyConnectedConv2D<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LocallyConnectedConv2D(input, weights, bias, stride);
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -4487,7 +4487,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> LocallyConnectedConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> weights, int[] inputShape, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LocallyConnectedConv2DBackwardInput(gradOutput, weights, inputShape, stride);
 
         // Validate inputs
@@ -4542,7 +4542,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
 
         // Validate inputs
@@ -4597,7 +4597,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new Tensor<T> LocallyConnectedConv2DBackwardBias<T>(Tensor<T> gradOutput)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LocallyConnectedConv2DBackwardBias<T>(gradOutput);
 
         // Validate input
@@ -4648,7 +4648,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int strideH, int strideW,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LocallyConnectedConv2DGpu");
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -4715,7 +4715,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
 
         // Validate inputs
@@ -4800,7 +4800,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
 
         if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
@@ -4872,7 +4872,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
 
         if (gradOutput.Rank != 4 || input.Rank != 4)
@@ -4944,7 +4944,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
 
         if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
@@ -5021,7 +5021,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (mask == null)
             throw new ArgumentNullException(nameof(mask), "Mask cannot be null when computing mask gradients");
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
 
         if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4 || mask.Rank != 4)
@@ -5104,7 +5104,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int groups, int deformGroups,
         FusedActivationType activation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DeformableConv2DGpu");
 
         // Expected input shape: [batch, inChannels, height, width]
@@ -5188,7 +5188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> saveMean,
         out Tensor<T> saveVar)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FusedBatchNorm(input, gamma, beta, runningMean, runningVar, epsilon, momentum, training, activation, out saveMean, out saveVar);
 
         if (input.Rank != 2)
@@ -5272,7 +5272,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> softmaxStats,
         Tensor<T>? attentionBias = null)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
         // Validate tensor shapes [batch, heads, seq, head_dim]
@@ -5346,7 +5346,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> gradValue,
         Tensor<T>? attentionBias = null)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
                 out gradQuery, out gradKey, out gradValue, attentionBias);
 
@@ -5422,7 +5422,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool isCausal,
         out Tensor<T> attentionWeights)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
 
         // Validate tensor shapes
@@ -5486,7 +5486,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> gradKey,
         out Tensor<T> gradValue)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
 
@@ -5559,7 +5559,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         double scale,
         bool isCausal = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionGpu");
 
         // Validate 4D tensor shapes
@@ -5610,7 +5610,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> attentionWeights,
         bool isCausal = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionGpu");
 
         // Validate 4D tensor shapes
@@ -5663,7 +5663,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         double scale,
         bool isCausal = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionBackwardGpu");
 
         // Extract dimensions from query tensor (all tensors share same shape except attn weights)
@@ -5724,7 +5724,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident permuted tensor.</returns>
     public Tensor<T> PermuteGpu<T>(Tensor<T> input, int[] permutation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for PermuteGpu");
 
         if (permutation.Length != input.Shape._dims.Length)
@@ -5755,7 +5755,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident output tensor.</returns>
     public Tensor<T> BatchedMatMulGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BatchedMatMulGpu");
 
         if (weights.Rank != 2)
@@ -5798,7 +5798,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident reshaped tensor (shares buffer with input).</returns>
     public void CopyGpu<T>(Tensor<T> source, Tensor<T> destination, int size)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CopyGpu");
 
         backend.Copy(source.Buffer, destination.Buffer, size);
@@ -5806,7 +5806,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public void CopyGpu<T>(Tensor<T> source, int srcOffset, Tensor<T> destination, int destOffset, int size)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CopyGpu");
 
         backend.Copy(source.Buffer, srcOffset, destination.Buffer, destOffset, size);
@@ -5814,7 +5814,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public void FillGpu<T>(Tensor<T> buffer, float value, int size)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FillGpu");
 
         backend.Fill(buffer.Buffer, value, size);
@@ -5835,7 +5835,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident output tensor with bias added.</returns>
     public Tensor<T> AddBiasGpu<T>(Tensor<T> input, Tensor<T> bias)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AddBiasGpu");
 
         if (bias.Rank != 1)
@@ -5873,7 +5873,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident upsampled tensor.</returns>
     public Tensor<T> UpsampleGpu<T>(Tensor<T> input, int scaleFactor)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleGpu");
 
         if (input.Shape._dims.Length < 2)
@@ -5925,7 +5925,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident gradient input tensor with original input shape.</returns>
     public Tensor<T> UpsampleBackwardGpu<T>(Tensor<T> gradOutput, int inputHeight, int inputWidth, int scaleFactor)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleBackwardGpu");
 
         if (gradOutput.Shape._dims.Length < 2)
@@ -5997,7 +5997,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         base.RegisterPersistentTensor(tensor, role);
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return;
 
         // Use the tensor's data array as the cache key
@@ -6048,7 +6048,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         base.InvalidatePersistentTensor(tensor);
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return;
 
         object key = tensor.GetDataArray();
@@ -6682,7 +6682,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Softmax<T>(Tensor<T> input, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Softmax(input, axis);
 
         // Handle negative axis
@@ -6759,7 +6759,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.SoftmaxBackward(gradOutput, output, axis);
 
         int rank = output.Rank;
@@ -6835,7 +6835,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.TensorSquash<T>(Tensor<T> tensor, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorSquash(tensor, axis);
 
         int rank = tensor.Rank;
@@ -6906,7 +6906,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.TensorSquashBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorSquashBackward(gradOutput, input, output, axis);
 
         int rank = input.Rank;
@@ -6982,7 +6982,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public Tensor<T> TileBatchGpu<T>(Tensor<T> input, int repeats)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TileBatchGpu");
 
         if (repeats <= 0)
@@ -7009,7 +7009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public Tensor<T> TileAxisGpu<T>(Tensor<T> input, int axis, int repeats)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TileAxisGpu");
 
         if (repeats <= 0)
@@ -7044,7 +7044,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public Tensor<T> GlobalMeanPoolGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMeanPoolGpu");
 
         int rank = input.Shape._dims.Length;
@@ -7134,7 +7134,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU tensor containing the max-pooled values.</returns>
     public Tensor<T> GlobalMaxPoolGpuWithGpuIndices<T>(Tensor<T> input, out Tensor<float>? gpuIndices)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMaxPoolGpu");
 
         int rank = input.Shape._dims.Length;
@@ -7202,7 +7202,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident gradient of same shape as original input.</returns>
     public Tensor<T> GlobalMeanPoolBackwardGpu<T>(Tensor<T> gradOutput, int[] inputShape)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMeanPoolBackwardGpu");
 
         // Parameter validation
@@ -7268,7 +7268,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident gradient of same shape as original input.</returns>
     public Tensor<T> GlobalMaxPoolBackwardGpu<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMaxPoolBackwardGpu");
 
         // Parameter validation
@@ -7318,7 +7318,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU tensor containing argmax indices as floats.</returns>
     public Tensor<float> ArgMaxGpu<T>(Tensor<T> input, int axis = -1)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ArgMaxGpu");
 
         int rank = input.Shape._dims.Length;
@@ -7357,7 +7357,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -7398,7 +7398,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.LayerNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LayerNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
 
         try
@@ -7441,7 +7441,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
         try
@@ -7477,7 +7477,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.RMSNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> rms, double epsilon, out Tensor<T> gradGamma)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.RMSNormBackward(gradOutput, input, gamma, rms, epsilon, out gradGamma);
 
         try
@@ -7515,7 +7515,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -7562,7 +7562,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -7635,7 +7635,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         double momentum,
         bool training)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedBatchNormGpu");
 
         int[] shape = input.Shape._dims;
@@ -7710,7 +7710,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> beta,
         double epsilon)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LayerNormGpu");
 
         int[] shape = input.Shape._dims;
@@ -7769,7 +7769,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> saveInvVar,
         double epsilon)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LayerNormBackwardGpu");
 
         int[] shape = gradOutput.Shape._dims;
@@ -7862,7 +7862,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with the element-wise sum.</returns>
     public Tensor<T> AddGpu<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AddGpu");
 
         int size = a.Length;
@@ -7882,7 +7882,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with the element-wise product.</returns>
     public Tensor<T> MultiplyGpu<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MultiplyGpu");
 
         int size = a.Length;
@@ -7902,7 +7902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with the scaled values.</returns>
     public Tensor<T> ScaleGpu<T>(Tensor<T> input, float scalar)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaleGpu");
 
         int size = input.Length;
@@ -7921,7 +7921,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with softmax applied.</returns>
     public Tensor<T> SoftmaxGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxGpu");
 
         // Assuming 2D input [batch, features]
@@ -7946,7 +7946,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with the top-k values.</returns>
     public Tensor<T> TopKGpu<T>(Tensor<T> input, int k, out Tensor<int> indices, bool sorted = true)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TopKGpu");
 
         // Assuming 2D input [batch, features]
@@ -7976,7 +7976,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with broadcast multiplication.</returns>
     public Tensor<T> BroadcastMultiplyColumnGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastMultiplyColumnGpu");
 
         int outerSize = input.Shape._dims[0];
@@ -7999,7 +7999,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor [batch, 1].</returns>
     public Tensor<T> SliceColumnGpu<T>(Tensor<T> input, int columnIndex)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SliceColumnGpu");
 
         int batchSize = input.Shape._dims[0];
@@ -8039,7 +8039,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident sliced tensor.</returns>
     public Tensor<T> SliceGpu<T>(Tensor<T> input, int axis, int start, int end)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SliceGpu");
 
         int rank = input.Shape._dims.Length;
@@ -8108,7 +8108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numIterations,
         float epsilon = 1e-12f)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for PowerIterationGpu");
 
         int rows = weights.Shape._dims[0];
@@ -8183,7 +8183,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public Tensor<T> DivideScalarGpu<T>(Tensor<T> input, float scalar)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DivideScalarGpu");
 
         int size = input.Length;
@@ -8208,7 +8208,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output grid [batch, outputHeight, outputWidth, 2].</returns>
     public Tensor<T> AffineGridGpu<T>(Tensor<T> theta, int batch, int outputHeight, int outputWidth)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AffineGridGpu");
 
         // Output shape: [batch, outputHeight, outputWidth, 2]
@@ -8232,7 +8232,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor [batch, channels, outHeight, outWidth].</returns>
     public Tensor<T> GridSampleGpu<T>(Tensor<T> input, Tensor<T> grid, int paddingMode = 0, bool alignCorners = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GridSampleGpu");
 
         // Input: [batch, channels, inHeight, inWidth]
@@ -8277,7 +8277,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int paddingMode = 0,
         bool alignCorners = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GridSampleBackwardGpu");
 
         // Input: [batch, channels, inHeight, inWidth]
@@ -8314,7 +8314,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with ReLU applied.</returns>
     public Tensor<T> ReluGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReluGpu");
 
         int size = input.Length;
@@ -8333,7 +8333,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with Tanh applied.</returns>
     public Tensor<T> TanhGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TanhGpu");
 
         int size = input.Length;
@@ -8353,7 +8353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with reduced dimensions.</returns>
     public Tensor<T> SumAxisGpu<T>(Tensor<T> input, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SumAxisGpu");
 
         // Validate axis for 2D tensors - only axis 0 and 1 are supported
@@ -8417,7 +8417,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor [numIndices, featureSize] with gathered values.</returns>
     public Tensor<T> GatherGpu<T>(Tensor<T> source, IGpuBuffer indices, int numIndices, int featureSize)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GatherGpu");
 
         var outputBuffer = backend.AllocateBuffer(numIndices * featureSize);
@@ -8438,7 +8438,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with scattered values.</returns>
     public Tensor<T> ScatterAddGpu<T>(Tensor<T> source, IGpuBuffer indices, int destSize)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScatterAddGpu");
 
         int sourceSize = source.Length;
@@ -8461,7 +8461,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident tensor filled with zeros.</returns>
     public Tensor<T> ZerosGpu<T>(int[] shape)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ZerosGpu");
 
         int size = 1;
@@ -8484,7 +8484,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident output tensor with element-wise division.</returns>
     public Tensor<T> DivideByBroadcastGpu<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DivideByBroadcastGpu");
 
         int outerSize = a.Shape._dims[0];
@@ -8545,7 +8545,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.DropoutBackward<T>(Tensor<T> gradOutput, Tensor<T> mask, double dropoutRate)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.DropoutBackward(gradOutput, mask, dropoutRate);
 
         try
@@ -8590,7 +8590,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (dropoutRate < 0.0 || dropoutRate >= 1.0)
             throw new ArgumentOutOfRangeException(nameof(dropoutRate), dropoutRate, "Dropout rate must be in [0, 1).");
 
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
         {
             // No GPU — fall back to CPU: add bias element-wise then dropout
             return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
@@ -8691,7 +8691,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
         try
@@ -8726,7 +8726,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.EmbeddingBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.EmbeddingBackward(gradOutput, indices, vocabSize, embeddingDim);
 
         try
@@ -8773,7 +8773,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     public Tensor<T> EmbeddingLookupGpu<T>(Tensor<T> embeddingTable, Tensor<int> indices)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingLookupGpu");
 
         int numIndices = indices.Length;
@@ -8810,7 +8810,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
     public Tensor<T> EmbeddingLookupGpu<T>(Tensor<T> embeddingTableGpu, Tensor<int> indices, int embeddingDim)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingLookupGpu");
 
         int numIndices = indices.Length;
@@ -8846,7 +8846,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
     public Tensor<T> EmbeddingBackwardGpu<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingBackwardGpu");
 
         int numIndices = indices.Length;
@@ -8877,7 +8877,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.CrossEntropyBackward(predictions, targets);
 
         try
@@ -8912,7 +8912,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.MseBackward(predictions, targets);
 
         try
@@ -8943,7 +8943,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.ReluBackward(gradOutput, input);
 
         try
@@ -8970,7 +8970,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.SigmoidBackward(gradOutput, output);
 
         try
@@ -8997,7 +8997,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TanhBackward(gradOutput, output);
 
         try
@@ -9024,7 +9024,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GeluBackward(gradOutput, input);
 
         try
@@ -9051,7 +9051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.LeakyReLU<T>(Tensor<T> input, T alpha)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LeakyReLU(input, alpha);
 
         try
@@ -9079,7 +9079,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LeakyReluBackward(gradOutput, input, negativeSlope);
 
         try
@@ -9106,7 +9106,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.ELU<T>(Tensor<T> input, double alpha)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.ELU(input, alpha);
 
         try
@@ -9132,7 +9132,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Swish<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Swish(input);
 
         try
@@ -9158,7 +9158,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Mish<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Mish(input);
 
         try
@@ -9184,7 +9184,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Softplus<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Softplus(input);
 
         try
@@ -9210,7 +9210,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.HardSwish<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.HardSwish(input);
 
         try
@@ -9241,7 +9241,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Conv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape,
         int[] stride, int[] padding, int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
 
         try
@@ -9291,7 +9291,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Conv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape,
         int[] stride, int[] padding, int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
 
         try
@@ -9344,7 +9344,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GlobalAvgPool2D<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GlobalAvgPool2D(input);
 
         try
@@ -9376,7 +9376,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GlobalMaxPool2D<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.GlobalMaxPool2D(input);
 
         try
@@ -9408,7 +9408,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
         try
@@ -9445,7 +9445,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var safeAxes = axes ?? Array.Empty<int>();
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.ReduceMean(input, safeAxes, keepDims);
 
         // Validate and normalize axes
@@ -9476,7 +9476,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public new Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
         var safeAxes = axes ?? Array.Empty<int>();
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.ReduceMax(input, safeAxes, keepDims, out maxIndices);
 
         // Validate and normalize axes
@@ -9512,7 +9512,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.ReduceSum(tensor, axes, keepDims);
 
         // If axes is null, reduce all dimensions
@@ -9694,7 +9694,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorBroadcastMultiply(a, b);
 
         // Fast path: same shape - use element-wise multiply
@@ -9871,7 +9871,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
     public Tensor<T> SparseDenseMatMulGpu<T>(SparseTensor<T> sparseA, Tensor<T> denseB)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulGpu");
 
         if (sparseA is null) throw new ArgumentNullException(nameof(sparseA));
@@ -9916,7 +9916,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
     public Tensor<T> SparseDenseMatMulBiasGpu<T>(SparseTensor<T> sparseA, Tensor<T> denseB, Tensor<T> bias)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulBiasGpu");
 
         if (sparseA is null) throw new ArgumentNullException(nameof(sparseA));
@@ -9972,7 +9972,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] targetIndices,
         float[]? edgeValues = null)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScatterAddGpu");
 
         if (nodeFeatures is null) throw new ArgumentNullException(nameof(nodeFeatures));
@@ -10084,7 +10084,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> ExpGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ExpGpu");
 
         int size = input.Length;
@@ -10096,7 +10096,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> SubtractGpu<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SubtractGpu");
 
         int size = a.Length;
@@ -10108,7 +10108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> BroadcastMultiplyRowGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastMultiplyRowGpu");
 
         int outerSize = input.Shape._dims[0];
@@ -10122,7 +10122,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> SinGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SinGpu");
 
         int size = input.Length;
@@ -10134,7 +10134,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> CosGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CosGpu");
 
         int size = input.Length;
@@ -10146,7 +10146,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> GreaterThanScalarGpu<T>(Tensor<T> input, float scalar)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GreaterThanScalarGpu");
 
         int size = input.Length;
@@ -10162,7 +10162,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> ConcatGpu<T>(Tensor<T>[] inputs, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ConcatGpu");
 
         if (inputs.Length == 0) throw new ArgumentException("No inputs to concatenate");
@@ -10251,7 +10251,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> ArgMaxAxisGpu<T>(Tensor<T> input, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ArgMaxAxisGpu");
 
         // Similar logic to ReduceAxisGpu for arbitrary axis
@@ -10306,7 +10306,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> MaxAxisGpu<T>(Tensor<T> input, int axis)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxAxisGpu");
 
         var inputShape = input.Shape._dims;
@@ -10343,7 +10343,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> BroadcastAddGpu<T>(Tensor<T> a, Tensor<T> b)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastAddGpu");
 
         // Support full broadcasting logic like NumPy?
@@ -10385,7 +10385,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident tensor.</returns>
     public Tensor<T> RandomUniformGpu<T>(int[] shape, float min, float max, ulong seed)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RandomUniformGpu");
 
         int size = 1;
@@ -10408,7 +10408,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A GPU-resident tensor.</returns>
     public Tensor<T> RandomNormalGpu<T>(int[] shape, float mean, float stdDev, ulong seed)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RandomNormalGpu");
 
         int size = 1;
@@ -10422,7 +10422,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> ReshapeGpu<T>(Tensor<T> input, int[] newShape)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReshapeGpu");
 
         // Validate size
@@ -10441,7 +10441,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public void SgdMomentumUpdateGpu<T>(Tensor<T> param, Tensor<T> gradient, Tensor<T> velocity, float learningRate, float momentum, float weightDecay)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SgdMomentumUpdateGpu");
 
         using var paramBuffer = GetOrAllocateBuffer(backend, param.GetDataArray());
@@ -10458,7 +10458,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public Tensor<T> RbfKernelGpu<T>(Tensor<T> input, Tensor<T> centers, Tensor<T> widths)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RbfKernelGpu");
 
         int batch = input.Shape._dims[0];
@@ -10494,7 +10494,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public void UpdateTracesGpu<T>(Tensor<T> traces, Tensor<T> spikes, Tensor<T> input, float decay, float threshold)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpdateTracesGpu");
 
         backend.UpdateTraces(traces.Buffer, spikes.Buffer, input.Buffer, decay, threshold, input.Length);
@@ -10512,7 +10512,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         double minWeight,
         double maxWeight)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for StdpUpdateGpu");
 
         int numPre = weights.Shape._dims[0];
@@ -10573,7 +10573,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident transposed tensor [cols, rows].</returns>
     public Tensor<T> TransposeGpu<T>(Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TransposeGpu");
 
         if (input.Shape._dims.Length != 2)
@@ -10599,7 +10599,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident output tensor C [M, N].</returns>
     public Tensor<T> MatMulGpuTensors<T>(Tensor<T> A, Tensor<T> B)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MatMulGpuTensors");
 
         if (A.Shape._dims.Length != 2 || B.Shape._dims.Length != 2)
@@ -10628,7 +10628,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> ReluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReluBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10649,7 +10649,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> SigmoidBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SigmoidBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10670,7 +10670,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> TanhBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TanhBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10692,7 +10692,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> LeakyReluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input, float alpha = 0.01f)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LeakyReluBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10712,7 +10712,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> GeluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GeluBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10732,7 +10732,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> SoftmaxBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxBackwardGpu");
 
         int batchSize = gradOutput.Shape._dims[0];
@@ -10754,7 +10754,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> SwishBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SwishBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10776,7 +10776,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident input gradient.</returns>
     public Tensor<T> EluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, float alpha = 1.0f)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EluBackwardGpu");
 
         int size = gradOutput.Length;
@@ -10811,7 +10811,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> saveInvVar,
         float epsilon)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BatchNormBackwardGpu");
 
         // Determine dimensions
@@ -10888,7 +10888,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardInputGpu");
 
         // Validate shape lengths to prevent index out of bounds
@@ -10948,7 +10948,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardKernelGpu");
 
         // Validate shape lengths to prevent index out of bounds
@@ -10995,7 +10995,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>GPU-resident gradient with respect to bias [outC].</returns>
     public Tensor<T> Conv2DBackwardBiasGpu<T>(Tensor<T> gradOutput)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardBiasGpu");
 
         // Validate shape length to prevent index out of bounds
@@ -11055,7 +11055,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] outputPadding)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ConvTranspose2DBackwardInputGpu");
 
         int batch = inputShape[0];
@@ -11108,7 +11108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] outputPadding)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ConvTranspose2DBackwardKernelGpu");
 
         int batch = input.Shape._dims[0];
@@ -11245,7 +11245,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorLeakyReLU(tensor, alpha);
 
         try
@@ -12251,7 +12251,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorClamp(tensor, min, max);
 
         try
@@ -13401,7 +13401,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.LeakyReLU(tensor, alpha);
 
         try
@@ -15009,7 +15009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexMultiply(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMultiply(a, b);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
 
         try
@@ -15222,7 +15222,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFFTComplex(input);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexFFTComplex(input);
 
         try
@@ -15254,15 +15254,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k)
     {
         if (input is null)
-            return base.NativeComplexTopK(input ?? throw new ArgumentNullException(nameof(input)), k);
+            throw new ArgumentNullException(nameof(input));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexTopK(input, k);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexTopK(input, k);
 
         try
         {
             int n = input.Length;
+            int clampedK = Math.Min(Math.Max(k, 0), n);
             var (inR, inI) = DecomposeComplex(input);
 
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
@@ -15270,10 +15271,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
             using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
 
-            backend.SplitComplexTopK(inRBuf.Buffer, inIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n, k);
+            backend.SplitComplexTopK(inRBuf.Buffer, inIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n, clampedK);
 
-            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
-                backend.DownloadBuffer(oIBuf.Buffer), input._shape);
+            var outR = backend.DownloadBuffer(oRBuf.Buffer);
+            var outI = backend.DownloadBuffer(oIBuf.Buffer);
+
+            // Post-filter: GPU threshold-based TopK may retain more than K on ties.
+            // Enforce exactly min(k,n) non-zero elements by zeroing the weakest extras.
+            int nonZero = 0;
+            for (int i = 0; i < n; i++)
+                if (outR[i] != 0f || outI[i] != 0f) nonZero++;
+
+            if (nonZero > clampedK)
+            {
+                // Build (magSq, idx) pairs for non-zero entries, sort ascending, zero the weakest
+                var extras = new (float mag, int idx)[nonZero];
+                int ei = 0;
+                for (int i = 0; i < n; i++)
+                    if (outR[i] != 0f || outI[i] != 0f)
+                        extras[ei++] = (outR[i] * outR[i] + outI[i] * outI[i], i);
+
+                Array.Sort(extras, (a, b) => a.mag.CompareTo(b.mag));
+                int toZero = nonZero - clampedK;
+                for (int i = 0; i < toZero; i++)
+                {
+                    int idx = extras[i].idx;
+                    outR[idx] = 0f;
+                    outI[idx] = 0f;
+                }
+            }
+
+            return RecomposeComplex<T>(outR, outI, input._shape);
         }
         catch { return base.NativeComplexTopK(input, k); }
     }
@@ -15284,7 +15312,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexCrossSpectral(x ?? throw new ArgumentNullException(nameof(x)), y ?? throw new ArgumentNullException(nameof(y)));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexCrossSpectral(x, y);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexCrossSpectral(x, y);
 
         try
@@ -15313,7 +15341,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFFT(input);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexFFT(input);
 
         try
@@ -15350,7 +15378,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexIFFTReal(input);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFTReal(input);
 
         try
@@ -15382,7 +15410,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexIFFT(input);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFT(input);
 
         try
@@ -15416,7 +15444,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorSoftmaxRows(input);
         if (input.Rank != 2)
             return base.TensorSoftmaxRows(input);
-                if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorSoftmaxRows(input);
 
         try

@@ -2862,9 +2862,10 @@ public interface IDirectGpuBackend : IDisposable
 
     /// <summary>
     /// Top-K by magnitude: retain elements whose magnitude-squared is at or above the K-th largest,
-    /// zeroing the rest. When ties exist at the threshold, all tied elements are retained, so the
-    /// output may contain more than K non-zero elements. This matches the CPU NativeComplexTopK
-    /// behavior which uses an index-based approach to guarantee exactly min(k,n) retained elements.
+    /// zeroing the rest. When ties exist at the threshold, all tied elements are retained, so some
+    /// GPU threshold-based implementations may produce more than K non-zero elements. This differs
+    /// from the CPU NativeComplexTopK behavior, which uses an index-based approach to guarantee
+    /// exactly min(k,n) retained elements.
     /// </summary>
     void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k);
 
