@@ -2860,7 +2860,13 @@ public interface IDirectGpuBackend : IDisposable
     void SplitComplexCrossSpectral(IGpuBuffer xReal, IGpuBuffer xImag, IGpuBuffer yReal, IGpuBuffer yImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n);
 
-    /// <summary>Top-K by magnitude: zero all but the K elements with largest sqrt(re^2+im^2).</summary>
+    /// <summary>
+    /// Top-K by magnitude: retain elements whose magnitude-squared is at or above the K-th largest,
+    /// zeroing the rest. When ties exist at the threshold, all tied elements are retained, so some
+    /// GPU threshold-based implementations may produce more than K non-zero elements. This differs
+    /// from the CPU NativeComplexTopK behavior, which uses an index-based approach to guarantee
+    /// exactly min(k,n) retained elements.
+    /// </summary>
     void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k);
 
     /// <summary>Per-row softmax on a 2D buffer: output[r][c] = exp(input[r][c]-max) / sum(exp).</summary>

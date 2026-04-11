@@ -27523,11 +27523,11 @@ public class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
-        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape, paramHash: k); if (ac is not null) return ac.Execute(); }
-
         var ops = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
         k = Math.Min(k, n);
+
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexTopK", input._shape, paramHash: k); if (ac is not null) return ac.Execute(); }
 
         // Compute magnitudes squared (avoid sqrt for ranking)
         var magSq = new (double mag, int idx)[n];

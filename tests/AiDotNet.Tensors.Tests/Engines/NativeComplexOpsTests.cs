@@ -432,6 +432,75 @@ public class NativeComplexOpsTests
     }
 
     // ================================================================
+    // CrossSpectral (X * conj(Y))
+    // ================================================================
+
+    [Fact]
+    public void CrossSpectral_CorrectResult()
+    {
+        // CrossSpectral computes X * conj(Y): (xr + xi*i)(yr - yi*i)
+        // = (xr*yr + xi*yi) + (xi*yr - xr*yi)*i
+        int n = 4;
+        var x = new Tensor<Complex<double>>([n]);
+        var y = new Tensor<Complex<double>>([n]);
+
+        x[0] = new Complex<double>(1, 2);
+        y[0] = new Complex<double>(3, 4);
+        // (1+2i)(3-4i) = 3-4i+6i-8i^2 = 3+2i+8 = 11+2i
+
+        x[1] = new Complex<double>(1, 0);
+        y[1] = new Complex<double>(0, 1);
+        // (1+0i)(0-1i) = 0-1i
+
+        x[2] = new Complex<double>(0, 0);
+        y[2] = new Complex<double>(5, 7);
+        // (0+0i)(5-7i) = 0+0i
+
+        x[3] = new Complex<double>(2, -3);
+        y[3] = new Complex<double>(2, -3);
+        // (2-3i)(2+3i) = 4+6i-6i-9i^2 = 4+9 = 13+0i
+
+        var result = _engine.NativeComplexCrossSpectral(x, y);
+
+        Assert.Equal(11.0, result[0].Real, 10);
+        Assert.Equal(2.0, result[0].Imaginary, 10);
+        Assert.Equal(0.0, result[1].Real, 10);
+        Assert.Equal(-1.0, result[1].Imaginary, 10);
+        Assert.Equal(0.0, result[2].Real, 10);
+        Assert.Equal(0.0, result[2].Imaginary, 10);
+        Assert.Equal(13.0, result[3].Real, 10);
+        Assert.Equal(0.0, result[3].Imaginary, 10);
+    }
+
+    [Fact]
+    public void CrossSpectral_SelfConjugate_ProducesMagnitudeSquared()
+    {
+        // X * conj(X) should equal |X|^2 (real-valued, all positive)
+        int n = 3;
+        var x = new Tensor<Complex<double>>([n]);
+        x[0] = new Complex<double>(3, 4);   // |x|^2 = 25
+        x[1] = new Complex<double>(-1, 2);  // |x|^2 = 5
+        x[2] = new Complex<double>(0, -5);  // |x|^2 = 25
+
+        var result = _engine.NativeComplexCrossSpectral(x, x);
+
+        Assert.Equal(25.0, result[0].Real, 10);
+        Assert.Equal(0.0, result[0].Imaginary, 10);
+        Assert.Equal(5.0, result[1].Real, 10);
+        Assert.Equal(0.0, result[1].Imaginary, 10);
+        Assert.Equal(25.0, result[2].Real, 10);
+        Assert.Equal(0.0, result[2].Imaginary, 10);
+    }
+
+    [Fact]
+    public void CrossSpectral_LengthMismatch_Throws()
+    {
+        var x = new Tensor<Complex<double>>([4]);
+        var y = new Tensor<Complex<double>>([8]);
+        Assert.Throws<ArgumentException>(() => _engine.NativeComplexCrossSpectral(x, y));
+    }
+
+    // ================================================================
     // SoftmaxRows
     // ================================================================
 

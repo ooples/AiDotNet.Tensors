@@ -51,7 +51,7 @@ public sealed partial class HipBackend
     {
         foreach (var buf in buffers)
         {
-            if (buf is null) throw new ArgumentNullException(opName, "GPU buffer cannot be null.");
+            if (buf is null) throw new ArgumentNullException(nameof(buffers), $"{opName}: GPU buffer cannot be null.");
             if (n > buf.Size) throw new ArgumentException($"{opName}: n ({n}) exceeds buffer size ({buf.Size}).");
         }
     }

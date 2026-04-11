@@ -15009,7 +15009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexMultiply(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMultiply(a, b);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
 
         try
@@ -15036,9 +15036,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexConjugate(a);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexConjugate(a);
 
         try
@@ -15061,9 +15061,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMagnitude(a);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitude(a);
 
         try
@@ -15084,9 +15084,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexMagnitudeSquared(a);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitudeSquared(a);
 
         try
@@ -15107,9 +15107,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexPhase(a);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexPhase(a);
 
         try
@@ -15130,9 +15130,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexFromPolar(magnitudes, phases);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexFromPolar(magnitudes, phases);
 
         try
@@ -15162,9 +15162,9 @@ if (!TryGetBackend(out var backend))
 
     public override Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
-                if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexScale(a, scalar);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexScale(a, scalar);
 
         try
@@ -15193,7 +15193,7 @@ if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexAdd(a, b);
-if (!TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
 
         try
@@ -15249,6 +15249,63 @@ if (!TryGetBackend(out var backend))
                 backend.DownloadBuffer(outIBuf.Buffer), input._shape);
         }
         catch { return base.NativeComplexFFTComplex(input); }
+    }
+
+    public override Tensor<Complex<T>> NativeComplexTopK<T>(Tensor<Complex<T>> input, int k)
+    {
+        if (input is null)
+            throw new ArgumentNullException(nameof(input));
+        if (k <= 0)
+            throw new ArgumentException("k must be positive.", nameof(k));
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return base.NativeComplexTopK(input, k);
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexTopK(input, k);
+
+        try
+        {
+            int n = input.Length;
+            int clampedK = Math.Min(k, n);
+            var (inR, inI) = DecomposeComplex(input);
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(inI), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.SplitComplexTopK(inRBuf.Buffer, inIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n, clampedK);
+
+            var outR = backend.DownloadBuffer(oRBuf.Buffer);
+            var outI = backend.DownloadBuffer(oIBuf.Buffer);
+
+            // Post-filter: GPU threshold-based TopK may retain more than K on ties.
+            // Ensure there are no more than min(k,n) non-zero elements by zeroing the weakest extras.
+            int nonZero = 0;
+            for (int i = 0; i < n; i++)
+                if (outR[i] != 0f || outI[i] != 0f) nonZero++;
+
+            if (nonZero > clampedK)
+            {
+                // Build (magSq, idx) pairs for non-zero entries, sort ascending, zero the weakest
+                var extras = new (float mag, int idx)[nonZero];
+                int ei = 0;
+                for (int i = 0; i < n; i++)
+                    if (outR[i] != 0f || outI[i] != 0f)
+                        extras[ei++] = (outR[i] * outR[i] + outI[i] * outI[i], i);
+
+                Array.Sort(extras, (a, b) => a.mag.CompareTo(b.mag));
+                int toZero = nonZero - clampedK;
+                for (int i = 0; i < toZero; i++)
+                {
+                    int idx = extras[i].idx;
+                    outR[idx] = 0f;
+                    outI[idx] = 0f;
+                }
+            }
+
+            return RecomposeComplex<T>(outR, outI, input._shape);
+        }
+        catch { return base.NativeComplexTopK(input, k); }
     }
 
     public override Tensor<Complex<T>> NativeComplexCrossSpectral<T>(Tensor<Complex<T>> x, Tensor<Complex<T>> y)
