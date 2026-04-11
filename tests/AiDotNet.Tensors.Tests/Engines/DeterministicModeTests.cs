@@ -54,7 +54,8 @@ public class DeterministicModeTests
         {
             AiDotNetEngine.SetDeterministicMode(true);
 
-            // Large enough to hit the BLAS work threshold (2*128*128*128 = 4.2M, above default threshold)
+            // Large enough to clear MatrixMultiplyHelper's BLAS work threshold (work = m*k*n,
+            // DefaultBlasWorkThreshold = 4096; 128*128*128 = 2,097,152 >> 4096).
             int m = 128, k = 128, n = 128;
             var rng = new Random(42);
             var a = new Tensor<float>([m, k]);

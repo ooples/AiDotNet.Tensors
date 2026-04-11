@@ -71,10 +71,36 @@ internal static class BlasProvider
                 _savedUseMklNet = _useMklNet;
                 _useMklNet = false;
             }
-            else if (_savedUseMklNet.HasValue)
+            else
             {
-                _useMklNet = _savedUseMklNet.Value;
-                _savedUseMklNet = null;
+                // Restore saved MKL state (what _useMklNet was before deterministic was turned on).
+                if (_savedUseMklNet.HasValue)
+                {
+                    _useMklNet = _savedUseMklNet.Value;
+                    _savedUseMklNet = null;
+                }
+
+                // Second-chance MKL.NET init: if BLAS was initialized DURING deterministic mode,
+                // TryLoadLibrary deliberately skipped MKL.NET and fell through to native BLAS
+                // (or no backend at all). Now that deterministic is off, attempt the MKL.NET
+                // load once more so the non-deterministic path isn't permanently stuck on the
+                // slower native/blocked fallback. This mirrors the code in TryLoadLibrary.
+                if (_initialized && !_useMklNet)
+                {
+                    try
+                    {
+                        if (TryInitializeMklNet())
+                        {
+                            Trace("[BLAS] MKL.NET retry-init after leaving deterministic mode succeeded");
+                            _useMklNet = true;
+                            _available = true;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace($"[BLAS] MKL.NET retry-init failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
             }
         }
     }

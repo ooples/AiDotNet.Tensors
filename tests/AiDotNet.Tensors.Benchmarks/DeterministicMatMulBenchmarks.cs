@@ -21,7 +21,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///
 /// A/B is driven by two bool params:
 ///  - <see cref="DeterministicMode"/>: off = MKL.NET GEMM, on = blocked C# fallback
-///  - <see cref="UseParallelGemm"/>: off = single-threaded SgemmTiled, on = parallel-M
+///  - <see cref="UseParallelGemm"/>: off = single-threaded SgemmTiled, on = parallel
+///    dispatch (1D parallel-M for shapes where row blocks alone saturate cores,
+///    2D (row × col-sub) grid for shapes where they don't)
 ///
 /// BDN runs each benchmark under all 4 combinations, letting us isolate the
 /// parallelism win from the deterministic-dispatch overhead independently.
@@ -44,10 +46,14 @@ public class DeterministicMatMulBenchmarks
 
     /// <summary>
     /// BDN expands this to {false, true}. Controls <see cref="SimdGemm.UseParallelGemm"/>,
-    /// the toggle that routes SgemmTiled through the parallel-M variant. Only meaningful
-    /// when the blocked C# path is actually used — i.e. when DeterministicMode is true OR
-    /// when the shape falls below the BLAS work threshold. For default-mode MKL runs this
-    /// has no effect (MKL manages its own parallelism).
+    /// the toggle that enables the parallel dispatch inside <c>SgemmTiled</c>. When true,
+    /// SgemmTiled picks between the 1D <c>SgemmTiledParallelM</c> variant (row-block-only
+    /// parallelism) and the 2D <c>SgemmTiledParallel2D</c> variant (row-block × col-sub
+    /// grid) based on shape — 2D is used for shapes where numRowBlocks alone does not
+    /// saturate logical cores. When false, SgemmTiled runs its original single-threaded
+    /// tiled path. Only meaningful when the blocked C# path is actually used — i.e. when
+    /// DeterministicMode is true OR the shape falls below the BLAS work threshold. For
+    /// default-mode MKL runs this has no effect (MKL manages its own parallelism).
     /// </summary>
     [ParamsAllValues]
     public bool UseParallelGemm { get; set; }
