@@ -239,12 +239,16 @@ internal static class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
-        // Decide parallel vs sequential up front. Parallel dispatches per-(jc,pc) tile
-        // by having each worker own its own row-block (ic), with packed-A allocated per
-        // worker from the ArrayPool and packed-B shared read-only within the tile.
+        // Decide parallel vs sequential up front. Parallel dispatches either:
+        //   - 1D parallel (SgemmTiledParallelM): row blocks only, when nc is too small
+        //     to justify col-sub parallelism OR when numRowBlocks already matches the
+        //     target core count.
+        //   - 2D parallel (SgemmTiledParallel2D): (row block × col sub) grid, when
+        //     numRowBlocks alone doesn't saturate available cores. Breaks past the
+        //     numRowBlocks ceiling that limited iter 1-3 at 1024² on 16-core machines.
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
         int numRowBlocks = (m + Mc - 1) / Mc;
-        bool useParallel = UseParallelGemm
+        bool canParallelize = UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 2
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
@@ -268,20 +272,36 @@ internal static class SimdGemm
                 {
                     int kc = Math.Min(Kc, k - pc);
 
-                    if (useParallel)
+                    if (canParallelize)
                     {
-                        // Parallel ic loop: each worker gets a disjoint row block with its
-                        // own packed-A, B is packed once and shared read-only. The output
-                        // row ranges are disjoint so no synchronization is needed on C.
-                        // Determinism: each C row's accumulation order is still fixed
-                        // (pc outer loop is sequential; inner kk/kIndex ordering is fixed
-                        // in the micro-kernel), so results are bit-exact regardless of
-                        // which worker processes which row block.
-                        SgemmTiledParallelM(
-                            a, b, c,
-                            m, k, n,
-                            jc, nc, pc, kc,
-                            numRowBlocks, packedBBuf);
+                        // Adaptive col-sub count: we want numRowBlocks * numColSubs ≈
+                        // target core count so the parallel dispatch fills the machine.
+                        // Clamp so each col sub has at least 4*Nr cols (else pack/compute
+                        // overhead dominates). If numColSubs <= 1, fall back to 1D.
+                        int targetCores = Math.Max(maxThreads / 2, 1); // physical cores
+                        int desiredColSubs = Math.Max(1, targetCores / numRowBlocks);
+                        int maxColSubs = Math.Max(1, nc / (Nr * 4));
+                        int numColSubs = Math.Min(desiredColSubs, maxColSubs);
+
+                        if (numColSubs >= 2)
+                        {
+                            SgemmTiledParallel2D(
+                                a, b, c,
+                                m, k, n,
+                                jc, nc, pc, kc,
+                                numRowBlocks, numColSubs);
+                        }
+                        else
+                        {
+                            // 1D parallel-M: each worker owns a disjoint row block with its
+                            // own packed-A, B is packed once and shared read-only. Output
+                            // row ranges are disjoint so no synchronization on C is needed.
+                            SgemmTiledParallelM(
+                                a, b, c,
+                                m, k, n,
+                                jc, nc, pc, kc,
+                                numRowBlocks, packedBBuf);
+                        }
                     }
                     else
                     {
@@ -489,6 +509,150 @@ internal static class SimdGemm
         {
             aHandle.Free();
             ArrayPool<float>.Shared.Return(aArr);
+        }
+    }
+
+    /// <summary>
+    /// 2D parallel GEMM: dispatches a grid of (ic_block × jc_sub) tiles in parallel.
+    /// Iter 4 (2026-04-11): breaks past the numRowBlocks parallelism ceiling. On a
+    /// 16-core machine at 1024² with Mc=128, the 1D M-parallel path was limited to
+    /// 8 workers; this variant adds col-sub parallelism to fill the remaining cores.
+    ///
+    /// Layout:
+    ///   - Each row block r has its own packed-A buffer, shared across all col subs
+    ///     (so PackA runs numRowBlocks times total, not numRowBlocks * numColSubs).
+    ///   - Each col sub cs has its own packed-B buffer, shared across all row blocks
+    ///     (so PackB runs numColSubs times, not numRowBlocks * numColSubs).
+    ///   - Compute dispatches numRowBlocks * numColSubs tiles in parallel, each
+    ///     reading its row's packed-A and its col-sub's packed-B, writing to a
+    ///     disjoint (mc x subNc) region of C.
+    ///
+    /// Determinism: output regions are disjoint per tile, inner pc loop is still
+    /// sequential, and the micro-kernel's FMA order is fixed. Results are bit-exact
+    /// identical to the sequential and 1D-parallel paths.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmTiledParallel2D(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m, int k, int n,
+        int jc, int nc, int pc, int kc,
+        int numRowBlocks, int numColSubBlocks)
+    {
+        // colSubSize: number of B columns per sub-block, rounded down to a multiple
+        // of Nr so MacroKernel's Nr panel loop stays clean. The last sub absorbs the
+        // remainder. If nc < numColSubBlocks*Nr, fall back to the 1D parallel path.
+        int colSubSize = (nc / numColSubBlocks / Nr) * Nr;
+        if (colSubSize < Nr)
+        {
+            // Degenerate — not enough cols per sub. Caller should have checked,
+            // but we guard here to avoid a zero-sized sub.
+            colSubSize = nc;
+            numColSubBlocks = 1;
+        }
+
+        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
+        int packedASizePerRow = mcRounded * Kc;
+        int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
+        int lastColSubWidth = nc - (numColSubBlocks - 1) * colSubSize;
+        int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
+        int packedBSizePerSub = Kc * Math.Max(colSubRounded, lastColSubRounded);
+
+        var packedABufs = new float[numRowBlocks][];
+        var packedBBufs = new float[numColSubBlocks][];
+        for (int r = 0; r < numRowBlocks; r++)
+            packedABufs[r] = ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        for (int cs = 0; cs < numColSubBlocks; cs++)
+            packedBBufs[cs] = ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+
+        // Pin A so workers can read it via ReadOnlySpan reconstruction inside the lambda.
+        float[] aArr = ArrayPool<float>.Shared.Rent(a.Length);
+        a.CopyTo(aArr);
+        var aHandle = GCHandle.Alloc(aArr, GCHandleType.Pinned);
+
+        // Pin B similarly — pack phase reads from it concurrently across workers.
+        float[] bArr = ArrayPool<float>.Shared.Rent(b.Length);
+        b.CopyTo(bArr);
+        var bHandle = GCHandle.Alloc(bArr, GCHandleType.Pinned);
+
+        try
+        {
+            float* localAPtr = (float*)aHandle.AddrOfPinnedObject();
+            int localALen = a.Length;
+            float* localBPtr = (float*)bHandle.AddrOfPinnedObject();
+            int localBLen = b.Length;
+            var localPackedABufs = packedABufs;
+            var localPackedBBufs = packedBBufs;
+            int localM = m, localK = k, localN = n;
+            int localJc = jc, localNc = nc, localPc = pc, localKc = kc;
+            int localColSubSize = colSubSize;
+            int localNumColSubs = numColSubBlocks;
+            int localMc = Mc;
+            int cLen = c.Length;
+
+            // Phase 1: parallel pack A for each row block. Runs PackA once per row
+            // block on independent output buffers — no contention.
+            Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks, r =>
+            {
+                int ic = r * localMc;
+                int mcLocal = Math.Min(localMc, localM - ic);
+                if (mcLocal > 0)
+                {
+                    var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                    PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
+                }
+            });
+
+            // Phase 2: parallel pack B for each col sub.
+            Helpers.CpuParallelSettings.LightweightParallel(numColSubBlocks, cs =>
+            {
+                int jStart = cs * localColSubSize;
+                int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                if (subNc > 0)
+                {
+                    var bSpan = new ReadOnlySpan<float>(localBPtr, localBLen);
+                    PackB(bSpan, localPackedBBufs[cs], localN, localPc, localKc, localJc + jStart, subNc);
+                }
+            });
+
+            // Phase 3: parallel compute for all (ic, jc_sub) tiles.
+            int totalTiles = numRowBlocks * numColSubBlocks;
+
+            fixed (float* cPtr = c)
+            {
+                var localCPtr = cPtr;
+                var localCLen = cLen;
+
+                Helpers.CpuParallelSettings.LightweightParallel(totalTiles, tileId =>
+                {
+                    int r = tileId / localNumColSubs;
+                    int cs = tileId % localNumColSubs;
+                    int ic = r * localMc;
+                    int mcLocal = Math.Min(localMc, localM - ic);
+                    int jStart = cs * localColSubSize;
+                    int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                    if (mcLocal > 0 && subNc > 0)
+                    {
+                        var cSpan = new Span<float>(localCPtr, localCLen);
+                        MacroKernel(
+                            localPackedABufs[r], localPackedBBufs[cs],
+                            cSpan, mcLocal, subNc, localKc, localN,
+                            ic, localJc + jStart);
+                    }
+                });
+            }
+        }
+        finally
+        {
+            if (aHandle.IsAllocated) aHandle.Free();
+            ArrayPool<float>.Shared.Return(aArr);
+            if (bHandle.IsAllocated) bHandle.Free();
+            ArrayPool<float>.Shared.Return(bArr);
+            for (int r = 0; r < numRowBlocks; r++)
+                ArrayPool<float>.Shared.Return(packedABufs[r]);
+            for (int cs = 0; cs < numColSubBlocks; cs++)
+                ArrayPool<float>.Shared.Return(packedBBufs[cs]);
         }
     }
 
