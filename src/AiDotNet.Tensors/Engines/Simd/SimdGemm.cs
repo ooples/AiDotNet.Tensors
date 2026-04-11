@@ -939,30 +939,13 @@ internal static class SimdGemm
         ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
         ref float bRef = ref MemoryMarshal.GetArrayDataReference(packedB);
 
-        // Prefetch distance: load B/A cache lines PrefetchDistance iterations ahead
-        // so they arrive in L1 just before they're consumed. Zen 2 L2→L1 latency is
-        // ~12 cycles and each k iteration is ~4 cycles (load-port limited), so 4
-        // iterations ahead covers the gap. Overrun past kc doesn't cause issues —
-        // prefetch instructions are hints and out-of-bounds prefetches are ignored.
-        const int PrefetchDistance = 8;
-        int prefetchLimit = kc - PrefetchDistance;
-
+        // Iter 16: removed software prefetch entirely. Zen 2's hardware prefetcher
+        // already handles sequential access well. Iter 9's explicit Sse.Prefetch0
+        // hints consumed load ports (10 loads per iter → 12 with 2 prefetches =
+        // 6 cycles load-limited vs 5 without), slightly slowing the critical path.
+        // The branch check (if p < prefetchLimit) also hurt loop predictability.
         for (int p = 0; p < kc; p++)
         {
-            // Prefetch B for the p+PrefetchDistance iteration (both halves of the
-            // Nr=16 row, which spans 2 cache lines on 64-byte lines / 16 floats).
-            if (p < prefetchLimit)
-            {
-                int prefBIdx = bOffset + (p + PrefetchDistance) * Nr;
-                Sse.Prefetch0(
-                    (void*)Unsafe.AsPointer(ref Unsafe.Add(ref bRef, prefBIdx)));
-                // Prefetch A's 6 floats for the p+PrefetchDistance iteration
-                // (fits in one cache line since Mr=6 floats = 24 bytes).
-                int prefAIdx = aOffset + (p + PrefetchDistance) * Mr;
-                Sse.Prefetch0(
-                    (void*)Unsafe.AsPointer(ref Unsafe.Add(ref aRef, prefAIdx)));
-            }
-
             // Load B row (Nr=16 = 2 vectors of 8). B regs are live across all 6 A
             // broadcasts, so they stay resident throughout the inner sequence.
             int bIdx = bOffset + p * Nr;
