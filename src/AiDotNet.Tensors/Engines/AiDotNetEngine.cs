@@ -1,5 +1,6 @@
 ﻿using System.Threading;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -207,5 +208,55 @@ public static class AiDotNetEngine
     {
         var engine = Current;
         return $"Engine: {engine.Name}, GPU Support: {engine.SupportsGpu}";
+    }
+
+    /// <summary>
+    /// Gets whether deterministic reduction mode is currently enabled.
+    /// When true, floating-point reductions (matmul, softmax, sums) produce
+    /// bit-identical results across runs on the same hardware.
+    /// </summary>
+    public static bool DeterministicMode => BlasProvider.IsDeterministicMode;
+
+    /// <summary>
+    /// Enables or disables deterministic reduction mode for CPU tensor operations.
+    /// </summary>
+    /// <param name="deterministic">True to enable deterministic mode; false to use the default high-throughput mode.</param>
+    /// <remarks>
+    /// <para>
+    /// Multi-threaded BLAS (MKL.NET) can produce slightly different floating-point results across
+    /// runs of the same inputs because parallel reduction order is not stable — floating-point
+    /// addition is non-associative, so any variation in accumulation order produces a slightly
+    /// different final value. In long training runs, small per-step drift can compound into
+    /// observable trajectory divergence (e.g. final val-loss differences between otherwise-identical
+    /// seeded runs).
+    /// </para>
+    /// <para>
+    /// Enabling deterministic mode:
+    /// <list type="bullet">
+    ///   <item>Disables MKL.NET managed GEMM and routes matmul through the blocked fallback,
+    ///         which writes disjoint output rows per thread with fixed inner accumulation order
+    ///         (bit-exact regardless of thread count).</item>
+    ///   <item>Forces native BLAS (when loaded) to single-threaded via <c>mkl_set_num_threads(1)</c>
+    ///         and <c>mkl_set_dynamic(0)</c>.</item>
+    ///   <item>Leaves all other tensor reductions alone — <c>TensorSum</c>, <c>TensorSumOfSquares</c>,
+    ///         <c>TensorMean</c>, and <c>TensorLogSoftmax</c> are already deterministic in this engine.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Performance trade-off:</b> deterministic mode skips MKL's multi-threaded GEMM, which can
+    /// reduce matmul throughput for large matrices. Only enable when reproducibility is required
+    /// (tests, scientific reproducibility, paper experiments). Safe to call at any time; takes
+    /// effect on the next BLAS call.
+    /// </para>
+    /// <para>
+    /// <b>For Beginners:</b> Turn this on if you need two identical training runs to produce
+    /// identical numerical results — useful for debugging, test assertions, and research
+    /// reproducibility. Leave it off for production training where raw speed matters more than
+    /// bit-for-bit reproducibility.
+    /// </para>
+    /// </remarks>
+    public static void SetDeterministicMode(bool deterministic)
+    {
+        BlasProvider.SetDeterministicMode(deterministic);
     }
 }
