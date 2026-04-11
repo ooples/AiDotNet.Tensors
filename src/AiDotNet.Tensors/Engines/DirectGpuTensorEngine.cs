@@ -15279,7 +15279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var outI = backend.DownloadBuffer(oIBuf.Buffer);
 
             // Post-filter: GPU threshold-based TopK may retain more than K on ties.
-            // Enforce exactly min(k,n) non-zero elements by zeroing the weakest extras.
+            // Ensure there are no more than min(k,n) non-zero elements by zeroing the weakest extras.
             int nonZero = 0;
             for (int i = 0; i < n; i++)
                 if (outR[i] != 0f || outI[i] != 0f) nonZero++;
