@@ -19,8 +19,11 @@ internal static class SimdGemm
 {
     // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
     // Iter 2 (2026-04-11): Mc lowered 256→128 to get more row blocks per problem, which
-    // improves parallel utilization on ≥8-core machines without affecting total pack cost
-    // (same total A bytes packed, just spread across more PackA calls).
+    // improves parallel utilization on ≥8-core machines without affecting total pack cost.
+    // Iter 3 (2026-04-11, reverted): Mc=64 was tried and failed — regressed 1024² from
+    // 15.5ms to 17.3ms and 256² from 785us to 2.82ms. Mc=64 is too small: 16 row blocks
+    // on 16 cores gives poor cache locality and 64 is not a multiple of Mr=6 (10.67→
+    // remainder-path overhead per panel). Kept at 128.
     private const int Mc = 128;  // Panel height for A (fits in L2)
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
@@ -690,29 +693,37 @@ internal static class SimdGemm
 
         for (int p = 0; p < kc; p++)
         {
-            // Load B row (Nr=16 = 2 vectors of 8)
+            // Load B row (Nr=16 = 2 vectors of 8). B regs are live across all 6 A
+            // broadcasts, so they stay resident throughout the inner sequence.
             int bIdx = bOffset + p * Nr;
             var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx)));
             var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx + 8)));
 
-            // Load A column (Mr=6 values)
+            // A broadcasts: load each element right before its 2 FMAs and let the
+            // register die immediately. This keeps only one A reg live at a time,
+            // bringing total live ymm regs to 12 acc + 2 B + 1 A = 15, fitting in
+            // AVX2's 16 ymm without spills. Prior version loaded all 6 A elements
+            // up front, forcing the JIT to keep 20 regs live and spill to stack.
             int aIdx = aOffset + p * Mr;
-            var a0 = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
-            var a1 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
-            var a2 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
-            var a3 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
-            var a4 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
-            var a5 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+            var a = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
 
-            // FMA: C[i,j] += A[i,p] * B[p,j]
-            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
-            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
-            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
-            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
-            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
-            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
         }
 
         // Store results back to C (accumulate)
