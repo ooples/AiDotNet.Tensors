@@ -18,12 +18,12 @@ namespace AiDotNet.Tensors.Engines.Simd;
 internal static class SimdGemm
 {
     // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
-    // Iter 2 (2026-04-11): Mc lowered 256→128 to get more row blocks per problem, which
-    // improves parallel utilization on ≥8-core machines without affecting total pack cost.
-    // Iter 3 (2026-04-11, reverted): Mc=64 was tried and failed — regressed 1024² from
-    // 15.5ms to 17.3ms and 256² from 785us to 2.82ms. Mc=64 is too small: 16 row blocks
-    // on 16 cores gives poor cache locality and 64 is not a multiple of Mr=6 (10.67→
-    // remainder-path overhead per panel). Kept at 128.
+    // Iter 2: Mc lowered 256→128 for more row blocks (better parallel utilization).
+    // Iter 3 (reverted): Mc=64 regressed across the board — too small for cache reuse.
+    // Iter 8 (reverted): Kc=256 was tried to fit per-tile working set in L2, but the
+    // extra pc iterations (4 instead of 2) doubled the number of parallel barriers and
+    // regressed 512² by 1.5x. The L2-fit argument was wrong because packed A gets
+    // evicted by packed B during the inner loop anyway. Kept at 512.
     private const int Mc = 128;  // Panel height for A (fits in L2)
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
@@ -832,7 +832,7 @@ internal static class SimdGemm
     /// Inner loop over K dimension broadcasts A elements and FMA with B row.
     /// </summary>
     [MethodImpl(HotInline)]
-    private static void MicroKernel6x16(
+    private static unsafe void MicroKernel6x16(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
         Span<float> c, int ldc,
@@ -850,8 +850,30 @@ internal static class SimdGemm
         ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
         ref float bRef = ref MemoryMarshal.GetArrayDataReference(packedB);
 
+        // Prefetch distance: load B/A cache lines PrefetchDistance iterations ahead
+        // so they arrive in L1 just before they're consumed. Zen 2 L2→L1 latency is
+        // ~12 cycles and each k iteration is ~4 cycles (load-port limited), so 4
+        // iterations ahead covers the gap. Overrun past kc doesn't cause issues —
+        // prefetch instructions are hints and out-of-bounds prefetches are ignored.
+        const int PrefetchDistance = 8;
+        int prefetchLimit = kc - PrefetchDistance;
+
         for (int p = 0; p < kc; p++)
         {
+            // Prefetch B for the p+PrefetchDistance iteration (both halves of the
+            // Nr=16 row, which spans 2 cache lines on 64-byte lines / 16 floats).
+            if (p < prefetchLimit)
+            {
+                int prefBIdx = bOffset + (p + PrefetchDistance) * Nr;
+                Sse.Prefetch0(
+                    (void*)Unsafe.AsPointer(ref Unsafe.Add(ref bRef, prefBIdx)));
+                // Prefetch A's 6 floats for the p+PrefetchDistance iteration
+                // (fits in one cache line since Mr=6 floats = 24 bytes).
+                int prefAIdx = aOffset + (p + PrefetchDistance) * Mr;
+                Sse.Prefetch0(
+                    (void*)Unsafe.AsPointer(ref Unsafe.Add(ref aRef, prefAIdx)));
+            }
+
             // Load B row (Nr=16 = 2 vectors of 8). B regs are live across all 6 A
             // broadcasts, so they stay resident throughout the inner sequence.
             int bIdx = bOffset + p * Nr;
