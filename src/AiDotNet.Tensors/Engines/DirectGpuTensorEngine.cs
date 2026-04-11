@@ -15255,6 +15255,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (input is null)
             throw new ArgumentNullException(nameof(input));
+        if (k <= 0)
+            throw new ArgumentException("k must be positive.", nameof(k));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return base.NativeComplexTopK(input, k);
         if (!TryGetBackend(out var backend))
@@ -15263,7 +15265,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int n = input.Length;
-            int clampedK = Math.Min(Math.Max(k, 0), n);
+            int clampedK = Math.Min(k, n);
             var (inR, inI) = DecomposeComplex(input);
 
             using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
