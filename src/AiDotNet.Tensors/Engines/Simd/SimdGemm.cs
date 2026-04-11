@@ -275,11 +275,13 @@ internal static class SimdGemm
                     if (canParallelize)
                     {
                         // Adaptive col-sub count: we want numRowBlocks * numColSubs ≈
-                        // target core count so the parallel dispatch fills the machine.
-                        // Clamp so each col sub has at least 4*Nr cols (else pack/compute
-                        // overhead dominates). If numColSubs <= 1, fall back to 1D.
-                        int targetCores = Math.Max(maxThreads / 2, 1); // physical cores
-                        int desiredColSubs = Math.Max(1, targetCores / numRowBlocks);
+                        // logical core count so the parallel dispatch fills the machine.
+                        // Iter 5 (2026-04-11): use maxThreads (logical cores) instead of
+                        // physical — at 1024² this gives 8 row blocks × 4 col subs = 32
+                        // tiles, one per logical core on the 32-core Ryzen. SMT siblings
+                        // help here because the work is load-port-limited rather than
+                        // FMA-port-limited in blocked GEMM.
+                        int desiredColSubs = Math.Max(1, maxThreads / numRowBlocks);
                         int maxColSubs = Math.Max(1, nc / (Nr * 4));
                         int numColSubs = Math.Min(desiredColSubs, maxColSubs);
 
