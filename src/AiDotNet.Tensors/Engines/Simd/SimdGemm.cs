@@ -568,22 +568,8 @@ internal static class SimdGemm
         for (int cs = 0; cs < numColSubBlocks; cs++)
             packedBBufs[cs] = ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
-        // Pin A so workers can read it via ReadOnlySpan reconstruction inside the lambda.
-        float[] aArr = ArrayPool<float>.Shared.Rent(a.Length);
-        a.CopyTo(aArr);
-        var aHandle = GCHandle.Alloc(aArr, GCHandleType.Pinned);
-
-        // Pin B similarly — pack phase reads from it concurrently across workers.
-        float[] bArr = ArrayPool<float>.Shared.Rent(b.Length);
-        b.CopyTo(bArr);
-        var bHandle = GCHandle.Alloc(bArr, GCHandleType.Pinned);
-
         try
         {
-            float* localAPtr = (float*)aHandle.AddrOfPinnedObject();
-            int localALen = a.Length;
-            float* localBPtr = (float*)bHandle.AddrOfPinnedObject();
-            int localBLen = b.Length;
             var localPackedABufs = packedABufs;
             var localPackedBBufs = packedBBufs;
             int localM = m, localK = k, localN = n;
@@ -591,41 +577,50 @@ internal static class SimdGemm
             int localColSubSize = colSubSize;
             int localNumColSubs = numColSubBlocks;
             int localMc = Mc;
-            int cLen = c.Length;
 
-            // Phase 1: parallel pack A for each row block. Runs PackA once per row
-            // block on independent output buffers — no contention.
-            Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks, r =>
+            // Pin A, B, C directly via the input spans — no extra copy. The fixed
+            // block outlives every LightweightParallel call below (synchronous
+            // dispatch waits for all workers before returning), so the pointers
+            // stay valid throughout. Iter 6: previous version copied A and B into
+            // rented arrays for pinning, which added 8MB of serial copy at 1024².
+            fixed (float* aPtr0 = a)
+            fixed (float* bPtr0 = b)
+            fixed (float* cPtr0 = c)
             {
-                int ic = r * localMc;
-                int mcLocal = Math.Min(localMc, localM - ic);
-                if (mcLocal > 0)
+                float* localAPtr = aPtr0;
+                int localALen = a.Length;
+                float* localBPtr = bPtr0;
+                int localBLen = b.Length;
+                float* localCPtr = cPtr0;
+                int localCLen = c.Length;
+
+                // Phase 1: parallel pack A for each row block. Runs PackA once per row
+                // block on independent output buffers — no contention.
+                Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks, r =>
                 {
-                    var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
-                    PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
-                }
-            });
+                    int ic = r * localMc;
+                    int mcLocal = Math.Min(localMc, localM - ic);
+                    if (mcLocal > 0)
+                    {
+                        var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                        PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
+                    }
+                });
 
-            // Phase 2: parallel pack B for each col sub.
-            Helpers.CpuParallelSettings.LightweightParallel(numColSubBlocks, cs =>
-            {
-                int jStart = cs * localColSubSize;
-                int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
-                if (subNc > 0)
+                // Phase 2: parallel pack B for each col sub.
+                Helpers.CpuParallelSettings.LightweightParallel(numColSubBlocks, cs =>
                 {
-                    var bSpan = new ReadOnlySpan<float>(localBPtr, localBLen);
-                    PackB(bSpan, localPackedBBufs[cs], localN, localPc, localKc, localJc + jStart, subNc);
-                }
-            });
+                    int jStart = cs * localColSubSize;
+                    int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                    if (subNc > 0)
+                    {
+                        var bSpan = new ReadOnlySpan<float>(localBPtr, localBLen);
+                        PackB(bSpan, localPackedBBufs[cs], localN, localPc, localKc, localJc + jStart, subNc);
+                    }
+                });
 
-            // Phase 3: parallel compute for all (ic, jc_sub) tiles.
-            int totalTiles = numRowBlocks * numColSubBlocks;
-
-            fixed (float* cPtr = c)
-            {
-                var localCPtr = cPtr;
-                var localCLen = cLen;
-
+                // Phase 3: parallel compute for all (ic, jc_sub) tiles.
+                int totalTiles = numRowBlocks * numColSubBlocks;
                 Helpers.CpuParallelSettings.LightweightParallel(totalTiles, tileId =>
                 {
                     int r = tileId / localNumColSubs;
@@ -647,10 +642,6 @@ internal static class SimdGemm
         }
         finally
         {
-            if (aHandle.IsAllocated) aHandle.Free();
-            ArrayPool<float>.Shared.Return(aArr);
-            if (bHandle.IsAllocated) bHandle.Free();
-            ArrayPool<float>.Shared.Return(bArr);
             for (int r = 0; r < numRowBlocks; r++)
                 ArrayPool<float>.Shared.Return(packedABufs[r]);
             for (int cs = 0; cs < numColSubBlocks; cs++)
