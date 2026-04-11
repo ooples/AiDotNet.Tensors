@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///   dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks \
 ///     -- --vs-deterministic-matmul
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 10)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 2, warmupCount: 5, iterationCount: 15)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class DeterministicMatMulBenchmarks
