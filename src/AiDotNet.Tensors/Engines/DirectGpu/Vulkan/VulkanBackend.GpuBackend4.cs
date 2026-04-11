@@ -1582,6 +1582,7 @@ public sealed unsafe partial class VulkanBackend
     // --- Split-buffer native Complex<T> operations (Vulkan) ---
     // Composes from existing GPU primitives with cached scratch buffers.
 
+    private readonly object _complexScratchLock = new();
     private IGpuBuffer[]? _complexScratch;
     private int _complexScratchSize;
 
@@ -1598,11 +1599,14 @@ public sealed unsafe partial class VulkanBackend
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;
-        EnsureComplexScratch(n);
-        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-        Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
-        Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
+        lock (_complexScratchLock)
+        {
+            EnsureComplexScratch(n);
+            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+            Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
+            Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
+        }
     }
 
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
@@ -1616,9 +1620,12 @@ public sealed unsafe partial class VulkanBackend
     public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
     {
         if (n <= 0) return;
-        EnsureComplexScratch(n);
-        Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
-        Add(_complexScratch[0], _complexScratch[1], o, n);
+        lock (_complexScratchLock)
+        {
+            EnsureComplexScratch(n);
+            Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
+            Add(_complexScratch[0], _complexScratch[1], o, n);
+        }
     }
     public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
     public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
@@ -1638,11 +1645,14 @@ public sealed unsafe partial class VulkanBackend
     public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;
-        EnsureComplexScratch(n);
-        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-        Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
-        Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
+        lock (_complexScratchLock)
+        {
+            EnsureComplexScratch(n);
+            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+            Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
+            Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
+        }
     }
 
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
