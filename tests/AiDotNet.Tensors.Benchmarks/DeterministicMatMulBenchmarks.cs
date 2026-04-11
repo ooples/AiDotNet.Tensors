@@ -1,5 +1,6 @@
 #if NET8_0_OR_GREATER
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.LinearAlgebra;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
@@ -18,13 +19,16 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// matter, we can flip the deterministic default or remove MKL.NET entirely
 /// per the project's strategic direction.
 ///
-/// A/B is driven by <see cref="DeterministicMode"/> (a bool param). BDN runs
-/// each benchmark twice — once with deterministic mode off (MKL.NET path) and
-/// once with it on (blocked C# fallback). Same matmul code, same tensor data,
-/// only the underlying dispatch changes.
+/// A/B is driven by two bool params:
+///  - <see cref="DeterministicMode"/>: off = MKL.NET GEMM, on = blocked C# fallback
+///  - <see cref="UseParallelGemm"/>: off = single-threaded SgemmTiled, on = parallel-M
+///
+/// BDN runs each benchmark under all 4 combinations, letting us isolate the
+/// parallelism win from the deterministic-dispatch overhead independently.
 ///
 /// Run with:
-///   dotnet run -c Release --filter DeterministicMatMul*
+///   dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks \
+///     -- --vs-deterministic-matmul
 /// </summary>
 [SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 10)]
 [MemoryDiagnoser]
@@ -37,6 +41,16 @@ public class DeterministicMatMulBenchmarks
     /// </summary>
     [ParamsAllValues]
     public bool DeterministicMode { get; set; }
+
+    /// <summary>
+    /// BDN expands this to {false, true}. Controls <see cref="SimdGemm.UseParallelGemm"/>,
+    /// the toggle that routes SgemmTiled through the parallel-M variant. Only meaningful
+    /// when the blocked C# path is actually used — i.e. when DeterministicMode is true OR
+    /// when the shape falls below the BLAS work threshold. For default-mode MKL runs this
+    /// has no effect (MKL manages its own parallelism).
+    /// </summary>
+    [ParamsAllValues]
+    public bool UseParallelGemm { get; set; }
 
     private CpuEngine _engine = null!;
 
@@ -97,9 +111,10 @@ public class DeterministicMatMulBenchmarks
     [IterationSetup]
     public void IterationSetup()
     {
-        // Apply mode per iteration so BDN's {false, true} parameter split routes
-        // each benchmark through the correct dispatch path.
+        // Apply mode per iteration so BDN's parameter expansion routes each
+        // benchmark through the correct dispatch path.
         AiDotNetEngine.SetDeterministicMode(DeterministicMode);
+        SimdGemm.UseParallelGemm = UseParallelGemm;
     }
 
     [GlobalCleanup]
@@ -107,6 +122,7 @@ public class DeterministicMatMulBenchmarks
     {
         // Leave the engine in default mode after the benchmark run.
         AiDotNetEngine.SetDeterministicMode(false);
+        SimdGemm.UseParallelGemm = true;
     }
 
     // ───────────── HRE baseline (Issue #131 defaults) ─────────────

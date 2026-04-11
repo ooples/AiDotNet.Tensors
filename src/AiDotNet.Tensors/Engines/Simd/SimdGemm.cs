@@ -27,6 +27,16 @@ internal static class SimdGemm
     private const int Mr = 6;
     private const int Nr = 16;
 
+    // A/B test toggle: set to false to force sequential SgemmTiled for baseline
+    // comparisons. Defaults to true so multi-core systems get parallel execution.
+    // Intended for benchmark A/B iteration, not production config.
+    internal static bool UseParallelGemm = true;
+
+    // Minimum problem size (2*m*n*k flops) to enable parallel dispatch. Below this
+    // threshold the thread-pool overhead outweighs the parallelism benefit and the
+    // sequential tiled path wins.
+    private const long ParallelWorkThreshold = 4L * 1024 * 1024; // ~4M flops (e.g. 128^3 * 2)
+
     /// <summary>
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
     /// All matrices are in row-major order. C is cleared before computation.
@@ -222,6 +232,17 @@ internal static class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        // Decide parallel vs sequential up front. Parallel dispatches per-(jc,pc) tile
+        // by having each worker own its own row-block (ic), with packed-A allocated per
+        // worker from the ArrayPool and packed-B shared read-only within the tile.
+        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        bool useParallel = UseParallelGemm
+            && maxThreads > 1
+            && numRowBlocks >= 2
+            && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
+            && (long)m * k * n >= ParallelWorkThreshold;
+
         // Round up to micro-tile dimensions to avoid buffer overruns in PackA/PackB padding
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
@@ -240,16 +261,34 @@ internal static class SimdGemm
                 {
                     int kc = Math.Min(Kc, k - pc);
 
-                    // Sequential path (parallel paths use the same PackA/PackB with stride params)
-                    PackA(a, packedABuf, lda, transA, ic: 0, mc: Math.Min(Mc, m), pc, kc);
-                    PackB(b, packedBBuf, ldb, transB, pc, kc, jc, nc);
-
-                    for (int ic = 0; ic < m; ic += Mc)
+                    if (useParallel)
                     {
-                        int mc = Math.Min(Mc, m - ic);
-                        if (ic > 0) // first block already packed above
-                            PackA(a, packedABuf, lda, transA, ic, mc, pc, kc);
-                        MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
+                        // Parallel ic loop: each worker gets a disjoint row block with its
+                        // own packed-A, B is packed once and shared read-only. The output
+                        // row ranges are disjoint so no synchronization is needed on C.
+                        // Determinism: each C row's accumulation order is still fixed
+                        // (pc outer loop is sequential; inner kk/kIndex ordering is fixed
+                        // in the micro-kernel), so results are bit-exact regardless of
+                        // which worker processes which row block.
+                        SgemmTiledParallelM(
+                            a, b, c,
+                            m, k, n,
+                            jc, nc, pc, kc,
+                            numRowBlocks, packedBBuf);
+                    }
+                    else
+                    {
+                        // Sequential path (original)
+                        PackA(a, packedABuf, lda, transA, ic: 0, mc: Math.Min(Mc, m), pc, kc);
+                        PackB(b, packedBBuf, ldb, transB, pc, kc, jc, nc);
+
+                        for (int ic = 0; ic < m; ic += Mc)
+                        {
+                            int mc = Math.Min(Mc, m - ic);
+                            if (ic > 0) // first block already packed above
+                                PackA(a, packedABuf, lda, transA, ic, mc, pc, kc);
+                            MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
+                        }
                     }
                 }
             }
