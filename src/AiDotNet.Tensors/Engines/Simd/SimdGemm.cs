@@ -665,23 +665,68 @@ internal static class SimdGemm
     /// When transA=false: reads A[row, col] = a[row*lda + col] (row-major).
     /// When transA=true:  reads A^T[row, col] = a[col*lda + row] (transposed).
     /// Layout: groups of Mr rows, each stored as Mr x kc contiguous block.
+    /// Iter 14: non-transpose full-Mr panel path uses direct pointer arithmetic with
+    /// 6 hoisted row pointers and inner-loop unroll-by-4. Eliminates the JIT's bounds
+    /// checks and repeated index calculations, cutting pack A time substantially.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
+    private static unsafe void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
     {
         int pos = 0;
         int i = 0;
 
-        // Full Mr-row panels
-        for (; i + Mr <= mc; i += Mr)
+#if NET5_0_OR_GREATER
+        // Fast path: non-transpose, full Mr-row panels. Hoist 6 row pointers out
+        // of the p-loop, unroll p by 4.
+        if (!transA)
         {
-            for (int p = 0; p < kc; p++)
+            fixed (float* aPtr = a)
+            fixed (float* packedPtr = packed)
             {
-                for (int ii = 0; ii < Mr; ii++)
+                for (; i + Mr <= mc; i += Mr)
                 {
-                    int row = ic + i + ii;
-                    int col = pc + p;
-                    packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
+                    float* row0 = aPtr + (ic + i + 0) * lda + pc;
+                    float* row1 = aPtr + (ic + i + 1) * lda + pc;
+                    float* row2 = aPtr + (ic + i + 2) * lda + pc;
+                    float* row3 = aPtr + (ic + i + 3) * lda + pc;
+                    float* row4 = aPtr + (ic + i + 4) * lda + pc;
+                    float* row5 = aPtr + (ic + i + 5) * lda + pc;
+                    float* pp = packedPtr + pos;
+
+                    int p = 0;
+                    for (; p + 4 <= kc; p += 4)
+                    {
+                        pp[0]  = row0[0]; pp[1]  = row1[0]; pp[2]  = row2[0]; pp[3]  = row3[0]; pp[4]  = row4[0]; pp[5]  = row5[0];
+                        pp[6]  = row0[1]; pp[7]  = row1[1]; pp[8]  = row2[1]; pp[9]  = row3[1]; pp[10] = row4[1]; pp[11] = row5[1];
+                        pp[12] = row0[2]; pp[13] = row1[2]; pp[14] = row2[2]; pp[15] = row3[2]; pp[16] = row4[2]; pp[17] = row5[2];
+                        pp[18] = row0[3]; pp[19] = row1[3]; pp[20] = row2[3]; pp[21] = row3[3]; pp[22] = row4[3]; pp[23] = row5[3];
+                        pp += 24;
+                        row0 += 4; row1 += 4; row2 += 4; row3 += 4; row4 += 4; row5 += 4;
+                    }
+                    for (; p < kc; p++)
+                    {
+                        pp[0] = row0[0]; pp[1] = row1[0]; pp[2] = row2[0]; pp[3] = row3[0]; pp[4] = row4[0]; pp[5] = row5[0];
+                        pp += 6;
+                        row0++; row1++; row2++; row3++; row4++; row5++;
+                    }
+                    pos += Mr * kc;
+                }
+            }
+        }
+        else
+#endif
+        {
+            // Scalar fallback (transpose path or older TFMs)
+            for (; i + Mr <= mc; i += Mr)
+            {
+                for (int p = 0; p < kc; p++)
+                {
+                    for (int ii = 0; ii < Mr; ii++)
+                    {
+                        int row = ic + i + ii;
+                        int col = pc + p;
+                        packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
+                    }
                 }
             }
         }
