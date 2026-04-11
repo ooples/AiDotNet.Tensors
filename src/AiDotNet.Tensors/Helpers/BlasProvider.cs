@@ -35,12 +35,14 @@ internal static class BlasProvider
     private static readonly bool TraceEnabled = ReadEnvBool("AIDOTNET_BLAS_TRACE");
 
     /// <summary>
-    /// Enables deterministic mode by forcing BLAS to single-threaded execution.
-    /// Multi-threaded BLAS (OpenBLAS, MKL) can produce slightly different FP results
-    /// across runs due to parallel reduction ordering. Single-threaded mode guarantees
-    /// bit-identical results for the same input.
+    /// When true, BLAS/MKL GEMM paths are bypassed entirely — TryGemm and
+    /// IsMklVerified return false at their top so matmul falls through to the
+    /// bit-exact blocked C# fallback. This guarantees bit-identical results
+    /// across runs regardless of thread count, since the fallback's inner
+    /// accumulation order is fixed. Volatile so that lock-free reads in the
+    /// hot TryGemm path see writes made under InitLock without stale caching.
     /// </summary>
-    private static bool _deterministicMode;
+    private static volatile bool _deterministicMode;
 
     /// <summary>
     /// Returns whether deterministic mode is currently enabled.
@@ -59,10 +61,11 @@ internal static class BlasProvider
             if (_deterministicMode == deterministic) return;
             _deterministicMode = deterministic;
             // Deterministic mode routes all matmul through the bit-exact blocked C# fallback
-            // by having TryGemm/IsMklVerified return false at the top. We don't need to force
-            // native BLAS to single-threaded — it never gets called in deterministic mode —
-            // so we leave ThreadCountOverride alone to avoid touching native thread-control
-            // functions that can be unsafe on some platforms.
+            // by having TryGemm/IsMklVerified return false at the top. It does NOT call into
+            // native thread-control functions (mkl_set_num_threads, etc.) — those paths are
+            // only triggered when AIDOTNET_BLAS_THREADS is explicitly set via env var, which
+            // drives ThreadCountOverride. ThreadCountOverride is intentionally left alone
+            // here to avoid touching native symbols that can be unsafe on some platforms.
             if (deterministic)
             {
                 _savedUseMklNet = _useMklNet;
@@ -856,11 +859,13 @@ internal static class BlasProvider
         }
 
         // Only invoke native thread-control functions when the caller has explicitly
-        // requested a specific thread count (env var or deterministic mode). The
-        // loaded symbols can be unsafe to call blindly on some platforms — on net10.0
-        // Windows, for example, invoking them without explicit opt-in has been seen
-        // to trigger access violations. Falling through leaves the native library at
-        // its own default thread count, which is safe.
+        // provided a ThreadCountOverride (set via the AIDOTNET_BLAS_THREADS env var).
+        // Deterministic mode does NOT opt in here — it bypasses BLAS entirely via
+        // the TryGemm short-circuit, so thread-control calls would be pointless.
+        // The loaded symbols can be unsafe to call blindly on some platforms — on
+        // net10.0 Windows, for example, invoking them without this explicit opt-in
+        // has been seen to trigger access violations. Falling through leaves the
+        // native library at its own default thread count, which is safe.
         if (!ThreadCountOverride.HasValue)
         {
             Trace("[BLAS] ApplyThreadSettings skipped — no explicit thread count requested");

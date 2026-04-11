@@ -233,11 +233,15 @@ public static class AiDotNetEngine
     /// <para>
     /// Enabling deterministic mode:
     /// <list type="bullet">
-    ///   <item>Disables MKL.NET managed GEMM and routes matmul through the blocked fallback,
-    ///         which writes disjoint output rows per thread with fixed inner accumulation order
-    ///         (bit-exact regardless of thread count).</item>
-    ///   <item>Forces native BLAS (when loaded) to single-threaded via <c>mkl_set_num_threads(1)</c>
-    ///         and <c>mkl_set_dynamic(0)</c>.</item>
+    ///   <item>Has <c>BlasProvider.TryGemm</c> and <c>IsMklVerified</c> short-circuit at the top,
+    ///         bypassing both MKL.NET managed GEMM and any native BLAS GEMM paths entirely.</item>
+    ///   <item>Routes matmul through the blocked C# fallback (<c>MatrixMultiplyHelper.MultiplyBlocked</c>
+    ///         for matrices, <c>CpuEngine.TensorMatMul2D</c>'s <c>Parallel.For</c> path for tensors),
+    ///         which writes disjoint output rows per thread with a fixed inner accumulation order —
+    ///         bit-exact regardless of thread count.</item>
+    ///   <item>Leaves native BLAS thread-control functions alone. Deterministic mode does <b>not</b>
+    ///         invoke <c>mkl_set_num_threads</c> or <c>mkl_set_dynamic</c>; those are only touched
+    ///         when <c>AIDOTNET_BLAS_THREADS</c> is explicitly set via env var.</item>
     ///   <item>Leaves all other tensor reductions alone — <c>TensorSum</c>, <c>TensorSumOfSquares</c>,
     ///         <c>TensorMean</c>, and <c>TensorLogSoftmax</c> are already deterministic in this engine.</item>
     /// </list>

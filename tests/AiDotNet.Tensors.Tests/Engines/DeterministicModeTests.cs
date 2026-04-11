@@ -5,10 +5,27 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines;
 
 /// <summary>
+/// Collection fixture that forces DeterministicModeTests to run sequentially and
+/// in isolation from any other test classes that share this collection. The tests
+/// mutate a process-wide static flag (AiDotNetEngine.DeterministicMode) which
+/// would otherwise race with concurrent matmul/BLAS tests under xUnit's default
+/// parallel execution. Putting all BLAS-state-mutating test classes in this
+/// collection serializes their execution with respect to each other and guarantees
+/// the flag is stable for the duration of each test method.
+/// </summary>
+[CollectionDefinition("BlasGlobalState", DisableParallelization = true)]
+public sealed class BlasGlobalStateCollection { }
+
+/// <summary>
 /// Tests for AiDotNetEngine.SetDeterministicMode — verifies the public API surface
 /// and that enabling deterministic mode produces bit-exact reproducible results for
 /// large matmuls (the hot path that uses MKL.NET in default mode).
+///
+/// Marked with [Collection("BlasGlobalState")] so these tests run serialized —
+/// they toggle a process-wide static flag that would race with concurrent BLAS
+/// calls from other parallel test classes.
 /// </summary>
+[Collection("BlasGlobalState")]
 public class DeterministicModeTests
 {
     [Fact]
