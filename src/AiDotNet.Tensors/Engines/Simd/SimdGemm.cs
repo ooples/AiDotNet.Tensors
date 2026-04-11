@@ -18,7 +18,10 @@ namespace AiDotNet.Tensors.Engines.Simd;
 internal static class SimdGemm
 {
     // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
-    private const int Mc = 256;  // Panel height for A (fits in L2)
+    // Iter 2 (2026-04-11): Mc lowered 256→128 to get more row blocks per problem, which
+    // improves parallel utilization on ≥8-core machines without affecting total pack cost
+    // (same total A bytes packed, just spread across more PackA calls).
+    private const int Mc = 128;  // Panel height for A (fits in L2)
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
 
@@ -32,10 +35,11 @@ internal static class SimdGemm
     // Intended for benchmark A/B iteration, not production config.
     internal static bool UseParallelGemm = true;
 
-    // Minimum problem size (2*m*n*k flops) to enable parallel dispatch. Below this
-    // threshold the thread-pool overhead outweighs the parallelism benefit and the
-    // sequential tiled path wins.
-    private const long ParallelWorkThreshold = 4L * 1024 * 1024; // ~4M flops (e.g. 128^3 * 2)
+    // Minimum problem size (m*n*k, count as flops/2) to enable parallel dispatch.
+    // Iter 2 (2026-04-11): raised 4M → 20M after measuring that 256² (16.8M) regressed
+    // with parallel on — thread-pool overhead dominates at that size. 512² (134M) and
+    // 1024² (1B) are the real winners and comfortably clear the new threshold.
+    private const long ParallelWorkThreshold = 20L * 1024 * 1024;
 
     /// <summary>
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
