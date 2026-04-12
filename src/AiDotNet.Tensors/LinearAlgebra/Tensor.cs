@@ -317,6 +317,26 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Returns the backing <see cref="Vector{T}"/> of this tensor — zero-copy.
+    /// Only valid for contiguous tensors with no storage offset. Mutations to
+    /// either are visible in the other.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">If the tensor is not contiguous
+    /// or has a non-zero storage offset (e.g., a sliced view).</exception>
+    public Vector<T> AsVector()
+    {
+        if (_shape.Length != 1)
+            throw new InvalidOperationException(
+                $"AsVector requires a rank-1 tensor, got rank {_shape.Length}. " +
+                "Use Reshape([Length]) first if you want to flatten.");
+        if (!IsContiguous || _storageOffset != 0)
+            throw new InvalidOperationException(
+                "AsVector requires a contiguous tensor with zero storage offset. " +
+                "Call .Contiguous() first to materialize a copy if needed.");
+        return _data;
+    }
+
+    /// <summary>
     /// Creates a tensor from pooled memory. The pooled array is tracked for return to the pool.
     /// </summary>
     /// <param name="memory">The sliced memory (exact size) to use as backing store.</param>

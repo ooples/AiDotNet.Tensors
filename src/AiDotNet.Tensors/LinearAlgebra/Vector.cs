@@ -1657,4 +1657,14 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentNullException(nameof(list));
         return new Vector<T>(list);
     }
+
+    /// <summary>
+    /// Returns a rank-1 <see cref="Tensor{T}"/> that shares the same backing
+    /// memory as this vector — zero-copy. Mutations to either are visible in
+    /// the other. The returned tensor has shape <c>[Length]</c>.
+    /// </summary>
+    public Tensor<T> AsTensor()
+    {
+        return Tensor<T>.FromMemory(AsWritableMemory(), [Length]);
+    }
 }
