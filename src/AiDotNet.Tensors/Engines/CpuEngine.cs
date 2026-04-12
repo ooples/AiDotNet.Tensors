@@ -8825,6 +8825,63 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
+        // im2col + GEMM fast path for float: kernel^T × gradOutput → col, then col2im
+        if (typeof(T) == typeof(float))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            var gradInputF = new float[batch * inChannels * height * width];
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var kernelF = (float[])(object)kernel.GetFlattenedData();
+
+            // Reshape kernel from [outC, inC, kH, kW] to [outC, colH] — already contiguous in memory
+            // We need kernel^T which is [colH, outC]
+            var kernelT = new float[colH * outChannels];
+            for (int r = 0; r < outChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelT[c * outChannels + r] = kernelF[r * colH + c];
+
+            // Parallel across batches — each batch rents a colBuffer from the pool
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            Parallel.For(0, batch, b =>
+            {
+                var colBuf = pool.Rent(colW * colH);
+                try
+                {
+                    int gradOutOff = b * outChannels * colW;
+
+                    // BLAS GEMM: col = kernel^T × gradOutput → [colH, colW]
+                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                        kernelT, 0, outChannels,
+                        gradOutputF, gradOutOff, colW,
+                        colBuf, 0, colW))
+                    {
+                        // SimdGemm fallback when BLAS unavailable
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(kernelT),
+                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW),
+                            new Span<float>(colBuf, 0, colH * colW),
+                            colH, outChannels, colW);
+                    }
+
+                    int imgOff = b * inChannels * height * width;
+                    Im2ColHelper.Col2ImAccumulate(
+                        new ReadOnlySpan<float>(colBuf, 0, colW * colH),
+                        new Span<float>(gradInputF, imgOff, inChannels * height * width),
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                }
+                finally { pool.Return(colBuf); }
+            });
+
+            var ops2 = MathHelper.GetNumericOperations<T>();
+            var resultArr = new T[gradInputF.Length];
+            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultArr));
+            return TensorAllocator.Rent<T>(inputShape, new Vector<T>(resultArr));
+        }
+
+        // Generic fallback for non-float types
         var gradInput = new T[batch * inChannels * height * width];
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
@@ -8854,7 +8911,6 @@ public class CpuEngine : ITensorLevelEngine
                                 {
                                     int gradInputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
                                     int kernelIdx = ((oc * inChannels + ic) * kernelHeight + kh) * kernelWidth + kw;
-                                    // No lock needed - each (batch, inChannel) partition owns disjoint gradInput slices
                                     gradInput[gradInputIdx] = numOps.Add(gradInput[gradInputIdx], numOps.Multiply(gradVal, kernelData[kernelIdx]));
                                 }
                             }
@@ -8904,6 +8960,77 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
+        // im2col + GEMM fast path for float: gradKernel += gradOutput × im2col^T
+        if (typeof(T) == typeof(float))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            var gradKernelF = new float[outChannels * colH];
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var inputF = (float[])(object)input.GetFlattenedData();
+            int inputSliceSize = inChannels * height * width;
+
+            // Parallel across batches — each batch accumulates into a local gradKernel,
+            // merged after. This avoids lock contention on the shared accumulator.
+            var perBatchGrads = new float[batch][];
+            var kPool = System.Buffers.ArrayPool<float>.Shared;
+            Parallel.For(0, batch, b =>
+            {
+                var im2colBuf = kPool.Rent(colH * colW);
+                var localGrad = kPool.Rent(outChannels * colH);
+                try
+                {
+                    Array.Clear(localGrad, 0, outChannels * colH);
+
+                    Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                        new Span<float>(im2colBuf),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+
+                    int gradOutOff = b * outChannels * colW;
+
+                    // BLAS GEMM with transpose: localGrad = gradOutput × im2col^T
+                    if (!Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, colW,
+                        gradOutputF, gradOutOff, colW, false,
+                        im2colBuf, 0, colW, true,
+                        localGrad, 0, colH))
+                    {
+                        // SimdGemm fallback with transpose
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
+                            new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
+                            new Span<float>(localGrad, 0, outChannels * colH),
+                            outChannels, colW, colH);
+                    }
+
+                    var gradCopy = new float[outChannels * colH];
+                    Array.Copy(localGrad, gradCopy, outChannels * colH);
+                    perBatchGrads[b] = gradCopy;
+                }
+                finally
+                {
+                    kPool.Return(im2colBuf);
+                    kPool.Return(localGrad);
+                }
+            });
+
+            // Merge per-batch gradients
+            for (int b = 0; b < batch; b++)
+            {
+                var lg = perBatchGrads[b];
+                for (int i = 0; i < gradKernelF.Length; i++)
+                    gradKernelF[i] += lg[i];
+            }
+
+            var ops2 = MathHelper.GetNumericOperations<T>();
+            var resultArr = new T[gradKernelF.Length];
+            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultArr));
+            return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(resultArr));
+        }
+
+        // Generic fallback for non-float types
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
