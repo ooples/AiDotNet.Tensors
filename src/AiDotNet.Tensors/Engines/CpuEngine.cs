@@ -27927,6 +27927,14 @@ public class CpuEngine : ITensorLevelEngine
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops)
     {
+        if (typeof(T) == typeof(float))
+        {
+            NativeFFTInPlaceFloat(
+                System.Runtime.CompilerServices.Unsafe.As<Complex<T>[], Complex<float>[]>(ref data),
+                inverse);
+            return;
+        }
+
         if (typeof(T) == typeof(double))
         {
             NativeFFTInPlaceDouble(
@@ -28040,6 +28048,61 @@ public class CpuEngine : ITensorLevelEngine
                     double uIm = data[start + k].Imaginary;
                     data[start + k] = new Complex<double>(uRe + tRe, uIm + tIm);
                     data[start + k + halfSize] = new Complex<double>(uRe - tRe, uIm - tIm);
+                }
+            }
+            twiddleIdx += halfSize;
+        }
+    }
+
+    [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<float>[]>? _twiddleCacheFloat;
+
+    private static void NativeFFTInPlaceFloat(Complex<float>[] data, bool inverse)
+    {
+        int n = data.Length;
+        int bits = 0;
+        for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
+
+        for (int i = 0; i < n; i++)
+        {
+            int j = BitReverse(i, bits);
+            if (j > i)
+                (data[i], data[j]) = (data[j], data[i]);
+        }
+
+        _twiddleCacheFloat ??= new Dictionary<(int, bool), Complex<float>[]>();
+        var cacheKey = (n, inverse);
+        if (!_twiddleCacheFloat.TryGetValue(cacheKey, out var cachedTwiddles))
+        {
+            cachedTwiddles = new Complex<float>[n - 1];
+            int idx = 0;
+            for (int size = 2; size <= n; size *= 2)
+            {
+                int halfSize = size / 2;
+                double baseAngle = (inverse ? 2.0 : -2.0) * Math.PI / size;
+                for (int k = 0; k < halfSize; k++)
+                    cachedTwiddles[idx++] = new Complex<float>((float)Math.Cos(baseAngle * k), (float)Math.Sin(baseAngle * k));
+            }
+            _twiddleCacheFloat[cacheKey] = cachedTwiddles;
+        }
+
+        int twiddleIdx = 0;
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+            for (int start = 0; start < n; start += size)
+            {
+                for (int k = 0; k < halfSize; k++)
+                {
+                    float twRe = cachedTwiddles[twiddleIdx + k].Real;
+                    float twIm = cachedTwiddles[twiddleIdx + k].Imaginary;
+                    float dRe = data[start + k + halfSize].Real;
+                    float dIm = data[start + k + halfSize].Imaginary;
+                    float tRe = twRe * dRe - twIm * dIm;
+                    float tIm = twRe * dIm + twIm * dRe;
+                    float uRe = data[start + k].Real;
+                    float uIm = data[start + k].Imaginary;
+                    data[start + k] = new Complex<float>(uRe + tRe, uIm + tIm);
+                    data[start + k + halfSize] = new Complex<float>(uRe - tRe, uIm - tIm);
                 }
             }
             twiddleIdx += halfSize;
