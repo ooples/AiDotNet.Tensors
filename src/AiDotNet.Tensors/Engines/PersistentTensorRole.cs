@@ -25,42 +25,50 @@ public enum PersistentTensorRole
     /// Layer weights that change only during training updates.
     /// These are the primary candidates for GPU persistence.
     /// </summary>
-    Weights,
+    Weights = 0,
 
     /// <summary>
     /// Layer biases that change only during training updates.
     /// </summary>
-    Biases,
+    Biases = 1,
 
     /// <summary>
     /// Normalization parameters (gamma/beta for BatchNorm, LayerNorm, etc.).
     /// </summary>
-    NormalizationParams,
+    NormalizationParams = 2,
 
     /// <summary>
     /// Embedding lookup tables.
     /// These can be very large and benefit significantly from GPU persistence.
     /// </summary>
-    Embeddings,
+    Embeddings = 3,
 
     /// <summary>
     /// Attention key/value caches for inference.
     /// Used in autoregressive generation to cache previous attention states.
     /// </summary>
-    AttentionCache,
+    AttentionCache = 4,
 
     /// <summary>
     /// Optimizer state tensors (velocity, momentum, etc.).
     /// </summary>
-    OptimizerState,
+    OptimizerState = 5,
 
     /// <summary>
     /// Constant tensors that never change (e.g., precomputed frequencies, positional encodings).
     /// </summary>
-    Constant,
+    Constant = 6,
 
     /// <summary>
     /// Other persistent tensors not fitting above categories.
     /// </summary>
-    Other
+    Other = 7,
+
+    /// <summary>
+    /// Per-unit scale or width parameters (e.g., RBF kernel widths, learnable scales).
+    /// Distinct from <see cref="Weights"/> (inter-unit connection matrices) and
+    /// <see cref="Biases"/> (offset terms). Consumers that register multiple persistent
+    /// tensors per layer should use distinct roles to avoid role-based deduplication.
+    /// </summary>
+    ScaleParameters = 8
 }
