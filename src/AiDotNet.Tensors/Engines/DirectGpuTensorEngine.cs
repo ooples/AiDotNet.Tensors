@@ -15536,7 +15536,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
-        if (input is null || filter is null || input.Rank < 2 || filter.Rank < 2)
+        // Delegate to base for validation (rejects non-2D filter, mismatched dims)
+        if (input is null || filter is null || input.Rank < 2 || filter.Rank != 2)
             return base.NativeSpectralFilter(
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
@@ -15549,6 +15550,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int w = input._shape[^1];
             if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
                 return base.NativeSpectralFilter(input, filter);
+            if (filter._shape[0] != h || filter._shape[1] != w)
+                return base.NativeSpectralFilter(input, filter);
 
             int batchCount = input.Length / (h * w);
             int sliceSize = h * w;
@@ -15558,9 +15561,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Decompose filter to split real/imag, broadcast to match batch count
+            // Decompose filter to split real/imag — always a single [H,W] slice
             var (fR, fI) = DecomposeComplex(filter);
-            int filterSliceCount = filter.Length / sliceSize;
+            int filterSliceCount = 1; // shared [H,W] filter broadcasts to all slices
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
             using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
@@ -15577,7 +15580,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
-        if (input is null || filter is null || input.Rank != 4)
+        // Delegate to base for validation (rejects non-4D input, wrong filter rank/shape)
+        if (input is null || filter is null || input.Rank != 4 || (filter.Rank != 2 && filter.Rank != 3))
             return base.NativeSpectralFilterBatch(
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
@@ -15591,6 +15595,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int h = input._shape[2];
             int w = input._shape[3];
             if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
+                return base.NativeSpectralFilterBatch(input, filter);
+
+            // Validate filter spatial dims
+            if (filter._shape[^2] != h || filter._shape[^1] != w)
+                return base.NativeSpectralFilterBatch(input, filter);
+            if (filter.Rank == 3 && filter._shape[0] != channels)
                 return base.NativeSpectralFilterBatch(input, filter);
 
             int totalSlices = batch * channels;

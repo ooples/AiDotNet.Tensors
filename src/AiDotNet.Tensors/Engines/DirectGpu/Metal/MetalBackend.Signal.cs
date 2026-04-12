@@ -628,18 +628,21 @@ public sealed partial class MetalBackend
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
     {
+        ThrowIfDisposed();
         if (batch <= 0 || height <= 0 || width <= 0) return;
+        if (filterSliceCount <= 0 || (filterSliceCount != 1 && filterSliceCount != batch))
+            throw new ArgumentException($"filterSliceCount must be 1 (shared) or batch ({batch}). Got {filterSliceCount}.");
+
         int sliceSize = height * width;
         int totalSize = batch * sliceSize;
 
-        var fftR = AllocateBuffer(totalSize);
-        var fftI = AllocateBuffer(totalSize);
-        var mulR = AllocateBuffer(totalSize);
-        var mulI = AllocateBuffer(totalSize);
-        var ifftI = AllocateBuffer(totalSize);
-        var zeroI = AllocateBuffer(new float[totalSize]);
+        IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
         try
         {
+            fftR = AllocateBuffer(totalSize); fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize); mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize); zeroI = AllocateBuffer(new float[totalSize]);
+
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
 
             if (filterSliceCount == batch)
@@ -654,9 +657,8 @@ public sealed partial class MetalBackend
                 {
                     for (int b = 0; b < batch; b++)
                     {
-                        int srcOff = (b % filterSliceCount) * sliceSize;
-                        Copy(filterReal, srcOff, bcastFR, b * sliceSize, sliceSize);
-                        Copy(filterImag, srcOff, bcastFI, b * sliceSize, sliceSize);
+                        Copy(filterReal, 0, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, 0, bcastFI, b * sliceSize, sliceSize);
                     }
                     SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
                 }
@@ -667,9 +669,9 @@ public sealed partial class MetalBackend
         }
         finally
         {
-            fftR.Dispose(); fftI.Dispose();
-            mulR.Dispose(); mulI.Dispose();
-            ifftI.Dispose(); zeroI.Dispose();
+            fftR?.Dispose(); fftI?.Dispose();
+            mulR?.Dispose(); mulI?.Dispose();
+            ifftI?.Dispose(); zeroI?.Dispose();
         }
     }
 }
