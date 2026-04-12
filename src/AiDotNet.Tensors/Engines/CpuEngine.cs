@@ -28158,40 +28158,36 @@ public class CpuEngine : ITensorLevelEngine
         if (filter is null) throw new ArgumentNullException(nameof(filter));
         if (input.Rank < 2)
             throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
-        if (filter.Rank < 2)
-            throw new ArgumentException("NativeSpectralFilter requires at least a 2D filter tensor.", nameof(filter));
+        if (filter.Rank != 2)
+            throw new ArgumentException(
+                $"NativeSpectralFilter requires a 2D filter [H,W]. Got rank {filter.Rank}. " +
+                "For per-channel [C,H,W] filtering, use NativeSpectralFilterBatch instead.",
+                nameof(filter));
 
         int h = input._shape[^2];
         int w = input._shape[^1];
-        if (filter._shape[^2] != h || filter._shape[^1] != w)
+        if (filter._shape[0] != h || filter._shape[1] != w)
             throw new ArgumentException(
-                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
+                $"Filter shape [{filter._shape[0]},{filter._shape[1]}] must match input spatial dims [{h},{w}].",
                 nameof(filter));
 
-        // Fused: FFT2D → pointwise multiply → IFFT2D (eliminates 2 intermediate allocations)
+        // Fused: FFT2D → pointwise multiply with broadcast → IFFT2D
         var spectrum = NativeComplexFFT2D(input);
 
-        // Broadcast filter to match spectrum shape if needed
-        Tensor<Complex<T>> broadcastedFilter;
-        if (filter.Length == spectrum.Length)
+        // Multiply spectrum by filter using modular index — avoids materializing a tiled filter tensor
+        int sliceSize = h * w;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var filtered = new Tensor<Complex<T>>(spectrum._shape);
+        for (int i = 0; i < spectrum.Length; i++)
         {
-            broadcastedFilter = filter;
-        }
-        else
-        {
-            // filter is [H, W], spectrum might be [..., H, W] — broadcast by tiling
-            int sliceSize = h * w;
-            int batchCount = spectrum.Length / sliceSize;
-            broadcastedFilter = new Tensor<Complex<T>>(spectrum._shape);
-            for (int b = 0; b < batchCount; b++)
-            {
-                int offset = b * sliceSize;
-                for (int i = 0; i < sliceSize; i++)
-                    broadcastedFilter[offset + i] = filter[i];
-            }
+            int fi = i % sliceSize;
+            var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
+            var fr = filter[fi].Real; var fi2 = filter[fi].Imaginary;
+            filtered[i] = new Complex<T>(
+                ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fi2)),
+                ops.Add(ops.Multiply(sr, fi2), ops.Multiply(si, fr)));
         }
 
-        var filtered = NativeComplexMultiply(spectrum, broadcastedFilter);
         return NativeComplexIFFT2DReal(filtered);
     }
 
@@ -28235,21 +28231,22 @@ public class CpuEngine : ITensorLevelEngine
         // FFT2D the entire [B,C,H,W] input — the FFT2D already batches over leading dims
         var spectrum = NativeComplexFFT2D(input);
 
-        // Build the full [B,C,H,W] filter by broadcasting
+        // Multiply spectrum by filter using index arithmetic — avoids materializing full [B,C,H,W] filter
         int sliceSize = h * w;
-        var fullFilter = new Tensor<Complex<T>>(spectrum._shape);
-        for (int b = 0; b < batch; b++)
+        var ops = MathHelper.GetNumericOperations<T>();
+        var filtered = new Tensor<Complex<T>>(spectrum._shape);
+        for (int i = 0; i < spectrum.Length; i++)
         {
-            for (int c = 0; c < channels; c++)
-            {
-                int dstOff = (b * channels + c) * sliceSize;
-                int srcOff = perChannel ? c * sliceSize : 0;
-                for (int i = 0; i < sliceSize; i++)
-                    fullFilter[dstOff + i] = filter[srcOff + i];
-            }
+            // Map flat index to filter index: per-channel uses (channel * sliceSize + spatial),
+            // shared uses just spatial offset
+            int srcOff = perChannel ? ((i / sliceSize) % channels) * sliceSize + (i % sliceSize) : i % sliceSize;
+            var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
+            var fr = filter[srcOff].Real; var fi2 = filter[srcOff].Imaginary;
+            filtered[i] = new Complex<T>(
+                ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fi2)),
+                ops.Add(ops.Multiply(sr, fi2), ops.Multiply(si, fr)));
         }
 
-        var filtered = NativeComplexMultiply(spectrum, fullFilter);
         return NativeComplexIFFT2DReal(filtered);
     }
 

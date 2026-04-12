@@ -7523,11 +7523,14 @@ public interface IEngine
     /// Fused spectral filter: FFT2D(input) ⊙ filter → IFFT2D → real output.
     /// Single engine call that eliminates 2 intermediate tensor allocations.
     /// Input shape: [H, W] or [..., H, W] (batches over leading dims).
-    /// Filter shape: must match or broadcast to the spatial dimensions of input.
+    /// Filter shape: [H, W] — shared across all leading batch dimensions.
+    /// The same filter is applied to every (b, c, ...) slice. For per-channel
+    /// filtering, use <see cref="NativeSpectralFilterBatch{T}"/> instead.
     /// </summary>
     /// <param name="input">Real-valued spatial input. Last two axes must be powers of 2.</param>
-    /// <param name="filter">Complex-valued spectral filter. Shape [H, W].</param>
+    /// <param name="filter">Complex-valued spectral filter of shape [H, W].</param>
     /// <returns>Real-valued filtered output of same shape as input.</returns>
+    /// <exception cref="ArgumentException">Thrown if filter is not exactly [H, W].</exception>
     Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter);
 
     /// <summary>
