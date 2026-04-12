@@ -1657,4 +1657,20 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentNullException(nameof(list));
         return new Vector<T>(list);
     }
+
+    /// <summary>
+    /// Returns a rank-1 <see cref="Tensor{T}"/> that shares the same backing
+    /// memory as this vector — zero-copy. Mutations to either are visible in
+    /// the other. The returned tensor has shape <c>[Length]</c>.
+    /// Forces CPU materialization for deferred/GPU-backed vectors.
+    /// </summary>
+    public Tensor<T> AsTensor()
+    {
+        var memory = AsWritableMemory();
+        if (memory.Length == 0 && Length > 0)
+            throw new InvalidOperationException(
+                "Cannot create a Tensor view of a GPU-resident or unmaterialized vector. " +
+                "Copy to CPU first.");
+        return Tensor<T>.FromMemory(memory, [Length]);
+    }
 }
