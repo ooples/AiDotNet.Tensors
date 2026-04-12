@@ -7526,7 +7526,8 @@ public interface IEngine
     /// Filter shape: must match or broadcast to the spatial dimensions of input.
     /// </summary>
     /// <param name="input">Real-valued spatial input. Last two axes must be powers of 2.</param>
-    /// <param name="filter">Complex-valued spectral filter. Shape [H, W].</param>
+    /// <param name="filter">Complex-valued spectral filter. Shape [H, W] for shared filter
+    /// or [..., H, W] matching the leading dims of input for per-channel/per-batch filtering.</param>
     /// <returns>Real-valued filtered output of same shape as input.</returns>
     Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter);
 

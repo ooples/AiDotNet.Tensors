@@ -15558,7 +15558,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Decompose filter to split real/imag, broadcast to match batch count
+            // Validate filter spatial dims match input
+            if (filter._shape[^2] != h || filter._shape[^1] != w)
+                return base.NativeSpectralFilter(input, filter);
+            if (filter.Length % sliceSize != 0)
+                return base.NativeSpectralFilter(input, filter);
+
             var (fR, fI) = DecomposeComplex(filter);
             int filterSliceCount = filter.Length / sliceSize;
 
@@ -15602,8 +15607,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
             // Decompose filter and determine broadcast mode
-            var (fR, fI) = DecomposeComplex(filter);
+            // Validate filter shape: [H,W] shared or [C,H,W] per-channel
+            if (filter._shape[^2] != h || filter._shape[^1] != w)
+                return base.NativeSpectralFilterBatch(input, filter);
             bool perChannel = filter.Rank == 3;
+            if (perChannel && filter._shape[0] != channels)
+                return base.NativeSpectralFilterBatch(input, filter);
+
+            var (fR, fI) = DecomposeComplex(filter);
 
             // Build full [totalSlices * sliceSize] filter buffer for GPU
             // For per-channel [C,H,W]: replicate across batches

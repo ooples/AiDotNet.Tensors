@@ -28179,15 +28179,19 @@ public class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            // filter is [H, W], spectrum might be [..., H, W] — broadcast by tiling
+            // Broadcast filter to match spectrum shape.
+            // filter can be [H, W] (shared across all slices) or [C, H, W] (per-channel).
             int sliceSize = h * w;
-            int batchCount = spectrum.Length / sliceSize;
+            int filterSlices = filter.Length / sliceSize;
+            int spectrumSlices = spectrum.Length / sliceSize;
             broadcastedFilter = new Tensor<Complex<T>>(spectrum._shape);
-            for (int b = 0; b < batchCount; b++)
+            for (int b = 0; b < spectrumSlices; b++)
             {
-                int offset = b * sliceSize;
+                int dstOffset = b * sliceSize;
+                // Cycle through filter slices: shared (1 slice) or per-channel
+                int srcOffset = (b % filterSlices) * sliceSize;
                 for (int i = 0; i < sliceSize; i++)
-                    broadcastedFilter[offset + i] = filter[i];
+                    broadcastedFilter[dstOffset + i] = filter[srcOffset + i];
             }
         }
 
