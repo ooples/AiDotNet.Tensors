@@ -1761,4 +1761,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     public virtual void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) => Inner.SplitComplexTopK(inReal, inImag, outReal, outImag, n, k);
     public virtual void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) => Inner.SoftmaxRows(input, output, rows, cols);
+
+    /// <inheritdoc/>
+    public virtual void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+        => Inner.SpectralFilter(inputReal, filterReal, filterImag, outputReal, batch, height, width, filterSliceCount);
 }

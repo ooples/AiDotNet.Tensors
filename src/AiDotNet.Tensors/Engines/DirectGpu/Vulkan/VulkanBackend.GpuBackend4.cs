@@ -1740,4 +1740,53 @@ public sealed unsafe partial class VulkanBackend
         try { Copy(rb, 0, output, 0, rows * cols); }
         finally { rb.Dispose(); }
     }
+
+    /// <inheritdoc/>
+    public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+    {
+        if (batch <= 0 || height <= 0 || width <= 0) return;
+        int sliceSize = height * width;
+        int totalSize = batch * sliceSize;
+
+        var fftR = AllocateBuffer(totalSize);
+        var fftI = AllocateBuffer(totalSize);
+        var mulR = AllocateBuffer(totalSize);
+        var mulI = AllocateBuffer(totalSize);
+        var ifftI = AllocateBuffer(totalSize);
+        var zeroI = AllocateBuffer(new float[totalSize]);
+        try
+        {
+            BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
+
+            if (filterSliceCount == batch)
+            {
+                SplitComplexMultiply(fftR, fftI, filterReal, filterImag, mulR, mulI, totalSize);
+            }
+            else
+            {
+                var bcastFR = AllocateBuffer(totalSize);
+                var bcastFI = AllocateBuffer(totalSize);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int srcOff = (b % filterSliceCount) * sliceSize;
+                        Copy(filterReal, srcOff, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, srcOff, bcastFI, b * sliceSize, sliceSize);
+                    }
+                    SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
+                }
+                finally { bcastFR.Dispose(); bcastFI.Dispose(); }
+            }
+
+            BatchedFFT2D(mulR, mulI, outputReal, ifftI, batch, height, width, inverse: true);
+        }
+        finally
+        {
+            fftR.Dispose(); fftI.Dispose();
+            mulR.Dispose(); mulI.Dispose();
+            ifftI.Dispose(); zeroI.Dispose();
+        }
+    }
 }

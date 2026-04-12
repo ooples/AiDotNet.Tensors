@@ -10612,6 +10612,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     #endregion
 // Fused kernel dispatch methods    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedAxis("reduce_mean", i, o, 1, sz); }    public unsafe void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if(!_kernelCache.TryGetValue("clip_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: clip_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&op;a[2]=&mn;a[3]=&mx;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { LaunchFusedScalar("pow_scalar", i, o, ex, sz); }    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedUnary("frac_kernel", i, o, sz); }    public unsafe void EyeKernel(IGpuBuffer o, int n) { if(!_kernelCache.TryGetValue("eye_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: eye_kernel"); using var _=PushContext(); IntPtr op=o.Handle; void** a=stackalloc void*[2]; a[0]=&op;a[1]=&n; LaunchKernel(k,(uint)((n*n+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(!_kernelCache.TryGetValue("one_hot_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: one_hot_kernel"); using var _=PushContext(); IntPtr ip=idx.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&bs;a[3]=&nc; LaunchKernel(k,(uint)((bs*nc+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(!_kernelCache.TryGetValue("masked_fill_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: masked_fill_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,mp=m.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&mp;a[2]=&op;a[3]=&fv;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void EqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("equals_kernel", a1, b1, o, sz); }    public void NotEqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("not_equals_kernel", a1, b1, o, sz); }    public unsafe void OuterProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int M, int N) { if(!_kernelCache.TryGetValue("outer_product",out var k))throw new InvalidOperationException("HIP kernel not found: outer_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&M;a[4]=&N; LaunchKernel(k,(uint)((M*N+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void BatchDotProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int bs, int dim) { if(!_kernelCache.TryGetValue("batch_dot_product",out var k))throw new InvalidOperationException("HIP kernel not found: batch_dot_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&bs;a[4]=&dim; LaunchKernel(k,(uint)((bs+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("glu_forward", i, o, os, hd); }    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("geglu_forward", i, o, os, hd); }    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("reglu_forward", i, o, os, hd); }    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("swiglu_forward", i, o, os, hd); }    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { LaunchFusedBinary("bce_loss", p, t, l, sz); }
 
+    /// <inheritdoc/>
+    public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+    {
+        if (batch <= 0 || height <= 0 || width <= 0) return;
+        int sliceSize = height * width;
+        int totalSize = batch * sliceSize;
+
+        var fftR = AllocateBuffer(totalSize);
+        var fftI = AllocateBuffer(totalSize);
+        var mulR = AllocateBuffer(totalSize);
+        var mulI = AllocateBuffer(totalSize);
+        var ifftI = AllocateBuffer(totalSize);
+        var zeroI = AllocateBuffer(new float[totalSize]);
+        try
+        {
+            BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
+
+            if (filterSliceCount == batch)
+            {
+                SplitComplexMultiply(fftR, fftI, filterReal, filterImag, mulR, mulI, totalSize);
+            }
+            else
+            {
+                var bcastFR = AllocateBuffer(totalSize);
+                var bcastFI = AllocateBuffer(totalSize);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int srcOff = (b % filterSliceCount) * sliceSize;
+                        Copy(filterReal, srcOff, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, srcOff, bcastFI, b * sliceSize, sliceSize);
+                    }
+                    SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
+                }
+                finally { bcastFR.Dispose(); bcastFI.Dispose(); }
+            }
+
+            BatchedFFT2D(mulR, mulI, outputReal, ifftI, batch, height, width, inverse: true);
+        }
+        finally
+        {
+            fftR.Dispose(); fftI.Dispose();
+            mulR.Dispose(); mulI.Dispose();
+            ifftI.Dispose(); zeroI.Dispose();
+        }
+    }
 
 }
 

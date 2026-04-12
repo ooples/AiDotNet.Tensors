@@ -10050,6 +10050,67 @@ public sealed class CudaBackend : IAsyncGpuBackend
             (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
     }
 
+    /// <inheritdoc/>
+    public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (batch <= 0 || height <= 0 || width <= 0) return;
+
+        using var _ = PushContext();
+        int sliceSize = height * width;
+        int totalSize = batch * sliceSize;
+
+        // All temp buffers live on GPU — zero CPU round-trips
+        var fftR = AllocateBuffer(totalSize);
+        var fftI = AllocateBuffer(totalSize);
+        var mulR = AllocateBuffer(totalSize);
+        var mulI = AllocateBuffer(totalSize);
+        var ifftI = AllocateBuffer(totalSize);
+        // inputImag for FFT is zero — upload zero array
+        var zeroI = AllocateBuffer(new float[totalSize]);
+        try
+        {
+
+            // Step 1: FFT2D on all slices (GPU-resident)
+            BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
+
+            // Step 2: Broadcast-multiply with filter on GPU
+            // If filterSliceCount == batch, filter already matches; if 1, broadcast per-slice
+            if (filterSliceCount == batch)
+            {
+                SplitComplexMultiply(fftR, fftI, filterReal, filterImag, mulR, mulI, totalSize);
+            }
+            else
+            {
+                // Broadcast: replicate filter[0..sliceSize] for each batch slice
+                var bcastFR = AllocateBuffer(totalSize);
+                var bcastFI = AllocateBuffer(totalSize);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int srcOff = (b % filterSliceCount) * sliceSize;
+                        Copy(filterReal, srcOff, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, srcOff, bcastFI, b * sliceSize, sliceSize);
+                    }
+                    SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
+                }
+                finally { bcastFR.Dispose(); bcastFI.Dispose(); }
+            }
+
+            // Step 3: IFFT2D on all slices (GPU-resident)
+            BatchedFFT2D(mulR, mulI, outputReal, ifftI, batch, height, width, inverse: true);
+            // outputReal now contains the real part; ifftI (imaginary) is discarded
+        }
+        finally
+        {
+            fftR.Dispose(); fftI.Dispose();
+            mulR.Dispose(); mulI.Dispose();
+            ifftI.Dispose(); zeroI.Dispose();
+        }
+    }
+
     #endregion
 
     #region Quantum Computing Operations
