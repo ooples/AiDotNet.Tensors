@@ -35,30 +35,72 @@ internal static class BlasProvider
     private static readonly bool TraceEnabled = ReadEnvBool("AIDOTNET_BLAS_TRACE");
 
     /// <summary>
-    /// Enables deterministic mode by forcing BLAS to single-threaded execution.
-    /// Multi-threaded BLAS (OpenBLAS, MKL) can produce slightly different FP results
-    /// across runs due to parallel reduction ordering. Single-threaded mode guarantees
-    /// bit-identical results for the same input.
+    /// When true, BLAS/MKL GEMM paths are bypassed entirely — TryGemm and
+    /// IsMklVerified return false at their top so matmul falls through to the
+    /// bit-exact blocked C# fallback. This guarantees bit-identical results
+    /// across runs regardless of thread count, since the fallback's inner
+    /// accumulation order is fixed. Volatile so that lock-free reads in the
+    /// hot TryGemm path see writes made under InitLock without stale caching.
     /// </summary>
-    private static bool _deterministicMode;
+    private static volatile bool _deterministicMode;
+
+    /// <summary>
+    /// Returns whether deterministic mode is currently enabled.
+    /// </summary>
+    public static bool IsDeterministicMode => _deterministicMode;
+
+    // Saved state so that toggling deterministic mode off restores whatever MKL.NET
+    // was doing before. Null means no saved state (deterministic mode was never on
+    // or has already been turned off).
+    private static bool? _savedUseMklNet;
 
     public static void SetDeterministicMode(bool deterministic)
     {
         lock (InitLock)
         {
+            if (_deterministicMode == deterministic) return;
             _deterministicMode = deterministic;
-            ThreadCountOverride = deterministic ? 1 : ReadEnvInt("AIDOTNET_BLAS_THREADS");
+            // Deterministic mode routes all matmul through the bit-exact blocked C# fallback
+            // by having TryGemm/IsMklVerified return false at the top. It does NOT call into
+            // native thread-control functions (mkl_set_num_threads, etc.) — those paths are
+            // only triggered when AIDOTNET_BLAS_THREADS is explicitly set via env var, which
+            // drives ThreadCountOverride. ThreadCountOverride is intentionally left alone
+            // here to avoid touching native symbols that can be unsafe on some platforms.
             if (deterministic)
             {
-                // Disable MKL.NET managed bindings: MKL's multi-threaded GEMM produces
-                // non-deterministic results from parallel reduction ordering, and we cannot
-                // reliably set MKL's internal thread count via the managed API.
-                // Falls back to deterministic sequential MultiplyMatrixBlocked.
+                _savedUseMklNet = _useMklNet;
                 _useMklNet = false;
             }
-            if (_initialized)
+            else
             {
-                ApplyThreadSettings();
+                // Restore saved MKL state (what _useMklNet was before deterministic was turned on).
+                if (_savedUseMklNet.HasValue)
+                {
+                    _useMklNet = _savedUseMklNet.Value;
+                    _savedUseMklNet = null;
+                }
+
+                // Second-chance MKL.NET init: if BLAS was initialized DURING deterministic mode,
+                // TryLoadLibrary deliberately skipped MKL.NET and fell through to native BLAS
+                // (or no backend at all). Now that deterministic is off, attempt the MKL.NET
+                // load once more so the non-deterministic path isn't permanently stuck on the
+                // slower native/blocked fallback. This mirrors the code in TryLoadLibrary.
+                if (_initialized && !_useMklNet)
+                {
+                    try
+                    {
+                        if (TryInitializeMklNet())
+                        {
+                            Trace("[BLAS] MKL.NET retry-init after leaving deterministic mode succeeded");
+                            _useMklNet = true;
+                            _available = true;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace($"[BLAS] MKL.NET retry-init failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
             }
         }
     }
@@ -129,6 +171,11 @@ internal static class BlasProvider
 
     internal static bool TryGemm(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
     {
+        // Deterministic mode: fall through to the bit-exact blocked C# fallback in
+        // MatrixMultiplyHelper.MultiplyBlocked. Also avoids triggering native BLAS
+        // initialization, which can be unsafe on some platforms.
+        if (_deterministicMode) return false;
+
         // Hot path: after MKL is verified AND still enabled, skip all checks
         if (_mklVerified && _useMklNet)
         {
@@ -221,8 +268,10 @@ internal static class BlasProvider
     /// <summary>
     /// True after MKL has been verified working. Use IsMklVerified + MklSgemmZeroOffset
     /// to bypass TryGemm entirely when offsets are always 0 (FusedLinear hot path).
+    /// Returns false in deterministic mode so direct-MKL hot paths fall through to the
+    /// deterministic blocked matmul fallback.
     /// </summary>
-    internal static bool IsMklVerified => _mklVerified;
+    internal static bool IsMklVerified => _mklVerified && !_deterministicMode;
 
     /// <summary>
     /// Absolute fastest MKL path: zero-offset spans, no TryGemm dispatch, no validation.
@@ -291,6 +340,7 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemmWithBeta(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc, float beta)
     {
+        if (_deterministicMode) return false;
         if (!EnsureInitialized()) return false;
         if (!HasEnoughData(a.Length, aOffset, m, k, lda) ||
             !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
@@ -318,6 +368,7 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemmWithBeta(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc, double beta)
     {
+        if (_deterministicMode) return false;
         if (!EnsureInitialized()) return false;
         if (!HasEnoughData(a.Length, aOffset, m, k, lda) ||
             !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
@@ -345,6 +396,7 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
+        if (_deterministicMode) return false;
         if (!EnsureInitialized()) return false;
 
         // Bounds validation (same as TryGemm)
@@ -407,6 +459,7 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
+        if (_deterministicMode) return false;
         if (!EnsureInitialized())
         {
             return false;
@@ -453,6 +506,7 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
+        if (_deterministicMode) return false;
         if (!EnsureInitialized())
         {
             return false;
@@ -572,6 +626,9 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
+        // Deterministic mode: fall through to the bit-exact blocked C# fallback.
+        if (_deterministicMode) return false;
+
         // Hot path: skip all checks after MKL verified AND still enabled
         if (_mklVerified && _useMklNet)
         {
@@ -827,10 +884,23 @@ internal static class BlasProvider
             return;
         }
 
+        // Only invoke native thread-control functions when the caller has explicitly
+        // provided a ThreadCountOverride (set via the AIDOTNET_BLAS_THREADS env var).
+        // Deterministic mode does NOT opt in here — it bypasses BLAS entirely via
+        // the TryGemm short-circuit, so thread-control calls would be pointless.
+        // The loaded symbols can be unsafe to call blindly on some platforms — on
+        // net10.0 Windows, for example, invoking them without this explicit opt-in
+        // has been seen to trigger access violations. Falling through leaves the
+        // native library at its own default thread count, which is safe.
+        if (!ThreadCountOverride.HasValue)
+        {
+            Trace("[BLAS] ApplyThreadSettings skipped — no explicit thread count requested");
+            return;
+        }
+
         try
         {
-            // Use override if specified, otherwise use all available processors
-            int threadCount = ThreadCountOverride ?? Environment.ProcessorCount;
+            int threadCount = ThreadCountOverride.Value;
             _setDynamic?.Invoke(0);
             _setNumThreads(threadCount);
             Trace($"[BLAS] Set thread count to {threadCount}");

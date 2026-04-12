@@ -18,7 +18,13 @@ namespace AiDotNet.Tensors.Engines.Simd;
 internal static class SimdGemm
 {
     // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
-    private const int Mc = 256;  // Panel height for A (fits in L2)
+    // Iter 2: Mc lowered 256→128 for more row blocks (better parallel utilization).
+    // Iter 3 (reverted): Mc=64 regressed across the board — too small for cache reuse.
+    // Iter 8 (reverted): Kc=256 was tried to fit per-tile working set in L2, but the
+    // extra pc iterations (4 instead of 2) doubled the number of parallel barriers and
+    // regressed 512² by 1.5x. The L2-fit argument was wrong because packed A gets
+    // evicted by packed B during the inner loop anyway. Kept at 512.
+    private const int Mc = 128;  // Panel height for A (fits in L2)
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
 
@@ -26,6 +32,17 @@ internal static class SimdGemm
     // 6 rows * 16 cols = 96 floats = 12 Vector256<float> accumulators
     private const int Mr = 6;
     private const int Nr = 16;
+
+    // A/B test toggle: set to false to force sequential SgemmTiled for baseline
+    // comparisons. Defaults to true so multi-core systems get parallel execution.
+    // Intended for benchmark A/B iteration, not production config.
+    internal static bool UseParallelGemm = true;
+
+    // Minimum problem size (m*n*k, count as flops/2) to enable parallel dispatch.
+    // Iter 2 (2026-04-11): raised 4M → 20M after measuring that 256² (16.8M) regressed
+    // with parallel on — thread-pool overhead dominates at that size. 512² (134M) and
+    // 1024² (1B) are the real winners and comfortably clear the new threshold.
+    private const long ParallelWorkThreshold = 20L * 1024 * 1024;
 
     /// <summary>
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
@@ -222,6 +239,23 @@ internal static class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        // Decide parallel vs sequential up front. Parallel dispatches either:
+        //   - 1D parallel (SgemmTiledParallelM): row blocks only, when nc is too small
+        //     to justify col-sub parallelism OR when numRowBlocks already matches the
+        //     target core count.
+        //   - 2D parallel (SgemmTiledParallel2D): (row block × col sub) grid, when
+        //     either M or N alone doesn't saturate available cores. Handles row-heavy
+        //     problems (1024²) by splitting columns too, AND col-heavy problems
+        //     (LM-head [64, 128]x[128, 50257]) by parallelizing the 1 row block across
+        //     many col subs.
+        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        bool canParallelize = UseParallelGemm
+            && maxThreads > 1
+            && numRowBlocks >= 1
+            && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
+            && (long)m * k * n >= ParallelWorkThreshold;
+
         // Round up to micro-tile dimensions to avoid buffer overruns in PackA/PackB padding
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
@@ -240,16 +274,52 @@ internal static class SimdGemm
                 {
                     int kc = Math.Min(Kc, k - pc);
 
-                    // Sequential path (parallel paths use the same PackA/PackB with stride params)
-                    PackA(a, packedABuf, lda, transA, ic: 0, mc: Math.Min(Mc, m), pc, kc);
-                    PackB(b, packedBBuf, ldb, transB, pc, kc, jc, nc);
+                    // Decide per-tile parallel dispatch. numColSubs is adaptive to
+                    // logical core count so numRowBlocks * numColSubs ≈ maxThreads.
+                    // Iter 5: logical cores, not physical — SMT siblings help because
+                    // blocked GEMM is load-port-limited not FMA-port-limited.
+                    // Iter 7: allow numRowBlocks=1 through the 2D path so col-heavy
+                    // problems like LM-head [64,128]x[128,50257] get parallelism.
+                    int desiredColSubs = canParallelize ? Math.Max(1, maxThreads / numRowBlocks) : 1;
+                    int maxColSubs = Math.Max(1, nc / (Nr * 4));
+                    int numColSubs = Math.Min(desiredColSubs, maxColSubs);
+                    int totalTiles = numRowBlocks * numColSubs;
 
-                    for (int ic = 0; ic < m; ic += Mc)
+                    bool used2D = canParallelize && numColSubs >= 2 && totalTiles >= 2;
+                    bool used1D = canParallelize && !used2D && numRowBlocks >= 2;
+
+                    if (used2D)
                     {
-                        int mc = Math.Min(Mc, m - ic);
-                        if (ic > 0) // first block already packed above
-                            PackA(a, packedABuf, lda, transA, ic, mc, pc, kc);
-                        MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
+                        SgemmTiledParallel2D(
+                            a, b, c,
+                            m, k, n,
+                            jc, nc, pc, kc,
+                            numRowBlocks, numColSubs);
+                    }
+                    else if (used1D)
+                    {
+                        // 1D parallel-M: each worker owns a disjoint row block with its
+                        // own packed-A, B is packed once and shared read-only. Output
+                        // row ranges are disjoint so no synchronization on C is needed.
+                        SgemmTiledParallelM(
+                            a, b, c,
+                            m, k, n,
+                            jc, nc, pc, kc,
+                            numRowBlocks, packedBBuf);
+                    }
+                    else
+                    {
+                        // Sequential path (original)
+                        PackA(a, packedABuf, lda, transA, ic: 0, mc: Math.Min(Mc, m), pc, kc);
+                        PackB(b, packedBBuf, ldb, transB, pc, kc, jc, nc);
+
+                        for (int ic = 0; ic < m; ic += Mc)
+                        {
+                            int mc = Math.Min(Mc, m - ic);
+                            if (ic > 0) // first block already packed above
+                                PackA(a, packedABuf, lda, transA, ic, mc, pc, kc);
+                            MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
+                        }
                     }
                 }
             }
@@ -447,27 +517,216 @@ internal static class SimdGemm
     }
 
     /// <summary>
+    /// 2D parallel GEMM: dispatches a grid of (ic_block × jc_sub) tiles in parallel.
+    /// Iter 4 (2026-04-11): breaks past the numRowBlocks parallelism ceiling. On a
+    /// 16-core machine at 1024² with Mc=128, the 1D M-parallel path was limited to
+    /// 8 workers; this variant adds col-sub parallelism to fill the remaining cores.
+    ///
+    /// Layout:
+    ///   - Each row block r has its own packed-A buffer, shared across all col subs
+    ///     (so PackA runs numRowBlocks times total, not numRowBlocks * numColSubs).
+    ///   - Each col sub cs has its own packed-B buffer, shared across all row blocks
+    ///     (so PackB runs numColSubs times, not numRowBlocks * numColSubs).
+    ///   - Compute dispatches numRowBlocks * numColSubs tiles in parallel, each
+    ///     reading its row's packed-A and its col-sub's packed-B, writing to a
+    ///     disjoint (mc x subNc) region of C.
+    ///
+    /// Determinism: output regions are disjoint per tile, inner pc loop is still
+    /// sequential, and the micro-kernel's FMA order is fixed. Results are bit-exact
+    /// identical to the sequential and 1D-parallel paths.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmTiledParallel2D(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m, int k, int n,
+        int jc, int nc, int pc, int kc,
+        int numRowBlocks, int numColSubBlocks)
+    {
+        // colSubSize: number of B columns per sub-block, rounded down to a multiple
+        // of Nr so MacroKernel's Nr panel loop stays clean. The last sub absorbs the
+        // remainder. If nc < numColSubBlocks*Nr, fall back to the 1D parallel path.
+        int colSubSize = (nc / numColSubBlocks / Nr) * Nr;
+        if (colSubSize < Nr)
+        {
+            // Degenerate — not enough cols per sub. Caller should have checked,
+            // but we guard here to avoid a zero-sized sub.
+            colSubSize = nc;
+            numColSubBlocks = 1;
+        }
+
+        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
+        int packedASizePerRow = mcRounded * Kc;
+        int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
+        int lastColSubWidth = nc - (numColSubBlocks - 1) * colSubSize;
+        int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
+        int packedBSizePerSub = Kc * Math.Max(colSubRounded, lastColSubRounded);
+
+        var packedABufs = new float[numRowBlocks][];
+        var packedBBufs = new float[numColSubBlocks][];
+        for (int r = 0; r < numRowBlocks; r++)
+            packedABufs[r] = ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        for (int cs = 0; cs < numColSubBlocks; cs++)
+            packedBBufs[cs] = ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+
+        try
+        {
+            var localPackedABufs = packedABufs;
+            var localPackedBBufs = packedBBufs;
+            int localM = m, localK = k, localN = n;
+            int localJc = jc, localNc = nc, localPc = pc, localKc = kc;
+            int localColSubSize = colSubSize;
+            int localNumColSubs = numColSubBlocks;
+            int localMc = Mc;
+
+            // Pin A, B, C directly via the input spans — no extra copy. The fixed
+            // block outlives every LightweightParallel call below (synchronous
+            // dispatch waits for all workers before returning), so the pointers
+            // stay valid throughout. Iter 6: previous version copied A and B into
+            // rented arrays for pinning, which added 8MB of serial copy at 1024².
+            fixed (float* aPtr0 = a)
+            fixed (float* bPtr0 = b)
+            fixed (float* cPtr0 = c)
+            {
+                float* localAPtr = aPtr0;
+                int localALen = a.Length;
+                float* localBPtr = bPtr0;
+                int localBLen = b.Length;
+                float* localCPtr = cPtr0;
+                int localCLen = c.Length;
+
+                // Iter 12: fuse phases 1 (pack A) and 2 (pack B) into a single parallel
+                // dispatch to save one barrier per (jc, pc) iteration. Tasks 0..numRowBlocks-1
+                // pack A, tasks numRowBlocks..numRowBlocks+numColSubs-1 pack B. All
+                // independent output buffers — no contention, all can run concurrently.
+                int numPackTasks = numRowBlocks + numColSubBlocks;
+                int localNumRowBlocks = numRowBlocks;
+                Helpers.CpuParallelSettings.LightweightParallel(numPackTasks, taskId =>
+                {
+                    if (taskId < localNumRowBlocks)
+                    {
+                        // Pack A for row block r = taskId
+                        int r = taskId;
+                        int ic = r * localMc;
+                        int mcLocal = Math.Min(localMc, localM - ic);
+                        if (mcLocal > 0)
+                        {
+                            var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                            PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
+                        }
+                    }
+                    else
+                    {
+                        // Pack B for col sub cs = taskId - numRowBlocks
+                        int cs = taskId - localNumRowBlocks;
+                        int jStart = cs * localColSubSize;
+                        int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                        if (subNc > 0)
+                        {
+                            var bSpan = new ReadOnlySpan<float>(localBPtr, localBLen);
+                            PackB(bSpan, localPackedBBufs[cs], localN, localPc, localKc, localJc + jStart, subNc);
+                        }
+                    }
+                });
+
+                // Phase 2 (was 3): parallel compute for all (ic, jc_sub) tiles.
+                int totalTiles = numRowBlocks * numColSubBlocks;
+                Helpers.CpuParallelSettings.LightweightParallel(totalTiles, tileId =>
+                {
+                    int r = tileId / localNumColSubs;
+                    int cs = tileId % localNumColSubs;
+                    int ic = r * localMc;
+                    int mcLocal = Math.Min(localMc, localM - ic);
+                    int jStart = cs * localColSubSize;
+                    int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                    if (mcLocal > 0 && subNc > 0)
+                    {
+                        var cSpan = new Span<float>(localCPtr, localCLen);
+                        MacroKernel(
+                            localPackedABufs[r], localPackedBBufs[cs],
+                            cSpan, mcLocal, subNc, localKc, localN,
+                            ic, localJc + jStart);
+                    }
+                });
+            }
+        }
+        finally
+        {
+            for (int r = 0; r < numRowBlocks; r++)
+                ArrayPool<float>.Shared.Return(packedABufs[r]);
+            for (int cs = 0; cs < numColSubBlocks; cs++)
+                ArrayPool<float>.Shared.Return(packedBBufs[cs]);
+        }
+    }
+
+    /// <summary>
     /// Pack op(A)[ic:ic+mc, pc:pc+kc] into row-panel format for sequential access in micro-kernel.
     /// When transA=false: reads A[row, col] = a[row*lda + col] (row-major).
     /// When transA=true:  reads A^T[row, col] = a[col*lda + row] (transposed).
     /// Layout: groups of Mr rows, each stored as Mr x kc contiguous block.
+    /// Iter 14: non-transpose full-Mr panel path uses direct pointer arithmetic with
+    /// 6 hoisted row pointers and inner-loop unroll-by-4. Eliminates the JIT's bounds
+    /// checks and repeated index calculations, cutting pack A time substantially.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
+    private static unsafe void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
     {
         int pos = 0;
         int i = 0;
 
-        // Full Mr-row panels
-        for (; i + Mr <= mc; i += Mr)
+#if NET5_0_OR_GREATER
+        // Fast path: non-transpose, full Mr-row panels. Hoist 6 row pointers out
+        // of the p-loop, unroll p by 4.
+        if (!transA)
         {
-            for (int p = 0; p < kc; p++)
+            fixed (float* aPtr = a)
+            fixed (float* packedPtr = packed)
             {
-                for (int ii = 0; ii < Mr; ii++)
+                for (; i + Mr <= mc; i += Mr)
                 {
-                    int row = ic + i + ii;
-                    int col = pc + p;
-                    packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
+                    float* row0 = aPtr + (ic + i + 0) * lda + pc;
+                    float* row1 = aPtr + (ic + i + 1) * lda + pc;
+                    float* row2 = aPtr + (ic + i + 2) * lda + pc;
+                    float* row3 = aPtr + (ic + i + 3) * lda + pc;
+                    float* row4 = aPtr + (ic + i + 4) * lda + pc;
+                    float* row5 = aPtr + (ic + i + 5) * lda + pc;
+                    float* pp = packedPtr + pos;
+
+                    int p = 0;
+                    for (; p + 4 <= kc; p += 4)
+                    {
+                        pp[0]  = row0[0]; pp[1]  = row1[0]; pp[2]  = row2[0]; pp[3]  = row3[0]; pp[4]  = row4[0]; pp[5]  = row5[0];
+                        pp[6]  = row0[1]; pp[7]  = row1[1]; pp[8]  = row2[1]; pp[9]  = row3[1]; pp[10] = row4[1]; pp[11] = row5[1];
+                        pp[12] = row0[2]; pp[13] = row1[2]; pp[14] = row2[2]; pp[15] = row3[2]; pp[16] = row4[2]; pp[17] = row5[2];
+                        pp[18] = row0[3]; pp[19] = row1[3]; pp[20] = row2[3]; pp[21] = row3[3]; pp[22] = row4[3]; pp[23] = row5[3];
+                        pp += 24;
+                        row0 += 4; row1 += 4; row2 += 4; row3 += 4; row4 += 4; row5 += 4;
+                    }
+                    for (; p < kc; p++)
+                    {
+                        pp[0] = row0[0]; pp[1] = row1[0]; pp[2] = row2[0]; pp[3] = row3[0]; pp[4] = row4[0]; pp[5] = row5[0];
+                        pp += 6;
+                        row0++; row1++; row2++; row3++; row4++; row5++;
+                    }
+                    pos += Mr * kc;
+                }
+            }
+        }
+        else
+#endif
+        {
+            // Scalar fallback (transpose path or older TFMs)
+            for (; i + Mr <= mc; i += Mr)
+            {
+                for (int p = 0; p < kc; p++)
+                {
+                    for (int ii = 0; ii < Mr; ii++)
+                    {
+                        int row = ic + i + ii;
+                        int col = pc + p;
+                        packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
+                    }
                 }
             }
         }
@@ -504,14 +763,45 @@ internal static class SimdGemm
     /// When transB=false: reads B[row, col] = b[row*ldb + col] (row-major).
     /// When transB=true:  reads B^T[row, col] = b[col*ldb + row] (transposed).
     /// Layout: groups of Nr columns, each stored as kc x Nr contiguous block.
+    /// Iter 11: non-transpose full-Nr path uses 2x Vector256 loads/stores per k
+    /// iteration — reads 16 contiguous floats from a B row and writes them to
+    /// the packed buffer as two 256-bit aligned writes. ~8x faster than the
+    /// scalar fallback on cached data.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, bool transB, int pc, int kc, int jc, int nc)
+    private static unsafe void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, bool transB, int pc, int kc, int jc, int nc)
     {
         int pos = 0;
         int j = 0;
 
-        // Full Nr-column panels
+#if NET5_0_OR_GREATER
+        // Fast path: non-transpose, full Nr-column panels with SIMD copy.
+        // Nr=16 floats per row → 2 Vector256<float> = 64 bytes per iter.
+        if (!transB && Avx.IsSupported)
+        {
+            fixed (float* pBBase = b)
+            fixed (float* pPackedBase = packed)
+            {
+                for (; j + Nr <= nc; j += Nr)
+                {
+                    float* pPacked = pPackedBase + pos;
+                    float* pBCol = pBBase + pc * ldb + (jc + j);
+                    for (int p = 0; p < kc; p++)
+                    {
+                        var v0 = Avx.LoadVector256(pBCol);
+                        var v1 = Avx.LoadVector256(pBCol + 8);
+                        Avx.Store(pPacked, v0);
+                        Avx.Store(pPacked + 8, v1);
+                        pBCol += ldb;
+                        pPacked += Nr;
+                    }
+                    pos += kc * Nr;
+                }
+            }
+        }
+#endif
+
+        // Remaining full panels (transpose path or older TFMs) — scalar loop.
         for (; j + Nr <= nc; j += Nr)
         {
             for (int p = 0; p < kc; p++)
@@ -571,6 +861,10 @@ internal static class SimdGemm
         CpuJitKernels.GemmMicroKernel? jitKernel =
             CpuJitSelfTest.IsVerified ? CpuJitKernels.GetGemmMicroKernel(kc, ldc) : null;
 
+        // Iter 10 (reverted): tried pinning packedA/B/C once around the whole micro-
+        // kernel loop to eliminate per-call fixed overhead. It regressed ~14% at 512².
+        // The JIT was already eliding the inner-loop fixed statements, and the outer
+        // fixed created a longer-lived GC pin that seemed to hurt. Reverted.
         for (int jr = 0; jr < nrBlocks; jr++)
         {
             int jLocal = jr * Nr;
@@ -627,7 +921,7 @@ internal static class SimdGemm
     /// Inner loop over K dimension broadcasts A elements and FMA with B row.
     /// </summary>
     [MethodImpl(HotInline)]
-    private static void MicroKernel6x16(
+    private static unsafe void MicroKernel6x16(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
         Span<float> c, int ldc,
@@ -645,31 +939,44 @@ internal static class SimdGemm
         ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
         ref float bRef = ref MemoryMarshal.GetArrayDataReference(packedB);
 
+        // Iter 16: removed software prefetch entirely. Zen 2's hardware prefetcher
+        // already handles sequential access well. Iter 9's explicit Sse.Prefetch0
+        // hints consumed load ports (10 loads per iter → 12 with 2 prefetches =
+        // 6 cycles load-limited vs 5 without), slightly slowing the critical path.
+        // The branch check (if p < prefetchLimit) also hurt loop predictability.
         for (int p = 0; p < kc; p++)
         {
-            // Load B row (Nr=16 = 2 vectors of 8)
+            // Load B row (Nr=16 = 2 vectors of 8). B regs are live across all 6 A
+            // broadcasts, so they stay resident throughout the inner sequence.
             int bIdx = bOffset + p * Nr;
             var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx)));
             var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx + 8)));
 
-            // Load A column (Mr=6 values)
+            // A broadcasts: load each element right before its 2 FMAs and let the
+            // register die immediately. This keeps only one A reg live at a time,
+            // bringing total live ymm regs to 12 acc + 2 B + 1 A = 15, fitting in
+            // AVX2's 16 ymm without spills. Prior version loaded all 6 A elements
+            // up front, forcing the JIT to keep 20 regs live and spill to stack.
             int aIdx = aOffset + p * Mr;
-            var a0 = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
-            var a1 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
-            var a2 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
-            var a3 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
-            var a4 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
-            var a5 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+            var a = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
 
-            // FMA: C[i,j] += A[i,p] * B[p,j]
-            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
-            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
-            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
-            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
-            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
-            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
         }
 
         // Store results back to C (accumulate)

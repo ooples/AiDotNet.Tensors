@@ -246,6 +246,13 @@ class Program
             return;
         }
 
+        // Run deterministic vs MKL matmul A/B benchmarks (Issue #131 Step 2, ~5-15min)
+        if (args[0] == "--vs-deterministic-matmul")
+        {
+            BenchmarkRunner.Run<DeterministicMatMulBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
         if (args[0] == "--vs-tensorcodec-gaps")
         {

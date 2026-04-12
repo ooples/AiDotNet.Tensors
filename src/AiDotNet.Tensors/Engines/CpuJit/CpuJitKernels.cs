@@ -509,51 +509,124 @@ internal static class CpuJitKernels
             // Save R8 (C pointer) into R10 — we'll need R8 pristine for C stores later
             e.MovRR(X86Emitter.R10, X86Emitter.R8);
 
-            // Loop counter: R9 = kc (counts down to 0)
-            int loopLabel = e.NewLabel();
-            e.BindLabel(loopLabel);
+            // Iter 17: 2x-unrolled K loop. Each loop body processes 2 K iterations
+            // back-to-back, giving the OoO engine more instruction-level parallelism
+            // and halving the loop overhead. Pointer advances: A += 48 (2*Mr*4),
+            // B += 128 (2*Nr*4), counter decrements by 2. If kc is odd, handle the
+            // last iteration after the main loop with a scalar-style single step.
+            int unrolledIters = kc / 2;
+            int tail = kc & 1;
 
-            // Load B row: 2 vectors of 8 floats from packedB (RDX)
-            e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);   // B[p, 0:7]
-            e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);  // B[p, 8:15]
+            if (unrolledIters > 0)
+            {
+                // R9 counts unrolled iterations (down from kc/2 to 0)
+                // Main loop counter was set to kc by the caller (via R9); we override below.
+                // Actually R9 starts at kc from the prologue — we need to set it to unrolledIters.
+                // The prologue sets R9 from the argument (kc) already.
+                // We need to divide R9 by 2. Shift right by 1 is simplest but X86Emitter
+                // may not expose it — use SubImm32 pattern instead.
+                // Actually, since kc is baked at JIT time (one kernel per kc value),
+                // we can just set R9 = unrolledIters directly via a MOV with the constant.
+                e.MovImm32(X86Emitter.R9, unrolledIters);
 
-            // Row 0: broadcast A[p*6+0], FMA with B
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
-            e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+                int loopLabel = e.NewLabel();
+                e.BindLabel(loopLabel);
 
-            // Row 1
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
-            e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+                // === Iteration p ===
+                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);
+                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);
 
-            // Row 2
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
-            e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
+                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
 
-            // Row 3
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
-            e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
+                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
 
-            // Row 4
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
-            e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
+                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
 
-            // Row 5
-            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
-            e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
-            e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
+                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
 
-            // Advance A by Mr*4=24 bytes, B by Nr*4=64 bytes
-            e.AddImm32(X86Emitter.RCX, 24);
-            e.AddImm32(X86Emitter.RDX, 64);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
+                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
 
-            // Decrement kc and loop
-            e.SubImm32(X86Emitter.R9, 1);
-            e.Jne(loopLabel);
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
+                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                // === Iteration p+1 ===
+                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 64);   // B[p+1, 0:7] at +64 bytes
+                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 96);   // B[p+1, 8:15] at +96 bytes
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 24);  // A[(p+1)*6+0] at +24 bytes
+                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 28);
+                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 32);
+                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 36);
+                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 40);
+                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 44);
+                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                // Advance A by 2*Mr*4=48 bytes, B by 2*Nr*4=128 bytes
+                e.AddImm32(X86Emitter.RCX, 48);
+                e.AddImm32(X86Emitter.RDX, 128);
+
+                // Decrement unrolled counter and loop
+                e.SubImm32(X86Emitter.R9, 1);
+                e.Jne(loopLabel);
+            }
+
+            // Tail: if kc is odd, process one more iteration
+            if (tail > 0)
+            {
+                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);
+                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
+                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
+                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
+                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
+                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
+                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
+                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+            }
 
             // === Store accumulated results back to C (load-add-store) ===
             // R10 = C pointer, ldc baked as displacement
