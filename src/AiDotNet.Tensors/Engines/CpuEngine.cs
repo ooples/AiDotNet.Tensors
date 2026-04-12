@@ -28151,6 +28151,99 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+        if (input.Rank < 2)
+            throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
+        if (filter.Rank < 2)
+            throw new ArgumentException("NativeSpectralFilter requires at least a 2D filter tensor.", nameof(filter));
+
+        int h = input._shape[^2];
+        int w = input._shape[^1];
+        if (filter._shape[^2] != h || filter._shape[^1] != w)
+            throw new ArgumentException(
+                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
+                nameof(filter));
+        if (filter.Length > input.Length)
+            throw new ArgumentException(
+                $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
+                nameof(filter));
+
+        // Fused: FFT2D → pointwise multiply with broadcast → IFFT2D
+        var spectrum = NativeComplexFFT2D(input);
+
+        // Multiply spectrum by filter using modular broadcast on filter.Length.
+        // This naturally handles any rank: [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, etc.
+        int filterLen = filter.Length;
+        if (filterLen <= 0)
+            throw new ArgumentException("Filter length must be a positive multiple of spatial slice size.", nameof(filter));
+        int sliceSize = h * w;
+        if (sliceSize > 0 && filterLen % sliceSize != 0)
+            throw new ArgumentException(
+                $"Filter length ({filterLen}) must be a positive multiple of spatial slice size ({sliceSize}).",
+                nameof(filter));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var filtered = new Tensor<Complex<T>>(spectrum._shape);
+        for (int i = 0; i < spectrum.Length; i++)
+        {
+            int fi = i % filterLen;
+            var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
+            var fr = filter[fi].Real; var fi2 = filter[fi].Imaginary;
+            filtered[i] = new Complex<T>(
+                ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fi2)),
+                ops.Add(ops.Multiply(sr, fi2), ops.Multiply(si, fr)));
+        }
+
+        return NativeComplexIFFT2DReal(filtered);
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+        if (input.Rank != 4)
+            throw new ArgumentException(
+                $"NativeSpectralFilterBatch requires 4D input [B,C,H,W]. Got rank {input.Rank}.",
+                nameof(input));
+        if (filter.Rank < 2)
+            throw new ArgumentException("Filter must be at least 2D.", nameof(filter));
+
+        int h = input._shape[2];
+        int w = input._shape[3];
+        if (filter._shape[^2] != h || filter._shape[^1] != w)
+            throw new ArgumentException(
+                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
+                nameof(filter));
+        if (filter.Length > input.Length)
+            throw new ArgumentException(
+                $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
+                nameof(filter));
+
+        // FFT2D the entire [B,C,H,W] input — the FFT2D already batches over leading dims
+        var spectrum = NativeComplexFFT2D(input);
+
+        // Multiply spectrum by filter using modular broadcast on filter.Length.
+        // [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, [B,C,H,W] is direct.
+        int filterLen = filter.Length;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var filtered = new Tensor<Complex<T>>(spectrum._shape);
+        for (int i = 0; i < spectrum.Length; i++)
+        {
+            int fi = i % filterLen;
+            var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
+            var fr = filter[fi].Real; var fi2 = filter[fi].Imaginary;
+            filtered[i] = new Complex<T>(
+                ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fi2)),
+                ops.Add(ops.Multiply(sr, fi2), ops.Multiply(si, fr)));
+        }
+
+        return NativeComplexIFFT2DReal(filtered);
+    }
+
     /// <summary>
     /// Transpose the last two axes of a complex tensor using a specialized nested loop.
     /// For shape [..., H, W] → [..., W, H], iterates batch × H × W with direct index

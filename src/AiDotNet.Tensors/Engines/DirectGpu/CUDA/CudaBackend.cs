@@ -10050,6 +10050,63 @@ public sealed class CudaBackend : IAsyncGpuBackend
             (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
     }
 
+    /// <inheritdoc/>
+    public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (batch <= 0 || height <= 0 || width <= 0) return;
+        if (filterSliceCount <= 0 || (filterSliceCount != 1 && filterSliceCount != batch))
+            throw new ArgumentException($"filterSliceCount must be 1 (shared) or batch ({batch}). Got {filterSliceCount}.");
+
+        using var _ = PushContext();
+        int sliceSize = height * width;
+        int totalSize = batch * sliceSize;
+
+        // All temp buffers on GPU — zero CPU round-trips for intermediates
+        IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
+        try
+        {
+            fftR = AllocateBuffer(totalSize);
+            fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize);
+            mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize);
+            zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
+
+            BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
+
+            if (filterSliceCount == batch)
+            {
+                SplitComplexMultiply(fftR, fftI, filterReal, filterImag, mulR, mulI, totalSize);
+            }
+            else
+            {
+                var bcastFR = AllocateBuffer(totalSize);
+                var bcastFI = AllocateBuffer(totalSize);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        Copy(filterReal, 0, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, 0, bcastFI, b * sliceSize, sliceSize);
+                    }
+                    SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
+                }
+                finally { bcastFR.Dispose(); bcastFI.Dispose(); }
+            }
+
+            BatchedFFT2D(mulR, mulI, outputReal, ifftI, batch, height, width, inverse: true);
+        }
+        finally
+        {
+            fftR?.Dispose(); fftI?.Dispose();
+            mulR?.Dispose(); mulI?.Dispose();
+            ifftI?.Dispose(); zeroI?.Dispose();
+        }
+    }
+
     #endregion
 
     #region Quantum Computing Operations

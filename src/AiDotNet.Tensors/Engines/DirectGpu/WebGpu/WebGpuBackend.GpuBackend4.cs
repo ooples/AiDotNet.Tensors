@@ -1464,5 +1464,62 @@ public sealed partial class WebGpuBackend
     }
 
     #endregion
+
+    /// <inheritdoc/>
+    public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
+        IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
+    {
+        if (filterSliceCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(filterSliceCount), "Must be >= 1.");
+        if (height <= 0 || width <= 0 || batch <= 0)
+            throw new ArgumentOutOfRangeException("Dimensions must be positive.");
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            throw new ArgumentException("height and width must be powers of 2 for FFT.");
+
+        int sliceSize = height * width;
+        int totalSize = batch * sliceSize;
+
+        IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
+        try
+        {
+            fftR = AllocateBuffer(totalSize);
+            fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize);
+            mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize);
+            zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
+
+            BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
+
+            if (filterSliceCount == batch)
+            {
+                SplitComplexMultiply(fftR, fftI, filterReal, filterImag, mulR, mulI, totalSize);
+            }
+            else
+            {
+                var bcastFR = AllocateBuffer(totalSize);
+                var bcastFI = AllocateBuffer(totalSize);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        Copy(filterReal, 0, bcastFR, b * sliceSize, sliceSize);
+                        Copy(filterImag, 0, bcastFI, b * sliceSize, sliceSize);
+                    }
+                    SplitComplexMultiply(fftR, fftI, bcastFR, bcastFI, mulR, mulI, totalSize);
+                }
+                finally { bcastFR.Dispose(); bcastFI.Dispose(); }
+            }
+
+            BatchedFFT2D(mulR, mulI, outputReal, ifftI, batch, height, width, inverse: true);
+        }
+        finally
+        {
+            fftR?.Dispose(); fftI?.Dispose();
+            mulR?.Dispose(); mulI?.Dispose();
+            ifftI?.Dispose(); zeroI?.Dispose();
+        }
+    }
 }
 #endif

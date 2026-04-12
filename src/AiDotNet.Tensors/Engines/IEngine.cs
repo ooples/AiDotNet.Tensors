@@ -7520,6 +7520,38 @@ public interface IEngine
     Tensor<T> NativeComplexIFFTNDReal<T>(Tensor<Complex<T>> input, int[] axes);
 
     /// <summary>
+    /// Fused spectral filter: FFT2D(input) ⊙ filter → IFFT2DReal → output.
+    /// Single engine call that eliminates 2 intermediate tensor allocations.
+    /// Input shape: [H, W] or [..., H, W] (batches over leading dims).
+    /// Filter shape: any rank ≥ 2 where last two dims match [H, W]. Leading dims
+    /// are broadcast via modular indexing: [H,W] applies the same filter to every slice,
+    /// [C,H,W] cycles per-channel across batches, [B,C,H,W] is a direct 1:1 match.
+    /// The result is the real projection of the inverse transform — imaginary components
+    /// from IFFT are discarded (correct when the original input was real-valued).
+    /// </summary>
+    /// <param name="input">Real-valued spatial input. Last two axes must be powers of 2.</param>
+    /// <param name="filter">Complex-valued spectral filter. Last two dims must match input [H, W].
+    /// Filter length must not exceed input length.</param>
+    /// <returns>Real-valued filtered output of same shape as input (real projection of IFFT2D).</returns>
+    Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter);
+
+    /// <summary>
+    /// Batched spectral filter across samples and channels.
+    /// Input: [B, C, H, W]. Filter: any rank ≥ 2 where last two dims match [H, W].
+    /// Applies FFT2D → pointwise multiply → IFFT2DReal to every (b, c) slice in one call,
+    /// replacing the O(B×C) dispatch loop that dominates vision-model training time.
+    /// Filter broadcasting: [H,W] shared across all, [C,H,W] per-channel cycling across
+    /// batches, [B,C,H,W] direct 1:1 match.
+    /// The result is the real projection of each slice's inverse transform — imaginary
+    /// components from IFFT are discarded (correct when the original input was real-valued).
+    /// </summary>
+    /// <param name="input">Real-valued 4D tensor [B, C, H, W]. H and W must be powers of 2.</param>
+    /// <param name="filter">Complex-valued filter. Last two dims must match [H, W].
+    /// Filter length must not exceed input length.</param>
+    /// <returns>Real-valued output [B, C, H, W] (real projection of IFFT2D per slice).</returns>
+    Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter);
+
+    /// <summary>
     /// Selects the top-K elements by complex magnitude, zeroing all others.
     /// Used for spectral sparsity masking — retains the K strongest frequency components.
     /// </summary>
