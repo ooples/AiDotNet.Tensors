@@ -67,4 +67,23 @@ public class ZeroCopyConversionTests
         Assert.Equal(3, tensor.Length);
         Assert.Equal(2f, tensor[1]);
     }
+
+    [Fact]
+    public void TensorAsVector_SparseCheck()
+    {
+        var tensor = new Tensor<double>([4]);
+        for (int i = 0; i < 4; i++) tensor[i] = i;
+        var vec = tensor.AsVector();
+        Assert.Equal(4, vec.Length);
+    }
+
+    [Fact]
+    public void TensorAsVector_LengthMismatch_ReturnsCopy()
+    {
+        var vec = new Vector<double>([10.0, 20.0, 30.0, 40.0, 50.0]);
+        var tensor = vec.AsTensor();
+        var roundTrip = tensor.AsVector();
+        Assert.Equal(5, roundTrip.Length);
+        Assert.Equal(30.0, roundTrip[2]);
+    }
 }

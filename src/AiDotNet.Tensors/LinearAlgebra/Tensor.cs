@@ -317,23 +317,30 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Returns the backing <see cref="Vector{T}"/> of this tensor — zero-copy.
-    /// Only valid for contiguous tensors with no storage offset. Mutations to
-    /// either are visible in the other.
+    /// Returns a <see cref="Vector{T}"/> view of this rank-1 tensor — zero-copy
+    /// when the backing data length matches, otherwise a trimmed copy.
+    /// Only valid for rank-1 tensors. For sliced views (non-zero storage offset)
+    /// or sparse tensors, throws — call <c>.Contiguous()</c> first.
     /// </summary>
-    /// <exception cref="InvalidOperationException">If the tensor is not contiguous
-    /// or has a non-zero storage offset (e.g., a sliced view).</exception>
+    /// <exception cref="InvalidOperationException">If the tensor is not rank-1,
+    /// not contiguous, has a non-zero storage offset, or is sparse.</exception>
     public Vector<T> AsVector()
     {
         if (_shape.Length != 1)
             throw new InvalidOperationException(
                 $"AsVector requires a rank-1 tensor, got rank {_shape.Length}. " +
                 "Use Reshape([Length]) first if you want to flatten.");
+        if (IsSparse)
+            throw new InvalidOperationException(
+                "AsVector does not support sparse tensors. " +
+                "Call .Contiguous() first to densify.");
         if (!IsContiguous || _storageOffset != 0)
             throw new InvalidOperationException(
                 "AsVector requires a contiguous tensor with zero storage offset. " +
                 "Call .Contiguous() first to materialize a copy if needed.");
-        return _data;
+        if (_data.Length == _shape[0])
+            return _data;
+        return new Vector<T>(_data.AsSpan().Slice(0, _shape[0]).ToArray());
     }
 
     /// <summary>
