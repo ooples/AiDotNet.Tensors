@@ -308,13 +308,83 @@ public class SpectralFilterTests
     }
 
     [Fact]
-    public void SpectralFilter_ThrowsOnNon2DFilter()
+    public void SpectralFilter_Rank3Filter_BroadcastsPerChannel()
     {
-        // Rank-3 filter [C,H,W] should be rejected — use NativeSpectralFilterBatch instead
-        var input = new Tensor<double>([2, 3, 8, 8]);
-        var rank3Filter = new Tensor<Complex<double>>([3, 8, 8]);
+        // [C,H,W] filter with [B,C,H,W] input should broadcast per-channel across batches
+        int batch = 2, channels = 3, h = 8, w = 8;
+        var rng = new Random(42);
+        var input = new Tensor<double>([batch, channels, h, w]);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() * 2 - 1;
 
-        Assert.Throws<ArgumentException>(() => _engine.NativeSpectralFilter(input, rank3Filter));
+        var filter = new Tensor<Complex<double>>([channels, h, w]);
+        for (int i = 0; i < filter.Length; i++)
+            filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+        var result = _engine.NativeSpectralFilter(input, filter);
+        Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
+
+        // Verify each (b,c) slice matches single-slice spectral filter with the channel's filter
+        int sliceSize = h * w;
+        for (int b = 0; b < batch; b++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                var singleSlice = new Tensor<double>([h, w]);
+                int srcOff = (b * channels + c) * sliceSize;
+                for (int i = 0; i < sliceSize; i++) singleSlice[i] = input[srcOff + i];
+
+                var channelFilter = new Tensor<Complex<double>>([h, w]);
+                int fOff = c * sliceSize;
+                for (int i = 0; i < sliceSize; i++) channelFilter[i] = filter[fOff + i];
+
+                var singleResult = _engine.NativeSpectralFilter(singleSlice, channelFilter);
+                for (int i = 0; i < sliceSize; i++)
+                {
+                    double diff = Math.Abs(result[srcOff + i] - singleResult[i]);
+                    Assert.True(diff < 1e-8,
+                        $"Rank-3 filter (b={b},c={c}) mismatch at [{i}]: " +
+                        $"batched={result[srcOff + i]:F10}, single={singleResult[i]:F10}");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void SpectralFilter_FullRankFilter_DirectMultiply()
+    {
+        // [B,C,H,W] filter with [B,C,H,W] input — no broadcast, direct 1:1 multiply
+        int batch = 2, channels = 3, h = 8, w = 8;
+        var rng = new Random(99);
+        var input = new Tensor<double>([batch, channels, h, w]);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() * 2 - 1;
+
+        var filter = new Tensor<Complex<double>>([batch, channels, h, w]);
+        for (int i = 0; i < filter.Length; i++)
+            filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+        var result = _engine.NativeSpectralFilter(input, filter);
+        Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
+
+        // Verify against manual pipeline
+        var spectrum = _engine.NativeComplexFFT2D(input);
+        var filtered = _engine.NativeComplexMultiply(spectrum, filter);
+        var expected = _engine.NativeComplexIFFT2DReal(filtered);
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double diff = Math.Abs(expected[i] - result[i]);
+            Assert.True(diff < 1e-8,
+                $"Full-rank filter mismatch at [{i}]: expected={expected[i]:F10}, actual={result[i]:F10}");
+        }
+    }
+
+    [Fact]
+    public void SpectralFilter_ThrowsOnFilterLargerThanInput()
+    {
+        var input = new Tensor<double>([8, 8]);
+        var bigFilter = new Tensor<Complex<double>>([2, 8, 8]); // filter larger than input
+
+        Assert.Throws<ArgumentException>(() => _engine.NativeSpectralFilter(input, bigFilter));
     }
 
     [Fact]
@@ -327,21 +397,41 @@ public class SpectralFilterTests
     }
 
     [Fact]
-    public void SpectralFilterBatch_ThrowsOnWrongChannelCount()
+    public void SpectralFilterBatch_ThrowsOnFilterLargerThanInput()
     {
         var input = new Tensor<double>([2, 3, 8, 8]);
-        var wrongFilter = new Tensor<Complex<double>>([5, 8, 8]); // 5 channels != 3
+        var bigFilter = new Tensor<Complex<double>>([4, 3, 8, 8]); // larger than input
 
-        Assert.Throws<ArgumentException>(() => _engine.NativeSpectralFilterBatch(input, wrongFilter));
+        Assert.Throws<ArgumentException>(() => _engine.NativeSpectralFilterBatch(input, bigFilter));
     }
 
     [Fact]
-    public void SpectralFilterBatch_ThrowsOnWrongFilterRank()
+    public void SpectralFilterBatch_Rank4Filter_DirectMultiply()
     {
-        var input = new Tensor<double>([2, 3, 8, 8]);
-        var wrongFilter = new Tensor<Complex<double>>([2, 3, 8, 8]); // rank 4 not supported
+        // Full-rank [B,C,H,W] filter — no broadcast, direct 1:1 match
+        int batch = 2, channels = 3, h = 8, w = 8;
+        var rng = new Random(77);
+        var input = new Tensor<double>([batch, channels, h, w]);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() * 2 - 1;
 
-        Assert.Throws<ArgumentException>(() => _engine.NativeSpectralFilterBatch(input, wrongFilter));
+        var filter = new Tensor<Complex<double>>([batch, channels, h, w]);
+        for (int i = 0; i < filter.Length; i++)
+            filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+        var result = _engine.NativeSpectralFilterBatch(input, filter);
+        Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
+
+        // Verify against manual pipeline
+        var spectrum = _engine.NativeComplexFFT2D(input);
+        var filtered = _engine.NativeComplexMultiply(spectrum, filter);
+        var expected = _engine.NativeComplexIFFT2DReal(filtered);
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double diff = Math.Abs(expected[i] - result[i]);
+            Assert.True(diff < 1e-8,
+                $"Rank-4 batch filter mismatch at [{i}]: expected={expected[i]:F10}, actual={result[i]:F10}");
+        }
     }
 
     // ================================================================

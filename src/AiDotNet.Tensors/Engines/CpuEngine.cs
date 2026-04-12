@@ -28158,29 +28158,31 @@ public class CpuEngine : ITensorLevelEngine
         if (filter is null) throw new ArgumentNullException(nameof(filter));
         if (input.Rank < 2)
             throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
-        if (filter.Rank != 2)
-            throw new ArgumentException(
-                $"NativeSpectralFilter requires a 2D filter [H,W]. Got rank {filter.Rank}. " +
-                "For per-channel [C,H,W] filtering, use NativeSpectralFilterBatch instead.",
-                nameof(filter));
+        if (filter.Rank < 2)
+            throw new ArgumentException("NativeSpectralFilter requires at least a 2D filter tensor.", nameof(filter));
 
         int h = input._shape[^2];
         int w = input._shape[^1];
-        if (filter._shape[0] != h || filter._shape[1] != w)
+        if (filter._shape[^2] != h || filter._shape[^1] != w)
             throw new ArgumentException(
-                $"Filter shape [{filter._shape[0]},{filter._shape[1]}] must match input spatial dims [{h},{w}].",
+                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
+                nameof(filter));
+        if (filter.Length > input.Length)
+            throw new ArgumentException(
+                $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
                 nameof(filter));
 
         // Fused: FFT2D → pointwise multiply with broadcast → IFFT2D
         var spectrum = NativeComplexFFT2D(input);
 
-        // Multiply spectrum by filter using modular index — avoids materializing a tiled filter tensor
-        int sliceSize = h * w;
+        // Multiply spectrum by filter using modular broadcast on filter.Length.
+        // This naturally handles any rank: [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, etc.
+        int filterLen = filter.Length;
         var ops = MathHelper.GetNumericOperations<T>();
         var filtered = new Tensor<Complex<T>>(spectrum._shape);
         for (int i = 0; i < spectrum.Length; i++)
         {
-            int fi = i % sliceSize;
+            int fi = i % filterLen;
             var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
             var fr = filter[fi].Real; var fi2 = filter[fi].Imaginary;
             filtered[i] = new Complex<T>(
@@ -28200,48 +28202,33 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"NativeSpectralFilterBatch requires 4D input [B,C,H,W]. Got rank {input.Rank}.",
                 nameof(input));
+        if (filter.Rank < 2)
+            throw new ArgumentException("Filter must be at least 2D.", nameof(filter));
 
-        int batch = input._shape[0];
-        int channels = input._shape[1];
         int h = input._shape[2];
         int w = input._shape[3];
-
-        bool perChannel = filter.Rank == 3;
-        if (perChannel)
-        {
-            if (filter._shape[0] != channels || filter._shape[1] != h || filter._shape[2] != w)
-                throw new ArgumentException(
-                    $"Per-channel filter shape [{filter._shape[0]},{filter._shape[1]},{filter._shape[2]}] " +
-                    $"must match [C={channels},H={h},W={w}].", nameof(filter));
-        }
-        else if (filter.Rank == 2)
-        {
-            if (filter._shape[0] != h || filter._shape[1] != w)
-                throw new ArgumentException(
-                    $"Shared filter shape [{filter._shape[0]},{filter._shape[1]}] must match [H={h},W={w}].",
-                    nameof(filter));
-        }
-        else
-        {
+        if (filter._shape[^2] != h || filter._shape[^1] != w)
             throw new ArgumentException(
-                $"Filter must be [C,H,W] (per-channel) or [H,W] (shared). Got rank {filter.Rank}.",
+                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
                 nameof(filter));
-        }
+        if (filter.Length > input.Length)
+            throw new ArgumentException(
+                $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
+                nameof(filter));
 
         // FFT2D the entire [B,C,H,W] input — the FFT2D already batches over leading dims
         var spectrum = NativeComplexFFT2D(input);
 
-        // Multiply spectrum by filter using index arithmetic — avoids materializing full [B,C,H,W] filter
-        int sliceSize = h * w;
+        // Multiply spectrum by filter using modular broadcast on filter.Length.
+        // [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, [B,C,H,W] is direct.
+        int filterLen = filter.Length;
         var ops = MathHelper.GetNumericOperations<T>();
         var filtered = new Tensor<Complex<T>>(spectrum._shape);
         for (int i = 0; i < spectrum.Length; i++)
         {
-            // Map flat index to filter index: per-channel uses (channel * sliceSize + spatial),
-            // shared uses just spatial offset
-            int srcOff = perChannel ? ((i / sliceSize) % channels) * sliceSize + (i % sliceSize) : i % sliceSize;
+            int fi = i % filterLen;
             var sr = spectrum[i].Real; var si = spectrum[i].Imaginary;
-            var fr = filter[srcOff].Real; var fi2 = filter[srcOff].Imaginary;
+            var fr = filter[fi].Real; var fi2 = filter[fi].Imaginary;
             filtered[i] = new Complex<T>(
                 ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fi2)),
                 ops.Add(ops.Multiply(sr, fi2), ops.Multiply(si, fr)));

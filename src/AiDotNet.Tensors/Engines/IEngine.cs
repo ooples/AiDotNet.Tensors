@@ -7523,24 +7523,27 @@ public interface IEngine
     /// Fused spectral filter: FFT2D(input) ⊙ filter → IFFT2D → real output.
     /// Single engine call that eliminates 2 intermediate tensor allocations.
     /// Input shape: [H, W] or [..., H, W] (batches over leading dims).
-    /// Filter shape: [H, W] — shared across all leading batch dimensions.
-    /// The same filter is applied to every (b, c, ...) slice. For per-channel
-    /// filtering, use <see cref="NativeSpectralFilterBatch{T}"/> instead.
+    /// Filter shape: any rank ≥ 2 where last two dims match [H, W]. Leading dims
+    /// are broadcast via modular indexing: [H,W] applies the same filter to every slice,
+    /// [C,H,W] cycles per-channel across batches, [B,C,H,W] is a direct 1:1 match.
     /// </summary>
     /// <param name="input">Real-valued spatial input. Last two axes must be powers of 2.</param>
-    /// <param name="filter">Complex-valued spectral filter of shape [H, W].</param>
+    /// <param name="filter">Complex-valued spectral filter. Last two dims must match input [H, W].
+    /// Filter length must not exceed input length.</param>
     /// <returns>Real-valued filtered output of same shape as input.</returns>
-    /// <exception cref="ArgumentException">Thrown if filter is not exactly [H, W].</exception>
     Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter);
 
     /// <summary>
     /// Batched spectral filter across samples and channels.
-    /// Input: [B, C, H, W]. Filter: [C, H, W] (per-channel) or [H, W] (shared).
+    /// Input: [B, C, H, W]. Filter: any rank ≥ 2 where last two dims match [H, W].
     /// Applies FFT2D → pointwise multiply → IFFT2D to every (b, c) slice in one call,
     /// replacing the O(B×C) dispatch loop that dominates vision-model training time.
+    /// Filter broadcasting: [H,W] shared across all, [C,H,W] per-channel cycling across
+    /// batches, [B,C,H,W] direct 1:1 match.
     /// </summary>
     /// <param name="input">Real-valued 4D tensor [B, C, H, W]. H and W must be powers of 2.</param>
-    /// <param name="filter">Complex-valued filter [C, H, W] or [H, W].</param>
+    /// <param name="filter">Complex-valued filter. Last two dims must match [H, W].
+    /// Filter length must not exceed input length.</param>
     /// <returns>Real-valued output [B, C, H, W].</returns>
     Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter);
 

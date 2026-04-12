@@ -15536,8 +15536,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
-        // Delegate to base for validation (rejects non-2D filter, mismatched dims)
-        if (input is null || filter is null || input.Rank < 2 || filter.Rank != 2)
+        if (input is null || filter is null || input.Rank < 2 || filter.Rank < 2)
             return base.NativeSpectralFilter(
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
@@ -15550,20 +15549,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int w = input._shape[^1];
             if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
                 return base.NativeSpectralFilter(input, filter);
-            if (filter._shape[0] != h || filter._shape[1] != w)
+            if (filter._shape[^2] != h || filter._shape[^1] != w)
                 return base.NativeSpectralFilter(input, filter);
 
             int batchCount = input.Length / (h * w);
             int sliceSize = h * w;
+            int filterSliceCount = filter.Length / sliceSize;
+            if (filterSliceCount <= 0 || filter.Length % sliceSize != 0)
+                return base.NativeSpectralFilter(input, filter);
+            // GPU backend accepts filterSliceCount of 1 or batch — fall back for others
+            if (filterSliceCount != 1 && filterSliceCount != batchCount)
+                return base.NativeSpectralFilter(input, filter);
 
-            // Convert real input to float at GPU boundary
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Decompose filter to split real/imag — always a single [H,W] slice
             var (fR, fI) = DecomposeComplex(filter);
-            int filterSliceCount = 1; // shared [H,W] filter broadcasts to all slices
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
             using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
@@ -15580,8 +15582,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
-        // Delegate to base for validation (rejects non-4D input, wrong filter rank/shape)
-        if (input is null || filter is null || input.Rank != 4 || (filter.Rank != 2 && filter.Rank != 3))
+        if (input is null || filter is null || input.Rank != 4 || filter.Rank < 2)
             return base.NativeSpectralFilterBatch(
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
@@ -15596,56 +15597,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int w = input._shape[3];
             if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
                 return base.NativeSpectralFilterBatch(input, filter);
-
-            // Validate filter spatial dims
             if (filter._shape[^2] != h || filter._shape[^1] != w)
-                return base.NativeSpectralFilterBatch(input, filter);
-            if (filter.Rank == 3 && filter._shape[0] != channels)
                 return base.NativeSpectralFilterBatch(input, filter);
 
             int totalSlices = batch * channels;
             int sliceSize = h * w;
+            int filterSliceCount = filter.Length / sliceSize;
+            if (filterSliceCount <= 0 || filter.Length % sliceSize != 0)
+                return base.NativeSpectralFilterBatch(input, filter);
+            // GPU backend accepts 1 or totalSlices — fall back for intermediate counts
+            if (filterSliceCount != 1 && filterSliceCount != totalSlices)
+                return base.NativeSpectralFilterBatch(input, filter);
 
-            // Convert real input to float at GPU boundary
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
-            // Decompose filter and determine broadcast mode
             var (fR, fI) = DecomposeComplex(filter);
-            bool perChannel = filter.Rank == 3;
-
-            // Build full [totalSlices * sliceSize] filter buffer for GPU
-            // For per-channel [C,H,W]: replicate across batches
-            // For shared [H,W]: single slice, filterSliceCount=1
-            float[] fullFR, fullFI;
-            int filterSliceCount;
-            if (perChannel)
-            {
-                filterSliceCount = totalSlices;
-                fullFR = new float[totalSlices * sliceSize];
-                fullFI = new float[totalSlices * sliceSize];
-                for (int b = 0; b < batch; b++)
-                {
-                    for (int c = 0; c < channels; c++)
-                    {
-                        int dstOff = (b * channels + c) * sliceSize;
-                        int srcOff = c * sliceSize;
-                        Array.Copy(fR, srcOff, fullFR, dstOff, sliceSize);
-                        Array.Copy(fI, srcOff, fullFI, dstOff, sliceSize);
-                    }
-                }
-            }
-            else
-            {
-                filterSliceCount = 1;
-                fullFR = fR;
-                fullFI = fI;
-            }
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
-            using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fullFR), true);
-            using var fIBuf = new OwnedBuffer(backend.AllocateBuffer(fullFI), true);
+            using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
+            using var fIBuf = new OwnedBuffer(backend.AllocateBuffer(fI), true);
             using var outBuf = new OwnedBuffer(backend.AllocateBuffer(input.Length), true);
 
             backend.SpectralFilter(inBuf.Buffer, fRBuf.Buffer, fIBuf.Buffer,
