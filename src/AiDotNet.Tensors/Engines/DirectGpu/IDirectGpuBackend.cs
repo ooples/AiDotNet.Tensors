@@ -2905,8 +2905,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="batch">Number of 2D slices (B*C for 4D input).</param>
     /// <param name="height">Height (must be power of 2).</param>
     /// <param name="width">Width (must be power of 2).</param>
-    /// <param name="filterSliceCount">Number of filter slices. Backends use (b % filterSliceCount) for
-    /// indexing, so: 1 = shared across all slices, batch = per-slice, or any divisor for repeating patterns.</param>
+    /// <param name="filterSliceCount">Number of filter slices (must be >= 1). Backends use
+    /// (b % filterSliceCount) for indexing, so: 1 = shared across all slices, batch = per-slice,
+    /// or any divisor for repeating patterns. Throws <see cref="ArgumentOutOfRangeException"/> if 0.</param>
     void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount);
 

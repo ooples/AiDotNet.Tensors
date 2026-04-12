@@ -15566,6 +15566,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             var (fR, fI) = DecomposeComplex(filter);
             int filterSliceCount = filter.Length / sliceSize;
+            if (filterSliceCount != 1 && filterSliceCount != batchCount)
+                return base.NativeSpectralFilter(input, filter);
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
             using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
@@ -15612,6 +15614,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return base.NativeSpectralFilterBatch(input, filter);
             bool perChannel = filter.Rank == 3;
             if (perChannel && filter._shape[0] != channels)
+                return base.NativeSpectralFilterBatch(input, filter);
+            // Reject higher-rank filters (e.g., [B,C,H,W]) -- not supported by GPU path
+            if (!perChannel && filter.Rank > 2)
                 return base.NativeSpectralFilterBatch(input, filter);
 
             var (fR, fI) = DecomposeComplex(filter);

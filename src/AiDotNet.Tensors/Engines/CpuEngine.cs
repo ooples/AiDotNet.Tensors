@@ -28183,6 +28183,8 @@ public class CpuEngine : ITensorLevelEngine
             // filter can be [H, W] (shared across all slices) or [C, H, W] (per-channel).
             int sliceSize = h * w;
             int filterSlices = filter.Length / sliceSize;
+            if (filterSlices <= 0)
+                throw new ArgumentException("Filter length must be a positive multiple of spatial slice size.", nameof(filter));
             int spectrumSlices = spectrum.Length / sliceSize;
             broadcastedFilter = new Tensor<Complex<T>>(spectrum._shape);
             for (int b = 0; b < spectrumSlices; b++)
