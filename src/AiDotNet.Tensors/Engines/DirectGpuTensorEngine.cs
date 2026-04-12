@@ -1805,7 +1805,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -1839,7 +1839,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -1879,7 +1879,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
         // Try GPU softmax: upload input, compute on GPU, download to destination
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -1913,7 +1913,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -1949,7 +1949,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.SwishInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         // GPU: use Sigmoid + Multiply kernels
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -1985,7 +1985,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GELUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2018,7 +2018,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TanhInto<T>(Tensor<T> dest, Tensor<T> input)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2051,7 +2051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.MishInto<T>(Tensor<T> dest, Tensor<T> input)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2075,7 +2075,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.LeakyReLUInto<T>(Tensor<T> dest, Tensor<T> input, T alpha)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2108,7 +2108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
     {
         // Only use GPU flat copy for axis=0 concat (leading axis — data is contiguous)
-        if (typeof(T) == typeof(float) && axis == 0 && TryGetBackend(out var gpuBackend) && tensors.Length == 2)
+        if (axis == 0 && TryGetBackend(out var gpuBackend) && tensors.Length == 2)
         {
             try
             {
@@ -2139,7 +2139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Only use GPU fast path for standard 2D transpose (axes == [1, 0])
         bool isStandardTranspose = input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0;
-        if (typeof(T) == typeof(float) && isStandardTranspose && TryGetBackend(out var gpuBackend))
+        if (isStandardTranspose && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2163,7 +2163,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        if (TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -2200,7 +2200,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
+        if (TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
         {
             try
             {
@@ -11659,10 +11659,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
-                var gArr = (float[])(object)gradOutput.GetFlattenedData();
-                var iArr = (float[])(object)input.GetFlattenedData();
+                var gArr = DirectGpuEngine.ToFloatArray(gradOutput.GetFlattenedData());
+                var iArr = DirectGpuEngine.ToFloatArray(input.GetFlattenedData());
                 int size = gArr.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gArr);
                 using var iBuf = GetOrAllocateBuffer(backend, iArr);
@@ -11684,10 +11684,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
-                var gArr = (float[])(object)gradOutput.GetFlattenedData();
-                var oArr = (float[])(object)output.GetDataArray();
+                var gArr = DirectGpuEngine.ToFloatArray(gradOutput.GetFlattenedData());
+                var oArr = DirectGpuEngine.ToFloatArray(output.GetDataArray());
                 int size = gArr.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gArr);
                 using var oBuf = GetOrAllocateBuffer(backend, oArr);
@@ -11709,10 +11709,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
-                var gArr = (float[])(object)gradOutput.GetFlattenedData();
-                var oArr = (float[])(object)output.GetDataArray();
+                var gArr = DirectGpuEngine.ToFloatArray(gradOutput.GetFlattenedData());
+                var oArr = DirectGpuEngine.ToFloatArray(output.GetDataArray());
                 int size = gArr.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gArr);
                 using var oBuf = GetOrAllocateBuffer(backend, oArr);
@@ -11738,7 +11738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11760,7 +11760,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11782,7 +11782,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11804,7 +11804,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11826,7 +11826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11848,7 +11848,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11870,7 +11870,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 const float alpha = 1.6732632423543772f;
                 const float scale = 1.0507009873554805f;
@@ -11894,7 +11894,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11916,7 +11916,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11938,7 +11938,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -11960,7 +11960,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var oBuf2 = GetOrAllocateBuffer(backend, output);
@@ -11982,7 +11982,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 int size = input.Length;
                 int alphaSize = alpha.Length;
@@ -12010,7 +12010,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 int outerSize = 1;
                 int reduceSize = input.Length;
@@ -12035,7 +12035,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 int outerSize = 1;
                 int reduceSize = input.Length;
@@ -12101,7 +12101,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 float scalarF = scalar is float f ? f : Convert.ToSingle(scalar);
                 var result = TryRunUnary(tensor, (b, input, output, size) => b.Scale(input, output, scalarF, size));
@@ -12158,7 +12158,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 float expF = exponent is float ef ? ef : Convert.ToSingle(exponent);
                 var result = TryRunUnary(tensor, (b, input, output, size) => b.Power(input, output, expF, size));
@@ -12275,7 +12275,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorWhere<T>(Tensor<T> condition, Tensor<T> x, Tensor<T> y)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorWhere(condition, x, y);
 
         try
@@ -12303,7 +12303,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
 
         try
@@ -12329,7 +12329,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || a.Rank < 3 || b.Rank < 3)
+        if (!TryGetBackend(out var backend) || a.Rank < 3 || b.Rank < 3)
             return base.BatchMatMul(a, b);
 
         try
@@ -12357,7 +12357,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || tensor.Rank != 2)
+        if (!TryGetBackend(out var backend) || tensor.Rank != 2)
             return base.TensorTranspose(tensor);
 
         try
@@ -12380,7 +12380,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorPermute(tensor, axes);
 
         try
@@ -12409,7 +12409,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 2)
+        if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -12443,7 +12443,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 2)
+        if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -12471,7 +12471,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 2)
+        if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -12500,7 +12500,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 4)
+        if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         try
@@ -12529,7 +12529,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 2)
+        if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
         try
@@ -12564,7 +12564,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Conv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 3)
+        if (!TryGetBackend(out var backend) || input.Rank < 3)
             return base.Conv1D(input, kernel, stride, padding, dilation);
 
         try
@@ -12591,7 +12591,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 5)
+        if (!TryGetBackend(out var backend) || input.Rank < 5)
             return base.Conv3D(input, kernel, stride, padding, dilation);
 
         try
@@ -12625,7 +12625,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ConvTranspose2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] outputPadding)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank < 4)
+        if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.ConvTranspose2D(input, kernel, stride, padding, outputPadding);
 
         try
@@ -12661,7 +12661,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Softmax<T>(Tensor<T> input, int axis)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.Softmax(input, axis);
 
         try
@@ -12697,7 +12697,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || axis != 0)
+        if (!TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
 
         try
@@ -12725,7 +12725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || axis != 0)
+        if (!TryGetBackend(out var backend) || axis != 0)
             return base.TensorScatterAdd(destination, indices, updates, axis);
 
         try
@@ -12750,7 +12750,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
         try
@@ -12779,7 +12779,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
-        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
+        if (!TryGetBatchBackend(out var bb))
             return base.TensorMSELoss(predictions, targets);
 
         try
@@ -12800,7 +12800,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorL1Loss(predictions, targets);
 
         try
@@ -12822,7 +12822,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorHuberLoss(predictions, targets, delta);
 
         try
@@ -12844,7 +12844,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorBCEWithLogitsLoss(logits, targets);
 
         try
@@ -12864,7 +12864,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || logits.Rank < 2)
+        if (!TryGetBackend(out var backend) || logits.Rank < 2)
             return base.TensorCrossEntropyLoss(logits, targets);
 
         try
@@ -12886,7 +12886,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || logProbs.Rank < 2)
+        if (!TryGetBackend(out var backend) || logProbs.Rank < 2)
             return base.TensorNLLLoss(logProbs, targets);
 
         try
@@ -12908,7 +12908,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorKLDivLoss(input, target);
 
         try
@@ -12932,7 +12932,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || !training)
+        if (!TryGetBackend(out var backend) || !training)
             return base.Dropout(input, dropoutRate, training, out mask);
 
         try
@@ -12955,7 +12955,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4 || scaleH != scaleW)
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || scaleH != scaleW)
             return base.Upsample(input, scaleH, scaleW);
 
         try
@@ -12977,7 +12977,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4 || grid.Rank != 4)
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || grid.Rank != 4)
             return base.GridSample(input, grid);
 
         try
@@ -13001,7 +13001,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4)
+        if (!TryGetBackend(out var backend) || input.Rank != 4)
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
         try
@@ -13054,7 +13054,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
         {
             base.LeakyReLUInPlace(tensor, alpha);
             return;
@@ -13066,7 +13066,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var buf = GetOrAllocateBuffer(backend, tensor.GetDataArray());
             backend.LeakyRelu(buf.Buffer, buf.Buffer, alphaF, tensor.Length);
             float[] result = backend.DownloadBuffer(buf.Buffer);
-            result.AsSpan().CopyTo(((Tensor<float>)(object)tensor).Data.Span);
+            var ops = MathHelper.GetNumericOperations<T>();
+            ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpan());
             return;
         }
         catch { }
@@ -13079,7 +13080,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorPReLU(tensor, alpha);
 
         try
@@ -13102,7 +13103,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorThreshold(tensor, threshold, value);
 
         try
@@ -13131,7 +13132,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4)
+        if (!TryGetBackend(out var backend) || input.Rank != 4)
             return base.Unfold(input, kernelSize, stride, padding);
 
         try
@@ -13158,7 +13159,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.Fold(input, outputSize, kernelSize, stride, padding);
 
         try
@@ -13198,7 +13199,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            if (TryGetBackend(out var backend))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -13249,7 +13250,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 3)
+        if (!TryGetBackend(out var backend) || input.Rank != 3)
             return base.TensorAvgPool1D(input, kernelSize, stride);
         try
         {
@@ -13266,7 +13267,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 3)
+        if (!TryGetBackend(out var backend) || input.Rank != 3)
             return base.TensorMaxPool1D(input, kernelSize, stride);
         try
         {
@@ -13283,7 +13284,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4 || outputSize.Length < 2)
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || outputSize.Length < 2)
             return base.TensorUpsampleBilinear(input, outputSize);
         try
         {
@@ -13301,7 +13302,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || dim != 0)
+        if (!TryGetBackend(out var backend) || dim != 0)
             return base.ScatterMean(source, indices, out counts, dim, outputSize);
         try
         {
@@ -13449,7 +13450,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
             {
@@ -13471,7 +13472,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
             {
@@ -13493,7 +13494,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
             {
@@ -13528,7 +13529,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorVar<T>(Tensor<T> tensor)
     {
-        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
+        if (!TryGetBatchBackend(out var bb))
             return base.TensorVar(tensor);
 
         try
@@ -13551,7 +13552,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorStd<T>(Tensor<T> tensor)
     {
-        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
+        if (!TryGetBatchBackend(out var bb))
             return base.TensorStd(tensor);
 
         try
@@ -13574,7 +13575,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        if (TryGetBackend(out var backend))
         {
             try
             {
@@ -13591,7 +13592,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        if (TryGetBackend(out var backend))
         {
             try
             {
@@ -13608,7 +13609,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (typeof(T) == typeof(float) && TryGetBatchBackend(out var bb))
+        if (TryGetBatchBackend(out var bb))
         {
             try
             {
@@ -13624,7 +13625,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb) || axes.Length != 1)
+        if (!TryGetBatchBackend(out var bb) || axes.Length != 1)
             return base.ReduceStd(input, axes, keepDims);
 
         try
@@ -13669,7 +13670,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower, double upper, bool training)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorRReLU(tensor, lower, upper, training);
 
         try
@@ -13704,7 +13705,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
     {
-        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb) || axis != 0)
+        if (!TryGetBatchBackend(out var bb) || axis != 0)
             return base.TensorIndexSelect(tensor, indices, axis);
 
         try
@@ -13733,7 +13734,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (!TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
 
         try
@@ -13798,7 +13799,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4)
+        if (!TryGetBackend(out var backend) || input.Rank != 4)
             return base.TensorAdaptiveMaxPool2D(input, outputSize);
 
         try
@@ -13837,7 +13838,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // --- Scalar reductions ---
     T IEngine.Sum<T>(Vector<T> v)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -13854,7 +13855,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.Mean<T>(Vector<T> v)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -13942,7 +13943,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorRandomUniform<T>(int[] shape)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -13959,7 +13960,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorRandomNormal<T>(int[] shape, T mean, T stddev)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14306,7 +14307,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14323,7 +14324,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorClip<T>(Tensor<T> input, T min, T max)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14339,7 +14340,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorPow<T>(Tensor<T> input, T exponent)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14355,7 +14356,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorFrac<T>(Tensor<T> input)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14371,7 +14372,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorEye<T>(int n)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14389,7 +14390,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        if (TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
@@ -14406,7 +14407,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        if (TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
@@ -14423,7 +14424,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorOuter<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14441,7 +14442,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.DotProduct<T>(Vector<T> a, Vector<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14460,7 +14461,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14484,7 +14485,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.GeGLU<T>(Tensor<T> input, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14508,7 +14509,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.ReGLU<T>(Tensor<T> input, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14531,7 +14532,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.SwiGLU<T>(Tensor<T> input, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        if (TryGetBackend(out var b))
         {
             try
             {
@@ -14699,7 +14700,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend))
             {
                 using var src = GetOrAllocateBuffer(backend, tensor);
                 var dst = AllocateOutputBuffer(backend, tensor.Length);
@@ -14723,7 +14724,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+            if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
                 && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
             {
                 int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
@@ -14755,7 +14756,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+            if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
                 && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
             {
                 int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
@@ -14780,7 +14781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+            if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
                 && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
             {
                 int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
@@ -14805,7 +14806,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+            if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
                 && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
             {
                 int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
@@ -14837,7 +14838,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+            if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
                 && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
             {
                 int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
@@ -14869,7 +14870,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+            if (TryGetBackend(out var backend)
                 && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
                 && target.Shape.Length == 2 && target.Shape[1] == 4
                 && target.Shape[0] == predicted.Shape[0])
@@ -14894,7 +14895,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+            if (TryGetBackend(out var backend)
                 && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
                 && target.Shape.Length == 2 && target.Shape[1] == 4
                 && target.Shape[0] == predicted.Shape[0])
@@ -14919,7 +14920,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+            if (TryGetBackend(out var backend)
                 && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
                 && target.Shape.Length == 2 && target.Shape[1] == 4
                 && target.Shape[0] == predicted.Shape[0])
@@ -14944,7 +14945,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+            if (TryGetBackend(out var backend)
                 && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
                 && target.Shape.Length == 2 && target.Shape[1] == 4
                 && target.Shape[0] == predicted.Shape[0])
@@ -14978,8 +14979,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || input._shape[1] != weight._shape[1])
             return base.OctonionMatMulTensor(input ?? throw new ArgumentNullException(nameof(input)),
                 weight ?? throw new ArgumentNullException(nameof(weight)));
-        if (typeof(T) != typeof(float))
-            return base.OctonionMatMulTensor(input, weight);
+
         if (!TryGetBackend(out var backend))
             return base.OctonionMatMulTensor(input, weight);
 
@@ -14990,8 +14990,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int outputFeatures = weight._shape[0];
 
             // T is float — direct cast, no ToDouble round-trip
-            var inputF = (float[])(object)input.GetFlattenedData();
-            var weightF = (float[])(object)weight.GetFlattenedData();
+            var inputF = DirectGpuEngine.ToFloatArray(input.GetFlattenedData());
+            var weightF = DirectGpuEngine.ToFloatArray(weight.GetFlattenedData());
             var biasData = new float[outputFeatures * 8]; // zero bias
 
             using var inputBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
@@ -15004,8 +15004,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             var gpuResult = backend.DownloadBuffer(outputBuf.Buffer);
             var result = new Tensor<T>(new[] { batch, outputFeatures, 8 });
-            var resultF = (float[])(object)result.GetDataArray();
-            Array.Copy(gpuResult, resultF, gpuResult.Length);
+            // Vectorized float→T conversion directly into the tensor's backing array
+            var resultData = result.GetDataArray();
+            var resultOps = MathHelper.GetNumericOperations<T>();
+            resultOps.FromFloatSpan(new ReadOnlySpan<float>(gpuResult), new Span<T>(resultData));
 
             Autodiff.DifferentiableOps.RecordBinary("OctonionMatMulTensor", result, input, weight,
                 Autodiff.BackwardFunctions<T>.OctonionMatMulBackward);
@@ -15057,8 +15059,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (a is null || b is null || a.Length != b.Length)
             return base.NativeComplexMultiply(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexMultiply(a, b);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
 
@@ -15086,8 +15086,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexConjugate(a);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexConjugate(a);
 
@@ -15111,8 +15109,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeComplexMagnitude<T>(Tensor<Complex<T>> a)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexMagnitude(a);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitude(a);
 
@@ -15134,8 +15130,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexMagnitudeSquared(a);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitudeSquared(a);
 
@@ -15157,8 +15151,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeComplexPhase<T>(Tensor<Complex<T>> a)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexPhase(a);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexPhase(a);
 
@@ -15180,8 +15172,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexFromPolar(magnitudes, phases);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFromPolar(magnitudes, phases);
 
@@ -15212,8 +15202,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexScale<T>(Tensor<Complex<T>> a, T scalar)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexScale(a, scalar);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexScale(a, scalar);
 
@@ -15241,8 +15229,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (a is null || b is null || a.Length != b.Length)
             return base.NativeComplexAdd(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexAdd(a, b);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
 
@@ -15270,8 +15256,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexFFTComplex(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFFTComplex(input);
 
@@ -15307,8 +15291,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentNullException(nameof(input));
         if (k <= 0)
             throw new ArgumentException("k must be positive.", nameof(k));
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexTopK(input, k);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexTopK(input, k);
 
@@ -15362,8 +15344,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (x is null || y is null || x.Length != y.Length)
             return base.NativeComplexCrossSpectral(x ?? throw new ArgumentNullException(nameof(x)), y ?? throw new ArgumentNullException(nameof(y)));
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexCrossSpectral(x, y);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexCrossSpectral(x, y);
 
@@ -15391,8 +15371,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexFFT(input);
 
@@ -15428,8 +15406,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexIFFTReal(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFTReal(input);
 
@@ -15460,8 +15436,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.NativeComplexIFFT(input);
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFT(input);
 
@@ -15490,10 +15464,78 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch { return base.NativeComplexIFFT(input); }
     }
 
+    public override Tensor<Complex<T>> NativeComplexFFT2D<T>(Tensor<T> input)
+    {
+        if (input is null || input.Rank < 2)
+            return base.NativeComplexFFT2D(input ?? throw new ArgumentNullException(nameof(input)));
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFT2D(input);
+
+        try
+        {
+            int h = input._shape[^2];
+            int w = input._shape[^1];
+            if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
+                return base.NativeComplexFFT2D(input);
+
+            int batchCount = input.Length / (h * w);
+            int n = input.Length;
+
+            // Convert any T to split real/imag float at the GPU boundary
+            var ops = MathHelper.GetNumericOperations<T>();
+            var realF = new float[n];
+            for (int i = 0; i < n; i++) realF[i] = (float)ops.ToDouble(input[i]);
+            var imagF = new float[n]; // zero-initialized — real input has no imaginary
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(realF), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(imagF), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.BatchedFFT2D(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer,
+                batchCount, h, w, inverse: false);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
+                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexFFT2D(input); }
+    }
+
+    public override Tensor<T> NativeComplexIFFT2DReal<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null || input.Rank < 2)
+            return base.NativeComplexIFFT2DReal(input ?? throw new ArgumentNullException(nameof(input)));
+        if (!TryGetBackend(out var backend))
+            return base.NativeComplexIFFT2DReal(input);
+
+        try
+        {
+            int h = input._shape[^2];
+            int w = input._shape[^1];
+            if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
+                return base.NativeComplexIFFT2DReal(input);
+
+            int batchCount = input.Length / (h * w);
+            int n = input.Length;
+
+            // Convert Complex<T> to split real/imag float at the GPU boundary
+            var (inR, inI) = DecomposeComplex(input);
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inR), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(inI), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            backend.BatchedFFT2D(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer,
+                batchCount, h, w, inverse: true);
+
+            return RecomposeReal<T>(backend.DownloadBuffer(outRBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeComplexIFFT2DReal(input); }
+    }
+
     public override Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
-            return base.TensorSoftmaxRows(input);
         if (input.Rank != 2)
             return base.TensorSoftmaxRows(input);
         if (!TryGetBackend(out var backend))

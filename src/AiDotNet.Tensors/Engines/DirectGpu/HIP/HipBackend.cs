@@ -8301,6 +8301,45 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     /// <summary>
     /// Applies a window function element-wise.
     /// </summary>
+    /// <inheritdoc/>
+    /// <inheritdoc/>
+    public void BatchedFFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag,
+        int batch, int height, int width, bool inverse)
+    {
+        if (batch <= 0 || height <= 0 || width <= 0) return;
+        int sliceSize = height * width;
+
+        if (batch == 1)
+        {
+            FFT2D(inputReal, inputImag, outputReal, outputImag, height, width, inverse);
+            return;
+        }
+
+        // Temp slice buffers reused across all slices — fully GPU-resident
+        var tempInR = AllocateBuffer(sliceSize);
+        var tempInI = AllocateBuffer(sliceSize);
+        var tempOutR = AllocateBuffer(sliceSize);
+        var tempOutI = AllocateBuffer(sliceSize);
+        try
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int off = b * sliceSize;
+                Copy(inputReal, off, tempInR, 0, sliceSize);
+                Copy(inputImag, off, tempInI, 0, sliceSize);
+                FFT2D(tempInR, tempInI, tempOutR, tempOutI, height, width, inverse);
+                Copy(tempOutR, 0, outputReal, off, sliceSize);
+                Copy(tempOutI, 0, outputImag, off, sliceSize);
+            }
+        }
+        finally
+        {
+            tempInR.Dispose(); tempInI.Dispose();
+            tempOutR.Dispose(); tempOutI.Dispose();
+        }
+    }
+
     public unsafe void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
     {
         if (!IsAvailable)

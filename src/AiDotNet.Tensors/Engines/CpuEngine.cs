@@ -27884,6 +27884,360 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFFT2D<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank < 2)
+            throw new ArgumentException("NativeComplexFFT2D requires at least a 2D tensor.", nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT2D", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT2D(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT2D", input._shape); if (ac is not null) return ac.Execute(); }
+
+        int h = input._shape[^2];
+        int w = input._shape[^1];
+        if ((h & (h - 1)) != 0 || h <= 0)
+            throw new ArgumentException($"Height {h} must be a positive power of 2.", nameof(input));
+        if ((w & (w - 1)) != 0 || w <= 0)
+            throw new ArgumentException($"Width {w} must be a positive power of 2.", nameof(input));
+
+        // Step 1: FFT along last axis (rows) — NativeComplexFFT already batches this
+        var afterRows = NativeComplexFFT(input);
+
+        // Step 2: Transpose last two axes so columns become the last axis
+        var transposed = TransposeLastTwoAxes(afterRows);
+
+        // Step 3: FFT along (now-last) column axis
+        var afterCols = NativeComplexFFTComplex(transposed);
+
+        // Step 4: Transpose back
+        var result = TransposeLastTwoAxes(afterCols);
+        { var ci = input; AutoTracer.RecordOp("NativeComplexFFT2D", result, eng => eng.NativeComplexFFT2D(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexIFFT2DReal<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank < 2)
+            throw new ArgumentException("NativeComplexIFFT2DReal requires at least a 2D tensor.", nameof(input));
+
+        int ih = input._shape[^2];
+        int iw = input._shape[^1];
+        if ((ih & (ih - 1)) != 0 || ih <= 0)
+            throw new ArgumentException($"Height {ih} must be a positive power of 2.", nameof(input));
+        if ((iw & (iw - 1)) != 0 || iw <= 0)
+            throw new ArgumentException($"Width {iw} must be a positive power of 2.", nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFT2DReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT2DReal(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFT2DReal", input._shape); if (ac is not null) return ac.Execute(); }
+
+        // Step 1: Transpose so columns are last axis
+        var transposed = TransposeLastTwoAxes(input);
+
+        // Step 2: IFFT along columns (now last axis)
+        var afterCols = NativeComplexIFFT(transposed);
+
+        // Step 3: Transpose back so rows are last axis
+        var afterColsT = TransposeLastTwoAxes(afterCols);
+
+        // Step 4: IFFT along rows and return real
+        var result = NativeComplexIFFTReal(afterColsT);
+        { var ci = input; AutoTracer.RecordOp("NativeComplexIFFT2DReal", result, eng => eng.NativeComplexIFFT2DReal(ci)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeComplexFFTND<T>(Tensor<T> input, int[] axes)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (axes is null || axes.Length == 0) throw new ArgumentException("axes must be non-empty.", nameof(axes));
+
+        // Derive a paramHash from axes so that different axis sets on the same shape
+        // don't collide in the AutoTracer cache.
+        long axesHash = 0;
+        for (int i = 0; i < axes.Length; i++)
+            axesHash = axesHash * 31 + axes[i];
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFTND", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTND(c, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTND", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
+
+        // Normalize negative axes and reject duplicates (matches NumPy/PyTorch behavior)
+        int rank = input.Rank;
+        var normalizedAxes = new int[axes.Length];
+        var seen = new HashSet<int>();
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int ax = axes[i] < 0 ? rank + axes[i] : axes[i];
+            if (ax < 0 || ax >= rank)
+                throw new ArgumentException($"Axis {axes[i]} is out of range for rank-{rank} tensor.");
+            if (!seen.Add(ax))
+                throw new ArgumentException($"Duplicate axis {axes[i]} (normalized: {ax}).");
+            normalizedAxes[i] = ax;
+        }
+
+        // First axis: real-to-complex FFT via MoveAxisToLast + NativeComplexFFT + MoveAxisBack
+        var result = FFTAlongAxis(input, normalizedAxes[0]);
+
+        // Subsequent axes: complex-to-complex FFT
+        for (int i = 1; i < normalizedAxes.Length; i++)
+            result = FFTComplexAlongAxis(result, normalizedAxes[i]);
+
+        { var ci = input; var ca = axes; AutoTracer.RecordOp("NativeComplexFFTND", result, eng => eng.NativeComplexFFTND(ci, ca), paramHash: axesHash); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeComplexIFFTNDReal<T>(Tensor<Complex<T>> input, int[] axes)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (axes is null || axes.Length == 0) throw new ArgumentException("axes must be non-empty.", nameof(axes));
+
+        long axesHash = 0;
+        for (int i = 0; i < axes.Length; i++)
+            axesHash = axesHash * 31 + axes[i];
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTNDReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTNDReal(c, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTNDReal", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
+
+        int rank = input.Rank;
+        var normalizedAxes = new int[axes.Length];
+        var seen = new HashSet<int>();
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int ax = axes[i] < 0 ? rank + axes[i] : axes[i];
+            if (ax < 0 || ax >= rank)
+                throw new ArgumentException($"Axis {axes[i]} is out of range for rank-{rank} tensor.");
+            if (!seen.Add(ax))
+                throw new ArgumentException($"Duplicate axis {axes[i]} (normalized: {ax}).");
+            normalizedAxes[i] = ax;
+        }
+
+        // IFFT in reverse axis order. All but the last axis: complex-to-complex IFFT.
+        var current = input;
+        for (int i = normalizedAxes.Length - 1; i >= 1; i--)
+            current = IFFTComplexAlongAxis(current, normalizedAxes[i]);
+
+        // Last axis: complex-to-real IFFT
+        var result = IFFTRealAlongAxis(current, normalizedAxes[0]);
+        { var ci = input; var ca = axes; AutoTracer.RecordOp("NativeComplexIFFTNDReal", result, eng => eng.NativeComplexIFFTNDReal(ci, ca), paramHash: axesHash); }
+        return result;
+    }
+
+    /// <summary>
+    /// Transpose the last two axes of a complex tensor using a specialized nested loop.
+    /// For shape [..., H, W] → [..., W, H], iterates batch × H × W with direct index
+    /// arithmetic instead of per-element multi-index decomposition.
+    /// </summary>
+    private static Tensor<Complex<T>> TransposeLastTwoAxes<T>(Tensor<Complex<T>> input)
+    {
+        int rank = input.Rank;
+        int h = input._shape[rank - 2];
+        int w = input._shape[rank - 1];
+        int batchSize = input.Length / (h * w);
+
+        var newShape = (int[])input._shape.Clone();
+        newShape[rank - 2] = w;
+        newShape[rank - 1] = h;
+
+        var result = new Tensor<Complex<T>>(newShape);
+        var srcArr = input.GetDataArray();
+        var dstArr = result.GetDataArray();
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int srcBase = b * h * w;
+            int dstBase = b * w * h;
+            for (int r = 0; r < h; r++)
+                for (int c = 0; c < w; c++)
+                    dstArr[dstBase + c * h + r] = srcArr[srcBase + r * w + c];
+        }
+
+        return result;
+    }
+
+    /// <summary>FFT along a specific axis (real-to-complex). Moves axis to last, FFTs, moves back.</summary>
+    private Tensor<Complex<T>> FFTAlongAxis<T>(Tensor<T> input, int axis)
+    {
+        if (axis == input.Rank - 1)
+            return NativeComplexFFT(input);
+
+        // Move target axis to last position
+        var permuted = MoveAxisToLast(input, axis);
+        var result = NativeComplexFFT(permuted);
+        return MoveAxisFromLast(result, axis);
+    }
+
+    /// <summary>Complex-to-complex FFT along a specific axis.</summary>
+    private Tensor<Complex<T>> FFTComplexAlongAxis<T>(Tensor<Complex<T>> input, int axis)
+    {
+        if (axis == input.Rank - 1)
+            return NativeComplexFFTComplex(input);
+
+        var permuted = MoveAxisToLast(input, axis);
+        var result = NativeComplexFFTComplex(permuted);
+        return MoveAxisFromLast(result, axis);
+    }
+
+    /// <summary>Complex-to-complex IFFT along a specific axis.</summary>
+    private Tensor<Complex<T>> IFFTComplexAlongAxis<T>(Tensor<Complex<T>> input, int axis)
+    {
+        if (axis == input.Rank - 1)
+            return NativeComplexIFFT(input);
+
+        var permuted = MoveAxisToLast(input, axis);
+        var result = NativeComplexIFFT(permuted);
+        return MoveAxisFromLast(result, axis);
+    }
+
+    /// <summary>Complex-to-real IFFT along a specific axis.</summary>
+    private Tensor<T> IFFTRealAlongAxis<T>(Tensor<Complex<T>> input, int axis)
+    {
+        if (axis == input.Rank - 1)
+            return NativeComplexIFFTReal(input);
+
+        var permuted = MoveAxisToLast(input, axis);
+        var result = NativeComplexIFFTReal(permuted);
+        return MoveAxisFromLastReal(result, axis);
+    }
+
+    /// <summary>Move a given axis to the last position via permute.</summary>
+    private static Tensor<Complex<T>> MoveAxisToLast<T>(Tensor<Complex<T>> input, int axis)
+    {
+        int rank = input.Rank;
+        var perm = new int[rank];
+        int p = 0;
+        for (int i = 0; i < rank; i++)
+            if (i != axis) perm[p++] = i;
+        perm[rank - 1] = axis;
+        return PermuteComplex(input, perm);
+    }
+
+    /// <summary>Move axis to last position via data copy. Does NOT record to tape/GraphMode.</summary>
+    private static Tensor<T> MoveAxisToLast<T>(Tensor<T> input, int axis)
+    {
+        int rank = input.Rank;
+        var perm = new int[rank];
+        int p = 0;
+        for (int i = 0; i < rank; i++)
+            if (i != axis) perm[p++] = i;
+        perm[rank - 1] = axis;
+        return PermuteReal(input, perm);
+    }
+
+    /// <summary>Move the last axis back to the original position.</summary>
+    private static Tensor<Complex<T>> MoveAxisFromLast<T>(Tensor<Complex<T>> input, int axis)
+    {
+        int rank = input.Rank;
+        var perm = new int[rank];
+        for (int i = 0; i < rank; i++)
+        {
+            if (i < axis) perm[i] = i;
+            else if (i == axis) perm[i] = rank - 1;
+            else perm[i] = i - 1;
+        }
+        return PermuteComplex(input, perm);
+    }
+
+    /// <summary>Move last axis back to original position via data copy. Does NOT record to tape.</summary>
+    private static Tensor<T> MoveAxisFromLastReal<T>(Tensor<T> input, int axis)
+    {
+        int rank = input.Rank;
+        var perm = new int[rank];
+        for (int i = 0; i < rank; i++)
+        {
+            if (i < axis) perm[i] = i;
+            else if (i == axis) perm[i] = rank - 1;
+            else perm[i] = i - 1;
+        }
+        return PermuteReal(input, perm);
+    }
+
+    /// <summary>Permute a real tensor (data copy, no tape recording).</summary>
+    private static Tensor<T> PermuteReal<T>(Tensor<T> input, int[] perm)
+    {
+        int rank = input.Rank;
+        var newShape = new int[rank];
+        for (int i = 0; i < rank; i++)
+            newShape[i] = input._shape[perm[i]];
+
+        var result = new Tensor<T>(newShape);
+        var srcArr = input.GetDataArray();
+        var dstArr = result.GetDataArray();
+
+        var srcStrides = new int[rank];
+        srcStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            srcStrides[i] = srcStrides[i + 1] * input._shape[i + 1];
+
+        var dstStrides = new int[rank];
+        dstStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            dstStrides[i] = dstStrides[i + 1] * newShape[i + 1];
+
+        var indices = new int[rank];
+        for (int flat = 0; flat < input.Length; flat++)
+        {
+            int remaining = flat;
+            for (int d = 0; d < rank; d++)
+            {
+                indices[d] = remaining / srcStrides[d];
+                remaining %= srcStrides[d];
+            }
+
+            int dstFlat = 0;
+            for (int d = 0; d < rank; d++)
+                dstFlat += indices[perm[d]] * dstStrides[d];
+
+            dstArr[dstFlat] = srcArr[flat];
+        }
+
+        return result;
+    }
+
+    /// <summary>Permute a complex tensor (data copy, no tape recording).</summary>
+    private static Tensor<Complex<T>> PermuteComplex<T>(Tensor<Complex<T>> input, int[] perm)
+    {
+        int rank = input.Rank;
+        var newShape = new int[rank];
+        for (int i = 0; i < rank; i++)
+            newShape[i] = input._shape[perm[i]];
+
+        var result = new Tensor<Complex<T>>(newShape);
+        var srcArr = input.GetDataArray();
+        var dstArr = result.GetDataArray();
+
+        var srcStrides = new int[rank];
+        srcStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            srcStrides[i] = srcStrides[i + 1] * input._shape[i + 1];
+
+        var dstStrides = new int[rank];
+        dstStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            dstStrides[i] = dstStrides[i + 1] * newShape[i + 1];
+
+        var indices = new int[rank];
+        for (int flat = 0; flat < input.Length; flat++)
+        {
+            int remaining = flat;
+            for (int d = 0; d < rank; d++)
+            {
+                indices[d] = remaining / srcStrides[d];
+                remaining %= srcStrides[d];
+            }
+
+            int dstFlat = 0;
+            for (int d = 0; d < rank; d++)
+                dstFlat += indices[perm[d]] * dstStrides[d];
+
+            dstArr[dstFlat] = srcArr[flat];
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
     public virtual Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

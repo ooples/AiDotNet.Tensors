@@ -2135,6 +2135,26 @@ public interface IDirectGpuBackend : IDisposable
         int height, int width, bool inverse);
 
     /// <summary>
+    /// Batched 2D FFT using split real/imag buffers. Processes all batch slices
+    /// GPU-resident — no CPU round-trips between slices. Each buffer contains
+    /// batch * height * width floats laid out as batch contiguous [H, W] images.
+    /// Implementation: allocates reusable temp slice buffers, extracts each slice
+    /// via GPU-to-GPU Copy with offset, runs FFT2D per slice, copies result back.
+    /// All operations stay on GPU.
+    /// </summary>
+    /// <param name="inputReal">Real part [batch * height * width].</param>
+    /// <param name="inputImag">Imaginary part [batch * height * width].</param>
+    /// <param name="outputReal">Real part output [batch * height * width].</param>
+    /// <param name="outputImag">Imaginary part output [batch * height * width].</param>
+    /// <param name="batch">Number of 2D images to transform.</param>
+    /// <param name="height">Height of each image (must be power of 2).</param>
+    /// <param name="width">Width of each image (must be power of 2).</param>
+    /// <param name="inverse">If true, compute inverse 2D FFT.</param>
+    void BatchedFFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag,
+        int batch, int height, int width, bool inverse);
+
+    /// <summary>
     /// Applies a window function element-wise.
     /// </summary>
     /// <param name="input">Input signal.</param>

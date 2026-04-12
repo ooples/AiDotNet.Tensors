@@ -7484,6 +7484,42 @@ public interface IEngine
     Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input);
 
     /// <summary>
+    /// 2D FFT on the last two axes of a real tensor. Input shape [..., H, W] where H and W
+    /// must be powers of 2. Applies row-wise FFT then column-wise FFT using the fast
+    /// NativeComplexFFT batched path. Handles arbitrary leading batch dimensions (e.g.
+    /// [B, C, H, W] for batched multi-channel vision models per Issue #137/#139).
+    /// </summary>
+    Tensor<Complex<T>> NativeComplexFFT2D<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Inverse 2D FFT returning a real tensor. Input shape [..., H, W] complex.
+    /// Applies column-wise IFFT then row-wise IFFT. Only the real part of the
+    /// final result is returned — imaginary components are discarded. This is
+    /// correct when the input spectrum represents a real-valued spatial signal
+    /// (Hermitian symmetry), such as one produced by <see cref="NativeComplexFFT2D{T}"/>.
+    /// For arbitrary complex spectra where the imaginary part is meaningful,
+    /// use <see cref="NativeComplexIFFT{T}"/> instead.
+    /// </summary>
+    Tensor<T> NativeComplexIFFT2DReal<T>(Tensor<Complex<T>> input);
+
+    /// <summary>
+    /// N-D FFT over specified axes. Applies 1D FFT sequentially along each axis in the
+    /// given order. Supports arbitrary tensor shapes and axis combinations, subsuming
+    /// 1D (axes=[-1]) and 2D (axes=[-2,-1]) as special cases. Per Issue #135.
+    /// </summary>
+    /// <param name="input">Real-valued input tensor. Each transformed axis length must be a power of 2; non-transformed axes can have any length.</param>
+    /// <param name="axes">Axes to transform. Negative indices count from the end.</param>
+    Tensor<Complex<T>> NativeComplexFFTND<T>(Tensor<T> input, int[] axes);
+
+    /// <summary>
+    /// Inverse N-D FFT returning a real tensor. Applies 1D IFFT sequentially along each
+    /// axis in reverse order. Only the real part of the final result is returned —
+    /// imaginary components are discarded. Correct when the input was produced by
+    /// <see cref="NativeComplexFFTND{T}"/> from a real-valued input.
+    /// </summary>
+    Tensor<T> NativeComplexIFFTNDReal<T>(Tensor<Complex<T>> input, int[] axes);
+
+    /// <summary>
     /// Selects the top-K elements by complex magnitude, zeroing all others.
     /// Used for spectral sparsity masking — retains the K strongest frequency components.
     /// </summary>
