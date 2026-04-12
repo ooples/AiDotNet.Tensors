@@ -200,6 +200,8 @@ internal static class OpRegistry
         "NativeComplexPhase", "NativeComplexFromPolar",
         "NativeComplexFFTComplex", "NativeComplexTopK",
         "NativeComplexCrossSpectral",
+        "NativeComplexFFT2D", "NativeComplexIFFT2DReal",
+        "NativeComplexFFTND", "NativeComplexIFFTNDReal",
         "TensorSoftmaxRows",
 
         // Rounding (non-differentiable, STE would need explicit annotation)

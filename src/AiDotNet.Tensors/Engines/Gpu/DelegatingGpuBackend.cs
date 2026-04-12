@@ -1574,6 +1574,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.FFT2D(inputReal, inputImag, outputReal, outputImag, height, width, inverse);
 
     /// <inheritdoc/>
+    public virtual void BatchedFFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag,
+        int batch, int height, int width, bool inverse)
+        => Inner.BatchedFFT2D(inputReal, inputImag, outputReal, outputImag, batch, height, width, inverse);
+
+    /// <inheritdoc/>
     public virtual void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
         => Inner.ApplyWindow(input, window, output, n);
 
