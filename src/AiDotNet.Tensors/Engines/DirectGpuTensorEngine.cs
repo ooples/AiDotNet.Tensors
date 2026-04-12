@@ -15557,15 +15557,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int filterSliceCount = filter.Length / sliceSize;
             if (filterSliceCount <= 0 || filter.Length % sliceSize != 0)
                 return base.NativeSpectralFilter(input, filter);
-            // GPU backend accepts filterSliceCount of 1 or batch — fall back for others
-            if (filterSliceCount != 1 && filterSliceCount != batchCount)
-                return base.NativeSpectralFilter(input, filter);
 
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
             var (fR, fI) = DecomposeComplex(filter);
+
+            // GPU backend requires filterSliceCount of 1 or batchCount.
+            // For intermediate counts (e.g. [C,H,W] with [B,C,H,W] input),
+            // expand filter on CPU before uploading to keep the GPU path.
+            if (filterSliceCount != 1 && filterSliceCount != batchCount)
+            {
+                var expandedR = new float[batchCount * sliceSize];
+                var expandedI = new float[batchCount * sliceSize];
+                for (int s = 0; s < batchCount; s++)
+                {
+                    int src = (s % filterSliceCount) * sliceSize;
+                    Array.Copy(fR, src, expandedR, s * sliceSize, sliceSize);
+                    Array.Copy(fI, src, expandedI, s * sliceSize, sliceSize);
+                }
+                fR = expandedR;
+                fI = expandedI;
+                filterSliceCount = batchCount;
+            }
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
             using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
@@ -15605,15 +15620,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int filterSliceCount = filter.Length / sliceSize;
             if (filterSliceCount <= 0 || filter.Length % sliceSize != 0)
                 return base.NativeSpectralFilterBatch(input, filter);
-            // GPU backend accepts 1 or totalSlices — fall back for intermediate counts
-            if (filterSliceCount != 1 && filterSliceCount != totalSlices)
-                return base.NativeSpectralFilterBatch(input, filter);
 
             var ops = MathHelper.GetNumericOperations<T>();
             var inputF = new float[input.Length];
             for (int i = 0; i < input.Length; i++) inputF[i] = (float)ops.ToDouble(input[i]);
 
             var (fR, fI) = DecomposeComplex(filter);
+
+            // GPU backend requires filterSliceCount of 1 or totalSlices.
+            // For intermediate counts (e.g. [C,H,W] filter), expand on CPU before upload.
+            if (filterSliceCount != 1 && filterSliceCount != totalSlices)
+            {
+                var expandedR = new float[totalSlices * sliceSize];
+                var expandedI = new float[totalSlices * sliceSize];
+                for (int s = 0; s < totalSlices; s++)
+                {
+                    int src = (s % filterSliceCount) * sliceSize;
+                    Array.Copy(fR, src, expandedR, s * sliceSize, sliceSize);
+                    Array.Copy(fI, src, expandedI, s * sliceSize, sliceSize);
+                }
+                fR = expandedR;
+                fI = expandedI;
+                filterSliceCount = totalSlices;
+            }
 
             using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
             using var fRBuf = new OwnedBuffer(backend.AllocateBuffer(fR), true);
