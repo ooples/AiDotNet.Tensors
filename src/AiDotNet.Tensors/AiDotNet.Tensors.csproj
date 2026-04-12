@@ -37,6 +37,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="AiDotNet" />
+    <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
   </ItemGroup>
