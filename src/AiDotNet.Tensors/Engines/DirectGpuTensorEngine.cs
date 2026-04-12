@@ -15551,6 +15551,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return base.NativeSpectralFilter(input, filter);
             if (filter._shape[^2] != h || filter._shape[^1] != w)
                 return base.NativeSpectralFilter(input, filter);
+            if (filter.Length > input.Length)
+                return base.NativeSpectralFilter(input, filter);
 
             int batchCount = input.Length / (h * w);
             int sliceSize = h * w;
@@ -15613,6 +15615,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if ((h & (h - 1)) != 0 || h <= 0 || (w & (w - 1)) != 0 || w <= 0)
                 return base.NativeSpectralFilterBatch(input, filter);
             if (filter._shape[^2] != h || filter._shape[^1] != w)
+                return base.NativeSpectralFilterBatch(input, filter);
+            if (filter.Length > input.Length)
+                return base.NativeSpectralFilterBatch(input, filter);
+            // Only rank-2 [H,W] (shared) and rank-3 [C,H,W] (per-channel) are GPU-optimized;
+            // higher-rank filters fall back to the CPU path for safety.
+            if (filter.Rank > 3)
                 return base.NativeSpectralFilterBatch(input, filter);
 
             int totalSlices = batch * channels;

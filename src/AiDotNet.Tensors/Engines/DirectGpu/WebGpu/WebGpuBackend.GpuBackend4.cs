@@ -1469,9 +1469,12 @@ public sealed partial class WebGpuBackend
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
     {
-        if (batch <= 0 || height <= 0 || width <= 0) return;
-        if (filterSliceCount <= 0 || (filterSliceCount != 1 && filterSliceCount != batch))
-            throw new ArgumentException($"filterSliceCount must be 1 (shared) or batch ({batch}). Got {filterSliceCount}.");
+        if (filterSliceCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(filterSliceCount), "Must be >= 1.");
+        if (height <= 0 || width <= 0 || batch <= 0)
+            throw new ArgumentOutOfRangeException("Dimensions must be positive.");
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            throw new ArgumentException("height and width must be powers of 2 for FFT.");
 
         int sliceSize = height * width;
         int totalSize = batch * sliceSize;
@@ -1479,9 +1482,13 @@ public sealed partial class WebGpuBackend
         IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
         try
         {
-            fftR = AllocateBuffer(totalSize); fftI = AllocateBuffer(totalSize);
-            mulR = AllocateBuffer(totalSize); mulI = AllocateBuffer(totalSize);
-            ifftI = AllocateBuffer(totalSize); zeroI = AllocateBuffer(new float[totalSize]);
+            fftR = AllocateBuffer(totalSize);
+            fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize);
+            mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize);
+            zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
 
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
 

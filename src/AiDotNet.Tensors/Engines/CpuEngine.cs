@@ -28178,6 +28178,13 @@ public class CpuEngine : ITensorLevelEngine
         // Multiply spectrum by filter using modular broadcast on filter.Length.
         // This naturally handles any rank: [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, etc.
         int filterLen = filter.Length;
+        if (filterLen <= 0)
+            throw new ArgumentException("Filter length must be a positive multiple of spatial slice size.", nameof(filter));
+        int sliceSize = h * w;
+        if (sliceSize > 0 && filterLen % sliceSize != 0)
+            throw new ArgumentException(
+                $"Filter length ({filterLen}) must be a positive multiple of spatial slice size ({sliceSize}).",
+                nameof(filter));
         var ops = MathHelper.GetNumericOperations<T>();
         var filtered = new Tensor<Complex<T>>(spectrum._shape);
         for (int i = 0; i < spectrum.Length; i++)

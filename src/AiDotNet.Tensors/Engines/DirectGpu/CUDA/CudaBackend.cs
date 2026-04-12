@@ -10072,7 +10072,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             mulR = AllocateBuffer(totalSize);
             mulI = AllocateBuffer(totalSize);
             ifftI = AllocateBuffer(totalSize);
-            zeroI = AllocateBuffer(new float[totalSize]);
+            zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
 
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
 

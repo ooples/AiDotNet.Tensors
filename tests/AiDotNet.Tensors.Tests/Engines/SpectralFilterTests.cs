@@ -453,7 +453,8 @@ public class SpectralFilterTests
 
         int sliceSize = h * w;
 
-        // Pre-extract per-channel filters (done once, not counted in timing)
+        // Pre-allocate reusable buffers (not counted in timing)
+        var sliceBuf = new Tensor<double>([h, w]);
         var channelFilters = new Tensor<Complex<double>>[channels];
         for (int c = 0; c < channels; c++)
         {
@@ -464,12 +465,8 @@ public class SpectralFilterTests
 
         // Warmup both paths
         _engine.NativeSpectralFilterBatch(input, filter);
-        for (int c = 0; c < channels; c++)
-        {
-            var slice = new Tensor<double>([h, w]);
-            for (int i = 0; i < sliceSize; i++) slice[i] = input[c * sliceSize + i];
-            _engine.NativeSpectralFilter(slice, channelFilters[c]);
-        }
+        for (int i = 0; i < sliceSize; i++) sliceBuf[i] = input[i];
+        _engine.NativeSpectralFilter(sliceBuf, channelFilters[0]);
 
         // Time fused batched path
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -479,7 +476,7 @@ public class SpectralFilterTests
         sw.Stop();
         double fusedMs = sw.Elapsed.TotalMilliseconds / iters;
 
-        // Time manual per-slice loop (fair: no extra allocation in loop, filters pre-extracted)
+        // Time manual per-slice loop (reuses pre-allocated slice buffer)
         sw.Restart();
         for (int iter = 0; iter < iters; iter++)
         {
@@ -487,10 +484,9 @@ public class SpectralFilterTests
             {
                 for (int c = 0; c < channels; c++)
                 {
-                    var slice = new Tensor<double>([h, w]);
                     int off = (b * channels + c) * sliceSize;
-                    for (int i = 0; i < sliceSize; i++) slice[i] = input[off + i];
-                    _engine.NativeSpectralFilter(slice, channelFilters[c]);
+                    for (int i = 0; i < sliceSize; i++) sliceBuf[i] = input[off + i];
+                    _engine.NativeSpectralFilter(sliceBuf, channelFilters[c]);
                 }
             }
         }
@@ -503,9 +499,9 @@ public class SpectralFilterTests
         _output.WriteLine($"  Manual per-slice loop: {manualMs:F2}ms");
         _output.WriteLine($"  Speedup: {speedup:F1}x");
 
-        _output.WriteLine(speedup > 1.5
-            ? $"  PASS: {speedup:F1}x exceeds 1.5x threshold"
-            : $"  NOTE: {speedup:F1}x below 1.5x — may vary by hardware");
+        Assert.True(speedup >= 1.0,
+            $"Fused path should not be slower than manual loop. Got {speedup:F1}x " +
+            $"(fused={fusedMs:F2}ms, manual={manualMs:F2}ms)");
     }
 
     // ================================================================

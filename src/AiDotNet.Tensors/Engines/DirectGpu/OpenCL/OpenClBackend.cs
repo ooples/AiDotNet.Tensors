@@ -10560,9 +10560,13 @@ KERNEL VARIANTS (A/B testing):
         IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
         try
         {
-            fftR = AllocateBuffer(totalSize); fftI = AllocateBuffer(totalSize);
-            mulR = AllocateBuffer(totalSize); mulI = AllocateBuffer(totalSize);
-            ifftI = AllocateBuffer(totalSize); zeroI = AllocateBuffer(new float[totalSize]);
+            fftR = AllocateBuffer(totalSize);
+            fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize);
+            mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize);
+            zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
 
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
 
