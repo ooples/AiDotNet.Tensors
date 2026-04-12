@@ -2806,12 +2806,24 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var gamma = numOps.FromDouble((double)savedState[0]);
-        var gammaT = new Tensor<T>(new[] { gamma }, new[] { 1 });
-        var (gradX, gradY, gradGamma) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], output, gammaT);
+        // inputs[0]=input, inputs[1]=centers, inputs[2]=epsilons (full tensor)
+        var epsilons = inputs.Length > 2 ? inputs[2] : CreateScalarEpsilonsFallback(savedState, inputs[1]._shape[0]);
+        var (gradX, gradY, gradEpsilons) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], epsilons, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+        if (inputs.Length > 2)
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], gradEpsilons, engine);
+    }
+
+    /// <summary>Fallback for legacy recordings that only saved a scalar epsilon.</summary>
+    private static Tensor<T> CreateScalarEpsilonsFallback(object[] savedState, int numCenters)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gamma = numOps.FromDouble((double)savedState[0]);
+        var epsilons = new Tensor<T>(new int[] { numCenters });
+        for (int i = 0; i < numCenters; i++)
+            epsilons[i] = gamma;
+        return epsilons;
     }
 
     /// <summary>TensorBinaryCrossEntropy backward via engine</summary>

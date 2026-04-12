@@ -18558,7 +18558,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordIfActive("RBFKernel", output, new[] { input, centers }, BackwardFunctions<T>.RBFKernelBackward, new object[] { numOps.ToDouble(epsilonsData[0]) });
+        DifferentiableOps.RecordIfActive("RBFKernel", output, new[] { input, centers, epsilons }, BackwardFunctions<T>.RBFKernelBackward, new object[] { numOps.ToDouble(epsilonsData[0]) });
         { var ci = input; var cc = centers; var ce = epsilons; AutoTracer.RecordOp("RBFKernel", output, eng => eng.RBFKernel(ci, cc, ce)); }
         return output;
     }
