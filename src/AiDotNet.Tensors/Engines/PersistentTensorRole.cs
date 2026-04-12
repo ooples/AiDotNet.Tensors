@@ -60,6 +60,14 @@ public enum PersistentTensorRole
     Constant,
 
     /// <summary>
+    /// Per-unit scale or width parameters (e.g., RBF kernel widths, learnable scales).
+    /// Distinct from Weights (inter-unit connection matrices) and Biases (offset terms).
+    /// Without a dedicated role, layers registering multiple parameter types under the
+    /// same role get silently replaced by RegisterTrainableParameter's role-based dedup.
+    /// </summary>
+    ScaleParameters,
+
+    /// <summary>
     /// Other persistent tensors not fitting above categories.
     /// </summary>
     Other
