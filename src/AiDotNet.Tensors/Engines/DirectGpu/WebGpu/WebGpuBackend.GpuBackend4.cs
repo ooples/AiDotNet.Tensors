@@ -1478,7 +1478,8 @@ public sealed partial class WebGpuBackend
         var mulR = AllocateBuffer(totalSize);
         var mulI = AllocateBuffer(totalSize);
         var ifftI = AllocateBuffer(totalSize);
-        var zeroI = AllocateBuffer(new float[totalSize]);
+        var zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
         try
         {
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);

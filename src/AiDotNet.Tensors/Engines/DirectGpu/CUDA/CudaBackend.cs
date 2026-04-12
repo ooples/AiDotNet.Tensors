@@ -10055,7 +10055,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
-        if (batch <= 0 || height <= 0 || width <= 0) return;
+        if (filterSliceCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(filterSliceCount), "Must be >= 1.");
+        if (height <= 0 || width <= 0 || batch <= 0)
+            throw new ArgumentOutOfRangeException("Dimensions must be positive.");
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            throw new ArgumentException("height and width must be powers of 2 for FFT.");
 
         using var _ = PushContext();
         int sliceSize = height * width;
@@ -10067,8 +10072,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         var mulR = AllocateBuffer(totalSize);
         var mulI = AllocateBuffer(totalSize);
         var ifftI = AllocateBuffer(totalSize);
-        // inputImag for FFT is zero — upload zero array
-        var zeroI = AllocateBuffer(new float[totalSize]);
+        var zeroI = AllocateBuffer(totalSize);
+        Fill(zeroI, 0f, totalSize);
         try
         {
 

@@ -10616,18 +10616,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
     {
-        if (batch <= 0 || height <= 0 || width <= 0) return;
+        if (filterSliceCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(filterSliceCount), "Must be >= 1.");
+        if (height <= 0 || width <= 0 || batch <= 0)
+            throw new ArgumentOutOfRangeException("Dimensions must be positive.");
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            throw new ArgumentException("height and width must be powers of 2 for FFT.");
+
         int sliceSize = height * width;
         int totalSize = batch * sliceSize;
 
-        var fftR = AllocateBuffer(totalSize);
-        var fftI = AllocateBuffer(totalSize);
-        var mulR = AllocateBuffer(totalSize);
-        var mulI = AllocateBuffer(totalSize);
-        var ifftI = AllocateBuffer(totalSize);
-        var zeroI = AllocateBuffer(new float[totalSize]);
+        IGpuBuffer? fftR = null, fftI = null, mulR = null, mulI = null, ifftI = null, zeroI = null;
         try
         {
+            fftR = AllocateBuffer(totalSize);
+            fftI = AllocateBuffer(totalSize);
+            mulR = AllocateBuffer(totalSize);
+            mulI = AllocateBuffer(totalSize);
+            ifftI = AllocateBuffer(totalSize);
+            zeroI = AllocateBuffer(totalSize);
+            Fill(zeroI, 0f, totalSize);
+
             BatchedFFT2D(inputReal, zeroI, fftR, fftI, batch, height, width, inverse: false);
 
             if (filterSliceCount == batch)
@@ -10655,9 +10664,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         }
         finally
         {
-            fftR.Dispose(); fftI.Dispose();
-            mulR.Dispose(); mulI.Dispose();
-            ifftI.Dispose(); zeroI.Dispose();
+            fftR?.Dispose(); fftI?.Dispose();
+            mulR?.Dispose(); mulI?.Dispose();
+            ifftI?.Dispose(); zeroI?.Dispose();
         }
     }
 
