@@ -9,9 +9,8 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <summary>
 /// Performance tests proving Conv2DBackwardInput/BackwardKernel im2col+GEMM
 /// is significantly faster than naive loops. Gated by Category=Performance
-/// trait — exclude from CI with --filter "Category!=Performance" if needed.
+/// trait on timing methods only — correctness tests always run.
 /// </summary>
-[Trait("Category", "Performance")]
 public class Conv2DBackwardPerfTests
 {
     private readonly ITestOutputHelper _output;
@@ -22,10 +21,136 @@ public class Conv2DBackwardPerfTests
         _output = output;
     }
 
+    /// <summary>
+    /// Naive float Conv2DBackwardInput using nested loops — same algorithm as the
+    /// generic T fallback but operating on float[] directly. This isolates the
+    /// algorithm speedup (im2col+GEMM vs loops) from any data-type differences.
+    /// </summary>
+    private static float[] NaiveConv2DBackwardInputFloat(
+        float[] gradOutputData, int[] gradOutputShape,
+        float[] kernelData, int[] kernelShape,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation)
+    {
+        int batch = inputShape[0];
+        int inChannels = inputShape[1];
+        int height = inputShape[2];
+        int width = inputShape[3];
+        int outChannels = kernelShape[0];
+        int kernelHeight = kernelShape[2];
+        int kernelWidth = kernelShape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutputShape[2];
+        int outputWidth = gradOutputShape[3];
+
+        var gradInput = new float[batch * inChannels * height * width];
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int oh = 0; oh < outputHeight; oh++)
+                {
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                            float gradVal = gradOutputData[gradOutIdx];
+
+                            for (int kh = 0; kh < kernelHeight; kh++)
+                            {
+                                for (int kw = 0; kw < kernelWidth; kw++)
+                                {
+                                    int ih = oh * strideH + kh * dilationH - padH;
+                                    int iw = ow * strideW + kw * dilationW - padW;
+
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    {
+                                        int gradInputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                        int kernelIdx = ((oc * inChannels + ic) * kernelHeight + kh) * kernelWidth + kw;
+                                        gradInput[gradInputIdx] += gradVal * kernelData[kernelIdx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return gradInput;
+    }
+
+    /// <summary>
+    /// Naive float Conv2DBackwardKernel using nested loops — same algorithm as the
+    /// generic T fallback but operating on float[] directly.
+    /// </summary>
+    private static float[] NaiveConv2DBackwardKernelFloat(
+        float[] gradOutputData, int[] gradOutputShape,
+        float[] inputData, int[] inputShape,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation)
+    {
+        int batch = inputShape[0];
+        int inChannels = inputShape[1];
+        int height = inputShape[2];
+        int width = inputShape[3];
+        int outChannels = kernelShape[0];
+        int kernelHeight = kernelShape[2];
+        int kernelWidth = kernelShape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutputShape[2];
+        int outputWidth = gradOutputShape[3];
+
+        var gradKernel = new float[outChannels * inChannels * kernelHeight * kernelWidth];
+
+        for (int oc = 0; oc < outChannels; oc++)
+        {
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int kh = 0; kh < kernelHeight; kh++)
+                {
+                    for (int kw = 0; kw < kernelWidth; kw++)
+                    {
+                        float sum = 0f;
+
+                        for (int b = 0; b < batch; b++)
+                        {
+                            for (int oh = 0; oh < outputHeight; oh++)
+                            {
+                                for (int ow = 0; ow < outputWidth; ow++)
+                                {
+                                    int ih = oh * strideH + kh * dilationH - padH;
+                                    int iw = ow * strideW + kw * dilationW - padW;
+
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    {
+                                        int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                        int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                        sum += gradOutputData[gradOutIdx] * inputData[inputIdx];
+                                    }
+                                }
+                            }
+                        }
+
+                        int kernelIdx = ((oc * inChannels + ic) * kernelHeight + kh) * kernelWidth + kw;
+                        gradKernel[kernelIdx] = sum;
+                    }
+                }
+            }
+        }
+
+        return gradKernel;
+    }
+
     [Theory]
+    [Trait("Category", "Performance")]
     [InlineData(4, 8, 16, 32, 32, 3, 3)]   // Small shape
     [InlineData(4, 64, 64, 56, 56, 3, 3)]  // ResNet50-like shape (from issue #148)
-    public void Conv2DBackwardInput_FloatFastPath_IsFasterThanGenericPath(
+    public void Conv2DBackwardInput_FloatFastPath_IsFasterThanNaiveFloatPath(
         int batch, int inC, int outC, int h, int w, int kH, int kW)
     {
         int outH = h - kH + 1;
@@ -42,46 +167,49 @@ public class Conv2DBackwardPerfTests
         var padding = new[] { 0, 0 };
         var dilation = new[] { 1, 1 };
 
-        // Warmup
-        _engine.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
+        // Extract raw float arrays for the naive baseline
+        var gradOutputF = new float[gradOutput.Length];
+        for (int i = 0; i < gradOutput.Length; i++) gradOutputF[i] = gradOutput[i];
+        var kernelF = new float[kernel.Length];
+        for (int i = 0; i < kernel.Length; i++) kernelF[i] = kernel[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var kernelShape = new[] { outC, inC, kH, kW };
 
-        // Time the float fast path (im2col+GEMM)
+        // Warmup both paths
+        _engine.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
+        NaiveConv2DBackwardInputFloat(gradOutputF, gradOutputShape, kernelF, kernelShape, inputShape, stride, padding, dilation);
+
+        // Time the float im2col+GEMM fast path
         var sw = Stopwatch.StartNew();
         int iters = 10;
         for (int i = 0; i < iters; i++)
             _engine.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
         sw.Stop();
-        double floatMs = sw.Elapsed.TotalMilliseconds / iters;
+        double gemmMs = sw.Elapsed.TotalMilliseconds / iters;
 
-        // Time the generic path (naive loops) using double to force the generic path
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var kernelD = new Tensor<double>([outC, inC, kH, kW]);
-        for (int i = 0; i < gradOutput.Length; i++) gradOutputD[i] = gradOutput[i];
-        for (int i = 0; i < kernel.Length; i++) kernelD[i] = kernel[i];
-
-        _engine.Conv2DBackwardInput(gradOutputD, kernelD, inputShape, stride, padding, dilation);
-
+        // Time the naive float loop baseline (same data type — apples to apples)
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            _engine.Conv2DBackwardInput(gradOutputD, kernelD, inputShape, stride, padding, dilation);
+            NaiveConv2DBackwardInputFloat(gradOutputF, gradOutputShape, kernelF, kernelShape, inputShape, stride, padding, dilation);
         sw.Stop();
-        double genericMs = sw.Elapsed.TotalMilliseconds / iters;
+        double naiveMs = sw.Elapsed.TotalMilliseconds / iters;
 
-        double speedup = genericMs / floatMs;
+        double speedup = naiveMs / gemmMs;
         _output.WriteLine($"Conv2DBackwardInput [{batch},{inC},{h},{w}] outC={outC} kernel {kH}x{kW}:");
-        _output.WriteLine($"  Float im2col+GEMM: {floatMs:F2}ms");
-        _output.WriteLine($"  Double generic loops: {genericMs:F2}ms");
+        _output.WriteLine($"  Float im2col+GEMM: {gemmMs:F2}ms");
+        _output.WriteLine($"  Float naive loops: {naiveMs:F2}ms");
         _output.WriteLine($"  Speedup: {speedup:F1}x");
 
-                Assert.True(speedup > 10.0,
+        Assert.True(speedup > 10.0,
             $"Expected at least 10x speedup from im2col+GEMM but got {speedup:F1}x " +
-            $"(float={floatMs:F2}ms, generic={genericMs:F2}ms)");
+            $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
 
     [Theory]
+    [Trait("Category", "Performance")]
     [InlineData(4, 8, 16, 32, 32, 3, 3)]
     [InlineData(4, 64, 64, 56, 56, 3, 3)]
-    public void Conv2DBackwardKernel_FloatFastPath_IsFasterThanGenericPath(
+    public void Conv2DBackwardKernel_FloatFastPath_IsFasterThanNaiveFloatPath(
         int batch, int inC, int outC, int h, int w, int kH, int kW)
     {
         int outH = h - kH + 1;
@@ -98,106 +226,120 @@ public class Conv2DBackwardPerfTests
         var padding = new[] { 0, 0 };
         var dilation = new[] { 1, 1 };
 
-        _engine.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
+        // Extract raw float arrays for the naive baseline
+        var gradOutputF = new float[gradOutput.Length];
+        for (int i = 0; i < gradOutput.Length; i++) gradOutputF[i] = gradOutput[i];
+        var inputF = new float[input.Length];
+        for (int i = 0; i < input.Length; i++) inputF[i] = input[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var inputShape = new[] { batch, inC, h, w };
 
+        // Warmup both paths
+        _engine.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
+        NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
+
+        // Time the float im2col+GEMM fast path
         var sw = Stopwatch.StartNew();
         int iters = 10;
         for (int i = 0; i < iters; i++)
             _engine.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
         sw.Stop();
-        double floatMs = sw.Elapsed.TotalMilliseconds / iters;
+        double gemmMs = sw.Elapsed.TotalMilliseconds / iters;
 
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var inputD = new Tensor<double>([batch, inC, h, w]);
-        for (int i = 0; i < gradOutput.Length; i++) gradOutputD[i] = gradOutput[i];
-        for (int i = 0; i < input.Length; i++) inputD[i] = input[i];
-
-        _engine.Conv2DBackwardKernel(gradOutputD, inputD, kernelShape, stride, padding, dilation);
-
+        // Time the naive float loop baseline (same data type — apples to apples)
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            _engine.Conv2DBackwardKernel(gradOutputD, inputD, kernelShape, stride, padding, dilation);
+            NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
         sw.Stop();
-        double genericMs = sw.Elapsed.TotalMilliseconds / iters;
+        double naiveMs = sw.Elapsed.TotalMilliseconds / iters;
 
-        double speedup = genericMs / floatMs;
+        double speedup = naiveMs / gemmMs;
         _output.WriteLine($"Conv2DBackwardKernel [{batch},{inC},{h},{w}] outC={outC} kernel {kH}x{kW}:");
-        _output.WriteLine($"  Float im2col+GEMM: {floatMs:F2}ms");
-        _output.WriteLine($"  Double generic loops: {genericMs:F2}ms");
+        _output.WriteLine($"  Float im2col+GEMM: {gemmMs:F2}ms");
+        _output.WriteLine($"  Float naive loops: {naiveMs:F2}ms");
         _output.WriteLine($"  Speedup: {speedup:F1}x");
 
-                Assert.True(speedup > 10.0,
+        Assert.True(speedup > 10.0,
             $"Expected at least 10x speedup from im2col+GEMM but got {speedup:F1}x " +
-            $"(float={floatMs:F2}ms, generic={genericMs:F2}ms)");
+            $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
 
     [Fact]
-    public void Conv2DBackwardInput_Correctness_MatchesGenericPath()
+    public void Conv2DBackwardInput_Correctness_MatchesNaivePath()
     {
-        // Verify the GEMM path produces the same results as the generic path
+        // Verify the GEMM path produces the same results as the naive float path
         int batch = 2, inC = 3, outC = 4, h = 8, w = 8, kH = 3, kW = 3;
         int outH = h - kH + 1;
         int outW = w - kW + 1;
 
         var rng = new Random(123);
-        var gradOutputF = new Tensor<float>([batch, outC, outH, outW]);
-        var kernelF = new Tensor<float>([outC, inC, kH, kW]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputF[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < kernelF.Length; i++) kernelF[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        // Double path uses generic loops
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var kernelD = new Tensor<double>([outC, inC, kH, kW]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputD[i] = gradOutputF[i];
-        for (int i = 0; i < kernelF.Length; i++) kernelD[i] = kernelF[i];
+        var gradOutputT = new Tensor<float>([batch, outC, outH, outW]);
+        var kernelT = new Tensor<float>([outC, inC, kH, kW]);
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputT[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < kernelT.Length; i++) kernelT[i] = (float)(rng.NextDouble() * 2 - 1);
 
         var inputShape = new[] { batch, inC, h, w };
         var stride = new[] { 1, 1 };
         var padding = new[] { 0, 0 };
         var dilation = new[] { 1, 1 };
 
-        var resultFloat = _engine.Conv2DBackwardInput(gradOutputF, kernelF, inputShape, stride, padding, dilation);
-        var resultDouble = _engine.Conv2DBackwardInput(gradOutputD, kernelD, inputShape, stride, padding, dilation);
+        // im2col+GEMM fast path via CpuEngine
+        var resultGemm = _engine.Conv2DBackwardInput(gradOutputT, kernelT, inputShape, stride, padding, dilation);
 
-        for (int i = 0; i < resultFloat.Length; i++)
+        // Naive float loops baseline
+        var gradOutputF = new float[gradOutputT.Length];
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputF[i] = gradOutputT[i];
+        var kernelF = new float[kernelT.Length];
+        for (int i = 0; i < kernelT.Length; i++) kernelF[i] = kernelT[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var kernelShape = new[] { outC, inC, kH, kW };
+
+        var resultNaive = NaiveConv2DBackwardInputFloat(gradOutputF, gradOutputShape, kernelF, kernelShape, inputShape, stride, padding, dilation);
+
+        for (int i = 0; i < resultGemm.Length; i++)
         {
-            double diff = Math.Abs(resultFloat[i] - (float)resultDouble[i]);
+            double diff = Math.Abs(resultGemm[i] - resultNaive[i]);
             Assert.True(diff < 1e-3,
-                $"Mismatch at [{i}]: float={resultFloat[i]:F6}, double={(float)resultDouble[i]:F6}, diff={diff:E2}");
+                $"Mismatch at [{i}]: gemm={resultGemm[i]:F6}, naive={resultNaive[i]:F6}, diff={diff:E2}");
         }
     }
 
     [Fact]
-    public void Conv2DBackwardKernel_Correctness_MatchesGenericPath()
+    public void Conv2DBackwardKernel_Correctness_MatchesNaivePath()
     {
         int batch = 2, inC = 3, outC = 4, h = 8, w = 8, kH = 3, kW = 3;
         int outH = h - kH + 1;
         int outW = w - kW + 1;
 
         var rng = new Random(456);
-        var gradOutputF = new Tensor<float>([batch, outC, outH, outW]);
-        var inputF = new Tensor<float>([batch, inC, h, w]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputF[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < inputF.Length; i++) inputF[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var inputD = new Tensor<double>([batch, inC, h, w]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputD[i] = gradOutputF[i];
-        for (int i = 0; i < inputF.Length; i++) inputD[i] = inputF[i];
+        var gradOutputT = new Tensor<float>([batch, outC, outH, outW]);
+        var inputT = new Tensor<float>([batch, inC, h, w]);
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputT[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < inputT.Length; i++) inputT[i] = (float)(rng.NextDouble() * 2 - 1);
 
         var kernelShape = new[] { outC, inC, kH, kW };
         var stride = new[] { 1, 1 };
         var padding = new[] { 0, 0 };
         var dilation = new[] { 1, 1 };
 
-        var resultFloat = _engine.Conv2DBackwardKernel(gradOutputF, inputF, kernelShape, stride, padding, dilation);
-        var resultDouble = _engine.Conv2DBackwardKernel(gradOutputD, inputD, kernelShape, stride, padding, dilation);
+        // im2col+GEMM fast path via CpuEngine
+        var resultGemm = _engine.Conv2DBackwardKernel(gradOutputT, inputT, kernelShape, stride, padding, dilation);
 
-        for (int i = 0; i < resultFloat.Length; i++)
+        // Naive float loops baseline
+        var gradOutputF = new float[gradOutputT.Length];
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputF[i] = gradOutputT[i];
+        var inputF = new float[inputT.Length];
+        for (int i = 0; i < inputT.Length; i++) inputF[i] = inputT[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var inputShape = new[] { batch, inC, h, w };
+
+        var resultNaive = NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
+
+        for (int i = 0; i < resultGemm.Length; i++)
         {
-            double diff = Math.Abs(resultFloat[i] - (float)resultDouble[i]);
+            double diff = Math.Abs(resultGemm[i] - resultNaive[i]);
             Assert.True(diff < 1e-2,
-                $"Mismatch at [{i}]: float={resultFloat[i]:F6}, double={(float)resultDouble[i]:F6}, diff={diff:E2}");
+                $"Mismatch at [{i}]: gemm={resultGemm[i]:F6}, naive={resultNaive[i]:F6}, diff={diff:E2}");
         }
     }
 
@@ -215,30 +357,35 @@ public class Conv2DBackwardPerfTests
         int outW = (w + 2 * padVal - effKW) / strideVal + 1;
 
         var rng = new Random(789);
-        var gradOutputF = new Tensor<float>([batch, outC, outH, outW]);
-        var kernelF = new Tensor<float>([outC, inC, kH, kW]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputF[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < kernelF.Length; i++) kernelF[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var kernelD = new Tensor<double>([outC, inC, kH, kW]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputD[i] = gradOutputF[i];
-        for (int i = 0; i < kernelF.Length; i++) kernelD[i] = kernelF[i];
+        var gradOutputT = new Tensor<float>([batch, outC, outH, outW]);
+        var kernelT = new Tensor<float>([outC, inC, kH, kW]);
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputT[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < kernelT.Length; i++) kernelT[i] = (float)(rng.NextDouble() * 2 - 1);
 
         var inputShape = new[] { batch, inC, h, w };
         var stride = new[] { strideVal, strideVal };
         var padding = new[] { padVal, padVal };
         var dilation = new[] { dilationVal, dilationVal };
 
-        var resultF = _engine.Conv2DBackwardInput(gradOutputF, kernelF, inputShape, stride, padding, dilation);
-        var resultD = _engine.Conv2DBackwardInput(gradOutputD, kernelD, inputShape, stride, padding, dilation);
+        // im2col+GEMM fast path
+        var resultGemm = _engine.Conv2DBackwardInput(gradOutputT, kernelT, inputShape, stride, padding, dilation);
 
-        for (int i = 0; i < resultF.Length; i++)
+        // Naive float baseline
+        var gradOutputF = new float[gradOutputT.Length];
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputF[i] = gradOutputT[i];
+        var kernelF = new float[kernelT.Length];
+        for (int i = 0; i < kernelT.Length; i++) kernelF[i] = kernelT[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var kernelShape = new[] { outC, inC, kH, kW };
+
+        var resultNaive = NaiveConv2DBackwardInputFloat(gradOutputF, gradOutputShape, kernelF, kernelShape, inputShape, stride, padding, dilation);
+
+        for (int i = 0; i < resultGemm.Length; i++)
         {
-            double diff = Math.Abs(resultF[i] - (float)resultD[i]);
+            double diff = Math.Abs(resultGemm[i] - resultNaive[i]);
             Assert.True(diff < 1e-2,
                 $"BackwardInput stride={strideVal} pad={padVal} dil={dilationVal} mismatch at [{i}]: " +
-                $"float={resultF[i]:F6}, double={(float)resultD[i]:F6}, diff={diff:E2}");
+                $"gemm={resultGemm[i]:F6}, naive={resultNaive[i]:F6}, diff={diff:E2}");
         }
     }
 
@@ -256,30 +403,35 @@ public class Conv2DBackwardPerfTests
         int outW = (w + 2 * padVal - effKW) / strideVal + 1;
 
         var rng = new Random(101);
-        var gradOutputF = new Tensor<float>([batch, outC, outH, outW]);
-        var inputF = new Tensor<float>([batch, inC, h, w]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputF[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < inputF.Length; i++) inputF[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        var gradOutputD = new Tensor<double>([batch, outC, outH, outW]);
-        var inputD = new Tensor<double>([batch, inC, h, w]);
-        for (int i = 0; i < gradOutputF.Length; i++) gradOutputD[i] = gradOutputF[i];
-        for (int i = 0; i < inputF.Length; i++) inputD[i] = inputF[i];
+        var gradOutputT = new Tensor<float>([batch, outC, outH, outW]);
+        var inputT = new Tensor<float>([batch, inC, h, w]);
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputT[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < inputT.Length; i++) inputT[i] = (float)(rng.NextDouble() * 2 - 1);
 
         var kernelShape = new[] { outC, inC, kH, kW };
         var stride = new[] { strideVal, strideVal };
         var padding = new[] { padVal, padVal };
         var dilation = new[] { dilationVal, dilationVal };
 
-        var resultF = _engine.Conv2DBackwardKernel(gradOutputF, inputF, kernelShape, stride, padding, dilation);
-        var resultD = _engine.Conv2DBackwardKernel(gradOutputD, inputD, kernelShape, stride, padding, dilation);
+        // im2col+GEMM fast path
+        var resultGemm = _engine.Conv2DBackwardKernel(gradOutputT, inputT, kernelShape, stride, padding, dilation);
 
-        for (int i = 0; i < resultF.Length; i++)
+        // Naive float baseline
+        var gradOutputF = new float[gradOutputT.Length];
+        for (int i = 0; i < gradOutputT.Length; i++) gradOutputF[i] = gradOutputT[i];
+        var inputF = new float[inputT.Length];
+        for (int i = 0; i < inputT.Length; i++) inputF[i] = inputT[i];
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var inputShape = new[] { batch, inC, h, w };
+
+        var resultNaive = NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
+
+        for (int i = 0; i < resultGemm.Length; i++)
         {
-            double diff = Math.Abs(resultF[i] - (float)resultD[i]);
+            double diff = Math.Abs(resultGemm[i] - resultNaive[i]);
             Assert.True(diff < 1e-1,
                 $"BackwardKernel stride={strideVal} pad={padVal} dil={dilationVal} mismatch at [{i}]: " +
-                $"float={resultF[i]:F6}, double={(float)resultD[i]:F6}, diff={diff:E2}");
+                $"gemm={resultGemm[i]:F6}, naive={resultNaive[i]:F6}, diff={diff:E2}");
         }
     }
 }
