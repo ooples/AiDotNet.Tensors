@@ -14965,6 +14965,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorCIoULoss(predicted, target);
     }
 
+    // --- Octonion GPU overrides ---
+    // Dispatches OctonionMatMulTensor to GPU backends' OctonionLinearForward kernel.
+    // The GPU kernel expects a bias buffer; we pass zeros since OctonionMatMulTensor has no bias.
+
+    public override Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
+    {
+        // Validate shapes match base implementation before indexing
+        if (input is null || weight is null
+            || input.Rank != 3 || input._shape[2] != 8
+            || weight.Rank != 3 || weight._shape[2] != 8
+            || input._shape[1] != weight._shape[1])
+            return base.OctonionMatMulTensor(input ?? throw new ArgumentNullException(nameof(input)),
+                weight ?? throw new ArgumentNullException(nameof(weight)));
+        if (typeof(T) != typeof(float))
+            return base.OctonionMatMulTensor(input, weight);
+        if (!TryGetBackend(out var backend))
+            return base.OctonionMatMulTensor(input, weight);
+
+        try
+        {
+            int batch = input._shape[0];
+            int inputFeatures = input._shape[1];
+            int outputFeatures = weight._shape[0];
+
+            // T is float — direct cast, no ToDouble round-trip
+            var inputF = (float[])(object)input.GetFlattenedData();
+            var weightF = (float[])(object)weight.GetFlattenedData();
+            var biasData = new float[outputFeatures * 8]; // zero bias
+
+            using var inputBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var weightBuf = new OwnedBuffer(backend.AllocateBuffer(weightF), true);
+            using var biasBuf = new OwnedBuffer(backend.AllocateBuffer(biasData), true);
+            using var outputBuf = new OwnedBuffer(backend.AllocateBuffer(batch * outputFeatures * 8), true);
+
+            backend.OctonionLinearForward(inputBuf.Buffer, weightBuf.Buffer, biasBuf.Buffer,
+                outputBuf.Buffer, batch, inputFeatures, outputFeatures);
+
+            var gpuResult = backend.DownloadBuffer(outputBuf.Buffer);
+            var result = new Tensor<T>(new[] { batch, outputFeatures, 8 });
+            var resultF = (float[])(object)result.GetDataArray();
+            Array.Copy(gpuResult, resultF, gpuResult.Length);
+
+            Autodiff.DifferentiableOps.RecordBinary("OctonionMatMulTensor", result, input, weight,
+                Autodiff.BackwardFunctions<T>.OctonionMatMulBackward);
+
+            return result;
+        }
+        catch { return base.OctonionMatMulTensor(input, weight); }
+    }
+
     // --- Native Complex<T> GPU overrides ---
     // Decomposes Tensor<Complex<T>> to split real/imag GPU buffers,
     // dispatches via IDirectGpuBackend.SplitComplex*, recomposes result.

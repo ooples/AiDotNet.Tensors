@@ -65,3 +65,4 @@ ehthumbs.db
 # Large native binaries (too large for git, build locally for NuGet)
 # CUDA binaries (~770MB total) - download from NVIDIA CUDA Toolkit
 src/AiDotNet.Native.CUDA/runtimes/*/native/*.dll
+.claude/scheduled_tasks.lock

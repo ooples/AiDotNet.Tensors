@@ -2806,12 +2806,122 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var gamma = numOps.FromDouble((double)savedState[0]);
-        var gammaT = new Tensor<T>(new[] { gamma }, new[] { 1 });
-        var (gradX, gradY, gradGamma) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], output, gammaT);
+        // inputs: [0]=input, [1]=centers, [2]=epsilons
+        // RBFKernelBackward signature: (gradOutput, input, centers, epsilons, output)
+        var (gradX, gradCenters, gradEpsilons) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], inputs[2], output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradCenters, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradEpsilons, engine);
+    }
+
+    /// <summary>
+    /// OctonionMatMulTensor backward. Forward: output[b,o,:] = sum_i(weight[o,i,:] * input[b,i,:]).
+    /// Gradients use the 8x8 Jacobians of octonion multiplication (non-commutative).
+    /// For r = w * x: dR/dX = Jacobian_B(w), dR/dW = Jacobian_A(x).
+    /// gradInput[b,i,:] = sum_o (J_B(w[o,i])^T @ gradOut[b,o,:])
+    /// gradWeight[o,i,:] = sum_b (J_A(x[b,i])^T @ gradOut[b,o,:])
+    /// </summary>
+    internal static void OctonionMatMulBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];  // [batch, inputFeatures, 8]
+        var weight = inputs[1]; // [outputFeatures, inputFeatures, 8]
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        int batch = input._shape[0];
+        int inputFeatures = input._shape[1];
+        int outputFeatures = weight._shape[0];
+
+        var gradInput = new Tensor<T>(input._shape);
+        var gradWeight = new Tensor<T>(weight._shape);
+
+        var w = new double[8];
+        var x = new double[8];
+        var g = new double[8];
+        var jac = new double[64]; // 8x8 Jacobian
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < inputFeatures; i++)
+            {
+                for (int o = 0; o < outputFeatures; o++)
+                {
+                    // Load weight[o, i, :] and input[b, i, :] and gradOutput[b, o, :]
+                    for (int c = 0; c < 8; c++)
+                    {
+                        w[c] = numOps.ToDouble(weight[o, i, c]);
+                        x[c] = numOps.ToDouble(input[b, i, c]);
+                        g[c] = numOps.ToDouble(gradOutput[b, o, c]);
+                    }
+
+                    // gradInput += J_B(w)^T @ gradOut  (Jacobian of r=w*x w.r.t. x, transposed)
+                    OctonionJacobianB(w, jac);
+                    for (int ci = 0; ci < 8; ci++)
+                    {
+                        double sum = 0;
+                        for (int co = 0; co < 8; co++)
+                            sum += jac[co * 8 + ci] * g[co]; // J^T: column ci of J = row ci of J^T
+                        gradInput[b, i, ci] = numOps.Add(gradInput[b, i, ci], numOps.FromDouble(sum));
+                    }
+
+                    // gradWeight += J_A(x)^T @ gradOut  (Jacobian of r=w*x w.r.t. w, transposed)
+                    OctonionJacobianA(x, jac);
+                    for (int ci = 0; ci < 8; ci++)
+                    {
+                        double sum = 0;
+                        for (int co = 0; co < 8; co++)
+                            sum += jac[co * 8 + ci] * g[co];
+                        gradWeight[o, i, ci] = numOps.Add(gradWeight[o, i, ci], numOps.FromDouble(sum));
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, weight, gradWeight, engine);
+    }
+
+    /// <summary>Jacobian of r = a * b w.r.t. a (left factor). 8x8 row-major.</summary>
+    private static void OctonionJacobianA(double[] b, double[] jac)
+    {
+        // Row 0: r0 = a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7
+        jac[0] = b[0]; jac[1] = -b[1]; jac[2] = -b[2]; jac[3] = -b[3]; jac[4] = -b[4]; jac[5] = -b[5]; jac[6] = -b[6]; jac[7] = -b[7];
+        // Row 1: r1 = a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6
+        jac[8] = b[1]; jac[9] = b[0]; jac[10] = b[3]; jac[11] = -b[2]; jac[12] = b[5]; jac[13] = -b[4]; jac[14] = -b[7]; jac[15] = b[6];
+        // Row 2: r2 = a0*b2 - a1*b3 + a2*b0 + a3*b1 + a4*b6 + a5*b7 - a6*b4 - a7*b5
+        jac[16] = b[2]; jac[17] = -b[3]; jac[18] = b[0]; jac[19] = b[1]; jac[20] = b[6]; jac[21] = b[7]; jac[22] = -b[4]; jac[23] = -b[5];
+        // Row 3: r3 = a0*b3 + a1*b2 - a2*b1 + a3*b0 + a4*b7 - a5*b6 + a6*b5 - a7*b4
+        jac[24] = b[3]; jac[25] = b[2]; jac[26] = -b[1]; jac[27] = b[0]; jac[28] = b[7]; jac[29] = -b[6]; jac[30] = b[5]; jac[31] = -b[4];
+        // Row 4: r4 = a0*b4 - a1*b5 - a2*b6 - a3*b7 + a4*b0 + a5*b1 + a6*b2 + a7*b3
+        jac[32] = b[4]; jac[33] = -b[5]; jac[34] = -b[6]; jac[35] = -b[7]; jac[36] = b[0]; jac[37] = b[1]; jac[38] = b[2]; jac[39] = b[3];
+        // Row 5: r5 = a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2
+        jac[40] = b[5]; jac[41] = b[4]; jac[42] = -b[7]; jac[43] = b[6]; jac[44] = -b[1]; jac[45] = b[0]; jac[46] = -b[3]; jac[47] = b[2];
+        // Row 6: r6 = a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1
+        jac[48] = b[6]; jac[49] = b[7]; jac[50] = b[4]; jac[51] = -b[5]; jac[52] = -b[2]; jac[53] = b[3]; jac[54] = b[0]; jac[55] = -b[1];
+        // Row 7: r7 = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0
+        jac[56] = b[7]; jac[57] = -b[6]; jac[58] = b[5]; jac[59] = b[4]; jac[60] = -b[3]; jac[61] = -b[2]; jac[62] = b[1]; jac[63] = b[0];
+    }
+
+    /// <summary>Jacobian of r = a * b w.r.t. b (right factor). 8x8 row-major.</summary>
+    private static void OctonionJacobianB(double[] a, double[] jac)
+    {
+        // Row 0: r0 = a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7
+        jac[0] = a[0]; jac[1] = -a[1]; jac[2] = -a[2]; jac[3] = -a[3]; jac[4] = -a[4]; jac[5] = -a[5]; jac[6] = -a[6]; jac[7] = -a[7];
+        // Row 1: r1 = a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6
+        jac[8] = a[1]; jac[9] = a[0]; jac[10] = -a[3]; jac[11] = a[2]; jac[12] = -a[5]; jac[13] = a[4]; jac[14] = a[7]; jac[15] = -a[6];
+        // Row 2
+        jac[16] = a[2]; jac[17] = a[3]; jac[18] = a[0]; jac[19] = -a[1]; jac[20] = -a[6]; jac[21] = -a[7]; jac[22] = a[4]; jac[23] = a[5];
+        // Row 3
+        jac[24] = a[3]; jac[25] = -a[2]; jac[26] = a[1]; jac[27] = a[0]; jac[28] = -a[7]; jac[29] = a[6]; jac[30] = -a[5]; jac[31] = a[4];
+        // Row 4
+        jac[32] = a[4]; jac[33] = a[5]; jac[34] = a[6]; jac[35] = a[7]; jac[36] = a[0]; jac[37] = -a[1]; jac[38] = -a[2]; jac[39] = -a[3];
+        // Row 5
+        jac[40] = a[5]; jac[41] = -a[4]; jac[42] = a[7]; jac[43] = -a[6]; jac[44] = a[1]; jac[45] = a[0]; jac[46] = a[3]; jac[47] = -a[2];
+        // Row 6
+        jac[48] = a[6]; jac[49] = -a[7]; jac[50] = -a[4]; jac[51] = a[5]; jac[52] = a[2]; jac[53] = -a[3]; jac[54] = a[0]; jac[55] = a[1];
+        // Row 7
+        jac[56] = a[7]; jac[57] = a[6]; jac[58] = -a[5]; jac[59] = -a[4]; jac[60] = a[3]; jac[61] = a[2]; jac[62] = -a[1]; jac[63] = a[0];
     }
 
     /// <summary>TensorBinaryCrossEntropy backward via engine</summary>
