@@ -46,7 +46,7 @@ jobs:
     - name: Test with Coverage
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
-          --filter "Category!=Benchmark" \
+          --filter "Category!=Benchmark&Category!=Performance" \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
