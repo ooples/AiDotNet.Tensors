@@ -18558,7 +18558,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordIfActive("RBFKernel", output, new[] { input, centers }, BackwardFunctions<T>.RBFKernelBackward, new object[] { numOps.ToDouble(epsilonsData[0]) });
+        DifferentiableOps.RecordIfActive("RBFKernel", output, new[] { input, centers, epsilons }, BackwardFunctions<T>.RBFKernelBackward, epsilonsData.Length > 0 ? new object[] { numOps.ToDouble(epsilonsData[0]) } : Array.Empty<object>());
         { var ci = input; var cc = centers; var ce = epsilons; AutoTracer.RecordOp("RBFKernel", output, eng => eng.RBFKernel(ci, cc, ce)); }
         return output;
     }
@@ -18601,6 +18601,10 @@ public class CpuEngine : ITensorLevelEngine
         var gradInput = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var gradCenters = AutoTensorCache.RentOrAllocate<T>(centers._shape);
         var gradEpsilons = AutoTensorCache.RentOrAllocate<T>(epsilons._shape);
+        // Zero pooled buffers — RentOrAllocate can return stale data from the cache
+        gradInput.AsWritableSpan().Clear();
+        gradCenters.AsWritableSpan().Clear();
+        gradEpsilons.AsWritableSpan().Clear();
 
         var inputData = input.GetFlattenedData();
         var centersData = centers.GetFlattenedData();
@@ -27082,7 +27086,7 @@ public class CpuEngine : ITensorLevelEngine
         => _algebraEngine.So3AdjointBatch(group, rotations);
 
     /// <inheritdoc />
-    public Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
+    public virtual Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
     {
         if (input.Rank != 3 || input._shape[2] != 8)
             throw new ArgumentException($"Input must be rank-3 with last dim 8, got shape [{string.Join(", ", input._shape)}].", nameof(input));
@@ -27090,8 +27094,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Weight must be rank-3 with last dim 8, got shape [{string.Join(", ", weight._shape)}].", nameof(weight));
         if (input._shape[1] != weight._shape[1])
             throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, input._shape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MatMulBackward); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("OctonionMatMulTensor", input._shape); if (ac is not null) return ac.Execute(); }
+        var outputShape = new[] { input._shape[0], weight._shape[0], 8 };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, outputShape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OctonionMatMulBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("OctonionMatMulTensor", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -27137,7 +27142,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordBinary("OctonionMatMulTensor", output, input, weight, BackwardFunctions<T>.MatMulBackward);
+        DifferentiableOps.RecordBinary("OctonionMatMulTensor", output, input, weight, BackwardFunctions<T>.OctonionMatMulBackward);
         { var ci = input; var cw = weight; AutoTracer.RecordOp("OctonionMatMulTensor", output, eng => eng.OctonionMatMulTensor(ci, cw)); }
         return output;
     }
@@ -27204,55 +27209,51 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Zero-allocation octonion multiply that writes result into a pre-allocated destination buffer.
-    /// Uses direct multiplication table instead of Cayley-Dickson decomposition to avoid
-    /// intermediate quaternion allocations.
+    /// Zero-allocation octonion multiply using the standard Cayley-Dickson table.
+    /// Matches the CUDA kernels in CudaOctonionKernels.cs and the backward
+    /// Jacobian tables in BackwardFunctions.OctonionJacobianA/B. Uses static
+    /// sign/index lookup tables and a simple accumulation loop — no nested
+    /// ops.Add/Subtract chains that were prone to sign errors.
     /// </summary>
+    // Standard Cayley-Dickson octonion multiplication sign table.
+    // signs[component][term]: +1 or -1 for the a[term]*b[bIdx[term]] product.
+    private static readonly int[][] OctonionSigns = {
+        new[]{ 1,-1,-1,-1,-1,-1,-1,-1}, // e0
+        new[]{ 1, 1, 1,-1, 1,-1,-1, 1}, // e1
+        new[]{ 1,-1, 1, 1, 1, 1,-1,-1}, // e2
+        new[]{ 1, 1,-1, 1, 1,-1, 1,-1}, // e3
+        new[]{ 1,-1,-1,-1, 1, 1, 1, 1}, // e4
+        new[]{ 1, 1,-1, 1,-1, 1,-1, 1}, // e5
+        new[]{ 1, 1, 1,-1,-1, 1, 1,-1}, // e6
+        new[]{ 1,-1, 1, 1,-1,-1, 1, 1}, // e7
+    };
+
+    // b-index table: bIdx[component][term] gives which b[j] multiplies a[term].
+    private static readonly int[][] OctonionBIdx = {
+        new[]{0,1,2,3,4,5,6,7}, // e0
+        new[]{1,0,3,2,5,4,7,6}, // e1
+        new[]{2,3,0,1,6,7,4,5}, // e2
+        new[]{3,2,1,0,7,6,5,4}, // e3
+        new[]{4,5,6,7,0,1,2,3}, // e4
+        new[]{5,4,7,6,1,0,3,2}, // e5
+        new[]{6,7,4,5,2,3,0,1}, // e6
+        new[]{7,6,5,4,3,2,1,0}, // e7
+    };
+
     private static void OctonionMultiplyInPlace<T>(T[] a, T[] b, T[] result, INumericOperations<T> ops)
     {
-        T a0=a[0],a1=a[1],a2=a[2],a3=a[3],a4=a[4],a5=a[5],a6=a[6],a7=a[7];
-        T b0=b[0],b1=b[1],b2=b[2],b3=b[3],b4=b[4],b5=b[5],b6=b[6],b7=b[7];
-
-        // e0
-        result[0] = ops.Subtract(ops.Subtract(ops.Subtract(ops.Subtract(
-            ops.Subtract(ops.Subtract(ops.Subtract(ops.Multiply(a0,b0), ops.Multiply(a1,b1)),
-            ops.Multiply(a2,b2)), ops.Multiply(a3,b3)), ops.Multiply(a4,b4)),
-            ops.Multiply(a5,b5)), ops.Multiply(a6,b6)), ops.Multiply(a7,b7));
-        // e1
-        result[1] = ops.Add(ops.Subtract(ops.Add(ops.Add(
-            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b1), ops.Multiply(a1,b0)),
-            ops.Multiply(a2,b3)), ops.Multiply(a3,b2)), ops.Multiply(a4,b5)),
-            ops.Multiply(a5,b4)), ops.Multiply(a6,b7)), ops.Multiply(a7,b6));
-        // e2
-        result[2] = ops.Subtract(ops.Subtract(ops.Add(ops.Add(
-            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b2), ops.Multiply(a2,b0)),
-            ops.Multiply(a1,b3)), ops.Multiply(a3,b1)), ops.Multiply(a4,b6)),
-            ops.Multiply(a5,b7)), ops.Multiply(a6,b4)), ops.Multiply(a7,b5));
-        // e3
-        result[3] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
-            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b3), ops.Multiply(a3,b0)),
-            ops.Multiply(a2,b1)), ops.Multiply(a1,b2)), ops.Multiply(a4,b7)),
-            ops.Multiply(a5,b6)), ops.Multiply(a6,b5)), ops.Multiply(a7,b4));
-        // e4
-        result[4] = ops.Add(ops.Add(ops.Add(ops.Subtract(
-            ops.Subtract(ops.Subtract(ops.Add(ops.Multiply(a0,b4), ops.Multiply(a4,b0)),
-            ops.Multiply(a1,b5)), ops.Multiply(a2,b6)), ops.Multiply(a3,b7)),
-            ops.Multiply(a5,b1)), ops.Multiply(a6,b2)), ops.Multiply(a7,b3));
-        // e5
-        result[5] = ops.Add(ops.Subtract(ops.Subtract(ops.Add(
-            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b5), ops.Multiply(a5,b0)),
-            ops.Multiply(a4,b1)), ops.Multiply(a1,b4)), ops.Multiply(a3,b6)),
-            ops.Multiply(a2,b7)), ops.Multiply(a6,b3)), ops.Multiply(a7,b2));
-        // e6
-        result[6] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
-            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b6), ops.Multiply(a6,b0)),
-            ops.Multiply(a1,b7)), ops.Multiply(a4,b2)), ops.Multiply(a2,b4)),
-            ops.Multiply(a5,b3)), ops.Multiply(a3,b5)), ops.Multiply(a7,b1));
-        // e7
-        result[7] = ops.Add(ops.Subtract(ops.Subtract(ops.Subtract(
-            ops.Add(ops.Add(ops.Add(ops.Multiply(a0,b7), ops.Multiply(a7,b0)),
-            ops.Multiply(a2,b5)), ops.Multiply(a3,b4)), ops.Multiply(a1,b6)),
-            ops.Multiply(a4,b3)), ops.Multiply(a5,b2)), ops.Multiply(a6,b1));
+        for (int comp = 0; comp < 8; comp++)
+        {
+            T sum = ops.Zero;
+            var signs = OctonionSigns[comp];
+            var bIdx = OctonionBIdx[comp];
+            for (int term = 0; term < 8; term++)
+            {
+                T product = ops.Multiply(a[term], b[bIdx[term]]);
+                sum = signs[term] > 0 ? ops.Add(sum, product) : ops.Subtract(sum, product);
+            }
+            result[comp] = sum;
+        }
     }
 
     #endregion
