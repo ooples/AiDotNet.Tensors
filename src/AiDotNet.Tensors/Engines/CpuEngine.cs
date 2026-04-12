@@ -28151,6 +28151,108 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+        if (input.Rank < 2)
+            throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
+        if (filter.Rank < 2)
+            throw new ArgumentException("NativeSpectralFilter requires at least a 2D filter tensor.", nameof(filter));
+
+        int h = input._shape[^2];
+        int w = input._shape[^1];
+        if (filter._shape[^2] != h || filter._shape[^1] != w)
+            throw new ArgumentException(
+                $"Filter spatial dims [{filter._shape[^2]},{filter._shape[^1]}] must match input [{h},{w}].",
+                nameof(filter));
+
+        // Fused: FFT2D → pointwise multiply → IFFT2D (eliminates 2 intermediate allocations)
+        var spectrum = NativeComplexFFT2D(input);
+
+        // Broadcast filter to match spectrum shape if needed
+        Tensor<Complex<T>> broadcastedFilter;
+        if (filter.Length == spectrum.Length)
+        {
+            broadcastedFilter = filter;
+        }
+        else
+        {
+            // filter is [H, W], spectrum might be [..., H, W] — broadcast by tiling
+            int sliceSize = h * w;
+            int batchCount = spectrum.Length / sliceSize;
+            broadcastedFilter = new Tensor<Complex<T>>(spectrum._shape);
+            for (int b = 0; b < batchCount; b++)
+            {
+                int offset = b * sliceSize;
+                for (int i = 0; i < sliceSize; i++)
+                    broadcastedFilter[offset + i] = filter[i];
+            }
+        }
+
+        var filtered = NativeComplexMultiply(spectrum, broadcastedFilter);
+        return NativeComplexIFFT2DReal(filtered);
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+        if (input.Rank != 4)
+            throw new ArgumentException(
+                $"NativeSpectralFilterBatch requires 4D input [B,C,H,W]. Got rank {input.Rank}.",
+                nameof(input));
+
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int h = input._shape[2];
+        int w = input._shape[3];
+
+        bool perChannel = filter.Rank == 3;
+        if (perChannel)
+        {
+            if (filter._shape[0] != channels || filter._shape[1] != h || filter._shape[2] != w)
+                throw new ArgumentException(
+                    $"Per-channel filter shape [{filter._shape[0]},{filter._shape[1]},{filter._shape[2]}] " +
+                    $"must match [C={channels},H={h},W={w}].", nameof(filter));
+        }
+        else if (filter.Rank == 2)
+        {
+            if (filter._shape[0] != h || filter._shape[1] != w)
+                throw new ArgumentException(
+                    $"Shared filter shape [{filter._shape[0]},{filter._shape[1]}] must match [H={h},W={w}].",
+                    nameof(filter));
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"Filter must be [C,H,W] (per-channel) or [H,W] (shared). Got rank {filter.Rank}.",
+                nameof(filter));
+        }
+
+        // FFT2D the entire [B,C,H,W] input — the FFT2D already batches over leading dims
+        var spectrum = NativeComplexFFT2D(input);
+
+        // Build the full [B,C,H,W] filter by broadcasting
+        int sliceSize = h * w;
+        var fullFilter = new Tensor<Complex<T>>(spectrum._shape);
+        for (int b = 0; b < batch; b++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                int dstOff = (b * channels + c) * sliceSize;
+                int srcOff = perChannel ? c * sliceSize : 0;
+                for (int i = 0; i < sliceSize; i++)
+                    fullFilter[dstOff + i] = filter[srcOff + i];
+            }
+        }
+
+        var filtered = NativeComplexMultiply(spectrum, fullFilter);
+        return NativeComplexIFFT2DReal(filtered);
+    }
+
     /// <summary>
     /// Transpose the last two axes of a complex tensor using a specialized nested loop.
     /// For shape [..., H, W] → [..., W, H], iterates batch × H × W with direct index

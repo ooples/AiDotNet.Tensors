@@ -7520,6 +7520,28 @@ public interface IEngine
     Tensor<T> NativeComplexIFFTNDReal<T>(Tensor<Complex<T>> input, int[] axes);
 
     /// <summary>
+    /// Fused spectral filter: FFT2D(input) ⊙ filter → IFFT2D → real output.
+    /// Single engine call that eliminates 2 intermediate tensor allocations.
+    /// Input shape: [H, W] or [..., H, W] (batches over leading dims).
+    /// Filter shape: must match or broadcast to the spatial dimensions of input.
+    /// </summary>
+    /// <param name="input">Real-valued spatial input. Last two axes must be powers of 2.</param>
+    /// <param name="filter">Complex-valued spectral filter. Shape [H, W].</param>
+    /// <returns>Real-valued filtered output of same shape as input.</returns>
+    Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter);
+
+    /// <summary>
+    /// Batched spectral filter across samples and channels.
+    /// Input: [B, C, H, W]. Filter: [C, H, W] (per-channel) or [H, W] (shared).
+    /// Applies FFT2D → pointwise multiply → IFFT2D to every (b, c) slice in one call,
+    /// replacing the O(B×C) dispatch loop that dominates vision-model training time.
+    /// </summary>
+    /// <param name="input">Real-valued 4D tensor [B, C, H, W]. H and W must be powers of 2.</param>
+    /// <param name="filter">Complex-valued filter [C, H, W] or [H, W].</param>
+    /// <returns>Real-valued output [B, C, H, W].</returns>
+    Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter);
+
+    /// <summary>
     /// Selects the top-K elements by complex magnitude, zeroing all others.
     /// Used for spectral sparsity masking — retains the K strongest frequency components.
     /// </summary>

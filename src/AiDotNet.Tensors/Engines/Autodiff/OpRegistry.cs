@@ -304,6 +304,10 @@ internal static class OpRegistry
         "FusedConv3D",         // composed
         "FusedConvTranspose2D", // composed
         "FusedBatchNorm",      // composed from BatchNorm + activation
+
+        // Spectral filter ops (composed from FFT2D + NativeComplexMultiply + IFFT2DReal)
+        "NativeSpectralFilter",       // FFT2D → multiply → IFFT2D
+        "NativeSpectralFilterBatch",  // batched across [B, C, H, W]
     };
 
     /// <summary>
