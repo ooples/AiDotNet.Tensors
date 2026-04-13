@@ -210,6 +210,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
+    private static int _gpuRngSeed = Environment.TickCount;
 
     // GPU buffer cache for persistent tensors - keyed by tensor data array reference
     // Thread-safety: ConcurrentDictionary provides atomic operations. Invalidation uses
@@ -13950,7 +13951,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int total = 1;
                 foreach (var d in shape) total *= d;
                 var go = b.AllocateBuffer(total);
-                b.GenerateRandomUniform(go, total, 0f, 1f, (ulong)Environment.TickCount);
+                b.GenerateRandomUniform(go, total, 0f, 1f, (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
                 return DeferTensorResult<T>(b, go, total, shape);
             }
             catch { }
@@ -13967,7 +13968,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int total = 1;
                 foreach (var d in shape) total *= d;
                 var go = b.AllocateBuffer(total);
-                b.GenerateRandomNormal(go, total, Convert.ToSingle(mean), Convert.ToSingle(stddev), (ulong)Environment.TickCount);
+                b.GenerateRandomNormal(go, total, Convert.ToSingle(mean), Convert.ToSingle(stddev), (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
                 return DeferTensorResult<T>(b, go, total, shape);
             }
             catch { }
