@@ -928,6 +928,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
         => Inner.GenerateRandomNormal(output, size, mean, stdDev, seed);
 
+    /// <inheritdoc/>
+    public virtual void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+        => Inner.GenerateSecureRandomUniform(output, size, min, max);
+
     #endregion
 
     #region Specialized Layer Operations

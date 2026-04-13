@@ -218,46 +218,57 @@ public sealed class SimdRandom
     {
         if (typeof(T) == typeof(double))
         {
-            // Chunk-fill doubles directly via Unsafe.As — no full-size temp array
             const int chunk = 256;
-            var buf = new double[chunk];
-            int i = 0;
-            while (i < destination.Length)
+            var buf = System.Buffers.ArrayPool<double>.Shared.Rent(chunk);
+            try
             {
-                int n = Math.Min(chunk, destination.Length - i);
-                NextDoubles(buf.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
-                    destination[i + j] = Unsafe.As<double, T>(ref buf[j]);
-                i += n;
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(chunk, destination.Length - i);
+                    NextDoubles(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = Unsafe.As<double, T>(ref buf[j]);
+                    i += n;
+                }
             }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
         }
         else if (typeof(T) == typeof(float))
         {
             const int chunk = 256;
-            var buf = new float[chunk];
-            int i = 0;
-            while (i < destination.Length)
+            var buf = System.Buffers.ArrayPool<float>.Shared.Rent(chunk);
+            try
             {
-                int n = Math.Min(chunk, destination.Length - i);
-                NextFloats(buf.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
-                    destination[i + j] = Unsafe.As<float, T>(ref buf[j]);
-                i += n;
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(chunk, destination.Length - i);
+                    NextFloats(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = Unsafe.As<float, T>(ref buf[j]);
+                    i += n;
+                }
             }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(buf); }
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var temp = new double[Math.Min(256, destination.Length)];
-            int i = 0;
-            while (i < destination.Length)
+            var temp = System.Buffers.ArrayPool<double>.Shared.Rent(Math.Min(256, destination.Length));
+            try
             {
-                int n = Math.Min(temp.Length, destination.Length - i);
-                NextDoubles(temp.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
-                    destination[i + j] = numOps.FromDouble(temp[j]);
-                i += n;
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(256, destination.Length - i);
+                    NextDoubles(temp.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = numOps.FromDouble(temp[j]);
+                    i += n;
+                }
             }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(temp); }
         }
     }
 
@@ -271,50 +282,203 @@ public sealed class SimdRandom
         if (typeof(T) == typeof(double))
         {
             const int chunk = 256;
-            var buf = new double[chunk];
-            int i = 0;
-            while (i < destination.Length)
+            var buf = System.Buffers.ArrayPool<double>.Shared.Rent(chunk);
+            try
             {
-                int n = Math.Min(chunk, destination.Length - i);
-                NextDoubles(buf.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
+                int i = 0;
+                while (i < destination.Length)
                 {
-                    double val = buf[j] * range + min;
-                    destination[i + j] = Unsafe.As<double, T>(ref val);
+                    int n = Math.Min(chunk, destination.Length - i);
+                    NextDoubles(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                    {
+                        double val = buf[j] * range + min;
+                        destination[i + j] = Unsafe.As<double, T>(ref val);
+                    }
+                    i += n;
                 }
-                i += n;
             }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
         }
         else if (typeof(T) == typeof(float))
         {
             const int chunk = 256;
-            var buf = new float[chunk];
-            int i = 0;
-            while (i < destination.Length)
+            var buf = System.Buffers.ArrayPool<float>.Shared.Rent(chunk);
+            try
             {
-                int n = Math.Min(chunk, destination.Length - i);
-                NextFloats(buf.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
+                int i = 0;
+                while (i < destination.Length)
                 {
-                    float val = buf[j] * (float)range + (float)min;
-                    destination[i + j] = Unsafe.As<float, T>(ref val);
+                    int n = Math.Min(chunk, destination.Length - i);
+                    NextFloats(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                    {
+                        float val = buf[j] * (float)range + (float)min;
+                        destination[i + j] = Unsafe.As<float, T>(ref val);
+                    }
+                    i += n;
                 }
-                i += n;
             }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(buf); }
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var temp = new double[Math.Min(256, destination.Length)];
-            int i = 0;
-            while (i < destination.Length)
+            var temp = System.Buffers.ArrayPool<double>.Shared.Rent(Math.Min(256, destination.Length));
+            try
             {
-                int n = Math.Min(temp.Length, destination.Length - i);
-                NextDoubles(temp.AsSpan(0, n));
-                for (int j = 0; j < n; j++)
-                    destination[i + j] = numOps.FromDouble(temp[j] * range + min);
-                i += n;
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(256, destination.Length - i);
+                    NextDoubles(temp.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = numOps.FromDouble(temp[j] * range + min);
+                    i += n;
+                }
             }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(temp); }
+        }
+    }
+
+    /// <summary>
+    /// Fills a span with cryptographically secure random doubles in [0, 1).
+    /// Uses RandomNumberGenerator.Fill for bulk byte generation, then SIMD-converts
+    /// to doubles. Much faster than per-element LockedRandom.NextDouble() for large fills.
+    /// </summary>
+    public static void SecureFillDoubles(Span<double> destination)
+    {
+        int byteCount = destination.Length * 8;
+        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
+        try
+        {
+#if NET8_0_OR_GREATER
+            System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
+#else
+            using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+            rng.GetBytes(bytes, 0, byteCount);
+#endif
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && destination.Length >= 4)
+            {
+                var one = Vector256.Create(1.0);
+                var exponentMask = Vector256.Create(0x3FF0000000000000UL);
+                var mantissaMask = Vector256.Create(0x000FFFFFFFFFFFFFUL);
+
+                int simdLen = destination.Length & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    // Load 4 x 8 bytes as 4 ulongs
+                    var raw = Unsafe.ReadUnaligned<Vector256<ulong>>(
+                        ref bytes[i * 8]);
+                    var shifted = Avx2.ShiftRightLogical(raw, 12);
+                    var bits = Avx2.Or(Avx2.And(shifted, mantissaMask), exponentMask);
+                    var doubles = Avx.Subtract(bits.AsDouble(), one);
+                    Unsafe.WriteUnaligned(
+                        ref Unsafe.As<double, byte>(ref destination[i]),
+                        doubles);
+                }
+            }
+#endif
+            // Scalar tail
+            for (; i < destination.Length; i++)
+            {
+                ulong raw = BitConverter.ToUInt64(bytes, i * 8);
+                destination[i] = BitConverter.Int64BitsToDouble(
+                    (long)((raw >> 12) | 0x3FF0000000000000UL)) - 1.0;
+            }
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes); }
+    }
+
+    /// <summary>
+    /// Fills a span with cryptographically secure random floats in [0, 1).
+    /// </summary>
+    public static void SecureFillFloats(Span<float> destination)
+    {
+        int byteCount = destination.Length * 4;
+        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
+        try
+        {
+#if NET8_0_OR_GREATER
+            System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
+#else
+            using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+            rng.GetBytes(bytes, 0, byteCount);
+#endif
+            for (int i = 0; i < destination.Length; i++)
+            {
+                uint raw = BitConverter.ToUInt32(bytes, i * 4);
+                // Use upper 23 bits mapped to [1.0f, 2.0f) then subtract 1.0f
+                int bits = (int)((raw >> 9) | 0x3F800000U);
+                destination[i] = Unsafe.As<int, float>(ref bits) - 1.0f;
+            }
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes); }
+    }
+
+    /// <summary>
+    /// Fills a span with cryptographically secure uniform random values in [0, 1).
+    /// Type-specialized: float/double use bulk crypto RNG + SIMD conversion.
+    /// Other types use batched crypto doubles + NumOps.FromDouble.
+    /// </summary>
+    public static void SecureFillUniform<T>(Span<T> destination)
+    {
+        if (typeof(T) == typeof(double))
+        {
+            const int chunk = 4096;
+            var buf = System.Buffers.ArrayPool<double>.Shared.Rent(Math.Min(chunk, destination.Length));
+            try
+            {
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(buf.Length, destination.Length - i);
+                    SecureFillDoubles(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = Unsafe.As<double, T>(ref buf[j]);
+                    i += n;
+                }
+            }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            const int chunk = 4096;
+            var buf = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Min(chunk, destination.Length));
+            try
+            {
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(buf.Length, destination.Length - i);
+                    SecureFillFloats(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = Unsafe.As<float, T>(ref buf[j]);
+                    i += n;
+                }
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(buf); }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            const int chunk = 256;
+            var buf = System.Buffers.ArrayPool<double>.Shared.Rent(chunk);
+            try
+            {
+                int i = 0;
+                while (i < destination.Length)
+                {
+                    int n = Math.Min(chunk, destination.Length - i);
+                    SecureFillDoubles(buf.AsSpan(0, n));
+                    for (int j = 0; j < n; j++)
+                        destination[i + j] = numOps.FromDouble(buf[j]);
+                    i += n;
+                }
+            }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
         }
     }
 

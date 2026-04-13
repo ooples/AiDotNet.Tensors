@@ -9369,6 +9369,21 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    {
+        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
+            float range = max - min;
+            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
+            var temp = AllocateBuffer(hostBuf.AsSpan(0, size).ToArray());
+            try { Copy(temp, 0, output, 0, size); }
+            finally { temp.Dispose(); }
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+    }
+
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))

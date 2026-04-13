@@ -43,11 +43,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private static bool InitDiagnosticOutput()
         {
             var val = Environment.GetEnvironmentVariable("AIDOTNET_GPU_VERBOSE");
-            if (string.IsNullOrWhiteSpace(val)) return true;
-            return val.Equals("1", StringComparison.OrdinalIgnoreCase) ||
-                   val.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-                   val.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
-                   val.Equals("on", StringComparison.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(val)) return true; // default: verbose
+            // Explicitly disabled
+            if (val.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+                val.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                val.Equals("no", StringComparison.OrdinalIgnoreCase) ||
+                val.Equals("off", StringComparison.OrdinalIgnoreCase))
+                return false;
+            // Unknown value — default to verbose to avoid silent suppression
+            return true;
+        }
+
+        private static void WriteDiag(string message)
+        {
+            WriteDiag(message);
         }
 
         private DirectOpenClContext? _context;
@@ -139,9 +148,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             try
             {
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Creating DirectOpenClContext for device {deviceIndex}...");
+                WriteDiag($"[OpenClBackend] Creating DirectOpenClContext for device {deviceIndex}...");
                 _context = new DirectOpenClContext(deviceIndex);
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Context created: Device={_context.DeviceName}, Vendor={_context.DeviceVendor}");
+                WriteDiag($"[OpenClBackend] Context created: Device={_context.DeviceName}, Vendor={_context.DeviceVendor}");
 
                 IsAvailable = true;
                 DeviceName = _context.DeviceName;
@@ -152,7 +161,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 string? envCUs = Environment.GetEnvironmentVariable("AIDOTNET_GPU_COMPUTE_UNITS");
                 if (int.TryParse(envCUs, out int overrideCUs) && overrideCUs > 0 && overrideCUs <= 256)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] CU override: {detectedCUs} -> {overrideCUs} (via AIDOTNET_GPU_COMPUTE_UNITS)");
+                    WriteDiag($"[OpenClBackend] CU override: {detectedCUs} -> {overrideCUs} (via AIDOTNET_GPU_COMPUTE_UNITS)");
                     ComputeUnits = overrideCUs;
                 }
                 else
@@ -171,35 +180,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _supportsSubgroups = _context.SupportsSubgroups;
 
                 // Print GPU capabilities for diagnostics
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] GPU Capabilities:");
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Compute Units: {ComputeUnits}");
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Max Work Group Size: {_maxWorkGroupSize}");
+                WriteDiag($"[OpenClBackend] GPU Capabilities:");
+                WriteDiag($"[OpenClBackend]   Compute Units: {ComputeUnits}");
+                WriteDiag($"[OpenClBackend]   Max Work Group Size: {_maxWorkGroupSize}");
                 if (_maxWorkItemSizes.Length >= 2)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Max Work Item Sizes: [{string.Join(", ", _maxWorkItemSizes)}]");
+                    WriteDiag($"[OpenClBackend]   Max Work Item Sizes: [{string.Join(", ", _maxWorkItemSizes)}]");
                 }
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Local Memory: {LocalMemoryBytes / 1024} KB");
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Supports FP16: {_supportsFp16}");
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend]   Supports Subgroups: {_supportsSubgroups}");
+                WriteDiag($"[OpenClBackend]   Local Memory: {LocalMemoryBytes / 1024} KB");
+                WriteDiag($"[OpenClBackend]   Supports FP16: {_supportsFp16}");
+                WriteDiag($"[OpenClBackend]   Supports Subgroups: {_supportsSubgroups}");
 
                 // Initialize default stream wrapper
                 _defaultStream = new OpenClCommandQueue(this, _context.CommandQueue, _context.Context, _context.Device,
                     GpuStreamType.Default, _context.IsProfilingEnabled, ownsHandle: false);
-                if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Default command queue wrapper initialized.");
+                WriteDiag("[OpenClBackend] Default command queue wrapper initialized.");
 
-                if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Compiling kernels...");
+                WriteDiag("[OpenClBackend] Compiling kernels...");
                 CompileKernels();
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Kernels compiled successfully. Total: {_kernelCache.Count}");
+                WriteDiag($"[OpenClBackend] Kernels compiled successfully. Total: {_kernelCache.Count}");
 
                 // Initialize dynamic kernel generator for Bayesian-optimized GEMM
                 _dynamicGemm = new DynamicGemmKernel(_context);
-                if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Dynamic GEMM kernel generator initialized.");
+                WriteDiag("[OpenClBackend] Dynamic GEMM kernel generator initialized.");
             }
             catch (Exception ex)
             {
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Initialization FAILED: {ex.GetType().Name}: {ex.Message}");
+                WriteDiag($"[OpenClBackend] Initialization FAILED: {ex.GetType().Name}: {ex.Message}");
                 if (ex.InnerException != null)
-                    if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Inner: {ex.InnerException.Message}");
+                    WriteDiag($"[OpenClBackend] Inner: {ex.InnerException.Message}");
                 System.Diagnostics.Debug.WriteLine($"OpenClBackend initialization failed: {ex.Message}");
                 IsAvailable = false;
                 DeviceName = "None";
@@ -217,7 +226,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var cached = DirectOpenClProgram.TryCreateFromCache(_context, source, buildOptions);
             if (cached != null)
             {
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] {label}: loaded from cache");
+                WriteDiag($"[OpenClBackend] {label}: loaded from cache");
                 return cached;
             }
 
@@ -226,7 +235,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             try
             {
                 program.Build(buildOptions);
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] {label}: compiled from source");
+                WriteDiag($"[OpenClBackend] {label}: compiled from source");
                 return program;
             }
             catch
@@ -251,14 +260,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             try
             {
                 // Compile GEMM kernels with aggressive optimizations
-                if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Compiling GEMM kernels...");
+                WriteDiag("[OpenClBackend] Compiling GEMM kernels...");
                 var gemmProgram = CompileOrLoadCached(GemmKernel.GetSource(), optimizationFlags, "GEMM kernels");
                 _programs.Add(gemmProgram);
                 foreach (var name in GemmKernel.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, gemmProgram, name);
                 }
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
+                WriteDiag($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
                 // Compile activation kernels
                 var activationProgram = CompileOrLoadCached(ActivationKernels.GetSource(), optimizationFlags, "Activation kernels");
@@ -377,19 +386,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         _kernelCache["mixed_precision_backward"] = new DirectOpenClKernel(_context, mpProgram, "mixed_precision_backward");
                         _kernelCache["accumulate_gradient_fp32"] = new DirectOpenClKernel(_context, mpProgram, "accumulate_gradient_fp32");
                         _mixedPrecisionKernelsAvailable = true;
-                        if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Mixed precision kernels compiled: 5 kernels");
+                        WriteDiag("[OpenClBackend] Mixed precision kernels compiled: 5 kernels");
                     }
                     catch (Exception ex)
                     {
                         // Mixed precision compilation failed - this is non-fatal
                         // Device may report FP16 support but have driver issues with these kernels
-                        if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] Warning: Mixed precision kernel compilation failed (non-fatal): {ex.Message}");
-                        if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Continuing without mixed precision support.");
+                        WriteDiag($"[OpenClBackend] Warning: Mixed precision kernel compilation failed (non-fatal): {ex.Message}");
+                        WriteDiag("[OpenClBackend] Continuing without mixed precision support.");
                     }
                 }
                 else
                 {
-                    if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Skipping mixed precision kernels (FP16 not supported on this device).");
+                    WriteDiag("[OpenClBackend] Skipping mixed precision kernels (FP16 not supported on this device).");
                 }
 
                 // Compile attention kernels (FlashAttention, GQA, ScaledDotProduct)
@@ -415,7 +424,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
-                if (DiagnosticOutput) Console.WriteLine("[OpenClBackend] Spatial transformer kernels compiled: 4 kernels");
+                WriteDiag("[OpenClBackend] Spatial transformer kernels compiled: 4 kernels");
 
                 // Compile locally connected convolution kernels
                 var locallyConnectedProgram = CompileOrLoadCached(LocallyConnectedKernels.GetSource(), optimizationFlags, "Locally connected kernels");
@@ -810,12 +819,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     var previous = Console.ForegroundColor;
                     Console.ForegroundColor = color.Value;
-                    if (DiagnosticOutput) Console.WriteLine(message);
+                    WriteDiag(message);
                     Console.ForegroundColor = previous;
                 }
                 else
                 {
-                    if (DiagnosticOutput) Console.WriteLine(message);
+                    WriteDiag(message);
                 }
             }
 
@@ -962,7 +971,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                     if (EnableTuningDiagnostics)
                     {
-                        if (DiagnosticOutput) Console.WriteLine($"[GEMM] Cached config invalid: {validationError}");
+                        WriteDiag($"[GEMM] Cached config invalid: {validationError}");
                     }
                 }
 
@@ -1027,7 +1036,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (EnableTuningDiagnostics)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM] Tuning lookup failed: {ex.Message}");
+                    WriteDiag($"[GEMM] Tuning lookup failed: {ex.Message}");
                 }
 
                 return false;
@@ -1061,7 +1070,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _clblastTransposeParams = ClBlastTransposeDatabase.GetParameters(deviceInfo);
                 _clblastDirectParams = ClBlastXgemmDirectDatabase.GetParameters(deviceInfo);
                 _clblastMinIndirectSize = ClBlastGemmRoutineDatabase.GetXgemmMinIndirectSize(deviceInfo);
-                if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend] CLBlast MinIndirectSize threshold: {_clblastMinIndirectSize} (use INDIRECT for M/N >= {_clblastMinIndirectSize})");
+                WriteDiag($"[OpenClBackend] CLBlast MinIndirectSize threshold: {_clblastMinIndirectSize} (use INDIRECT for M/N >= {_clblastMinIndirectSize})");
 
                 if (ClBlastXgemmDatabase.TryGetConfig(deviceInfo, out var baseline))
                 {
@@ -1421,19 +1430,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!useIndirectPath || forceDirect)
             {
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] Trying DIRECT path (M/N < {_clblastMinIndirectSize} or forceDirect={forceDirect})");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying DIRECT path (M/N < {_clblastMinIndirectSize} or forceDirect={forceDirect})");
                 if (TryExecuteClBlastDirectGemm(A, B, C, M, N, K, alpha, beta))
                 {
                     if (traceEnabled)
-                        if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: DIRECT path executed");
+                        WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: DIRECT path executed");
                     return true;
                 }
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] DIRECT path failed, trying INDIRECT");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] DIRECT path failed, trying INDIRECT");
             }
             else if (traceEnabled)
             {
-                if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] Skipping DIRECT path (M/N >= {_clblastMinIndirectSize}), using INDIRECT");
+                WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Skipping DIRECT path (M/N >= {_clblastMinIndirectSize}), using INDIRECT");
             }
 
             if (_dynamicGemm == null)
@@ -1575,7 +1584,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         var total = allocTime + packATime + packBTime + packCTime + gemmTime + unpackCTime;
                         double flops = 2.0 * M * N * K;
                         double gflops = flops / (total / ticksPerMs) / 1e6;
-                        if (DiagnosticOutput) Console.WriteLine($"[TIMING-SWAP {M}x{N}x{K}] Alloc={allocTime / ticksPerMs:F2}ms PackA={packATime / ticksPerMs:F2}ms PackB={packBTime / ticksPerMs:F2}ms GEMM={gemmTime / ticksPerMs:F2}ms UnpackC={unpackCTime / ticksPerMs:F2}ms Total={total / ticksPerMs:F2}ms ({gflops:F0} GFLOPS)");
+                        WriteDiag($"[TIMING-SWAP {M}x{N}x{K}] Alloc={allocTime / ticksPerMs:F2}ms PackA={packATime / ticksPerMs:F2}ms PackB={packBTime / ticksPerMs:F2}ms GEMM={gemmTime / ticksPerMs:F2}ms UnpackC={unpackCTime / ticksPerMs:F2}ms Total={total / ticksPerMs:F2}ms ({gflops:F0} GFLOPS)");
                     }
 
                     return true;
@@ -1676,7 +1685,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     {
                         double ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000.0;
                         var total = allocTime + packATime + packBTime + packCTime + gemmTime + unpackCTime;
-                        if (DiagnosticOutput) Console.WriteLine($"[TIMING {M}x{N}x{K}] Alloc={allocTime / ticksPerMs:F2}ms PackA={packATime / ticksPerMs:F2}ms PackB={packBTime / ticksPerMs:F2}ms GEMM={gemmTime / ticksPerMs:F2}ms UnpackC={unpackCTime / ticksPerMs:F2}ms Total={total / ticksPerMs:F2}ms");
+                        WriteDiag($"[TIMING {M}x{N}x{K}] Alloc={allocTime / ticksPerMs:F2}ms PackA={packATime / ticksPerMs:F2}ms PackB={packBTime / ticksPerMs:F2}ms GEMM={gemmTime / ticksPerMs:F2}ms UnpackC={unpackCTime / ticksPerMs:F2}ms Total={total / ticksPerMs:F2}ms");
                     }
 
                     return true;
@@ -1779,7 +1788,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (EnableTuningDiagnostics)
             {
-                if (DiagnosticOutput) Console.WriteLine($"[GEMM] Packed GEMM: {M}x{N}x{K} -> {mPad}x{nPad}x{kPad}");
+                WriteDiag($"[GEMM] Packed GEMM: {M}x{N}x{K} -> {mPad}x{nPad}x{kPad}");
             }
 
             using var aPad = AllocateBuffer(mPad * kPad);
@@ -1843,7 +1852,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (EnableTuningDiagnostics)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM] Dynamic config invalid: {validationError}");
+                    WriteDiag($"[GEMM] Dynamic config invalid: {validationError}");
                 }
                 return false;
             }
@@ -1859,7 +1868,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (EnableTuningDiagnostics)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM] Dynamic kernel failed ({config.KernelName}): {ex.Message}");
+                    WriteDiag($"[GEMM] Dynamic kernel failed ({config.KernelName}): {ex.Message}");
                 }
                 return false;
             }
@@ -1882,61 +1891,61 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (ClBlastNative.IsAvailable && ShouldUseVendorGemm(M, N, K, offlineEnabled))
             {
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] Trying CLBlast library");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying CLBlast library");
 
                 if (TryExecuteClBlastLibraryGemm(A, B, C, M, N, K, alpha, beta))
                 {
                     if (traceEnabled)
-                        if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast library executed");
+                        WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast library executed");
                     return;
                 }
 
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: CLBlast library FAILED");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: CLBlast library FAILED");
             }
             else if (traceEnabled && !ClBlastNative.IsAvailable)
             {
-                if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SKIP: CLBlast library not available");
+                WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SKIP: CLBlast library not available");
             }
 
             if (!offlineEnabled && TryGetClBlastBaselineConfig(out var baselineConfig))
             {
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] Trying CLBlast baseline (TileM={baselineConfig.TileM}, TileN={baselineConfig.TileN}, TileK={baselineConfig.TileK})");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying CLBlast baseline (TileM={baselineConfig.TileM}, TileN={baselineConfig.TileN}, TileK={baselineConfig.TileK})");
 
                 if (TryExecuteClBlastBaselineGemm(A, B, C, M, N, K, alpha, beta, baselineConfig))
                 {
                     if (traceEnabled)
-                        if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast baseline executed");
+                        WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast baseline executed");
                     return;
                 }
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: CLBlast baseline FAILED");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: CLBlast baseline FAILED");
             }
             else
             {
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SKIP: CLBlast baseline not available (offline={offlineEnabled})");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SKIP: CLBlast baseline not available (offline={offlineEnabled})");
             }
 
             if (_dynamicGemm != null && M >= 128 && N >= 128 && K >= 64 &&
                 TryGetTunedConfig(M, N, K, out var tunedConfig))
             {
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] Trying dynamic GEMM");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying dynamic GEMM");
                 if (TryExecutePackedDynamicGemm(A, B, C, M, N, K, alpha, beta, tunedConfig))
                 {
                     if (traceEnabled)
-                        if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: Dynamic GEMM executed");
+                        WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: Dynamic GEMM executed");
                     return;
                 }
                 if (traceEnabled)
-                    if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: Dynamic GEMM FAILED");
+                    WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: Dynamic GEMM FAILED");
             }
 
             // FALLBACK: Using our own kernels (NOT CLBlast identical!)
             if (traceEnabled)
-                if (DiagnosticOutput) Console.WriteLine($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: Using built-in kernel (NOT CLBlast!)");
+                WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: Using built-in kernel (NOT CLBlast!)");
 
             // Choose kernel based on matrix size
             // Use optimized kernel for matrices >= 128 in any dimension
@@ -1991,7 +2000,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
         {
-            if (DiagnosticOutput) Console.WriteLine($"[OpenClBackend.MatMul] Called: {M}x{N}x{K}");
+            WriteDiag($"[OpenClBackend.MatMul] Called: {M}x{N}x{K}");
             var C = AllocateBuffer(M * N);
             Gemm(A, B, C, M, N, K, 1.0f, 0.0f);
             // Sync only when returning buffer that might be immediately read
@@ -4113,65 +4122,65 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (Console.IsOutputRedirected)
                 {
-                    if (DiagnosticOutput) Console.WriteLine(message);
+                    WriteDiag(message);
                     return;
                 }
 
                 var previous = Console.ForegroundColor;
                 Console.ForegroundColor = color;
-                if (DiagnosticOutput) Console.WriteLine(message);
+                WriteDiag(message);
                 Console.ForegroundColor = previous;
             }
 
             if (DiagnosticOutput) Console.WriteLine();
-            if (DiagnosticOutput) Console.WriteLine("=== OpenCL GEMM Diagnostics ===");
-            if (DiagnosticOutput) Console.WriteLine($"Matrix dimensions: M={diagnostics.M}, N={diagnostics.N}, K={diagnostics.K}");
-            if (DiagnosticOutput) Console.WriteLine($"Kernel: {diagnostics.KernelName}");
-            if (DiagnosticOutput) Console.WriteLine($"Work configuration: Global({diagnostics.GlobalSizeX}x{diagnostics.GlobalSizeY}), Local({diagnostics.LocalSizeX}x{diagnostics.LocalSizeY})");
-            if (DiagnosticOutput) Console.WriteLine($"Work items launched: {diagnostics.WorkItemsLaunched:N0}");
-            if (DiagnosticOutput) Console.WriteLine($"Work groups launched: {diagnostics.WorkGroupsLaunched:N0}");
+            WriteDiag("=== OpenCL GEMM Diagnostics ===");
+            WriteDiag($"Matrix dimensions: M={diagnostics.M}, N={diagnostics.N}, K={diagnostics.K}");
+            WriteDiag($"Kernel: {diagnostics.KernelName}");
+            WriteDiag($"Work configuration: Global({diagnostics.GlobalSizeX}x{diagnostics.GlobalSizeY}), Local({diagnostics.LocalSizeX}x{diagnostics.LocalSizeY})");
+            WriteDiag($"Work items launched: {diagnostics.WorkItemsLaunched:N0}");
+            WriteDiag($"Work groups launched: {diagnostics.WorkGroupsLaunched:N0}");
             if (DiagnosticOutput) Console.WriteLine();
 
             if (diagnostics.IsProfilingAvailable && diagnostics.KernelExecutionNs > 0)
             {
-                if (DiagnosticOutput) Console.WriteLine("--- GPU Timing (from OpenCL events) ---");
-                if (DiagnosticOutput) Console.WriteLine($"Queue to Submit: {diagnostics.QueueToSubmitNs / 1e6:F3} ms");
-                if (DiagnosticOutput) Console.WriteLine($"Submit to Start (launch overhead): {diagnostics.SubmitToStartNs / 1e6:F3} ms");
-                if (DiagnosticOutput) Console.WriteLine($"Kernel Execution: {diagnostics.KernelExecutionNs / 1e6:F3} ms");
-                if (DiagnosticOutput) Console.WriteLine($"Total GPU Time: {diagnostics.TotalGpuTimeNs / 1e6:F3} ms");
+                WriteDiag("--- GPU Timing (from OpenCL events) ---");
+                WriteDiag($"Queue to Submit: {diagnostics.QueueToSubmitNs / 1e6:F3} ms");
+                WriteDiag($"Submit to Start (launch overhead): {diagnostics.SubmitToStartNs / 1e6:F3} ms");
+                WriteDiag($"Kernel Execution: {diagnostics.KernelExecutionNs / 1e6:F3} ms");
+                WriteDiag($"Total GPU Time: {diagnostics.TotalGpuTimeNs / 1e6:F3} ms");
             }
             else if (!string.IsNullOrEmpty(diagnostics.ProfilingError))
             {
-                if (DiagnosticOutput) Console.WriteLine($"Profiling error: {diagnostics.ProfilingError}");
+                WriteDiag($"Profiling error: {diagnostics.ProfilingError}");
             }
 
-            if (DiagnosticOutput) Console.WriteLine($"Wall clock time: {diagnostics.WallClockMs:F3} ms");
+            WriteDiag($"Wall clock time: {diagnostics.WallClockMs:F3} ms");
             if (DiagnosticOutput) Console.WriteLine();
 
-            if (DiagnosticOutput) Console.WriteLine("--- Performance Metrics ---");
-            if (DiagnosticOutput) Console.WriteLine($"FLOPS required: {diagnostics.FlopsRequired:N0} ({diagnostics.FlopsRequired / 1e9:F2} GFLOP)");
-            if (DiagnosticOutput) Console.WriteLine($"Bytes transferred: {diagnostics.BytesTransferred:N0} ({diagnostics.BytesTransferred / 1e6:F2} MB)");
-            if (DiagnosticOutput) Console.WriteLine($"Arithmetic intensity: {diagnostics.ArithmeticIntensity:F2} FLOP/byte");
-            if (DiagnosticOutput) Console.WriteLine($"Achieved GFLOPS: {diagnostics.AchievedGflops:F2}");
-            if (DiagnosticOutput) Console.WriteLine($"Achieved bandwidth: {diagnostics.AchievedBandwidthGBps:F2} GB/s");
-            if (DiagnosticOutput) Console.WriteLine($"Compute efficiency: {diagnostics.ComputeEfficiency:F1}% of theoretical peak");
+            WriteDiag("--- Performance Metrics ---");
+            WriteDiag($"FLOPS required: {diagnostics.FlopsRequired:N0} ({diagnostics.FlopsRequired / 1e9:F2} GFLOP)");
+            WriteDiag($"Bytes transferred: {diagnostics.BytesTransferred:N0} ({diagnostics.BytesTransferred / 1e6:F2} MB)");
+            WriteDiag($"Arithmetic intensity: {diagnostics.ArithmeticIntensity:F2} FLOP/byte");
+            WriteDiag($"Achieved GFLOPS: {diagnostics.AchievedGflops:F2}");
+            WriteDiag($"Achieved bandwidth: {diagnostics.AchievedBandwidthGBps:F2} GB/s");
+            WriteDiag($"Compute efficiency: {diagnostics.ComputeEfficiency:F1}% of theoretical peak");
             if (DiagnosticOutput) Console.WriteLine();
 
-            if (DiagnosticOutput) Console.WriteLine("--- Bottleneck Analysis ---");
+            WriteDiag("--- Bottleneck Analysis ---");
             if (diagnostics.SubmitToStartNs > diagnostics.KernelExecutionNs * 0.5 && diagnostics.KernelExecutionNs > 0)
             {
                 WriteColored("WARNING: High launch overhead detected (>50% of kernel time)", ConsoleColor.Yellow);
-                if (DiagnosticOutput) Console.WriteLine("  -> Consider batching multiple small operations");
+                WriteDiag("  -> Consider batching multiple small operations");
             }
             if (diagnostics.IsLikelyMemoryBound)
             {
                 WriteColored("LIKELY MEMORY BOUND: Achieved GFLOPS limited by memory bandwidth", ConsoleColor.Yellow);
-                if (DiagnosticOutput) Console.WriteLine("  -> Consider using data tiling, caching, or reducing data movement");
+                WriteDiag("  -> Consider using data tiling, caching, or reducing data movement");
             }
             else if (diagnostics.ComputeEfficiency < 50)
             {
                 WriteColored("LIKELY COMPUTE BOUND with low efficiency:", ConsoleColor.Red);
-                if (DiagnosticOutput) Console.WriteLine("  -> Check for bank conflicts, divergent warps, or suboptimal work group size");
+                WriteDiag("  -> Check for bank conflicts, divergent warps, or suboptimal work group size");
             }
             else if (diagnostics.ComputeEfficiency < 80)
             {
@@ -4191,18 +4200,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
             {
-                if (DiagnosticOutput) Console.WriteLine("OpenCL context not available");
+                WriteDiag("OpenCL context not available");
                 return;
             }
 
             var deviceInfo = GetDeviceInfo();
-            if (DiagnosticOutput) Console.WriteLine("=== OpenCL GEMM Benchmark ===");
-            if (DiagnosticOutput) Console.WriteLine($"Device: {deviceInfo.DeviceName}");
-            if (DiagnosticOutput) Console.WriteLine($"Vendor: {deviceInfo.DeviceVendor}");
-            if (DiagnosticOutput) Console.WriteLine($"Compute Units: {deviceInfo.ComputeUnits}");
-            if (DiagnosticOutput) Console.WriteLine($"Clock: {deviceInfo.ClockFrequencyMHz} MHz");
-            if (DiagnosticOutput) Console.WriteLine($"Theoretical Peak: {deviceInfo.TheoreticalPeakGflops:F0} GFLOPS");
-            if (DiagnosticOutput) Console.WriteLine($"Profiling enabled: {IsProfilingEnabled}");
+            WriteDiag("=== OpenCL GEMM Benchmark ===");
+            WriteDiag($"Device: {deviceInfo.DeviceName}");
+            WriteDiag($"Vendor: {deviceInfo.DeviceVendor}");
+            WriteDiag($"Compute Units: {deviceInfo.ComputeUnits}");
+            WriteDiag($"Clock: {deviceInfo.ClockFrequencyMHz} MHz");
+            WriteDiag($"Theoretical Peak: {deviceInfo.TheoreticalPeakGflops:F0} GFLOPS");
+            WriteDiag($"Profiling enabled: {IsProfilingEnabled}");
             if (DiagnosticOutput) Console.WriteLine();
 
             int sizeIndex = 0;
@@ -4210,8 +4219,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 sizeIndex++;
                 int M = size, N = size, K = size;
-                if (DiagnosticOutput) Console.WriteLine($"[Progress] {sizeIndex}/{sizes.Length} size {size}x{size}x{size}");
-                if (DiagnosticOutput) Console.WriteLine($"--- Matrix size: {size}x{size}x{size} ---");
+                WriteDiag($"[Progress] {sizeIndex}/{sizes.Length} size {size}x{size}x{size}");
+                WriteDiag($"--- Matrix size: {size}x{size}x{size} ---");
 
                 // Allocate buffers
                 var dataA = new float[M * K];
@@ -4264,15 +4273,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 avgBandwidth /= benchmarkIterations;
                 avgLaunchOverhead /= benchmarkIterations;
 
-                if (DiagnosticOutput) Console.WriteLine($"  Kernel: {allDiagnostics[0].KernelName}");
-                if (DiagnosticOutput) Console.WriteLine($"  Avg kernel time: {avgKernelTimeMs:F3} ms");
+                WriteDiag($"  Kernel: {allDiagnostics[0].KernelName}");
+                WriteDiag($"  Avg kernel time: {avgKernelTimeMs:F3} ms");
                 if (avgLaunchOverhead > 0)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"  Avg launch overhead: {avgLaunchOverhead:F3} ms");
+                    WriteDiag($"  Avg launch overhead: {avgLaunchOverhead:F3} ms");
                 }
-                if (DiagnosticOutput) Console.WriteLine($"  Avg GFLOPS: {avgGflops:F2}");
-                if (DiagnosticOutput) Console.WriteLine($"  Avg bandwidth: {avgBandwidth:F2} GB/s");
-                if (DiagnosticOutput) Console.WriteLine($"  Efficiency: {avgGflops / deviceInfo.TheoreticalPeakGflops * 100:F1}%");
+                WriteDiag($"  Avg GFLOPS: {avgGflops:F2}");
+                WriteDiag($"  Avg bandwidth: {avgBandwidth:F2} GB/s");
+                WriteDiag($"  Efficiency: {avgGflops / deviceInfo.TheoreticalPeakGflops * 100:F1}%");
                 if (DiagnosticOutput) Console.WriteLine();
             }
         }
@@ -4321,14 +4330,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var capabilities = GpuCapabilities.Detect(ComputeUnits, GlobalMemoryBytes, (int)LocalMemoryBytes,
                 (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions);
 
-            if (DiagnosticOutput) Console.WriteLine("=== Bayesian GEMM Optimization ===");
-            if (DiagnosticOutput) Console.WriteLine($"Matrix: {M}x{N}x{K}, Device: {DeviceName}, Max trials: {maxTrials}");
+            WriteDiag("=== Bayesian GEMM Optimization ===");
+            WriteDiag($"Matrix: {M}x{N}x{K}, Device: {DeviceName}, Max trials: {maxTrials}");
 
             // Print GPU capabilities if diagnostics enabled
             if (EnableTuningDiagnostics)
             {
-                if (DiagnosticOutput) Console.WriteLine("[GPU Capabilities]");
-                if (DiagnosticOutput) Console.Write(capabilities.GetDiagnosticString());
+                WriteDiag("[GPU Capabilities]");
+                WriteDiag(capabilities.GetDiagnosticString());
             }
 
             var dataA = new float[M * K];
@@ -4368,7 +4377,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     benchmarkFailures++;
                     if (EnableTuningDiagnostics)
                     {
-                        if (DiagnosticOutput) Console.WriteLine($"  [Validation] {config.KernelName}: {validationError}");
+                        WriteDiag($"  [Validation] {config.KernelName}: {validationError}");
                     }
                     database.MarkAsTested(M, N, K, config, 0);
                     return double.NaN;
@@ -4381,7 +4390,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     {
                         if (EnableTuningDiagnostics)
                         {
-                            if (DiagnosticOutput) Console.WriteLine($"  [Cache] {config.KernelName}: {cachedGflops.Value:F2} GFLOPS");
+                            WriteDiag($"  [Cache] {config.KernelName}: {cachedGflops.Value:F2} GFLOPS");
                         }
 
                         return ops / (cachedGflops.Value * 1e6);
@@ -4415,12 +4424,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 catch (Exception ex)
                 {
                     benchmarkFailures++;
-                    if (DiagnosticOutput) Console.WriteLine($"  Config {config} failed: {ex.Message}");
+                    WriteDiag($"  Config {config} failed: {ex.Message}");
 
                     // Print kernel stats on failure
                     if (EnableTuningDiagnostics && _dynamicGemm != null)
                     {
-                        if (DiagnosticOutput) Console.WriteLine($"  [DynamicGemm Stats] {_dynamicGemm.GetDiagnosticStats()}");
+                        WriteDiag($"  [DynamicGemm Stats] {_dynamicGemm.GetDiagnosticStats()}");
                     }
 
                     database.MarkAsTested(M, N, K, config, 0);
@@ -4440,8 +4449,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 var cachedConfig = cachedEntry.Value.Config;
                 databaseGflops = cachedEntry.Value.GFlops;  // Use stored GFLOPS as baseline
-                if (DiagnosticOutput) Console.WriteLine($"Using cached configuration: {cachedConfig}");
-                if (DiagnosticOutput) Console.WriteLine($"Database best: {databaseGflops:F2} GFLOPS (threshold to beat)");
+                WriteDiag($"Using cached configuration: {cachedConfig}");
+                WriteDiag($"Database best: {databaseGflops:F2} GFLOPS (threshold to beat)");
 
                 // Re-benchmark to validate config works and add to result set
                 var cachedTimeMs = BenchmarkConfigNoCache(cachedConfig);
@@ -4455,7 +4464,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         GFlops = revalidatedGflops,
                         IsValid = true
                     };
-                    if (DiagnosticOutput) Console.WriteLine($"Revalidated: {revalidatedGflops:F2} GFLOPS");
+                    WriteDiag($"Revalidated: {revalidatedGflops:F2} GFLOPS");
                 }
             }
 
@@ -4466,10 +4475,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // Print final statistics
             if (EnableTuningDiagnostics)
             {
-                if (DiagnosticOutput) Console.WriteLine($"\n[Benchmark Stats] Attempts: {benchmarkAttempts}, Failures: {benchmarkFailures}");
+                WriteDiag($"\n[Benchmark Stats] Attempts: {benchmarkAttempts}, Failures: {benchmarkFailures}");
                 if (_dynamicGemm != null)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"[DynamicGemm Stats] {_dynamicGemm.GetDiagnosticStats()}");
+                    WriteDiag($"[DynamicGemm Stats] {_dynamicGemm.GetDiagnosticStats()}");
                 }
             }
 
@@ -4486,18 +4495,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (allResults.Count > 0 && allResults[0].IsValid)
             {
                 var best = allResults[0];
-                if (DiagnosticOutput) Console.WriteLine($"Best: {best.Config} - {best.GFlops:F2} GFLOPS");
+                WriteDiag($"Best: {best.Config} - {best.GFlops:F2} GFLOPS");
 
                 // Only update database if we found something better than the DATABASE best
                 // Note: We compare against databaseGflops (historical best), NOT re-benchmarked value
                 if (best.GFlops > databaseGflops)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"NEW GLOBAL BEST! {best.GFlops:F2} > {databaseGflops:F2} GFLOPS (previous best)");
+                    WriteDiag($"NEW GLOBAL BEST! {best.GFlops:F2} > {databaseGflops:F2} GFLOPS (previous best)");
                     database.StoreResult(M, N, K, best.Config, best.GFlops);
                 }
                 else
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"No improvement: {best.GFlops:F2} <= {databaseGflops:F2} GFLOPS (database best)");
+                    WriteDiag($"No improvement: {best.GFlops:F2} <= {databaseGflops:F2} GFLOPS (database best)");
                 }
             }
 
@@ -4518,8 +4527,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var capabilities = GpuCapabilities.Detect(ComputeUnits, GlobalMemoryBytes, (int)LocalMemoryBytes,
                 (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions);
 
-            if (DiagnosticOutput) Console.WriteLine("=== EXHAUSTIVE GEMM Optimization (CLBlast-style) ===");
-            if (DiagnosticOutput) Console.WriteLine($"Matrix: {M}x{N}x{K}, Device: {DeviceName}");
+            WriteDiag("=== EXHAUSTIVE GEMM Optimization (CLBlast-style) ===");
+            WriteDiag($"Matrix: {M}x{N}x{K}, Device: {DeviceName}");
 
             var dataA = new float[M * K];
             var dataB = new float[K * N];
@@ -4552,7 +4561,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     if (EnableTuningDiagnostics)
                     {
-                        if (DiagnosticOutput) Console.WriteLine($"  [Validation] {config.KernelName}: {validationError}");
+                        WriteDiag($"  [Validation] {config.KernelName}: {validationError}");
                     }
                     database.MarkAsTested(M, N, K, config, 0);
                     return double.NaN;
@@ -4565,7 +4574,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     {
                         if (EnableTuningDiagnostics)
                         {
-                            if (DiagnosticOutput) Console.WriteLine($"  [Cache] {config.KernelName}: {cachedGflops.Value:F2} GFLOPS");
+                            WriteDiag($"  [Cache] {config.KernelName}: {cachedGflops.Value:F2} GFLOPS");
                         }
 
                         return ops / (cachedGflops.Value * 1e6);
@@ -4596,7 +4605,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 catch (Exception ex)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"  Config {config} failed: {ex.Message}");
+                    WriteDiag($"  Config {config} failed: {ex.Message}");
                     database.MarkAsTested(M, N, K, config, 0);
                     return double.NaN;
                 }
@@ -4610,7 +4619,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (results.Length > 0 && results[0].IsValid)
             {
                 var best = results[0];
-                if (DiagnosticOutput) Console.WriteLine($"EXHAUSTIVE Best: {best.Config} - {best.GFlops:F2} GFLOPS");
+                WriteDiag($"EXHAUSTIVE Best: {best.Config} - {best.GFlops:F2} GFLOPS");
 
                 database.StoreResult(M, N, K, best.Config, best.GFlops);
             }
@@ -4650,7 +4659,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (EnableTuningDiagnostics)
                 {
-                    if (DiagnosticOutput) Console.WriteLine($"CLBlast SGEMM failed with status: {status}");
+                    WriteDiag($"CLBlast SGEMM failed with status: {status}");
                 }
                 return false;
             }
@@ -4912,7 +4921,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // Auto-print if profiling is enabled
             if (GetEnvBool(GemmProfileEnvVar))
             {
-                if (DiagnosticOutput) Console.WriteLine(result);
+                WriteDiag(result.ToString());
             }
 
             return result;
@@ -10084,6 +10093,22 @@ KERNEL VARIANTS (A/B testing):
             // Each thread generates 2 numbers
             int numThreads = (size + 1) / 2;
             kernel.Execute1D(numThreads, Math.Min(256, numThreads));
+        }
+
+        public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
+            try
+            {
+                Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
+                float range = max - min;
+                for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
+                var temp = AllocateBuffer(hostBuf.AsSpan(0, size).ToArray());
+                try { Copy(temp, 0, output, 0, size); }
+                finally { temp.Dispose(); }
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
         }
 
         #endregion

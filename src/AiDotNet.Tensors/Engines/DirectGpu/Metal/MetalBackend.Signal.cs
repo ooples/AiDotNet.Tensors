@@ -507,6 +507,20 @@ public sealed partial class MetalBackend
         UploadToBuffer(output, data);
     }
 
+    public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    {
+        ThrowIfDisposed();
+        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
+            float range = max - min;
+            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
+            UploadToBuffer(output, hostBuf.AsSpan(0, size).ToArray());
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+    }
+
     #endregion
 
     #region Specialized Layer Operations

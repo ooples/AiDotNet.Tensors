@@ -1072,6 +1072,21 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a new vector filled with cryptographically secure random values between 0 and 1.
+    /// Use this when security guarantees are required (tokens, keys, salts).
+    /// For ML weight initialization, prefer <see cref="CreateRandom(int)"/> which is faster.
+    /// </summary>
+    /// <param name="size">The size of the vector to create.</param>
+    /// <returns>A new vector filled with cryptographically secure random values.</returns>
+    public static Vector<T> CreateSecureRandom(int size)
+    {
+        var vector = new Vector<T>(size);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
+
+        return vector;
+    }
+
+    /// <summary>
     /// Creates a new vector of the specified size filled with random values using the specified random number generator.
     /// </summary>
     /// <param name="random">The random number generator to use. Pass a seeded Random for reproducible results.</param>

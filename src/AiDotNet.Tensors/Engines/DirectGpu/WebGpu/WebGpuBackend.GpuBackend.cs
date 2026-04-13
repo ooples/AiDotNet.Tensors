@@ -834,6 +834,21 @@ public sealed partial class WebGpuBackend
             output, uniforms, size).GetAwaiter().GetResult();
     }
 
+    public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    {
+        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
+            float range = max - min;
+            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
+            var temp = AllocateBuffer(hostBuf.AsSpan(0, size).ToArray());
+            try { Copy(temp, 0, output, 0, size); }
+            finally { temp.Dispose(); }
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+    }
+
     #endregion
 }
 #endif
