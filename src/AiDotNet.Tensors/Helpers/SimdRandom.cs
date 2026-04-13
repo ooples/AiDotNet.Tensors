@@ -348,48 +348,53 @@ public sealed class SimdRandom
     /// </summary>
     public static void SecureFillDoubles(Span<double> destination)
     {
-        int byteCount = destination.Length * 8;
-        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
-        try
+        // Process in chunks to avoid int overflow on byteCount for large spans
+        const int maxChunk = 32768; // 32K doubles = 256KB bytes, safe from overflow
+        int offset = 0;
+        while (offset < destination.Length)
         {
-#if NET8_0_OR_GREATER
-            System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
-#else
-            using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
-            rng.GetBytes(bytes, 0, byteCount);
-#endif
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && destination.Length >= 4)
+            int chunk = Math.Min(maxChunk, destination.Length - offset);
+            int byteCount = chunk * 8;
+            var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
+            try
             {
-                var one = Vector256.Create(1.0);
-                var exponentMask = Vector256.Create(0x3FF0000000000000UL);
-                var mantissaMask = Vector256.Create(0x000FFFFFFFFFFFFFUL);
-
-                int simdLen = destination.Length & ~3;
-                for (; i < simdLen; i += 4)
+#if NET8_0_OR_GREATER
+                System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
+#else
+                using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+                rng.GetBytes(bytes, 0, byteCount);
+#endif
+                int i = 0;
+#if NET5_0_OR_GREATER
+                if (Avx2.IsSupported && chunk >= 4)
                 {
-                    // Load 4 x 8 bytes as 4 ulongs
-                    var raw = Unsafe.ReadUnaligned<Vector256<ulong>>(
-                        ref bytes[i * 8]);
-                    var shifted = Avx2.ShiftRightLogical(raw, 12);
-                    var bits = Avx2.Or(Avx2.And(shifted, mantissaMask), exponentMask);
-                    var doubles = Avx.Subtract(bits.AsDouble(), one);
-                    Unsafe.WriteUnaligned(
-                        ref Unsafe.As<double, byte>(ref destination[i]),
-                        doubles);
+                    var one = Vector256.Create(1.0);
+                    var exponentMask = Vector256.Create(0x3FF0000000000000UL);
+                    var mantissaMask = Vector256.Create(0x000FFFFFFFFFFFFFUL);
+
+                    int simdLen = chunk & ~3;
+                    for (; i < simdLen; i += 4)
+                    {
+                        var raw = Unsafe.ReadUnaligned<Vector256<ulong>>(ref bytes[i * 8]);
+                        var shifted = Avx2.ShiftRightLogical(raw, 12);
+                        var bits = Avx2.Or(Avx2.And(shifted, mantissaMask), exponentMask);
+                        var doubles = Avx.Subtract(bits.AsDouble(), one);
+                        Unsafe.WriteUnaligned(
+                            ref Unsafe.As<double, byte>(ref destination[offset + i]),
+                            doubles);
+                    }
+                }
+#endif
+                for (; i < chunk; i++)
+                {
+                    ulong raw = BitConverter.ToUInt64(bytes, i * 8);
+                    destination[offset + i] = BitConverter.Int64BitsToDouble(
+                        (long)((raw >> 12) | 0x3FF0000000000000UL)) - 1.0;
                 }
             }
-#endif
-            // Scalar tail
-            for (; i < destination.Length; i++)
-            {
-                ulong raw = BitConverter.ToUInt64(bytes, i * 8);
-                destination[i] = BitConverter.Int64BitsToDouble(
-                    (long)((raw >> 12) | 0x3FF0000000000000UL)) - 1.0;
-            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
+            offset += chunk;
         }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
     }
 
     /// <summary>
@@ -397,25 +402,31 @@ public sealed class SimdRandom
     /// </summary>
     public static void SecureFillFloats(Span<float> destination)
     {
-        int byteCount = destination.Length * 4;
-        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
-        try
+        const int maxChunk = 65536; // 64K floats = 256KB bytes
+        int offset = 0;
+        while (offset < destination.Length)
         {
-#if NET8_0_OR_GREATER
-            System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
-#else
-            using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
-            rng.GetBytes(bytes, 0, byteCount);
-#endif
-            for (int i = 0; i < destination.Length; i++)
+            int chunk = Math.Min(maxChunk, destination.Length - offset);
+            int byteCount = chunk * 4;
+            var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
+            try
             {
-                uint raw = BitConverter.ToUInt32(bytes, i * 4);
-                // Use upper 23 bits mapped to [1.0f, 2.0f) then subtract 1.0f
-                int bits = (int)((raw >> 9) | 0x3F800000U);
-                destination[i] = Unsafe.As<int, float>(ref bits) - 1.0f;
+#if NET8_0_OR_GREATER
+                System.Security.Cryptography.RandomNumberGenerator.Fill(bytes.AsSpan(0, byteCount));
+#else
+                using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+                rng.GetBytes(bytes, 0, byteCount);
+#endif
+                for (int i = 0; i < chunk; i++)
+                {
+                    uint raw = BitConverter.ToUInt32(bytes, i * 4);
+                    int bits = (int)((raw >> 9) | 0x3F800000U);
+                    destination[offset + i] = Unsafe.As<int, float>(ref bits) - 1.0f;
+                }
             }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
+            offset += chunk;
         }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
     }
 
     /// <summary>

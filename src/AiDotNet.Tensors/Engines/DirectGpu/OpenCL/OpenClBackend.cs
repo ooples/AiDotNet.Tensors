@@ -10100,23 +10100,26 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
             if (size <= 0) return;
             var data = new float[size];
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            var openClBuffer = (DirectOpenClGpuBuffer)output;
-            fixed (float* ptr = data)
+            try
             {
-                int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                    _defaultStream?.Handle ?? _context.CommandQueue,
-                    openClBuffer.Buffer.Handle,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(size * sizeof(float)),
-                    (IntPtr)ptr, 0, IntPtr.Zero, IntPtr.Zero);
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
+                Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+                float range = max - min;
+                for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+                var openClBuffer = (DirectOpenClGpuBuffer)output;
+                fixed (float* ptr = data)
+                {
+                    int err = OpenClNativeBindings.EnqueueWriteBuffer(
+                        _defaultStream?.Handle ?? _context.CommandQueue,
+                        openClBuffer.Buffer.Handle,
+                        1, // blocking
+                        UIntPtr.Zero,
+                        (UIntPtr)(size * sizeof(float)),
+                        (IntPtr)ptr, 0, IntPtr.Zero, IntPtr.Zero);
+                    if (err != OpenClNativeBindings.CL_SUCCESS)
+                        throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
+                }
             }
-            Array.Clear(data, 0, size);
+            finally { Array.Clear(data, 0, size); }
         }
 
         #endregion

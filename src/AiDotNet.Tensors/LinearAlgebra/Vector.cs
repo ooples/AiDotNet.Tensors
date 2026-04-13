@@ -1052,17 +1052,32 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Creates a new vector of the specified size filled with random values between 0 and 1.
-    /// Uses SimdRandom (xoshiro256** PRNG) for high-throughput ML initialization.
-    /// Not cryptographically secure — use System.Security.Cryptography for security-sensitive applications.
+    /// Creates a new vector of the specified size filled with cryptographically secure random values between 0 and 1.
+    /// Uses SIMD-accelerated bulk crypto RNG for high throughput.
     /// </summary>
     /// <param name="size">The size of the vector to create.</param>
     /// <returns>A new vector filled with random values.</returns>
     /// <remarks>
     /// <para><b>For Beginners:</b> This method creates a vector of a specific size where each element
     /// is a random number between 0 and 1. This is useful for initializing vectors for machine learning algorithms.</para>
+    /// <para>For maximum speed without crypto guarantees, use <see cref="CreateFastRandom(int)"/>.</para>
     /// </remarks>
     public static Vector<T> CreateRandom(int size)
+    {
+        var vector = new Vector<T>(size);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
+
+        return vector;
+    }
+
+    /// <summary>
+    /// Creates a new vector filled with non-cryptographic random values between 0 and 1.
+    /// Uses SimdRandom (xoshiro256** PRNG) for maximum throughput on ML hot paths.
+    /// Not cryptographically secure — use <see cref="CreateRandom(int)"/> for security-sensitive applications.
+    /// </summary>
+    /// <param name="size">The size of the vector to create.</param>
+    /// <returns>A new vector filled with random values.</returns>
+    public static Vector<T> CreateFastRandom(int size)
     {
         var vector = new Vector<T>(size);
         var rng = new Helpers.SimdRandom();

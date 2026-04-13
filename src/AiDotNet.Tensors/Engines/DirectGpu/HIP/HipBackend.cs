@@ -8972,11 +8972,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         if (size <= 0) return;
         var data = new float[size];
-        Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-        float range = max - min;
-        for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-        UploadToBuffer(output, data);
-        Array.Clear(data, 0, size);
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+            float range = max - min;
+            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+            UploadToBuffer(output, data);
+        }
+        finally { Array.Clear(data, 0, size); }
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
