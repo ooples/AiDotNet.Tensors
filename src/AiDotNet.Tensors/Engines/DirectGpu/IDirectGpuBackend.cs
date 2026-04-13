@@ -2246,6 +2246,18 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="seed">Random seed.</param>
     void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed);
 
+    /// <summary>
+    /// Generates cryptographically secure uniform random floats in [min, max).
+    /// Entropy is generated on the host via RandomNumberGenerator + SIMD conversion,
+    /// scaled to [min, max) on the host, then uploaded to the GPU output buffer.
+    /// Output is GPU-resident after the call (no download needed).
+    /// </summary>
+    /// <param name="output">Output buffer [size].</param>
+    /// <param name="size">Number of elements.</param>
+    /// <param name="min">Minimum value (inclusive).</param>
+    /// <param name="max">Maximum value (exclusive).</param>
+    void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max);
+
     #endregion
 
     #region Specialized Layer Operations

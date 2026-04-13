@@ -19595,7 +19595,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorRandomUniform<T>(int[] shape)
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
-        return Tensor<T>.CreateRandom(shape);
+        var tensor = new Tensor<T>(shape);
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniform(tensor.DataVector.AsWritableSpan());
+        return tensor;
     }
 
     /// <inheritdoc/>

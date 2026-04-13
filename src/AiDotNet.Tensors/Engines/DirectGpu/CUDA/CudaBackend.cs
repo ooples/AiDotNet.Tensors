@@ -9369,6 +9369,26 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    {
+        if (size <= 0) return;
+        using var _ = PushContext();
+        var data = new float[size];
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+            float range = max - min;
+            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+            fixed (float* ptr = data)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)ptr, (ulong)(size * sizeof(float))),
+                    "cuMemcpyHtoD (GenerateSecureRandomUniform)");
+            }
+        }
+        finally { Array.Clear(data, 0, size); }
+    }
+
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))

@@ -147,6 +147,18 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a vector by copying data from a span, avoiding the intermediate .ToArray() allocation.
+    /// </summary>
+    /// <param name="span">The span of data to copy into the new vector.</param>
+    /// <returns>A new vector containing a copy of the span data.</returns>
+    public static Vector<T> FromSpan(ReadOnlySpan<T> span)
+    {
+        var vec = new Vector<T>(span.Length, skipZeroInit: true);
+        span.CopyTo(vec.AsWritableSpan());
+        return vec;
+    }
+
+    /// <summary>
     /// Creates a GPU-resident vector with zero CPU allocation.
     /// The backing array is allocated lazily when CPU code first accesses data.
     /// </summary>
@@ -1040,22 +1052,51 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Creates a new vector of the specified size filled with random values between 0 and 1.
+    /// Creates a new vector of the specified size filled with cryptographically secure random values between 0 and 1.
+    /// Uses SIMD-accelerated bulk crypto RNG for high throughput.
     /// </summary>
     /// <param name="size">The size of the vector to create.</param>
     /// <returns>A new vector filled with random values.</returns>
     /// <remarks>
     /// <para><b>For Beginners:</b> This method creates a vector of a specific size where each element
     /// is a random number between 0 and 1. This is useful for initializing vectors for machine learning algorithms.</para>
+    /// <para>For maximum speed without crypto guarantees, use <see cref="CreateFastRandom(int)"/>.</para>
     /// </remarks>
     public static Vector<T> CreateRandom(int size)
     {
-        Vector<T> vector = new(size);
-        var random = RandomHelper.CreateSecureRandom();
-        for (int i = 0; i < size; i++)
-        {
-            vector[i] = _numOps.FromDouble(random.NextDouble());
-        }
+        var vector = new Vector<T>(size);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
+
+        return vector;
+    }
+
+    /// <summary>
+    /// Creates a new vector filled with non-cryptographic random values between 0 and 1.
+    /// Uses SimdRandom (xoshiro256** PRNG) for maximum throughput on ML hot paths.
+    /// Not cryptographically secure — use <see cref="CreateRandom(int)"/> for security-sensitive applications.
+    /// </summary>
+    /// <param name="size">The size of the vector to create.</param>
+    /// <returns>A new vector filled with random values.</returns>
+    public static Vector<T> CreateFastRandom(int size)
+    {
+        var vector = new Vector<T>(size);
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniform(vector.AsWritableSpan());
+
+        return vector;
+    }
+
+    /// <summary>
+    /// Creates a new vector filled with cryptographically secure random values between 0 and 1.
+    /// Use this when security guarantees are required (tokens, keys, salts).
+    /// For ML weight initialization, prefer <see cref="CreateRandom(int)"/> which is faster.
+    /// </summary>
+    /// <param name="size">The size of the vector to create.</param>
+    /// <returns>A new vector filled with cryptographically secure random values.</returns>
+    public static Vector<T> CreateSecureRandom(int size)
+    {
+        var vector = new Vector<T>(size);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
 
         return vector;
     }
@@ -1102,15 +1143,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (min >= max)
             throw new ArgumentException("Minimum value must be less than maximum value");
 
-        var random = RandomHelper.CreateSecureRandom();
         var vector = new Vector<T>(size);
-
-        for (int i = 0; i < size; i++)
-        {
-            // Generate random value between min and max
-            double randomValue = random.NextDouble() * (max - min) + min;
-            vector[i] = _numOps.FromDouble(randomValue);
-        }
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniformRange(vector.AsWritableSpan(), min, max);
 
         return vector;
     }

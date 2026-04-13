@@ -678,19 +678,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (dimensions == null || dimensions.Length == 0)
             throw new ArgumentException("Dimensions cannot be null or empty.", nameof(dimensions));
 
-        var tensor = new Tensor<T>(dimensions);
-        var random = RandomHelper.CreateSecureRandom();
-        var numOps = MathHelper.GetNumericOperations<T>();
-
-        // Use flat indexing for better performance (avoids multi-dimensional index calculation overhead)
-        var flattenedSize = dimensions.Aggregate(1, (a, b) => a * b);
-        for (int i = 0; i < flattenedSize; i++)
-        {
-            // Generate a random value between 0 and 1
-            tensor._data[i] = numOps.FromDouble(random.NextDouble());
-        }
-
-        return tensor;
+        // Route through the engine which has GPU dispatch when a GPU engine is active
+        return Engines.AiDotNetEngine.Current.TensorRandomUniform<T>(dimensions);
     }
 
     /// <summary>

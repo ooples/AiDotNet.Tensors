@@ -522,16 +522,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public static Matrix<T> CreateRandom(int rows, int columns)
     {
-        Matrix<T> matrix = new(rows, columns);
-        var random = RandomHelper.CreateSecureRandom();
-
-        for (int i = 0; i < rows; i++)
-        {
-            for (int j = 0; j < columns; j++)
-            {
-                matrix[i, j] = _numOps.FromDouble(random.NextDouble());
-            }
-        }
+        var matrix = new Matrix<T>(rows, columns);
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniform(matrix.AsWritableSpan());
 
         return matrix;
     }
@@ -603,18 +596,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         if (min >= max)
             throw new ArgumentException("Minimum value must be less than maximum value");
 
-        var random = RandomHelper.CreateSecureRandom();
         var matrix = new Matrix<T>(rows, columns);
-
-        for (int i = 0; i < rows; i++)
-        {
-            for (int j = 0; j < columns; j++)
-            {
-                // Generate random value between min and max
-                double randomValue = random.NextDouble() * (max - min) + min;
-                matrix[i, j] = _numOps.FromDouble(randomValue);
-            }
-        }
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniformRange(matrix.AsWritableSpan(), min, max);
 
         return matrix;
     }

@@ -1168,5 +1168,20 @@ void main() {
         UploadToBuffer(data, output);
     }
 
+    public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var data = new float[size];
+        try
+        {
+            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+            float range = max - min;
+            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+            UploadToBuffer(data, output);
+        }
+        finally { Array.Clear(data, 0, size); }
+    }
+
     #endregion
 }
