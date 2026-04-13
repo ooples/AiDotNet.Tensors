@@ -212,41 +212,108 @@ public sealed class SimdRandom
     /// <summary>
     /// Fills a span with uniform random values in [0, 1), using type-specialized
     /// direct writes for float/double to avoid per-element NumOps.FromDouble overhead.
-    /// </summary>
-    /// <summary>
-    /// Fills a span with uniform random values in [0, 1), using type-specialized
-    /// direct writes for float/double to avoid per-element NumOps.FromDouble overhead.
+    /// Not cryptographically secure — uses xoshiro256** PRNG suitable for ML workloads.
     /// </summary>
     public void FillUniform<T>(Span<T> destination)
     {
         if (typeof(T) == typeof(double))
         {
-            // Direct write for double — reinterpret via pinned array
-            var arr = new double[destination.Length];
-            NextDoubles(arr.AsSpan());
-            for (int i2 = 0; i2 < destination.Length; i2++)
-                destination[i2] = Unsafe.As<double, T>(ref arr[i2]);
+            // Chunk-fill doubles directly via Unsafe.As — no full-size temp array
+            const int chunk = 256;
+            var buf = new double[chunk];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int n = Math.Min(chunk, destination.Length - i);
+                NextDoubles(buf.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
+                    destination[i + j] = Unsafe.As<double, T>(ref buf[j]);
+                i += n;
+            }
         }
         else if (typeof(T) == typeof(float))
         {
-            var arr = new float[destination.Length];
-            NextFloats(arr.AsSpan());
-            for (int i2 = 0; i2 < destination.Length; i2++)
-                destination[i2] = Unsafe.As<float, T>(ref arr[i2]);
+            const int chunk = 256;
+            var buf = new float[chunk];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int n = Math.Min(chunk, destination.Length - i);
+                NextFloats(buf.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
+                    destination[i + j] = Unsafe.As<float, T>(ref buf[j]);
+                i += n;
+            }
         }
         else
         {
-            // Fallback: batch-generate doubles then convert via NumOps
             var numOps = MathHelper.GetNumericOperations<T>();
             var temp = new double[Math.Min(256, destination.Length)];
             int i = 0;
             while (i < destination.Length)
             {
-                int chunk = Math.Min(temp.Length, destination.Length - i);
-                NextDoubles(temp.AsSpan(0, chunk));
-                for (int j = 0; j < chunk; j++)
+                int n = Math.Min(temp.Length, destination.Length - i);
+                NextDoubles(temp.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
                     destination[i + j] = numOps.FromDouble(temp[j]);
-                i += chunk;
+                i += n;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fills a span with uniform random values in [min, max), with type-specialized
+    /// fast paths for float/double that avoid per-element NumOps virtual dispatch.
+    /// </summary>
+    public void FillUniformRange<T>(Span<T> destination, double min, double max)
+    {
+        double range = max - min;
+        if (typeof(T) == typeof(double))
+        {
+            const int chunk = 256;
+            var buf = new double[chunk];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int n = Math.Min(chunk, destination.Length - i);
+                NextDoubles(buf.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
+                {
+                    double val = buf[j] * range + min;
+                    destination[i + j] = Unsafe.As<double, T>(ref val);
+                }
+                i += n;
+            }
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            const int chunk = 256;
+            var buf = new float[chunk];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int n = Math.Min(chunk, destination.Length - i);
+                NextFloats(buf.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
+                {
+                    float val = buf[j] * (float)range + (float)min;
+                    destination[i + j] = Unsafe.As<float, T>(ref val);
+                }
+                i += n;
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var temp = new double[Math.Min(256, destination.Length)];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int n = Math.Min(temp.Length, destination.Length - i);
+                NextDoubles(temp.AsSpan(0, n));
+                for (int j = 0; j < n; j++)
+                    destination[i + j] = numOps.FromDouble(temp[j] * range + min);
+                i += n;
             }
         }
     }

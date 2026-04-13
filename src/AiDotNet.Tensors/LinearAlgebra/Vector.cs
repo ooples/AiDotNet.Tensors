@@ -1053,6 +1053,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
     /// <summary>
     /// Creates a new vector of the specified size filled with random values between 0 and 1.
+    /// Uses SimdRandom (xoshiro256** PRNG) for high-throughput ML initialization.
+    /// Not cryptographically secure — use System.Security.Cryptography for security-sensitive applications.
     /// </summary>
     /// <param name="size">The size of the vector to create.</param>
     /// <returns>A new vector filled with random values.</returns>
@@ -1113,12 +1115,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
         var vector = new Vector<T>(size);
         var rng = new Helpers.SimdRandom();
-        // Fill with [0, 1) then scale to [min, max)
-        rng.FillUniform(vector.AsWritableSpan());
-        double range = max - min;
-        var span = vector.AsWritableSpan();
-        for (int i = 0; i < size; i++)
-            span[i] = _numOps.FromDouble(_numOps.ToDouble(span[i]) * range + min);
+        rng.FillUniformRange(vector.AsWritableSpan(), min, max);
 
         return vector;
     }

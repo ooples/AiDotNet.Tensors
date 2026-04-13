@@ -35,10 +35,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
         /// Set to false to suppress GPU diagnostics for rich terminal UI or batch processing.
-        /// Can also be controlled via AIDOTNET_GPU_VERBOSE environment variable ("false" to disable).
+        /// Controlled via AIDOTNET_GPU_VERBOSE environment variable (accepts true/false/1/0/yes/no/on/off).
+        /// Defaults to true (verbose) when the env var is unset.
         /// </summary>
-        public static bool DiagnosticOutput { get; set; } =
-            !string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_GPU_VERBOSE"), "false", StringComparison.OrdinalIgnoreCase);
+        public static bool DiagnosticOutput { get; set; } = InitDiagnosticOutput();
+
+        private static bool InitDiagnosticOutput()
+        {
+            var val = Environment.GetEnvironmentVariable("AIDOTNET_GPU_VERBOSE");
+            if (string.IsNullOrWhiteSpace(val)) return true;
+            return val.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                   val.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                   val.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+                   val.Equals("on", StringComparison.OrdinalIgnoreCase);
+        }
 
         private DirectOpenClContext? _context;
         private readonly Dictionary<string, DirectOpenClKernel> _kernelCache;
@@ -4318,7 +4328,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (EnableTuningDiagnostics)
             {
                 if (DiagnosticOutput) Console.WriteLine("[GPU Capabilities]");
-                Console.Write(capabilities.GetDiagnosticString());
+                if (DiagnosticOutput) Console.Write(capabilities.GetDiagnosticString());
             }
 
             var dataA = new float[M * K];

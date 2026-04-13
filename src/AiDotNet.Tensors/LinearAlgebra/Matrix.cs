@@ -598,12 +598,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         var matrix = new Matrix<T>(rows, columns);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(matrix.AsWritableSpan());
-        double range = max - min;
-        var span = matrix.AsWritableSpan();
-        int total = rows * columns;
-        for (int i = 0; i < total; i++)
-            span[i] = _numOps.FromDouble(_numOps.ToDouble(span[i]) * range + min);
+        rng.FillUniformRange(matrix.AsWritableSpan(), min, max);
 
         return matrix;
     }
