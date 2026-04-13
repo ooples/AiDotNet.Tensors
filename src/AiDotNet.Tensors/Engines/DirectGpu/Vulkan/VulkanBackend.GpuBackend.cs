@@ -1171,15 +1171,13 @@ void main() {
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         EnsureInitialized();
-        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
-            float range = max - min;
-            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
-            UploadToBuffer(hostBuf.AsSpan(0, size).ToArray(), output);
-        }
-        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+        if (size <= 0) return;
+        var data = new float[size];
+        Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+        float range = max - min;
+        for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+        UploadToBuffer(data, output);
+        Array.Clear(data, 0, size);
     }
 
     #endregion

@@ -8970,17 +8970,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
-        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
-            float range = max - min;
-            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
-            var temp = AllocateBuffer(hostBuf.AsSpan(0, size).ToArray());
-            try { Copy(temp, 0, output, 0, size); }
-            finally { temp.Dispose(); }
-        }
-        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+        if (size <= 0) return;
+        var data = new float[size];
+        Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+        float range = max - min;
+        for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+        UploadToBuffer(output, data);
+        Array.Clear(data, 0, size);
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)

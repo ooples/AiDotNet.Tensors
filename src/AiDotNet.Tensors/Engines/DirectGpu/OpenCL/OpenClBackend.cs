@@ -56,7 +56,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private static void WriteDiag(string message)
         {
-            WriteDiag(message);
+            if (DiagnosticOutput) Console.WriteLine(message);
         }
 
         private DirectOpenClContext? _context;
@@ -10095,20 +10095,28 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(numThreads, Math.Min(256, numThreads));
         }
 
-        public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+        public unsafe void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
-            var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
-            try
+            if (size <= 0) return;
+            var data = new float[size];
+            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+            float range = max - min;
+            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+            var openClBuffer = (DirectOpenClGpuBuffer)output;
+            fixed (float* ptr = data)
             {
-                Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
-                float range = max - min;
-                for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
-                var temp = AllocateBuffer(hostBuf.AsSpan(0, size).ToArray());
-                try { Copy(temp, 0, output, 0, size); }
-                finally { temp.Dispose(); }
+                int err = OpenClNativeBindings.EnqueueWriteBuffer(
+                    _defaultStream?.Handle ?? _context.CommandQueue,
+                    openClBuffer.Buffer.Handle,
+                    1, // blocking
+                    UIntPtr.Zero,
+                    (UIntPtr)(size * sizeof(float)),
+                    (IntPtr)ptr, 0, IntPtr.Zero, IntPtr.Zero);
+                if (err != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
             }
-            finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+            Array.Clear(data, 0, size);
         }
 
         #endregion

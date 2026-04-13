@@ -389,7 +389,7 @@ public sealed class SimdRandom
                     (long)((raw >> 12) | 0x3FF0000000000000UL)) - 1.0;
             }
         }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes); }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
     }
 
     /// <summary>
@@ -415,7 +415,7 @@ public sealed class SimdRandom
                 destination[i] = Unsafe.As<int, float>(ref bits) - 1.0f;
             }
         }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes); }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bytes, clearArray: true); }
     }
 
     /// <summary>
@@ -441,7 +441,7 @@ public sealed class SimdRandom
                     i += n;
                 }
             }
-            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf, clearArray: true); }
         }
         else if (typeof(T) == typeof(float))
         {
@@ -459,7 +459,7 @@ public sealed class SimdRandom
                     i += n;
                 }
             }
-            finally { System.Buffers.ArrayPool<float>.Shared.Return(buf); }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(buf, clearArray: true); }
         }
         else
         {
@@ -478,7 +478,7 @@ public sealed class SimdRandom
                     i += n;
                 }
             }
-            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf); }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(buf, clearArray: true); }
         }
     }
 

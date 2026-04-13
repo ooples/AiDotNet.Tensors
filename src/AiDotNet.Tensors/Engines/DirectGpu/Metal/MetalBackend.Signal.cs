@@ -510,15 +510,13 @@ public sealed partial class MetalBackend
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         ThrowIfDisposed();
-        var hostBuf = System.Buffers.ArrayPool<float>.Shared.Rent(size);
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(hostBuf.AsSpan(0, size));
-            float range = max - min;
-            for (int i = 0; i < size; i++) hostBuf[i] = hostBuf[i] * range + min;
-            UploadToBuffer(output, hostBuf.AsSpan(0, size).ToArray());
-        }
-        finally { System.Buffers.ArrayPool<float>.Shared.Return(hostBuf); }
+        if (size <= 0) return;
+        var data = new float[size];
+        Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
+        float range = max - min;
+        for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
+        UploadToBuffer(output, data);
+        Array.Clear(data, 0, size);
     }
 
     #endregion
