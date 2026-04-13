@@ -147,6 +147,18 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a vector by copying data from a span, avoiding the intermediate .ToArray() allocation.
+    /// </summary>
+    /// <param name="span">The span of data to copy into the new vector.</param>
+    /// <returns>A new vector containing a copy of the span data.</returns>
+    public static Vector<T> FromSpan(ReadOnlySpan<T> span)
+    {
+        var vec = new Vector<T>(span.Length, skipZeroInit: true);
+        span.CopyTo(vec.AsWritableSpan());
+        return vec;
+    }
+
+    /// <summary>
     /// Creates a GPU-resident vector with zero CPU allocation.
     /// The backing array is allocated lazily when CPU code first accesses data.
     /// </summary>
@@ -1050,12 +1062,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Vector<T> CreateRandom(int size)
     {
-        Vector<T> vector = new(size);
-        var random = RandomHelper.CreateSecureRandom();
-        for (int i = 0; i < size; i++)
-        {
-            vector[i] = _numOps.FromDouble(random.NextDouble());
-        }
+        var vector = new Vector<T>(size);
+        var rng = new Helpers.SimdRandom();
+        rng.FillUniform(vector.AsWritableSpan());
 
         return vector;
     }
@@ -1102,15 +1111,14 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (min >= max)
             throw new ArgumentException("Minimum value must be less than maximum value");
 
-        var random = RandomHelper.CreateSecureRandom();
         var vector = new Vector<T>(size);
-
+        var rng = new Helpers.SimdRandom();
+        // Fill with [0, 1) then scale to [min, max)
+        rng.FillUniform(vector.AsWritableSpan());
+        double range = max - min;
+        var span = vector.AsWritableSpan();
         for (int i = 0; i < size; i++)
-        {
-            // Generate random value between min and max
-            double randomValue = random.NextDouble() * (max - min) + min;
-            vector[i] = _numOps.FromDouble(randomValue);
-        }
+            span[i] = _numOps.FromDouble(_numOps.ToDouble(span[i]) * range + min);
 
         return vector;
     }

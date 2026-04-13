@@ -46,10 +46,13 @@ public sealed class SimdRandom
         }
     }
 
+    private static int _seedCounter = Environment.TickCount;
+
     /// <summary>
-    /// Creates a new SIMD random generator with a random seed.
+    /// Creates a new SIMD random generator with a unique random seed.
+    /// Each call produces a different seed via atomic increment.
     /// </summary>
-    public SimdRandom() : this(Environment.TickCount) { }
+    public SimdRandom() : this(System.Threading.Interlocked.Increment(ref _seedCounter)) { }
 
     /// <summary>
     /// Fills a span with uniform random doubles in [0, 1).
@@ -204,6 +207,48 @@ public sealed class SimdRandom
         _s3[0] = RotateLeft64(_s3[0], 45);
 
         return d;
+    }
+
+    /// <summary>
+    /// Fills a span with uniform random values in [0, 1), using type-specialized
+    /// direct writes for float/double to avoid per-element NumOps.FromDouble overhead.
+    /// </summary>
+    /// <summary>
+    /// Fills a span with uniform random values in [0, 1), using type-specialized
+    /// direct writes for float/double to avoid per-element NumOps.FromDouble overhead.
+    /// </summary>
+    public void FillUniform<T>(Span<T> destination)
+    {
+        if (typeof(T) == typeof(double))
+        {
+            // Direct write for double — reinterpret via pinned array
+            var arr = new double[destination.Length];
+            NextDoubles(arr.AsSpan());
+            for (int i2 = 0; i2 < destination.Length; i2++)
+                destination[i2] = Unsafe.As<double, T>(ref arr[i2]);
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            var arr = new float[destination.Length];
+            NextFloats(arr.AsSpan());
+            for (int i2 = 0; i2 < destination.Length; i2++)
+                destination[i2] = Unsafe.As<float, T>(ref arr[i2]);
+        }
+        else
+        {
+            // Fallback: batch-generate doubles then convert via NumOps
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var temp = new double[Math.Min(256, destination.Length)];
+            int i = 0;
+            while (i < destination.Length)
+            {
+                int chunk = Math.Min(temp.Length, destination.Length - i);
+                NextDoubles(temp.AsSpan(0, chunk));
+                for (int j = 0; j < chunk; j++)
+                    destination[i + j] = numOps.FromDouble(temp[j]);
+                i += chunk;
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
