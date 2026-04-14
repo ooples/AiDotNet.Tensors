@@ -1,0 +1,288 @@
+// Validating benchmarks:
+// ***** BenchmarkRunner: Start   *****
+// ***** Found 2 benchmark(s) in total *****
+// ***** Building 1 exe(s) in Parallel: Start   *****
+// start dotnet  restore --nodeReuse:false /p:UseSharedCompilation=false /p:Deterministic=true /p:Optimize=true /p:ArtifactsPath="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1/" /p:OutDir="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0/" /p:OutputPath="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0/" /p:PublishDir="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\publish/" in C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1
+// command took 1.73 sec and exited with 0
+// start dotnet  build -c Release --no-restore --nodeReuse:false /p:UseSharedCompilation=false /p:Deterministic=true /p:Optimize=true /p:ArtifactsPath="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1/" /p:OutDir="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0/" /p:OutputPath="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0/" /p:PublishDir="C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\publish/" --output "C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0/" in C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1
+// command took 29.48 sec and exited with 0
+// ***** Done, took 00:00:31 (31.28 sec)   *****
+// Found 2 benchmarks:
+//   DitXLSdpaBenchmarks.'SDPA DiT-XL [4,16,256,72]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+//   DitXLSdpaBenchmarks.'SDPA small [1,8,128,64]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+
+Setup power plan (GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c FriendlyName: High performance)
+// **************************
+// Benchmark: DitXLSdpaBenchmarks.'SDPA DiT-XL [4,16,256,72]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+// *** Execute ***
+// Launch: 1 / 1
+// Execute: dotnet AiDotNet.Tensors.Benchmarks-1.dll --anonymousPipes 1404 1296 --benchmarkName AiDotNet.Tensors.Benchmarks.DitXLSdpaBenchmarks.SDPA_DitXL --job "Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3" --benchmarkId 0 in C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0
+// BeforeAnythingElse
+
+// Benchmark Process Environment Information:
+// BenchmarkDotNet v0.15.8
+// Runtime=.NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3
+// GC=Concurrent Workstation
+// HardwareIntrinsics=AVX2+BMI1+BMI2+F16C+FMA+LZCNT+MOVBE,AVX,SSE3+SSSE3+SSE4.1+SSE4.2+POPCNT,X86Base+SSE+SSE2,AES+PCLMUL VectorSize=256
+// Job: Job-UWLSOM(IterationCount=10, LaunchCount=1, WarmupCount=3)
+
+OverheadJitting  1: 1 op, 242900.00 ns, 242.9000 us/op
+WorkloadJitting  1: 1 op, 2581994500.00 ns, 2.5820 s/op
+
+OverheadJitting  2: 1 op, 500.00 ns, 500.0000 ns/op
+WorkloadJitting  2: 1 op, 25175400.00 ns, 25.1754 ms/op
+
+OverheadJitting  3: 16 op, 869000.00 ns, 54.3125 us/op
+WorkloadJitting  3: 16 op, 811955900.00 ns, 50.7472 ms/op
+
+WorkloadPilot    1: 16 op, 366082700.00 ns, 22.8802 ms/op
+WorkloadPilot    2: 32 op, 1595339400.00 ns, 49.8544 ms/op
+
+OverheadWarmup   1: 32 op, 2100.00 ns, 65.6250 ns/op
+OverheadWarmup   2: 32 op, 1500.00 ns, 46.8750 ns/op
+OverheadWarmup   3: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadWarmup   4: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadWarmup   5: 32 op, 1500.00 ns, 46.8750 ns/op
+OverheadWarmup   6: 32 op, 1100.00 ns, 34.3750 ns/op
+OverheadWarmup   7: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadWarmup   8: 32 op, 500.00 ns, 15.6250 ns/op
+OverheadWarmup   9: 32 op, 500.00 ns, 15.6250 ns/op
+
+OverheadActual   1: 32 op, 700.00 ns, 21.8750 ns/op
+OverheadActual   2: 32 op, 1000.00 ns, 31.2500 ns/op
+OverheadActual   3: 32 op, 1100.00 ns, 34.3750 ns/op
+OverheadActual   4: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual   5: 32 op, 700.00 ns, 21.8750 ns/op
+OverheadActual   6: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual   7: 32 op, 500.00 ns, 15.6250 ns/op
+OverheadActual   8: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual   9: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual  10: 32 op, 700.00 ns, 21.8750 ns/op
+OverheadActual  11: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual  12: 32 op, 500.00 ns, 15.6250 ns/op
+OverheadActual  13: 32 op, 500.00 ns, 15.6250 ns/op
+OverheadActual  14: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual  15: 32 op, 1300.00 ns, 40.6250 ns/op
+OverheadActual  16: 32 op, 800.00 ns, 25.0000 ns/op
+OverheadActual  17: 32 op, 500.00 ns, 15.6250 ns/op
+OverheadActual  18: 32 op, 700.00 ns, 21.8750 ns/op
+OverheadActual  19: 32 op, 600.00 ns, 18.7500 ns/op
+OverheadActual  20: 32 op, 500.00 ns, 15.6250 ns/op
+
+WorkloadWarmup   1: 32 op, 3825352600.00 ns, 119.5423 ms/op
+WorkloadWarmup   2: 32 op, 1477531100.00 ns, 46.1728 ms/op
+WorkloadWarmup   3: 32 op, 711493200.00 ns, 22.2342 ms/op
+
+// BeforeActualRun
+WorkloadActual   1: 32 op, 717715000.00 ns, 22.4286 ms/op
+WorkloadActual   2: 32 op, 761647100.00 ns, 23.8015 ms/op
+WorkloadActual   3: 32 op, 813387800.00 ns, 25.4184 ms/op
+WorkloadActual   4: 32 op, 818531100.00 ns, 25.5791 ms/op
+WorkloadActual   5: 32 op, 795649000.00 ns, 24.8640 ms/op
+WorkloadActual   6: 32 op, 816740300.00 ns, 25.5231 ms/op
+WorkloadActual   7: 32 op, 811905000.00 ns, 25.3720 ms/op
+WorkloadActual   8: 32 op, 793800200.00 ns, 24.8063 ms/op
+WorkloadActual   9: 32 op, 817548600.00 ns, 25.5484 ms/op
+WorkloadActual  10: 32 op, 815031000.00 ns, 25.4697 ms/op
+
+// AfterActualRun
+WorkloadResult   1: 32 op, 717714400.00 ns, 22.4286 ms/op
+WorkloadResult   2: 32 op, 761646500.00 ns, 23.8015 ms/op
+WorkloadResult   3: 32 op, 813387200.00 ns, 25.4184 ms/op
+WorkloadResult   4: 32 op, 818530500.00 ns, 25.5791 ms/op
+WorkloadResult   5: 32 op, 795648400.00 ns, 24.8640 ms/op
+WorkloadResult   6: 32 op, 816739700.00 ns, 25.5231 ms/op
+WorkloadResult   7: 32 op, 811904400.00 ns, 25.3720 ms/op
+WorkloadResult   8: 32 op, 793799600.00 ns, 24.8062 ms/op
+WorkloadResult   9: 32 op, 817548000.00 ns, 25.5484 ms/op
+WorkloadResult  10: 32 op, 815030400.00 ns, 25.4697 ms/op
+// GC:  18 18 18 1913210240 32
+// Threading:  1356 11 32
+
+// AfterAll
+// Benchmark Process 21616 has exited with code 0.
+
+Mean = 24.881 ms, StdErr = 0.323 ms (1.30%), N = 10, StdDev = 1.022 ms
+Min = 22.429 ms, Q1 = 24.821 ms, Median = 25.395 ms, Q3 = 25.510 ms, Max = 25.579 ms
+IQR = 0.689 ms, LowerFence = 23.787 ms, UpperFence = 26.543 ms
+ConfidenceInterval = [23.335 ms; 26.427 ms] (CI 99.9%), Margin = 1.546 ms (6.21% of Mean)
+Skewness = -1.37, Kurtosis = 3.52, MValue = 2
+
+// ** Remained 1 (50.0%) benchmark(s) to run. Estimated finish 2026-04-14 15:12 (0h 0m from now) **
+Setup power plan (GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c FriendlyName: High performance)
+// **************************
+// Benchmark: DitXLSdpaBenchmarks.'SDPA small [1,8,128,64]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+// *** Execute ***
+// Launch: 1 / 1
+// Execute: dotnet AiDotNet.Tensors.Benchmarks-1.dll --anonymousPipes 1372 1304 --benchmarkName AiDotNet.Tensors.Benchmarks.DitXLSdpaBenchmarks.SDPA_Small --job "Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3" --benchmarkId 1 in C:\Users\cheat\source\repos\AiDotNet.Tensors-mkl-replacement\tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks-1\bin\Release\net10.0
+// BeforeAnythingElse
+
+// Benchmark Process Environment Information:
+// BenchmarkDotNet v0.15.8
+// Runtime=.NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3
+// GC=Concurrent Workstation
+// HardwareIntrinsics=AVX2+BMI1+BMI2+F16C+FMA+LZCNT+MOVBE,AVX,SSE3+SSSE3+SSE4.1+SSE4.2+POPCNT,X86Base+SSE+SSE2,AES+PCLMUL VectorSize=256
+// Job: Job-UWLSOM(IterationCount=10, LaunchCount=1, WarmupCount=3)
+
+OverheadJitting  1: 1 op, 210500.00 ns, 210.5000 us/op
+WorkloadJitting  1: 1 op, 649534200.00 ns, 649.5342 ms/op
+
+OverheadJitting  2: 1 op, 200.00 ns, 200.0000 ns/op
+WorkloadJitting  2: 1 op, 1409500.00 ns, 1.4095 ms/op
+
+OverheadJitting  3: 16 op, 838000.00 ns, 52.3750 us/op
+WorkloadJitting  3: 16 op, 17834700.00 ns, 1.1147 ms/op
+
+WorkloadPilot    1: 16 op, 15002200.00 ns, 937.6375 us/op
+WorkloadPilot    2: 32 op, 33587000.00 ns, 1.0496 ms/op
+WorkloadPilot    3: 64 op, 64096500.00 ns, 1.0015 ms/op
+WorkloadPilot    4: 128 op, 345690600.00 ns, 2.7007 ms/op
+WorkloadPilot    5: 256 op, 310359900.00 ns, 1.2123 ms/op
+WorkloadPilot    6: 512 op, 1214268100.00 ns, 2.3716 ms/op
+
+OverheadWarmup   1: 512 op, 4300.00 ns, 8.3984 ns/op
+OverheadWarmup   2: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadWarmup   3: 512 op, 2600.00 ns, 5.0781 ns/op
+OverheadWarmup   4: 512 op, 2500.00 ns, 4.8828 ns/op
+OverheadWarmup   5: 512 op, 2600.00 ns, 5.0781 ns/op
+OverheadWarmup   6: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadWarmup   7: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadWarmup   8: 512 op, 2500.00 ns, 4.8828 ns/op
+OverheadWarmup   9: 512 op, 2600.00 ns, 5.0781 ns/op
+
+OverheadActual   1: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   2: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   3: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   4: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadActual   5: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   6: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadActual   7: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   8: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual   9: 512 op, 2500.00 ns, 4.8828 ns/op
+OverheadActual  10: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadActual  11: 512 op, 2900.00 ns, 5.6641 ns/op
+OverheadActual  12: 512 op, 2700.00 ns, 5.2734 ns/op
+OverheadActual  13: 512 op, 2800.00 ns, 5.4688 ns/op
+OverheadActual  14: 512 op, 2500.00 ns, 4.8828 ns/op
+OverheadActual  15: 512 op, 2700.00 ns, 5.2734 ns/op
+
+WorkloadWarmup   1: 512 op, 676729100.00 ns, 1.3217 ms/op
+WorkloadWarmup   2: 512 op, 619931600.00 ns, 1.2108 ms/op
+WorkloadWarmup   3: 512 op, 649539900.00 ns, 1.2686 ms/op
+
+// BeforeActualRun
+WorkloadActual   1: 512 op, 615122800.00 ns, 1.2014 ms/op
+WorkloadActual   2: 512 op, 534786900.00 ns, 1.0445 ms/op
+WorkloadActual   3: 512 op, 601812400.00 ns, 1.1754 ms/op
+WorkloadActual   4: 512 op, 608165900.00 ns, 1.1878 ms/op
+WorkloadActual   5: 512 op, 625423800.00 ns, 1.2215 ms/op
+WorkloadActual   6: 512 op, 622663700.00 ns, 1.2161 ms/op
+WorkloadActual   7: 512 op, 648028100.00 ns, 1.2657 ms/op
+WorkloadActual   8: 512 op, 644365900.00 ns, 1.2585 ms/op
+WorkloadActual   9: 512 op, 563660300.00 ns, 1.1009 ms/op
+WorkloadActual  10: 512 op, 486104800.00 ns, 949.4234 us/op
+
+// AfterActualRun
+WorkloadResult   1: 512 op, 615120000.00 ns, 1.2014 ms/op
+WorkloadResult   2: 512 op, 534784100.00 ns, 1.0445 ms/op
+WorkloadResult   3: 512 op, 601809600.00 ns, 1.1754 ms/op
+WorkloadResult   4: 512 op, 608163100.00 ns, 1.1878 ms/op
+WorkloadResult   5: 512 op, 625421000.00 ns, 1.2215 ms/op
+WorkloadResult   6: 512 op, 622660900.00 ns, 1.2161 ms/op
+WorkloadResult   7: 512 op, 648025300.00 ns, 1.2657 ms/op
+WorkloadResult   8: 512 op, 644363100.00 ns, 1.2585 ms/op
+WorkloadResult   9: 512 op, 563657500.00 ns, 1.1009 ms/op
+WorkloadResult  10: 512 op, 486102000.00 ns, 949.4180 us/op
+// GC:  36 36 36 1077394968 512
+// Threading:  4608 12 512
+
+// AfterAll
+// Benchmark Process 41848 has exited with code 0.
+
+Mean = 1.162 ms, StdErr = 0.032 ms (2.75%), N = 10, StdDev = 0.101 ms
+Min = 0.949 ms, Q1 = 1.120 ms, Median = 1.195 ms, Q3 = 1.220 ms, Max = 1.266 ms
+IQR = 0.101 ms, LowerFence = 0.969 ms, UpperFence = 1.371 ms
+ConfidenceInterval = [1.010 ms; 1.315 ms] (CI 99.9%), Margin = 0.153 ms (13.13% of Mean)
+Skewness = -0.88, Kurtosis = 2.39, MValue = 2.57
+
+// ** Remained 0 (0.0%) benchmark(s) to run. Estimated finish 2026-04-14 15:12 (0h 0m from now) **
+Successfully reverted power plan (GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c FriendlyName: High performance)
+// ***** BenchmarkRunner: Finish  *****
+
+// * Export *
+  BenchmarkDotNet.Artifacts\results\AiDotNet.Tensors.Benchmarks.DitXLSdpaBenchmarks-report.csv
+  BenchmarkDotNet.Artifacts\results\AiDotNet.Tensors.Benchmarks.DitXLSdpaBenchmarks-report-github.md
+  BenchmarkDotNet.Artifacts\results\AiDotNet.Tensors.Benchmarks.DitXLSdpaBenchmarks-report.html
+
+// * Detailed results *
+DitXLSdpaBenchmarks.'SDPA DiT-XL [4,16,256,72]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+Runtime = .NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3; GC = Concurrent Workstation
+Mean = 24.881 ms, StdErr = 0.323 ms (1.30%), N = 10, StdDev = 1.022 ms
+Min = 22.429 ms, Q1 = 24.821 ms, Median = 25.395 ms, Q3 = 25.510 ms, Max = 25.579 ms
+IQR = 0.689 ms, LowerFence = 23.787 ms, UpperFence = 26.543 ms
+ConfidenceInterval = [23.335 ms; 26.427 ms] (CI 99.9%), Margin = 1.546 ms (6.21% of Mean)
+Skewness = -1.37, Kurtosis = 3.52, MValue = 2
+-------------------- Histogram --------------------
+[21.806 ms ; 23.179 ms) | @
+[23.179 ms ; 24.570 ms) | @
+[24.570 ms ; 25.815 ms) | @@@@@@@@
+---------------------------------------------------
+
+DitXLSdpaBenchmarks.'SDPA small [1,8,128,64]': Job-BMPORG(Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3)
+Runtime = .NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3; GC = Concurrent Workstation
+Mean = 1.162 ms, StdErr = 0.032 ms (2.75%), N = 10, StdDev = 0.101 ms
+Min = 0.949 ms, Q1 = 1.120 ms, Median = 1.195 ms, Q3 = 1.220 ms, Max = 1.266 ms
+IQR = 0.101 ms, LowerFence = 0.969 ms, UpperFence = 1.371 ms
+ConfidenceInterval = [1.010 ms; 1.315 ms] (CI 99.9%), Margin = 0.153 ms (13.13% of Mean)
+Skewness = -0.88, Kurtosis = 2.39, MValue = 2.57
+-------------------- Histogram --------------------
+[0.888 ms ; 1.011 ms) | @
+[1.011 ms ; 1.134 ms) | @@
+[1.134 ms ; 1.282 ms) | @@@@@@@
+---------------------------------------------------
+
+// * Summary *
+
+BenchmarkDotNet v0.15.8, Windows 11 (10.0.26220.8165)
+AMD Ryzen 9 3950X 3.70GHz, 1 CPU, 32 logical and 16 physical cores
+.NET SDK 10.0.201
+  [Host]     : .NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3
+  Job-BMPORG : .NET 10.0.5 (10.0.5, 10.0.526.15411), X64 RyuJIT x86-64-v3
+
+Runtime=.NET 10.0  IterationCount=10  LaunchCount=1  
+WarmupCount=3  
+
+| Method                      | Mean      | Error     | StdDev    | Gen0     | Gen1     | Gen2     | Allocated |
+|---------------------------- |----------:|----------:|----------:|---------:|---------:|---------:|----------:|
+| 'SDPA DiT-XL [4,16,256,72]' | 24.881 ms | 1.5457 ms | 1.0224 ms | 562.5000 | 562.5000 | 562.5000 |  57.02 MB |
+| 'SDPA small [1,8,128,64]'   |  1.162 ms | 0.1526 ms | 0.1009 ms |  70.3125 |  70.3125 |  70.3125 |   2.01 MB |
+
+// * Hints *
+Outliers
+  DitXLSdpaBenchmarks.'SDPA DiT-XL [4,16,256,72]': Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3 -> 1 outlier  was  detected (22.43 ms)
+  DitXLSdpaBenchmarks.'SDPA small [1,8,128,64]': Runtime=.NET 10.0, IterationCount=10, LaunchCount=1, WarmupCount=3   -> 1 outlier  was  detected (949.42 us)
+// * Config Issues *
+
+// * Warnings *
+Configuration
+  Summary -> The exporter MarkdownExporter-github is already present in configuration. There may be unexpected results.
+
+// * Legends *
+  Mean      : Arithmetic mean of all measurements
+  Error     : Half of 99.9% confidence interval
+  StdDev    : Standard deviation of all measurements
+  Gen0      : GC Generation 0 collects per 1000 operations
+  Gen1      : GC Generation 1 collects per 1000 operations
+  Gen2      : GC Generation 2 collects per 1000 operations
+  Allocated : Allocated memory per single operation (managed only, inclusive, 1KB = 1024B)
+  1 ms      : 1 Millisecond (0.001 sec)
+
+// * Diagnostic Output - MemoryDiagnoser *
+
+
+// ***** BenchmarkRunner: End *****
+Run time: 00:00:35 (35.41 sec), executed benchmarks: 2
+
+Global total time: 00:01:07 (67.39 sec), executed benchmarks: 2
+// * Artifacts cleanup *
+Artifacts cleanup is finished

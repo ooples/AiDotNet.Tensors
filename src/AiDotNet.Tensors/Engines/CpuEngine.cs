@@ -14710,6 +14710,8 @@ public class CpuEngine : ITensorLevelEngine
 
         // Stride-aware: attention QKV often come from reshape+transpose views
         if (!value.IsContiguous) value = value.Contiguous();
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
 
         // Expected shapes: [batch, heads, seq, d_k] for Q, K and [batch, heads, seq, d_v] for V
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
@@ -14732,6 +14734,32 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute scale factor
         double scaleVal = scale ?? (1.0 / Math.Sqrt(d_k));
+
+        // ────────────────────────────────────────────────────────────────────
+        // Fast path for float: BLAS-backed batched GEMM per head.
+        //
+        // Replaces the scalar virtual-dispatch triple-loop that was dominating
+        // DiT-XL forward wall clock (Issue #162). For DiT-XL at B=4, H=16,
+        // seq=256, d_k=72, the old path ran ~75M virtual-dispatch FMAs per
+        // SDPA call × 28 blocks = tens of seconds per forward; the BLAS path
+        // executes the same FMAs as two batched SGEMMs (Q@K^T then P@V) per
+        // head, parallel over batch*heads.
+        //
+        // The float path handles the 99% case. Double and other numeric types
+        // fall through to the original scalar code below (preserves exact
+        // existing behavior for generic T).
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            return ScaledDotProductAttentionFloat(
+                (Tensor<float>)(object)query,
+                (Tensor<float>)(object)key,
+                (Tensor<float>)(object)value,
+                mask, scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out attentionWeights);
+        }
+
         T scaleFactor = numOps.FromDouble(scaleVal);
 
         // Compute attention scores: Q @ K^T -> [batch, heads, seqQ, seqK]
@@ -14834,6 +14862,133 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         return TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+    }
+
+    /// <summary>
+    /// BLAS-backed float-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
+    /// Replaces the scalar virtual-dispatch triple-loop with two batched SGEMMs per head
+    /// (Q·K^T then P·V), parallelized across batch*heads. Expected to collapse the
+    /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
+    /// pass (Issue #162).
+    /// </summary>
+    private Tensor<T> ScaledDotProductAttentionFloat<T>(
+        Tensor<float> query,
+        Tensor<float> key,
+        Tensor<float> value,
+        Tensor<bool>? mask,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<T> attentionWeights)
+    {
+        int bhCount = batch * heads;
+        var qf = query.GetFlattenedData();
+        var kf = key.GetFlattenedData();
+        var vf = value.GetDataArray();
+
+        var scoresData  = new float[bhCount * seqQ * seqK];
+        var weightsData = new float[bhCount * seqQ * seqK];
+        var outputData  = new float[bhCount * seqQ * d_v];
+
+        float scaleF  = (float)scaleValue;
+        float negInfF = float.NegativeInfinity;
+
+        // Process each batch-head slice in parallel. Each slice is two independent
+        // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
+        // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
+        // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
+        // kernel — not the scalar fallback.
+        Parallel.For(0, bhCount, bh =>
+        {
+            int b = bh / heads;
+            int h = bh % heads;
+
+            int qOff = bh * seqQ * d_k;
+            int kOff = bh * seqK * d_k;
+            int sOff = bh * seqQ * seqK;
+
+            // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
+            // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
+            // to pre-transposing K and calling SimdGemm.Sgemm.
+            bool gemmed = BlasProvider.TryGemmEx(
+                m: seqQ, n: seqK, k: d_k,
+                a: qf, aOffset: qOff, lda: d_k, transA: false,
+                b: kf, bOffset: kOff, ldb: d_k, transB: true,
+                c: scoresData, cOffset: sOff, ldc: seqK);
+            if (!gemmed)
+            {
+                // Manual K^T for this head, then SimdGemm (AVX2 blocked).
+                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kf[kOff + i * d_k + j];
+                    Engines.Simd.SimdGemm.Sgemm(
+                        qf.AsSpan(qOff, seqQ * d_k),
+                        kt.AsSpan(0, d_k * seqK),
+                        scoresData.AsSpan(sOff, seqQ * seqK),
+                        seqQ, d_k, seqK);
+                }
+                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
+            }
+
+            // ──── Step 2: fused scale + mask + numerically-stable softmax,
+            // row-wise over the [seqQ, seqK] scores matrix for this head.
+            for (int i = 0; i < seqQ; i++)
+            {
+                int rowOff = sOff + i * seqK;
+                // First pass: scale in-place, mask, and find row max.
+                float maxVal = negInfF;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float v = scoresData[rowOff + j] * scaleF;
+                    if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                    if (v > maxVal) maxVal = v;
+                    scoresData[rowOff + j] = v;
+                }
+                // Second pass: exp(v - max), sum.
+                float sumExp = 0f;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                    weightsData[rowOff + j] = e;
+                    sumExp += e;
+                }
+                // Third pass: normalize. Use 1/sumExp to turn N divides into N muls.
+                float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                for (int j = 0; j < seqK; j++)
+                    weightsData[rowOff + j] *= inv;
+            }
+
+            // ──── Step 3: output = weights @ V, via BLAS (no transpose).
+            int wOff = bh * seqQ * seqK;
+            int vOff = bh * seqK * d_v;
+            int oOff = bh * seqQ * d_v;
+            bool gemmed2 = BlasProvider.TryGemmEx(
+                m: seqQ, n: d_v, k: seqK,
+                a: weightsData, aOffset: wOff, lda: seqK, transA: false,
+                b: vf, bOffset: vOff, ldb: d_v, transB: false,
+                c: outputData, cOffset: oOff, ldc: d_v);
+            if (!gemmed2)
+            {
+                Engines.Simd.SimdGemm.Sgemm(
+                    weightsData.AsSpan(wOff, seqQ * seqK),
+                    vf.AsSpan(vOff, seqK * d_v),
+                    outputData.AsSpan(oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
+            }
+        });
+
+        // Wrap the float[] buffers back into the generic Tensor<T> shape.
+        // T is guaranteed to be float at this point by the typeof check in the caller.
+        var weightsT = (float[])(object)weightsData;
+        var outputT  = (float[])(object)outputData;
+        attentionWeights = TensorAllocator.Rent<T>(
+            new[] { batch, heads, seqQ, seqK },
+            new Vector<T>((T[])(object)weightsT));
+        return TensorAllocator.Rent<T>(
+            new[] { batch, heads, seqQ, d_v },
+            new Vector<T>((T[])(object)outputT));
     }
 
     /// <summary>

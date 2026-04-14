@@ -262,6 +262,15 @@ class Program
             return;
         }
 
+        // DiT-XL SDPA benchmark: measures ScaledDotProductAttention at the exact
+        // 4D shape DiT-XL exercises, to verify the Issue #162 BLAS-backed fast
+        // path eliminates the scalar virtual-dispatch wall clock. (~1-2min).
+        if (args[0] == "--dit-xl-sdpa")
+        {
+            BenchmarkRunner.Run<DitXLSdpaBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
         if (args[0] == "--vs-tensorcodec-gaps")
         {
