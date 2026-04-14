@@ -509,11 +509,48 @@ internal static class CpuJitKernels
             // Save R8 (C pointer) into R10 — we'll need R8 pristine for C stores later
             e.MovRR(X86Emitter.R10, X86Emitter.R8);
 
-            // Iter 17: 2x-unrolled K loop. Each loop body processes 2 K iterations
-            // back-to-back, giving the OoO engine more instruction-level parallelism
-            // and halving the loop overhead. Pointer advances: A += 48 (2*Mr*4),
-            // B += 128 (2*Nr*4), counter decrements by 2. If kc is odd, handle the
-            // last iteration after the main loop with a scalar-style single step.
+            // Iter 18c: full K-unroll for small kc.
+            //
+            // For kc ≤ FullUnrollKcThreshold, emit all K iterations as straight-line code
+            // with constant displacements. No loop counter, no backward branch, no loop-
+            // closing overhead per K. libxsmm's signature optimization — eliminates the
+            // ~1 cycle branch cost × kc branches (≈ 128 cycles on kc=128 that we were
+            // paying per micro-kernel call) and lets the OoO engine see the entire FMA
+            // chain as one basic block.
+            //
+            // Threshold rationale: 128 K iterations × 14 instructions/iter ≈ 1800 instructions
+            // ≈ 15 KB of code per kernel. Zen 2 L1I is 32 KB, so a few co-resident kernels
+            // stay hot. For kc > 128 we fall back to the iter-17 2×-unrolled loop whose
+            // shorter body fits more easily.
+            //
+            // Target shapes that benefit from full unroll:
+            //   - Per-head attention Q·K^T [256,72]×[72,256]: kc=72 (fully unrolled)
+            //   - Per-head attention A·V [256,256]×[256,72]: kc=256 (falls back to 2×-loop)
+            //   - DiT-block Square 1152²: kc=512 (2×-loop)
+            const int FullUnrollKcThreshold = 128;
+
+            if (kc <= FullUnrollKcThreshold)
+            {
+                // Straight-line code: emit kc K-iterations back-to-back with constant
+                // displacements off RCX (A) and RDX (B). No pointer advance, no loop
+                // counter, no Jne branch. RCX/RDX stay pointing at the panel base.
+                for (int p = 0; p < kc; p++)
+                {
+                    EmitGemmKIteration(e, p * Mr_bytes, p * Nr_bytes);
+                }
+
+                // Store accumulators into C as the final step.
+                EmitGemmAccumStore(e, ldcBytes);
+                e.Epilogue();
+                return e.Build();
+            }
+
+            // kc > FullUnrollKcThreshold — use the iter-17 2×-unrolled loop.
+            // Each loop body processes 2 K iterations back-to-back, giving the OoO engine
+            // more instruction-level parallelism and halving the loop overhead. Pointer
+            // advances: A += 48 (2*Mr*4), B += 128 (2*Nr*4), counter decrements by 2. If
+            // kc is odd, handle the last iteration after the main loop with a scalar-style
+            // single step.
             int unrolledIters = kc / 2;
             int tail = kc & 1;
 
@@ -666,6 +703,66 @@ internal static class CpuJitKernels
         // Store back
         e.VmovupsStore(X86Emitter.YMM14, baseReg, disp);
         e.VmovupsStore(X86Emitter.YMM15, baseReg, disp + 32);
+    }
+
+    // Iter 18c helpers: emit the core single-K-iteration FMA block and the final
+    // C store phase. Separated so the full-unroll path can emit many K-iterations
+    // back-to-back without the 2×-loop wrapper.
+
+    // Stride constants used by the full-unroll emit (displacements into packedA/packedB).
+    private const int Mr_bytes = 24;  // Mr=6 × sizeof(float)
+    private const int Nr_bytes = 64;  // Nr=16 × sizeof(float)
+
+    /// <summary>
+    /// Emit one K-iteration's worth of the 6×16 FMA kernel at the given A/B displacements.
+    /// Uses YMM0..YMM11 as the 12 accumulators, YMM12/YMM13 for B loads, YMM14 for A broadcasts.
+    /// RCX holds the packedA base, RDX holds the packedB base.
+    /// </summary>
+    private static void EmitGemmKIteration(X86Emitter e, int aDisp, int bDisp)
+    {
+        // Load B[p, 0:7] into YMM12, B[p, 8:15] into YMM13
+        e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, bDisp);
+        e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, bDisp + 32);
+
+        // 6 A broadcasts × 2 FMAs each — ping-pongs YMM14 so the JIT (x86 emitter in
+        // this case) emits the broadcasts interleaved with their FMAs.
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 0);
+        e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 4);
+        e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 8);
+        e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 12);
+        e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 16);
+        e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 20);
+        e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+    }
+
+    /// <summary>
+    /// Emit the 6-row C accumulate-and-store phase. R10 holds C base; ldcBytes is the
+    /// pre-computed byte stride between C rows (row * ldcBytes).
+    /// </summary>
+    private static void EmitGemmAccumStore(X86Emitter e, int ldcBytes)
+    {
+        EmitGemmStoreRow(e, X86Emitter.R10, 0, X86Emitter.YMM0, X86Emitter.YMM1);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes, X86Emitter.YMM2, X86Emitter.YMM3);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 2, X86Emitter.YMM4, X86Emitter.YMM5);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 3, X86Emitter.YMM6, X86Emitter.YMM7);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 4, X86Emitter.YMM8, X86Emitter.YMM9);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 5, X86Emitter.YMM10, X86Emitter.YMM11);
     }
 
     /// <summary>
