@@ -234,6 +234,19 @@ internal static class SimdGemm
 
 #if NET5_0_OR_GREATER
     /// <summary>
+    /// Iter 29 (REVERTED): tried a direct no-packing 6×16 FMA path for small
+    /// matmuls (work ≤ 8M, k ≤ 512) to eliminate PackA/PackB overhead on
+    /// per-head attention shapes. The full-6×16 hot path worked, but the
+    /// scalar N-edge fallback (called when n % Nr ≠ 0) catastrophically
+    /// regressed A·V [256,256]×[256,72] from 163µs → 909µs (5.6× slower)
+    /// because the per-tile scalar loop ran 516K scalar FMAs at ~1 per cycle
+    /// for the 8-wide N tail. Reverted. The correct fix would be a fully
+    /// vectorized 6×8 edge kernel for nTail ≥ 8 and a masked 6×(nTail) kernel
+    /// for nTail &lt; 8, but that's significantly more code than the simple
+    /// small-matmul concept suggested — deferred.
+    /// </summary>
+
+    /// <summary>
     /// Tiled GEMM with panel packing and FMA micro-kernel.
     /// Follows BLIS architecture: loop order is jc -> pc -> ic -> jr -> ir.
     /// Supports parallelism over both M and N dimensions for different matrix shapes.
