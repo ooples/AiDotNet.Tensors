@@ -1,524 +1,57 @@
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Provides access to Intel MKL's Vector Math Library (VML) for high-performance
-/// vectorized transcendental functions (Exp, Log, Sqrt, etc.).
-/// VML uses SVML intrinsics internally and is 2-5x faster than polynomial approximations.
+/// Intel MKL VML (Vector Math Library) accelerator — <b>disabled in the
+/// supply-chain-independence build</b>.
 ///
-/// Uses C# 9 unmanaged function pointers (delegate* unmanaged[Cdecl]) for zero-overhead
-/// P/Invoke — no delegate allocation, no marshal overhead, just a direct call instruction.
-/// Previous delegate-based approach added ~50ns overhead per call which negated the SVML benefit.
+/// <para>
+/// Historically this class dynamically loaded <c>mkl_rt.dll</c> at runtime and
+/// exposed <c>vs*</c> / <c>vmd*</c> bindings for vectorized transcendentals
+/// (Exp / Log / Tanh / Sin / Cos / Sqrt / Erf / Abs / Sigmoid). Consumers
+/// would call <c>if (!VmlProvider.TryExp(...)) { SimdKernels.Exp(...); }</c>
+/// and opportunistically hit the faster VML path when the MKL runtime was
+/// present.
+/// </para>
+/// <para>
+/// After <c>feat/finish-mkl-replacement</c>, every entry point returns
+/// <c>false</c> immediately and no native library is loaded. The SimdKernels
+/// fallback (Herumi exp, Pade sigmoid, Schraudolph fast-exp, vectorized
+/// tanh/log/sin/cos/sqrt/erf/abs) is already AVX2-vectorized and was the
+/// primary path in all benchmarks — disabling VML has negligible measurable
+/// impact at the shapes we care about.
+/// </para>
+/// <para>
+/// This stub replaces ~520 lines of unmanaged-function-pointer P/Invoke
+/// plumbing that became unreachable after the disable. See git history for
+/// the original implementation if a user ever wants to opt back in.
+/// </para>
 /// </summary>
 internal static class VmlProvider
 {
-    // VML_EP (Enhanced Performance) = fastest mode for double. ~7 correct digits —
-    // more than enough for neural networks. VML_EP (0x1) was also fast but VML_EP (0x3)
-    // is marginally faster and avoids the first-call cold-start regression.
-    private const long VML_EP = 0x00000003;
+    /// <summary>Always false — external VML is disabled.</summary>
+    public static bool IsAvailable => false;
 
-    private static bool _initialized;
-    private static bool _available;
-    private static readonly object InitLock = new();
+    /// <summary>Always false — external VML is disabled.</summary>
+    internal static bool IsInitialized => false;
 
-#if NET5_0_OR_GREATER
-    // Unmanaged function pointers — zero marshal overhead (C# 9 feature).
-    // Float VML — no mode needed (float is fast even in VML_HA)
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsExp;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsLn;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSqrt;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsAbs;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSin;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsCos;
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsErf;
+    public static unsafe bool TryExp(float* input, float* output, int length) => false;
+    public static unsafe bool TryExp(double* input, double* output, int length) => false;
 
-    // Double VML — mode-specific (vmd* takes mode as 4th arg).
-    // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
-    // when the global mode resets between calls.
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdExp;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdLn;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdTanh;
-#endif
+    public static unsafe bool TryLn(float* input, float* output, int length) => false;
+    public static unsafe bool TryLn(double* input, double* output, int length) => false;
 
-    /// <summary>Whether MKL VML functions are available.</summary>
-    public static bool IsAvailable
-    {
-        get
-        {
-            EnsureInitialized();
-            return _available;
-        }
-    }
+    public static unsafe bool TryTanh(float* input, float* output, int length) => false;
+    public static unsafe bool TryTanh(double* input, double* output, int length) => false;
 
-    /// <summary>
-    /// Computes element-wise exp(x) using MKL VML. Returns false if VML not available.
-    /// Zero overhead — uses unmanaged function pointer, not delegate.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryExp(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsExp == null) return false;
-        _vsExp(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
+    public static unsafe bool TrySigmoid(float* input, float* output, int length) => false;
 
-    /// <summary>
-    /// Computes element-wise exp(x) for double using MKL VML with VML_EP mode per-call.
-    /// Uses vmdExp (mode-specific) instead of vdExp to avoid VML_HA regression.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryExp(double* input, double* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vmdExp == null) return false;
-        _vmdExp(length, input, output, VML_EP);
-        return true;
-#else
-        return false;
-#endif
-    }
+    public static unsafe bool TrySqrt(float* input, float* output, int length) => false;
 
-    /// <summary>
-    /// Computes element-wise ln(x) using MKL VML.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryLn(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsLn == null) return false;
-        _vsLn(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
+    public static unsafe bool TryAbs(float* input, float* output, int length) => false;
 
-    /// <summary>Double ln(x) via vmdLn with VML_EP per-call.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryLn(double* input, double* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vmdLn == null) return false;
-        _vmdLn(length, input, output, VML_EP);
-        return true;
-#else
-        return false;
-#endif
-    }
+    public static unsafe bool TrySin(float* input, float* output, int length) => false;
 
-    /// <summary>
-    /// Computes element-wise tanh(x) using MKL VML.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryTanh(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsTanh == null) return false;
-        _vsTanh(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
+    public static unsafe bool TryCos(float* input, float* output, int length) => false;
 
-    /// <summary>Double tanh(x) via vmdTanh with VML_EP per-call.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryTanh(double* input, double* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vmdTanh == null) return false;
-        _vmdTanh(length, input, output, VML_EP);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>
-    /// Computes element-wise sigmoid(x) = 1/(1+exp(-x)) using VML exp + SIMD.
-    /// VML accelerates the exp(-x) part, SIMD does the reciprocal.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TrySigmoid(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsExp == null) return false;
-
-        // Step 1: output[i] = -input[i]
-        for (int i = 0; i < length; i++) output[i] = -input[i];
-        // Step 2: output[i] = exp(-input[i]) via VML SVML
-        _vsExp(length, output, output);
-        // Step 3: output[i] = 1 / (1 + exp(-input[i])) via SIMD
-        if (System.Runtime.Intrinsics.X86.Avx.IsSupported)
-        {
-            var vOne = System.Runtime.Intrinsics.Vector256.Create(1.0f);
-            int simdLen = length & ~7;
-            for (int i = 0; i < simdLen; i += 8)
-            {
-                var e = System.Runtime.Intrinsics.X86.Avx.LoadVector256(output + i);
-                var denom = System.Runtime.Intrinsics.X86.Avx.Add(vOne, e);
-                System.Runtime.Intrinsics.X86.Avx.Store(output + i,
-                    System.Runtime.Intrinsics.X86.Avx.Divide(vOne, denom));
-            }
-            for (int i = simdLen; i < length; i++)
-                output[i] = 1.0f / (1.0f + output[i]);
-        }
-        else
-        {
-            for (int i = 0; i < length; i++)
-                output[i] = 1.0f / (1.0f + output[i]);
-        }
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Computes element-wise sqrt(x) using MKL VML.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TrySqrt(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsSqrt == null) return false;
-        _vsSqrt(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Computes element-wise abs(x) using MKL VML.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryAbs(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsAbs == null) return false;
-        _vsAbs(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Computes element-wise sin(x) using MKL VML SVML.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TrySin(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsSin == null) return false;
-        _vsSin(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Computes element-wise cos(x) using MKL VML SVML.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe bool TryCos(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsCos == null) return false;
-        _vsCos(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Vectorized error function (SVML). Used for exact GELU computation.</summary>
-    public static unsafe bool TryErf(float* input, float* output, int length)
-    {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vsErf == null) return false;
-        _vsErf(length, input, output);
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /// <summary>Whether VML has been initialized and is available (avoids triggering lazy init).</summary>
-    internal static bool IsInitialized => _initialized && _available;
-
-    // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
-
-    private static bool EnsureInitialized()
-    {
-        // External BLAS / VML disabled in the supply-chain-independence build
-        // (feat/finish-mkl-replacement). All TryX entry points return false
-        // immediately, forcing callers through their SimdKernels fallback path
-        // (which already provides AVX2-vectorized Exp/Log/Tanh/Sin/Cos/Sqrt/Erf).
-        //
-        // The native-loader code below is retained as reference but never runs.
-        if (true) return false;
-#pragma warning disable CS0162 // Unreachable code — intentional; kept for reference
-
-        if (_initialized) return _available;
-
-        lock (InitLock)
-        {
-            if (_initialized) return _available;
-            _available = TryLoadVml();
-            _initialized = true;
-            return _available;
-        }
-    }
-
-    private static bool TryLoadVml()
-    {
-#if NET5_0_OR_GREATER
-        try
-        {
-            // MKL.NET package reference was removed (feat/finish-mkl-replacement).
-            // VML is now loaded opportunistically from whatever MKL runtime the
-            // user has installed (via a system-wide MKL install, user-supplied
-            // mkl_rt.dll on the search path, etc.) — note AiDotNet.Native.OneDNN
-            // ships dnnl.dll (oneDNN) rather than the MKL runtime, so it does
-            // NOT provide VML symbols. If no MKL runtime is present, VML is
-            // simply unavailable and SimdKernels provides fallback implementations
-            // of all the transcendentals VML was accelerating.
-
-            // Try to load MKL runtime library from multiple candidate names
-            var candidates = new[]
-            {
-                "mkl_rt", "mkl_rt.2", "libmkl_rt", "libmkl_rt.so", "libmkl_rt.so.2",
-                "mkl_sequential", "libmkl_sequential"
-            };
-
-            foreach (var lib in candidates)
-            {
-                if (NativeLibrary.TryLoad(lib, out var handle))
-                {
-                    if (TryLoadSymbols(handle))
-                        return true;
-                    NativeLibrary.Free(handle);
-                }
-            }
-
-            // Historically tried the MKL.NET package's managed DLL directory
-            // as a fallback search path. After the removal, only the dynamic
-            // candidate names above are used — if the user wants VML they
-            // install the MKL runtime themselves or use SimdKernels.
-            string? mklDir = null;
-            if (mklDir != null)
-            {
-                // Search managed DLL directory and runtimes/win-x64/native/ subdirectory
-                var searchDirs = new List<string> { mklDir };
-                // Search the app's base directory (test host copies natives here)
-                var appBase = AppContext.BaseDirectory;
-                if (!string.IsNullOrEmpty(appBase))
-                {
-                    searchDirs.Add(appBase);
-                    var appRuntimeNative = Path.Combine(appBase, "runtimes", "win-x64", "native");
-                    if (Directory.Exists(appRuntimeNative))
-                        searchDirs.Add(appRuntimeNative);
-                }
-                // NuGet packages store native DLLs in runtimes/<rid>/native/
-                var runtimeNative = Path.Combine(mklDir, "..", "..", "runtimes", "win-x64", "native");
-                if (Directory.Exists(runtimeNative))
-                    searchDirs.Add(Path.GetFullPath(runtimeNative));
-                // Also search NuGet cache directly
-                var nugetCache = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    ".nuget", "packages", "mkl.net.win-x64");
-                if (Directory.Exists(nugetCache))
-                {
-                    foreach (var versionDir in Directory.GetDirectories(nugetCache))
-                    {
-                        var nativeDir = Path.Combine(versionDir, "runtimes", "win-x64", "native");
-                        if (Directory.Exists(nativeDir))
-                            searchDirs.Add(nativeDir);
-                    }
-                }
-
-                foreach (var dir in searchDirs)
-                {
-                    try
-                    {
-                        foreach (var dllPath in Directory.GetFiles(dir, "mkl_rt*"))
-                        {
-                            // Add native directory to PATH so mkl_rt can find dependencies
-                            var nativeDir = Path.GetDirectoryName(dllPath);
-                            if (nativeDir != null)
-                            {
-                                // Add to PATH so dependent DLLs can be found.
-                                // Uses OS-appropriate separator.
-                                var pathSep = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                                    System.Runtime.InteropServices.OSPlatform.Windows) ? ";" : ":";
-                                var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-                                if (!path.Contains(nativeDir))
-                                    Environment.SetEnvironmentVariable("PATH", nativeDir + pathSep + path);
-                            }
-                            if (NativeLibrary.TryLoad(dllPath, out var handle))
-                            {
-                                if (TryLoadSymbols(handle))
-                                    return true;
-                                NativeLibrary.Free(handle);
-                            }
-                        }
-                    }
-                    catch { /* directory access error */ }
-                }
-            }
-        }
-        catch
-        {
-            // MKL not available — fall back to polynomial approximations
-        }
-#endif
-        return false;
-    }
-
-#if NET5_0_OR_GREATER
-    private static unsafe bool TryLoadSymbols(IntPtr handle)
-    {
-        try
-        {
-            // Float VML — no mode needed (fast in all modes)
-            _vsExp = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsExp", "MKL_vsExp", "VSEXP");
-            _vsLn = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsLn", "MKL_vsLn", "VSLN");
-            _vsTanh = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsTanh", "MKL_vsTanh", "VSTANH");
-            _vsSqrt = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsSqrt", "MKL_vsSqrt", "VSSQRT");
-            _vsAbs = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsAbs", "MKL_vsAbs", "VSABS");
-            _vsSin = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsSin", "MKL_vsSin", "VSSIN");
-            _vsCos = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsCos", "MKL_vsCos", "VSCOS");
-            _vsErf = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
-                TryGetExport(handle, "vsErf", "MKL_vsErf", "VSERF");
-
-            // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
-            // This avoids the VML_HA regression that vd* functions hit when
-            // the global vmlSetMode resets between calls.
-            _vmdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
-                TryGetExport(handle, "vmdExp", "MKL_vmdExp", "VMDEXP");
-            _vmdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
-                TryGetExport(handle, "vmdLn", "MKL_vmdLn", "VMDLN");
-            _vmdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
-                TryGetExport(handle, "vmdTanh", "MKL_vmdTanh", "VMDTANH");
-
-            // Verify correctness at n=1 AND n=1000 (catches scale-dependent issues).
-            // Also verify performance: must be faster than scalar at n=10000.
-            _vsExp = VerifyFloat(_vsExp, 1.0f, 2.71828f, 0.01f);
-            _vsLn = VerifyFloat(_vsLn, 2.71828f, 1.0f, 0.01f);
-            _vsTanh = VerifyFloat(_vsTanh, 1.0f, 0.7616f, 0.01f);
-            _vmdExp = VerifyDoubleModeAtScale(_vmdExp, 1.0, 2.71828, 0.001);
-            _vmdLn = VerifyDoubleModeAtScale(_vmdLn, 2.71828, 1.0, 0.001);
-            _vmdTanh = VerifyDoubleModeAtScale(_vmdTanh, 1.0, 0.76159, 0.001);
-
-            return _vsExp != null || _vmdExp != null || _vsLn != null || _vmdLn != null
-                || _vsTanh != null || _vmdTanh != null;
-        }
-        catch
-        {
-            ClearAllPointers();
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Tries multiple symbol names and returns the first found export address, or IntPtr.Zero.
-    /// </summary>
-    private static IntPtr TryGetExport(IntPtr handle, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (NativeLibrary.TryGetExport(handle, name, out var ptr))
-                return ptr;
-        }
-        return IntPtr.Zero;
-    }
-
-    /// <summary>
-    /// Verifies a float VML function pointer by calling it with a test input.
-    /// Returns the pointer if valid, null if corrupt.
-    /// </summary>
-    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void>
-        VerifyFloat(delegate* unmanaged[Cdecl]<int, float*, float*, void> fn,
-        float testInput, float expectedOutput, float tolerance)
-    {
-        if (fn == null) return null;
-        try
-        {
-            var inArr = new float[] { testInput };
-            var outArr = new float[] { 0f };
-            fixed (float* pIn = inArr, pOut = outArr)
-            {
-                fn(1, pIn, pOut);
-            }
-            if (float.IsNaN(outArr[0]) || float.IsInfinity(outArr[0])
-                || Math.Abs(outArr[0] - expectedOutput) > tolerance)
-                return null;
-            return fn;
-        }
-        catch { return null; }
-    }
-
-    /// <summary>
-    /// Verifies a double VML function pointer at n=1 AND n=1000.
-    /// Also checks that it's faster than scalar Math.Exp at n=10000.
-    /// Verifies a mode-specific double VML function (vmd*) at n=1 and n=1000.
-    /// The 4th arg is the VML mode (VML_EP=1). No need for performance test
-    /// since VML_EP is passed per-call and can't regress.
-    /// </summary>
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void>
-        VerifyDoubleModeAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, long, void> fn,
-        double testInput, double expectedOutput, double tolerance)
-    {
-        if (fn == null) return null;
-        try
-        {
-            var inArr = new double[] { testInput };
-            var outArr = new double[] { 0.0 };
-            fixed (double* pIn = inArr, pOut = outArr)
-            {
-                fn(1, pIn, pOut, VML_EP);
-            }
-            if (double.IsNaN(outArr[0]) || double.IsInfinity(outArr[0])
-                || Math.Abs(outArr[0] - expectedOutput) > tolerance)
-                return null;
-
-            // Verify at scale
-            const int testSize = 1000;
-            var bigIn = new double[testSize];
-            var bigOut = new double[testSize];
-            for (int i = 0; i < testSize; i++) bigIn[i] = testInput;
-            fixed (double* pIn = bigIn, pOut = bigOut)
-            {
-                fn(testSize, pIn, pOut, VML_EP);
-            }
-            if (double.IsNaN(bigOut[0]) || Math.Abs(bigOut[0] - expectedOutput) > tolerance)
-                return null;
-            if (double.IsNaN(bigOut[testSize - 1]) || Math.Abs(bigOut[testSize - 1] - expectedOutput) > tolerance)
-                return null;
-
-            return fn;
-        }
-        catch { return null; }
-    }
-
-    private static unsafe void ClearAllPointers()
-    {
-        _vsExp = null;
-        _vsLn = null;
-        _vsTanh = null;
-        _vmdExp = null;
-        _vmdLn = null;
-        _vmdTanh = null;
-    }
-#endif
-#pragma warning restore CS0162
+    public static unsafe bool TryErf(float* input, float* output, int length) => false;
 }

@@ -57,24 +57,24 @@
 
   <ItemGroup>
     <!--
-      MKL.NET package references REMOVED per the feat/finish-mkl-replacement
-      branch (Issue #131 completion). Supply-chain risk from a bundled
-      110 MB Intel binary outweighs the perf of MKL at the handful of
-      shapes where our SimdGemm still trails. Native BLAS (OpenBLAS,
-      Accelerate, etc.) remains OPTIONAL at runtime via BlasProvider's
-      P/Invoke path — install AiDotNet.Native.OpenBLAS or supply any
-      cblas-compatible library to opt in; otherwise all matmul runs
-      through SimdGemm's AVX2 blocked kernel (tuned in Issue #131
-      iterations 1-24 to match or beat MKL on most DiT-XL shapes).
+      External CPU math libraries REMOVED per the feat/finish-mkl-replacement
+      branch (Issue #131 completion + supply-chain-independence directive):
+        - MKL.NET + MKL.NET.win-x64 (110 MB Intel binary previously bundled)
+        - Native BLAS loader (cblas_sgemm via BlasProvider / CpuNativeBlas)
+        - MKL VML (VmlProvider)
+        - Intel oneDNN (OneDnnProvider — dnnl.dll)
+      All of the above are now stub classes that return false at every
+      entry point. The engine routes all matmul through SimdGemm's AVX2
+      blocked kernel + JIT micro-kernels; all element-wise transcendentals
+      through SimdKernels (Herumi exp, Pade sigmoid, vectorized tanh/log/...);
+      all Conv2D through FusedConv + SimdGemm / Winograd / SIMD-direct.
+
+      Per iter 18c benchmarks (docs/mkl-replacement/baseline/iter18c-results.md),
+      the in-house kernels are at 0.99-1.04× of MKL on every tracked DiT-XL
+      shape — 5 shapes beat MKL, 5 at parity, 0 meaningfully trailing.
     -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
-
-  <!--
-    Intel oneDNN support for optimized CPU convolution, ReLU, sigmoid, and element-wise operations.
-    The native dnnl.dll is provided by the separate AiDotNet.Native.OneDNN package.
-    Install AiDotNet.Native.OneDNN to enable oneDNN acceleration (Windows x64 only, .NET Core+).
-  -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
@@ -82,11 +82,11 @@
   </ItemGroup>
 
   <!--
-    Native library acceleration packages are OPTIONAL.
-    Install AiDotNet.Native.OneDNN for CPU deep learning acceleration (convolution, ReLU, etc).
-    Install AiDotNet.Native.OpenBLAS for CPU BLAS acceleration.
-    Install AiDotNet.Native.CLBlast for OpenCL GPU acceleration.
-    The core package works without them using managed fallbacks.
+    GPU-side optional packages — separate supply-chain surface (users opt in
+    per-hardware): AiDotNet.Native.CLBlast (OpenCL), AiDotNet.Native.CUDA
+    (NVIDIA), AiDotNet.Native.ROCm (AMD), AiDotNet.Native.MoltenVK (macOS/iOS).
+    The core package works without any of them using managed fallbacks + the
+    in-house CPU kernels (SimdGemm / SimdKernels / FusedConv).
   -->
 
   <!-- Exclude files that require .NET Core intrinsics from .NET Framework builds -->
