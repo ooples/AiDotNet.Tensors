@@ -15215,36 +15215,13 @@ public class CpuEngine : ITensorLevelEngine
         int headDim = query._shape[3];
         int seqK = key._shape[2];
 
-        // ────────────────────────────────────────────────────────────────────
-        // Fast path for float: materialized-softmax with SimdGemm, same pattern
-        // as the SDPA fix (Issue #162). Replaces the scalar virtual-dispatch
-        // triple-loop below which was dominated by INumericOperations<T>.Multiply
-        // / .Add calls per FMA.
-        //
-        // The tiled online-softmax approach of the scalar path is memory-efficient
-        // for very long sequences (O(N) memory), but at DiT-XL's N=256 the
-        // materialized [N,N] scores matrix is only 256 KB per head — fits in L2
-        // comfortably. For that regime, materializing + batched SGEMMs is
-        // substantially faster than the tiled scalar loop.
-        //
-        // Non-float T continues through the existing scalar path below.
-        // ────────────────────────────────────────────────────────────────────
-        if (typeof(T) == typeof(float))
-        {
-            double scaleValF = scale ?? 1.0 / Math.Sqrt(headDim);
-            return FlashAttentionFloat(
-                (Tensor<float>)(object)query,
-                (Tensor<float>)(object)key,
-                (Tensor<float>)(object)value,
-                attentionBias is null ? null : (Tensor<float>)(object)attentionBias,
-                scaleValF, isCausal,
-                batch, heads, seqQ, headDim, seqK,
-                out softmaxStats);
-        }
-
-        // Extract and validate bias data if provided
-        T[]? biasData = null;
-        bool hasBias = false;
+        // Validate bias shape *before* the float fast-path branch below. The
+        // fast path (FlashAttentionFloat) trusts its caller to hand it a
+        // correctly-shaped bias, so the rank/dimension check has to run here
+        // or we silently accept malformed bias tensors on the float path.
+        // (Regression exposed by FlashAttention_InvalidBiasRank_Throws +
+        // FlashAttention_Mismatched{3D,}BiasDimensions_Throws after the fast
+        // path was added.)
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
         {
@@ -15272,6 +15249,40 @@ public class CpuEngine : ITensorLevelEngine
                     $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
                     nameof(attentionBias));
             }
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // Fast path for float: materialized-softmax with SimdGemm, same pattern
+        // as the SDPA fix (Issue #162). Replaces the scalar virtual-dispatch
+        // triple-loop below which was dominated by INumericOperations<T>.Multiply
+        // / .Add calls per FMA.
+        //
+        // The tiled online-softmax approach of the scalar path is memory-efficient
+        // for very long sequences (O(N) memory), but at DiT-XL's N=256 the
+        // materialized [N,N] scores matrix is only 256 KB per head — fits in L2
+        // comfortably. For that regime, materializing + batched SGEMMs is
+        // substantially faster than the tiled scalar loop.
+        //
+        // Non-float T continues through the existing scalar path below.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            double scaleValF = scale ?? 1.0 / Math.Sqrt(headDim);
+            return FlashAttentionFloat(
+                (Tensor<float>)(object)query,
+                (Tensor<float>)(object)key,
+                (Tensor<float>)(object)value,
+                attentionBias is null ? null : (Tensor<float>)(object)attentionBias,
+                scaleValF, isCausal,
+                batch, heads, seqQ, headDim, seqK,
+                out softmaxStats);
+        }
+
+        // Extract bias data for the scalar path (shape already validated above).
+        T[]? biasData = null;
+        bool hasBias = false;
+        if (attentionBias is not null)
+        {
             biasData = attentionBias.GetDataArray();
             hasBias = true;
         }
