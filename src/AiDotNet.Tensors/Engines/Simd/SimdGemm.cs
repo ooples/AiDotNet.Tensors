@@ -877,6 +877,34 @@ internal static class SimdGemm
                 int mc_actual = Math.Min(Mr, mc - iLocal);
                 int aPanelOffset = ir * kc * Mr;
 
+                // Iter 19 (oneDNN-style next-A-panel prefetch): before dispatching the
+                // current micro-kernel, issue prefetcht2 hints on the NEXT ir's packedA
+                // panel. The hardware prefetcher handles *within-panel* sequential access
+                // well (iter 16 verified this on Zen 2) but doesn't reliably cross the
+                // ir → ir+1 boundary. Prefetching ~4 cache lines (256 B) at the start of
+                // the next panel lets the HW prefetcher pick up from there and have the
+                // data warm in L1/L2 by the time MicroKernel6x16 first touches it.
+                //
+                // prefetcht2 specifically (not t0/t1): keeps the hint from evicting the
+                // current Mr-panel from L1/L2 and from competing with inner-loop loads
+                // for load-port bandwidth. Iter 9's prefetcht0 inside the K loop was
+                // reverted in iter 16 precisely because it competed with loads; placing
+                // the hints *outside* the K loop and using the weakest level avoids that.
+                if (ir + 1 < mrBlocks)
+                {
+                    int nextAPanelOffset = (ir + 1) * kc * Mr;
+                    unsafe
+                    {
+                        fixed (float* pNextA = &packedA[nextAPanelOffset])
+                        {
+                            Sse.Prefetch2(pNextA);
+                            Sse.Prefetch2(pNextA + 16);
+                            Sse.Prefetch2(pNextA + 32);
+                            Sse.Prefetch2(pNextA + 48);
+                        }
+                    }
+                }
+
                 if (mc_actual == Mr && nc_actual == Nr)
                 {
                     if (jitKernel is not null)
