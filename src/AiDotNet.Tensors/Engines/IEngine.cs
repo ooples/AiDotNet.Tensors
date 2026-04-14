@@ -7500,6 +7500,86 @@ public interface IEngine
     Tensor<T> NativeNormalizeRows<T>(Tensor<T> input);
 
     /// <summary>
+    /// Element-wise hyperbolic tangent with SIMD acceleration on float/double.
+    /// </summary>
+    Tensor<T> NativeTanh<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Element-wise exponential (e^x) with SIMD acceleration on float/double.
+    /// </summary>
+    Tensor<T> NativeExp<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Element-wise atan2(imag, real) with SIMD acceleration. Both tensors must have the same shape.
+    /// </summary>
+    Tensor<T> NativeAtan2<T>(Tensor<T> imag, Tensor<T> real);
+
+    /// <summary>
+    /// Computes magnitude and phase of a complex tensor in a single pass.
+    /// Returns magnitude; writes phase into the out parameter.
+    /// </summary>
+    Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase);
+
+    /// <summary>
+    /// Third-order bispectrum: B(f1, f2) = X(f1) · X(f2) · conj(X(f1+f2)).
+    /// Input is a 1D complex spectrum of length N (must be a power of 2 for FFT-derived spectra).
+    /// Output shape is [maxF1, maxF2]. Used for higher-order phase-coupling features.
+    /// </summary>
+    /// <param name="spectrum">1D complex spectrum.</param>
+    /// <param name="maxF1">Maximum f1 frequency bin (exclusive).</param>
+    /// <param name="maxF2">Maximum f2 frequency bin (exclusive).</param>
+    Tensor<Complex<T>> NativeBispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2);
+
+    /// <summary>
+    /// Fourth-order trispectrum: T(f1, f2, f3) = X(f1) · X(f2) · X(f3) · conj(X(f1+f2+f3)).
+    /// </summary>
+    Tensor<Complex<T>> NativeTrispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2, int maxF3);
+
+    /// <summary>
+    /// Batched forward pass for resonant-cavity style operators.
+    /// Applies a per-cavity transfer function (set of complex filter responses) to a batch of inputs.
+    /// Input: [batch, N]. Filters: [numCavities, N] complex. Output: [batch, numCavities, N] real.
+    /// Fuses FFT → per-cavity multiply → IFFT → nonlinear bounce (tanh) across all cavities in one call.
+    /// </summary>
+    /// <param name="input">Real-valued [batch, N] input waveforms.</param>
+    /// <param name="cavityFilters">Complex [numCavities, N] frequency-domain filter responses.</param>
+    /// <param name="numBounces">Number of recursive nonlinear bounces per cavity.</param>
+    /// <returns>[batch, numCavities, N] real-valued output.</returns>
+    Tensor<T> NativeBatchedCavityForward<T>(Tensor<T> input, Tensor<Complex<T>> cavityFilters, int numBounces);
+
+    /// <summary>
+    /// End-to-end MFCC feature extraction pipeline for a batch of waveforms.
+    /// Fuses STFT → power spectrum → mel filterbank → log → DCT → per-segment pooling.
+    /// </summary>
+    /// <param name="waveforms">[batch, numSamples] or [numSamples] real waveforms.</param>
+    /// <param name="numSegments">Number of non-overlapping time segments.</param>
+    /// <param name="numMfcc">Number of MFCC coefficients per segment.</param>
+    /// <param name="paddedDim">Padded dimension (power of 2) used for FFT.</param>
+    /// <returns>[batch, numSegments * numMfcc] or [numSegments * numMfcc] feature tensor.</returns>
+    Tensor<T> NativeMfccFeatures<T>(Tensor<T> waveforms, int numSegments, int numMfcc, int paddedDim);
+
+    /// <summary>
+    /// End-to-end wideband spectral feature extraction pipeline.
+    /// Fuses segmentation → FFT → log-magnitude binning → pooling.
+    /// </summary>
+    Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins);
+
+    /// <summary>
+    /// End-to-end phase-amplitude coupling (PAC) feature extraction pipeline.
+    /// For each gamma band: analytic signal on theta → phase, analytic signal on gamma → amplitude,
+    /// compute modulation index. Fuses Hilbert + envelope + PAC MI in one call.
+    /// </summary>
+    /// <param name="waveforms">[batch, numSamples] or [numSamples] real waveforms.</param>
+    /// <param name="sampleRate">Sample rate in Hz.</param>
+    /// <param name="envelopeRate">Target envelope sample rate in Hz for decimation.</param>
+    /// <param name="thetaLow">Theta band low-frequency (Hz).</param>
+    /// <param name="thetaHigh">Theta band high-frequency (Hz).</param>
+    /// <param name="gammaBands">Array of (lowHz, highHz) gamma band tuples.</param>
+    /// <returns>[batch, gammaBands.Length] PAC modulation index tensor.</returns>
+    Tensor<T> NativePacFeatures<T>(Tensor<T> waveforms, int sampleRate, int envelopeRate,
+        double thetaLow, double thetaHigh, (double low, double high)[] gammaBands);
+
+    /// <summary>
     /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning real-valued tensor.
     /// Extracts only the real component of the inverse transform. Use this when the original
     /// signal was real-valued (Hermitian symmetry assumed). Applies 1/N normalization.

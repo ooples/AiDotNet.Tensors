@@ -205,6 +205,10 @@ internal static class OpRegistry
         "NativeAnalyticSignal",
         "NativeNormalizeRows",
         "NativeComplexFFTSpan", "NativeComplexIFFTSpan", "NativeComplexFFTComplexSpan",
+        "NativeTanh", "NativeExp", "NativeAtan2", "NativeMagnitudeAndPhase",
+        "NativeBispectrum", "NativeTrispectrum",
+        "NativeBatchedCavityForward",
+        "NativeMfccFeatures", "NativeWidebandFeatures", "NativePacFeatures",
         "TensorSoftmaxRows",
 
         // Rounding (non-differentiable, STE would need explicit annotation)
