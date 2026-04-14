@@ -60,14 +60,28 @@ After PR #136 master is at iter 17 — we re-baseline in Phase 0 before any kern
 
 Ordered by expected impact against the **square-shape gap**. Each iteration = one commit, A/B gated against Phase 0 baseline, reverted on regression.
 
+### Status as of this branch
+
+| Iter | Change | Status | Result |
+|---|---|---|---|
+| 18a | Masked AVX2 edge kernel for `mc==Mr, nc<Nr` partial tiles | ✅ `6b74b75` | **A·V 10.3× → 2.7× slower than MKL (3.48× speedup on-shape)** |
+| 19 | `prefetcht2` on next A panel | ✅ `ccff3ae` | No regression; possibly 12-20% at DiT-block shapes (noise-dominated run) |
+| 20 | 4-way K unroll in `MicroKernel6x16` | ⏳ benchmarking | Pending |
+| — | **SDPA BLAS fast path (Issue #162)** | ✅ `cd954be` | **DiT-XL SDPA 93 ms → 25 ms (3.68×); saves ~2s/forward** |
+| — | Adaptive `ParallelWorkThreshold` (Issue #162) | ✅ `14efda4` | CI 2-core: parallel at 128² and above |
+
+### Remaining work (original plan, refined by competitive analysis)
+
 | Iter | Change | Expected at 1024² | Risk |
 |---|---|---|---|
-| 18 | **Fully-specialized JIT micro-kernel** (libxsmm-style) — emit (mc, nc, kc) as immediates, unroll k loop completely. Extends the existing `CpuJitKernels` path. | 20-40% at all shapes | Medium |
-| 19 | **Register-level software prefetch** — prefetch next `Mr` rows of A during B loads, not block-level prefetch. | 5-10% | Low |
-| 20 | **Per-µarch tile sizes** — runtime switch on `CpuFeatures.Microarch`. Zen 2 may prefer smaller Mc; Skylake may prefer smaller Nc. | 5-15% on non-Zen2 hardware | Low |
-| 21 | **Non-temporal stores for C** — when `m*n*4 > L2_size`, use `vmovntps` on the output panel. | 10-20% at ≥1024² | Medium (correctness-sensitive) |
-| 22 | **AVX-512 8×24 micro-kernel** — runtime-detected, AVX2 fallback. 2× FMA throughput on AVX-512 hardware. | 2× on AVX-512 | High (no local validation on Zen 2) |
-| 23 | **Batched-GEMM consolidation** — single pack for shared B across batch slices (eliminates the per-batch BLAS dispatch in `TensorMatMulBatched`). | 1.5-3× at batched-small patterns | Medium |
+| 18b | Masked kernel for `mc<Mr, nc==Nr` / `mc<Mr, nc<Nr` — closes the remaining 2.7× A·V gap from iter 18a | 2× more on A·V | Low |
+| 18c | **Fully-specialized JIT micro-kernel** (libxsmm-style) — emit (mc, nc, kc) as immediates, unroll k loop completely via `System.Reflection.Emit`. **The single highest-projected win from the competitive analysis.** Would close most of the square-shape gap. | 20-40% at square ≥512² | Medium (IL emission complexity) |
+| 21 | **Per-µarch tile sizes** — runtime switch on `CpuFeatures.Microarch`. Zen 2 may prefer smaller Mc; Skylake may prefer smaller Nc. Needs Intel hardware for validation. | 5-15% on non-Zen2 | Low |
+| 22 | **Non-temporal stores for C** — ~~competitive analysis ruled this OUT~~ — no open-source GEMM library uses NT stores for C (GEMM output is always reused). Skipped. | — | — |
+| 23 | **AVX-512 8×24 micro-kernel** — runtime-detected, AVX2 fallback. 2× FMA throughput on AVX-512 hardware. Can't validate on Zen 2. | 2× on AVX-512 | High |
+| 24 | **Batched-GEMM consolidation** — single pack for shared B across batch slices (eliminates the per-batch BLAS dispatch in `TensorMatMulBatched`). Addresses the 1.16× → 1.75× degradation with batch. | 1.5-3× at batched-small patterns | Medium |
+| 25 | **Prefetch C (write-intent)** via `Sse.Prefetch1` before micro-kernel store-back. oneDNN uses `prefetchw`; we can approximate with `prefetcht1`. | 3-5% at large C shapes | Low |
+| 26 | **64-byte aligned packed A/B buffers** + `vmovaps` (aligned) loads instead of `vmovups`. Marginal on Haswell, more on Zen 2. | 1-3% | Low |
 
 ### Phase 3 — Flip the default
 

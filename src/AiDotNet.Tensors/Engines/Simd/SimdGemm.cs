@@ -955,28 +955,22 @@ internal static class SimdGemm
                             kc);
                     }
                 }
-                else if (mc_actual == Mr && nc_actual > 0 && nc_actual < Nr)
+                else if (mc_actual > 0 && nc_actual > 0)
                 {
-                    // Iter 18a: partial Nr tile (full Mr=6 rows, fewer than Nr=16 cols).
-                    // Previously fell through to MicroKernelScalar — a fully scalar K-loop
-                    // that dominated per-head attention matmuls like A·V [256,256]×[256,72]
-                    // (10.3× slower than MKL baseline per docs/mkl-replacement/baseline).
+                    // Iter 18a + 18b: any partial tile (mc ≤ Mr or nc ≤ Nr) with at
+                    // least one active lane. Previously fell through to MicroKernelScalar
+                    // (fully scalar K-loop) for any edge case — dominated per-head
+                    // attention A·V [256,256]×[256,72] (10.3× slower than MKL; now 2.7×
+                    // after iter 18a covered only the nc-edge, and closing further with
+                    // this mc-edge extension).
+                    //
                     // The masked vector kernel uses the same 12-accumulator FMA path as
-                    // MicroKernel6x16 (packedB is zero-padded on the unused cols so FMAs
-                    // contribute nothing), with masked load/add/store at the end. Keeps
-                    // AVX throughput for the common partial-N edge.
-                    MicroKernel6xNMasked(
-                        packedA, aPanelOffset,
-                        packedB, bPanelOffset,
-                        c, ldc,
-                        icOffset + iLocal, jcOffset + jLocal,
-                        kc, nc_actual);
-                }
-                else
-                {
-                    // Edge case: partial mc tile (mc < Mr). Still scalar for now —
-                    // these are rare and handling them needs a separate specialization.
-                    MicroKernelScalar(
+                    // MicroKernel6x16. PackA zero-pads rows past mc_actual (lines 772-775
+                    // of PackA) and PackB zero-pads cols past nc_actual (lines 830-833 of
+                    // PackB), so FMAs on inactive positions contribute nothing to the
+                    // accumulators. The store phase masks per-row (mc_actual) and per-col
+                    // (nc_actual) so we only write the active output cells.
+                    MicroKernelMxNMasked(
                         packedA, aPanelOffset,
                         packedB, bPanelOffset,
                         c, ldc,
@@ -1016,37 +1010,113 @@ internal static class SimdGemm
         // hints consumed load ports (10 loads per iter → 12 with 2 prefetches =
         // 6 cycles load-limited vs 5 without), slightly slowing the critical path.
         // The branch check (if p < prefetchLimit) also hurt loop predictability.
-        for (int p = 0; p < kc; p++)
+        //
+        // Iter 20: 4-way manual K unroll (vs single-step loop). Motivation from
+        // OpenBLAS's sgemm_kernel_16x4_haswell.S which uses 8-way K unroll — we
+        // take a lighter 4-way to stay within a reasonable basic-block size for
+        // RyuJIT while still cutting the loop branch overhead by 4× and giving
+        // the scheduler 48 FMAs per loop body to overlap. Same 12 accumulators,
+        // same live-register budget, same A-broadcast ping-pong pattern — the
+        // only change is 4 K iterations per pass instead of 1.
+        int pEnd4 = kc & ~3;  // round down to multiple of 4
+        int p = 0;
+        for (; p < pEnd4; p += 4)
         {
-            // Load B row (Nr=16 = 2 vectors of 8). B regs are live across all 6 A
-            // broadcasts, so they stay resident throughout the inner sequence.
+            int bBase = bOffset + p * Nr;
+            int aBase = aOffset + p * Mr;
+
+            // --- K iteration +0 ---
+            var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase)));
+            var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + 8)));
+            var a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 0));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+
+            // --- K iteration +1 ---
+            b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + Nr)));
+            b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + Nr + 8)));
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 0));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + Mr + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+
+            // --- K iteration +2 ---
+            b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + 2 * Nr)));
+            b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + 2 * Nr + 8)));
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 0));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2 * Mr + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+
+            // --- K iteration +3 ---
+            b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + 3 * Nr)));
+            b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bBase + 3 * Nr + 8)));
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 0));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+            a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3 * Mr + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+        }
+
+        // Scalar K tail (kc % 4 remainder, 0..3 iterations)
+        for (; p < kc; p++)
+        {
             int bIdx = bOffset + p * Nr;
             var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx)));
             var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
                 ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx + 8)));
-
-            // A broadcasts: load each element right before its 2 FMAs and let the
-            // register die immediately. This keeps only one A reg live at a time,
-            // bringing total live ymm regs to 12 acc + 2 B + 1 A = 15, fitting in
-            // AVX2's 16 ymm without spills. Prior version loaded all 6 A elements
-            // up front, forcing the JIT to keep 20 regs live and spill to stack.
             int aIdx = aOffset + p * Mr;
             var a = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
             c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
-
             a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
             c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
-
             a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
             c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
-
             a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
             c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
-
             a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
             c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
-
             a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
             c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
         }
@@ -1100,19 +1170,28 @@ internal static class SimdGemm
     };
 
     /// <summary>
-    /// Iter 18a masked 6×N micro-kernel for partial-Nr tiles (0 &lt; nc_actual &lt; Nr).
-    /// Shares the 12-accumulator FMA inner loop with <see cref="MicroKernel6x16"/>;
-    /// relies on PackB's zero-padding of unused cols so FMAs contribute nothing.
-    /// Masked load-add-store on write-back preserves the existing columns beyond
-    /// nc_actual (which may be outside the caller-supplied C span).
+    /// Iter 18a + 18b masked Mr×Nr micro-kernel for any partial tile
+    /// (0 &lt; mc_actual &lt;= Mr, 0 &lt; nc_actual &lt;= Nr).
+    ///
+    /// Shares the 12-accumulator FMA inner loop with <see cref="MicroKernel6x16"/>.
+    /// PackA zero-pads rows past mc_actual (SimdGemm.cs:772-775) and PackB zero-
+    /// pads cols past nc_actual (SimdGemm.cs:830-833), so FMAs at inactive
+    /// positions contribute 0 to the accumulators. The store phase uses per-row
+    /// guards (mc_actual) and per-column masked load/store (nc_actual) so we only
+    /// touch the active output cells — surrounding data is preserved.
+    ///
+    /// Iter 18a covered only the mc==Mr, nc&lt;Nr edge. Iter 18b extends to the
+    /// mc&lt;Mr cases (all four combinations: mc==Mr/nc&lt;Nr, mc&lt;Mr/nc==Nr,
+    /// mc&lt;Mr/nc&lt;Nr). The full-tile case mc==Mr && nc==Nr is still handled by
+    /// the fast path above (JIT or plain MicroKernel6x16).
     /// </summary>
     [MethodImpl(HotInline)]
-    private static unsafe void MicroKernel6xNMasked(
+    private static unsafe void MicroKernelMxNMasked(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
         Span<float> c, int ldc,
         int cRow, int cCol,
-        int kc, int nc_actual)
+        int kc, int mc_actual, int nc_actual)
     {
         // 12 accumulators — identical to MicroKernel6x16.
         var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
@@ -1153,24 +1232,29 @@ internal static class SimdGemm
             c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
         }
 
-        // Build lane masks from nc_actual.
-        //   nc_actual ∈ (0, 8]: lane 0 is partial (nc_actual lanes), lane 1 skipped.
-        //   nc_actual ∈ (8, 16): lane 0 fully used, lane 1 is partial (nc_actual - 8).
+        // Build column lane masks from nc_actual.
+        //   nc_actual ∈ (0, 8]:  lane 0 is partial (nc_actual lanes), lane 1 skipped.
+        //   nc_actual ∈ (8, 16]: lane 0 fully used, lane 1 is partial (nc_actual - 8).
+        //   (nc_actual == 16 lands lane1N=8, which is the "all lanes" mask — same
+        //    behavior as an unmasked store, which is what we want for the nc==Nr case.)
         int lane0N = nc_actual >= 8 ? 8 : nc_actual;
         int lane1N = nc_actual >= 8 ? nc_actual - 8 : 0;
         Vector256<int> mask0 = _partialNrMasks[lane0N];
         Vector256<int> mask1 = _partialNrMasks[lane1N];
 
-        // Masked accumulate-and-store back to C.
+        // Masked accumulate-and-store back to C, row-by-row with mc_actual guard.
+        // When mc_actual < Mr, rows past mc_actual are skipped entirely — their
+        // accumulators (which are zero, since PackA zero-padded the A rows) would
+        // otherwise overwrite valid data in the NEXT Ir block or past end of C.
         fixed (float* pC = c)
         {
             float* row = pC + cRow * ldc + cCol;
-            StoreMaskedAccumRow(row,             mask0, mask1, c00, c01);
-            StoreMaskedAccumRow(row + ldc,       mask0, mask1, c10, c11);
-            StoreMaskedAccumRow(row + ldc * 2,   mask0, mask1, c20, c21);
-            StoreMaskedAccumRow(row + ldc * 3,   mask0, mask1, c30, c31);
-            StoreMaskedAccumRow(row + ldc * 4,   mask0, mask1, c40, c41);
-            StoreMaskedAccumRow(row + ldc * 5,   mask0, mask1, c50, c51);
+            if (mc_actual > 0) StoreMaskedAccumRow(row,             mask0, mask1, c00, c01);
+            if (mc_actual > 1) StoreMaskedAccumRow(row + ldc,       mask0, mask1, c10, c11);
+            if (mc_actual > 2) StoreMaskedAccumRow(row + ldc * 2,   mask0, mask1, c20, c21);
+            if (mc_actual > 3) StoreMaskedAccumRow(row + ldc * 3,   mask0, mask1, c30, c31);
+            if (mc_actual > 4) StoreMaskedAccumRow(row + ldc * 4,   mask0, mask1, c40, c41);
+            if (mc_actual > 5) StoreMaskedAccumRow(row + ldc * 5,   mask0, mask1, c50, c51);
         }
     }
 
