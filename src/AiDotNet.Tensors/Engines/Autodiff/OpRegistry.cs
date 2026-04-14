@@ -204,7 +204,7 @@ internal static class OpRegistry
         "NativeComplexFFTND", "NativeComplexIFFTNDReal",
         "NativeAnalyticSignal",
         "NativeNormalizeRows",
-        "NativeComplexFFTSpan", "NativeComplexIFFTSpan", "NativeComplexFFTComplexSpan",
+        "NativeComplexFFTSpan", "NativeComplexIFFTSpan", "NativeComplexFFTComplexSpan", "NativeComplexIFFTRealSpan",
         "NativeTanh", "NativeExp", "NativeAtan2", "NativeMagnitudeAndPhase",
         "NativeBispectrum", "NativeTrispectrum",
         "NativeBatchedCavityForward",

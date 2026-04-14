@@ -7477,6 +7477,13 @@ public interface IEngine
     void NativeComplexFFTComplexSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output);
 
     /// <summary>
+    /// Span-based inverse 1D FFT returning real output (Hermitian symmetry assumed).
+    /// Most important variant for Hilbert/PAC/MFCC pipelines that need to return to time-domain real.
+    /// Applies 1/N normalization, discards imaginary part.
+    /// </summary>
+    void NativeComplexIFFTRealSpan<T>(ReadOnlySpan<Complex<T>> input, Span<T> output);
+
+    /// <summary>
     /// Fused analytic-signal kernel (Hilbert transform via FFT).
     /// Computes analytic signal z(t) = x(t) + i·H{x}(t) in one fused call:
     /// forward FFT → zero negative frequencies (and optionally zero outside [freqLow, freqHigh])
@@ -7496,8 +7503,9 @@ public interface IEngine
     /// are left as zeros (no division).
     /// </summary>
     /// <param name="input">2D input tensor [rows, cols].</param>
+    /// <param name="inPlace">If true, writes back into the input buffer (no allocation). Default false.</param>
     /// <returns>2D output tensor of same shape with each row having unit L2 norm.</returns>
-    Tensor<T> NativeNormalizeRows<T>(Tensor<T> input);
+    Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false);
 
     /// <summary>
     /// Element-wise hyperbolic tangent with SIMD acceleration on float/double.

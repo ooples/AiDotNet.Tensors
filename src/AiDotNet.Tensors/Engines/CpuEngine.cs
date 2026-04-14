@@ -27696,6 +27696,58 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public virtual void NativeComplexIFFTRealSpan<T>(ReadOnlySpan<Complex<T>> input, Span<T> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+            {
+                double r = buf[i].Real * scale;
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref r);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+            {
+                float r = buf[i].Real * scale;
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref r);
+            }
+            return;
+        }
+
+        var opsG = MathHelper.GetNumericOperations<T>();
+        var arrG = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arrG[i] = input[i];
+        NativeFFTInPlace(arrG, true, opsG);
+        var scaleT = opsG.FromDouble(n);
+        for (int i = 0; i < n; i++)
+            output[i] = opsG.Divide(arrG[i].Real, scaleT);
+    }
+
+    /// <inheritdoc />
     public virtual Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -27770,14 +27822,14 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
-    public virtual Tensor<T> NativeNormalizeRows<T>(Tensor<T> input)
+    public virtual Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
 
         int rows = input._shape[0];
         int cols = input._shape[1];
-        var result = new Tensor<T>(input._shape);
+        var result = inPlace ? input : new Tensor<T>(input._shape);
 
         if (typeof(T) == typeof(double))
         {

@@ -127,6 +127,42 @@ public class SpectralPerfOpsTests
         Assert.Throws<ArgumentException>(() => _engine.NativeComplexFFTSpan<double>(input, output));
     }
 
+    [Fact]
+    public void IFFTRealSpan_RecoversOriginal()
+    {
+        int n = 256;
+        var rng = new Random(42);
+        var input = new double[n];
+        for (int i = 0; i < n; i++) input[i] = rng.NextDouble();
+
+        var spectrum = new Complex<double>[n];
+        _engine.NativeComplexFFTSpan<double>(input, spectrum);
+
+        var recovered = new double[n];
+        _engine.NativeComplexIFFTRealSpan<double>(spectrum, recovered);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(input[i], recovered[i], 10);
+    }
+
+    [Fact]
+    public void IFFTRealSpan_Float_RecoversOriginal()
+    {
+        int n = 64;
+        var rng = new Random(99);
+        var input = new float[n];
+        for (int i = 0; i < n; i++) input[i] = (float)rng.NextDouble();
+
+        var spectrum = new Complex<float>[n];
+        _engine.NativeComplexFFTSpan<float>(input, spectrum);
+
+        var recovered = new float[n];
+        _engine.NativeComplexIFFTRealSpan<float>(spectrum, recovered);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(input[i], recovered[i], 3);
+    }
+
     // ================================================================
     // NativeAnalyticSignal (Hilbert transform)
     // ================================================================
@@ -265,6 +301,33 @@ public class SpectralPerfOpsTests
     {
         var input = new Tensor<double>([8]);
         Assert.Throws<ArgumentException>(() => _engine.NativeNormalizeRows(input));
+    }
+
+    [Fact]
+    public void NormalizeRows_InPlace_MutatesInputAndReturnsIt()
+    {
+        int rows = 4, cols = 16;
+        var input = new Tensor<double>([rows, cols]);
+        var rng = new Random(123);
+        for (int i = 0; i < rows * cols; i++) input[i] = rng.NextDouble() * 5 - 2.5;
+
+        // Save original first row for comparison
+        double origFirstSum = 0;
+        for (int c = 0; c < cols; c++) origFirstSum += input[c] * input[c];
+        Assert.NotEqual(1.0, origFirstSum, 5);
+
+        var result = _engine.NativeNormalizeRows(input, inPlace: true);
+
+        // Result should be the same tensor reference
+        Assert.Same(input, result);
+
+        // Each row should now have unit L2 norm in the input itself
+        for (int r = 0; r < rows; r++)
+        {
+            double sumSq = 0;
+            for (int c = 0; c < cols; c++) sumSq += input[r * cols + c] * input[r * cols + c];
+            Assert.Equal(1.0, sumSq, 10);
+        }
     }
 
     [Fact]

@@ -15691,4 +15691,345 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch { return base.TensorSoftmaxRows(input); }
     }
+
+    // ============================================================================
+    // Issue #160 spectral perf op overrides — dispatch to backend.* GPU kernels.
+    // Each op converts T to float at GPU boundary (matches existing engine pattern).
+    // ============================================================================
+
+    public override Tensor<T> NativeTanh<T>(Tensor<T> input)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeTanh(input);
+        try
+        {
+            int n = input.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var inputF = new float[n];
+            for (int i = 0; i < n; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            backend.Tanh(inBuf.Buffer, outBuf.Buffer, n);
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeTanh(input); }
+    }
+
+    public override Tensor<T> NativeExp<T>(Tensor<T> input)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeExp(input);
+        try
+        {
+            int n = input.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var inputF = new float[n];
+            for (int i = 0; i < n; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            backend.Exp(inBuf.Buffer, outBuf.Buffer, n);
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeExp(input); }
+    }
+
+    public override Tensor<T> NativeAtan2<T>(Tensor<T> imag, Tensor<T> real)
+    {
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag.Length != real.Length) return base.NativeAtan2(imag, real);
+        if (!TryGetBackend(out var backend)) return base.NativeAtan2(imag, real);
+        try
+        {
+            int n = imag.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var iF = new float[n];
+            var rF = new float[n];
+            for (int i = 0; i < n; i++) { iF[i] = (float)ops.ToDouble(imag[i]); rF[i] = (float)ops.ToDouble(real[i]); }
+            using var iBuf = new OwnedBuffer(backend.AllocateBuffer(iF), true);
+            using var rBuf = new OwnedBuffer(backend.AllocateBuffer(rF), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            backend.Atan2Elementwise(iBuf.Buffer, rBuf.Buffer, outBuf.Buffer, n);
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), imag._shape);
+        }
+        catch { return base.NativeAtan2(imag, real); }
+    }
+
+    public override Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeMagnitudeAndPhase(input, out phase);
+        try
+        {
+            int n = input.Length;
+            var (rF, iF) = DecomposeComplex(input);
+            using var rBuf = new OwnedBuffer(backend.AllocateBuffer(rF), true);
+            using var iBuf = new OwnedBuffer(backend.AllocateBuffer(iF), true);
+            using var magBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var phaseBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            backend.SplitComplexMagnitude(rBuf.Buffer, iBuf.Buffer, magBuf.Buffer, n);
+            backend.SplitComplexPhase(rBuf.Buffer, iBuf.Buffer, phaseBuf.Buffer, n);
+            phase = RecomposeReal<T>(backend.DownloadBuffer(phaseBuf.Buffer), input._shape);
+            return RecomposeReal<T>(backend.DownloadBuffer(magBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeMagnitudeAndPhase(input, out phase); }
+    }
+
+    public override Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeAnalyticSignal(input, freqLow, freqHigh, sampleRate);
+        try
+        {
+            int fftSize = input._shape[^1];
+            int batchCount = input.Length / fftSize;
+            if (fftSize <= 0 || (fftSize & (fftSize - 1)) != 0)
+                return base.NativeAnalyticSignal(input, freqLow, freqHigh, sampleRate);
+
+            int total = input.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var inputF = new float[total];
+            for (int i = 0; i < total; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+            var zerosF = new float[total];
+
+            int halfN = fftSize / 2;
+            int binLow = freqLow <= 0 ? 0 : (int)Math.Ceiling(freqLow * fftSize / sampleRate);
+            int binHigh = double.IsPositiveInfinity(freqHigh) || freqHigh >= sampleRate * 0.5
+                ? halfN + 1 : Math.Min(halfN + 1, (int)Math.Ceiling(freqHigh * fftSize / sampleRate));
+
+            using var inRBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var inIBuf = new OwnedBuffer(backend.AllocateBuffer(zerosF), true);
+            using var specRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var specIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var maskedRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var maskedIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var outRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var outIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+
+            // Forward FFT
+            if (batchCount > 1)
+                backend.BatchedFFT(inRBuf.Buffer, inIBuf.Buffer, specRBuf.Buffer, specIBuf.Buffer, batchCount, fftSize, inverse: false);
+            else
+                backend.FFT(inRBuf.Buffer, inIBuf.Buffer, specRBuf.Buffer, specIBuf.Buffer, fftSize, inverse: false);
+
+            // Apply Hilbert mask via dedicated kernel
+            backend.AnalyticSignalMask(specRBuf.Buffer, specIBuf.Buffer, maskedRBuf.Buffer, maskedIBuf.Buffer,
+                batchCount, fftSize, binLow, binHigh);
+
+            // Inverse FFT
+            if (batchCount > 1)
+                backend.BatchedFFT(maskedRBuf.Buffer, maskedIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: true);
+            else
+                backend.FFT(maskedRBuf.Buffer, maskedIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
+
+            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
+                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+        }
+        catch { return base.NativeAnalyticSignal(input, freqLow, freqHigh, sampleRate); }
+    }
+
+    public override Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeNormalizeRows(input, inPlace);
+        if (input.Rank != 2) return base.NativeNormalizeRows(input, inPlace);
+        try
+        {
+            int rows = input._shape[0];
+            int cols = input._shape[1];
+            int total = rows * cols;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var inputF = new float[total];
+            for (int i = 0; i < total; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            backend.NormalizeRowsFused(inBuf.Buffer, outBuf.Buffer, rows, cols);
+            var result = RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), input._shape);
+            if (inPlace)
+            {
+                // Copy result data back into the input tensor's buffer for in-place semantics
+                var src = result.DataVector.AsSpan();
+                var dst = input.DataVector.AsWritableSpan();
+                src.CopyTo(dst);
+                return input;
+            }
+            return result;
+        }
+        catch { return base.NativeNormalizeRows(input, inPlace); }
+    }
+
+    public override Tensor<Complex<T>> NativeBispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeBispectrum(spectrum, maxF1, maxF2);
+        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF1 + maxF2 > spectrum.Length)
+            return base.NativeBispectrum(spectrum, maxF1, maxF2);
+        try
+        {
+            int total = maxF1 * maxF2;
+            var (rF, iF) = DecomposeComplex(spectrum);
+            using var sRBuf = new OwnedBuffer(backend.AllocateBuffer(rF), true);
+            using var sIBuf = new OwnedBuffer(backend.AllocateBuffer(iF), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            backend.BispectrumGather(sRBuf.Buffer, sIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, maxF1, maxF2);
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), new[] { maxF1, maxF2 });
+        }
+        catch { return base.NativeBispectrum(spectrum, maxF1, maxF2); }
+    }
+
+    public override Tensor<Complex<T>> NativeTrispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2, int maxF3)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeTrispectrum(spectrum, maxF1, maxF2, maxF3);
+        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0 || maxF1 + maxF2 + maxF3 > spectrum.Length)
+            return base.NativeTrispectrum(spectrum, maxF1, maxF2, maxF3);
+        try
+        {
+            int total = maxF1 * maxF2 * maxF3;
+            var (rF, iF) = DecomposeComplex(spectrum);
+            using var sRBuf = new OwnedBuffer(backend.AllocateBuffer(rF), true);
+            using var sIBuf = new OwnedBuffer(backend.AllocateBuffer(iF), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            backend.TrispectrumGather(sRBuf.Buffer, sIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, maxF1, maxF2, maxF3);
+            return RecomposeComplex<T>(backend.DownloadBuffer(oRBuf.Buffer),
+                backend.DownloadBuffer(oIBuf.Buffer), new[] { maxF1, maxF2, maxF3 });
+        }
+        catch { return base.NativeTrispectrum(spectrum, maxF1, maxF2, maxF3); }
+    }
+
+    public override Tensor<T> NativeBatchedCavityForward<T>(Tensor<T> input, Tensor<Complex<T>> cavityFilters, int numBounces)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeBatchedCavityForward(input, cavityFilters, numBounces);
+        if (input.Rank != 2 || cavityFilters.Rank != 2 || numBounces < 1)
+            return base.NativeBatchedCavityForward(input, cavityFilters, numBounces);
+        try
+        {
+            int batch = input._shape[0];
+            int n = input._shape[1];
+            int numCavities = cavityFilters._shape[0];
+            if (cavityFilters._shape[1] != n || (n & (n - 1)) != 0)
+                return base.NativeBatchedCavityForward(input, cavityFilters, numBounces);
+
+            var ops = MathHelper.GetNumericOperations<T>();
+            int total = batch * n;
+            var inputF = new float[total];
+            for (int i = 0; i < total; i++) inputF[i] = (float)ops.ToDouble(input[i]);
+            var (filtRF, filtIF) = DecomposeComplex(cavityFilters);
+
+            // Compose on GPU: initial FFT → per cavity (multiply + IFFT + tanh + FFT for next bounce).
+            // Uses existing backend primitives + the new CavityBounceInplace kernel.
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inputF), true);
+            using var zerosBuf = new OwnedBuffer(backend.AllocateBuffer(new float[total]), true);
+            using var specRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var specIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var workRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var workIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var tmpRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var tmpIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var tiledRBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var tiledIBuf = new OwnedBuffer(backend.AllocateBuffer(total), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(batch * numCavities * n), true);
+
+            // Initial batched FFT of input waveforms
+            backend.BatchedFFT(inBuf.Buffer, zerosBuf.Buffer, specRBuf.Buffer, specIBuf.Buffer, batch, n, inverse: false);
+
+            for (int c = 0; c < numCavities; c++)
+            {
+                // Tile this cavity's filter across batch
+                for (int b = 0; b < batch; b++)
+                {
+                    backend.Copy(backend.AllocateBuffer(new ReadOnlySpan<float>(filtRF, c * n, n).ToArray()),
+                        0, tiledRBuf.Buffer, b * n, n);
+                    backend.Copy(backend.AllocateBuffer(new ReadOnlySpan<float>(filtIF, c * n, n).ToArray()),
+                        0, tiledIBuf.Buffer, b * n, n);
+                }
+                // Reset working spectrum
+                backend.Copy(specRBuf.Buffer, 0, workRBuf.Buffer, 0, total);
+                backend.Copy(specIBuf.Buffer, 0, workIBuf.Buffer, 0, total);
+
+                for (int bounce = 0; bounce < numBounces; bounce++)
+                {
+                    backend.SplitComplexMultiply(workRBuf.Buffer, workIBuf.Buffer,
+                        tiledRBuf.Buffer, tiledIBuf.Buffer,
+                        tmpRBuf.Buffer, tmpIBuf.Buffer, total);
+                    backend.BatchedFFT(tmpRBuf.Buffer, tmpIBuf.Buffer,
+                        workRBuf.Buffer, workIBuf.Buffer, batch, n, inverse: true);
+                    // Apply 1/N scale + tanh + zero imag in single fused kernel
+                    backend.CavityBounceInplace(workRBuf.Buffer, workIBuf.Buffer, total, 1f / n);
+                    if (bounce < numBounces - 1)
+                    {
+                        backend.BatchedFFT(workRBuf.Buffer, workIBuf.Buffer,
+                            tmpRBuf.Buffer, tmpIBuf.Buffer, batch, n, inverse: false);
+                        backend.Copy(tmpRBuf.Buffer, 0, workRBuf.Buffer, 0, total);
+                        backend.Copy(tmpIBuf.Buffer, 0, workIBuf.Buffer, 0, total);
+                    }
+                }
+
+                // Copy this cavity's output for all batches into output buffer
+                for (int b = 0; b < batch; b++)
+                    backend.Copy(workRBuf.Buffer, b * n, outBuf.Buffer, (b * numCavities + c) * n, n);
+            }
+
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), new[] { batch, numCavities, n });
+        }
+        catch { return base.NativeBatchedCavityForward(input, cavityFilters, numBounces); }
+    }
+
+    public override Tensor<T> NativeMfccFeatures<T>(Tensor<T> waveforms, int numSegments, int numMfcc, int paddedDim)
+    {
+        // Pipeline composes from backend.FFT + backend.MelFilterbankApply + backend.MfccLog1p + backend.MatMul (DCT).
+        // For now use base CPU implementation; full GPU pipeline would require precomputed mel/DCT bases.
+        return base.NativeMfccFeatures(waveforms, numSegments, numMfcc, paddedDim);
+    }
+
+    public override Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins)
+    {
+        if (!TryGetBackend(out var backend)) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
+        if (numSegments <= 0 || numBins <= 0) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
+        try
+        {
+            bool batched = waveforms.Rank == 2;
+            int batch = batched ? waveforms._shape[0] : 1;
+            int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
+            int segmentLen = numSamples / numSegments;
+            int fftSize = 1; while (fftSize < segmentLen) fftSize <<= 1;
+            int totalSegBatch = batch * numSegments;
+            int totalSegFFT = totalSegBatch * fftSize;
+
+            var ops = MathHelper.GetNumericOperations<T>();
+            var segRF = new float[totalSegFFT];
+            for (int b = 0; b < batch; b++)
+                for (int s = 0; s < numSegments; s++)
+                {
+                    int srcOff = b * numSamples + s * segmentLen;
+                    int dstOff = (b * numSegments + s) * fftSize;
+                    for (int i = 0; i < segmentLen && srcOff + i < (batched ? batch * numSamples : numSamples); i++)
+                        segRF[dstOff + i] = (float)ops.ToDouble(waveforms[srcOff + i]);
+                }
+
+            using var segRBuf = new OwnedBuffer(backend.AllocateBuffer(segRF), true);
+            using var segIBuf = new OwnedBuffer(backend.AllocateBuffer(new float[totalSegFFT]), true);
+            using var fftRBuf = new OwnedBuffer(backend.AllocateBuffer(totalSegFFT), true);
+            using var fftIBuf = new OwnedBuffer(backend.AllocateBuffer(totalSegFFT), true);
+            using var magBuf = new OwnedBuffer(backend.AllocateBuffer(totalSegFFT), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(batch * numSegments * numBins), true);
+
+            backend.BatchedFFT(segRBuf.Buffer, segIBuf.Buffer, fftRBuf.Buffer, fftIBuf.Buffer, totalSegBatch, fftSize, inverse: false);
+            backend.SplitComplexMagnitude(fftRBuf.Buffer, fftIBuf.Buffer, magBuf.Buffer, totalSegFFT);
+            backend.WidebandLogBinPool(magBuf.Buffer, outBuf.Buffer, totalSegBatch, fftSize, numBins, fftSize / 2);
+
+            var outShape = batched ? new[] { batch, numSegments * numBins } : new[] { numSegments * numBins };
+            return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), outShape);
+        }
+        catch { return base.NativeWidebandFeatures(waveforms, numSegments, numBins); }
+    }
+
+    public override Tensor<T> NativePacFeatures<T>(Tensor<T> waveforms, int sampleRate, int envelopeRate,
+        double thetaLow, double thetaHigh, (double low, double high)[] gammaBands)
+    {
+        // Pipeline composes from backend.AnalyticSignal + backend.SplitComplexMagnitude/Phase + backend.PacPhaseBinMi
+        // Full GPU pipeline requires multi-stage orchestration; defer to CPU base for correctness.
+        return base.NativePacFeatures(waveforms, sampleRate, envelopeRate, thetaLow, thetaHigh, gammaBands);
+    }
+
+    // Span-based FFT entry points: GPU backends already have FFT/BatchedFFT; the span entry points
+    // are CPU-side optimizations that bypass tensor wrapping. On a GPU engine, the CPU base is
+    // still the right path because there's no benefit to round-tripping span data through GPU
+    // for a single FFT call (the buffer transfer dominates). Fall-through to base is correct.
 }
