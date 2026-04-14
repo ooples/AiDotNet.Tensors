@@ -1771,8 +1771,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
         => Inner.SpectralFilter(inputReal, filterReal, filterImag, outputReal, batch, height, width, filterSliceCount);
 
-    public virtual void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
-        => Inner.Atan2Elementwise(imag, real, output, n);
+    public virtual void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+        => Inner.Atan2Elementwise(real, imag, output, n);
 
     public virtual void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
         => Inner.NormalizeRowsFused(input, output, rows, cols);

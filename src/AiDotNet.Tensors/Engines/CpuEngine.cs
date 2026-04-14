@@ -27566,6 +27566,38 @@ public class CpuEngine : ITensorLevelEngine
         ValidatePowerOfTwo(input.Length, nameof(input));
 
         int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            // Reinterpret caller's output span as Span<Complex<double>> (layout-identical when T=double).
+            // Fill output directly with (input[i], 0), then run the in-place butterflies on it.
+            // Zero extra allocations, single write pass before FFT.
+            ref Complex<T> outHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref outHead), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = new Complex<double>(System.Runtime.CompilerServices.Unsafe.As<T, double>(ref src), 0.0);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: false);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> outHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref outHead), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = new Complex<float>(System.Runtime.CompilerServices.Unsafe.As<T, float>(ref src), 0f);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: false);
+            return;
+        }
+#else
+        // net471 fallback: no MemoryMarshal.CreateSpan — use a scratch buffer.
         if (typeof(T) == typeof(double))
         {
             var buf = new Complex<double>[n];
@@ -27592,6 +27624,7 @@ public class CpuEngine : ITensorLevelEngine
                 output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
             return;
         }
+#endif
 
         // Generic fallback
         var ops = MathHelper.GetNumericOperations<T>();
@@ -27609,6 +27642,41 @@ public class CpuEngine : ITensorLevelEngine
         ValidatePowerOfTwo(input.Length, nameof(input));
 
         int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            // Copy input into output (reinterpret as Complex<double>) then IFFT + scale in place.
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+                outD[i] = new Complex<double>(outD[i].Real * scale, outD[i].Imaginary * scale);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+                outF[i] = new Complex<float>(outF[i].Real * scale, outF[i].Imaginary * scale);
+            return;
+        }
+#else
         if (typeof(T) == typeof(double))
         {
             var buf = new Complex<double>[n];
@@ -27643,6 +27711,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             return;
         }
+#endif
 
         var ops = MathHelper.GetNumericOperations<T>();
         var arr = new Complex<T>[n];
@@ -27661,6 +27730,34 @@ public class CpuEngine : ITensorLevelEngine
         ValidatePowerOfTwo(input.Length, nameof(input));
 
         int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: false);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: false);
+            return;
+        }
+#else
         if (typeof(T) == typeof(double))
         {
             var buf = new Complex<double>[n];
@@ -27687,6 +27784,7 @@ public class CpuEngine : ITensorLevelEngine
                 output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
             return;
         }
+#endif
 
         var ops = MathHelper.GetNumericOperations<T>();
         var arr = new Complex<T>[n];
@@ -27751,6 +27849,14 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (!(sampleRate > 0.0) || double.IsNaN(sampleRate) || double.IsInfinity(sampleRate))
+            throw new ArgumentException($"sampleRate must be a positive finite value. Got {sampleRate}.", nameof(sampleRate));
+        if (double.IsNaN(freqLow) || freqLow < 0.0)
+            throw new ArgumentException($"freqLow must be a non-negative finite value. Got {freqLow}.", nameof(freqLow));
+        if (double.IsNaN(freqHigh))
+            throw new ArgumentException("freqHigh must not be NaN.", nameof(freqHigh));
+        if (freqHigh < freqLow)
+            throw new ArgumentException($"freqHigh ({freqHigh}) must be >= freqLow ({freqLow}).", nameof(freqHigh));
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
@@ -27831,9 +27937,41 @@ public class CpuEngine : ITensorLevelEngine
         int cols = input._shape[1];
         var result = inPlace ? input : new Tensor<T>(input._shape);
 
+#if NET5_0_OR_GREATER
         if (typeof(T) == typeof(double))
         {
-            // Reinterpret via Unsafe.As on each element — typeof check guarantees T=double
+            // Reinterpret the underlying DataVector spans as double spans (layout-identical when T=double).
+            // Zero allocations, zero copy passes — SIMD kernel reads/writes the tensor memory directly.
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
+            ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
+            var srcD = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, double>(ref srcHead), n);
+            var dstD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, double>(ref dstHead), n);
+            NormalizeRowsDouble(srcD, dstD, rows, cols);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
+            ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
+            var srcF = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, float>(ref srcHead), n);
+            var dstF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, float>(ref dstHead), n);
+            NormalizeRowsFloat(srcF, dstF, rows, cols);
+            return result;
+        }
+#else
+        if (typeof(T) == typeof(double))
+        {
+            // net471 fallback: no MemoryMarshal.CreateSpan. Use temp buffer path.
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
             var dstData = result.DataVector.AsWritableSpan();
@@ -27866,6 +28004,7 @@ public class CpuEngine : ITensorLevelEngine
                 dstData[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
         }
+#endif
 
         // Generic fallback
         var ops = MathHelper.GetNumericOperations<T>();
@@ -28097,7 +28236,11 @@ public class CpuEngine : ITensorLevelEngine
                 ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
                 srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
             }
-            for (int i = 0; i < n; i++) dstD[i] = Math.Exp(srcD[i]);
+            unsafe
+            {
+                fixed (double* ip = srcD) fixed (double* op = dstD)
+                    Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
+            }
             var dstSpan = result.DataVector.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
@@ -28326,14 +28469,20 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeMfccFeatures<T>(Tensor<T> waveforms, int numSegments, int numMfcc, int paddedDim)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
-        if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.");
-        if (numMfcc <= 0) throw new ArgumentException("numMfcc must be positive.");
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
+        if (numMfcc <= 0) throw new ArgumentException("numMfcc must be positive.", nameof(numMfcc));
         ValidatePowerOfTwo(paddedDim, nameof(paddedDim));
 
         bool batched = waveforms.Rank == 2;
         int batch = batched ? waveforms._shape[0] : 1;
         int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
         int segmentLen = numSamples / numSegments;
+        if (segmentLen <= 0)
+            throw new ArgumentException($"numSegments ({numSegments}) must not exceed signal length ({numSamples}).", nameof(numSegments));
+        if (paddedDim < segmentLen)
+            throw new ArgumentException($"paddedDim ({paddedDim}) must be >= segmentLen ({segmentLen}).", nameof(paddedDim));
 
         var outShape = batched ? new[] { batch, numSegments * numMfcc } : new[] { numSegments * numMfcc };
         var result = new Tensor<T>(outShape);
@@ -28394,12 +28543,17 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
-        if (numSegments <= 0 || numBins <= 0) throw new ArgumentException("numSegments and numBins must be positive.");
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
+        if (numBins <= 0) throw new ArgumentException("numBins must be positive.", nameof(numBins));
 
         bool batched = waveforms.Rank == 2;
         int batch = batched ? waveforms._shape[0] : 1;
         int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
         int segmentLen = numSamples / numSegments;
+        if (segmentLen <= 1)
+            throw new ArgumentException($"numSegments ({numSegments}) produces segmentLen ({segmentLen}); must yield >= 2 samples per segment for a usable spectrum.", nameof(numSegments));
 
         // Pick FFT size as next power of 2 >= segmentLen
         int fftSize = 1;
@@ -28461,7 +28615,19 @@ public class CpuEngine : ITensorLevelEngine
         double thetaLow, double thetaHigh, (double low, double high)[] gammaBands)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
-        if (gammaBands is null || gammaBands.Length == 0) throw new ArgumentException("gammaBands must be non-empty.");
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (sampleRate <= 0) throw new ArgumentException("sampleRate must be positive.", nameof(sampleRate));
+        if (envelopeRate <= 0) throw new ArgumentException("envelopeRate must be positive.", nameof(envelopeRate));
+        if (gammaBands is null || gammaBands.Length == 0) throw new ArgumentException("gammaBands must be non-empty.", nameof(gammaBands));
+        if (!(thetaHigh > thetaLow) || thetaLow < 0.0 || double.IsNaN(thetaLow) || double.IsNaN(thetaHigh))
+            throw new ArgumentException($"theta band must satisfy 0 <= thetaLow < thetaHigh. Got [{thetaLow}, {thetaHigh}].");
+        for (int g = 0; g < gammaBands.Length; g++)
+        {
+            var (lo, hi) = gammaBands[g];
+            if (!(hi > lo) || lo < 0.0 || double.IsNaN(lo) || double.IsNaN(hi))
+                throw new ArgumentException($"gammaBands[{g}] must satisfy 0 <= low < high. Got [{lo}, {hi}].", nameof(gammaBands));
+        }
 
         bool batched = waveforms.Rank == 2;
         int batch = batched ? waveforms._shape[0] : 1;

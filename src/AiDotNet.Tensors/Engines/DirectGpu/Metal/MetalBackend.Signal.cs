@@ -699,13 +699,15 @@ public sealed partial class MetalBackend
     }
 
     /// <inheritdoc/>
-    public void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
+    public void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
     {
+        ThrowIfDisposed();
         if (n <= 0) return;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "atan2_elementwise");
         var (groups, threads) = pipeline.Calculate1DDispatch(n);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
+        // Kernel signature is atan2_elementwise(imag, real, ...), keep binding order unchanged.
         encoder.SetBuffer((MetalGpuBuffer)imag, 0);
         encoder.SetBuffer((MetalGpuBuffer)real, 1);
         encoder.SetBuffer((MetalGpuBuffer)output, 2);
@@ -716,9 +718,14 @@ public sealed partial class MetalBackend
     /// <inheritdoc/>
     public void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
+        ThrowIfDisposed();
         if (rows <= 0 || cols <= 0) return;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "normalize_rows_fused");
-        uint block = (uint)Math.Min(256, Math.Max(32, cols));
+        // The normalize_rows_fused kernel uses a tree reduction that requires a power-of-two threadgroup size.
+        // Pick the largest power-of-two <= min(256, cols), then clamp to a minimum of 32.
+        uint block = 32;
+        uint cap = (uint)Math.Min(256, cols);
+        while (block * 2 <= cap) block *= 2;
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer((MetalGpuBuffer)input, 0);
@@ -733,6 +740,8 @@ public sealed partial class MetalBackend
     public void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
     {
+        ThrowIfDisposed();
+        if (batch <= 0 || fftSize <= 0) return;
         int total = batch * fftSize;
         if (total <= 0) return;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "analytic_signal_mask");
@@ -754,8 +763,11 @@ public sealed partial class MetalBackend
     public void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
     {
-        int total = maxF1 * maxF2;
-        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "bispectrum_gather");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
@@ -773,8 +785,11 @@ public sealed partial class MetalBackend
     public void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
     {
-        int total = maxF1 * maxF2 * maxF3;
-        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "trispectrum_gather");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
@@ -792,6 +807,7 @@ public sealed partial class MetalBackend
     /// <inheritdoc/>
     public void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
     {
+        ThrowIfDisposed();
         if (total <= 0) return;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "cavity_bounce_inplace");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
@@ -808,8 +824,11 @@ public sealed partial class MetalBackend
     public void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
         int totalSegBatch, int fftSize, int numBins, int usable)
     {
-        int total = totalSegBatch * numBins;
-        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "wideband_log_bin_pool");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
@@ -827,8 +846,11 @@ public sealed partial class MetalBackend
     public void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
         int totalSegBatch, int specBins, int melBins)
     {
-        int total = totalSegBatch * melBins;
-        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "mel_filterbank_apply");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
@@ -845,6 +867,7 @@ public sealed partial class MetalBackend
     /// <inheritdoc/>
     public void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
     {
+        ThrowIfDisposed();
         if (n <= 0) return;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "mfcc_log1p");
         var (groups, threads) = pipeline.Calculate1DDispatch(n);
@@ -860,7 +883,14 @@ public sealed partial class MetalBackend
     public void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
         int batch, int numSamples, int numGammaBands, int gammaIdx)
     {
+        ThrowIfDisposed();
         if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "pac_phase_bin_mi");
         var (groups, threads) = pipeline.Calculate1DDispatch(batch);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();

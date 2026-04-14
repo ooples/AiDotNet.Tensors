@@ -271,27 +271,36 @@ public class SpectralPerfOpsExtendedTests
     [Fact]
     public void NativePacFeatures_StructuredSignal_HasHigherPac()
     {
-        // A signal that actually has theta-gamma coupling should have higher PAC than random noise
+        // A signal that actually has theta-gamma coupling should have higher PAC than an
+        // uncoupled control — not just > 0, which any signal with nonzero gamma amplitude
+        // would satisfy.
         int numSamples = 2048;
         int sampleRate = 1000;
         double thetaFreq = 6.0;  // Hz
         double gammaFreq = 80.0; // Hz
 
         var coupled = new Tensor<double>([numSamples]);
+        var uncoupled = new Tensor<double>([numSamples]);
+        var rng = new Random(42);
         for (int i = 0; i < numSamples; i++)
         {
             double t = i / (double)sampleRate;
             double theta = Math.Cos(2 * Math.PI * thetaFreq * t);
-            // Gamma amplitude modulated by theta phase
-            double gammaAmp = 0.5 + 0.5 * theta;
-            coupled[i] = theta + gammaAmp * Math.Cos(2 * Math.PI * gammaFreq * t);
+            // Coupled: gamma amplitude modulated by theta phase
+            double gammaAmpCoupled = 0.5 + 0.5 * theta;
+            coupled[i] = theta + gammaAmpCoupled * Math.Cos(2 * Math.PI * gammaFreq * t);
+            // Uncoupled control: gamma with constant amplitude (no phase coupling) + same theta
+            uncoupled[i] = theta + Math.Cos(2 * Math.PI * gammaFreq * t) + 0.05 * (rng.NextDouble() - 0.5);
         }
 
         var gammaBands = new[] { (60.0, 100.0) };
-        var result = _engine.NativePacFeatures(coupled, sampleRate, envelopeRate: 200,
+        var resCoupled = _engine.NativePacFeatures(coupled, sampleRate, envelopeRate: 200,
+            thetaLow: 4.0, thetaHigh: 8.0, gammaBands: gammaBands);
+        var resUncoupled = _engine.NativePacFeatures(uncoupled, sampleRate, envelopeRate: 200,
             thetaLow: 4.0, thetaHigh: 8.0, gammaBands: gammaBands);
 
-        // Coupled signal should produce some PAC MI (not zero)
-        Assert.True(result[0] > 0.0);
+        // Coupled signal must have strictly higher PAC MI than the uncoupled control.
+        Assert.True(resCoupled[0] > resUncoupled[0],
+            $"Expected coupled PAC > uncoupled PAC, but got coupled={resCoupled[0]}, uncoupled={resUncoupled[0]}");
     }
 }

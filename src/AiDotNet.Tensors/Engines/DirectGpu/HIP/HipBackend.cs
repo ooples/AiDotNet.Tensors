@@ -10689,7 +10689,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     }
 
     /// <inheritdoc/>
-    public unsafe void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
+    public unsafe void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
@@ -10709,7 +10709,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         IntPtr ip = input.Handle, op = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &ip; args[1] = &op; args[2] = &rows; args[3] = &cols;
-        uint block = (uint)Math.Min(256, Math.Max(32, cols));
+        // The kernel uses a tree reduction that requires a power-of-two threadgroup size.
+        uint block = 32;
+        uint cap = (uint)Math.Min(256, cols);
+        while (block * 2 <= cap) block *= 2;
         LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float),
             new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3] });
     }
@@ -10718,8 +10721,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
     {
-        int total = batch * fftSize;
-        if (total <= 0) return;
+        if (batch <= 0 || fftSize <= 0) return;
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: analytic_signal_mask");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
@@ -10733,8 +10738,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
     {
-        int total = maxF1 * maxF2;
-        if (total <= 0) return;
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: bispectrum_gather");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
@@ -10748,8 +10755,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
     {
-        int total = maxF1 * maxF2 * maxF3;
-        if (total <= 0) return;
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: trispectrum_gather");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
@@ -10775,8 +10784,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
         int totalSegBatch, int fftSize, int numBins, int usable)
     {
-        int total = totalSegBatch * numBins;
-        if (total <= 0) return;
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: wideband_log_bin_pool");
         IntPtr mp = magBuf.Handle, op = output.Handle;
@@ -10790,8 +10801,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
         int totalSegBatch, int specBins, int melBins)
     {
-        int total = totalSegBatch * melBins;
-        if (total <= 0) return;
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: mel_filterbank_apply");
         IntPtr ps = powerSpec.Handle, mf = melFilters.Handle, me = melEnergy.Handle;
@@ -10818,6 +10831,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         int batch, int numSamples, int numGammaBands, int gammaIdx)
     {
         if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
         if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
         IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;

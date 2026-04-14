@@ -2923,8 +2923,9 @@ public interface IDirectGpuBackend : IDisposable
     void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount);
 
-    /// <summary>Element-wise atan2(imag, real). All buffers length n.</summary>
-    void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n);
+    /// <summary>Element-wise atan2: output[i] = atan2(imag[i], real[i]). Parameter order matches
+    /// <see cref="ComplexPhase"/> / <see cref="SplitComplexPhase"/> (real, imag). All buffers length n.</summary>
+    void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n);
 
     /// <summary>Per-row L2 normalize. Single fused kernel: per-row sum-of-squares + rsqrt + multiply.
     /// One block per row, threads cooperate on shared-memory reduction.</summary>

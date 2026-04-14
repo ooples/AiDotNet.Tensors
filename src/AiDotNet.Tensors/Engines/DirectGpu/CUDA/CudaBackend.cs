@@ -10130,7 +10130,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     }
 
     /// <inheritdoc/>
-    public unsafe void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
+    public unsafe void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
@@ -10154,7 +10154,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
         void** args = stackalloc void*[4];
         args[0] = &ip; args[1] = &op; args[2] = &rows; args[3] = &cols;
         uint grid = (uint)rows;
-        uint block = (uint)Math.Min(256, Math.Max(32, cols));
+        // Tree reduction requires a power-of-two block size.
+        uint block = 32;
+        uint cap = (uint)Math.Min(256, cols);
+        while (block * 2 <= cap) block *= 2;
         uint sharedMem = block * sizeof(float);
         CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
             sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
@@ -10165,11 +10168,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
     {
         if (batch <= 0 || fftSize <= 0) return;
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: analytic_signal_mask");
         using var _ = PushContext();
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
-        int total = batch * fftSize;
         void** args = stackalloc void*[8];
         args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
         args[4] = &batch; args[5] = &fftSize; args[6] = &binLow; args[7] = &binHigh;
@@ -10181,8 +10186,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
     {
-        int total = maxF1 * maxF2;
-        if (total <= 0) return;
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: bispectrum_gather");
         using var _ = PushContext();
@@ -10198,8 +10205,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
     {
-        int total = maxF1 * maxF2 * maxF3;
-        if (total <= 0) return;
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: trispectrum_gather");
         using var _ = PushContext();
@@ -10229,8 +10238,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
         int totalSegBatch, int fftSize, int numBins, int usable)
     {
-        int total = totalSegBatch * numBins;
-        if (total <= 0) return;
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: wideband_log_bin_pool");
         using var _ = PushContext();
@@ -10246,8 +10257,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
         int totalSegBatch, int specBins, int melBins)
     {
-        int total = totalSegBatch * melBins;
-        if (total <= 0) return;
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mel_filterbank_apply");
         using var _ = PushContext();
@@ -10278,6 +10291,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int batch, int numSamples, int numGammaBands, int gammaIdx)
     {
         if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
         if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         using var _ = PushContext();

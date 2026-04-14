@@ -15747,7 +15747,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var iBuf = new OwnedBuffer(backend.AllocateBuffer(iF), true);
             using var rBuf = new OwnedBuffer(backend.AllocateBuffer(rF), true);
             using var outBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
-            backend.Atan2Elementwise(iBuf.Buffer, rBuf.Buffer, outBuf.Buffer, n);
+            // Interface order: Atan2Elementwise(real, imag, output) matches ComplexPhase/SplitComplexPhase.
+            backend.Atan2Elementwise(rBuf.Buffer, iBuf.Buffer, outBuf.Buffer, n);
             return RecomposeReal<T>(backend.DownloadBuffer(outBuf.Buffer), imag._shape);
         }
         catch { return base.NativeAtan2(imag, real); }
@@ -15929,15 +15930,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Initial batched FFT of input waveforms
             backend.BatchedFFT(inBuf.Buffer, zerosBuf.Buffer, specRBuf.Buffer, specIBuf.Buffer, batch, n, inverse: false);
 
+            var cavRSlice = new float[n];
+            var cavISlice = new float[n];
             for (int c = 0; c < numCavities; c++)
             {
-                // Tile this cavity's filter across batch
+                // Upload this cavity's filter once (shared across all batches), then tile via Copy.
+                // Using OwnedBuffer ensures the GPU buffer is disposed when this cavity is done.
+                Array.Copy(filtRF, c * n, cavRSlice, 0, n);
+                Array.Copy(filtIF, c * n, cavISlice, 0, n);
+                using var cavRBuf = new OwnedBuffer(backend.AllocateBuffer(cavRSlice), true);
+                using var cavIBuf = new OwnedBuffer(backend.AllocateBuffer(cavISlice), true);
                 for (int b = 0; b < batch; b++)
                 {
-                    backend.Copy(backend.AllocateBuffer(new ReadOnlySpan<float>(filtRF, c * n, n).ToArray()),
-                        0, tiledRBuf.Buffer, b * n, n);
-                    backend.Copy(backend.AllocateBuffer(new ReadOnlySpan<float>(filtIF, c * n, n).ToArray()),
-                        0, tiledIBuf.Buffer, b * n, n);
+                    backend.Copy(cavRBuf.Buffer, 0, tiledRBuf.Buffer, b * n, n);
+                    backend.Copy(cavIBuf.Buffer, 0, tiledIBuf.Buffer, b * n, n);
                 }
                 // Reset working spectrum
                 backend.Copy(specRBuf.Buffer, 0, workRBuf.Buffer, 0, total);

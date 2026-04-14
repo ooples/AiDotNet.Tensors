@@ -7469,11 +7469,17 @@ public interface IEngine
     /// <summary>
     /// Span-based inverse 1D FFT (complex-to-complex) with 1/N normalization.
     /// </summary>
+    /// <param name="input">Complex input spectrum. Length must be a power of 2.</param>
+    /// <param name="output">Preallocated complex output buffer. Length must equal input length.</param>
+    /// <exception cref="ArgumentException">Thrown if lengths mismatch or input is not a power of 2.</exception>
     void NativeComplexIFFTSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output);
 
     /// <summary>
     /// Span-based complex-to-complex forward 1D FFT.
     /// </summary>
+    /// <param name="input">Complex input samples. Length must be a power of 2.</param>
+    /// <param name="output">Preallocated complex output buffer. Length must equal input length.</param>
+    /// <exception cref="ArgumentException">Thrown if lengths mismatch or input is not a power of 2.</exception>
     void NativeComplexFFTComplexSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output);
 
     /// <summary>
@@ -7481,6 +7487,9 @@ public interface IEngine
     /// Most important variant for Hilbert/PAC/MFCC pipelines that need to return to time-domain real.
     /// Applies 1/N normalization, discards imaginary part.
     /// </summary>
+    /// <param name="input">Complex input spectrum (should satisfy Hermitian symmetry for meaningful output). Length must be a power of 2.</param>
+    /// <param name="output">Preallocated real output buffer. Length must equal input length.</param>
+    /// <exception cref="ArgumentException">Thrown if lengths mismatch or input is not a power of 2.</exception>
     void NativeComplexIFFTRealSpan<T>(ReadOnlySpan<Complex<T>> input, Span<T> output);
 
     /// <summary>
@@ -7493,8 +7502,13 @@ public interface IEngine
     /// <param name="input">Real-valued time-domain input. Last axis length must be power of 2.</param>
     /// <param name="freqLow">Optional low-frequency cutoff in Hz (inclusive). Bins below are zeroed.</param>
     /// <param name="freqHigh">Optional high-frequency cutoff in Hz (exclusive). Bins at/above are zeroed.</param>
-    /// <param name="sampleRate">Sample rate in Hz for interpreting freqLow/freqHigh. Default 1.0 means no band-limiting.</param>
+    /// <param name="sampleRate">Sample rate in Hz for interpreting freqLow/freqHigh. Must be positive and finite.
+    /// Band-limiting is effectively disabled when the defaults <paramref name="freqLow"/>=0 and
+    /// <paramref name="freqHigh"/>=<see cref="double.MaxValue"/> are used; sampleRate then has no effect on the output.</param>
     /// <returns>Complex-valued analytic signal tensor of same shape as input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if input is null.</exception>
+    /// <exception cref="ArgumentException">Thrown if sampleRate is non-positive/non-finite,
+    /// if freqLow is negative or NaN, or if freqHigh &lt; freqLow.</exception>
     Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0);
 
     /// <summary>
