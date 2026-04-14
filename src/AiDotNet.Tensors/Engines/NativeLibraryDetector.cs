@@ -249,43 +249,11 @@ public static class NativeLibraryDetector
         return false;
     }
 
-    private static IEnumerable<string> GetOpenBlasLibraryNames()
-    {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            yield return "openblas.dll";
-            yield return "libopenblas.dll";
-            yield return "libopenblas64_.dll";
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            yield return "libopenblas.so";
-            yield return "libopenblas.so.0";
-            yield return "libopenblas64_.so";
-            yield return "libopenblas64_.so.0";
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            yield return "libopenblas.dylib";
-        }
-    }
-
-    private static IEnumerable<string> GetMklLibraryNames()
-    {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            yield return "mkl_rt.dll";
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            yield return "libmkl_rt.so";
-            yield return "libmkl_rt.so.2";
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            yield return "libmkl_rt.dylib";
-        }
-    }
+    // GetOpenBlasLibraryNames / GetMklLibraryNames removed in
+    // feat/finish-mkl-replacement: DetectOpenBlas and DetectMkl short-circuit
+    // to return false, so the library-name enumerators they previously fed
+    // were unreachable. See git history for the original lists if a user ever
+    // wants to re-enable CPU BLAS detection.
 #endif
 }
 
