@@ -55,6 +55,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _iouLibrary;
     private IntPtr _hyperbolicLibrary;
     private IntPtr _octonionLibrary;
+    private IntPtr _spectralPerfLibrary;
 
     #region Properties
 
@@ -181,6 +182,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
             // Compile octonion algebra operations
             _octonionLibrary = _shaderLibrary.CompileLibrary("Octonion", MetalKernels.OctonionKernels);
+
+            // Compile Issue #160 spectral perf kernels
+            _spectralPerfLibrary = _shaderLibrary.CompileLibrary("SpectralPerf", MetalKernels.SpectralPerfKernels);
 
             _fusedLinearLibrary = _shaderLibrary.CompileLibrary("FusedLinear", MetalKernels.FusedLinearKernels);
             _iouLibrary = _shaderLibrary.CompileLibrary("IoULoss", MetalKernels.IoULossKernels);

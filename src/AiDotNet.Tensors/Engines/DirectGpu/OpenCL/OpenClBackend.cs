@@ -417,6 +417,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, fftProgram, name);
                 }
 
+                // Compile spectral perf kernels (Issue #160)
+                var spectralPerfProgram = CompileOrLoadCached(SpectralPerfKernels.GetSource(), optimizationFlags, "Spectral perf kernels");
+                _programs.Add(spectralPerfProgram);
+                foreach (var name in SpectralPerfKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, spectralPerfProgram, name);
+                }
+
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
@@ -10652,6 +10660,164 @@ KERNEL VARIANTS (A/B testing):
             mulR?.Dispose(); mulI?.Dispose();
             ifftI?.Dispose(); zeroI?.Dispose();
         }
+    }
+
+    /// <inheritdoc/>
+    public void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: atan2_elementwise");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)imag).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)real).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(3u, n);
+        kernel.Execute1D(n, Math.Min(256, n));
+    }
+
+    /// <inheritdoc/>
+    public void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: normalize_rows_fused");
+        int block = Math.Min(256, Math.Max(32, cols));
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetLocalArg(2u, block * sizeof(float));
+        kernel.SetArg(3u, rows);
+        kernel.SetArg(4u, cols);
+        kernel.Execute1D(rows * block, block);
+    }
+
+    /// <inheritdoc/>
+    public void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        int total = batch * fftSize;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: analytic_signal_mask");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+        kernel.SetArg(4u, batch);
+        kernel.SetArg(5u, fftSize);
+        kernel.SetArg(6u, binLow);
+        kernel.SetArg(7u, binHigh);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        int total = maxF1 * maxF2;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: bispectrum_gather");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+        kernel.SetArg(4u, maxF1);
+        kernel.SetArg(5u, maxF2);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        int total = maxF1 * maxF2 * maxF3;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: trispectrum_gather");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+        kernel.SetArg(4u, maxF1);
+        kernel.SetArg(5u, maxF2);
+        kernel.SetArg(6u, maxF3);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: cavity_bounce_inplace");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)workReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)workImag).Buffer.Handle);
+        kernel.SetArg(2u, total);
+        kernel.SetArg(3u, invN);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        int total = totalSegBatch * numBins;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: wideband_log_bin_pool");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)magBuf).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, totalSegBatch);
+        kernel.SetArg(3u, fftSize);
+        kernel.SetArg(4u, numBins);
+        kernel.SetArg(5u, usable);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        int total = totalSegBatch * melBins;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: mel_filterbank_apply");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)powerSpec).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)melFilters).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)melEnergy).Buffer.Handle);
+        kernel.SetArg(3u, totalSegBatch);
+        kernel.SetArg(4u, specBins);
+        kernel.SetArg(5u, melBins);
+        kernel.Execute1D(total, Math.Min(256, total));
+    }
+
+    /// <inheritdoc/>
+    public void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: mfcc_log1p");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, n);
+        kernel.Execute1D(n, Math.Min(256, n));
+    }
+
+    /// <inheritdoc/>
+    public void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        if (batch <= 0) return;
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: pac_phase_bin_mi");
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)thetaPhase).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)gammaAmp).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(3u, batch);
+        kernel.SetArg(4u, numSamples);
+        kernel.SetArg(5u, numGammaBands);
+        kernel.SetArg(6u, gammaIdx);
+        kernel.Execute1D(batch, Math.Min(256, batch));
     }
 
     #endregion

@@ -60,6 +60,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _fusedModule;
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
+    private IntPtr _spectralPerfModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
     private IntPtr _deformableConvModule;
@@ -458,6 +459,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             // Compile FFT kernels (Cooley-Tukey radix-2 FFT, STFT, Mel spectrogram)
             CompileKernelModule(HipFFTKernels.GetSource(), "fft", ref _fftModule,
                 HipFFTKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipSpectralPerfKernels.GetSource(), "spectral_perf", ref _spectralPerfModule,
+                Kernels.HipSpectralPerfKernels.GetKernelNames());
 
             // Compile Sparse kernels (CSR SpMM, GNN message passing)
             CompileKernelModule(HipSparseKernels.GetSource(), "sparse", ref _sparseModule,
@@ -10050,6 +10053,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             HipNativeBindings.hipModuleUnload(_fftModule);
             _fftModule = IntPtr.Zero;
         }
+        if (_spectralPerfModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_spectralPerfModule);
+            _spectralPerfModule = IntPtr.Zero;
+        }
         if (_locallyConnectedModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_locallyConnectedModule);
@@ -10680,6 +10688,145 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         }
     }
 
+    /// <inheritdoc/>
+    public unsafe void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: atan2_elementwise");
+        IntPtr ip = imag.Handle, rp = real.Handle, op = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &ip; args[1] = &rp; args[2] = &op; args[3] = &n;
+        LaunchKernel(kernel, (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: normalize_rows_fused");
+        IntPtr ip = input.Handle, op = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &ip; args[1] = &op; args[2] = &rows; args[3] = &cols;
+        uint block = (uint)Math.Min(256, Math.Max(32, cols));
+        LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float),
+            new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3] });
+    }
+
+    /// <inheritdoc/>
+    public unsafe void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        int total = batch * fftSize;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: analytic_signal_mask");
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &batch; args[5] = &fftSize; args[6] = &binLow; args[7] = &binHigh;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        int total = maxF1 * maxF2;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: bispectrum_gather");
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &maxF1; args[5] = &maxF2;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        int total = maxF1 * maxF2 * maxF3;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: trispectrum_gather");
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &maxF1; args[5] = &maxF2; args[6] = &maxF3;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: cavity_bounce_inplace");
+        IntPtr wr = workReal.Handle, wi = workImag.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &wr; args[1] = &wi; args[2] = &total; args[3] = &invN;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        int total = totalSegBatch * numBins;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: wideband_log_bin_pool");
+        IntPtr mp = magBuf.Handle, op = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &mp; args[1] = &op;
+        args[2] = &totalSegBatch; args[3] = &fftSize; args[4] = &numBins; args[5] = &usable;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        int total = totalSegBatch * melBins;
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: mel_filterbank_apply");
+        IntPtr ps = powerSpec.Handle, mf = melFilters.Handle, me = melEnergy.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &ps; args[1] = &mf; args[2] = &me;
+        args[3] = &totalSegBatch; args[4] = &specBins; args[5] = &melBins;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: mfcc_log1p");
+        IntPtr ip = input.Handle, op = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &ip; args[1] = &op; args[2] = &n;
+        LaunchKernel(kernel, (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        if (batch <= 0) return;
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
+        IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &tp; args[1] = &ga; args[2] = &op;
+        args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
+        LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)),
+            new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3], (IntPtr)args[4], (IntPtr)args[5], (IntPtr)args[6] });
+    }
 }
 
 /// <summary>

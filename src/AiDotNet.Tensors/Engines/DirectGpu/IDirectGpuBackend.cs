@@ -2923,6 +2923,46 @@ public interface IDirectGpuBackend : IDisposable
     void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount);
 
+    /// <summary>Element-wise atan2(imag, real). All buffers length n.</summary>
+    void Atan2Elementwise(IGpuBuffer imag, IGpuBuffer real, IGpuBuffer output, int n);
+
+    /// <summary>Per-row L2 normalize. Single fused kernel: per-row sum-of-squares + rsqrt + multiply.
+    /// One block per row, threads cooperate on shared-memory reduction.</summary>
+    void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols);
+
+    /// <summary>Apply Hilbert mask (analytic-signal frequency-domain weights) to a complex spectrum.
+    /// One thread per (batch, bin) pair. Mask gain is 0/1/2 based on bin index and band limits.</summary>
+    void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag,
+        int batch, int fftSize, int binLow, int binHigh);
+
+    /// <summary>Bispectrum gather kernel: B(f1,f2) = X(f1)*X(f2)*conj(X(f1+f2)). One thread per output.</summary>
+    void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2);
+
+    /// <summary>Trispectrum gather kernel: T(f1,f2,f3) = X(f1)*X(f2)*X(f3)*conj(X(f1+f2+f3)).</summary>
+    void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3);
+
+    /// <summary>In-place cavity bounce: scale real by 1/N, apply tanh, zero imaginary.</summary>
+    void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN);
+
+    /// <summary>Wideband log-bin pooling: per (batch,segment), pool magnitudes into numBins
+    /// logarithmically-spaced bins, take log(1+avg).</summary>
+    void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable);
+
+    /// <summary>Mel filterbank apply: melEnergy[seg,m] = sum_i powerSpec[seg,i] * melFilters[m,i].</summary>
+    void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins);
+
+    /// <summary>log(1 + e) compression for MFCC mel-energy.</summary>
+    void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n);
+
+    /// <summary>PAC phase-binned KL modulation index. One block per batch sample.</summary>
+    void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx);
+
     #endregion
 }
 
