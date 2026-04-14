@@ -8578,6 +8578,28 @@ public class CpuEngine : ITensorLevelEngine
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
 
+        // Iter 24 (batched-GEMM consolidation): for the ND×2D broadcast pattern, B is
+        // SHARED across all batch slices and A is stored row-major contiguous, so the
+        // whole batched matmul collapses to a single 2D GEMM of shape
+        // [batchSize*m, n] × [n, p] = [batchSize*m, p]. This eliminates the per-slice
+        // BLAS dispatch overhead (2-3 µs per call × batchSize) and lets MKL pack B
+        // once instead of N times. The Phase 0 baseline measured the per-slice
+        // dispatch cost via Batched 3D [4,256,1152]×[1152,4608] which was 1.75× slower
+        // than MKL's equivalent 2D matmul — this consolidation should close most of
+        // that gap.
+        //
+        // Requires A to be contiguous (batch dims stacked as rows). The caller in
+        // TensorMatMul ensures this via `a.Contiguous()` before reaching here.
+        if (a.IsContiguous && MatrixMultiplyHelper.TryGemm(
+            a.Data, 0, b.Data, 0, result.Data, 0,
+            batchSize * m, n, p))
+        {
+            return result;
+        }
+
+        // Fallback: per-slice dispatch (preserves behavior for non-contiguous A or
+        // when the big GEMM declines — e.g. non-float/double T, or work below the
+        // BLAS threshold where per-slice dispatch can actually win).
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
