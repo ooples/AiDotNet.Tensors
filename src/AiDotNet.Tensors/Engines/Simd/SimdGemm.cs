@@ -40,9 +40,35 @@ internal static class SimdGemm
 
     // Minimum problem size (m*n*k, count as flops/2) to enable parallel dispatch.
     // Iter 2 (2026-04-11): raised 4M → 20M after measuring that 256² (16.8M) regressed
-    // with parallel on — thread-pool overhead dominates at that size. 512² (134M) and
-    // 1024² (1B) are the real winners and comfortably clear the new threshold.
-    private const long ParallelWorkThreshold = 20L * 1024 * 1024;
+    // with parallel on a 16-core Ryzen 9 3950X — thread-pool dispatch overhead scales
+    // with core count (barrier latency is roughly O(log cores) + per-thread work-steal
+    // setup). 512² (134M) and 1024² (1B) are the real winners at 16 cores.
+    //
+    // Issue #162 context: AiDotNet CI runners have 2 cores (Windows) / 4 cores (Linux).
+    // At those core counts, thread-dispatch overhead is much lower, so parallel dispatch
+    // becomes beneficial at smaller problem sizes. The fixed 20M threshold leaves 2-core
+    // boxes running sequential on medium matmuls that would benefit from parallelism.
+    //
+    // Scale the threshold linearly with core count, floored at 2M (tiny matmuls never
+    // parallelize no matter the core count), capped at 20M (preserves the empirically-
+    // tuned iter-2 value at 16+ cores).
+    //
+    // Example thresholds:
+    //   2 cores:  2M  (CI Windows — gets parallel at 128² and above)
+    //   4 cores:  5M  (CI Linux)
+    //   8 cores: 10M
+    //  16 cores: 20M  (iter 2 default — unchanged)
+    //  32 cores: 20M  (capped)
+    private static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
+
+    private static long ComputeParallelWorkThreshold()
+    {
+        int cores = Math.Max(1, Environment.ProcessorCount);
+        long scaled = (20L * 1024 * 1024 / 16) * cores;
+        if (scaled < 2L * 1024 * 1024) scaled = 2L * 1024 * 1024;
+        if (scaled > 20L * 1024 * 1024) scaled = 20L * 1024 * 1024;
+        return scaled;
+    }
 
     /// <summary>
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
