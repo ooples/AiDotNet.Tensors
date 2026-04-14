@@ -7524,22 +7524,42 @@ public interface IEngine
     /// <summary>
     /// Element-wise hyperbolic tangent with SIMD acceleration on float/double.
     /// </summary>
+    /// <remarks>
+    /// <b>Non-differentiable:</b> this op is registered as non-differentiable in the autograd
+    /// <c>OpRegistry</c> and does not record a backward. Use the differentiable equivalent
+    /// <c>Tanh&lt;T&gt;</c> in training graphs; use <c>NativeTanh</c> only for inference or
+    /// post-training pipelines (e.g. HRE spectral/audio ops) that need SIMD throughput.
+    /// </remarks>
     Tensor<T> NativeTanh<T>(Tensor<T> input);
 
     /// <summary>
     /// Element-wise exponential (e^x) with SIMD acceleration on float/double.
     /// </summary>
+    /// <remarks>
+    /// <b>Non-differentiable:</b> this op is registered as non-differentiable in the autograd
+    /// <c>OpRegistry</c> and does not record a backward. Use the differentiable equivalent
+    /// <c>TensorExp&lt;T&gt;</c> in training graphs; use <c>NativeExp</c> only for inference or
+    /// post-training pipelines that need SIMD throughput.
+    /// </remarks>
     Tensor<T> NativeExp<T>(Tensor<T> input);
 
     /// <summary>
     /// Element-wise atan2(imag, real) with SIMD acceleration. Both tensors must have the same shape.
     /// </summary>
+    /// <remarks>
+    /// <b>Non-differentiable:</b> no backward is recorded. Intended for phase extraction in
+    /// signal-processing pipelines, not for training graphs.
+    /// </remarks>
     Tensor<T> NativeAtan2<T>(Tensor<T> imag, Tensor<T> real);
 
     /// <summary>
     /// Computes magnitude and phase of a complex tensor in a single pass.
     /// Returns magnitude; writes phase into the out parameter.
     /// </summary>
+    /// <remarks>
+    /// <b>Non-differentiable:</b> no backward is recorded. Intended for spectral feature
+    /// extraction, not for training graphs.
+    /// </remarks>
     Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase);
 
     /// <summary>

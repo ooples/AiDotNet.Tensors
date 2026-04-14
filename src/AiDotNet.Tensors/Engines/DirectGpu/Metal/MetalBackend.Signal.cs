@@ -742,8 +742,15 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (batch <= 0 || fftSize <= 0) return;
-        int total = batch * fftSize;
-        if (total <= 0) return;
+        // Validate signed bin indices before casting to uint (negative values would wrap to
+        // very large unsigned values and corrupt kernel indexing).
+        if (binLow < 0 || binHigh < binLow || binHigh > fftSize)
+            throw new ArgumentOutOfRangeException(nameof(binHigh),
+                $"Require 0 <= binLow ({binLow}) <= binHigh ({binHigh}) <= fftSize ({fftSize}).");
+        // Guard batch*fftSize against int overflow.
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
         var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "analytic_signal_mask");
         var (groups, threads) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();

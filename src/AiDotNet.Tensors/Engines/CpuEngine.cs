@@ -28258,7 +28258,17 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (imag is null) throw new ArgumentNullException(nameof(imag));
         if (real is null) throw new ArgumentNullException(nameof(real));
-        if (imag.Length != real.Length) throw new ArgumentException("imag and real must have same length.");
+        // Require matching shape, not just length. Equal-length tensors with different shapes
+        // would silently pair values by flat index which is almost never what the caller wants.
+        if (imag.Rank != real.Rank)
+            throw new ArgumentException($"imag rank ({imag.Rank}) must equal real rank ({real.Rank}).", nameof(real));
+        for (int d = 0; d < imag.Rank; d++)
+        {
+            if (imag._shape[d] != real._shape[d])
+                throw new ArgumentException(
+                    $"imag and real must have the same shape; differ at axis {d}: imag={imag._shape[d]}, real={real._shape[d]}.",
+                    nameof(real));
+        }
         var result = new Tensor<T>(imag._shape);
         int n = imag.Length;
 

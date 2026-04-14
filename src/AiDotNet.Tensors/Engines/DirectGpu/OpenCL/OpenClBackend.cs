@@ -9880,7 +9880,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(1, winBuf.Handle);
             kernel.SetArg(2, outBuf.Handle);
             kernel.SetArg(3, n);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         /// <inheritdoc/>
@@ -9897,7 +9897,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(1, imagBuf.Handle);
             kernel.SetArg(2, magBuf.Handle);
             kernel.SetArg(3, n);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         /// <inheritdoc/>
@@ -9914,7 +9914,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(1, imagBuf.Handle);
             kernel.SetArg(2, phaseBuf.Handle);
             kernel.SetArg(3, n);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         /// <inheritdoc/>
@@ -9933,7 +9933,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(2, realBuf.Handle);
             kernel.SetArg(3, imagBuf.Handle);
             kernel.SetArg(4, n);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         /// <inheritdoc/>
@@ -9969,7 +9969,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(2, n);
             kernel.SetArg(3, refValue);
             kernel.SetArg(4, minDb);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         /// <inheritdoc/>
@@ -9985,7 +9985,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(1, powerBuf.Handle);
             kernel.SetArg(2, n);
             kernel.SetArg(3, refValue);
-            kernel.Execute1D(n, Math.Min(256, n));
+            kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
         }
 
         public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
@@ -10672,7 +10672,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)real).Buffer.Handle);
         kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
         kernel.SetArg(3u, n);
-        kernel.Execute1D(n, Math.Min(256, n));
+        kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
     }
 
     /// <inheritdoc/>
@@ -10681,9 +10681,11 @@ KERNEL VARIANTS (A/B testing):
         if (rows <= 0 || cols <= 0) return;
         if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
             throw new InvalidOperationException("OpenCL kernel not found: normalize_rows_fused");
-        // Tree reduction requires a power-of-two local work-group size.
+        // Tree reduction requires a power-of-two local work-group size. Clamp to the
+        // device's max work-group size via the backend's sizing helper.
+        int ideal = CalculateOptimalWorkGroupSize1D(cols);
         int block = 32;
-        int cap = Math.Min(256, cols);
+        int cap = Math.Min(ideal, cols);
         while (block * 2 <= cap) block *= 2;
         kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -10711,7 +10713,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(5u, fftSize);
         kernel.SetArg(6u, binLow);
         kernel.SetArg(7u, binHigh);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10730,7 +10732,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
         kernel.SetArg(4u, maxF1);
         kernel.SetArg(5u, maxF2);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10750,7 +10752,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(4u, maxF1);
         kernel.SetArg(5u, maxF2);
         kernel.SetArg(6u, maxF3);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10763,7 +10765,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)workImag).Buffer.Handle);
         kernel.SetArg(2u, total);
         kernel.SetArg(3u, invN);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10782,7 +10784,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(3u, fftSize);
         kernel.SetArg(4u, numBins);
         kernel.SetArg(5u, usable);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10801,7 +10803,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(3u, totalSegBatch);
         kernel.SetArg(4u, specBins);
         kernel.SetArg(5u, melBins);
-        kernel.Execute1D(total, Math.Min(256, total));
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     /// <inheritdoc/>
@@ -10813,7 +10815,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
         kernel.SetArg(2u, n);
-        kernel.Execute1D(n, Math.Min(256, n));
+        kernel.Execute1D(n, CalculateOptimalWorkGroupSize1D(n));
     }
 
     /// <inheritdoc/>
@@ -10836,7 +10838,7 @@ KERNEL VARIANTS (A/B testing):
         kernel.SetArg(4u, numSamples);
         kernel.SetArg(5u, numGammaBands);
         kernel.SetArg(6u, gammaIdx);
-        kernel.Execute1D(batch, Math.Min(256, batch));
+        kernel.Execute1D(batch, CalculateOptimalWorkGroupSize1D(batch));
     }
 
     #endregion
