@@ -56,8 +56,17 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="MKL.NET" Version="1.6.0" />
-    <PackageReference Include="MKL.NET.win-x64" Version="2022.0.0.115" />
+    <!--
+      MKL.NET package references REMOVED per the feat/finish-mkl-replacement
+      branch (Issue #131 completion). Supply-chain risk from a bundled
+      110 MB Intel binary outweighs the perf of MKL at the handful of
+      shapes where our SimdGemm still trails. Native BLAS (OpenBLAS,
+      Accelerate, etc.) remains OPTIONAL at runtime via BlasProvider's
+      P/Invoke path — install AiDotNet.Native.OpenBLAS or supply any
+      cblas-compatible library to opt in; otherwise all matmul runs
+      through SimdGemm's AVX2 blocked kernel (tuned in Issue #131
+      iterations 1-24 to match or beat MKL on most DiT-XL shapes).
+    -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
@@ -87,6 +96,10 @@
     <Compile Remove="Helpers\OneDnnProvider.cs" />
     <Compile Remove="Helpers\NativeMemoryManager.cs" />
     <Compile Remove="Helpers\FusedConvHelper.cs" />
+    <!-- SupabaseTelemetryClient needs System.Net.Http which was transitively brought in
+         by MKL.NET.win-x64 pre-removal. The telemetry path is only useful on net10.0
+         runtimes (the GPU backends we wire it into), so excluding it on net471 is safe. -->
+    <Compile Remove="Engines\DirectGpu\Telemetry\SupabaseTelemetryClient.cs" />
   </ItemGroup>
 
   <!--

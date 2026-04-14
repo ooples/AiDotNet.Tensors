@@ -268,9 +268,11 @@ internal static class VmlProvider
 #if NET5_0_OR_GREATER
         try
         {
-            // Force MKL.NET to load its native library first — this ensures
-            // the mkl_rt DLL is in the process and available for symbol lookup.
-            try { _ = typeof(MKLNET.Blas).Assembly; } catch { /* MKL.NET not available */ }
+            // MKL.NET package reference was removed (feat/finish-mkl-replacement).
+            // VML is now loaded opportunistically from whatever MKL runtime the
+            // user has installed (via AiDotNet.Native.OneDNN, system MKL, etc.)
+            // or simply skipped — SimdKernels provides fallback implementations
+            // of all the transcendentals VML was accelerating.
 
             // Try to load MKL runtime library from multiple candidate names
             var candidates = new[]
@@ -289,8 +291,11 @@ internal static class VmlProvider
                 }
             }
 
-            // Try loading from the MKL.NET package's managed DLL directory
-            var mklDir = Path.GetDirectoryName(typeof(MKLNET.Blas).Assembly.Location);
+            // Historically tried the MKL.NET package's managed DLL directory
+            // as a fallback search path. After the removal, only the dynamic
+            // candidate names above are used — if the user wants VML they
+            // install the MKL runtime themselves or use SimdKernels.
+            string? mklDir = null;
             if (mklDir != null)
             {
                 // Search managed DLL directory and runtimes/win-x64/native/ subdirectory

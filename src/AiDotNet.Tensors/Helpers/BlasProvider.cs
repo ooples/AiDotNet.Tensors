@@ -4,10 +4,29 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using MKLNET;
 
 namespace AiDotNet.Tensors.Helpers;
 
+/// <summary>
+/// Native BLAS (cblas_sgemm / cblas_dgemm) provider. Dynamically loads a
+/// cblas-compatible library (OpenBLAS, Accelerate, or Intel MKL if the user
+/// supplies the native DLL out-of-band) at runtime via P/Invoke.
+///
+/// <para>
+/// <b>Supply-chain note</b>: MKL.NET was removed from this project's dependencies
+/// (was previously bundled as a 110 MB Intel binary). BLAS is now entirely
+/// OPT-IN at runtime — install the optional <c>AiDotNet.Native.OpenBLAS</c>
+/// package, set <c>AIDOTNET_BLAS_PATH</c> to a cblas-compatible library, or
+/// place the library on the standard search path. Without one, all matmul
+/// routes through <see cref="Engines.Simd.SimdGemm"/>'s AVX2 blocked kernel.
+/// </para>
+/// <para>
+/// The public surface (<c>IsMklVerified</c>, <c>MklSgemmZeroOffset</c>, etc.)
+/// is kept for consumer compatibility. After the MKL.NET removal they wrap
+/// the native <c>cblas_sgemm</c> P/Invoke path rather than managed MKL.NET
+/// bindings — the <c>Mkl</c> prefix is historical.
+/// </para>
+/// </summary>
 internal static class BlasProvider
 {
     private const int CblasRowMajor = 101;
@@ -17,8 +36,6 @@ internal static class BlasProvider
     private static readonly object InitLock = new object();
     private static bool _initialized;
     private static bool _available;
-    private static bool _useMklNet;  // True if using MKL.NET managed bindings
-    private static bool _mklVerified; // True after first successful MKL call — skip try/catch
     private static IntPtr _libraryHandle;
     private static CblasSgemm? _sgemm;
     private static CblasDgemm? _dgemm;
@@ -31,16 +48,15 @@ internal static class BlasProvider
     private static BlasSetNumThreads? _setNumThreads;
     private static MklSetDynamic? _setDynamic;
     private static int? ThreadCountOverride = ReadEnvInt("AIDOTNET_BLAS_THREADS");
-    private static readonly bool PreferMkl = ReadEnvBool("AIDOTNET_BLAS_PREFER_MKL");
     private static readonly bool TraceEnabled = ReadEnvBool("AIDOTNET_BLAS_TRACE");
 
     /// <summary>
-    /// When true, BLAS/MKL GEMM paths are bypassed entirely — TryGemm and
-    /// IsMklVerified return false at their top so matmul falls through to the
-    /// bit-exact blocked C# fallback. This guarantees bit-identical results
-    /// across runs regardless of thread count, since the fallback's inner
-    /// accumulation order is fixed. Volatile so that lock-free reads in the
-    /// hot TryGemm path see writes made under InitLock without stale caching.
+    /// When true, BLAS GEMM paths are bypassed entirely — TryGemm and
+    /// IsMklVerified return false so matmul falls through to the bit-exact
+    /// blocked C# fallback. Guarantees bit-identical results across runs
+    /// regardless of thread count, since the fallback's inner accumulation
+    /// order is fixed. Volatile so lock-free reads in the hot TryGemm path
+    /// see writes made under InitLock without stale caching.
     /// </summary>
     private static volatile bool _deterministicMode;
 
@@ -48,11 +64,6 @@ internal static class BlasProvider
     /// Returns whether deterministic mode is currently enabled.
     /// </summary>
     public static bool IsDeterministicMode => _deterministicMode;
-
-    // Saved state so that toggling deterministic mode off restores whatever MKL.NET
-    // was doing before. Null means no saved state (deterministic mode was never on
-    // or has already been turned off).
-    private static bool? _savedUseMklNet;
 
     public static void SetDeterministicMode(bool deterministic)
     {
@@ -62,46 +73,8 @@ internal static class BlasProvider
             _deterministicMode = deterministic;
             // Deterministic mode routes all matmul through the bit-exact blocked C# fallback
             // by having TryGemm/IsMklVerified return false at the top. It does NOT call into
-            // native thread-control functions (mkl_set_num_threads, etc.) — those paths are
-            // only triggered when AIDOTNET_BLAS_THREADS is explicitly set via env var, which
-            // drives ThreadCountOverride. ThreadCountOverride is intentionally left alone
-            // here to avoid touching native symbols that can be unsafe on some platforms.
-            if (deterministic)
-            {
-                _savedUseMklNet = _useMklNet;
-                _useMklNet = false;
-            }
-            else
-            {
-                // Restore saved MKL state (what _useMklNet was before deterministic was turned on).
-                if (_savedUseMklNet.HasValue)
-                {
-                    _useMklNet = _savedUseMklNet.Value;
-                    _savedUseMklNet = null;
-                }
-
-                // Second-chance MKL.NET init: if BLAS was initialized DURING deterministic mode,
-                // TryLoadLibrary deliberately skipped MKL.NET and fell through to native BLAS
-                // (or no backend at all). Now that deterministic is off, attempt the MKL.NET
-                // load once more so the non-deterministic path isn't permanently stuck on the
-                // slower native/blocked fallback. This mirrors the code in TryLoadLibrary.
-                if (_initialized && !_useMklNet)
-                {
-                    try
-                    {
-                        if (TryInitializeMklNet())
-                        {
-                            Trace("[BLAS] MKL.NET retry-init after leaving deterministic mode succeeded");
-                            _useMklNet = true;
-                            _available = true;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Trace($"[BLAS] MKL.NET retry-init failed: {ex.GetType().Name}: {ex.Message}");
-                    }
-                }
-            }
+            // native thread-control functions — those paths are only triggered when
+            // AIDOTNET_BLAS_THREADS is explicitly set via env var.
         }
     }
 
@@ -143,27 +116,28 @@ internal static class BlasProvider
     private delegate void MklSetDynamic(int enabled);
 
     /// <summary>
-    /// Returns true if a BLAS library has been successfully loaded.
-    /// Useful for diagnostics to verify native library is available.
+    /// Returns true if a native BLAS library has been successfully loaded.
+    /// Useful for diagnostics to verify a backing library is available.
     /// </summary>
     internal static bool IsAvailable
     {
         get
         {
             EnsureInitialized();
-            return _available && (_useMklNet || _sgemm != null);
+            return _available && _sgemm != null;
         }
     }
 
     /// <summary>
-    /// Returns the name of the BLAS backend being used.
+    /// Returns the name of the BLAS backend being used. After the MKL.NET
+    /// removal (feat/finish-mkl-replacement) only "Native BLAS" or "None"
+    /// are possible.
     /// </summary>
     internal static string BackendName
     {
         get
         {
             EnsureInitialized();
-            if (_useMklNet) return "Intel MKL.NET";
             if (_sgemm != null) return "Native BLAS";
             return "None";
         }
@@ -175,13 +149,6 @@ internal static class BlasProvider
         // MatrixMultiplyHelper.MultiplyBlocked. Also avoids triggering native BLAS
         // initialization, which can be unsafe on some platforms.
         if (_deterministicMode) return false;
-
-        // Hot path: after MKL is verified AND still enabled, skip all checks
-        if (_mklVerified && _useMklNet)
-        {
-            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
-            return true;
-        }
 
         if (!EnsureInitialized())
         {
@@ -195,13 +162,6 @@ internal static class BlasProvider
             return false;
         }
 
-        // Use MKL.NET if available (preferred for performance)
-        if (_useMklNet)
-        {
-            return TryMklNetSgemm(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
-        }
-
-        // Fall back to native library
         if (_sgemm == null)
         {
             return false;
@@ -224,15 +184,18 @@ internal static class BlasProvider
     }
 
     /// <summary>
-    /// Returns true if native BLAS (not MKL.NET) is available for direct pointer calls.
+    /// Returns true if native BLAS is available for direct pointer calls.
+    /// (After MKL.NET removal, this is the only BLAS path — kept for API
+    /// continuity with the pre-removal consumers.)
     /// </summary>
-    internal static bool HasNativeSgemm => _available && !_useMklNet && _sgemm != null;
-    internal static bool HasNativeDgemm => _available && !_useMklNet && _dgemm != null;
+    internal static bool HasNativeSgemm => _available && _sgemm != null;
+    internal static bool HasNativeDgemm => _available && _dgemm != null;
 
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Returns true if raw function pointers are available for zero-overhead calli dispatch.
-    /// This is the absolute fastest path — no delegate, no P/Invoke, just a direct native call.
+    /// This is the absolute fastest path — no delegate, no P/Invoke transition, just a
+    /// direct native call instruction.
     /// </summary>
     internal static bool HasRawSgemm => _sgemmPtr != IntPtr.Zero;
     internal static bool HasRawDgemm => _dgemmPtr != IntPtr.Zero;
@@ -261,62 +224,84 @@ internal static class BlasProvider
 #endif
 
     /// <summary>
-    /// Returns true if MKL.NET is available for direct span calls.
+    /// Historically "MKL.NET available" — after the MKL.NET removal this always
+    /// returns false. Kept for API continuity (some callers gate hot paths on
+    /// this). Consumers should prefer <see cref="HasNativeSgemm"/> or
+    /// <see cref="HasRawSgemm"/>.
     /// </summary>
-    internal static bool HasMklNet => _available && _useMklNet;
+    internal static bool HasMklNet => false;
 
     /// <summary>
-    /// True after MKL has been verified working. Use IsMklVerified + MklSgemmZeroOffset
-    /// to bypass TryGemm entirely when offsets are always 0 (FusedLinear hot path).
-    /// Returns false in deterministic mode so direct-MKL hot paths fall through to the
-    /// deterministic blocked matmul fallback.
+    /// Historically "MKL verified" — after the MKL.NET removal this aliases the
+    /// native-BLAS availability check. <c>IsMklVerified</c> == true means the
+    /// native raw-pointer path is usable. Returns false in deterministic mode
+    /// so direct-BLAS hot paths fall through to the blocked matmul fallback.
     /// </summary>
-    internal static bool IsMklVerified => _mklVerified && !_deterministicMode;
-
-    /// <summary>
-    /// Absolute fastest MKL path: zero-offset spans, no TryGemm dispatch, no validation.
-    /// Only call when IsMklVerified is true and all arrays start at offset 0.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklSgemmZeroOffset(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+    internal static bool IsMklVerified
     {
-        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-            1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+        get
+        {
+            if (_deterministicMode) return false;
+            EnsureInitialized();
+#if NET5_0_OR_GREATER
+            return _sgemmPtr != IntPtr.Zero;
+#else
+            return _sgemm != null;
+#endif
+        }
     }
 
     /// <summary>
-    /// Absolute fastest MKL path for double.
+    /// Zero-offset SGEMM fast path. Historically used MKL.NET Blas.gemm; now
+    /// wraps the native cblas_sgemm raw pointer for equivalent zero-overhead
+    /// dispatch. Only call when <see cref="IsMklVerified"/> is true and all
+    /// arrays start at offset 0.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklDgemmZeroOffset(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
+    internal static unsafe void MklSgemmZeroOffset(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
     {
-        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-            1.0, a, lda, b, ldb, 0.0, c, ldc);
+#if NET5_0_OR_GREATER
+        fixed (float* ap = a) fixed (float* bp = b) fixed (float* cp = c)
+            SgemmRaw(m, n, k, ap, lda, bp, ldb, cp, ldc);
+#else
+        fixed (float* ap = a) fixed (float* bp = b) fixed (float* cp = c)
+            _sgemm!(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, ap, lda, bp, ldb, 0.0f, cp, ldc);
+#endif
     }
 
     /// <summary>
-    /// Direct MKL.NET SGEMM with zero-offset spans. Skips TryGemm overhead (validation,
-    /// init check, try/catch, AsSpan offset). Caller must ensure arrays are correctly sized.
+    /// Zero-offset DGEMM fast path.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklSgemmDirect(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+    internal static unsafe void MklDgemmZeroOffset(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
     {
-        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k, 1.0f, a.AsSpan(), lda, b.AsSpan(), ldb, 0.0f, c.AsSpan(), ldc);
+#if NET5_0_OR_GREATER
+        fixed (double* ap = a) fixed (double* bp = b) fixed (double* cp = c)
+            DgemmRaw(m, n, k, ap, lda, bp, ldb, cp, ldc);
+#else
+        fixed (double* ap = a) fixed (double* bp = b) fixed (double* cp = c)
+            _dgemm!(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, ap, lda, bp, ldb, 0.0, cp, ldc);
+#endif
     }
 
     /// <summary>
-    /// Direct MKL.NET DGEMM with zero-offset spans.
+    /// SGEMM with zero offsets — historical MKL.NET name, now wraps native.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklDgemmDirect(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
-    {
-        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k, 1.0, a.AsSpan(), lda, b.AsSpan(), ldb, 0.0, c.AsSpan(), ldc);
-    }
+    internal static unsafe void MklSgemmDirect(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+        => MklSgemmZeroOffset(m, n, k, a, lda, b, ldb, c, ldc);
+
+    /// <summary>
+    /// DGEMM with zero offsets — historical MKL.NET name, now wraps native.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void MklDgemmDirect(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
+        => MklDgemmZeroOffset(m, n, k, a, lda, b, ldb, c, ldc);
 
     /// <summary>
     /// Raw SGEMM call with pre-pinned pointers. Skips ALL validation, initialization checks,
     /// and GC pinning. Caller must ensure pointers are valid and arrays are pinned.
-    /// Only available when HasNativeSgemm is true (native BLAS, not MKL.NET).
+    /// Only available when HasNativeSgemm is true.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void SgemmDirect(int m, int n, int k, float* a, int lda, float* b, int ldb, float* c, int ldc)
@@ -326,7 +311,6 @@ internal static class BlasProvider
 
     /// <summary>
     /// Raw DGEMM call with pre-pinned pointers.
-    /// Only available when HasNativeDgemm is true.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void DgemmDirect(int m, int n, int k, double* a, int lda, double* b, int ldb, double* c, int ldc)
@@ -346,12 +330,6 @@ internal static class BlasProvider
             !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
             !HasEnoughData(c.Length, cOffset, m, n, ldc))
             return false;
-
-        if (_useMklNet)
-        {
-            // MKL path: use TryMklNetSgemm which calls alpha=1,beta=0 — need to extend
-            // For now fall through to native path
-        }
 
         if (_sgemm == null) return false;
 
@@ -388,7 +366,6 @@ internal static class BlasProvider
     /// <summary>
     /// GEMM with transpose flags: C = alpha * op(A) * op(B) + beta * C
     /// where op(X) = X if transX=false, X^T if transX=true.
-    /// This avoids materializing transposed matrices — BLAS handles it internally.
     /// Critical for backward pass performance (dA = dC @ B^T, dB = A^T @ dC).
     /// </summary>
     internal static bool TryGemmEx(int m, int n, int k,
@@ -399,7 +376,6 @@ internal static class BlasProvider
         if (_deterministicMode) return false;
         if (!EnsureInitialized()) return false;
 
-        // Bounds validation (same as TryGemm)
         int aRows = transA ? k : m;
         int aCols = transA ? m : k;
         int bRows = transB ? n : k;
@@ -413,28 +389,6 @@ internal static class BlasProvider
 
         int transAFlag = transA ? CblasTrans : CblasNoTrans;
         int transBFlag = transB ? CblasTrans : CblasNoTrans;
-
-        if (_useMklNet)
-        {
-            try
-            {
-                // Apply offsets via Span (same pattern as TryMklNetSgemm)
-                var aSpan = a.AsSpan(aOffset);
-                var bSpan = b.AsSpan(bOffset);
-                var cSpan = c.AsSpan(cOffset);
-
-                Blas.gemm(
-                    Layout.RowMajor,
-                    transA ? Trans.Yes : Trans.No,
-                    transB ? Trans.Yes : Trans.No,
-                    m, n, k, 1.0f, aSpan, lda, bSpan, ldb, 0.0f, cSpan, ldc);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         if (_sgemm == null) return false;
 
@@ -465,24 +419,6 @@ internal static class BlasProvider
             return false;
         }
 
-        // Use MKL.NET if available (preferred for performance)
-        if (_useMklNet)
-        {
-            try
-            {
-                // Use helper method to prevent JIT from loading MKL.NET types
-                // if MKL.NET assembly is not available on this platform
-                return TryMklNetSpanSgemm(m, n, k, a, lda, b, ldb, c, ldc);
-            }
-            catch (Exception)
-            {
-                // MKL.NET call failed, disable and fall back to native
-                _useMklNet = false;
-                return false;
-            }
-        }
-
-        // Fall back to native library with pinned pointers
         if (_sgemm == null)
         {
             return false;
@@ -490,19 +426,15 @@ internal static class BlasProvider
 
         unsafe
         {
-            fixed (float* aPtr = a)
-            fixed (float* bPtr = b)
-            fixed (float* cPtr = c)
-            {
+            fixed (float* aPtr = a, bPtr = b, cPtr = c)
                 _sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, aPtr, lda, bPtr, ldb, 0.0f, cPtr, ldc);
-            }
         }
 
         return true;
     }
 
     /// <summary>
-    /// Span-based GEMM for double precision.
+    /// Span-based GEMM for zero-copy operations (double precision).
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
@@ -512,22 +444,6 @@ internal static class BlasProvider
             return false;
         }
 
-        if (_useMklNet)
-        {
-            try
-            {
-                // Use helper method to prevent JIT from loading MKL.NET types
-                // if MKL.NET assembly is not available on this platform
-                return TryMklNetSpanDgemm(m, n, k, a, lda, b, ldb, c, ldc);
-            }
-            catch (Exception)
-            {
-                // MKL.NET call failed, disable and fall back to native
-                _useMklNet = false;
-                return false;
-            }
-        }
-
         if (_dgemm == null)
         {
             return false;
@@ -535,113 +451,17 @@ internal static class BlasProvider
 
         unsafe
         {
-            fixed (double* aPtr = a)
-            fixed (double* bPtr = b)
-            fixed (double* cPtr = c)
-            {
+            fixed (double* aPtr = a, bPtr = b, cPtr = c)
                 _dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, aPtr, lda, bPtr, ldb, 0.0, cPtr, ldc);
-            }
         }
 
         return true;
     }
 
-    /// <summary>
-    /// Helper method for array-based float GEMM using MKL.NET.
-    /// Marked NoInlining to prevent JIT from loading MKL.NET types when method is not called.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static bool TryMklNetSgemm(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
-    {
-        // Fast path: after first successful call, skip try/catch entirely
-        if (_mklVerified)
-        {
-            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
-            return true;
-        }
-
-        try
-        {
-            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
-            _mklVerified = true;
-            return true;
-        }
-        catch (Exception)
-        {
-            _useMklNet = false;
-            return false;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void MklNetSgemmCore(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
-    {
-        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-            1.0f, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0f, c.AsSpan(cOffset), ldc);
-    }
-
-    /// <summary>
-    /// Helper method for span-based float GEMM using MKL.NET.
-    /// Marked NoInlining to prevent JIT from loading MKL.NET types when method is not called.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static bool TryMklNetSpanSgemm(int m, int n, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
-    {
-        Blas.gemm(
-            Layout.RowMajor,
-            Trans.No,
-            Trans.No,
-            m, n, k,
-            1.0f,
-            a, lda,
-            b, ldb,
-            0.0f,
-            c, ldc);
-        return true;
-    }
-
-    /// <summary>
-    /// Helper method for span-based double GEMM using MKL.NET.
-    /// Marked NoInlining to prevent JIT from loading MKL.NET types when method is not called.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static bool TryMklNetSpanDgemm(int m, int n, int k, ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
-    {
-        Blas.gemm(
-            Layout.RowMajor,
-            Trans.No,
-            Trans.No,
-            m, n, k,
-            1.0,
-            a, lda,
-            b, ldb,
-            0.0,
-            c, ldc);
-        return true;
-    }
-
-    /// <summary>
-    /// Attempts double-precision GEMM via MKL.NET.
-    /// Returns false if MKL.NET is unavailable or deterministic mode is active.
-    /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
-        // Deterministic mode: fall through to the bit-exact blocked C# fallback.
         if (_deterministicMode) return false;
-
-        // Hot path: skip all checks after MKL verified AND still enabled
-        if (_mklVerified && _useMklNet)
-        {
-            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
-            return true;
-        }
-
-        if (!EnsureInitialized())
-        {
-            return false;
-        }
-
+        if (!EnsureInitialized()) return false;
         if (!HasEnoughData(a.Length, aOffset, m, k, lda) ||
             !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
             !HasEnoughData(c.Length, cOffset, m, n, ldc))
@@ -649,17 +469,7 @@ internal static class BlasProvider
             return false;
         }
 
-        // Use MKL.NET if available (preferred for performance)
-        if (_useMklNet)
-        {
-            return TryMklNetDgemm(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
-        }
-
-        // Fall back to native library
-        if (_dgemm == null)
-        {
-            return false;
-        }
+        if (_dgemm == null) return false;
 
         unsafe
         {
@@ -675,34 +485,6 @@ internal static class BlasProvider
         }
 
         return true;
-    }
-
-    /// <summary>
-    /// Helper method for array-based double GEMM using MKL.NET.
-    /// Marked NoInlining to prevent JIT from loading MKL.NET types when method is not called.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static bool TryMklNetDgemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
-    {
-        if (_mklVerified)
-        {
-            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
-            return true;
-        }
-
-        try
-        {
-            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
-                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
-            _mklVerified = true;
-            return true;
-        }
-        catch (Exception)
-        {
-            _useMklNet = false;
-            return false;
-        }
     }
 
     private static bool EnsureInitialized()
@@ -727,7 +509,7 @@ internal static class BlasProvider
 
     private static bool TryLoadLibrary()
     {
-        Trace("[BLAS] TryLoadLibrary starting...");
+        Trace("[BLAS] TryLoadLibrary starting (native-only — MKL.NET removed)...");
         Trace($"[BLAS] AppContext.BaseDirectory: {AppContext.BaseDirectory}");
 
         var disable = Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_BLAS");
@@ -738,29 +520,6 @@ internal static class BlasProvider
             Trace("[BLAS] Disabled via AIDOTNET_DISABLE_BLAS");
             return false;
         }
-
-        // Try MKL.NET first (preferred for best performance)
-        // Skip MKL.NET in deterministic mode: MKL's multi-threaded GEMM produces
-        // non-deterministic results from parallel reduction ordering.
-        if (!_deterministicMode)
-        {
-            // Wrapped in try-catch because on net471, the JIT may throw FileNotFoundException
-            // when trying to resolve the MKL.NET assembly before entering TryInitializeMklNet's own try-catch
-            try
-            {
-                if (TryInitializeMklNet())
-                {
-                    Trace("[BLAS] Initialized MKL.NET successfully");
-                    _useMklNet = true;
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Trace($"[BLAS] MKL.NET JIT load failed: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-        Trace("[BLAS] MKL.NET not available, trying native libraries...");
 
         string? explicitPath = Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PATH");
         if (!string.IsNullOrWhiteSpace(explicitPath))
@@ -807,40 +566,8 @@ internal static class BlasProvider
             _libraryHandle = IntPtr.Zero;
         }
 
-        Trace("[BLAS] No BLAS library found in any candidate path");
+        Trace("[BLAS] No BLAS library found — matmul will use SimdGemm (AVX2 blocked)");
         return false;
-    }
-
-    private static bool TryInitializeMklNet()
-    {
-        try
-        {
-            // Verify MKL.NET is working by doing a tiny GEMM
-            // This will trigger MKL.NET to load its native libraries
-            float[] a = { 1.0f };
-            float[] b = { 1.0f };
-            float[] c = { 0.0f };
-
-            Blas.gemm(
-                Layout.RowMajor,
-                Trans.No,
-                Trans.No,
-                1, 1, 1,
-                1.0f,
-                a.AsSpan(), 1,
-                b.AsSpan(), 1,
-                0.0f,
-                c.AsSpan(), 1);
-
-            // If we get here, MKL.NET is working
-            Trace($"[BLAS] MKL.NET verification: 1x1 GEMM result = {c[0]} (expected 1.0)");
-            return Math.Abs(c[0] - 1.0f) < 0.001f;
-        }
-        catch (Exception ex)
-        {
-            Trace($"[BLAS] MKL.NET initialization failed: {ex.GetType().Name}: {ex.Message}");
-            return false;
-        }
     }
 
     private static void Trace(string message)
@@ -886,12 +613,10 @@ internal static class BlasProvider
 
         // Only invoke native thread-control functions when the caller has explicitly
         // provided a ThreadCountOverride (set via the AIDOTNET_BLAS_THREADS env var).
-        // Deterministic mode does NOT opt in here — it bypasses BLAS entirely via
-        // the TryGemm short-circuit, so thread-control calls would be pointless.
         // The loaded symbols can be unsafe to call blindly on some platforms — on
         // net10.0 Windows, for example, invoking them without this explicit opt-in
-        // has been seen to trigger access violations. Falling through leaves the
-        // native library at its own default thread count, which is safe.
+        // has been seen to trigger access violations (see blas_native_init_crash.md).
+        // Falling through leaves the native library at its own default thread count.
         if (!ThreadCountOverride.HasValue)
         {
             Trace("[BLAS] ApplyThreadSettings skipped — no explicit thread count requested");
@@ -905,22 +630,10 @@ internal static class BlasProvider
             _setNumThreads(threadCount);
             Trace($"[BLAS] Set thread count to {threadCount}");
         }
-        catch (DllNotFoundException)
-        {
-            // Ignore failures to keep BLAS optional and non-fatal.
-        }
-        catch (EntryPointNotFoundException)
-        {
-            // Ignore failures to keep BLAS optional and non-fatal.
-        }
-        catch (BadImageFormatException)
-        {
-            // Ignore failures to keep BLAS optional and non-fatal.
-        }
-        catch (SEHException)
-        {
-            // Ignore failures to keep BLAS optional and non-fatal.
-        }
+        catch (DllNotFoundException) { /* optional — don't fail */ }
+        catch (EntryPointNotFoundException) { /* optional — don't fail */ }
+        catch (BadImageFormatException) { /* optional — don't fail */ }
+        catch (SEHException) { /* optional — don't fail */ }
     }
 
     private static T? TryLoadSymbol<T>(string name) where T : class
@@ -956,6 +669,11 @@ internal static class BlasProvider
 
     private static string[] GetCandidateLibraryNames()
     {
+        // After the MKL.NET removal, OpenBLAS is the preferred candidate library
+        // (bundled via the optional AiDotNet.Native.OpenBLAS package). MKL native
+        // DLLs are still loaded if the user supplies them — the mkl_rt symbols
+        // follow the same cblas_sgemm ABI — but we no longer bundle or depend
+        // on MKL in any form.
         string[] openblas =
         {
             "openblas",
@@ -975,18 +693,10 @@ internal static class BlasProvider
             "libmkl_rt.dylib"
         };
 
-        bool preferMkl = PreferMkl || RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        // Prefer OpenBLAS by default; user can override via AIDOTNET_BLAS_PATH.
         var names = new List<string>(openblas.Length + mkl.Length);
-        if (preferMkl)
-        {
-            names.AddRange(mkl);
-            names.AddRange(openblas);
-        }
-        else
-        {
-            names.AddRange(openblas);
-            names.AddRange(mkl);
-        }
+        names.AddRange(openblas);
+        names.AddRange(mkl);
 
         // Also try loading from various known directories
         var additionalPaths = new List<string>();
