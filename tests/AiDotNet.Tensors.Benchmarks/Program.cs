@@ -253,6 +253,15 @@ class Program
             return;
         }
 
+        // DiT-XL A/B matmul benchmarks: our blocked C# GEMM vs MKL.NET at the exact
+        // shapes a DiT-XL forward pass exercises. Used as the acceptance gate for
+        // the "finish MKL replacement" feature branch (~10-20min).
+        if (args[0] == "--dit-xl-matmul")
+        {
+            BenchmarkRunner.Run<DitXLMatMulBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
         if (args[0] == "--vs-tensorcodec-gaps")
         {
@@ -362,6 +371,8 @@ class Program
         Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
         Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
         Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
+        Console.WriteLine("  --vs-deterministic-matmul: Deterministic (blocked C#) vs MKL.NET matmul (HRE + square shapes)");
+        Console.WriteLine("  --dit-xl-matmul     : Blocked C# vs MKL.NET at DiT-XL shapes (feat/finish-mkl-replacement baseline)");
 #endif
     }
 }
