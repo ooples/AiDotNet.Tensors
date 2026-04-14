@@ -160,29 +160,21 @@ public static class NativeLibraryDetector
 
     private static bool DetectOpenBlas()
     {
-#if NET5_0_OR_GREATER
-        foreach (var name in GetOpenBlasLibraryNames())
-        {
-            if (TryLoadLibrary(name))
-            {
-                return true;
-            }
-        }
-#endif
+        // External BLAS disabled in the supply-chain-independence build
+        // (feat/finish-mkl-replacement). NativeLibraryDetector still exists for
+        // diagnostic purposes (HasCuda / HasHip / HasOpenCl / HasClBlast all
+        // report GPU-side libraries that ARE still loaded when AiDotNet.Native.*
+        // packages are installed), but the two CPU BLAS detectors (OpenBlas,
+        // MKL) always report false since those paths are no longer used by
+        // the engine — matmul runs through SimdGemm.
         return false;
     }
 
     private static bool DetectMkl()
     {
-#if NET5_0_OR_GREATER
-        foreach (var name in GetMklLibraryNames())
-        {
-            if (TryLoadLibrary(name))
-            {
-                return true;
-            }
-        }
-#endif
+        // See DetectOpenBlas: CPU BLAS detection disabled. The engine routes
+        // all matmul through SimdGemm's AVX2 blocked kernel + JIT micro-kernel
+        // regardless of whether a system MKL DLL is present.
         return false;
     }
 

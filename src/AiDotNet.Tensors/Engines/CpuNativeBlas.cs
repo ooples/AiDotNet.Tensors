@@ -22,13 +22,18 @@ internal static class CpuNativeBlas
 
     private static readonly Lazy<BlasState?> s_state = new Lazy<BlasState?>(LoadState, true);
 
-    internal static bool IsAvailable => s_state.Value != null;
+    // External BLAS disabled in the supply-chain-independence build
+    // (feat/finish-mkl-replacement). IsAvailable returns false so all
+    // callers fall through to SimdGemm. The LoadState lazy below is
+    // therefore never forced. The loader code is retained as reference
+    // but unreachable.
+    internal static bool IsAvailable => false;
 
-    internal static bool TryGemm(float[] a, float[] b, float[] c, int m, int n, int k)
-        => TryGemm(a, 0, b, 0, c, 0, m, n, k, k, n, n);
+    // External BLAS disabled: every TryGemm returns false without touching s_state.
+    // Keeping the signatures for caller compat; the native body below is unreachable.
+    internal static bool TryGemm(float[] a, float[] b, float[] c, int m, int n, int k) => false;
 
-    internal static bool TryGemm(double[] a, double[] b, double[] c, int m, int n, int k)
-        => TryGemm(a, 0, b, 0, c, 0, m, n, k, k, n, n);
+    internal static bool TryGemm(double[] a, double[] b, double[] c, int m, int n, int k) => false;
 
     internal static bool TryGemm(
         float[] a,
@@ -44,6 +49,8 @@ internal static class CpuNativeBlas
         int ldb,
         int ldc)
     {
+        return false;
+#pragma warning disable CS0162 // Unreachable — dead native path, kept for reference
         var state = s_state.Value;
         if (state == null || state.Sgemm == null)
         {
@@ -93,6 +100,7 @@ internal static class CpuNativeBlas
         int ldb,
         int ldc)
     {
+        return false;
         var state = s_state.Value;
         if (state == null || state.Dgemm == null)
         {
@@ -591,6 +599,7 @@ internal static class CpuNativeBlas
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void BlasSetNumThreads(int threads);
+#pragma warning restore CS0162
 }
 #else
 internal static class CpuNativeBlas
