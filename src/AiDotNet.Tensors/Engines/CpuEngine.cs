@@ -14907,9 +14907,21 @@ public class CpuEngine : ITensorLevelEngine
         var kf = key.GetFlattenedData();
         var vf = value.GetDataArray();
 
-        var scoresData  = new float[bhCount * seqQ * seqK];
-        var weightsData = new float[bhCount * seqQ * seqK];
-        var outputData  = new float[bhCount * seqQ * d_v];
+        // scoresData is internal scratch — reused between the QK^T and softmax
+        // steps within each call and never escapes this method. Rent from
+        // ArrayPool to amortize the ~16 MB allocation over many calls on the
+        // DiT-XL hot path (28 SDPA calls per forward × ~16 MB = 448 MB of raw
+        // allocation saved per forward).
+        //
+        // weightsData and outputData are returned to the caller via
+        // attentionWeights + the return tensor, so they must stay independently
+        // allocated. Caller owns the array lifetime after this returns.
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
+        try
+        {
+        var weightsData = new float[scoresLen];
+        var outputData = new float[bhCount * seqQ * d_v];
 
         float scaleF  = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
@@ -15025,6 +15037,15 @@ public class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(
             new[] { batch, heads, seqQ, d_v },
             new Vector<T>((T[])(object)outputT));
+        }
+        finally
+        {
+            // scoresData was rented from ArrayPool — return it regardless of success.
+            // clearArray:false because the scratch doesn't leak data (we overwrite
+            // every slot in the next rental) and clearing a 16 MB buffer would
+            // undo the allocation savings.
+            System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
     }
 
     /// <summary>
