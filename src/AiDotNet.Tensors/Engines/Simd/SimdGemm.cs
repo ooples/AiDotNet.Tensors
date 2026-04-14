@@ -53,12 +53,12 @@ internal static class SimdGemm
     // parallelize no matter the core count), capped at 20M (preserves the empirically-
     // tuned iter-2 value at 16+ cores).
     //
-    // Example thresholds:
-    //   2 cores:  2M  (CI Windows — gets parallel at 128² and above)
-    //   4 cores:  5M  (CI Linux)
-    //   8 cores: 10M
-    //  16 cores: 20M  (iter 2 default — unchanged)
-    //  32 cores: 20M  (capped)
+    // Example thresholds (computed = 1,310,720 × cores, clamped to [2M, 20M]):
+    //   2 cores:  2.62 Mi work-elements  → gates parallel on ~137² and above
+    //   4 cores:  5.24 Mi  (CI Linux)
+    //   8 cores: 10.48 Mi
+    //  16 cores: 20 Mi   (iter 2 cap — unchanged)
+    //  32 cores: 20 Mi   (capped)
     private static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
 
     private static long ComputeParallelWorkThreshold()
@@ -85,6 +85,28 @@ internal static class SimdGemm
     {
         c.Clear();
         SgemmAdd(a, b, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Sequential SGEMM — forces the tiled kernel to run without internal parallelism
+    /// even when work would normally exceed <see cref="ParallelWorkThreshold"/>.
+    ///
+    /// Use this inside an outer <c>Parallel.For</c> that already provides parallelism
+    /// (e.g. per-head attention where the batch*heads loop parallelizes per slice):
+    /// letting SgemmTiled also spawn workers would over-subscribe and create more tasks
+    /// than cores, hurting throughput. This overload threads an <c>allowParallel=false</c>
+    /// flag through the dispatch instead of mutating the shared <see cref="UseParallelGemm"/>
+    /// field, so it is safe to call concurrently from many worker threads.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmSequential(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false);
     }
 
     /// <summary>
@@ -151,10 +173,28 @@ internal static class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true);
+    }
+
+    /// <summary>
+    /// Shared implementation of C += op(A) * op(B) with an explicit parallel gate.
+    /// Used by both <see cref="SgemmAdd"/> (allowParallel=true) and
+    /// <see cref="SgemmSequential"/> (allowParallel=false). Threading the flag here
+    /// avoids races on the global <see cref="UseParallelGemm"/> field when the
+    /// caller is itself inside a parallel region.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static void SgemmAddInternal(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c,
+        int m, int k, int n,
+        bool allowParallel)
+    {
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
         {
-            SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n);
+            SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel);
             return;
         }
 #endif
@@ -263,7 +303,8 @@ internal static class SimdGemm
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> c,
-        int m, int k, int n)
+        int m, int k, int n,
+        bool allowParallel = true)
     {
         // Decide parallel vs sequential up front. Parallel dispatches either:
         //   - 1D parallel (SgemmTiledParallelM): row blocks only, when nc is too small
@@ -274,9 +315,14 @@ internal static class SimdGemm
         //     problems (1024²) by splitting columns too, AND col-heavy problems
         //     (LM-head [64, 128]x[128, 50257]) by parallelizing the 1 row block across
         //     many col subs.
+        //
+        // allowParallel=false: caller is inside an outer Parallel.For region and is
+        // already providing parallelism (e.g. SDPA per-head dispatch). Force sequential
+        // to avoid spawning (outer_workers × inner_workers) tasks for (cores) cores.
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
         int numRowBlocks = (m + Mc - 1) / Mc;
-        bool canParallelize = UseParallelGemm
+        bool canParallelize = allowParallel
+            && UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads

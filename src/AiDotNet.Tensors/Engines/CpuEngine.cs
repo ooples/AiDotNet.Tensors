@@ -14945,7 +14945,10 @@ public class CpuEngine : ITensorLevelEngine
                     for (int i = 0; i < seqK; i++)
                         for (int j = 0; j < d_k; j++)
                             kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                    Engines.Simd.SimdGemm.Sgemm(
+                    // SgemmSequential: we're already inside Parallel.For(bhCount), so
+                    // forcing the inner SIMD kernel to run sequential avoids
+                    // bhCount × maxThreads workers on (maxThreads) cores.
+                    Engines.Simd.SimdGemm.SgemmSequential(
                         qf.AsSpan(qOff, seqQ * d_k),
                         kt.AsSpan(0, d_k * seqK),
                         scoresData.AsSpan(sOff, seqQ * seqK),
@@ -14969,6 +14972,17 @@ public class CpuEngine : ITensorLevelEngine
                     scoresData[rowOff + j] = v;
                 }
                 // Second pass: exp(v - max), sum.
+                // Edge case: if the entire row was masked out, maxVal is still -Infinity.
+                // (scores - (-Inf)) == +Inf; MathF.Exp(+Inf) == +Inf; normalizing produces
+                // NaN. Detect that case up front and emit an all-zero softmax row, which
+                // is the sensible behavior (no attention anywhere → no value flows).
+                if (float.IsNegativeInfinity(maxVal))
+                {
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] = 0f;
+                    continue;
+                }
+
                 float sumExp = 0f;
                 for (int j = 0; j < seqK; j++)
                 {
@@ -14993,7 +15007,7 @@ public class CpuEngine : ITensorLevelEngine
                 c: outputData, cOffset: oOff, ldc: d_v);
             if (!gemmed2)
             {
-                Engines.Simd.SimdGemm.Sgemm(
+                Engines.Simd.SimdGemm.SgemmSequential(
                     weightsData.AsSpan(wOff, seqQ * seqK),
                     vf.AsSpan(vOff, seqK * d_v),
                     outputData.AsSpan(oOff, seqQ * d_v),

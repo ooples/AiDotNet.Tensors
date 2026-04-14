@@ -270,8 +270,11 @@ internal static class VmlProvider
         {
             // MKL.NET package reference was removed (feat/finish-mkl-replacement).
             // VML is now loaded opportunistically from whatever MKL runtime the
-            // user has installed (via AiDotNet.Native.OneDNN, system MKL, etc.)
-            // or simply skipped — SimdKernels provides fallback implementations
+            // user has installed (via a system-wide MKL install, user-supplied
+            // mkl_rt.dll on the search path, etc.) — note AiDotNet.Native.OneDNN
+            // ships dnnl.dll (oneDNN) rather than the MKL runtime, so it does
+            // NOT provide VML symbols. If no MKL runtime is present, VML is
+            // simply unavailable and SimdKernels provides fallback implementations
             // of all the transcendentals VML was accelerating.
 
             // Try to load MKL runtime library from multiple candidate names
