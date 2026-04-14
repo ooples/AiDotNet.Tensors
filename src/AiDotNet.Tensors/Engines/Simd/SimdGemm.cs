@@ -901,9 +901,27 @@ internal static class SimdGemm
                             kc);
                     }
                 }
+                else if (mc_actual == Mr && nc_actual > 0 && nc_actual < Nr)
+                {
+                    // Iter 18a: partial Nr tile (full Mr=6 rows, fewer than Nr=16 cols).
+                    // Previously fell through to MicroKernelScalar — a fully scalar K-loop
+                    // that dominated per-head attention matmuls like A·V [256,256]×[256,72]
+                    // (10.3× slower than MKL baseline per docs/mkl-replacement/baseline).
+                    // The masked vector kernel uses the same 12-accumulator FMA path as
+                    // MicroKernel6x16 (packedB is zero-padded on the unused cols so FMAs
+                    // contribute nothing), with masked load/add/store at the end. Keeps
+                    // AVX throughput for the common partial-N edge.
+                    MicroKernel6xNMasked(
+                        packedA, aPanelOffset,
+                        packedB, bPanelOffset,
+                        c, ldc,
+                        icOffset + iLocal, jcOffset + jLocal,
+                        kc, nc_actual);
+                }
                 else
                 {
-                    // Edge case: partial tile
+                    // Edge case: partial mc tile (mc < Mr). Still scalar for now —
+                    // these are rare and handling them needs a separate specialization.
                     MicroKernelScalar(
                         packedA, aPanelOffset,
                         packedB, bPanelOffset,
@@ -1008,6 +1026,115 @@ internal static class SimdGemm
         Unsafe.WriteUnaligned(
             ref Unsafe.As<float, byte>(ref Unsafe.Add(ref target, 8)),
             Avx.Add(existing1, v1));
+    }
+
+    // Iter 18a: precomputed masked-store masks for partial-Nr tiles, indexed by the
+    // number of active lanes (0..8). Used to widen the masked 6×N kernel without
+    // constructing a mask from scratch per call. MSB=1 in a lane means that lane
+    // is active for MaskLoad/MaskStore.
+    private static readonly Vector256<int>[] _partialNrMasks = new[]
+    {
+        Vector256.Create( 0,  0,  0,  0,  0,  0,  0,  0),
+        Vector256.Create(-1,  0,  0,  0,  0,  0,  0,  0),
+        Vector256.Create(-1, -1,  0,  0,  0,  0,  0,  0),
+        Vector256.Create(-1, -1, -1,  0,  0,  0,  0,  0),
+        Vector256.Create(-1, -1, -1, -1,  0,  0,  0,  0),
+        Vector256.Create(-1, -1, -1, -1, -1,  0,  0,  0),
+        Vector256.Create(-1, -1, -1, -1, -1, -1,  0,  0),
+        Vector256.Create(-1, -1, -1, -1, -1, -1, -1,  0),
+        Vector256.Create(-1, -1, -1, -1, -1, -1, -1, -1),
+    };
+
+    /// <summary>
+    /// Iter 18a masked 6×N micro-kernel for partial-Nr tiles (0 &lt; nc_actual &lt; Nr).
+    /// Shares the 12-accumulator FMA inner loop with <see cref="MicroKernel6x16"/>;
+    /// relies on PackB's zero-padding of unused cols so FMAs contribute nothing.
+    /// Masked load-add-store on write-back preserves the existing columns beyond
+    /// nc_actual (which may be outside the caller-supplied C span).
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void MicroKernel6xNMasked(
+        float[] packedA, int aOffset,
+        float[] packedB, int bOffset,
+        Span<float> c, int ldc,
+        int cRow, int cCol,
+        int kc, int nc_actual)
+    {
+        // 12 accumulators — identical to MicroKernel6x16.
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
+        ref float bRef = ref MemoryMarshal.GetArrayDataReference(packedB);
+
+        for (int p = 0; p < kc; p++)
+        {
+            int bIdx = bOffset + p * Nr;
+            var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx)));
+            var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx + 8)));
+
+            int aIdx = aOffset + p * Mr;
+            var a = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
+            c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
+            c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
+            c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
+            c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
+            c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+
+            a = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+            c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+        }
+
+        // Build lane masks from nc_actual.
+        //   nc_actual ∈ (0, 8]: lane 0 is partial (nc_actual lanes), lane 1 skipped.
+        //   nc_actual ∈ (8, 16): lane 0 fully used, lane 1 is partial (nc_actual - 8).
+        int lane0N = nc_actual >= 8 ? 8 : nc_actual;
+        int lane1N = nc_actual >= 8 ? nc_actual - 8 : 0;
+        Vector256<int> mask0 = _partialNrMasks[lane0N];
+        Vector256<int> mask1 = _partialNrMasks[lane1N];
+
+        // Masked accumulate-and-store back to C.
+        fixed (float* pC = c)
+        {
+            float* row = pC + cRow * ldc + cCol;
+            StoreMaskedAccumRow(row,             mask0, mask1, c00, c01);
+            StoreMaskedAccumRow(row + ldc,       mask0, mask1, c10, c11);
+            StoreMaskedAccumRow(row + ldc * 2,   mask0, mask1, c20, c21);
+            StoreMaskedAccumRow(row + ldc * 3,   mask0, mask1, c30, c31);
+            StoreMaskedAccumRow(row + ldc * 4,   mask0, mask1, c40, c41);
+            StoreMaskedAccumRow(row + ldc * 5,   mask0, mask1, c50, c51);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreMaskedAccumRow(
+        float* row, Vector256<int> mask0, Vector256<int> mask1,
+        Vector256<float> v0, Vector256<float> v1)
+    {
+        // Masked accumulate: (read-existing, add, write). Avx.MaskLoad/MaskStore for
+        // float take a Vector256<float> mask — reinterpret the int mask (MSB in each
+        // int lane acts as the selector, bit-identical to the float-mask convention
+        // since the int lane bits overlay the float lane bits).
+        var m0f = mask0.AsSingle();
+        var m1f = mask1.AsSingle();
+        var existing0 = Avx.MaskLoad(row, m0f);
+        var existing1 = Avx.MaskLoad(row + 8, m1f);
+        Avx.MaskStore(row, m0f, Avx.Add(existing0, v0));
+        Avx.MaskStore(row + 8, m1f, Avx.Add(existing1, v1));
     }
 
     /// <summary>
