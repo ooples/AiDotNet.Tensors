@@ -7453,6 +7453,53 @@ public interface IEngine
     Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input);
 
     /// <summary>
+    /// Span-based forward 1D FFT on a real-valued signal.
+    /// Writes complex frequency bins directly into the caller-provided output span,
+    /// eliminating per-call wrapping overhead (virtual indexer, tensor allocation) for
+    /// hot paths that call FFT tens of thousands of times.
+    /// Internally dispatches to type-specialized float/double kernels via reinterpret;
+    /// the generic signature is uniform with the rest of the engine API.
+    /// </summary>
+    /// <typeparam name="T">Element type (float or double recommended for fast path).</typeparam>
+    /// <param name="input">Real-valued input samples. Length must be a power of 2.</param>
+    /// <param name="output">Preallocated complex output buffer. Length must equal input length.</param>
+    /// <exception cref="ArgumentException">Thrown if lengths mismatch or input is not a power of 2.</exception>
+    void NativeComplexFFTSpan<T>(ReadOnlySpan<T> input, Span<Complex<T>> output);
+
+    /// <summary>
+    /// Span-based inverse 1D FFT (complex-to-complex) with 1/N normalization.
+    /// </summary>
+    void NativeComplexIFFTSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output);
+
+    /// <summary>
+    /// Span-based complex-to-complex forward 1D FFT.
+    /// </summary>
+    void NativeComplexFFTComplexSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output);
+
+    /// <summary>
+    /// Fused analytic-signal kernel (Hilbert transform via FFT).
+    /// Computes analytic signal z(t) = x(t) + i·H{x}(t) in one fused call:
+    /// forward FFT → zero negative frequencies (and optionally zero outside [freqLow, freqHigh])
+    /// → double positive bins → inverse FFT. Collapses what is otherwise 3 separate engine
+    /// calls (FFT, bin masking, IFFT) into a single kernel.
+    /// </summary>
+    /// <param name="input">Real-valued time-domain input. Last axis length must be power of 2.</param>
+    /// <param name="freqLow">Optional low-frequency cutoff in Hz (inclusive). Bins below are zeroed.</param>
+    /// <param name="freqHigh">Optional high-frequency cutoff in Hz (exclusive). Bins at/above are zeroed.</param>
+    /// <param name="sampleRate">Sample rate in Hz for interpreting freqLow/freqHigh. Default 1.0 means no band-limiting.</param>
+    /// <returns>Complex-valued analytic signal tensor of same shape as input.</returns>
+    Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0);
+
+    /// <summary>
+    /// Per-row L2 normalization. For each row of a 2D tensor, divides by its L2 norm.
+    /// Uses SIMD for the sum-of-squares accumulation and multiplication. Rows with zero norm
+    /// are left as zeros (no division).
+    /// </summary>
+    /// <param name="input">2D input tensor [rows, cols].</param>
+    /// <returns>2D output tensor of same shape with each row having unit L2 norm.</returns>
+    Tensor<T> NativeNormalizeRows<T>(Tensor<T> input);
+
+    /// <summary>
     /// Inverse 1D FFT from Complex&lt;T&gt; tensor, returning real-valued tensor.
     /// Extracts only the real component of the inverse transform. Use this when the original
     /// signal was real-valued (Hermitian symmetry assumed). Applies 1/N normalization.

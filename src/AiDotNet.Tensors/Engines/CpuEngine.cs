@@ -27559,6 +27559,410 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public virtual void NativeComplexFFTSpan<T>(ReadOnlySpan<T> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = new Complex<double>(System.Runtime.CompilerServices.Unsafe.As<T, double>(ref src), 0.0);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref buf[i]);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = new Complex<float>(System.Runtime.CompilerServices.Unsafe.As<T, float>(ref src), 0f);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
+            return;
+        }
+
+        // Generic fallback
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = new Complex<T>(input[i], ops.Zero);
+        NativeFFTInPlace(arr, false, ops);
+        for (int i = 0; i < n; i++) output[i] = arr[i];
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexIFFTSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+            {
+                var scaled = new Complex<double>(buf[i].Real * scale, buf[i].Imaginary * scale);
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref scaled);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+            {
+                var scaled = new Complex<float>(buf[i].Real * scale, buf[i].Imaginary * scale);
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref scaled);
+            }
+            return;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = input[i];
+        NativeFFTInPlace(arr, true, ops);
+        var scaleT = ops.FromDouble(n);
+        for (int i = 0; i < n; i++)
+            output[i] = new Complex<T>(ops.Divide(arr[i].Real, scaleT), ops.Divide(arr[i].Imaginary, scaleT));
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexFFTComplexSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref buf[i]);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
+            return;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = input[i];
+        NativeFFTInPlace(arr, false, ops);
+        for (int i = 0; i < n; i++) output[i] = arr[i];
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        // Map frequency cutoffs to bin indices. freqLow/freqHigh are in Hz; each bin k
+        // represents frequency k * (sampleRate / fftSize). For positive-frequency bins
+        // in [0, fftSize/2], we keep bins k with: (k * sampleRate / fftSize) in [freqLow, freqHigh).
+        // binLow = ceil(freqLow * fftSize / sampleRate) — inclusive lower bin
+        // binHigh = floor(freqHigh * fftSize / sampleRate) — exclusive upper bin (clamp to fftSize/2+1)
+        int halfN = fftSize / 2;
+        int binLow = freqLow <= 0.0 ? 0 : (int)Math.Ceiling(freqLow * fftSize / sampleRate);
+        int binHigh;
+        if (double.IsPositiveInfinity(freqHigh) || freqHigh >= sampleRate * 0.5)
+            binHigh = halfN + 1;
+        else
+            binHigh = Math.Min(halfN + 1, (int)Math.Ceiling(freqHigh * fftSize / sampleRate));
+        if (binLow < 0) binLow = 0;
+        if (binHigh > halfN + 1) binHigh = halfN + 1;
+
+        // Fused: forward FFT → zero negative bins + band-mask positive bins + double (except DC/Nyquist) → inverse FFT
+        // Allocate a single working buffer per batch slice (shared across batches)
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+
+            NativeFFTInPlace(slice, false, ops);
+
+            // Apply Hilbert-in-frequency filter:
+            //   bin 0 and bin N/2 (Nyquist): unchanged if in [binLow, binHigh), else 0
+            //   bins 1..N/2-1: doubled if in [binLow, binHigh), else 0
+            //   bins N/2+1..N-1 (negative freq mirror): always 0
+            var two = ops.FromDouble(2.0);
+            for (int k = 0; k < fftSize; k++)
+            {
+                if (k == 0 || k == halfN)
+                {
+                    if (k < binLow || k >= binHigh) slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                    // else leave as-is
+                }
+                else if (k < halfN)
+                {
+                    if (k < binLow || k >= binHigh)
+                        slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                    else
+                        slice[k] = new Complex<T>(ops.Multiply(slice[k].Real, two), ops.Multiply(slice[k].Imaginary, two));
+                }
+                else
+                {
+                    slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                }
+            }
+
+            NativeFFTInPlace(slice, true, ops);
+
+            // IFFT normalization: divide by N
+            var scale = ops.FromDouble(fftSize);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = new Complex<T>(ops.Divide(slice[i].Real, scale), ops.Divide(slice[i].Imaginary, scale));
+        }
+
+        { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; AutoTracer.RecordOp("NativeAnalyticSignal", result, eng => eng.NativeAnalyticSignal(ci, fL, fH, sr)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeNormalizeRows<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
+
+        int rows = input._shape[0];
+        int cols = input._shape[1];
+        var result = new Tensor<T>(input._shape);
+
+        if (typeof(T) == typeof(double))
+        {
+            // Reinterpret via Unsafe.As on each element — typeof check guarantees T=double
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            var srcD = new double[n];
+            var dstD = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcData[i]);
+                srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
+            }
+            NormalizeRowsDouble(srcD, dstD, rows, cols);
+            for (int i = 0; i < n; i++)
+                dstData[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            var srcF = new float[n];
+            var dstF = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcData[i]);
+                srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
+            }
+            NormalizeRowsFloat(srcF, dstF, rows, cols);
+            for (int i = 0; i < n; i++)
+                dstData[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
+            return result;
+        }
+
+        // Generic fallback
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            var sumSq = ops.Zero;
+            for (int c = 0; c < cols; c++)
+            {
+                var v = input[off + c];
+                sumSq = ops.Add(sumSq, ops.Multiply(v, v));
+            }
+            if (ops.GreaterThan(sumSq, ops.Zero))
+            {
+                var invNorm = ops.Divide(ops.One, ops.Sqrt(sumSq));
+                for (int c = 0; c < cols; c++)
+                    result[off + c] = ops.Multiply(input[off + c], invNorm);
+            }
+            else
+            {
+                for (int c = 0; c < cols; c++) result[off + c] = ops.Zero;
+            }
+        }
+        return result;
+    }
+
+    // Type-specialized SIMD helpers for NativeNormalizeRows (double/float).
+    // Private — the public NativeNormalizeRows<T> entry point dispatches to these.
+    private static void NormalizeRowsDouble(ReadOnlySpan<double> src, Span<double> dst, int rows, int cols)
+    {
+        Span<double> lanes = stackalloc double[4];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            double sumSq = 0.0;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 4)
+            {
+                var acc = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int simdLen = cols & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<double>>(
+                        ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                    acc = System.Runtime.Intrinsics.X86.Avx.Add(acc, System.Runtime.Intrinsics.X86.Avx.Multiply(v, v));
+                }
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(lanes)),
+                    acc);
+                sumSq = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+            }
+#endif
+            for (; i < cols; i++) { double v = src[off + i]; sumSq += v * v; }
+
+            if (sumSq > 0.0)
+            {
+                double invNorm = 1.0 / Math.Sqrt(sumSq);
+                i = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 4)
+                {
+                    var vinv = System.Runtime.Intrinsics.Vector256.Create(invNorm);
+                    int simdLen = cols & ~3;
+                    for (; i < simdLen; i += 4)
+                    {
+                        var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<double>>(
+                            ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                        var m = System.Runtime.Intrinsics.X86.Avx.Multiply(v, vinv);
+                        System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                            ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dst.Slice(off + i))),
+                            m);
+                    }
+                }
+#endif
+                for (; i < cols; i++) dst[off + i] = src[off + i] * invNorm;
+            }
+            else
+            {
+                dst.Slice(off, cols).Clear();
+            }
+        }
+    }
+
+    private static void NormalizeRowsFloat(ReadOnlySpan<float> src, Span<float> dst, int rows, int cols)
+    {
+        Span<float> lanes = stackalloc float[8];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            float sumSq = 0f;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 8)
+            {
+                var acc = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                int simdLen = cols & ~7;
+                for (; i < simdLen; i += 8)
+                {
+                    var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                        ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                    acc = System.Runtime.Intrinsics.X86.Avx.Add(acc, System.Runtime.Intrinsics.X86.Avx.Multiply(v, v));
+                }
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(lanes)),
+                    acc);
+                for (int lane = 0; lane < 8; lane++) sumSq += lanes[lane];
+            }
+#endif
+            for (; i < cols; i++) { float v = src[off + i]; sumSq += v * v; }
+
+            if (sumSq > 0f)
+            {
+                float invNorm = 1f / MathF.Sqrt(sumSq);
+                i = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 8)
+                {
+                    var vinv = System.Runtime.Intrinsics.Vector256.Create(invNorm);
+                    int simdLen = cols & ~7;
+                    for (; i < simdLen; i += 8)
+                    {
+                        var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                            ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                        var m = System.Runtime.Intrinsics.X86.Avx.Multiply(v, vinv);
+                        System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                            ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dst.Slice(off + i))),
+                            m);
+                    }
+                }
+#endif
+                for (; i < cols; i++) dst[off + i] = src[off + i] * invNorm;
+            }
+            else
+            {
+                dst.Slice(off, cols).Clear();
+            }
+        }
+    }
+
+    /// <inheritdoc />
     public virtual Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -28507,7 +28911,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (typeof(T) == typeof(float))
         {
-            NativeFFTInPlaceFloat(
+            NativeFFTInPlaceFloatSpan(
                 System.Runtime.CompilerServices.Unsafe.As<Complex<T>[], Complex<float>[]>(ref data),
                 inverse);
             return;
@@ -28515,7 +28919,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            NativeFFTInPlaceDouble(
+            NativeFFTInPlaceDoubleSpan(
                 System.Runtime.CompilerServices.Unsafe.As<Complex<T>[], Complex<double>[]>(ref data),
                 inverse);
             return;
@@ -28579,7 +28983,8 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
-    private static void NativeFFTInPlaceDouble(Complex<double>[] data, bool inverse)
+    // Span-based overload — zero-copy entry point used by NativeComplexFFTSpan hot paths.
+    private static void NativeFFTInPlaceDoubleSpan(Span<Complex<double>> data, bool inverse)
     {
         int n = data.Length;
         int bits = 0;
@@ -28634,7 +29039,7 @@ public class CpuEngine : ITensorLevelEngine
 
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<float>[]>? _twiddleCacheFloat;
 
-    private static void NativeFFTInPlaceFloat(Complex<float>[] data, bool inverse)
+    private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {
         int n = data.Length;
         int bits = 0;
