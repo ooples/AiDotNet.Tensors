@@ -252,6 +252,15 @@ internal static class VmlProvider
 
     private static bool EnsureInitialized()
     {
+        // External BLAS / VML disabled in the supply-chain-independence build
+        // (feat/finish-mkl-replacement). All TryX entry points return false
+        // immediately, forcing callers through their SimdKernels fallback path
+        // (which already provides AVX2-vectorized Exp/Log/Tanh/Sin/Cos/Sqrt/Erf).
+        //
+        // The native-loader code below is retained as reference but never runs.
+        if (true) return false;
+#pragma warning disable CS0162 // Unreachable code — intentional; kept for reference
+
         if (_initialized) return _available;
 
         lock (InitLock)
@@ -511,4 +520,5 @@ internal static class VmlProvider
         _vmdTanh = null;
     }
 #endif
+#pragma warning restore CS0162
 }

@@ -1620,6 +1620,14 @@ internal static class OneDnnProvider
 
     private static bool EnsureInitialized()
     {
+        // External oneDNN disabled in the supply-chain-independence build
+        // (feat/finish-mkl-replacement). Every public TryX gate returns false
+        // immediately, forcing Conv2D / elementwise dispatch through the in-house
+        // FusedConv / Winograd / SIMD direct paths which use SimdGemm underneath.
+        //
+        // The native-loader code below is retained as reference but never runs.
+        return false;
+#pragma warning disable CS0162 // Unreachable code — intentional; kept for reference
         if (_initialized)
             return _available;
 
@@ -1926,4 +1934,5 @@ internal static class OneDnnProvider
             return false;
         }
     }
+#pragma warning restore CS0162
 }
