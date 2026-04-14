@@ -28325,7 +28325,9 @@ public class CpuEngine : ITensorLevelEngine
         if (spectrum.Rank != 1) throw new ArgumentException("Spectrum must be 1D.", nameof(spectrum));
         int n = spectrum.Length;
         if (maxF1 <= 0 || maxF2 <= 0) throw new ArgumentException("maxF1 and maxF2 must be positive.");
-        if (maxF1 + maxF2 > n) throw new ArgumentException("maxF1 + maxF2 must not exceed spectrum length.");
+        // The bispectrum indexes spectrum[f1 + f2] with f1 in [0, maxF1), f2 in [0, maxF2);
+        // the maximum accessed index is (maxF1 - 1) + (maxF2 - 1), which must be < n.
+        if (maxF1 + maxF2 - 1 > n) throw new ArgumentException($"maxF1 ({maxF1}) + maxF2 ({maxF2}) - 1 must not exceed spectrum length ({n}).");
 
         var result = new Tensor<Complex<T>>([maxF1, maxF2]);
         var ops = MathHelper.GetNumericOperations<T>();
@@ -28362,7 +28364,9 @@ public class CpuEngine : ITensorLevelEngine
         if (spectrum.Rank != 1) throw new ArgumentException("Spectrum must be 1D.", nameof(spectrum));
         int n = spectrum.Length;
         if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) throw new ArgumentException("All maxF values must be positive.");
-        if (maxF1 + maxF2 + maxF3 > n) throw new ArgumentException("maxF1+maxF2+maxF3 must not exceed spectrum length.");
+        // The trispectrum indexes spectrum[f1 + f2 + f3] with f_i in [0, maxF_i);
+        // the maximum accessed index is (maxF1 - 1) + (maxF2 - 1) + (maxF3 - 1), which must be < n.
+        if (maxF1 + maxF2 + maxF3 - 2 > n) throw new ArgumentException($"maxF1 ({maxF1}) + maxF2 ({maxF2}) + maxF3 ({maxF3}) - 2 must not exceed spectrum length ({n}).");
 
         var result = new Tensor<Complex<T>>([maxF1, maxF2, maxF3]);
         var ops = MathHelper.GetNumericOperations<T>();

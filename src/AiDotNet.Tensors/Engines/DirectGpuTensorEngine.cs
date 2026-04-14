@@ -15813,14 +15813,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.AnalyticSignalMask(specRBuf.Buffer, specIBuf.Buffer, maskedRBuf.Buffer, maskedIBuf.Buffer,
                 batchCount, fftSize, binLow, binHigh);
 
-            // Inverse FFT
+            // Inverse FFT (backend IFFT is unnormalized — scale by 1/fftSize afterward to match CPU semantics).
             if (batchCount > 1)
                 backend.BatchedFFT(maskedRBuf.Buffer, maskedIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, batchCount, fftSize, inverse: true);
             else
                 backend.FFT(maskedRBuf.Buffer, maskedIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
 
-            return RecomposeComplex<T>(backend.DownloadBuffer(outRBuf.Buffer),
-                backend.DownloadBuffer(outIBuf.Buffer), input._shape);
+            // Apply IFFT 1/N normalization on the downloaded real+imag arrays.
+            var outReal = backend.DownloadBuffer(outRBuf.Buffer);
+            var outImag = backend.DownloadBuffer(outIBuf.Buffer);
+            float invN = 1f / fftSize;
+            for (int i = 0; i < outReal.Length; i++) { outReal[i] *= invN; outImag[i] *= invN; }
+            return RecomposeComplex<T>(outReal, outImag, input._shape);
         }
         catch { return base.NativeAnalyticSignal(input, freqLow, freqHigh, sampleRate); }
     }
@@ -15857,7 +15861,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeBispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2)
     {
         if (!TryGetBackend(out var backend)) return base.NativeBispectrum(spectrum, maxF1, maxF2);
-        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF1 + maxF2 > spectrum.Length)
+        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF1 + maxF2 - 1 > spectrum.Length)
             return base.NativeBispectrum(spectrum, maxF1, maxF2);
         try
         {
@@ -15877,7 +15881,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeTrispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2, int maxF3)
     {
         if (!TryGetBackend(out var backend)) return base.NativeTrispectrum(spectrum, maxF1, maxF2, maxF3);
-        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0 || maxF1 + maxF2 + maxF3 > spectrum.Length)
+        if (spectrum.Rank != 1 || maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0 || maxF1 + maxF2 + maxF3 - 2 > spectrum.Length)
             return base.NativeTrispectrum(spectrum, maxF1, maxF2, maxF3);
         try
         {
@@ -15987,13 +15991,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins)
     {
         if (!TryGetBackend(out var backend)) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
+        // Mirror the base CPU preconditions so invalid inputs take the base path (which throws
+        // a clear ArgumentException) instead of silently producing truncated GPU output.
         if (numSegments <= 0 || numBins <= 0) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
+        if (waveforms.Rank != 1 && waveforms.Rank != 2) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
         try
         {
             bool batched = waveforms.Rank == 2;
             int batch = batched ? waveforms._shape[0] : 1;
             int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
             int segmentLen = numSamples / numSegments;
+            if (segmentLen <= 1) return base.NativeWidebandFeatures(waveforms, numSegments, numBins);
             int fftSize = 1; while (fftSize < segmentLen) fftSize <<= 1;
             int totalSegBatch = batch * numSegments;
             int totalSegFFT = totalSegBatch * fftSize;

@@ -205,18 +205,33 @@ public class SpectralPerfOpsTests
     [Fact]
     public void AnalyticSignal_BandLimited_ZerosOutsideBand()
     {
-        // Pass a two-frequency cosine and keep only one of them — verify magnitude drops at other freq
+        // Use FFT-bin-aligned frequencies so tones do not leak across bins — this makes the
+        // test sensitive to a broken band mask (an unfiltered two-tone signal has mean
+        // envelope magnitude well above 1.0 even with some bin leakage).
         int n = 512;
-        double sr = 1000.0; // 1 kHz
+        double sr = 512.0;             // Hz — chosen so one bin == 1 Hz
+        // bin k <-> freq k * sr / n = k Hz. Pick bin 50 (50 Hz) and bin 200 (200 Hz).
         double f1 = 50.0, f2 = 200.0;
         var input = new Tensor<double>([n]);
         for (int i = 0; i < n; i++)
             input[i] = Math.Cos(2.0 * Math.PI * f1 * i / sr) + Math.Cos(2.0 * Math.PI * f2 * i / sr);
 
-        // Keep only f1 band
-        var analytic = _engine.NativeAnalyticSignal(input, freqLow: 30.0, freqHigh: 100.0, sampleRate: sr);
+        // Unfiltered analytic signal of cos(f1) + cos(f2) has magnitude that oscillates in
+        // ~[0, 2], with mean well above 1.0. Verify that first.
+        var unfiltered = _engine.NativeAnalyticSignal(input);
+        double meanMagUnfiltered = 0.0;
+        int count = 0;
+        for (int i = 100; i < n - 100; i += 10)
+        {
+            double m = Math.Sqrt(unfiltered[i].Real * unfiltered[i].Real + unfiltered[i].Imaginary * unfiltered[i].Imaginary);
+            meanMagUnfiltered += m; count++;
+        }
+        meanMagUnfiltered /= count;
+        Assert.True(meanMagUnfiltered > 1.2,
+            $"Unfiltered two-tone envelope mean should be clearly > 1; got {meanMagUnfiltered}");
 
-        // Envelope magnitude should be roughly 1 (for a single cosine at f1) at interior points
+        // Keep only the f1 band (30..100 Hz) — covers bin 50 but excludes bin 200.
+        var analytic = _engine.NativeAnalyticSignal(input, freqLow: 30.0, freqHigh: 100.0, sampleRate: sr);
         double meanMag = 0.0;
         int sampleCount = 0;
         for (int i = 100; i < n - 100; i += 10)
@@ -226,8 +241,8 @@ public class SpectralPerfOpsTests
             sampleCount++;
         }
         meanMag /= sampleCount;
-        // Should be near 1.0 — only f1 survives
-        Assert.InRange(meanMag, 0.5, 1.5);
+        // After masking out f2, envelope should be tightly concentrated around 1.0.
+        Assert.InRange(meanMag, 0.9, 1.1);
     }
 
     // ================================================================
