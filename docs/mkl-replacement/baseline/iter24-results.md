@@ -63,4 +63,4 @@ PLAN.md's trigger for Phase 3 is "benchmarks show ≥ MKL at every shape". We're
 
 ## Correctness
 
-85/85 matmul + GEMM tests pass on net10.0 after the TensorMatMulBatched change. The consolidation is mathematically identical to per-slice dispatch (A is row-major contiguous, so `[batch, M, K]` is just `[batch*M, K]`), so outputs are bit-equivalent within floating-point noise.
+85/85 matmul + GEMM tests pass on net10.0 after the TensorMatMulBatched change. The consolidation is mathematically identical to per-slice dispatch (A is row-major contiguous, so `[batch, M, K]` is just `[batch*M, K]`): the outputs match the per-slice path to within floating-point rounding (accumulation order is identical when both paths use the same BLAS backend, so bit-equivalence holds when BLAS is deterministic).

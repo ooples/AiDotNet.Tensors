@@ -8,10 +8,18 @@ using BenchmarkDotNet.Jobs;
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// A/B benchmark: MKL.NET default matmul vs our blocked C# GEMM for the exact
-/// shapes a DiT-XL forward pass exercises. This is the workload that led the
-/// downstream HRE/DiT consumer to report CPU shards being cancelled at the
-/// 45-minute CI budget.
+/// A/B benchmark: native-BLAS (default, non-deterministic) matmul vs our blocked
+/// C# GEMM for the exact shapes a DiT-XL forward pass exercises. This is the
+/// workload that led the downstream HRE/DiT consumer to report CPU shards being
+/// cancelled at the 45-minute CI budget.
+///
+/// Note on "default path": pre-branch this PR, the default path went through
+/// MKL.NET's managed SGEMM bindings. After `feat/finish-mkl-replacement` /
+/// the MKL.NET package removal, the default path routes through whatever native
+/// BLAS the user has installed (OpenBLAS, user-supplied cblas, or an externally
+/// installed MKL native DLL) via BlasProvider's P/Invoke loader — no managed
+/// MKL.NET binding. Benchmark semantics are unchanged: Det=false exercises the
+/// native-BLAS path when available, Det=true forces our blocked SimdGemm path.
 ///
 /// DiT-XL config (from the DiT paper + HuggingFace diffusers default):
 ///   hidden_size = 1152, num_heads = 16 (head_dim = 72)
@@ -36,7 +44,10 @@ namespace AiDotNet.Tensors.Benchmarks;
 [MarkdownExporterAttribute.GitHub]
 public class DitXLMatMulBenchmarks
 {
-    /// <summary>off = MKL.NET GEMM, on = blocked C# (our path). BDN expands both.</summary>
+    /// <summary>off = native-BLAS GEMM (if a cblas-compatible library is on the path),
+    /// on = blocked C# (our SimdGemm path). Post-MKL.NET-removal: off no longer implies
+    /// MKL.NET — the native BLAS could be OpenBLAS, user-supplied cblas, or an externally
+    /// installed MKL DLL; whichever the BlasProvider loader finds. BDN expands both values.</summary>
     [ParamsAllValues]
     public bool DeterministicMode { get; set; }
 

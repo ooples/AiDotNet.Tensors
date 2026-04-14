@@ -65,10 +65,14 @@ Ordered by expected impact against the **square-shape gap**. Each iteration = on
 | Iter | Change | Status | Result |
 |---|---|---|---|
 | 18a | Masked AVX2 edge kernel for `mc==Mr, nc<Nr` partial tiles | ✅ `6b74b75` | **A·V 10.3× → 2.7× slower than MKL (3.48× speedup on-shape)** |
+| 18b | Generalized masked kernel for `mc<Mr` (any partial tile) | ✅ `249c7a6` | Closes the remaining mc edge |
+| 18c | **Full K-unroll JIT for small `kc`** (libxsmm-style) | ✅ `d7b9b94` | **Q·K^T 1.47× → 1.03×; A·V 1.75× → 0.995× (beats MKL)** |
 | 19 | `prefetcht2` on next A panel | ✅ `ccff3ae` | No regression; possibly 12-20% at DiT-block shapes (noise-dominated run) |
-| 20 | 4-way K unroll in `MicroKernel6x16` | ⏳ benchmarking | Pending |
+| 20 | 4-way K unroll in `MicroKernel6x16` | ✅ `249c7a6` | −2-3% on DiT-block shapes |
+| 24 | **Batched-GEMM consolidation** for ND×2D broadcast | ✅ `8560691` | **Batched 3D B=4: 1.75× → 1.02×** |
 | — | **SDPA BLAS fast path (Issue #162)** | ✅ `cd954be` | **DiT-XL SDPA 93 ms → 25 ms (3.68×); saves ~2s/forward** |
 | — | Adaptive `ParallelWorkThreshold` (Issue #162) | ✅ `14efda4` | CI 2-core: parallel at 128² and above |
+| — | **MKL.NET package removal** — supply-chain independence | ✅ `58740d2` | No more bundled 110 MB Intel binary |
 
 ### Remaining work (original plan, refined by competitive analysis)
 

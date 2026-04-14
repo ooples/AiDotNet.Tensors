@@ -18,8 +18,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///   head_dim    = 72  (hidden_size=1152 / 16 heads)
 ///
 /// 28 such calls per forward pass. Previous scalar virtual-dispatch path spent
-/// ~seconds per call × 28 = tens of seconds in SDPA alone; fast path should be
-/// on the order of milliseconds per call.
+/// ~93 ms per call × 28 ≈ 2.6 seconds in SDPA alone per DiT-XL forward; BLAS
+/// fast path should be ~25 ms per call (measured on this shape), collapsing
+/// the SDPA total to ~0.7 seconds per forward.
 ///
 /// Run:
 ///   dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks \

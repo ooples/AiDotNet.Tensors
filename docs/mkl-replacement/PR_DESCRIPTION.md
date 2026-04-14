@@ -33,7 +33,10 @@ Continues [Issue #131](https://github.com/ooples/AiDotNet.Tensors/issues/131) (d
 | `cd954be` | **SDPA BLAS fast path (Issue #162)** | DiT-XL SDPA 93 ms → 25 ms (3.68×) |
 | `14efda4` | **Adaptive `ParallelWorkThreshold` (Issue #162)** | 2-core CI: parallel at 128²+ |
 | `249c7a6` | **iter 20**: 4-way K unroll in `MicroKernel6x16` + **iter 18b**: generalized masked edge kernel for mc<Mr | −2-3% on DiT-block shapes (noise-dominated) |
-| (iter 24) | **Batched-GEMM consolidation**: single 2D GEMM for ND×2D broadcast instead of per-slice dispatch | TBD, pending benchmark |
+| `8560691` | **Batched-GEMM consolidation**: single 2D GEMM for ND×2D broadcast instead of per-slice dispatch | **Batched 3D B=4: 1.75× → 1.02×** |
+| `58740d2` | **MKL.NET package removal** (supply-chain independence) | 1096→554 line rewrite of BlasProvider.cs |
+| `d7b9b94` | **iter 18c: full K-unroll JIT for small kc** | **Every shape 0.99-1.04× of MKL** |
+| `c3a118f` | Reviewer feedback: NaN softmax edge, nested-parallel fix | 118/118 tests pass |
 
 ## What's NOT in this PR (future follow-ups)
 
@@ -70,7 +73,7 @@ The dev box (Ryzen 9 3950X, 16C/32T) runs the benchmark harness while also runni
 
 - `src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs` — the new masked kernel and its dispatch, the 4-way K unroll correctness (especially the scalar tail for `kc % 4 != 0`), the prefetch placement.
 - `src/AiDotNet.Tensors/Engines/CpuEngine.cs` — the SDPA fast-path branch, the batched-GEMM consolidation, and the (unchanged) scalar path for non-float `T`.
-- `src/AiDotNet.Tensors/Helpers/BlasProvider.cs` — no changes in this PR; the SDPA fast path uses the existing `TryGemmEx`.
+- `src/AiDotNet.Tensors/Helpers/BlasProvider.cs` — **rewritten** in `58740d2` (1096→554 lines). MKL.NET managed binding removed; public API (`IsMklVerified`, `MklSgemmZeroOffset`, etc.) preserved as native-BLAS wrappers for consumer compatibility.
 
 ## Downstream
 
