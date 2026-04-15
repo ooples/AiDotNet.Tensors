@@ -65,14 +65,16 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
 
-    // Iter 35 (reverted): tried a direct-access GemmDirectMicroKernel for
-    // small-matmul callers (k ≤ 128, lda/ldb/ldc baked). UnmanagedFunctionPointer
-    // delegate invoke carries ~40ns P/Invoke overhead per call — amortizes fine
-    // over Kc=512 packed micro-kernels (~4%) but is 22% of per-call time at k=72
-    // for direct kernels. C# DirectKernel6x16 (with [MethodImpl(HotInline)])
-    // gets inlined at the call site so dispatch is zero-cost, and RyuJIT emits
-    // essentially the same AVX2 machine code. A future "fat-kernel" JIT (one
-    // P/Invoke per full matmul instead of per-tile) could flip this — deferred.
+    // Iter 35 / 41 (both reverted): tried JIT-emitting a direct-access 6×16
+    // micro-kernel for k ≤ 128 (lda/ldb/ldc baked). Iter 35 used Delegate.Invoke
+    // (~40ns dispatch killed perf), iter 41 used `delegate* unmanaged[Stdcall]<>`
+    // (calli ~5 cycles) which saved 8 µs of dispatch but the JIT kernel itself
+    // was still 30 µs slower than iter 39's RyuJIT-inlined C# kernel.
+    //
+    // Conclusion: for small per-head matmuls, RyuJIT inlining + cross-call
+    // optimization beats hand-rolled JIT machine code. The 1.27× MKL gap is
+    // RyuJIT-vs-hand-tuned-asm territory — would need a true fat-kernel JIT
+    // (entire matmul in one code blob with outer loops in JIT) to close.
 
     // Cache compiled kernels by (opId, aligned, length)
     // Uses Lazy<> to ensure only one kernel is generated per key (avoids ExecutableBuffer leak under contention)
@@ -173,6 +175,7 @@ internal static class CpuJitKernels
         }));
         return (GemmMicroKernel)entry.Value.Kernel;
     }
+
 
 
     /// <summary>
@@ -725,6 +728,7 @@ internal static class CpuJitKernels
         EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 4, X86Emitter.YMM8, X86Emitter.YMM9);
         EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 5, X86Emitter.YMM10, X86Emitter.YMM11);
     }
+
 
     /// <summary>
     /// Generates a JIT Sigmoid kernel using 5th-order polynomial approximation.

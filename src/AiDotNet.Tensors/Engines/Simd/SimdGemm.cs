@@ -371,17 +371,19 @@ internal static class SimdGemm
         // inlined at the call site so dispatch cost is zero. Beating MKL on
         // per-head attn would need fat-kernel JIT (one P/Invoke per matmul).
 
-        // Iter 40 (REVERTED): tried a 4×24 micro-kernel layout (4 rows × 3 YMM
-        // lanes, same 12 accumulators) for shapes with m%4==0 AND n%24==0.
-        // Targeted A·V's n=72 = 3×24 exact to eliminate the 8-wide N-edge.
-        // Result: ~3µs improvement on A·V Det=T (within noise), unchanged
-        // elsewhere. The hypothesis that fewer broadcasts (4 vs 6) would help
-        // missed that we're already FMA-bound at 6 cycles/iter — broadcasts
-        // weren't the bottleneck. Net effect ≈ neutral; reverted for code
-        // cleanliness. The remaining 1.27× gap to MKL isn't kernel-layout
-        // shaped, it's micro-architectural (instruction encoding density,
-        // prefetcher hints, store buffer management) — territory that needs
-        // hand-tuned assembly or fat-kernel JIT.
+        // Iter 41 (REVERTED): tried calling a JIT-emitted direct kernel via
+        // `delegate* unmanaged[Stdcall]<>` (calli, ~5 cycles) instead of
+        // Delegate.Invoke (~40ns). The function-pointer trick did save ~8 µs
+        // of per-matmul dispatch (Q·K^T 144→136 vs iter 35's Delegate.Invoke
+        // version) but the JIT kernel itself was still 30 µs slower than
+        // iter 39's RyuJIT-inlined C# kernel (107 µs). Net regression.
+        //
+        // Lesson: for SMALL micro-kernels with high call frequency, RyuJIT
+        // inlining + cross-call optimization beats hand-rolled JIT + raw
+        // function-pointer dispatch. The remaining 1.27× MKL gap on per-head
+        // attention is RyuJIT-vs-hand-tuned-assembly territory — would need a
+        // true fat-kernel JIT (entire matmul in machine code, no per-tile
+        // dispatch) which is a multi-day infrastructure project.
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
