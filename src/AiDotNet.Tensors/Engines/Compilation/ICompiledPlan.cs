@@ -76,9 +76,24 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// </summary>
     /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
     /// <remarks>
-    /// The implementation is idempotent per plan — the most recent call wins. The
-    /// checkpointing system wraps the forward actions; gradients remain numerically
-    /// equivalent to the non-checkpointed path within floating-point tolerance.
+    /// <para>
+    /// This setting is reconfigurable per plan: if called multiple times, the most
+    /// recent call determines the active checkpointing configuration (previous
+    /// segment-size choices are overwritten rather than merged). The checkpointing
+    /// system wraps the forward actions; gradients remain numerically equivalent
+    /// to the non-checkpointed path within floating-point tolerance.
+    /// </para>
+    /// <para>
+    /// <b>SOURCE-BREAKING CHANGE WARNING:</b> adding this member to
+    /// <see cref="ICompiledTrainingPlan{T}"/> is a source-breaking change for any
+    /// downstream consumer that implements this interface directly (not just uses
+    /// it). The built-in <c>CompiledTrainingPlan&lt;T&gt;</c> in this assembly is
+    /// updated alongside this interface addition, but external implementers must
+    /// add a corresponding implementation when they pick up the change. Added per
+    /// Issue #165 where the downstream consumer needed interface-level access
+    /// (not a concrete-class cast) to route checkpointing through
+    /// <see cref="CompiledModelCache{T}"/>.
+    /// </para>
     /// </remarks>
     void EnableCheckpointing(int segmentSize = 0);
 }

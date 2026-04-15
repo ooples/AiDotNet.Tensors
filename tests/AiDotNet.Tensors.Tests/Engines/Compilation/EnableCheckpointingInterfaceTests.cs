@@ -29,12 +29,15 @@ public class EnableCheckpointingInterfaceTests
             plan = scope.CompileTraining(new[] { weight });
         }
 
-        // Interface method must be callable without reflection or casts
-        plan.EnableCheckpointing(segmentSize: 0);
+        using (plan)
+        {
+            // Interface method must be callable without reflection or casts
+            plan.EnableCheckpointing(segmentSize: 0);
 
-        // Plan should still be usable after enabling checkpointing
-        var loss = plan.Step();
-        Assert.False(float.IsNaN(loss[0]), "Loss is NaN after enabling checkpointing");
+            // Plan should still be usable after enabling checkpointing
+            var loss = plan.Step();
+            Assert.False(float.IsNaN(loss[0]), "Loss is NaN after enabling checkpointing");
+        }
     }
 
     [Fact]
@@ -66,33 +69,38 @@ public class EnableCheckpointingInterfaceTests
             engine.ReduceSum(output, null);
             checkpointed = scope.CompileTraining(new[] { weightCheckpointed });
         }
-        // Use segment size 4 as called out in the issue's acceptance criteria.
-        checkpointed.EnableCheckpointing(segmentSize: 4);
 
-        var lossBaseline = baseline.Step();
-        var lossCheckpointed = checkpointed.Step();
-
-        // Loss values match within tolerance
-        Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 4);
-
-        // Gradient shapes match
-        Assert.Equal(baseline.Gradients.Length, checkpointed.Gradients.Length);
-
-        // Each gradient tensor must match element-wise within tolerance
-        for (int i = 0; i < baseline.Gradients.Length; i++)
+        using (baseline)
+        using (checkpointed)
         {
-            var gBase = baseline.Gradients[i];
-            var gChk = checkpointed.Gradients[i];
-            Assert.NotNull(gBase);
-            Assert.NotNull(gChk);
-            Assert.Equal(gBase!._shape, gChk!._shape);
+            // Use segment size 4 as called out in the issue's acceptance criteria.
+            checkpointed.EnableCheckpointing(segmentSize: 4);
 
-            var baseData = gBase.GetDataArray();
-            var chkData = gChk.GetDataArray();
-            Assert.Equal(baseData.Length, chkData.Length);
-            for (int k = 0; k < baseData.Length; k++)
+            var lossBaseline = baseline.Step();
+            var lossCheckpointed = checkpointed.Step();
+
+            // Loss values match within tolerance
+            Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 4);
+
+            // Gradient shapes match
+            Assert.Equal(baseline.Gradients.Length, checkpointed.Gradients.Length);
+
+            // Each gradient tensor must match element-wise within tolerance
+            for (int i = 0; i < baseline.Gradients.Length; i++)
             {
-                Assert.Equal(baseData[k], chkData[k], precision: 4);
+                var gBase = baseline.Gradients[i];
+                var gChk = checkpointed.Gradients[i];
+                Assert.NotNull(gBase);
+                Assert.NotNull(gChk);
+                Assert.Equal(gBase!._shape, gChk!._shape);
+
+                var baseData = gBase.GetDataArray();
+                var chkData = gChk.GetDataArray();
+                Assert.Equal(baseData.Length, chkData.Length);
+                for (int k = 0; k < baseData.Length; k++)
+                {
+                    Assert.Equal(baseData[k], chkData[k], precision: 4);
+                }
             }
         }
     }
@@ -150,17 +158,22 @@ public class EnableCheckpointingInterfaceTests
             engine.ReduceSum(h, null);
             checkpointed = scope.CompileTraining(checkpointedWeights);
         }
-        // Auto segment size triggers the segmented forward path.
-        checkpointed.EnableCheckpointing(segmentSize: 0);
 
-        var lossBaseline = baseline.Step();
-        var lossCheckpointed = checkpointed.Step();
+        using (baseline)
+        using (checkpointed)
+        {
+            // Auto segment size triggers the segmented forward path.
+            checkpointed.EnableCheckpointing(segmentSize: 0);
 
-        Assert.False(float.IsNaN(lossBaseline[0]), "Baseline loss is NaN on deep graph");
-        Assert.False(float.IsNaN(lossCheckpointed[0]), "Checkpointed loss is NaN on deep graph");
-        // Losses should agree on the same weights / input within tolerance, confirming
-        // the segmentation path does not change the forward computation semantically.
-        Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 3);
+            var lossBaseline = baseline.Step();
+            var lossCheckpointed = checkpointed.Step();
+
+            Assert.False(float.IsNaN(lossBaseline[0]), "Baseline loss is NaN on deep graph");
+            Assert.False(float.IsNaN(lossCheckpointed[0]), "Checkpointed loss is NaN on deep graph");
+            // Losses should agree on the same weights / input within tolerance, confirming
+            // the segmentation path does not change the forward computation semantically.
+            Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 3);
+        }
     }
 
     [Fact]
@@ -173,7 +186,7 @@ public class EnableCheckpointingInterfaceTests
         var input = Tensor<float>.CreateRandom([4, 3]);
         var weight = Tensor<float>.CreateRandom([3, 2]);
 
-        var cache = new CompiledModelCache<float>();
+        using var cache = new CompiledModelCache<float>();
         ICompiledTrainingPlan<float> plan = cache.GetOrCompileTraining(
             input._shape,
             () =>
@@ -182,6 +195,9 @@ public class EnableCheckpointingInterfaceTests
                 engine.ReduceSum(output, null);
             },
             new[] { weight });
+
+        // plan is owned by the cache — disposing cache above will dispose all
+        // cached plans, so we don't dispose plan separately here.
 
         // The core acceptance criterion: this must compile without a cast to the
         // internal concrete class.
@@ -208,10 +224,13 @@ public class EnableCheckpointingInterfaceTests
             plan = scope.CompileTraining(new[] { weight });
         }
 
-        // No argument — tests the default parameter value is exposed through the interface
-        plan.EnableCheckpointing();
+        using (plan)
+        {
+            // No argument — tests the default parameter value is exposed through the interface
+            plan.EnableCheckpointing();
 
-        var loss = plan.Step();
-        Assert.False(float.IsNaN(loss[0]));
+            var loss = plan.Step();
+            Assert.False(float.IsNaN(loss[0]));
+        }
     }
 }
