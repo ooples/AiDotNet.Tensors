@@ -1770,4 +1770,40 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
         => Inner.SpectralFilter(inputReal, filterReal, filterImag, outputReal, batch, height, width, filterSliceCount);
+
+    public virtual void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+        => Inner.Atan2Elementwise(real, imag, output, n);
+
+    public virtual void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+        => Inner.NormalizeRowsFused(input, output, rows, cols);
+
+    public virtual void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+        => Inner.AnalyticSignalMask(specReal, specImag, outReal, outImag, batch, fftSize, binLow, binHigh);
+
+    public virtual void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+        => Inner.BispectrumGather(specReal, specImag, outReal, outImag, maxF1, maxF2);
+
+    public virtual void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+        => Inner.TrispectrumGather(specReal, specImag, outReal, outImag, maxF1, maxF2, maxF3);
+
+    public virtual void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+        => Inner.CavityBounceInplace(workReal, workImag, total, invN);
+
+    public virtual void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+        => Inner.WidebandLogBinPool(magBuf, output, totalSegBatch, fftSize, numBins, usable);
+
+    public virtual void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+        => Inner.MelFilterbankApply(powerSpec, melFilters, melEnergy, totalSegBatch, specBins, melBins);
+
+    public virtual void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+        => Inner.MfccLog1p(input, output, n);
+
+    public virtual void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+        => Inner.PacPhaseBinMi(thetaPhase, gammaAmp, output, batch, numSamples, numGammaBands, gammaIdx);
 }
