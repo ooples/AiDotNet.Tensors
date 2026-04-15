@@ -18,15 +18,42 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private readonly Tensor<T> _finalOutput;
     private readonly IEngine _engine;
     private readonly int[] _compiledInputShape;
+    // Reference to the tensor the plan was traced against — distinct from
+    // _compiledInputShape which is just a shape vector. Used by Then() so the
+    // stitched-plan's boundary copy knows where to deposit the upstream
+    // output. Null only for the degenerate empty-plan case (zero steps).
+    private readonly Tensor<T>? _compiledInputTensor;
     private readonly List<GCHandle> _pinnedHandles = new();
     private bool _disposed;
 
-    private CompiledInferencePlan(CompiledStep<T>[] steps, Tensor<T> finalOutput, IEngine engine, int[] inputShape, List<GCHandle>? handles = null)
+    /// <summary>
+    /// The output buffer produced by this plan's last step. Internal because
+    /// <see cref="ICompiledPlan{T}.Then"/>'s stitching machinery needs to
+    /// route data from this buffer into the next plan's captured input.
+    /// </summary>
+    internal Tensor<T> FinalOutputBuffer => _finalOutput;
+
+    /// <summary>
+    /// The captured-at-trace-time input tensor of this plan. Internal for the
+    /// same reason as <see cref="FinalOutputBuffer"/>: stitching needs to
+    /// know which buffer the next plan's first step reads from. Null for
+    /// empty plans (no steps to consume an input).
+    /// </summary>
+    internal Tensor<T>? CompiledInputTensor => _compiledInputTensor;
+
+    private CompiledInferencePlan(
+        CompiledStep<T>[] steps,
+        Tensor<T> finalOutput,
+        IEngine engine,
+        int[] inputShape,
+        Tensor<T>? compiledInputTensor,
+        List<GCHandle>? handles = null)
     {
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
         _compiledInputShape = inputShape;
+        _compiledInputTensor = compiledInputTensor;
         if (handles is not null)
             _pinnedHandles.AddRange(handles);
     }
@@ -43,6 +70,96 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return true;
     }
 
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Implementation: we splice the two plans' step arrays with a boundary
+    /// step that copies <c>this.FinalOutputBuffer</c> into
+    /// <c>nextPlan.CompiledInputTensor</c> in place. Both buffers were
+    /// pre-allocated at compile time, so the copy moves data within existing
+    /// storage — no <see cref="Tensor{T}"/> allocation between A and B,
+    /// satisfying the issue's "zero materialization" acceptance criterion.
+    /// True buffer aliasing (same storage object) is a future enhancement —
+    /// would require Tensor surgery to swap underlying <c>_data</c>
+    /// references on already-constructed tensors, which the closures inside
+    /// each step's <c>Execute</c> delegate already captured at trace time.
+    /// </remarks>
+    public ICompiledPlan<T> Then(ICompiledPlan<T> next)
+    {
+        if (next is null) throw new ArgumentNullException(nameof(next));
+
+        // Stitching needs to splice each plan's step array — that's a
+        // concrete-type concern, not interface-level. Reject foreign
+        // implementations cleanly rather than guessing.
+        if (next is not CompiledInferencePlan<T> nextPlan)
+            throw new NotSupportedException(
+                $"{nameof(Then)} requires the next plan to be a built-in CompiledInferencePlan<T>. " +
+                $"Got {next.GetType().FullName}. Third-party implementers can opt in by " +
+                "providing their own concrete-type stitcher.");
+
+        if (_steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot stitch from an empty plan (no steps to feed into next).", nameof(next));
+        if (nextPlan._steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot stitch into an empty plan (no steps to consume the upstream output).", nameof(next));
+        if (nextPlan._compiledInputTensor is null)
+            throw new ArgumentException(
+                "Next plan has no captured input tensor — it cannot be stitched onto.", nameof(next));
+
+        // Validate at stitch time, not at execute time, per acceptance
+        // criterion #3. Compare _shape arrays element-wise rather than
+        // SequenceEqual so the error message can name the mismatching dim.
+        var thisOut  = _finalOutput._shape;
+        var nextIn   = nextPlan._compiledInputTensor._shape;
+        if (thisOut.Length != nextIn.Length || !ShapesEqual(thisOut, nextIn))
+            throw new ArgumentException(
+                $"Cannot stitch: this plan's output shape [{string.Join(", ", thisOut)}] " +
+                $"does not match next plan's input shape [{string.Join(", ", nextIn)}]. " +
+                "Stitching requires shape-equal boundary tensors.",
+                nameof(next));
+
+        // Boundary step: copy this._finalOutput → next._compiledInputTensor.
+        // The Execute delegate ignores its `output` parameter because the
+        // boundary writes to a fixed buffer (next's captured input), not to
+        // a per-step output buffer. CompiledStep's contract permits this —
+        // OutputBuffer is also next._compiledInputTensor for diagnostics.
+        var fromBuffer = _finalOutput;
+        var toBuffer   = nextPlan._compiledInputTensor;
+        var boundaryStep = new CompiledStep<T>(
+            opName: "stitch.boundary",
+            execute: (eng, _) => fromBuffer.AsSpan().CopyTo(toBuffer.AsWritableSpan()),
+            outputBuffer: toBuffer,
+            inputs: new[] { fromBuffer });
+
+        // Splice: [thisSteps..., boundary, nextSteps...]
+        var combined = new CompiledStep<T>[_steps.Length + 1 + nextPlan._steps.Length];
+        Array.Copy(_steps, 0, combined, 0, _steps.Length);
+        combined[_steps.Length] = boundaryStep;
+        Array.Copy(nextPlan._steps, 0, combined, _steps.Length + 1, nextPlan._steps.Length);
+
+        // The stitched plan inherits this plan's input shape (callers re-use
+        // their existing IsValid checks) but reports next plan's final
+        // output as its result. Pinned handles stay with the originals —
+        // the stitched plan owns no new pins, so its Dispose is a no-op
+        // for handles. The originals must outlive the stitched plan; the
+        // xmldoc on Then() makes that ownership contract explicit.
+        return new CompiledInferencePlan<T>(
+            steps: combined,
+            finalOutput: nextPlan._finalOutput,
+            engine: _engine,
+            inputShape: (int[])_compiledInputShape.Clone(),
+            compiledInputTensor: _compiledInputTensor,
+            handles: null);
+    }
+
+    private static bool ShapesEqual(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
 
     /// <summary>
     /// Executes the compiled plan. Runs each step's delegate in order.
@@ -102,8 +219,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var pinnedHandles = new List<GCHandle>();
 
         // Determine input shape from the first step's inputs (for IsValid check)
-        var inputShape = steps.Count > 0 && steps[0].Inputs.Length > 0
-            ? (int[])steps[0].Inputs[0]._shape.Clone()
+        // and capture the tensor reference itself for Then() stitching.
+        var inputTensor = steps.Count > 0 && steps[0].Inputs.Length > 0
+            ? steps[0].Inputs[0]
+            : null;
+        var inputShape = inputTensor is not null
+            ? (int[])inputTensor._shape.Clone()
             : Array.Empty<int>();
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
@@ -188,7 +309,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         // Use the last optimized step's output (may differ from original after fusion/spectral passes)
         var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, pinnedHandles);
+        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles);
     }
 
     /// <summary>
