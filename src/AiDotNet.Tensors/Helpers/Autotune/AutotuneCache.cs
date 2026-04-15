@@ -102,6 +102,17 @@ public static class AutotuneCache
             // by a broken writer).
             if (choice.SchemaVersion <= 0 || choice.SchemaVersion > CurrentSchemaVersion) return null;
 
+            // Payload-completeness gate: KernelChoice's `Variant` and `Parameters`
+            // are non-nullable in the C# type, but System.Text.Json will happily
+            // assign null if the JSON explicitly contains `"Variant": null` (the
+            // property initializer only runs when the key is absent). A partial
+            // or tampered file like `{"Variant":null,"Parameters":null,"SchemaVersion":1}`
+            // deserializes without throwing. Callers of Lookup then dereference
+            // those fields and crash — so we promote incomplete payloads to a
+            // safe cache miss here, and the caller re-runs the benchmark.
+            if (string.IsNullOrWhiteSpace(choice.Variant)) return null;
+            if (choice.Parameters is null) return null;
+
             return choice;
         }
         catch

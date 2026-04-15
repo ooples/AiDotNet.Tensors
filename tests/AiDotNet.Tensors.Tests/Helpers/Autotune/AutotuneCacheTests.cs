@@ -180,13 +180,64 @@ public sealed class AutotuneCacheTests : IDisposable
     {
         // A plan written by a newer library version with an incompatible schema
         // should be treated as a miss, not fail loudly — this is the
-        // forward-compatibility contract.
+        // forward-compatibility contract. This test exercises the
+        // `SchemaVersion > CurrentSchemaVersion` guard specifically (not the
+        // <=0 corruption guard, which has its own coverage).
         AutotuneCache.Store(Gemm, Shape256, MakeWinner());
         var cacheFiles = Directory.GetFiles(
             Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint),
             "*.json");
-        // Overwrite with a schema version the reader rejects (<=0).
-        File.WriteAllText(cacheFiles[0], "{ \"Variant\": \"x\", \"SchemaVersion\": 0 }");
+        // Schema version newer than this binary understands. Parameters is set
+        // explicitly so the payload-completeness guard in Lookup doesn't
+        // short-circuit the test before the schema-version branch runs.
+        File.WriteAllText(cacheFiles[0], "{ \"Variant\": \"x\", \"Parameters\": {}, \"SchemaVersion\": 999 }");
+
+        Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
+    }
+
+    [Fact]
+    public void Lookup_RejectsNonPositiveSchemaVersion()
+    {
+        // The other half of the schema-version gate: files with SchemaVersion <= 0
+        // are treated as corruption (likely written by a broken writer that
+        // omitted the initializer). Separate from future-schema so a regression
+        // in either guard is localized.
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner());
+        var cacheFiles = Directory.GetFiles(
+            Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint),
+            "*.json");
+        File.WriteAllText(cacheFiles[0], "{ \"Variant\": \"x\", \"Parameters\": {}, \"SchemaVersion\": 0 }");
+
+        Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
+    }
+
+    [Fact]
+    public void Lookup_RejectsPayloadWithNullVariant()
+    {
+        // System.Text.Json assigns null when the JSON contains `"Variant": null`
+        // (the property initializer only runs when the key is absent). A silent
+        // null here would crash downstream consumers that dereference Variant —
+        // Lookup must promote it to a cache miss instead.
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner());
+        var cacheFiles = Directory.GetFiles(
+            Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint),
+            "*.json");
+        File.WriteAllText(cacheFiles[0], "{ \"Variant\": null, \"Parameters\": {}, \"SchemaVersion\": 1 }");
+
+        Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
+    }
+
+    [Fact]
+    public void Lookup_RejectsPayloadWithNullParameters()
+    {
+        // Same class of bug as null Variant — a `"Parameters": null` assignment
+        // would make the returned KernelChoice.Parameters reference null and
+        // crash the first consumer that enumerates tuned hyperparameters.
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner());
+        var cacheFiles = Directory.GetFiles(
+            Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint),
+            "*.json");
+        File.WriteAllText(cacheFiles[0], "{ \"Variant\": \"x\", \"Parameters\": null, \"SchemaVersion\": 1 }");
 
         Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
     }
