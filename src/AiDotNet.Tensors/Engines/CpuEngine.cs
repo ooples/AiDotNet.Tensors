@@ -27973,6 +27973,1245 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    public virtual void NativeComplexFFTSpan<T>(ReadOnlySpan<T> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            // Reinterpret caller's output span as Span<Complex<double>> (layout-identical when T=double).
+            // Fill output directly with (input[i], 0), then run the in-place butterflies on it.
+            // Zero extra allocations, single write pass before FFT.
+            ref Complex<T> outHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref outHead), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = new Complex<double>(System.Runtime.CompilerServices.Unsafe.As<T, double>(ref src), 0.0);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: false);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> outHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref outHead), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = new Complex<float>(System.Runtime.CompilerServices.Unsafe.As<T, float>(ref src), 0f);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: false);
+            return;
+        }
+#else
+        // net471 fallback: no MemoryMarshal.CreateSpan — use a scratch buffer.
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = new Complex<double>(System.Runtime.CompilerServices.Unsafe.As<T, double>(ref src), 0.0);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref buf[i]);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = new Complex<float>(System.Runtime.CompilerServices.Unsafe.As<T, float>(ref src), 0f);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
+            return;
+        }
+#endif
+
+        // Generic fallback
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = new Complex<T>(input[i], ops.Zero);
+        NativeFFTInPlace(arr, false, ops);
+        for (int i = 0; i < n; i++) output[i] = arr[i];
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexIFFTSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            // Copy input into output (reinterpret as Complex<double>) then IFFT + scale in place.
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+                outD[i] = new Complex<double>(outD[i].Real * scale, outD[i].Imaginary * scale);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+                outF[i] = new Complex<float>(outF[i].Real * scale, outF[i].Imaginary * scale);
+            return;
+        }
+#else
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+            {
+                var scaled = new Complex<double>(buf[i].Real * scale, buf[i].Imaginary * scale);
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref scaled);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+            {
+                var scaled = new Complex<float>(buf[i].Real * scale, buf[i].Imaginary * scale);
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref scaled);
+            }
+            return;
+        }
+#endif
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = input[i];
+        NativeFFTInPlace(arr, true, ops);
+        var scaleT = ops.FromDouble(n);
+        for (int i = 0; i < n; i++)
+            output[i] = new Complex<T>(ops.Divide(arr[i].Real, scaleT), ops.Divide(arr[i].Imaginary, scaleT));
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexFFTComplexSpan<T>(ReadOnlySpan<Complex<T>> input, Span<Complex<T>> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outD[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(outD, inverse: false);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            ref Complex<T> head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output);
+            var outF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref head), n);
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                outF[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(outF, inverse: false);
+            return;
+        }
+#else
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref buf[i]);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: false);
+            for (int i = 0; i < n; i++)
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref buf[i]);
+            return;
+        }
+#endif
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arr[i] = input[i];
+        NativeFFTInPlace(arr, false, ops);
+        for (int i = 0; i < n; i++) output[i] = arr[i];
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexIFFTRealSpan<T>(ReadOnlySpan<Complex<T>> input, Span<T> output)
+    {
+        if (input.Length != output.Length)
+            throw new ArgumentException($"Input length ({input.Length}) must equal output length ({output.Length}).");
+        ValidatePowerOfTwo(input.Length, nameof(input));
+
+        int n = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var buf = new Complex<double>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref src);
+            }
+            NativeFFTInPlaceDoubleSpan(buf, inverse: true);
+            double scale = 1.0 / n;
+            for (int i = 0; i < n; i++)
+            {
+                double r = buf[i].Real * scale;
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref r);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var buf = new Complex<float>[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref Complex<T> src = ref System.Runtime.CompilerServices.Unsafe.AsRef(in input[i]);
+                buf[i] = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref src);
+            }
+            NativeFFTInPlaceFloatSpan(buf, inverse: true);
+            float scale = 1f / n;
+            for (int i = 0; i < n; i++)
+            {
+                float r = buf[i].Real * scale;
+                output[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref r);
+            }
+            return;
+        }
+
+        var opsG = MathHelper.GetNumericOperations<T>();
+        var arrG = new Complex<T>[n];
+        for (int i = 0; i < n; i++) arrG[i] = input[i];
+        NativeFFTInPlace(arrG, true, opsG);
+        var scaleT = opsG.FromDouble(n);
+        for (int i = 0; i < n; i++)
+            output[i] = opsG.Divide(arrG[i].Real, scaleT);
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeAnalyticSignal<T>(Tensor<T> input, double freqLow = 0.0, double freqHigh = double.MaxValue, double sampleRate = 1.0)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (!(sampleRate > 0.0) || double.IsNaN(sampleRate) || double.IsInfinity(sampleRate))
+            throw new ArgumentException($"sampleRate must be a positive finite value. Got {sampleRate}.", nameof(sampleRate));
+        if (double.IsNaN(freqLow) || freqLow < 0.0)
+            throw new ArgumentException($"freqLow must be a non-negative finite value. Got {freqLow}.", nameof(freqLow));
+        if (double.IsNaN(freqHigh))
+            throw new ArgumentException("freqHigh must not be NaN.", nameof(freqHigh));
+        if (freqHigh < freqLow)
+            throw new ArgumentException($"freqHigh ({freqHigh}) must be >= freqLow ({freqLow}).", nameof(freqHigh));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+
+        // Map frequency cutoffs to bin indices. freqLow/freqHigh are in Hz; each bin k
+        // represents frequency k * (sampleRate / fftSize). For positive-frequency bins
+        // in [0, fftSize/2], we keep bins k with: (k * sampleRate / fftSize) in [freqLow, freqHigh).
+        // binLow = ceil(freqLow * fftSize / sampleRate) — inclusive lower bin
+        // binHigh = floor(freqHigh * fftSize / sampleRate) — exclusive upper bin (clamp to fftSize/2+1)
+        int halfN = fftSize / 2;
+        int binLow = freqLow <= 0.0 ? 0 : (int)Math.Ceiling(freqLow * fftSize / sampleRate);
+        int binHigh;
+        if (double.IsPositiveInfinity(freqHigh) || freqHigh >= sampleRate * 0.5)
+            binHigh = halfN + 1;
+        else
+            binHigh = Math.Min(halfN + 1, (int)Math.Ceiling(freqHigh * fftSize / sampleRate));
+        if (binLow < 0) binLow = 0;
+        if (binHigh > halfN + 1) binHigh = halfN + 1;
+
+        // Fused: forward FFT → zero negative bins + band-mask positive bins + double (except DC/Nyquist) → inverse FFT
+        // Allocate a single working buffer per batch slice (shared across batches)
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+
+            NativeFFTInPlace(slice, false, ops);
+
+            // Apply Hilbert-in-frequency filter:
+            //   bin 0 and bin N/2 (Nyquist): unchanged if in [binLow, binHigh), else 0
+            //   bins 1..N/2-1: doubled if in [binLow, binHigh), else 0
+            //   bins N/2+1..N-1 (negative freq mirror): always 0
+            var two = ops.FromDouble(2.0);
+            for (int k = 0; k < fftSize; k++)
+            {
+                if (k == 0 || k == halfN)
+                {
+                    if (k < binLow || k >= binHigh) slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                    // else leave as-is
+                }
+                else if (k < halfN)
+                {
+                    if (k < binLow || k >= binHigh)
+                        slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                    else
+                        slice[k] = new Complex<T>(ops.Multiply(slice[k].Real, two), ops.Multiply(slice[k].Imaginary, two));
+                }
+                else
+                {
+                    slice[k] = new Complex<T>(ops.Zero, ops.Zero);
+                }
+            }
+
+            NativeFFTInPlace(slice, true, ops);
+
+            // IFFT normalization: divide by N
+            var scale = ops.FromDouble(fftSize);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = new Complex<T>(ops.Divide(slice[i].Real, scale), ops.Divide(slice[i].Imaginary, scale));
+        }
+
+        { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; AutoTracer.RecordOp("NativeAnalyticSignal", result, eng => eng.NativeAnalyticSignal(ci, fL, fH, sr)); }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
+
+        int rows = input._shape[0];
+        int cols = input._shape[1];
+        var result = inPlace ? input : new Tensor<T>(input._shape);
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            // Reinterpret the underlying DataVector spans as double spans (layout-identical when T=double).
+            // Zero allocations, zero copy passes — SIMD kernel reads/writes the tensor memory directly.
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
+            ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
+            var srcD = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, double>(ref srcHead), n);
+            var dstD = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, double>(ref dstHead), n);
+            NormalizeRowsDouble(srcD, dstD, rows, cols);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
+            ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
+            var srcF = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, float>(ref srcHead), n);
+            var dstF = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<T, float>(ref dstHead), n);
+            NormalizeRowsFloat(srcF, dstF, rows, cols);
+            return result;
+        }
+#else
+        if (typeof(T) == typeof(double))
+        {
+            // net471 fallback: no MemoryMarshal.CreateSpan. Use temp buffer path.
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            var srcD = new double[n];
+            var dstD = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcData[i]);
+                srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
+            }
+            NormalizeRowsDouble(srcD, dstD, rows, cols);
+            for (int i = 0; i < n; i++)
+                dstData[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            int n = rows * cols;
+            var srcData = input.DataVector.AsSpan();
+            var dstData = result.DataVector.AsWritableSpan();
+            var srcF = new float[n];
+            var dstF = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcData[i]);
+                srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
+            }
+            NormalizeRowsFloat(srcF, dstF, rows, cols);
+            for (int i = 0; i < n; i++)
+                dstData[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
+            return result;
+        }
+#endif
+
+        // Generic fallback
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            var sumSq = ops.Zero;
+            for (int c = 0; c < cols; c++)
+            {
+                var v = input[off + c];
+                sumSq = ops.Add(sumSq, ops.Multiply(v, v));
+            }
+            if (ops.GreaterThan(sumSq, ops.Zero))
+            {
+                var invNorm = ops.Divide(ops.One, ops.Sqrt(sumSq));
+                for (int c = 0; c < cols; c++)
+                    result[off + c] = ops.Multiply(input[off + c], invNorm);
+            }
+            else
+            {
+                for (int c = 0; c < cols; c++) result[off + c] = ops.Zero;
+            }
+        }
+        return result;
+    }
+
+    // Type-specialized SIMD helpers for NativeNormalizeRows (double/float).
+    // Private — the public NativeNormalizeRows<T> entry point dispatches to these.
+    private static void NormalizeRowsDouble(ReadOnlySpan<double> src, Span<double> dst, int rows, int cols)
+    {
+        Span<double> lanes = stackalloc double[4];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            double sumSq = 0.0;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 4)
+            {
+                var acc = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int simdLen = cols & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<double>>(
+                        ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                    acc = System.Runtime.Intrinsics.X86.Avx.Add(acc, System.Runtime.Intrinsics.X86.Avx.Multiply(v, v));
+                }
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(lanes)),
+                    acc);
+                sumSq = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+            }
+#endif
+            for (; i < cols; i++) { double v = src[off + i]; sumSq += v * v; }
+
+            if (sumSq > 0.0)
+            {
+                double invNorm = 1.0 / Math.Sqrt(sumSq);
+                i = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 4)
+                {
+                    var vinv = System.Runtime.Intrinsics.Vector256.Create(invNorm);
+                    int simdLen = cols & ~3;
+                    for (; i < simdLen; i += 4)
+                    {
+                        var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<double>>(
+                            ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                        var m = System.Runtime.Intrinsics.X86.Avx.Multiply(v, vinv);
+                        System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                            ref System.Runtime.CompilerServices.Unsafe.As<double, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dst.Slice(off + i))),
+                            m);
+                    }
+                }
+#endif
+                for (; i < cols; i++) dst[off + i] = src[off + i] * invNorm;
+            }
+            else
+            {
+                dst.Slice(off, cols).Clear();
+            }
+        }
+    }
+
+    private static void NormalizeRowsFloat(ReadOnlySpan<float> src, Span<float> dst, int rows, int cols)
+    {
+        Span<float> lanes = stackalloc float[8];
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            float sumSq = 0f;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 8)
+            {
+                var acc = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                int simdLen = cols & ~7;
+                for (; i < simdLen; i += 8)
+                {
+                    var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                        ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                    acc = System.Runtime.Intrinsics.X86.Avx.Add(acc, System.Runtime.Intrinsics.X86.Avx.Multiply(v, v));
+                }
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(lanes)),
+                    acc);
+                for (int lane = 0; lane < 8; lane++) sumSq += lanes[lane];
+            }
+#endif
+            for (; i < cols; i++) { float v = src[off + i]; sumSq += v * v; }
+
+            if (sumSq > 0f)
+            {
+                float invNorm = 1f / MathF.Sqrt(sumSq);
+                i = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && cols >= 8)
+                {
+                    var vinv = System.Runtime.Intrinsics.Vector256.Create(invNorm);
+                    int simdLen = cols & ~7;
+                    for (; i < simdLen; i += 8)
+                    {
+                        var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                            ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(src.Slice(off + i))));
+                        var m = System.Runtime.Intrinsics.X86.Avx.Multiply(v, vinv);
+                        System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                            ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(
+                                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dst.Slice(off + i))),
+                            m);
+                    }
+                }
+#endif
+                for (; i < cols; i++) dst[off + i] = src[off + i] * invNorm;
+            }
+            else
+            {
+                dst.Slice(off, cols).Clear();
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeTanh<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var result = new Tensor<T>(input._shape);
+        int n = input.Length;
+
+        if (typeof(T) == typeof(double))
+        {
+            var srcD = new double[n];
+            var dstD = new double[n];
+            var srcSpan = input.DataVector.AsSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
+                srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
+            }
+            Engines.Simd.SimdKernels.Tanh(srcD, dstD);
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = new float[n];
+            var dstF = new float[n];
+            var srcSpan = input.DataVector.AsSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
+                srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
+            }
+            Engines.Simd.SimdKernels.Tanh(srcF, dstF);
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
+            return result;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+            result[i] = ops.FromDouble(Math.Tanh(ops.ToDouble(input[i])));
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeExp<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var result = new Tensor<T>(input._shape);
+        int n = input.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = new float[n];
+            var dstF = new float[n];
+            var srcSpan = input.DataVector.AsSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
+                srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
+            }
+            unsafe
+            {
+                fixed (float* ip = srcF) fixed (float* op = dstF)
+                    Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
+            }
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
+            return result;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var srcD = new double[n];
+            var dstD = new double[n];
+            var srcSpan = input.DataVector.AsSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
+                srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
+            }
+            unsafe
+            {
+                fixed (double* ip = srcD) fixed (double* op = dstD)
+                    Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
+            }
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
+            return result;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+            result[i] = ops.FromDouble(Math.Exp(ops.ToDouble(input[i])));
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeAtan2<T>(Tensor<T> imag, Tensor<T> real)
+    {
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        // Require matching shape, not just length. Equal-length tensors with different shapes
+        // would silently pair values by flat index which is almost never what the caller wants.
+        if (imag.Rank != real.Rank)
+            throw new ArgumentException($"imag rank ({imag.Rank}) must equal real rank ({real.Rank}).", nameof(real));
+        for (int d = 0; d < imag.Rank; d++)
+        {
+            if (imag._shape[d] != real._shape[d])
+                throw new ArgumentException(
+                    $"imag and real must have the same shape; differ at axis {d}: imag={imag._shape[d]}, real={real._shape[d]}.",
+                    nameof(real));
+        }
+        var result = new Tensor<T>(imag._shape);
+        int n = imag.Length;
+
+        if (typeof(T) == typeof(double))
+        {
+            var iSpan = imag.DataVector.AsSpan();
+            var rSpan = real.DataVector.AsSpan();
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
+                ref T rRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in rSpan[i]);
+                double iv = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref iRef);
+                double rv = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref rRef);
+                double atan = Math.Atan2(iv, rv);
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref atan);
+            }
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var iSpan = imag.DataVector.AsSpan();
+            var rSpan = real.DataVector.AsSpan();
+            var dstSpan = result.DataVector.AsWritableSpan();
+            for (int i = 0; i < n; i++)
+            {
+                ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
+                ref T rRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in rSpan[i]);
+                float iv = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref iRef);
+                float rv = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref rRef);
+                float atan = MathF.Atan2(iv, rv);
+                dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref atan);
+            }
+            return result;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+            result[i] = ops.FromDouble(Math.Atan2(ops.ToDouble(imag[i]), ops.ToDouble(real[i])));
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var magnitude = new Tensor<T>(input._shape);
+        phase = new Tensor<T>(input._shape);
+        int n = input.Length;
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+        {
+            var c = input[i];
+            magnitude[i] = ops.Sqrt(ops.Add(ops.Multiply(c.Real, c.Real), ops.Multiply(c.Imaginary, c.Imaginary)));
+            phase[i] = ops.FromDouble(Math.Atan2(ops.ToDouble(c.Imaginary), ops.ToDouble(c.Real)));
+        }
+        return magnitude;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeBispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2)
+    {
+        if (spectrum is null) throw new ArgumentNullException(nameof(spectrum));
+        if (spectrum.Rank != 1) throw new ArgumentException("Spectrum must be 1D.", nameof(spectrum));
+        int n = spectrum.Length;
+        if (maxF1 <= 0 || maxF2 <= 0) throw new ArgumentException("maxF1 and maxF2 must be positive.");
+        // The bispectrum indexes spectrum[f1 + f2] with f1 in [0, maxF1), f2 in [0, maxF2);
+        // the maximum accessed index is (maxF1 - 1) + (maxF2 - 1), which must be < n.
+        if (maxF1 + maxF2 - 1 > n) throw new ArgumentException($"maxF1 ({maxF1}) + maxF2 ({maxF2}) - 1 must not exceed spectrum length ({n}).");
+
+        var result = new Tensor<Complex<T>>([maxF1, maxF2]);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        // B(f1, f2) = X(f1) * X(f2) * conj(X(f1+f2))
+        System.Threading.Tasks.Parallel.For(0, maxF1, f1 =>
+        {
+            for (int f2 = 0; f2 < maxF2; f2++)
+            {
+                var xf1 = spectrum[f1];
+                var xf2 = spectrum[f2];
+                var xf1f2 = spectrum[f1 + f2];
+                var xf1f2conj = new Complex<T>(xf1f2.Real, ops.Negate(xf1f2.Imaginary));
+
+                // X(f1) * X(f2)
+                var t1Re = ops.Subtract(ops.Multiply(xf1.Real, xf2.Real), ops.Multiply(xf1.Imaginary, xf2.Imaginary));
+                var t1Im = ops.Add(ops.Multiply(xf1.Real, xf2.Imaginary), ops.Multiply(xf1.Imaginary, xf2.Real));
+
+                // * conj(X(f1+f2))
+                var bRe = ops.Subtract(ops.Multiply(t1Re, xf1f2conj.Real), ops.Multiply(t1Im, xf1f2conj.Imaginary));
+                var bIm = ops.Add(ops.Multiply(t1Re, xf1f2conj.Imaginary), ops.Multiply(t1Im, xf1f2conj.Real));
+
+                result[f1 * maxF2 + f2] = new Complex<T>(bRe, bIm);
+            }
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<Complex<T>> NativeTrispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2, int maxF3)
+    {
+        if (spectrum is null) throw new ArgumentNullException(nameof(spectrum));
+        if (spectrum.Rank != 1) throw new ArgumentException("Spectrum must be 1D.", nameof(spectrum));
+        int n = spectrum.Length;
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) throw new ArgumentException("All maxF values must be positive.");
+        // The trispectrum indexes spectrum[f1 + f2 + f3] with f_i in [0, maxF_i);
+        // the maximum accessed index is (maxF1 - 1) + (maxF2 - 1) + (maxF3 - 1), which must be < n.
+        if (maxF1 + maxF2 + maxF3 - 2 > n) throw new ArgumentException($"maxF1 ({maxF1}) + maxF2 ({maxF2}) + maxF3 ({maxF3}) - 2 must not exceed spectrum length ({n}).");
+
+        var result = new Tensor<Complex<T>>([maxF1, maxF2, maxF3]);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        System.Threading.Tasks.Parallel.For(0, maxF1, f1 =>
+        {
+            for (int f2 = 0; f2 < maxF2; f2++)
+            {
+                for (int f3 = 0; f3 < maxF3; f3++)
+                {
+                    var xf1 = spectrum[f1];
+                    var xf2 = spectrum[f2];
+                    var xf3 = spectrum[f3];
+                    var xsum = spectrum[f1 + f2 + f3];
+                    var xsumConj = new Complex<T>(xsum.Real, ops.Negate(xsum.Imaginary));
+
+                    // X(f1)*X(f2)
+                    var t1Re = ops.Subtract(ops.Multiply(xf1.Real, xf2.Real), ops.Multiply(xf1.Imaginary, xf2.Imaginary));
+                    var t1Im = ops.Add(ops.Multiply(xf1.Real, xf2.Imaginary), ops.Multiply(xf1.Imaginary, xf2.Real));
+                    // *X(f3)
+                    var t2Re = ops.Subtract(ops.Multiply(t1Re, xf3.Real), ops.Multiply(t1Im, xf3.Imaginary));
+                    var t2Im = ops.Add(ops.Multiply(t1Re, xf3.Imaginary), ops.Multiply(t1Im, xf3.Real));
+                    // *conj(X(f1+f2+f3))
+                    var tRe = ops.Subtract(ops.Multiply(t2Re, xsumConj.Real), ops.Multiply(t2Im, xsumConj.Imaginary));
+                    var tIm = ops.Add(ops.Multiply(t2Re, xsumConj.Imaginary), ops.Multiply(t2Im, xsumConj.Real));
+
+                    result[(f1 * maxF2 + f2) * maxF3 + f3] = new Complex<T>(tRe, tIm);
+                }
+            }
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeBatchedCavityForward<T>(Tensor<T> input, Tensor<Complex<T>> cavityFilters, int numBounces)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (cavityFilters is null) throw new ArgumentNullException(nameof(cavityFilters));
+        if (input.Rank != 2) throw new ArgumentException("input must be [batch, N].", nameof(input));
+        if (cavityFilters.Rank != 2) throw new ArgumentException("cavityFilters must be [numCavities, N].", nameof(cavityFilters));
+        if (numBounces < 1) throw new ArgumentException("numBounces must be >= 1.");
+
+        int batch = input._shape[0];
+        int n = input._shape[1];
+        int numCavities = cavityFilters._shape[0];
+        if (cavityFilters._shape[1] != n) throw new ArgumentException("cavityFilters last dim must match input N.");
+        ValidatePowerOfTwo(n, nameof(input));
+
+        var result = new Tensor<T>([batch, numCavities, n]);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        // Per batch: FFT once, then per cavity, per bounce: multiply in freq domain → IFFT → tanh → FFT again
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        {
+            var inSlice = new T[n];
+            for (int i = 0; i < n; i++) inSlice[i] = input[b * n + i];
+
+            // Compute the initial spectrum of this waveform
+            var spectrum0 = new Complex<T>[n];
+            for (int i = 0; i < n; i++) spectrum0[i] = new Complex<T>(inSlice[i], ops.Zero);
+            NativeFFTInPlace(spectrum0, false, ops);
+
+            var work = new Complex<T>[n];
+            for (int c = 0; c < numCavities; c++)
+            {
+                // Reset working spectrum from initial
+                Array.Copy(spectrum0, work, n);
+                for (int bounce = 0; bounce < numBounces; bounce++)
+                {
+                    // Multiply by cavity filter in frequency domain
+                    for (int i = 0; i < n; i++)
+                    {
+                        var f = cavityFilters[c * n + i];
+                        var aRe = work[i].Real; var aIm = work[i].Imaginary;
+                        var bRe = f.Real; var bIm = f.Imaginary;
+                        work[i] = new Complex<T>(
+                            ops.Subtract(ops.Multiply(aRe, bRe), ops.Multiply(aIm, bIm)),
+                            ops.Add(ops.Multiply(aRe, bIm), ops.Multiply(aIm, bRe)));
+                    }
+                    // IFFT → tanh → FFT for next bounce (if any)
+                    NativeFFTInPlace(work, true, ops);
+                    var scale = ops.FromDouble(n);
+                    for (int i = 0; i < n; i++)
+                    {
+                        double rv = ops.ToDouble(ops.Divide(work[i].Real, scale));
+                        work[i] = new Complex<T>(ops.FromDouble(Math.Tanh(rv)), ops.Zero);
+                    }
+                    if (bounce < numBounces - 1)
+                        NativeFFTInPlace(work, false, ops);
+                }
+
+                // Final output = real part of the time-domain result (already time-domain after tanh)
+                int outOff = (b * numCavities + c) * n;
+                for (int i = 0; i < n; i++)
+                    result[outOff + i] = work[i].Real;
+            }
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeMfccFeatures<T>(Tensor<T> waveforms, int numSegments, int numMfcc, int paddedDim)
+    {
+        if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
+        if (numMfcc <= 0) throw new ArgumentException("numMfcc must be positive.", nameof(numMfcc));
+        ValidatePowerOfTwo(paddedDim, nameof(paddedDim));
+
+        bool batched = waveforms.Rank == 2;
+        int batch = batched ? waveforms._shape[0] : 1;
+        int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
+        int segmentLen = numSamples / numSegments;
+        if (segmentLen <= 0)
+            throw new ArgumentException($"numSegments ({numSegments}) must not exceed signal length ({numSamples}).", nameof(numSegments));
+        if (paddedDim < segmentLen)
+            throw new ArgumentException($"paddedDim ({paddedDim}) must be >= segmentLen ({segmentLen}).", nameof(paddedDim));
+
+        var outShape = batched ? new[] { batch, numSegments * numMfcc } : new[] { numSegments * numMfcc };
+        var result = new Tensor<T>(outShape);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        {
+            int melBins = Math.Max(numMfcc * 2, 16);
+            var dctBasis = BuildDctBasis<T>(numMfcc, melBins);
+            var melFilters = BuildMelFilterbank<T>(melBins, paddedDim / 2 + 1);
+
+            var seg = new Complex<T>[paddedDim];
+            var powerSpec = new T[paddedDim / 2 + 1];
+            var melEnergy = new T[melBins];
+
+            for (int s = 0; s < numSegments; s++)
+            {
+                int start = s * segmentLen;
+                // Zero-pad into FFT buffer
+                for (int i = 0; i < paddedDim; i++)
+                {
+                    if (i < segmentLen && start + i < numSamples)
+                    {
+                        int idx = batched ? (b * numSamples + start + i) : (start + i);
+                        seg[i] = new Complex<T>(waveforms[idx], ops.Zero);
+                    }
+                    else seg[i] = new Complex<T>(ops.Zero, ops.Zero);
+                }
+                NativeFFTInPlace(seg, false, ops);
+                // Power spectrum (only first half)
+                for (int i = 0; i < paddedDim / 2 + 1; i++)
+                    powerSpec[i] = ops.Add(ops.Multiply(seg[i].Real, seg[i].Real), ops.Multiply(seg[i].Imaginary, seg[i].Imaginary));
+                // Mel filterbank
+                for (int m = 0; m < melBins; m++)
+                {
+                    var e = ops.Zero;
+                    for (int i = 0; i < paddedDim / 2 + 1; i++)
+                        e = ops.Add(e, ops.Multiply(melFilters[m * (paddedDim / 2 + 1) + i], powerSpec[i]));
+                    // Log-compression (log(1 + e))
+                    melEnergy[m] = ops.FromDouble(Math.Log(1.0 + ops.ToDouble(e)));
+                }
+                // DCT
+                for (int k = 0; k < numMfcc; k++)
+                {
+                    var sum = ops.Zero;
+                    for (int m = 0; m < melBins; m++)
+                        sum = ops.Add(sum, ops.Multiply(dctBasis[k * melBins + m], melEnergy[m]));
+                    int outOff = batched ? (b * numSegments * numMfcc + s * numMfcc + k) : (s * numMfcc + k);
+                    result[outOff] = sum;
+                }
+            }
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins)
+    {
+        if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
+        if (numBins <= 0) throw new ArgumentException("numBins must be positive.", nameof(numBins));
+
+        bool batched = waveforms.Rank == 2;
+        int batch = batched ? waveforms._shape[0] : 1;
+        int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
+        int segmentLen = numSamples / numSegments;
+        if (segmentLen <= 1)
+            throw new ArgumentException($"numSegments ({numSegments}) produces segmentLen ({segmentLen}); must yield >= 2 samples per segment for a usable spectrum.", nameof(numSegments));
+
+        // Pick FFT size as next power of 2 >= segmentLen
+        int fftSize = 1;
+        while (fftSize < segmentLen) fftSize <<= 1;
+
+        var outShape = batched ? new[] { batch, numSegments * numBins } : new[] { numSegments * numBins };
+        var result = new Tensor<T>(outShape);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        {
+            var buf = new Complex<T>[fftSize];
+            for (int s = 0; s < numSegments; s++)
+            {
+                int start = s * segmentLen;
+                for (int i = 0; i < fftSize; i++)
+                {
+                    if (i < segmentLen && start + i < numSamples)
+                    {
+                        int idx = batched ? (b * numSamples + start + i) : (start + i);
+                        buf[i] = new Complex<T>(waveforms[idx], ops.Zero);
+                    }
+                    else buf[i] = new Complex<T>(ops.Zero, ops.Zero);
+                }
+                NativeFFTInPlace(buf, false, ops);
+
+                // Average magnitudes into numBins logarithmically-spaced bins over [1, fftSize/2]
+                int usable = fftSize / 2;
+                for (int k = 0; k < numBins; k++)
+                {
+                    int binStart = 1 + (int)(Math.Pow((double)k / numBins, 2) * (usable - 1));
+                    int binEnd = 1 + (int)(Math.Pow((double)(k + 1) / numBins, 2) * (usable - 1));
+                    if (binEnd <= binStart) binEnd = binStart + 1;
+                    if (binEnd > usable) binEnd = usable;
+
+                    var sum = ops.Zero;
+                    int count = 0;
+                    for (int i = binStart; i < binEnd; i++)
+                    {
+                        var mag = ops.Sqrt(ops.Add(ops.Multiply(buf[i].Real, buf[i].Real), ops.Multiply(buf[i].Imaginary, buf[i].Imaginary)));
+                        sum = ops.Add(sum, mag);
+                        count++;
+                    }
+                    var avg = count > 0 ? ops.Divide(sum, ops.FromDouble(count)) : ops.Zero;
+                    // log-compress
+                    var logVal = ops.FromDouble(Math.Log(1.0 + ops.ToDouble(avg)));
+
+                    int outOff = batched ? (b * numSegments * numBins + s * numBins + k) : (s * numBins + k);
+                    result[outOff] = logVal;
+                }
+            }
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public virtual Tensor<T> NativePacFeatures<T>(Tensor<T> waveforms, int sampleRate, int envelopeRate,
+        double thetaLow, double thetaHigh, (double low, double high)[] gammaBands)
+    {
+        if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (waveforms.Rank != 1 && waveforms.Rank != 2)
+            throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
+        if (sampleRate <= 0) throw new ArgumentException("sampleRate must be positive.", nameof(sampleRate));
+        if (envelopeRate <= 0) throw new ArgumentException("envelopeRate must be positive.", nameof(envelopeRate));
+        if (gammaBands is null || gammaBands.Length == 0) throw new ArgumentException("gammaBands must be non-empty.", nameof(gammaBands));
+        if (!(thetaHigh > thetaLow) || thetaLow < 0.0 || double.IsNaN(thetaLow) || double.IsNaN(thetaHigh))
+            throw new ArgumentException($"theta band must satisfy 0 <= thetaLow < thetaHigh. Got [{thetaLow}, {thetaHigh}].");
+        for (int g = 0; g < gammaBands.Length; g++)
+        {
+            var (lo, hi) = gammaBands[g];
+            if (!(hi > lo) || lo < 0.0 || double.IsNaN(lo) || double.IsNaN(hi))
+                throw new ArgumentException($"gammaBands[{g}] must satisfy 0 <= low < high. Got [{lo}, {hi}].", nameof(gammaBands));
+        }
+
+        bool batched = waveforms.Rank == 2;
+        int batch = batched ? waveforms._shape[0] : 1;
+        int numSamples = batched ? waveforms._shape[1] : waveforms._shape[0];
+
+        // FFT size = next power of 2 >= numSamples
+        int fftSize = 1;
+        while (fftSize < numSamples) fftSize <<= 1;
+
+        int numBands = gammaBands.Length;
+        var outShape = batched ? new[] { batch, numBands } : new[] { numBands };
+        var result = new Tensor<T>(outShape);
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        {
+            // Compute theta phase via analytic signal on theta band
+            var wave = new T[fftSize];
+            for (int i = 0; i < numSamples; i++)
+            {
+                int idx = batched ? (b * numSamples + i) : i;
+                wave[i] = waveforms[idx];
+            }
+            for (int i = numSamples; i < fftSize; i++) wave[i] = ops.Zero;
+
+            var thetaAnalytic = AnalyticSignalSpan(wave, thetaLow, thetaHigh, sampleRate, fftSize, ops);
+            var thetaPhase = new double[numSamples];
+            for (int i = 0; i < numSamples; i++)
+                thetaPhase[i] = Math.Atan2(ops.ToDouble(thetaAnalytic[i].Imaginary), ops.ToDouble(thetaAnalytic[i].Real));
+
+            for (int g = 0; g < numBands; g++)
+            {
+                var gammaAnalytic = AnalyticSignalSpan(wave, gammaBands[g].low, gammaBands[g].high, sampleRate, fftSize, ops);
+                // Gamma envelope (magnitude)
+                var gammaAmp = new double[numSamples];
+                for (int i = 0; i < numSamples; i++)
+                {
+                    double re = ops.ToDouble(gammaAnalytic[i].Real);
+                    double im = ops.ToDouble(gammaAnalytic[i].Imaginary);
+                    gammaAmp[i] = Math.Sqrt(re * re + im * im);
+                }
+
+                // PAC modulation index via phase-binned amplitude distribution
+                const int numPhaseBins = 18;
+                double[] binSum = new double[numPhaseBins];
+                int[] binCount = new int[numPhaseBins];
+                for (int i = 0; i < numSamples; i++)
+                {
+                    int binIdx = (int)((thetaPhase[i] + Math.PI) / (2 * Math.PI) * numPhaseBins);
+                    if (binIdx < 0) binIdx = 0;
+                    if (binIdx >= numPhaseBins) binIdx = numPhaseBins - 1;
+                    binSum[binIdx] += gammaAmp[i];
+                    binCount[binIdx]++;
+                }
+                double totalAmp = 0;
+                for (int k = 0; k < numPhaseBins; k++)
+                    totalAmp += binCount[k] > 0 ? binSum[k] / binCount[k] : 0;
+
+                // Kullback-Leibler MI
+                double mi = 0;
+                if (totalAmp > 0)
+                {
+                    double entropy = 0;
+                    for (int k = 0; k < numPhaseBins; k++)
+                    {
+                        double p = binCount[k] > 0 ? (binSum[k] / binCount[k]) / totalAmp : 0;
+                        if (p > 1e-12) entropy -= p * Math.Log(p);
+                    }
+                    mi = (Math.Log(numPhaseBins) - entropy) / Math.Log(numPhaseBins);
+                }
+
+                int outOff = batched ? (b * numBands + g) : g;
+                result[outOff] = ops.FromDouble(mi);
+            }
+        });
+
+        return result;
+    }
+
+    // Internal helper: analytic signal on a raw array (used by PAC pipeline)
+    private static Complex<T>[] AnalyticSignalSpan<T>(T[] wave, double freqLow, double freqHigh, double sampleRate, int fftSize, INumericOperations<T> ops)
+    {
+        var buf = new Complex<T>[fftSize];
+        for (int i = 0; i < fftSize; i++) buf[i] = new Complex<T>(i < wave.Length ? wave[i] : ops.Zero, ops.Zero);
+        NativeFFTInPlace(buf, false, ops);
+
+        int halfN = fftSize / 2;
+        int binLow = freqLow <= 0 ? 0 : (int)Math.Ceiling(freqLow * fftSize / sampleRate);
+        int binHigh = double.IsPositiveInfinity(freqHigh) || freqHigh >= sampleRate * 0.5
+            ? halfN + 1 : Math.Min(halfN + 1, (int)Math.Ceiling(freqHigh * fftSize / sampleRate));
+
+        var two = ops.FromDouble(2.0);
+        for (int k = 0; k < fftSize; k++)
+        {
+            if (k == 0 || k == halfN)
+            {
+                if (k < binLow || k >= binHigh) buf[k] = new Complex<T>(ops.Zero, ops.Zero);
+            }
+            else if (k < halfN)
+            {
+                if (k < binLow || k >= binHigh)
+                    buf[k] = new Complex<T>(ops.Zero, ops.Zero);
+                else
+                    buf[k] = new Complex<T>(ops.Multiply(buf[k].Real, two), ops.Multiply(buf[k].Imaginary, two));
+            }
+            else
+            {
+                buf[k] = new Complex<T>(ops.Zero, ops.Zero);
+            }
+        }
+        NativeFFTInPlace(buf, true, ops);
+        var scale = ops.FromDouble(fftSize);
+        for (int i = 0; i < fftSize; i++)
+            buf[i] = new Complex<T>(ops.Divide(buf[i].Real, scale), ops.Divide(buf[i].Imaginary, scale));
+        return buf;
+    }
+
+    // Build a simple triangular mel filterbank — numFilters x numFftBins
+    private static T[] BuildMelFilterbank<T>(int numFilters, int numFftBins)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new T[numFilters * numFftBins];
+        // Uniform triangular bins (placeholder — full mel scaling would need sample rate)
+        double step = (double)numFftBins / (numFilters + 1);
+        for (int m = 0; m < numFilters; m++)
+        {
+            int center = (int)((m + 1) * step);
+            int left = (int)(m * step);
+            int right = (int)((m + 2) * step);
+            if (right > numFftBins) right = numFftBins;
+            for (int i = left; i < center; i++)
+                result[m * numFftBins + i] = ops.FromDouble((double)(i - left) / Math.Max(1, center - left));
+            for (int i = center; i < right; i++)
+                result[m * numFftBins + i] = ops.FromDouble((double)(right - i) / Math.Max(1, right - center));
+        }
+        return result;
+    }
+
+    // Build DCT-II basis: numCoeffs x numInputs
+    private static T[] BuildDctBasis<T>(int numCoeffs, int numInputs)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new T[numCoeffs * numInputs];
+        double norm = Math.Sqrt(2.0 / numInputs);
+        for (int k = 0; k < numCoeffs; k++)
+        {
+            for (int n = 0; n < numInputs; n++)
+            {
+                double val = norm * Math.Cos(Math.PI * k * (2 * n + 1) / (2 * numInputs));
+                result[k * numInputs + n] = ops.FromDouble(val);
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc />
     public virtual Tensor<T> NativeComplexIFFTReal<T>(Tensor<Complex<T>> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -28921,7 +30160,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (typeof(T) == typeof(float))
         {
-            NativeFFTInPlaceFloat(
+            NativeFFTInPlaceFloatSpan(
                 System.Runtime.CompilerServices.Unsafe.As<Complex<T>[], Complex<float>[]>(ref data),
                 inverse);
             return;
@@ -28929,7 +30168,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            NativeFFTInPlaceDouble(
+            NativeFFTInPlaceDoubleSpan(
                 System.Runtime.CompilerServices.Unsafe.As<Complex<T>[], Complex<double>[]>(ref data),
                 inverse);
             return;
@@ -28993,7 +30232,8 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
-    private static void NativeFFTInPlaceDouble(Complex<double>[] data, bool inverse)
+    // Span-based overload — zero-copy entry point used by NativeComplexFFTSpan hot paths.
+    private static void NativeFFTInPlaceDoubleSpan(Span<Complex<double>> data, bool inverse)
     {
         int n = data.Length;
         int bits = 0;
@@ -29048,7 +30288,7 @@ public class CpuEngine : ITensorLevelEngine
 
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<float>[]>? _twiddleCacheFloat;
 
-    private static void NativeFFTInPlaceFloat(Complex<float>[] data, bool inverse)
+    private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {
         int n = data.Length;
         int bits = 0;

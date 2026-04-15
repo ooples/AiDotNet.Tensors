@@ -4154,5 +4154,238 @@ kernel void ciou_loss_backward(device const float* goB [[buffer(0)]], device con
 }
 ";
 
+    public const string SpectralPerfKernels = CommonHeader + @"
+kernel void atan2_elementwise(
+    device const float* imag [[buffer(0)]],
+    device const float* real [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= n) return;
+    output[idx] = atan2(imag[idx], real[idx]);
+}
+
+kernel void analytic_signal_mask(
+    device const float* specReal [[buffer(0)]],
+    device const float* specImag [[buffer(1)]],
+    device float* outReal [[buffer(2)]],
+    device float* outImag [[buffer(3)]],
+    constant int& batch [[buffer(4)]],
+    constant int& fftSize [[buffer(5)]],
+    constant int& binLow [[buffer(6)]],
+    constant int& binHigh [[buffer(7)]],
+    uint idx [[thread_position_in_grid]])
+{
+    int total = batch * fftSize;
+    if ((int)idx >= total) return;
+    int k = (int)idx % fftSize;
+    int halfN = fftSize >> 1;
+    float gain;
+    if (k == 0 || k == halfN) gain = (k < binLow || k >= binHigh) ? 0.0f : 1.0f;
+    else if (k < halfN)        gain = (k < binLow || k >= binHigh) ? 0.0f : 2.0f;
+    else                       gain = 0.0f;
+    outReal[idx] = specReal[idx] * gain;
+    outImag[idx] = specImag[idx] * gain;
+}
+
+kernel void normalize_rows_fused(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& rows [[buffer(2)]],
+    constant int& cols [[buffer(3)]],
+    threadgroup float* sdata [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint blockDim [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]])
+{
+    if ((int)row >= rows) return;
+    int rowOff = (int)row * cols;
+    float local_acc = 0.0f;
+    for (int c = (int)tid; c < cols; c += (int)blockDim) {
+        float v = input[rowOff + c];
+        local_acc += v * v;
+    }
+    sdata[tid] = local_acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = blockDim >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float invNorm = 0.0f;
+    if (sdata[0] > 0.0f) invNorm = rsqrt(sdata[0]);
+    for (int c = (int)tid; c < cols; c += (int)blockDim) {
+        output[rowOff + c] = input[rowOff + c] * invNorm;
+    }
+}
+
+kernel void bispectrum_gather(
+    device const float* specReal [[buffer(0)]],
+    device const float* specImag [[buffer(1)]],
+    device float* outReal [[buffer(2)]],
+    device float* outImag [[buffer(3)]],
+    constant int& maxF1 [[buffer(4)]],
+    constant int& maxF2 [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    int total = maxF1 * maxF2;
+    if ((int)idx >= total) return;
+    int f1 = (int)idx / maxF2;
+    int f2 = (int)idx % maxF2;
+    int sumIdx = f1 + f2;
+    float ar = specReal[f1], ai = specImag[f1];
+    float br = specReal[f2], bi = specImag[f2];
+    float cr = specReal[sumIdx], ci = -specImag[sumIdx];
+    float abr = ar * br - ai * bi;
+    float abi = ar * bi + ai * br;
+    outReal[idx] = abr * cr - abi * ci;
+    outImag[idx] = abr * ci + abi * cr;
+}
+
+kernel void trispectrum_gather(
+    device const float* specReal [[buffer(0)]],
+    device const float* specImag [[buffer(1)]],
+    device float* outReal [[buffer(2)]],
+    device float* outImag [[buffer(3)]],
+    constant int& maxF1 [[buffer(4)]],
+    constant int& maxF2 [[buffer(5)]],
+    constant int& maxF3 [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    int total = maxF1 * maxF2 * maxF3;
+    if ((int)idx >= total) return;
+    int f1 = (int)idx / (maxF2 * maxF3);
+    int rem = (int)idx - f1 * maxF2 * maxF3;
+    int f2 = rem / maxF3;
+    int f3 = rem - f2 * maxF3;
+    int sumIdx = f1 + f2 + f3;
+    float ar = specReal[f1], ai = specImag[f1];
+    float br = specReal[f2], bi = specImag[f2];
+    float cr = specReal[f3], ci = specImag[f3];
+    float dr = specReal[sumIdx], di = -specImag[sumIdx];
+    float t1r = ar * br - ai * bi;
+    float t1i = ar * bi + ai * br;
+    float t2r = t1r * cr - t1i * ci;
+    float t2i = t1r * ci + t1i * cr;
+    outReal[idx] = t2r * dr - t2i * di;
+    outImag[idx] = t2r * di + t2i * dr;
+}
+
+kernel void cavity_bounce_inplace(
+    device float* workReal [[buffer(0)]],
+    device float* workImag [[buffer(1)]],
+    constant int& total [[buffer(2)]],
+    constant float& invN [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= total) return;
+    float r = workReal[idx] * invN;
+    r = clamp(r, -20.0f, 20.0f);
+    workReal[idx] = tanh(r);
+    workImag[idx] = 0.0f;
+}
+
+kernel void wideband_log_bin_pool(
+    device const float* magBuf [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& totalSegBatch [[buffer(2)]],
+    constant int& fftSize [[buffer(3)]],
+    constant int& numBins [[buffer(4)]],
+    constant int& usable [[buffer(5)]],
+    uint outIdx [[thread_position_in_grid]])
+{
+    int total = totalSegBatch * numBins;
+    if ((int)outIdx >= total) return;
+    int seg = (int)outIdx / numBins;
+    int k = (int)outIdx % numBins;
+    float r0 = (float)k / (float)numBins;
+    float r1 = (float)(k + 1) / (float)numBins;
+    int binStart = 1 + (int)(r0 * r0 * (float)(usable - 1));
+    int binEnd = 1 + (int)(r1 * r1 * (float)(usable - 1));
+    if (binEnd <= binStart) binEnd = binStart + 1;
+    if (binEnd > usable) binEnd = usable;
+    int magOff = seg * fftSize;
+    float sum = 0.0f; int cnt = 0;
+    for (int i = binStart; i < binEnd; i++) { sum += magBuf[magOff + i]; cnt++; }
+    float avg = (cnt > 0) ? (sum / (float)cnt) : 0.0f;
+    output[outIdx] = log(1.0f + avg);
+}
+
+kernel void mel_filterbank_apply(
+    device const float* powerSpec [[buffer(0)]],
+    device const float* melFilters [[buffer(1)]],
+    device float* melEnergy [[buffer(2)]],
+    constant int& totalSegBatch [[buffer(3)]],
+    constant int& specBins [[buffer(4)]],
+    constant int& melBins [[buffer(5)]],
+    uint outIdx [[thread_position_in_grid]])
+{
+    int total = totalSegBatch * melBins;
+    if ((int)outIdx >= total) return;
+    int seg = (int)outIdx / melBins;
+    int m = (int)outIdx % melBins;
+    int powerOff = seg * specBins;
+    int filtOff = m * specBins;
+    float sum = 0.0f;
+    for (int i = 0; i < specBins; i++)
+        sum += powerSpec[powerOff + i] * melFilters[filtOff + i];
+    melEnergy[outIdx] = sum;
+}
+
+kernel void mfcc_log1p(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= n) return;
+    output[idx] = log(1.0f + input[idx]);
+}
+
+kernel void pac_phase_bin_mi(
+    device const float* thetaPhase [[buffer(0)]],
+    device const float* gammaAmp [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant int& batch [[buffer(3)]],
+    constant int& numSamples [[buffer(4)]],
+    constant int& numGammaBands [[buffer(5)]],
+    constant int& gammaIdx [[buffer(6)]],
+    uint b [[thread_position_in_grid]])
+{
+    if ((int)b >= batch) return;
+    const int NUM_PHASE_BINS = 18;
+    float binSum[18]; float binCount[18];
+    for (int k = 0; k < NUM_PHASE_BINS; k++) { binSum[k] = 0.0f; binCount[k] = 0.0f; }
+    int sampleOff = (int)b * numSamples;
+    int gammaOff = (gammaIdx * batch + (int)b) * numSamples;
+    for (int i = 0; i < numSamples; i++) {
+        float phase = thetaPhase[sampleOff + i];
+        float amp = gammaAmp[gammaOff + i];
+        float fbin = (phase + 3.14159265358979f) / (2.0f * 3.14159265358979f) * (float)NUM_PHASE_BINS;
+        int bin = (int)fbin;
+        if (bin < 0) bin = 0;
+        if (bin >= NUM_PHASE_BINS) bin = NUM_PHASE_BINS - 1;
+        binSum[bin] += amp;
+        binCount[bin] += 1.0f;
+    }
+    float totalAmp = 0.0f;
+    for (int k = 0; k < NUM_PHASE_BINS; k++) {
+        float avg = (binCount[k] > 0.0f) ? (binSum[k] / binCount[k]) : 0.0f;
+        totalAmp += avg;
+    }
+    float mi = 0.0f;
+    if (totalAmp > 0.0f) {
+        float entropy = 0.0f;
+        for (int k = 0; k < NUM_PHASE_BINS; k++) {
+            float avg = (binCount[k] > 0.0f) ? (binSum[k] / binCount[k]) : 0.0f;
+            float p = avg / totalAmp;
+            if (p > 1e-12f) entropy -= p * log(p);
+        }
+        mi = (log((float)NUM_PHASE_BINS) - entropy) / log((float)NUM_PHASE_BINS);
+    }
+    output[(int)b * numGammaBands + gammaIdx] = mi;
+}
+";
+
     #endregion
 }
