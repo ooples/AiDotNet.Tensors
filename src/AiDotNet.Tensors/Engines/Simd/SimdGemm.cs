@@ -377,7 +377,14 @@ internal static class SimdGemm
         // (m - mFull rows) is handled after the fat kernel by the existing
         // C# masked kernel (rare path, ≤ 1 tile per matmul).
         int mFullIter42 = (m / Mr) * Mr;
+        // Gate the JIT dispatch on CpuJitSelfTest.IsVerified (which itself
+        // gates on Windows x64 + AVX2/FMA + a one-time correctness check).
+        // GetFatKernelPtr already guards against non-Windows internally, but
+        // skipping the dictionary lookup entirely on unsupported platforms
+        // saves a few ns per matmul AND makes the safety property locally
+        // obvious at this call site.
         IntPtr fatFn = (clearedOutput
+            && CpuJitSelfTest.IsVerified
             && (n % Nr == 0)
             && mFullIter42 >= Mr
             && k <= 128)

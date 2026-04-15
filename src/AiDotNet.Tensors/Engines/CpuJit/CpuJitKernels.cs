@@ -191,6 +191,13 @@ internal static class CpuJitKernels
     /// </summary>
     public static unsafe IntPtr GetFatKernelPtr(int mFull, int n, int k, int lda, int ldb, int ldc)
     {
+        // CRITICAL: gate on Windows x64. Our emitter produces Windows x64 ABI
+        // machine code (PUSH RBP/RBX, XMM6-15 callee-saved, RCX/RDX/R8/R9
+        // first-4-args). Calling that on Linux/macOS (System V ABI) where the
+        // first arg is RDI not RCX would dereference garbage and SEGFAULT the
+        // test host. Without this gate, downstream Linux/macOS users would
+        // crash on any matmul that hits the small-matmul SgemmDirect path.
+        if (!IsSupported) return IntPtr.Zero;
         if (k <= 0 || k > 128) return IntPtr.Zero;
         if (mFull <= 0 || n <= 0) return IntPtr.Zero;
 

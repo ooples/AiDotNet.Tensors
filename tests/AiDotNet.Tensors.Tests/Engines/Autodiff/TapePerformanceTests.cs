@@ -269,7 +269,7 @@ public class TapePerformanceTests
             $"Pure recording overhead {nsPerRecord:F1}ns exceeds 1000ns budget");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI. Measures absolute steps/sec which is machine-dependent and flaky on non-exclusive runners.")]
     [Trait("Category", "Benchmark")]
     public void MLP_TrainStep_StepsPerSecond()
     {
