@@ -127,7 +127,8 @@ public class CudaGraphScopeConstructionTests
             // Default stream is synchronous in the legacy mode this test uses,
             // but synchronize explicitly to be robust against per-thread-default
             // stream behaviour.
-            CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero);
+            Assert.Equal(CudaResult.Success,
+                CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero));
 
             // ── Captured path: construct scope with real CudaBackend ─────
             // THIS is the line the issue's acceptance criterion calls out —
@@ -140,8 +141,12 @@ public class CudaGraphScopeConstructionTests
             Assert.True(scope.IsCapturing);
 
             // Forward op recorded into the graph: async D2D memcpy on the
-            // captured stream. CUDA records this as a memcpy node; it does not
-            // execute during capture.
+            // captured stream. CUDA records this as a memcpy node AND may also
+            // dispatch it normally to the stream during capture (capture mode
+            // doesn't suppress execution — it observes and records). The re-zero
+            // step after EndCapture below makes this test robust either way by
+            // ensuring any pattern we observe post-Replay was written by Replay
+            // itself, not by a side-effect of capture.
             Assert.Equal(CudaResult.Success,
                 CudaNativeBindings.cuMemcpyDtoDAsync(
                     dstCapturedDevice, srcDevice, byteCount, stream));
@@ -177,7 +182,11 @@ public class CudaGraphScopeConstructionTests
             if (srcDevice != IntPtr.Zero) CuBlasNative.cuMemFree(srcDevice);
             if (dstEagerDevice != IntPtr.Zero) CuBlasNative.cuMemFree(dstEagerDevice);
             if (dstCapturedDevice != IntPtr.Zero) CuBlasNative.cuMemFree(dstCapturedDevice);
-            CudaNativeBindings.cuStreamDestroy(stream);
+            // Stream destroy is best-effort in a finally — fail the test loudly
+            // rather than silently if the driver reports a destroy failure, since
+            // that indicates a leaked CUDA handle that will affect later tests.
+            if (stream != IntPtr.Zero)
+                Assert.Equal(CudaResult.Success, CudaNativeBindings.cuStreamDestroy(stream));
         }
     }
 
@@ -195,7 +204,8 @@ public class CudaGraphScopeConstructionTests
             var result = CudaNativeBindings.cuMemcpyDtoHAsync(
                 hostPtr, deviceBuffer, byteCount, IntPtr.Zero);
             Assert.Equal(CudaResult.Success, result);
-            CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero);
+            Assert.Equal(CudaResult.Success,
+                CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero));
         }
         finally
         {

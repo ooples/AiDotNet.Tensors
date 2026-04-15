@@ -20,19 +20,30 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// // Warmup run (required by CUDA graphs)
 /// var output = model.Forward(input);
 ///
-/// // Create a CUDA stream for capture (caller owns its lifetime).
-/// IntPtr stream = backend.CreateStream();
-///
-/// // Record the graph on that stream
-/// using var graph = new CudaGraphScope(backend, stream);
-/// graph.BeginCapture();
-/// var recorded = model.Forward(input);  // Operations are recorded, not executed
-/// graph.EndCapture();
-///
-/// // Replay with zero launch overhead
-/// for (int epoch = 0; epoch &lt; 1000; epoch++)
+/// // Create a user CUDA stream for capture. The default/null stream
+/// // (IntPtr.Zero) is rejected by cuStreamBeginCapture, so a user-created
+/// // stream is required. IDirectGpuBackend does NOT define a CreateStream
+/// // API today — use the CUDA driver binding directly, and dispose via
+/// // cuStreamDestroy when finished. The scope does not take ownership of
+/// // the stream; the caller is responsible for its lifetime.
+/// CudaNativeBindings.cuStreamCreate(out IntPtr stream, flags: 0);
+/// try
 /// {
-///     graph.Replay();  // Instant replay of all recorded operations
+///     // Record the graph on that stream
+///     using var graph = new CudaGraphScope(backend, stream);
+///     graph.BeginCapture();
+///     var recorded = model.Forward(input);  // Operations are recorded while being dispatched on `stream`
+///     graph.EndCapture();
+///
+///     // Replay with zero launch overhead
+///     for (int epoch = 0; epoch &lt; 1000; epoch++)
+///     {
+///         graph.Replay();  // Instant replay of all recorded operations
+///     }
+/// }
+/// finally
+/// {
+///     CudaNativeBindings.cuStreamDestroy(stream);
 /// }
 /// </code>
 /// </remarks>
