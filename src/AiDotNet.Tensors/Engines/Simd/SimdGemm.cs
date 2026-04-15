@@ -39,15 +39,26 @@ internal static class SimdGemm
     // baseline, iter 31 was +9%). The partial-tile mask-path overhead and lost
     // DiT win (QKV fused +5.8%) made it net-negative vs iter 31.
     //
-    // Iter 33: adaptive Mc — use SmallMc (128, iter 18c value) for m &lt; 2048
-    // and LargeMc (192, iter 31 value) for m ≥ 2048. Sacrifices iter 31's DiT
-    // projection wins (m=1024 reverts to Mc=128) to buy back Square 1152²
-    // parity with MKL. Preserves iter 31's flagship Square 4608² win (m=4608
-    // keeps Mc=192). User chose this trade to maximize "beats MKL on every
-    // shape" optics over peak DiT-XL forward-pass speed.
+    // Iter 33: adaptive Mc with m-threshold (reverted to iter 36 below).
+    //
+    // Iter 36: adaptive Mc with work-based threshold (m*k*n >= 3G FMAs).
+    // The m-threshold was too coarse — it missed DiT projections at m=1024
+    // which have enough K*N work (4-5G FMAs) to amortize Mc=192's larger
+    // packed-A panel, but were stuck on Mc=128. Switching to a work floor
+    // captures them:
+    //   - Square 1152²  (1.53G): Mc=128  — protects from Mc=192's 2D-dispatch
+    //                                       regression (m=1152 → numRowBlocks=6)
+    //   - DiT attn out  (1.36G): Mc=128  — already below 3G; stays as-is
+    //   - DiT QKV fused (4.08G): Mc=192  — RESTORES iter 31's big win
+    //   - DiT MLP up    (5.44G): Mc=192  — RESTORES iter 31's big win
+    //   - DiT MLP down  (5.44G): Mc=192  — RESTORES iter 31's big win
+    //   - Batched B=4   (5.44G): Mc=192  — RESTORES iter 31's big win
+    //   - Batched B=1   (1.36G): Mc=128  — unchanged from iter 34
+    //   - Square 4608²  (97.8G): Mc=192  — preserves iter 31 flagship win
+    //   - Per-head Attn (4.7M):  N/A — routed through SgemmDirect, no packing
     private const int SmallMc = 128;
     private const int LargeMc = 192;
-    private const int AdaptiveMcThreshold = 2048;
+    private const long AdaptiveMcWorkThreshold = 3_000_000_000L; // 3G FMAs
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
 
@@ -663,7 +674,7 @@ internal static class SimdGemm
         // 2D dispatch overhead). Large m (≥ 2048) uses LargeMc=192 for Square
         // 4608²'s L2 saturation win (0.95× of MKL). Shadowed as `Mc` locally
         // so the rest of SgemmTiled's body reads unchanged.
-        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
             && UseParallelGemm
@@ -783,7 +794,7 @@ internal static class SimdGemm
         int nrPerWorker = (numNrBlocks + numWorkers - 1) / numWorkers;
 
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
 
         // Pre-pack A (shared across all workers, m is small so only 1 Mc block)
         int firstMc = Math.Min(Mc, m);
@@ -901,7 +912,7 @@ internal static class SimdGemm
         int numRowBlocks, float[] packedBBuf)
     {
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
 
         // Pack B once (shared across all M workers, read-only)
         PackB(b, packedBBuf, n, pc, kc, jc, nc);
@@ -983,7 +994,7 @@ internal static class SimdGemm
         int numRowBlocks, int numColSubBlocks)
     {
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
 
         // colSubSize: number of B columns per sub-block, rounded down to a multiple
         // of Nr so MacroKernel's Nr panel loop stays clean. The last sub absorbs the
