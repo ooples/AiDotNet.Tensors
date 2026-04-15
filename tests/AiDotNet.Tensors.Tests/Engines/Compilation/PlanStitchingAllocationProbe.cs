@@ -53,7 +53,7 @@ public class PlanStitchingAllocationProbe
 
         var planA = CompileMatMulSigmoid(engine, inputA, weightA);
         var planB = CompileMatMulSigmoid(engine, inputB, weightB);
-        using var stitched = planA.Then(planB);
+        using var stitched = planA.ThenAsync(planB);
 
         // Warm everything up so any first-call JIT/lazy-init costs are
         // amortized. Ten replays is plenty for the steady-state to settle.

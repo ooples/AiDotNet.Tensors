@@ -49,7 +49,7 @@ public class PlanStitchingTests
 
     // ── Acceptance criterion #1: bitwise equivalence ─────────────────────────
     [Fact]
-    public void Then_Execute_BitwiseIdenticalToSequentialExecution_Across100RandomInputs()
+    public void ThenAsync_Execute_BitwiseIdenticalToSequentialExecution_Across100RandomInputs()
     {
         var engine = new CpuEngine();
 
@@ -64,10 +64,10 @@ public class PlanStitchingTests
         var planA = CompileMatMulRelu(engine, inputA, weightA);
         var planB = CompileMatMulRelu(engine, inputB, weightB);
 
-        // Build the stitched plan. After this call, planA.Then(planB)'s
+        // Build the stitched plan. After this call, planA.ThenAsync(planB)'s
         // execute should be observationally equivalent to running planA,
         // then copying planA's output into planB's input, then running planB.
-        using var stitched = planA.Then(planB);
+        using var stitched = planA.ThenAsync(planB);
 
         for (int trial = 0; trial < 100; trial++)
         {
@@ -102,13 +102,14 @@ public class PlanStitchingTests
 
     // ── Acceptance criterion #2: zero intermediate materialization ──────────
     [Fact]
-    public void Then_StitchedPlan_HasExactlyOneBoundaryStep_NoNewTensorMaterialization()
+    public void ThenAsync_StitchedPlan_StepCountIsSumOfSources_NoBoundaryStep()
     {
         // The structural acceptance criterion: a stitched plan's step count
-        // is exactly A.StepCount + 1 (the boundary copy) + B.StepCount.
-        // No "materialize intermediate tensor" step is inserted because both
-        // boundary buffers were pre-allocated at compile time. The boundary
-        // step is an in-place memcpy between existing storage.
+        // is exactly A.StepCount + B.StepCount. No boundary step is inserted
+        // because ThenAsync rebinds next's input to share storage with this's
+        // final output at stitch time — the data path is established once,
+        // not re-established per execute. The two plans' delegate arrays
+        // are spliced verbatim: "one flat delegate array" per the issue spec.
         var engine = new CpuEngine();
 
         var inA = Tensor<float>.CreateRandom([2, 3]);
@@ -120,9 +121,14 @@ public class PlanStitchingTests
         var planA = CompileMatMulRelu(engine, inA, wA);
         var planB = CompileMatMulRelu(engine, inB, wB);
 
-        using var stitched = planA.Then(planB);
+        using var stitched = planA.ThenAsync(planB);
 
-        Assert.Equal(planA.StepCount + 1 + planB.StepCount, stitched.StepCount);
+        // Stitched plan's step count is exactly the sum — no boundary step
+        // is inserted because ThenAsync rebinds next's input to share
+        // storage with this's final output at stitch time (one-shot, not
+        // per-execute). The two plans' delegate arrays are spliced
+        // verbatim: [this.steps, next.steps].
+        Assert.Equal(planA.StepCount + planB.StepCount, stitched.StepCount);
 
         planA.Dispose();
         planB.Dispose();
@@ -130,7 +136,7 @@ public class PlanStitchingTests
 
     // ── Acceptance criterion #3: stitch-time validation ─────────────────────
     [Fact]
-    public void Then_WithMismatchedShapes_ThrowsAtStitchTime_NotExecuteTime()
+    public void ThenAsync_WithMismatchedShapes_ThrowsAtStitchTime_NotExecuteTime()
     {
         var engine = new CpuEngine();
 
@@ -142,7 +148,7 @@ public class PlanStitchingTests
             Tensor<float>.CreateRandom([4, 7]),
             Tensor<float>.CreateRandom([7, 2]));
 
-        var ex = Assert.Throws<ArgumentException>(() => planA.Then(planB));
+        var ex = Assert.Throws<ArgumentException>(() => planA.ThenAsync(planB));
         // Error message must name the shapes for debuggability.
         Assert.Contains("[4, 5]", ex.Message);
         Assert.Contains("[4, 7]", ex.Message);
@@ -153,19 +159,19 @@ public class PlanStitchingTests
 
     // ── Argument validation ─────────────────────────────────────────────────
     [Fact]
-    public void Then_WithNullNext_ThrowsArgumentNullException()
+    public void ThenAsync_WithNullNext_ThrowsArgumentNullException()
     {
         var engine = new CpuEngine();
         var plan = CompileMatMulRelu(engine,
             Tensor<float>.CreateRandom([2, 2]),
             Tensor<float>.CreateRandom([2, 2]));
 
-        Assert.Throws<ArgumentNullException>(() => plan.Then(null!));
+        Assert.Throws<ArgumentNullException>(() => plan.ThenAsync(null!));
         plan.Dispose();
     }
 
     [Fact]
-    public void Then_WithNonBuiltInImplementation_ThrowsNotSupportedException()
+    public void ThenAsync_WithNonBuiltInImplementation_ThrowsNotSupportedException()
     {
         // Stitching needs to splice each plan's internal step array, which
         // is implementation-specific. A foreign ICompiledPlan<T> can't be
@@ -177,15 +183,15 @@ public class PlanStitchingTests
             Tensor<float>.CreateRandom([2, 2]));
 
         var stub = new StubCompiledPlan();
-        Assert.Throws<NotSupportedException>(() => plan.Then(stub));
+        Assert.Throws<NotSupportedException>(() => plan.ThenAsync(stub));
         plan.Dispose();
     }
 
     // ── Associativity ───────────────────────────────────────────────────────
     [Fact]
-    public void Then_IsAssociative_LeftFoldEquivalentToRightFold()
+    public void ThenAsync_IsAssociative_LeftFoldEquivalentToRightFold()
     {
-        // (a.Then(b)).Then(c) and a.Then(b.Then(c)) must produce
+        // (a.ThenAsync(b)).ThenAsync(c) and a.ThenAsync(b.ThenAsync(c)) must produce
         // structurally-equivalent stitched plans with the same step count
         // and the same final output values for the same inputs.
         var engine = new CpuEngine();
@@ -199,8 +205,8 @@ public class PlanStitchingTests
             Tensor<float>.CreateRandom([5, 6]));
 
         // Step counts of each side: same total (boundary steps are 2 either way).
-        using var leftFold  = (planA.Then(planB)).Then(planC);
-        using var rightFold = planA.Then(planB.Then(planC));
+        using var leftFold  = (planA.ThenAsync(planB)).ThenAsync(planC);
+        using var rightFold = planA.ThenAsync(planB.ThenAsync(planC));
 
         Assert.Equal(leftFold.StepCount, rightFold.StepCount);
 
@@ -221,7 +227,7 @@ public class PlanStitchingTests
 
     // ── Re-entrancy: stitched plans can themselves be stitched ──────────────
     [Fact]
-    public void Then_IsReEntrant_StitchedPlanCanBeStitchedAgain()
+    public void ThenAsync_IsReEntrant_StitchedPlanCanBeStitchedAgain()
     {
         var engine = new CpuEngine();
 
@@ -235,8 +241,8 @@ public class PlanStitchingTests
             Tensor<float>.CreateRandom([2, 5]),
             Tensor<float>.CreateRandom([5, 6]));
 
-        var ab  = planA.Then(planB);
-        using var abc = ab.Then(planC); // re-entrant: ab is itself a stitched plan
+        var ab  = planA.ThenAsync(planB);
+        using var abc = ab.ThenAsync(planC); // re-entrant: ab is itself a stitched plan
 
         // Should not throw; output shape comes from C.
         var output = abc.Execute();
@@ -251,7 +257,7 @@ public class PlanStitchingTests
 
     // ── Ownership: stitched plan does NOT dispose its constituents ──────────
     [Fact]
-    public void Then_StitchedPlan_Dispose_DoesNotDisposeOriginalPlans()
+    public void ThenAsync_StitchedPlan_Dispose_DoesNotDisposeOriginalPlans()
     {
         // The xmldoc contract: callers retain ownership of `this` and `next`.
         // Disposing the stitched plan must NOT invalidate the originals — a
@@ -267,7 +273,7 @@ public class PlanStitchingTests
             Tensor<float>.CreateRandom([2, 4]),
             Tensor<float>.CreateRandom([4, 1]));
 
-        var stitched = planA.Then(planB);
+        var stitched = planA.ThenAsync(planB);
 
         RandomizeInPlace(inA, seed: 123);
         var stitchedOutput = Snapshot(stitched.Execute());
@@ -287,6 +293,102 @@ public class PlanStitchingTests
         planB.Dispose();
     }
 
+    // ── Reference identity: same backing storage after rebind ───────────────
+    [Fact]
+    public void ThenAsync_AfterStitch_NextInputAndThisOutputShareStorage()
+    {
+        // The strongest form of "no copy, same object reference" we can
+        // achieve given the existing Tensor contract: the two Tensor
+        // INSTANCES stay distinct, but their underlying Vector<T> and
+        // TensorStorage<T> references are the same. Writing to one is
+        // immediately visible through the other — no memcpy.
+        var engine = new CpuEngine();
+
+        var inputA  = Tensor<float>.CreateRandom([3, 4]);
+        var weightA = Tensor<float>.CreateRandom([4, 5]);
+        var inputB  = Tensor<float>.CreateRandom([3, 5]);
+        var weightB = Tensor<float>.CreateRandom([5, 2]);
+
+        var planA = (AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>)
+            CompileMatMulRelu(engine, inputA, weightA);
+        var planB = (AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>)
+            CompileMatMulRelu(engine, inputB, weightB);
+
+        // Sanity: before stitching, the buffers are distinct.
+        Assert.NotSame(planA.FinalOutputBuffer.DataVector, planB.CompiledInputTensor!.DataVector);
+
+        using var stitched = planA.ThenAsync(planB);
+
+        // After stitching, planB's captured input shares backing storage
+        // with planA's final output. Same Vector<T> reference, same
+        // TensorStorage<T> reference — the literal "no copy" semantic.
+        Assert.Same(planA.FinalOutputBuffer.DataVector, planB.CompiledInputTensor.DataVector);
+
+        planA.Dispose();
+        planB.Dispose();
+    }
+
+    // ── Disposed-source guard: contract violation throws cleanly ────────────
+    [Fact]
+    public void ThenAsync_Execute_WithDisposedSourcePlan_ThrowsObjectDisposedException()
+    {
+        // The xmldoc says "callers must keep all plans passed to ThenAsync
+        // alive for the lifetime of the stitched result." If they disobey,
+        // we owe them a clean error rather than silent corruption through
+        // freed GCHandles.
+        var engine = new CpuEngine();
+
+        var inA = Tensor<float>.CreateRandom([2, 3]);
+        var planA = CompileMatMulRelu(engine, inA, Tensor<float>.CreateRandom([3, 4]));
+        var planB = CompileMatMulRelu(engine,
+            Tensor<float>.CreateRandom([2, 4]),
+            Tensor<float>.CreateRandom([4, 1]));
+
+        var stitched = planA.ThenAsync(planB);
+
+        // Contract violation: dispose a source plan while the stitched
+        // plan is still alive.
+        planA.Dispose();
+
+        // Stitched.Execute must detect this and refuse to run.
+        var ex = Assert.Throws<ObjectDisposedException>(() => stitched.Execute());
+        Assert.Contains("source", ex.Message); // error names the failure mode
+
+        stitched.Dispose();
+        planB.Dispose();
+    }
+
+    [Fact]
+    public void ThenAsync_WithDisposedSource_ThrowsAtStitchTime()
+    {
+        // Stitching from a disposed plan should fail immediately — before
+        // we start mutating storage references or allocating the stitched
+        // result.
+        var engine = new CpuEngine();
+        var planA = CompileMatMulRelu(engine,
+            Tensor<float>.CreateRandom([2, 3]),
+            Tensor<float>.CreateRandom([3, 4]));
+        var planB = CompileMatMulRelu(engine,
+            Tensor<float>.CreateRandom([2, 4]),
+            Tensor<float>.CreateRandom([4, 5]));
+
+        planA.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => planA.ThenAsync(planB));
+
+        // Symmetric: disposed `next` is also rejected immediately.
+        var planC = CompileMatMulRelu(engine,
+            Tensor<float>.CreateRandom([2, 3]),
+            Tensor<float>.CreateRandom([3, 4]));
+        var planD = CompileMatMulRelu(engine,
+            Tensor<float>.CreateRandom([2, 4]),
+            Tensor<float>.CreateRandom([4, 5]));
+        planD.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => planC.ThenAsync(planD));
+
+        planB.Dispose();
+        planC.Dispose();
+    }
+
     // ── Empty-plan rejection ────────────────────────────────────────────────
     // Note: constructing an empty plan via the public API isn't directly
     // possible (CompileInference always produces ≥1 step). The internal guard
@@ -302,7 +404,7 @@ public class PlanStitchingTests
         public Tensor<float> Execute() => new Tensor<float>(new[] { 1 });
         public bool IsValid(int[] inputShape) => true;
         public int StepCount => 0;
-        public ICompiledPlan<float> Then(ICompiledPlan<float> next) => this;
+        public ICompiledPlan<float> ThenAsync(ICompiledPlan<float> next) => this;
         public void Dispose() { }
     }
 }
