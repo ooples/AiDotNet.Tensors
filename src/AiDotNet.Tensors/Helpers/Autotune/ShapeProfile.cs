@@ -14,15 +14,22 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </remarks>
 public sealed class ShapeProfile : IEquatable<ShapeProfile>
 {
-    /// <summary>Immutable array of dimension sizes.</summary>
-    public int[] Dimensions { get; }
+    // Defensive copy held privately. `Dimensions` returns a clone so external
+    // callers cannot mutate our internal state by writing into the array.
+    private readonly int[] _dimensions;
+
+    /// <summary>
+    /// Snapshot of the dimension sizes. Each call returns a fresh copy — mutating
+    /// the returned array does not affect this profile or its cache identity.
+    /// </summary>
+    public int[] Dimensions => (int[])_dimensions.Clone();
 
     /// <summary>Creates a shape profile. The input array is defensively copied.</summary>
     /// <param name="dimensions">Dimension sizes. Must be non-null.</param>
     public ShapeProfile(params int[] dimensions)
     {
         if (dimensions is null) throw new ArgumentNullException(nameof(dimensions));
-        Dimensions = (int[])dimensions.Clone();
+        _dimensions = (int[])dimensions.Clone();
     }
 
     /// <summary>
@@ -30,14 +37,14 @@ public sealed class ShapeProfile : IEquatable<ShapeProfile>
     /// Used by <see cref="AutotuneCache"/> to build per-shape cache filenames.
     /// </summary>
     public string ToFileStem()
-        => Dimensions.Length == 0 ? "scalar" : string.Join("x", Dimensions);
+        => _dimensions.Length == 0 ? "scalar" : string.Join("x", _dimensions);
 
     public bool Equals(ShapeProfile? other)
     {
         if (other is null) return false;
-        if (other.Dimensions.Length != Dimensions.Length) return false;
-        for (int i = 0; i < Dimensions.Length; i++)
-            if (Dimensions[i] != other.Dimensions[i]) return false;
+        if (other._dimensions.Length != _dimensions.Length) return false;
+        for (int i = 0; i < _dimensions.Length; i++)
+            if (_dimensions[i] != other._dimensions[i]) return false;
         return true;
     }
 
@@ -48,11 +55,11 @@ public sealed class ShapeProfile : IEquatable<ShapeProfile>
         unchecked
         {
             int hash = 17;
-            for (int i = 0; i < Dimensions.Length; i++)
-                hash = hash * 31 + Dimensions[i];
+            for (int i = 0; i < _dimensions.Length; i++)
+                hash = hash * 31 + _dimensions[i];
             return hash;
         }
     }
 
-    public override string ToString() => $"[{string.Join(", ", Dimensions)}]";
+    public override string ToString() => $"[{string.Join(", ", _dimensions)}]";
 }

@@ -110,6 +110,31 @@ public static class HardwareFingerprint
             if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) return "apple";
             return "arm";
         }
+
+        // Fallback for runtimes without System.Runtime.Intrinsics (e.g. net471):
+        // try Windows' PROCESSOR_IDENTIFIER env var, e.g.
+        //   "Intel64 Family 6 Model 158 Stepping 9, GenuineIntel"
+        //   "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD"
+        // Without this fallback every x64 net471 host collapses to the same
+        // "unknown" bucket and Intel/AMD machines share cache entries — exactly
+        // the cross-machine poisoning the fingerprint exists to prevent.
+        return VendorFromProcessorIdentifier();
+    }
+
+    private static string VendorFromProcessorIdentifier()
+    {
+        try
+        {
+            string? id = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER");
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                if (id!.IndexOf("Intel",  StringComparison.OrdinalIgnoreCase) >= 0) return "intel";
+                if (id.IndexOf("AMD",    StringComparison.OrdinalIgnoreCase) >= 0) return "amd";
+                if (id.IndexOf("Hygon",  StringComparison.OrdinalIgnoreCase) >= 0) return "hygon";
+                if (id.IndexOf("ARM",    StringComparison.OrdinalIgnoreCase) >= 0) return "arm";
+            }
+        }
+        catch { /* env access can throw under sandbox; fall through. */ }
         return "unknown";
     }
 
@@ -126,6 +151,15 @@ public static class HardwareFingerprint
         // ARM NEON / AdvSimd.
         if (AdvSimd.IsSupported) return "neon";
 #endif
+        // Fallback for net471: we cannot probe AVX/AVX2 support without the
+        // intrinsics API, but we can give a coarse architectural floor based
+        // on the process bitness. x64 implies SSE2 by definition (it's part of
+        // the AMD64 ABI); narrowing further requires CPUID, which is out of
+        // reach on this target. "sse2-fallback" is distinct from the full
+        // "sse2" tag so operators can tell tuned-on-net471 from
+        // tuned-on-modern-runtime in their cache directories.
+        if (RuntimeInformation.ProcessArchitecture == Architecture.X64) return "sse2-fallback";
+        if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64) return "neon-fallback";
         return "none";
     }
 

@@ -35,6 +35,15 @@ public static class AutotuneCache
 {
     private const string EnvVarCachePath = "AIDOTNET_AUTOTUNE_CACHE_PATH";
 
+    /// <summary>
+    /// The schema version this binary can read. Must match
+    /// <see cref="KernelChoice.SchemaVersion"/>'s default. Files with a higher
+    /// version are treated as misses (forward-compat escape hatch for newer
+    /// library versions that extend the schema); files with a non-positive
+    /// version are treated as corruption.
+    /// </summary>
+    internal const int CurrentSchemaVersion = 1;
+
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
         WriteIndented = true,
@@ -91,7 +100,7 @@ public static class AutotuneCache
             // Schema-version gate: reject files newer than we know how to read
             // (forward-incompatible) and files with SchemaVersion <= 0 (written
             // by a broken writer).
-            if (choice.SchemaVersion <= 0) return null;
+            if (choice.SchemaVersion <= 0 || choice.SchemaVersion > CurrentSchemaVersion) return null;
 
             return choice;
         }

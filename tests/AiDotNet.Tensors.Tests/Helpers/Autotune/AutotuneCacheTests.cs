@@ -9,14 +9,27 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 
 /// <summary>
+/// xUnit collection that pins <see cref="AutotuneCacheTests"/> to serial
+/// execution. Each test mutates the process-wide <c>AIDOTNET_AUTOTUNE_CACHE_PATH</c>
+/// environment variable in its constructor and restores it on Dispose; running
+/// these tests in parallel would let one test see another's redirected root.
+/// </summary>
+[CollectionDefinition("AutotuneCacheTests", DisableParallelization = true)]
+public sealed class AutotuneCacheTestsCollection { }
+
+/// <summary>
 /// Acceptance tests for issue #168 — persistent autotune cache keyed by
 /// hardware fingerprint.
 ///
 /// Each test re-points the cache root to a unique temp directory via the
 /// <c>AIDOTNET_AUTOTUNE_CACHE_PATH</c> environment variable so tests cannot
 /// stomp on each other or on a real user's cache. Cleanup runs in
-/// <see cref="IDisposable.Dispose"/> on the fixture class.
+/// <see cref="IDisposable.Dispose"/> on the fixture class. The collection
+/// attribute below pins the suite to serial execution because the env var is
+/// process-wide shared state — without it, parallel test workers would observe
+/// each other's redirected roots and false-positive cache hits/misses.
 /// </summary>
+[Collection("AutotuneCacheTests")]
 public sealed class AutotuneCacheTests : IDisposable
 {
     private const string EnvVar = "AIDOTNET_AUTOTUNE_CACHE_PATH";
