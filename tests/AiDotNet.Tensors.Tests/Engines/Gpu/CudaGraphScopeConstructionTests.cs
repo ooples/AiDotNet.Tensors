@@ -52,31 +52,22 @@ public class CudaGraphScopeConstructionTests
     }
 
     /// <summary>
-    /// Integration test (per issue #171 acceptance criterion):
-    /// <c>BeginCapture</c> → <c>EndCapture</c> → <c>Replay</c> with the real
+    /// Integration test covering issue #171's full acceptance criterion:
+    /// <c>BeginCapture</c> → forward op → <c>EndCapture</c> → <c>Replay</c>
+    /// with verified output equivalence vs. eager execution, using the real
     /// <see cref="CudaBackend"/> passed to the relaxed constructor.
     ///
-    /// Skipped when CUDA is unavailable on the host (CI without GPU, non-CUDA
-    /// dev machines). When a CUDA driver with graph-capture support (10.0+) is
-    /// present, the test:
-    /// <list type="number">
-    ///   <item>Creates a user stream via <c>cuStreamCreate</c> (graph capture
-    ///         rejects the default stream).</item>
-    ///   <item>Constructs <see cref="CudaGraphScope"/> with the real
-    ///         <see cref="CudaBackend"/> — the exact call that #171 unblocks.</item>
-    ///   <item>Captures an empty graph and replays it.</item>
-    /// </list>
+    /// The "forward op" is a device-to-device async memcpy on the captured
+    /// stream — the simplest real stream-submitted operation that (a) gets
+    /// recorded into the graph during capture, and (b) has a deterministic,
+    /// bit-exact expected output that can be compared against eager execution
+    /// without depending on any floating-point-sensitive kernel.
     ///
-    /// Capturing an empty graph is an intentionally minimal integration test —
-    /// it verifies the entire capture → instantiate → replay pipeline is
-    /// reachable via the relaxed constructor without depending on specific
-    /// kernel infrastructure (covered by the broader GPU correctness suite).
-    /// Output equivalence of real forward ops vs. eager is verified in those
-    /// other tests; this test specifically proves the constructor-relaxation
-    /// lets CUDA users wire up graph capture at all.
+    /// Skipped when CUDA is unavailable on the host (CI without GPU, non-CUDA
+    /// dev machines).
     /// </summary>
     [SkippableFact]
-    public void Constructor_WithRealCudaBackend_CanCaptureAndReplay()
+    public void Constructor_WithRealCudaBackend_CaptureReplayProducesSameOutputAsEager()
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable,
             "CUDA driver not available on this machine");
@@ -93,31 +84,117 @@ public class CudaGraphScopeConstructionTests
         Skip.IfNot(streamResult == CudaResult.Success,
             $"cuStreamCreate failed: {streamResult}");
 
+        // Use 16 uint32 elements (64 bytes) as the test payload — large enough
+        // to catch any per-element bugs, small enough to stay on any GPU.
+        const int elementCount = 16;
+        const ulong byteCount = elementCount * sizeof(uint);
+        const uint pattern = 0xDEADBEEFu;
+
+        IntPtr srcDevice = IntPtr.Zero;
+        IntPtr dstEagerDevice = IntPtr.Zero;
+        IntPtr dstCapturedDevice = IntPtr.Zero;
+
         try
         {
-            // The acceptance criterion: this line must compile and run with
-            // CudaBackend passed directly. Before this PR, CudaBackend did not
-            // satisfy the constructor's IGpuBatchExecution parameter.
+            // Allocate three device buffers: src (source pattern), dstEager
+            // (direct-copy reference), dstCaptured (filled via graph replay).
+            Assert.Equal(CudaResult.Success, CuBlasNative.cuMemAlloc(out srcDevice, byteCount));
+            Assert.Equal(CudaResult.Success, CuBlasNative.cuMemAlloc(out dstEagerDevice, byteCount));
+            Assert.Equal(CudaResult.Success, CuBlasNative.cuMemAlloc(out dstCapturedDevice, byteCount));
+
+            // Fill source with the known pattern (sync, pre-capture).
+            Assert.Equal(CudaResult.Success,
+                CuBlasNative.cuMemsetD32(srcDevice, pattern, elementCount));
+            // Zero both destinations so a failed copy would show as all-zeros.
+            Assert.Equal(CudaResult.Success,
+                CuBlasNative.cuMemsetD32(dstEagerDevice, 0u, elementCount));
+            Assert.Equal(CudaResult.Success,
+                CuBlasNative.cuMemsetD32(dstCapturedDevice, 0u, elementCount));
+
+            // ── Eager path: direct sync memcpy on default stream ──────────
+            // Using the sync D2H path to roundtrip: stage src -> host -> dstEager
+            // would defeat the comparison. Instead, we use cuMemcpyDtoDAsync
+            // with stream=Zero (synchronous default stream), which is the eager
+            // analogue of the captured async copy below.
+            Assert.Equal(CudaResult.Success,
+                CudaNativeBindings.cuMemcpyDtoDAsync(
+                    dstEagerDevice, srcDevice, byteCount, IntPtr.Zero));
+            // Default stream is synchronous in the legacy mode this test uses,
+            // but synchronize explicitly to be robust against per-thread-default
+            // stream behaviour.
+            CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero);
+
+            // ── Captured path: construct scope with real CudaBackend ─────
+            // THIS is the line the issue's acceptance criterion calls out —
+            // passing CudaBackend (IAsyncGpuBackend : IDirectGpuBackend) where
+            // previously IGpuBatchExecution was demanded.
             using var scope = new CudaGraphScope(cudaBackend, stream);
             Assert.True(scope.IsSupported);
 
             scope.BeginCapture();
             Assert.True(scope.IsCapturing);
 
-            // Empty graph: minimal valid capture. No kernels submitted — this
-            // test exists to prove the lifecycle is reachable via the relaxed
-            // constructor, not to re-verify kernel correctness.
+            // Forward op recorded into the graph: async D2D memcpy on the
+            // captured stream. CUDA records this as a memcpy node; it does not
+            // execute during capture.
+            Assert.Equal(CudaResult.Success,
+                CudaNativeBindings.cuMemcpyDtoDAsync(
+                    dstCapturedDevice, srcDevice, byteCount, stream));
+
             scope.EndCapture();
-            Assert.False(scope.IsCapturing);
             Assert.True(scope.HasGraph);
 
+            // Re-zero the captured destination so any "pattern" we see after
+            // replay must have been written by Replay, not by a lingering
+            // side-effect of capture.
+            Assert.Equal(CudaResult.Success,
+                CuBlasNative.cuMemsetD32(dstCapturedDevice, 0u, elementCount));
+
             scope.Replay();
-            // Replay internally calls cuStreamSynchronize, so completion is
-            // implicit. The assertion is "returns without throwing".
+            // Replay() internally synchronises the captured stream.
+
+            // ── Compare outputs ──────────────────────────────────────────
+            uint[] eagerHost = new uint[elementCount];
+            uint[] capturedHost = new uint[elementCount];
+            CopyDeviceToHost(dstEagerDevice, eagerHost, byteCount);
+            CopyDeviceToHost(dstCapturedDevice, capturedHost, byteCount);
+
+            // Sanity: the eager path wrote the pattern.
+            for (int i = 0; i < elementCount; i++)
+                Assert.Equal(pattern, eagerHost[i]);
+
+            // Acceptance criterion: captured/replayed output is bit-identical
+            // to the eager reference.
+            Assert.Equal(eagerHost, capturedHost);
         }
         finally
         {
+            if (srcDevice != IntPtr.Zero) CuBlasNative.cuMemFree(srcDevice);
+            if (dstEagerDevice != IntPtr.Zero) CuBlasNative.cuMemFree(dstEagerDevice);
+            if (dstCapturedDevice != IntPtr.Zero) CuBlasNative.cuMemFree(dstCapturedDevice);
             CudaNativeBindings.cuStreamDestroy(stream);
+        }
+    }
+
+    /// <summary>
+    /// Synchronous device-to-host copy for uint32 buffers, used by the
+    /// integration test to verify bit-identical output.
+    /// </summary>
+    private static void CopyDeviceToHost(IntPtr deviceBuffer, uint[] host, ulong byteCount)
+    {
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(host,
+            System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            var hostPtr = handle.AddrOfPinnedObject();
+            var result = CudaNativeBindings.cuMemcpyDtoHAsync(
+                hostPtr, deviceBuffer, byteCount, IntPtr.Zero);
+            Assert.Equal(CudaResult.Success, result);
+            CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero);
+        }
+        finally
+        {
+            handle.Free();
         }
     }
 }
