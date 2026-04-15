@@ -17,14 +17,37 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// </summary>
 internal static class SimdGemm
 {
-    // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
+    // Cache blocking parameters (tuned for typical L1=32KB, L2=512KB, L3=8MB+)
     // Iter 2: Mc lowered 256→128 for more row blocks (better parallel utilization).
     // Iter 3 (reverted): Mc=64 regressed across the board — too small for cache reuse.
     // Iter 8 (reverted): Kc=256 was tried to fit per-tile working set in L2, but the
     // extra pc iterations (4 instead of 2) doubled the number of parallel barriers and
     // regressed 512² by 1.5x. The L2-fit argument was wrong because packed A gets
     // evicted by packed B during the inner loop anyway. Kept at 512.
-    private const int Mc = 128;  // Panel height for A (fits in L2)
+    //
+    // Iter 31: Mc 128→192 attacked Square 4608² (flipped from 1.10× loss to 0.95×
+    // win, + 13-18% gains on DiT projections). One residual: Square 1152² moved
+    // from 0.99× parity to 1.05× loss because m=1152/Mc=192 gives numRowBlocks=6
+    // and dispatches to 2D-parallel with 12 tiles for 16 cores (4 idle).
+    //
+    // Iter 31b (reverted): tightening the 2D gate forced Square 1152² to 1D which
+    // made it 2.2× worse (1D at 6 row blocks leaves 10 cores idle). Confirmed
+    // 2D@Mc=192 is the minimum regression for that shape.
+    //
+    // Iter 32 (reverted): Mc 192→162 for "perfect 16-tile coverage" on m=1152.
+    // Didn't help — Square 1152² actually got slightly worse (+14% vs iter 18c
+    // baseline, iter 31 was +9%). The partial-tile mask-path overhead and lost
+    // DiT win (QKV fused +5.8%) made it net-negative vs iter 31.
+    //
+    // Iter 33: adaptive Mc — use SmallMc (128, iter 18c value) for m &lt; 2048
+    // and LargeMc (192, iter 31 value) for m ≥ 2048. Sacrifices iter 31's DiT
+    // projection wins (m=1024 reverts to Mc=128) to buy back Square 1152²
+    // parity with MKL. Preserves iter 31's flagship Square 4608² win (m=4608
+    // keeps Mc=192). User chose this trade to maximize "beats MKL on every
+    // shape" optics over peak DiT-XL forward-pass speed.
+    private const int SmallMc = 128;
+    private const int LargeMc = 192;
+    private const int AdaptiveMcThreshold = 2048;
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
 
@@ -194,12 +217,46 @@ internal static class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
         {
+            // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
+            // with fully vectorized masked edge kernels (proper fix for iter
+            // 29's scalar-edge disaster). Targets per-head-attention shapes
+            // where SgemmTiled's PackA + PackB + parallel dispatch overhead
+            // dominates the compute time (MKL hits ~85µs, we hit ~163µs in
+            // iter 18c/31/33 — ~2× MKL gap is pure packing overhead).
+            //
+            // Gate conditions (all required):
+            //   - work ≤ SmallMatmulWorkThreshold (8M FMAs): above this,
+            //     SgemmTiled's packing cost amortizes and is competitive
+            //   - k ≤ SmallMatmulKThreshold (512): keeps 6-row A panel at
+            //     ≤ 12KB in L1d during the inner kernel
+            //   - no transpose: direct-stride path only handles row-major
+            //   - (n % 8 == 0) OR n >= Nr+8: ensures N-edges are 8-aligned
+            //     (handled by DirectKernel6x8 / masked 6×8) or big enough to
+            //     fall through to the normal split. For DiT-XL shapes n=256
+            //     and n=72 both have n % 8 == 0.
+            long directWork = (long)m * k * n;
+            if (!transA && !transB
+                && directWork <= SmallMatmulWorkThreshold
+                && k <= SmallMatmulKThreshold
+                && (n % 8 == 0))
+            {
+                SgemmDirect(a, lda, b, ldb, c, m, k, n);
+                return;
+            }
+
             SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel);
             return;
         }
 #endif
         SgemmScalar(a, lda, transA, b, ldb, transB, c, m, k, n);
     }
+
+    // Iter 34 small-matmul gate. 8M FMAs captures per-head attention
+    // [256,72]×[72,256] (4.7M) and [256,256]×[256,72] (4.7M) and excludes
+    // 1024²-scale work (>= 1B). K ≤ 512 keeps the 6-row A panel at 12KB,
+    // well within Zen 2's 32KB L1d.
+    private const long SmallMatmulWorkThreshold = 8L * 1024 * 1024;
+    private const int SmallMatmulKThreshold = 512;
 
     /// <summary>
     /// Scalar GEMM fallback with stride/transpose support.
@@ -234,17 +291,284 @@ internal static class SimdGemm
 
 #if NET5_0_OR_GREATER
     /// <summary>
-    /// Iter 29 (REVERTED): tried a direct no-packing 6×16 FMA path for small
-    /// matmuls (work ≤ 8M, k ≤ 512) to eliminate PackA/PackB overhead on
-    /// per-head attention shapes. The full-6×16 hot path worked, but the
-    /// scalar N-edge fallback (called when n % Nr ≠ 0) catastrophically
-    /// regressed A·V [256,256]×[256,72] from 163µs → 909µs (5.6× slower)
-    /// because the per-tile scalar loop ran 516K scalar FMAs at ~1 per cycle
-    /// for the 8-wide N tail. Reverted. The correct fix would be a fully
-    /// vectorized 6×8 edge kernel for nTail ≥ 8 and a masked 6×(nTail) kernel
-    /// for nTail &lt; 8, but that's significantly more code than the simple
-    /// small-matmul concept suggested — deferred.
+    /// Iter 34: libxsmm-style no-packing GEMM dispatch for small matmuls.
+    /// <para>
+    /// Walks M in Mr=6 blocks and N in Nr=16 blocks. Full 6×16 tiles use
+    /// <see cref="DirectKernel6x16"/> (no masking, fastest). Any edge tile
+    /// (mc &lt; 6 OR nc &lt; 16) uses <see cref="DirectKernelMxNMasked"/>
+    /// which shares the same 12-accumulator FMA body with per-row mc_actual
+    /// guarding and precomputed lane masks for the N partial.
+    /// </para>
+    /// <para>
+    /// Unlike the iter 29 attempt (scalar N-edge fallback → 5.6× regression
+    /// on A·V), every edge path here stays vectorized.
+    /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmDirect(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c,
+        int m, int k, int n)
+    {
+        int mFull = (m / Mr) * Mr;
+        int nFull = (n / Nr) * Nr;
+
+        // Iter 35 (REVERTED): tried JIT-emitting the 6×16 direct kernel with
+        // k/lda/ldb/ldc all baked as immediates (full-unroll for k ≤ 128).
+        // Expected to beat the inlined C# kernel by eliminating C# compile
+        // overhead. Instead regressed Q·K^T by 34% (107µs → 144µs).
+        //
+        // Root cause: UnmanagedFunctionPointer-backed delegate invoke has
+        // ~40ns P/Invoke overhead per call. The PACKED JIT kernel
+        // (CpuJitKernels.GetGemmMicroKernel) absorbs this fine because each
+        // call does Kc=512 iterations ≈ 12K FMAs ≈ 1000ns of compute — 4%
+        // overhead. The DIRECT kernel at k=72 does only 864 FMAs ≈ 140ns
+        // per call — 22% overhead from the 40ns dispatch cost, net-negative
+        // vs the inlined [MethodImpl(HotInline)] C# variant.
+        //
+        // The C# DirectKernel6x16 gets RyuJIT-inlined at the call site
+        // here, so its dispatch cost is zero. RyuJIT emits essentially the
+        // same AVX2 machine code that the hand-rolled JIT would emit. The
+        // JIT kernel's theoretical advantages (full unroll, immediate disps)
+        // don't overcome the per-call barrier for small kernels.
+        //
+        // The right path to beat MKL's 85µs on Q·K^T is a FAT-kernel JIT —
+        // emit the entire SgemmDirect M×N loop as one kernel so only ONE
+        // P/Invoke per matmul instead of 672. Deferred — significant effort.
+
+        fixed (float* pAroot = a, pBroot = b, pCroot = c)
+        {
+            // Full-Mr rows: 6 rows at a time.
+            for (int i = 0; i < mFull; i += Mr)
+            {
+                float* pARow = pAroot + i * lda;
+                float* pCRow = pCroot + i * n;
+
+                // Full-Nr columns: 16 cols at a time → hot 6×16 kernel.
+                int j = 0;
+                for (; j + Nr <= n; j += Nr)
+                {
+                    DirectKernel6x16(pARow, lda, pBroot + j, ldb, pCRow + j, n, k);
+                }
+
+                // N-edge (nc ∈ [1, 15]) via the masked kernel.
+                int ncTail = n - j;
+                if (ncTail > 0)
+                {
+                    DirectKernelMxNMasked(
+                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                        k, mcActual: Mr, ncActual: ncTail);
+                }
+            }
+
+            // M-edge (mc ∈ [1, 5]): remaining rows go through the masked kernel.
+            int mcTail = m - mFull;
+            if (mcTail > 0)
+            {
+                float* pARow = pAroot + mFull * lda;
+                float* pCRow = pCroot + mFull * n;
+
+                int j = 0;
+                for (; j + Nr <= n; j += Nr)
+                {
+                    DirectKernelMxNMasked(
+                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                        k, mcActual: mcTail, ncActual: Nr);
+                }
+
+                // Corner: both M and N edges.
+                int ncTail = n - j;
+                if (ncTail > 0)
+                {
+                    DirectKernelMxNMasked(
+                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                        k, mcActual: mcTail, ncActual: ncTail);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Iter 34 hot kernel: direct 6×16 FMA over native strides. No packing,
+    /// no fixed statements inside the inner loop (caller pins root pointers).
+    /// Same 12-accumulator layout as <see cref="MicroKernel6x16"/> but reads
+    /// A with stride lda (one scalar per row per K iter) and B with stride ldb
+    /// (two YMM loads of contiguous 256+256 bits per K iter).
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void DirectKernel6x16(
+        float* pA, int lda,
+        float* pB, int ldb,
+        float* pC, int ldc,
+        int k)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        // Hoist per-row A base pointers out of the K loop (avoids an IMUL per iter).
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            var a1 = Vector256.Create(pA1[p]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+
+            var a2 = Vector256.Create(pA2[p]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+
+            var a3 = Vector256.Create(pA3[p]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+
+            var a4 = Vector256.Create(pA4[p]);
+            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+
+            var a5 = Vector256.Create(pA5[p]);
+            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+
+            pB += ldb;
+        }
+
+        // Accumulate into C (load-add-store). Caller cleared C via Sgemm() so
+        // on first call C contains zeros, but repeated MacroKernel-style
+        // invocations compose correctly.
+        Avx.Store(pC + 0, Avx.Add(c00, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c01, Avx.LoadVector256(pC + 8)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c10, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c11, Avx.LoadVector256(pC + 8)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c20, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c21, Avx.LoadVector256(pC + 8)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c30, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c31, Avx.LoadVector256(pC + 8)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c40, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c41, Avx.LoadVector256(pC + 8)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c50, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 8, Avx.Add(c51, Avx.LoadVector256(pC + 8)));
+    }
+
+    /// <summary>
+    /// Iter 34 edge kernel: masked 6×N or M×16 or M×N with direct A/B access.
+    ///
+    /// <para>
+    /// Same 12-accumulator FMA body as <see cref="DirectKernel6x16"/>. The
+    /// FMA loop always computes all 6×16 lanes (accumulators for inactive
+    /// rows get zeroed later). Store phase uses <see cref="_partialNrMasks"/>
+    /// for N lane masking and per-row mcActual guards for M.
+    /// </para>
+    /// <para>
+    /// Critical invariant (that iter 29 violated): when mcActual &lt; Mr,
+    /// rows past mcActual in pA are OUT OF BOUNDS. We must not deref those
+    /// addresses. Guarded via explicit `if (mcActual &gt; N)` branches
+    /// inside the K loop. Branches are loop-invariant and branch-predict
+    /// perfectly, so they're effectively free after first-iter warmup.
+    /// </para>
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void DirectKernelMxNMasked(
+        float* pA, int lda,
+        float* pB, int ldb,
+        float* pC, int ldc,
+        int k, int mcActual, int ncActual)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        // Per-row A base pointers (avoid IMUL per K iter). We always compute
+        // pA0..pA5 addresses but only *deref* the ones within mcActual.
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+
+            // Row 0 always active (mcActual >= 1 guaranteed by caller).
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            if (mcActual > 1)
+            {
+                var a1 = Vector256.Create(pA1[p]);
+                c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+            }
+            if (mcActual > 2)
+            {
+                var a2 = Vector256.Create(pA2[p]);
+                c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+            }
+            if (mcActual > 3)
+            {
+                var a3 = Vector256.Create(pA3[p]);
+                c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+            }
+            if (mcActual > 4)
+            {
+                var a4 = Vector256.Create(pA4[p]);
+                c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+            }
+            if (mcActual > 5)
+            {
+                var a5 = Vector256.Create(pA5[p]);
+                c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            }
+
+            pB += ldb;
+        }
+
+        // Build column lane masks from ncActual (same logic as MicroKernelMxNMasked).
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+
+        // Masked accumulate-and-store, row by row, skipping rows past mcActual.
+        if (mcActual > 0) StoreMaskedAccumRowDirect(pC,            mask0, mask1, c00, c01);
+        if (mcActual > 1) StoreMaskedAccumRowDirect(pC + ldc,      mask0, mask1, c10, c11);
+        if (mcActual > 2) StoreMaskedAccumRowDirect(pC + ldc * 2,  mask0, mask1, c20, c21);
+        if (mcActual > 3) StoreMaskedAccumRowDirect(pC + ldc * 3,  mask0, mask1, c30, c31);
+        if (mcActual > 4) StoreMaskedAccumRowDirect(pC + ldc * 4,  mask0, mask1, c40, c41);
+        if (mcActual > 5) StoreMaskedAccumRowDirect(pC + ldc * 5,  mask0, mask1, c50, c51);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreMaskedAccumRowDirect(
+        float* row, Vector256<float> m0, Vector256<float> m1,
+        Vector256<float> v0, Vector256<float> v1)
+    {
+        var existing0 = Avx.MaskLoad(row, m0);
+        var existing1 = Avx.MaskLoad(row + 8, m1);
+        Avx.MaskStore(row, m0, Avx.Add(existing0, v0));
+        Avx.MaskStore(row + 8, m1, Avx.Add(existing1, v1));
+    }
 
     /// <summary>
     /// Tiled GEMM with panel packing and FMA micro-kernel.
@@ -333,6 +657,13 @@ internal static class SimdGemm
         // already providing parallelism (e.g. SDPA per-head dispatch). Force sequential
         // to avoid spawning (outer_workers × inner_workers) tasks for (cores) cores.
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // Adaptive Mc (iter 33): Small m (< 2048) uses SmallMc=128 for cache
+        // behavior that matches iter 18c's parity on Square 1152² and keeps
+        // 1D dispatch at numRowBlocks=9 (9 tiles for 16 cores is fine, avoids
+        // 2D dispatch overhead). Large m (≥ 2048) uses LargeMc=192 for Square
+        // 4608²'s L2 saturation win (0.95× of MKL). Shadowed as `Mc` locally
+        // so the rest of SgemmTiled's body reads unchanged.
+        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
             && UseParallelGemm
@@ -370,6 +701,22 @@ internal static class SimdGemm
                     int numColSubs = Math.Min(desiredColSubs, maxColSubs);
                     int totalTiles = numRowBlocks * numColSubs;
 
+                    // Iter 31b (REVERTED): tried gating 2D with (a) numRowBlocks
+                    // * 2 < maxThreads AND (b) totalWork >= 2.5G to prevent the
+                    // Square 1152² regression from iter 31. Catastrophic result:
+                    // shapes that got kicked from 2D to 1D regressed 100-360%
+                    // because 1D at numRowBlocks=6 leaves 10 of 16 cores idle
+                    // (and Batched B=1's numRowBlocks=2 at Mc=192 leaves 14
+                    // cores idle). The 2D dispatch was PROTECTING these shapes,
+                    // not hurting them. Data:
+                    //   Square 1152² Mc=192+2D: 4,487 µs (+9% vs iter 18c)
+                    //   Square 1152² Mc=192+1D: 9,005 µs (+119% vs iter 18c)
+                    //   Batched B=1  Mc=192+2D: 5,612 µs
+                    //   Batched B=1  Mc=192+1D: 26,069 µs (+364%)
+                    // So 2D at Mc=192 is the MINIMUM regression possible for
+                    // these shapes. Kept the original unconditional-2D gate.
+                    // The Square 1152² +9% under iter 31 is an accepted cost
+                    // of Mc=192; see iter31b-run.log for evidence.
                     bool used2D = canParallelize && numColSubs >= 2 && totalTiles >= 2;
                     bool used1D = canParallelize && !used2D && numRowBlocks >= 2;
 
@@ -434,6 +781,9 @@ internal static class SimdGemm
     {
         int numWorkers = Math.Min(maxThreads, numNrBlocks);
         int nrPerWorker = (numNrBlocks + numWorkers - 1) / numWorkers;
+
+        // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
+        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
 
         // Pre-pack A (shared across all workers, m is small so only 1 Mc block)
         int firstMc = Math.Min(Mc, m);
@@ -550,6 +900,9 @@ internal static class SimdGemm
         int jc, int nc, int pc, int kc,
         int numRowBlocks, float[] packedBBuf)
     {
+        // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
+        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+
         // Pack B once (shared across all M workers, read-only)
         PackB(b, packedBBuf, n, pc, kc, jc, nc);
 
@@ -629,6 +982,9 @@ internal static class SimdGemm
         int jc, int nc, int pc, int kc,
         int numRowBlocks, int numColSubBlocks)
     {
+        // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
+        int Mc = (m >= AdaptiveMcThreshold) ? LargeMc : SmallMc;
+
         // colSubSize: number of B columns per sub-block, rounded down to a multiple
         // of Nr so MacroKernel's Nr panel loop stays clean. The last sub absorbs the
         // remainder. If nc < numColSubBlocks*Nr, fall back to the 1D parallel path.
