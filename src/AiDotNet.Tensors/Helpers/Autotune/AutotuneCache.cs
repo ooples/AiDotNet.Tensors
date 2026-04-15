@@ -113,6 +113,19 @@ public static class AutotuneCache
             if (string.IsNullOrWhiteSpace(choice.Variant)) return null;
             if (choice.Parameters is null) return null;
 
+            // Per-entry null gate: Dictionary<string,string> in C# declares
+            // non-nullable values, but System.Text.Json will happily deserialize
+            // `{"Parameters":{"TileM":null}}` into a dictionary whose "TileM"
+            // entry has a null value. A consumer that does
+            // `int.Parse(choice.Parameters["TileM"])` then NREs. Treat any null
+            // value as corruption and return a miss rather than leaking nulls
+            // to the caller. Empty-string values are intentionally allowed —
+            // some kernel categories may legitimately store empty metadata.
+            foreach (var kv in choice.Parameters)
+            {
+                if (kv.Value is null) return null;
+            }
+
             return choice;
         }
         catch
@@ -158,6 +171,20 @@ public static class AutotuneCache
                 "KernelChoice.Parameters must not be null (use an empty dictionary " +
                 "if no tuned hyperparameters apply).",
                 nameof(winner));
+        // Per-entry null gate: mirrors Lookup's completeness check. Writing a
+        // null value to disk would succeed (Text.Json happily serializes null
+        // in a Dictionary<string,string>), then Lookup's per-entry guard
+        // would reject it — the Store → Lookup round-trip would silently
+        // break. Fail at the boundary instead. Empty strings are allowed
+        // because some kernel categories may legitimately use them.
+        foreach (var kv in winner.Parameters)
+        {
+            if (kv.Value is null)
+                throw new ArgumentException(
+                    $"KernelChoice.Parameters['{kv.Key}'] is null. All tuned " +
+                    "parameter values must be non-null strings (empty is allowed).",
+                    nameof(winner));
+        }
 
         // Persist a shallow copy rather than the caller's instance so we can:
         //   (1) stamp CurrentSchemaVersion authoritatively — callers don't get

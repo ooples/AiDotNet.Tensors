@@ -242,6 +242,23 @@ public sealed class AutotuneCacheTests : IDisposable
         Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
     }
 
+    [Fact]
+    public void Lookup_RejectsPayloadWithNullParameterValue()
+    {
+        // One level deeper than the null-Parameters guard: a `Parameters`
+        // dictionary that exists but contains `{"TileM": null}` entries is
+        // still corruption — consumers doing `int.Parse(Parameters["TileM"])`
+        // would NRE. Lookup must treat this as a miss, not leak nulls.
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner());
+        var cacheFiles = Directory.GetFiles(
+            Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint),
+            "*.json");
+        File.WriteAllText(cacheFiles[0],
+            "{ \"Variant\": \"x\", \"Parameters\": { \"TileM\": null, \"TileN\": \"64\" }, \"SchemaVersion\": 1 }");
+
+        Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
+    }
+
     // ── Store-side validation (round-trip contract) ─────────────────────────
     //
     // Lookup's completeness guard rejects JSON with null Variant / null
@@ -276,6 +293,24 @@ public sealed class AutotuneCacheTests : IDisposable
         winner.Parameters = null!;
         var ex = Assert.Throws<ArgumentException>(() => AutotuneCache.Store(Gemm, Shape256, winner));
         Assert.Equal("winner", ex.ParamName);
+    }
+
+    [Fact]
+    public void Store_WithNullParameterValue_ThrowsArgumentException()
+    {
+        // Round-trip symmetry for the one-level-deeper null. Without this,
+        // Store would happily write `{"Parameters":{"TileM":null}}` and the
+        // very next Lookup would treat it as a miss. The error message also
+        // names the offending key so the caller can debug their benchmarker.
+        var winner = MakeWinner();
+        winner.Parameters = new Dictionary<string, string>
+        {
+            ["TileM"] = null!,
+            ["TileN"] = "64",
+        };
+        var ex = Assert.Throws<ArgumentException>(() => AutotuneCache.Store(Gemm, Shape256, winner));
+        Assert.Equal("winner", ex.ParamName);
+        Assert.Contains("TileM", ex.Message);
     }
 
     [Fact]
