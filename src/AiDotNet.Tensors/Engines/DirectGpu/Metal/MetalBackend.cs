@@ -55,6 +55,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _iouLibrary;
     private IntPtr _hyperbolicLibrary;
     private IntPtr _octonionLibrary;
+    private IntPtr _spectralPerfLibrary;
 
     #region Properties
 
@@ -181,14 +182,40 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
             // Compile octonion algebra operations
             _octonionLibrary = _shaderLibrary.CompileLibrary("Octonion", MetalKernels.OctonionKernels);
-
-            _fusedLinearLibrary = _shaderLibrary.CompileLibrary("FusedLinear", MetalKernels.FusedLinearKernels);
-            _iouLibrary = _shaderLibrary.CompileLibrary("IoULoss", MetalKernels.IoULossKernels);
         }
         catch (Exception ex)
         {
             // Log but don't fail - kernels will be compiled on-demand
             System.Diagnostics.Debug.WriteLine($"Metal kernel pre-compilation warning: {ex.Message}");
+        }
+
+        // Compile Issue #160 spectral perf kernels independently so a failure here does not
+        // prevent the following (unrelated) libraries from being compiled.
+        try
+        {
+            _spectralPerfLibrary = _shaderLibrary.CompileLibrary("SpectralPerf", MetalKernels.SpectralPerfKernels);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal SpectralPerf pre-compilation warning: {ex.Message}");
+        }
+
+        try
+        {
+            _fusedLinearLibrary = _shaderLibrary.CompileLibrary("FusedLinear", MetalKernels.FusedLinearKernels);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal FusedLinear pre-compilation warning: {ex.Message}");
+        }
+
+        try
+        {
+            _iouLibrary = _shaderLibrary.CompileLibrary("IoULoss", MetalKernels.IoULossKernels);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal IoULoss pre-compilation warning: {ex.Message}");
         }
     }
 

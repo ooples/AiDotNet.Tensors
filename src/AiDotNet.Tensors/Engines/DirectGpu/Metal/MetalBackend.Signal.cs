@@ -2,6 +2,7 @@
 // Metal GPU backend - FFT, Signal Processing, and RNG operations.
 
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
@@ -695,5 +696,219 @@ public sealed partial class MetalBackend
             mulR?.Dispose(); mulI?.Dispose();
             ifftI?.Dispose(); zeroI?.Dispose();
         }
+    }
+
+    /// <inheritdoc/>
+    public void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        if (n <= 0) return;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "atan2_elementwise");
+        var (groups, threads) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        // Kernel signature is atan2_elementwise(imag, real, ...), keep binding order unchanged.
+        encoder.SetBuffer((MetalGpuBuffer)imag, 0);
+        encoder.SetBuffer((MetalGpuBuffer)real, 1);
+        encoder.SetBuffer((MetalGpuBuffer)output, 2);
+        encoder.SetBytes((uint)n, 3);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        ThrowIfDisposed();
+        if (rows <= 0 || cols <= 0) return;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "normalize_rows_fused");
+        // The normalize_rows_fused kernel uses a tree reduction that requires a power-of-two threadgroup size.
+        // Pick the largest power-of-two <= min(256, cols), then clamp to a minimum of 32.
+        uint block = 32;
+        uint cap = (uint)Math.Min(256, cols);
+        while (block * 2 <= cap) block *= 2;
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)input, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes((uint)rows, 2);
+        encoder.SetBytes((uint)cols, 3);
+        encoder.SetThreadgroupMemoryLength(block * sizeof(float), 0);
+        encoder.DispatchThreadgroups(new MTLSize((uint)rows, 1, 1), new MTLSize(block, 1, 1));
+    }
+
+    /// <inheritdoc/>
+    public void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        ThrowIfDisposed();
+        if (batch <= 0 || fftSize <= 0) return;
+        // Validate signed bin indices before casting to uint (negative values would wrap to
+        // very large unsigned values and corrupt kernel indexing).
+        if (binLow < 0 || binHigh < binLow || binHigh > fftSize)
+            throw new ArgumentOutOfRangeException(nameof(binHigh),
+                $"Require 0 <= binLow ({binLow}) <= binHigh ({binHigh}) <= fftSize ({fftSize}).");
+        // Guard batch*fftSize against int overflow.
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "analytic_signal_mask");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)specReal, 0);
+        encoder.SetBuffer((MetalGpuBuffer)specImag, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outReal, 2);
+        encoder.SetBuffer((MetalGpuBuffer)outImag, 3);
+        encoder.SetBytes((uint)batch, 4);
+        encoder.SetBytes((uint)fftSize, 5);
+        encoder.SetBytes((uint)binLow, 6);
+        encoder.SetBytes((uint)binHigh, 7);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        ThrowIfDisposed();
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "bispectrum_gather");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)specReal, 0);
+        encoder.SetBuffer((MetalGpuBuffer)specImag, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outReal, 2);
+        encoder.SetBuffer((MetalGpuBuffer)outImag, 3);
+        encoder.SetBytes((uint)maxF1, 4);
+        encoder.SetBytes((uint)maxF2, 5);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        ThrowIfDisposed();
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "trispectrum_gather");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)specReal, 0);
+        encoder.SetBuffer((MetalGpuBuffer)specImag, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outReal, 2);
+        encoder.SetBuffer((MetalGpuBuffer)outImag, 3);
+        encoder.SetBytes((uint)maxF1, 4);
+        encoder.SetBytes((uint)maxF2, 5);
+        encoder.SetBytes((uint)maxF3, 6);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        ThrowIfDisposed();
+        if (total <= 0) return;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "cavity_bounce_inplace");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)workReal, 0);
+        encoder.SetBuffer((MetalGpuBuffer)workImag, 1);
+        encoder.SetBytes((uint)total, 2);
+        encoder.SetBytes(invN, 3);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        ThrowIfDisposed();
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "wideband_log_bin_pool");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)magBuf, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes((uint)totalSegBatch, 2);
+        encoder.SetBytes((uint)fftSize, 3);
+        encoder.SetBytes((uint)numBins, 4);
+        encoder.SetBytes((uint)usable, 5);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        ThrowIfDisposed();
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "mel_filterbank_apply");
+        var (groups, threads) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)powerSpec, 0);
+        encoder.SetBuffer((MetalGpuBuffer)melFilters, 1);
+        encoder.SetBuffer((MetalGpuBuffer)melEnergy, 2);
+        encoder.SetBytes((uint)totalSegBatch, 3);
+        encoder.SetBytes((uint)specBins, 4);
+        encoder.SetBytes((uint)melBins, 5);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        if (n <= 0) return;
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "mfcc_log1p");
+        var (groups, threads) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)input, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes((uint)n, 2);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <inheritdoc/>
+    public void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        ThrowIfDisposed();
+        if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
+        var pipeline = GetPipeline("SpectralPerf", _spectralPerfLibrary, "pac_phase_bin_mi");
+        var (groups, threads) = pipeline.Calculate1DDispatch(batch);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)thetaPhase, 0);
+        encoder.SetBuffer((MetalGpuBuffer)gammaAmp, 1);
+        encoder.SetBuffer((MetalGpuBuffer)output, 2);
+        encoder.SetBytes((uint)batch, 3);
+        encoder.SetBytes((uint)numSamples, 4);
+        encoder.SetBytes((uint)numGammaBands, 5);
+        encoder.SetBytes((uint)gammaIdx, 6);
+        encoder.DispatchThreadgroups(groups, threads);
     }
 }

@@ -33,6 +33,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _fusedModule;
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
+    private IntPtr _spectralPerfModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
@@ -578,6 +579,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _fusedModule = CompileKernelModule(device, CudaFusedKernels.GetSource(), "fused_kernels", CudaFusedKernels.GetKernelNames());
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
+        _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
 
@@ -10127,6 +10129,188 @@ public sealed class CudaBackend : IAsyncGpuBackend
         }
     }
 
+    /// <inheritdoc/>
+    public unsafe void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: atan2_elementwise");
+        using var _ = PushContext();
+        IntPtr ip = imag.Handle, rp = real.Handle, op = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &ip; args[1] = &rp; args[2] = &op; args[3] = &n;
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: normalize_rows_fused");
+        using var _ = PushContext();
+        IntPtr ip = input.Handle, op = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &ip; args[1] = &op; args[2] = &rows; args[3] = &cols;
+        uint grid = (uint)rows;
+        // Tree reduction requires a power-of-two block size.
+        uint block = 32;
+        uint cap = (uint)Math.Min(256, cols);
+        while (block * 2 <= cap) block *= 2;
+        uint sharedMem = block * sizeof(float);
+        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
+            sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        if (batch <= 0 || fftSize <= 0) return;
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: analytic_signal_mask");
+        using var _ = PushContext();
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &batch; args[5] = &fftSize; args[6] = &binLow; args[7] = &binHigh;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: bispectrum_gather");
+        using var _ = PushContext();
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &maxF1; args[5] = &maxF2;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: trispectrum_gather");
+        using var _ = PushContext();
+        IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
+        args[4] = &maxF1; args[5] = &maxF2; args[6] = &maxF3;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: cavity_bounce_inplace");
+        using var _ = PushContext();
+        IntPtr wr = workReal.Handle, wi = workImag.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &wr; args[1] = &wi; args[2] = &total; args[3] = &invN;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: wideband_log_bin_pool");
+        using var _ = PushContext();
+        IntPtr mp = magBuf.Handle, op = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &mp; args[1] = &op;
+        args[2] = &totalSegBatch; args[3] = &fftSize; args[4] = &numBins; args[5] = &usable;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mel_filterbank_apply");
+        using var _ = PushContext();
+        IntPtr ps = powerSpec.Handle, mf = melFilters.Handle, me = melEnergy.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &ps; args[1] = &mf; args[2] = &me;
+        args[3] = &totalSegBatch; args[4] = &specBins; args[5] = &melBins;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mfcc_log1p");
+        using var _ = PushContext();
+        IntPtr ip = input.Handle, op = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &ip; args[1] = &op; args[2] = &n;
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
+        using var _ = PushContext();
+        IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &tp; args[1] = &ga; args[2] = &op;
+        args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
+        uint grid = (uint)batch;
+        uint block = 256;
+        uint sharedMem = (uint)(2 * 18 * sizeof(float));
+        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
+            sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+    }
+
     #endregion
 
     #region Quantum Computing Operations
@@ -10657,6 +10841,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_fftModule);
             _fftModule = IntPtr.Zero;
+        }
+
+        if (_spectralPerfModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_spectralPerfModule);
+            _spectralPerfModule = IntPtr.Zero;
         }
 
         if (_spatialTransformerModule != IntPtr.Zero)
