@@ -223,7 +223,7 @@ public class DeterministicByDefaultTests
     public void SetCurrent_WithDeterministicFalse_OverridesProcessWideOnThisThread()
     {
         bool originalProcess = AiDotNetEngine.DeterministicMode;
-        var originalOptions = TensorCodecOptions.Current;
+        var originalOptions  = TensorCodecOptions.Current;
         try
         {
             // Process-wide true (the default after #164).
@@ -238,7 +238,18 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(null);
+            // Restore (not clear) so we don't clobber any ambient options bag a
+            // fixture or earlier collection-mate may have installed.
+            // Restore the captured ambient options for hygiene, then explicitly
+            // clear the BLAS override. Subtle but important: `Current` returns
+            // `_current ?? Default`, so when `_current` was null at capture time
+            // we end up holding a fresh `Default()` with `Deterministic=true`.
+            // Calling `SetCurrent(originalOptions)` would install that forced
+            // `true` override for this thread, leaking determinism state into
+            // whatever test the collection runs next. Clearing the override
+            // afterwards normalises that to "inherit process-wide."
+            TensorCodecOptions.SetCurrent(originalOptions);
+            BlasProvider.SetThreadLocalDeterministicMode(null);
             AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
@@ -248,6 +259,7 @@ public class DeterministicByDefaultTests
     {
         // The inverse direction: process is OFF but the caller wants ON for this thread.
         bool originalProcess = AiDotNetEngine.DeterministicMode;
+        var originalOptions  = TensorCodecOptions.Current;
         try
         {
             AiDotNetEngine.SetDeterministicMode(false);
@@ -258,7 +270,16 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(null);
+            // Restore the captured ambient options for hygiene, then explicitly
+            // clear the BLAS override. Subtle but important: `Current` returns
+            // `_current ?? Default`, so when `_current` was null at capture time
+            // we end up holding a fresh `Default()` with `Deterministic=true`.
+            // Calling `SetCurrent(originalOptions)` would install that forced
+            // `true` override for this thread, leaking determinism state into
+            // whatever test the collection runs next. Clearing the override
+            // afterwards normalises that to "inherit process-wide."
+            TensorCodecOptions.SetCurrent(originalOptions);
+            BlasProvider.SetThreadLocalDeterministicMode(null);
             AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
@@ -267,6 +288,7 @@ public class DeterministicByDefaultTests
     public void SetCurrent_Null_ClearsThreadLocalOverrideAndInheritsProcessWide()
     {
         bool originalProcess = AiDotNetEngine.DeterministicMode;
+        var originalOptions  = TensorCodecOptions.Current;
         try
         {
             AiDotNetEngine.SetDeterministicMode(true);
@@ -285,7 +307,16 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(null);
+            // Restore the captured ambient options for hygiene, then explicitly
+            // clear the BLAS override. Subtle but important: `Current` returns
+            // `_current ?? Default`, so when `_current` was null at capture time
+            // we end up holding a fresh `Default()` with `Deterministic=true`.
+            // Calling `SetCurrent(originalOptions)` would install that forced
+            // `true` override for this thread, leaking determinism state into
+            // whatever test the collection runs next. Clearing the override
+            // afterwards normalises that to "inherit process-wide."
+            TensorCodecOptions.SetCurrent(originalOptions);
+            BlasProvider.SetThreadLocalDeterministicMode(null);
             AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
@@ -296,6 +327,7 @@ public class DeterministicByDefaultTests
         // The core thread-local invariant: thread A's override must not change
         // what thread B sees. Without this, "thread-local" would be a lie.
         bool originalProcess = AiDotNetEngine.DeterministicMode;
+        var originalOptions  = TensorCodecOptions.Current;
         try
         {
             AiDotNetEngine.SetDeterministicMode(true);
@@ -331,7 +363,16 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(null);
+            // Restore the captured ambient options for hygiene, then explicitly
+            // clear the BLAS override. Subtle but important: `Current` returns
+            // `_current ?? Default`, so when `_current` was null at capture time
+            // we end up holding a fresh `Default()` with `Deterministic=true`.
+            // Calling `SetCurrent(originalOptions)` would install that forced
+            // `true` override for this thread, leaking determinism state into
+            // whatever test the collection runs next. Clearing the override
+            // afterwards normalises that to "inherit process-wide."
+            TensorCodecOptions.SetCurrent(originalOptions);
+            BlasProvider.SetThreadLocalDeterministicMode(null);
             AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
@@ -343,6 +384,7 @@ public class DeterministicByDefaultTests
         // thread-local override should automatically produce distinct plans when a
         // single thread toggles its own override between two compile calls.
         bool originalProcess = AiDotNetEngine.DeterministicMode;
+        var originalOptions  = TensorCodecOptions.Current;
         try
         {
             AiDotNetEngine.SetDeterministicMode(true);
@@ -377,7 +419,16 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(null);
+            // Restore the captured ambient options for hygiene, then explicitly
+            // clear the BLAS override. Subtle but important: `Current` returns
+            // `_current ?? Default`, so when `_current` was null at capture time
+            // we end up holding a fresh `Default()` with `Deterministic=true`.
+            // Calling `SetCurrent(originalOptions)` would install that forced
+            // `true` override for this thread, leaking determinism state into
+            // whatever test the collection runs next. Clearing the override
+            // afterwards normalises that to "inherit process-wide."
+            TensorCodecOptions.SetCurrent(originalOptions);
+            BlasProvider.SetThreadLocalDeterministicMode(null);
             AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
