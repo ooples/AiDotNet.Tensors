@@ -380,8 +380,8 @@ class Program
         Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
         Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
         Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
-        Console.WriteLine("  --vs-deterministic-matmul: Deterministic (blocked C#) vs native-BLAS matmul (HRE + square shapes)");
-        Console.WriteLine("  --dit-xl-matmul     : Blocked C# vs native-BLAS at DiT-XL shapes (feat/finish-mkl-replacement baseline)");
+        Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
+        Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
 #endif
     }

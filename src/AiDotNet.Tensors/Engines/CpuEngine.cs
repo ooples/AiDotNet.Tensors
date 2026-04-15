@@ -8588,9 +8588,13 @@ public class CpuEngine : ITensorLevelEngine
         // than MKL's equivalent 2D matmul — this consolidation should close most of
         // that gap.
         //
-        // Requires A to be contiguous (batch dims stacked as rows). The caller in
-        // TensorMatMul ensures this via `a.Contiguous()` before reaching here.
-        if (a.IsContiguous && MatrixMultiplyHelper.TryGemm(
+        // Requires BOTH A and B to be contiguous (tightly packed row-major).
+        // MatrixMultiplyHelper.TryGemm assumes row-major with leading dims k
+        // and n respectively; a transposed or sliced B would be read with the
+        // wrong stride and produce silently incorrect results. The caller in
+        // TensorMatMul ensures A is contiguous via a.Contiguous(); we guard
+        // B here since it may be a shared weight matrix passed directly.
+        if (a.IsContiguous && b.IsContiguous && MatrixMultiplyHelper.TryGemm(
             a.Data, 0, b.Data, 0, result.Data, 0,
             batchSize * m, n, p))
         {
@@ -14773,13 +14777,15 @@ public class CpuEngine : ITensorLevelEngine
         // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
-            return ScaledDotProductAttentionFloat(
+            var resultF = ScaledDotProductAttentionFloat(
                 (Tensor<float>)(object)query,
                 (Tensor<float>)(object)key,
                 (Tensor<float>)(object)value,
                 mask, scaleVal,
                 batch, heads, seqQ, d_k, seqK, d_v,
-                out attentionWeights);
+                out var weightsF);
+            attentionWeights = (Tensor<T>)(object)weightsF;
+            return (Tensor<T>)(object)resultF;
         }
 
         T scaleFactor = numOps.FromDouble(scaleVal);
@@ -14893,14 +14899,14 @@ public class CpuEngine : ITensorLevelEngine
     /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
     /// pass (Issue #162).
     /// </summary>
-    private Tensor<T> ScaledDotProductAttentionFloat<T>(
+    private Tensor<float> ScaledDotProductAttentionFloat(
         Tensor<float> query,
         Tensor<float> key,
         Tensor<float> value,
         Tensor<bool>? mask,
         double scaleValue,
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
-        out Tensor<T> attentionWeights)
+        out Tensor<float> attentionWeights)
     {
         int bhCount = batch * heads;
         var qf = query.GetFlattenedData();
@@ -15027,16 +15033,16 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        // Wrap the float[] buffers back into the generic Tensor<T> shape.
-        // T is guaranteed to be float at this point by the typeof check in the caller.
-        var weightsT = (float[])(object)weightsData;
-        var outputT  = (float[])(object)outputData;
-        attentionWeights = TensorAllocator.Rent<T>(
+        // Return strongly typed Tensor<float> (no generic cast). Caller bridges
+        // to the outer Tensor<T> via a single (Tensor<T>)(object) cast at the
+        // call site, keeping this method's contract explicit about the fact
+        // that it's float-only.
+        attentionWeights = TensorAllocator.Rent<float>(
             new[] { batch, heads, seqQ, seqK },
-            new Vector<T>((T[])(object)weightsT));
-        return TensorAllocator.Rent<T>(
+            new Vector<float>(weightsData));
+        return TensorAllocator.Rent<float>(
             new[] { batch, heads, seqQ, d_v },
-            new Vector<T>((T[])(object)outputT));
+            new Vector<float>(outputData));
         }
         finally
         {
@@ -15268,14 +15274,16 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             double scaleValF = scale ?? 1.0 / Math.Sqrt(headDim);
-            return FlashAttentionFloat(
+            var resultF = FlashAttentionFloat(
                 (Tensor<float>)(object)query,
                 (Tensor<float>)(object)key,
                 (Tensor<float>)(object)value,
                 attentionBias is null ? null : (Tensor<float>)(object)attentionBias,
                 scaleValF, isCausal,
                 batch, heads, seqQ, headDim, seqK,
-                out softmaxStats);
+                out var statsF);
+            softmaxStats = (Tensor<T>)(object)statsF;
+            return (Tensor<T>)(object)resultF;
         }
 
         // Extract bias data for the scalar path (shape already validated above).
@@ -15452,7 +15460,7 @@ public class CpuEngine : ITensorLevelEngine
     /// non-float tensor type, or we can add a tile-threshold check later if the need
     /// arises.
     /// </summary>
-    private Tensor<T> FlashAttentionFloat<T>(
+    private Tensor<float> FlashAttentionFloat(
         Tensor<float> query,
         Tensor<float> key,
         Tensor<float> value,
@@ -15460,7 +15468,7 @@ public class CpuEngine : ITensorLevelEngine
         double scaleValue,
         bool isCausal,
         int batch, int heads, int seqQ, int headDim, int seqK,
-        out Tensor<T> softmaxStats)
+        out Tensor<float> softmaxStats)
     {
         int bhCount = batch * heads;
         int d_v = headDim; // FlashAttention takes headDim for both Q/K and V
@@ -15579,12 +15587,12 @@ public class CpuEngine : ITensorLevelEngine
                     seqQ, seqK, d_v);
             });
 
-            softmaxStats = TensorAllocator.Rent<T>(
+            softmaxStats = TensorAllocator.Rent<float>(
                 new[] { batch, heads, seqQ },
-                new Vector<T>((T[])(object)statsData));
-            return TensorAllocator.Rent<T>(
+                new Vector<float>(statsData));
+            return TensorAllocator.Rent<float>(
                 new[] { batch, heads, seqQ, headDim },
-                new Vector<T>((T[])(object)outputData));
+                new Vector<float>(outputData));
         }
         finally
         {

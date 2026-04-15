@@ -8,18 +8,18 @@ using BenchmarkDotNet.Jobs;
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// A/B benchmark: native-BLAS (default, non-deterministic) matmul vs our blocked
-/// C# GEMM for the exact shapes a DiT-XL forward pass exercises. This is the
-/// workload that led the downstream HRE/DiT consumer to report CPU shards being
-/// cancelled at the 45-minute CI budget.
+/// A/B benchmark: the exact matmul shapes a DiT-XL forward pass exercises.
+/// This is the workload that led the downstream HRE/DiT consumer to report
+/// CPU shards being cancelled at the 45-minute CI budget.
 ///
-/// Note on "default path": pre-branch this PR, the default path went through
-/// MKL.NET's managed SGEMM bindings. After `feat/finish-mkl-replacement` /
-/// the MKL.NET package removal, the default path routes through whatever native
-/// BLAS the user has installed (OpenBLAS, user-supplied cblas, or an externally
-/// installed MKL native DLL) via BlasProvider's P/Invoke loader — no managed
-/// MKL.NET binding. Benchmark semantics are unchanged: Det=false exercises the
-/// native-BLAS path when available, Det=true forces our blocked SimdGemm path.
+/// Note on "Det=false vs Det=true" (post-MKL-removal semantics): BlasProvider
+/// is hard-disabled in this PR (TryGemm and TryGemmEx always return false), so
+/// BOTH Det=false and Det=true route through <see cref="Engines.Simd.SimdGemm"/>.
+/// The flag is preserved because <c>AiDotNetEngine.SetDeterministicMode</c> is
+/// public API — and for historical A/B comparison against iter-17 numbers
+/// where Det=false was real MKL, Det=true was our path. Pair runs with the
+/// baseline log at docs/mkl-replacement/baseline/baseline-iter17.md to see
+/// the structural gap closure.
 ///
 /// DiT-XL config (from the DiT paper + HuggingFace diffusers default):
 ///   hidden_size = 1152, num_heads = 16 (head_dim = 72)
@@ -28,12 +28,8 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///
 /// For batch B=4, seq S=256, we flatten [B*S, H] = [1024, 1152] for the
 /// per-block projections. This is the "square-ish" regime where our blocked
-/// path has been trailing MKL by 1.35–1.64× (per Issue #131 iter 9, 2026-04-11).
-///
-/// The goal of this benchmark is to quantify the current gap at *DiT-XL*
-/// shapes specifically, not the HRE-tiny shapes the existing
-/// <see cref="DeterministicMatMulBenchmarks"/> tracks. Beat MKL here and we
-/// beat MKL where it actually matters for downstream vision/diffusion work.
+/// path was trailing MKL by 1.35–1.64× (per Issue #131 iter 9) and closed
+/// to 0.85-0.99× MKL via iter 31+36 Mc tuning and iter 34 direct small-matmul.
 ///
 /// Run:
 ///   dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks \
@@ -44,10 +40,12 @@ namespace AiDotNet.Tensors.Benchmarks;
 [MarkdownExporterAttribute.GitHub]
 public class DitXLMatMulBenchmarks
 {
-    /// <summary>off = native-BLAS GEMM (if a cblas-compatible library is on the path),
-    /// on = blocked C# (our SimdGemm path). Post-MKL.NET-removal: off no longer implies
-    /// MKL.NET — the native BLAS could be OpenBLAS, user-supplied cblas, or an externally
-    /// installed MKL DLL; whichever the BlasProvider loader finds. BDN expands both values.</summary>
+    /// <summary>Det=false historically routed to native BLAS (if present);
+    /// Det=true forced our SimdGemm path. Post this PR both go through
+    /// SimdGemm (BlasProvider is hard-disabled). Flag is kept for API
+    /// compatibility and because BDN still exercises both columns — useful
+    /// for measuring run-to-run noise envelope since same-run Det=F/Det=T
+    /// should be bit-identical and any delta is noise.</summary>
     [ParamsAllValues]
     public bool DeterministicMode { get; set; }
 

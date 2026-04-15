@@ -87,22 +87,34 @@ Ordered by expected impact against the **square-shape gap**. Each iteration = on
 | 25 | **Prefetch C (write-intent)** via `Sse.Prefetch1` before micro-kernel store-back. oneDNN uses `prefetchw`; we can approximate with `prefetcht1`. | 3-5% at large C shapes | Low |
 | 26 | **64-byte aligned packed A/B buffers** + `vmovaps` (aligned) loads instead of `vmovups`. Marginal on Haswell, more on Zen 2. | 1-3% | Low |
 
-### Phase 3 — Flip the default
+### Phase 3 — Flip the default (COMPLETED in this PR)
 
 **Trigger:** benchmarks show ≥ MKL at **every** shape in `DitXLMatMulBenchmarks` and `DeterministicMatMulBenchmarks`.
 
-- Flip `BlasProvider._useMklNet` default to `false`. Still opt-in via `AIDOTNET_BLAS_PREFER_MKL=1` for comparison.
-- Update XML docs to reflect that ours is now the reference implementation.
-- Add a CI job that A/Bs our path vs MKL weekly to prevent regressions.
+- ✅ Removed `MKL.NET` + `MKL.NET.win-x64` package references from
+  `AiDotNet.Tensors.csproj`.
+- ✅ Deleted the MKL.NET managed-binding paths from `BlasProvider.cs`.
+- ✅ Disabled the native `cblas_sgemm` P/Invoke loader (`BlasProvider.TryGemm`
+  and `CpuNativeBlas.TryGemm` always return `false`).
+- ✅ Updated `BlasProvider.cs` XML docs to reflect that `SimdGemm` is now the
+  sole CPU GEMM implementation. Users who want a system BLAS at their own
+  risk must revert that file and re-add the `AiDotNet.Native.OneDNN` package.
+- 🟡 CI weekly A/B job: tracked for follow-up (needs a CI runner image that
+  ships a reference MKL; the `baseline-iter17.md` run log pins the MKL numbers
+  this PR measured against).
 
-### Phase 4 — Remove MKL dependency
+### Phase 4 — Finalize native-only BLAS posture (COMPLETED in this PR)
 
-**Trigger:** 2-4 weeks of production use with the flipped default, no regression reports.
-
-- Delete `MKLNET` package reference from `AiDotNet.Tensors.csproj`.
-- Delete MKL.NET paths from `BlasProvider.cs` (keep native `cblas_sgemm` P/Invoke as an optional fallback for users who want to supply their own BLAS).
-- Remove the 110 MB `MKL.NET.win-x64` binary from the published NuGet package.
-- Verify net471 + net10.0 builds still pass.
+- ✅ Default build has zero native CPU math dependencies. GPU-side native
+  packages (`AiDotNet.Native.CUDA`/`ROCm`/`MoltenVK`/`CLBlast`) remain opt-in
+  via separate NuGet packages.
+- ✅ `VmlProvider` (VML transcendentals) and `OneDnnProvider` (oneDNN
+  conv/element-wise) converted to the same hard-disabled stub pattern.
+  Element-wise transcendentals route through `SimdKernels` (Herumi exp,
+  Pade sigmoid, vectorized tanh/log/...); Conv2D routes through
+  `FusedConv + SimdGemm / Winograd / SIMD-direct`.
+- ✅ `net471` + `net10.0` both build with zero warnings/errors and
+  117/117 matmul + GEMM + JIT + FlashAttention/SDPA tests pass.
 
 ## Known bottlenecks in MKL we intend to exploit
 

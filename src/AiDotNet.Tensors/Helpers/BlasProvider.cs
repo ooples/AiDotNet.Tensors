@@ -26,12 +26,17 @@ namespace AiDotNet.Tensors.Helpers;
 /// <c>IsMklVerified</c> which always report <c>false</c>.
 /// </para>
 /// <para>
-/// Per Issue #131's iteration 18c benchmarks, SimdGemm is at or faster than MKL
-/// on every tracked DiT-XL shape (Square 1152² 0.99×, Attn A·V 0.995×, etc.),
-/// so the performance implications of disabling the native BLAS path are small.
-/// Users who want a system BLAS at their own risk can re-enable this by reverting
-/// this file to a prior revision and adding back a cblas-compatible library on
-/// the load path — but the default build has zero native BLAS dependencies.
+/// <b>This stub is a hard disable, not a runtime-opt-in mechanism</b>. All
+/// <c>Try*</c> methods unconditionally return <c>false</c>; <c>HasX</c> flags
+/// unconditionally return <c>false</c>; the <c>SgemmRaw</c>/<c>MklSgemmZeroOffset</c>
+/// hot paths throw <see cref="NotSupportedException"/>. There is no env var or
+/// build symbol that re-enables it. Per Issue #131 iter 18c benchmarks, SimdGemm
+/// is at or faster than MKL on every tracked DiT-XL shape (Square 1152² 0.99×,
+/// Attn A·V 0.995×, etc.), so the performance implications are negligible.
+/// Users who want a system BLAS at their own risk must revert this file to a
+/// prior revision (and re-add the <c>AiDotNet.Native.OneDNN</c> package if they
+/// want oneDNN back as well); the default build has zero CPU native-math
+/// dependencies.
 /// </para>
 /// </summary>
 internal static class BlasProvider
