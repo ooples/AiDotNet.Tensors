@@ -8578,6 +8578,32 @@ public class CpuEngine : ITensorLevelEngine
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
 
+        // Iter 24 (batched-GEMM consolidation): for the ND×2D broadcast pattern, B is
+        // SHARED across all batch slices and A is stored row-major contiguous, so the
+        // whole batched matmul collapses to a single 2D GEMM of shape
+        // [batchSize*m, n] × [n, p] = [batchSize*m, p]. This eliminates the per-slice
+        // BLAS dispatch overhead (2-3 µs per call × batchSize) and lets MKL pack B
+        // once instead of N times. The Phase 0 baseline measured the per-slice
+        // dispatch cost via Batched 3D [4,256,1152]×[1152,4608] which was 1.75× slower
+        // than MKL's equivalent 2D matmul — this consolidation should close most of
+        // that gap.
+        //
+        // Requires BOTH A and B to be contiguous (tightly packed row-major).
+        // MatrixMultiplyHelper.TryGemm assumes row-major with leading dims k
+        // and n respectively; a transposed or sliced B would be read with the
+        // wrong stride and produce silently incorrect results. The caller in
+        // TensorMatMul ensures A is contiguous via a.Contiguous(); we guard
+        // B here since it may be a shared weight matrix passed directly.
+        if (a.IsContiguous && b.IsContiguous && MatrixMultiplyHelper.TryGemm(
+            a.Data, 0, b.Data, 0, result.Data, 0,
+            batchSize * m, n, p))
+        {
+            return result;
+        }
+
+        // Fallback: per-slice dispatch (preserves behavior for non-contiguous A or
+        // when the big GEMM declines — e.g. non-float/double T, or work below the
+        // BLAS threshold where per-slice dispatch can actually win).
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
@@ -14710,6 +14736,8 @@ public class CpuEngine : ITensorLevelEngine
 
         // Stride-aware: attention QKV often come from reshape+transpose views
         if (!value.IsContiguous) value = value.Contiguous();
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
 
         // Expected shapes: [batch, heads, seq, d_k] for Q, K and [batch, heads, seq, d_v] for V
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
@@ -14732,6 +14760,34 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute scale factor
         double scaleVal = scale ?? (1.0 / Math.Sqrt(d_k));
+
+        // ────────────────────────────────────────────────────────────────────
+        // Fast path for float: BLAS-backed batched GEMM per head.
+        //
+        // Replaces the scalar virtual-dispatch triple-loop that was dominating
+        // DiT-XL forward wall clock (Issue #162). For DiT-XL at B=4, H=16,
+        // seq=256, d_k=72, the old path ran ~75M virtual-dispatch FMAs per
+        // SDPA call × 28 blocks = tens of seconds per forward; the BLAS path
+        // executes the same FMAs as two batched SGEMMs (Q@K^T then P@V) per
+        // head, parallel over batch*heads.
+        //
+        // The float path handles the 99% case. Double and other numeric types
+        // fall through to the original scalar code below (preserves exact
+        // existing behavior for generic T).
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            var resultF = ScaledDotProductAttentionFloat(
+                (Tensor<float>)(object)query,
+                (Tensor<float>)(object)key,
+                (Tensor<float>)(object)value,
+                mask, scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out var weightsF);
+            attentionWeights = (Tensor<T>)(object)weightsF;
+            return (Tensor<T>)(object)resultF;
+        }
+
         T scaleFactor = numOps.FromDouble(scaleVal);
 
         // Compute attention scores: Q @ K^T -> [batch, heads, seqQ, seqK]
@@ -14834,6 +14890,168 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         return TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+    }
+
+    /// <summary>
+    /// BLAS-backed float-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
+    /// Replaces the scalar virtual-dispatch triple-loop with two batched SGEMMs per head
+    /// (Q·K^T then P·V), parallelized across batch*heads. Expected to collapse the
+    /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
+    /// pass (Issue #162).
+    /// </summary>
+    private Tensor<float> ScaledDotProductAttentionFloat(
+        Tensor<float> query,
+        Tensor<float> key,
+        Tensor<float> value,
+        Tensor<bool>? mask,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<float> attentionWeights)
+    {
+        int bhCount = batch * heads;
+        var qf = query.GetFlattenedData();
+        var kf = key.GetFlattenedData();
+        var vf = value.GetDataArray();
+
+        // scoresData is internal scratch — reused between the QK^T and softmax
+        // steps within each call and never escapes this method. Rent from
+        // ArrayPool to amortize the ~16 MB allocation over many calls on the
+        // DiT-XL hot path (28 SDPA calls per forward × ~16 MB = 448 MB of raw
+        // allocation saved per forward).
+        //
+        // weightsData and outputData are returned to the caller via
+        // attentionWeights + the return tensor, so they must stay independently
+        // allocated. Caller owns the array lifetime after this returns.
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
+        try
+        {
+        var weightsData = new float[scoresLen];
+        var outputData = new float[bhCount * seqQ * d_v];
+
+        float scaleF  = (float)scaleValue;
+        float negInfF = float.NegativeInfinity;
+
+        // Process each batch-head slice in parallel. Each slice is two independent
+        // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
+        // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
+        // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
+        // kernel — not the scalar fallback.
+        Parallel.For(0, bhCount, bh =>
+        {
+            int b = bh / heads;
+            int h = bh % heads;
+
+            int qOff = bh * seqQ * d_k;
+            int kOff = bh * seqK * d_k;
+            int sOff = bh * seqQ * seqK;
+
+            // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
+            // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
+            // to pre-transposing K and calling SimdGemm.Sgemm.
+            bool gemmed = BlasProvider.TryGemmEx(
+                m: seqQ, n: seqK, k: d_k,
+                a: qf, aOffset: qOff, lda: d_k, transA: false,
+                b: kf, bOffset: kOff, ldb: d_k, transB: true,
+                c: scoresData, cOffset: sOff, ldc: seqK);
+            if (!gemmed)
+            {
+                // Manual K^T for this head, then SimdGemm (AVX2 blocked).
+                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kf[kOff + i * d_k + j];
+                    // SgemmSequential: we're already inside Parallel.For(bhCount), so
+                    // forcing the inner SIMD kernel to run sequential avoids
+                    // bhCount × maxThreads workers on (maxThreads) cores.
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        qf.AsSpan(qOff, seqQ * d_k),
+                        kt.AsSpan(0, d_k * seqK),
+                        scoresData.AsSpan(sOff, seqQ * seqK),
+                        seqQ, d_k, seqK);
+                }
+                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
+            }
+
+            // ──── Step 2: fused scale + mask + numerically-stable softmax,
+            // row-wise over the [seqQ, seqK] scores matrix for this head.
+            for (int i = 0; i < seqQ; i++)
+            {
+                int rowOff = sOff + i * seqK;
+                // First pass: scale in-place, mask, and find row max.
+                float maxVal = negInfF;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float v = scoresData[rowOff + j] * scaleF;
+                    if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                    if (v > maxVal) maxVal = v;
+                    scoresData[rowOff + j] = v;
+                }
+                // Second pass: exp(v - max), sum.
+                // Edge case: if the entire row was masked out, maxVal is still -Infinity.
+                // (scores - (-Inf)) == +Inf; MathF.Exp(+Inf) == +Inf; normalizing produces
+                // NaN. Detect that case up front and emit an all-zero softmax row, which
+                // is the sensible behavior (no attention anywhere → no value flows).
+                if (float.IsNegativeInfinity(maxVal))
+                {
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] = 0f;
+                    continue;
+                }
+
+                float sumExp = 0f;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                    weightsData[rowOff + j] = e;
+                    sumExp += e;
+                }
+                // Third pass: normalize. Use 1/sumExp to turn N divides into N muls.
+                float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                for (int j = 0; j < seqK; j++)
+                    weightsData[rowOff + j] *= inv;
+            }
+
+            // ──── Step 3: output = weights @ V, via BLAS (no transpose).
+            int wOff = bh * seqQ * seqK;
+            int vOff = bh * seqK * d_v;
+            int oOff = bh * seqQ * d_v;
+            bool gemmed2 = BlasProvider.TryGemmEx(
+                m: seqQ, n: d_v, k: seqK,
+                a: weightsData, aOffset: wOff, lda: seqK, transA: false,
+                b: vf, bOffset: vOff, ldb: d_v, transB: false,
+                c: outputData, cOffset: oOff, ldc: d_v);
+            if (!gemmed2)
+            {
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    weightsData.AsSpan(wOff, seqQ * seqK),
+                    vf.AsSpan(vOff, seqK * d_v),
+                    outputData.AsSpan(oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
+            }
+        });
+
+        // Return strongly typed Tensor<float> (no generic cast). Caller bridges
+        // to the outer Tensor<T> via a single (Tensor<T>)(object) cast at the
+        // call site, keeping this method's contract explicit about the fact
+        // that it's float-only.
+        attentionWeights = TensorAllocator.Rent<float>(
+            new[] { batch, heads, seqQ, seqK },
+            new Vector<float>(weightsData));
+        return TensorAllocator.Rent<float>(
+            new[] { batch, heads, seqQ, d_v },
+            new Vector<float>(outputData));
+        }
+        finally
+        {
+            // scoresData was rented from ArrayPool — return it regardless of success.
+            // clearArray:false because the scratch doesn't leak data (we overwrite
+            // every slot in the next rental) and clearing a 16 MB buffer would
+            // undo the allocation savings.
+            System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
     }
 
     /// <summary>
@@ -15003,9 +15221,13 @@ public class CpuEngine : ITensorLevelEngine
         int headDim = query._shape[3];
         int seqK = key._shape[2];
 
-        // Extract and validate bias data if provided
-        T[]? biasData = null;
-        bool hasBias = false;
+        // Validate bias shape *before* the float fast-path branch below. The
+        // fast path (FlashAttentionFloat) trusts its caller to hand it a
+        // correctly-shaped bias, so the rank/dimension check has to run here
+        // or we silently accept malformed bias tensors on the float path.
+        // (Regression exposed by FlashAttention_InvalidBiasRank_Throws +
+        // FlashAttention_Mismatched{3D,}BiasDimensions_Throws after the fast
+        // path was added.)
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
         {
@@ -15033,6 +15255,42 @@ public class CpuEngine : ITensorLevelEngine
                     $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
                     nameof(attentionBias));
             }
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // Fast path for float: materialized-softmax with SimdGemm, same pattern
+        // as the SDPA fix (Issue #162). Replaces the scalar virtual-dispatch
+        // triple-loop below which was dominated by INumericOperations<T>.Multiply
+        // / .Add calls per FMA.
+        //
+        // The tiled online-softmax approach of the scalar path is memory-efficient
+        // for very long sequences (O(N) memory), but at DiT-XL's N=256 the
+        // materialized [N,N] scores matrix is only 256 KB per head — fits in L2
+        // comfortably. For that regime, materializing + batched SGEMMs is
+        // substantially faster than the tiled scalar loop.
+        //
+        // Non-float T continues through the existing scalar path below.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            double scaleValF = scale ?? 1.0 / Math.Sqrt(headDim);
+            var resultF = FlashAttentionFloat(
+                (Tensor<float>)(object)query,
+                (Tensor<float>)(object)key,
+                (Tensor<float>)(object)value,
+                attentionBias is null ? null : (Tensor<float>)(object)attentionBias,
+                scaleValF, isCausal,
+                batch, heads, seqQ, headDim, seqK,
+                out var statsF);
+            softmaxStats = (Tensor<T>)(object)statsF;
+            return (Tensor<T>)(object)resultF;
+        }
+
+        // Extract bias data for the scalar path (shape already validated above).
+        T[]? biasData = null;
+        bool hasBias = false;
+        if (attentionBias is not null)
+        {
             biasData = attentionBias.GetDataArray();
             hasBias = true;
         }
@@ -15184,6 +15442,162 @@ public class CpuEngine : ITensorLevelEngine
 
         softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], new Vector<T>(statsData));
         return TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
+    }
+
+    /// <summary>
+    /// SimdGemm-backed float fast path for <see cref="FlashAttention{T}"/>.
+    /// Uses materialized softmax (not tiled online-softmax): computes
+    /// scores = Q·K^T via batched SimdGemm, applies scale + optional bias + optional
+    /// causal mask, numerically-stable softmax per row, then output = softmax · V
+    /// via batched SimdGemm. Also computes the log-sum-exp statistics the backward
+    /// pass needs.
+    ///
+    /// For DiT-XL-scale attention (N=256, headDim=72), this is substantially faster
+    /// than the scalar online-softmax path. For very long sequences (N ≥ ~2K), the
+    /// materialized [N,N] scores matrix starts to matter — the scalar path's tiled
+    /// approach has O(N) memory vs our O(N²). Callers that know they need very-long-
+    /// sequence semantics should still be able to hit the scalar path by using a
+    /// non-float tensor type, or we can add a tile-threshold check later if the need
+    /// arises.
+    /// </summary>
+    private Tensor<float> FlashAttentionFloat(
+        Tensor<float> query,
+        Tensor<float> key,
+        Tensor<float> value,
+        Tensor<float>? attentionBias,
+        double scaleValue,
+        bool isCausal,
+        int batch, int heads, int seqQ, int headDim, int seqK,
+        out Tensor<float> softmaxStats)
+    {
+        int bhCount = batch * heads;
+        int d_v = headDim; // FlashAttention takes headDim for both Q/K and V
+
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+
+        var qf = query.GetFlattenedData();
+        var kf = key.GetFlattenedData();
+        var vf = value.GetDataArray();
+        float[]? biasData = null;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            if (!attentionBias.IsContiguous) attentionBias = attentionBias.Contiguous();
+            biasData = attentionBias.GetDataArray();
+            biasBroadcastBatch = attentionBias.Rank == 3;
+        }
+
+        // scoresData is internal scratch pooled from ArrayPool. weightsData and
+        // outputData are returned to the caller (via the tensor pair + softmaxStats).
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
+        try
+        {
+            var weightsData = new float[scoresLen];
+            var outputData = new float[bhCount * seqQ * d_v];
+            var statsData = new float[bhCount * seqQ];
+
+            float scaleF  = (float)scaleValue;
+            float negInfF = float.NegativeInfinity;
+
+            Parallel.For(0, bhCount, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+
+                int qOff = bh * seqQ * headDim;
+                int kOff = bh * seqK * headDim;
+                int sOff = bh * seqQ * seqK;
+
+                // Step 1: scores = Q · K^T. Same pattern as SDPA fast path —
+                // pre-transpose this head's K slice into a pooled scratch buffer
+                // (SimdGemm has no transB support) then call SgemmSequential.
+                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(headDim * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < headDim; j++)
+                            kt[j * seqK + i] = kf[kOff + i * headDim + j];
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        qf.AsSpan(qOff, seqQ * headDim),
+                        kt.AsSpan(0, headDim * seqK),
+                        scoresData.AsSpan(sOff, seqQ * seqK),
+                        seqQ, headDim, seqK);
+                }
+                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
+
+                // Step 2: fused scale + causal-mask + bias + stable softmax per row.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    float maxVal = negInfF;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        float v = scoresData[rowOff + j] * scaleF;
+                        // Additive attention bias (3D [heads,seqQ,seqK] or 4D [B,H,seqQ,seqK])
+                        if (biasData is not null)
+                        {
+                            int biasIdx = biasBroadcastBatch
+                                ? (h * seqQ * seqK + i * seqK + j)
+                                : (b * heads * seqQ * seqK + h * seqQ * seqK + i * seqK + j);
+                            v += biasData[biasIdx];
+                        }
+                        // Causal mask: positions j > i don't attend
+                        if (isCausal && j > i) v = negInfF;
+                        if (v > maxVal) maxVal = v;
+                        scoresData[rowOff + j] = v;
+                    }
+
+                    // Fully-masked row guard (SDPA fix pattern): if every position
+                    // was masked out, the exp(x - (-Inf)) = +Inf trick produces NaN.
+                    // Emit all-zero softmax + log-sum-exp = -Inf for that row.
+                    if (float.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++)
+                            weightsData[rowOff + j] = 0f;
+                        statsData[bh * seqQ + i] = negInfF;
+                        continue;
+                    }
+
+                    float sumExp = 0f;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                        weightsData[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] *= inv;
+
+                    // logsumexp = max + log(sum) — the backward pass needs this.
+                    statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
+                }
+
+                // Step 3: output = softmax · V via SimdGemm (no transpose).
+                int wOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    weightsData.AsSpan(wOff, seqQ * seqK),
+                    vf.AsSpan(vOff, seqK * d_v),
+                    outputData.AsSpan(oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
+            });
+
+            softmaxStats = TensorAllocator.Rent<float>(
+                new[] { batch, heads, seqQ },
+                new Vector<float>(statsData));
+            return TensorAllocator.Rent<float>(
+                new[] { batch, heads, seqQ, headDim },
+                new Vector<float>(outputData));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
     }
 
     /// <summary>

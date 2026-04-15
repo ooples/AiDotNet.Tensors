@@ -253,6 +253,24 @@ class Program
             return;
         }
 
+        // DiT-XL A/B matmul benchmarks: our blocked C# GEMM vs MKL.NET at the exact
+        // shapes a DiT-XL forward pass exercises. Used as the acceptance gate for
+        // the "finish MKL replacement" feature branch (~10-20min).
+        if (args[0] == "--dit-xl-matmul")
+        {
+            BenchmarkRunner.Run<DitXLMatMulBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // DiT-XL SDPA benchmark: measures ScaledDotProductAttention at the exact
+        // 4D shape DiT-XL exercises, to verify the Issue #162 BLAS-backed fast
+        // path eliminates the scalar virtual-dispatch wall clock. (~1-2min).
+        if (args[0] == "--dit-xl-sdpa")
+        {
+            BenchmarkRunner.Run<DitXLSdpaBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
         if (args[0] == "--vs-tensorcodec-gaps")
         {
@@ -362,6 +380,9 @@ class Program
         Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
         Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
         Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
+        Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
+        Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
+        Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
 #endif
     }
 }

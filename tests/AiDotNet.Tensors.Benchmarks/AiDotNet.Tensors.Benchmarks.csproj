@@ -21,24 +21,18 @@
     <PackageReference Include="SciSharp.TensorFlow.Redist" Version="2.16.0" />
     <PackageReference Include="TorchSharp" Version="0.106.0" />
     <PackageReference Include="TorchSharp-cuda-windows" Version="0.106.0" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
-    <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.12.0" />
+    <!-- AiDotNet.Native.OneDNN removed in feat/finish-mkl-replacement: the
+         OneDnnProvider in src/ is now a stub that returns false at every entry
+         point, so shipping dnnl.dll in the benchmarks bin is ~50 MB of dead
+         weight. TorchSharp and TensorFlow.NET still pull in their own MKL/
+         oneDNN natives through their own native-deps packages (those libraries
+         use it internally for their own GEMM) — we keep those since they're
+         the competitive-benchmark reference points. -->
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
   </ItemGroup>
-
-  <!-- Resolve the installed OneDNN package version and copy dnnl.dll to output
-       (BenchmarkDotNet's isolated rebuild strips NuGet targets) -->
-  <PropertyGroup>
-    <OneDnnPackageVersion>0.12.0</OneDnnPackageVersion>
-  </PropertyGroup>
-  <Target Name="CopyDnnlToBenchmarkOutput" AfterTargets="Build">
-    <Copy SourceFiles="$(NuGetPackageRoot)aidotnet.native.onednn\$(OneDnnPackageVersion)\runtimes\win-x64\native\dnnl.dll"
-          DestinationFolder="$(OutputPath)"
-          SkipUnchangedFiles="true"
-          Condition="Exists('$(NuGetPackageRoot)aidotnet.native.onednn\$(OneDnnPackageVersion)\runtimes\win-x64\native\dnnl.dll')" />
-  </Target>
 
   <!-- Copy CLBlast native DLL for GPU-accelerated BLAS benchmarks -->
   <Target Name="CopyClBlastToBenchmarkOutput" AfterTargets="Build">

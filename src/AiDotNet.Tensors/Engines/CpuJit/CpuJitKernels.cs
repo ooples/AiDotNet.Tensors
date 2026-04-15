@@ -65,6 +65,19 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
 
+    // Iter 35 / 41 (both reverted): per-tile JIT kernels couldn't beat RyuJIT
+    // inlining because per-call dispatch overhead eats the small savings.
+    //
+    // Iter 42 — THE REAL FAT KERNEL: emit the ENTIRE SgemmDirect M×N loop as
+    // one machine-code blob. Outer loops, inner 6×16 micro-kernel body, and
+    // store phase all baked into one contiguous kernel. ONE dispatch per
+    // matmul (not 672). All of m/n/k/lda/ldb/ldc baked as immediates.
+    //
+    // Cache key (mFull, n, k, lda, ldb, ldc): mFull = (m/Mr)*Mr because the
+    // fat kernel only processes full 6-row blocks; caller handles M-edge in
+    // C# afterward using the existing masked kernel.
+    private static readonly ConcurrentDictionary<(int MFull, int N, int K, int Lda, int Ldb, int Ldc), Lazy<ExecutableBuffer>> _fatCache = new();
+
     // Cache compiled kernels by (opId, aligned, length)
     // Uses Lazy<> to ensure only one kernel is generated per key (avoids ExecutableBuffer leak under contention)
     private static readonly ConcurrentDictionary<long, Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>> _cache = new();
@@ -164,6 +177,37 @@ internal static class CpuJitKernels
         }));
         return (GemmMicroKernel)entry.Value.Kernel;
     }
+
+    /// <summary>
+    /// Iter 42: get function pointer to a FAT kernel that JIT-emits the
+    /// ENTIRE SgemmDirect M×N loop as one machine-code blob. ONE dispatch
+    /// per matmul (not 672 per-tile dispatches). Caller casts to
+    /// <c>delegate* unmanaged[Stdcall]&lt;float*, float*, float*, void&gt;</c>.
+    ///
+    /// <para>Preconditions: mFull % Mr==0 AND n % Nr==0 AND k ≤ 128 (full-unroll
+    /// cap). Caller handles M-edge (m - mFull rows) via the existing masked
+    /// kernel after the fat kernel returns. Kernel produces store-only output
+    /// so caller must have cleared C.</para>
+    /// </summary>
+    public static unsafe IntPtr GetFatKernelPtr(int mFull, int n, int k, int lda, int ldb, int ldc)
+    {
+        // CRITICAL: gate on Windows x64. Our emitter produces Windows x64 ABI
+        // machine code (PUSH RBP/RBX, XMM6-15 callee-saved, RCX/RDX/R8/R9
+        // first-4-args). Calling that on Linux/macOS (System V ABI) where the
+        // first arg is RDI not RCX would dereference garbage and SEGFAULT the
+        // test host. Without this gate, downstream Linux/macOS users would
+        // crash on any matmul that hits the small-matmul SgemmDirect path.
+        if (!IsSupported) return IntPtr.Zero;
+        if (k <= 0 || k > 128) return IntPtr.Zero;
+        if (mFull <= 0 || n <= 0) return IntPtr.Zero;
+
+        var key = (mFull, n, k, lda, ldb, ldc);
+        var entry = _fatCache.GetOrAdd(key, _ => new Lazy<ExecutableBuffer>(() =>
+            GenerateFatKernel(mFull, n, k, lda, ldb, ldc)));
+        return new IntPtr(entry.Value.GetFunctionPointer());
+    }
+
+
 
     /// <summary>
     /// Check if the current CPU and OS support our JIT kernels.
@@ -509,88 +553,101 @@ internal static class CpuJitKernels
             // Save R8 (C pointer) into R10 — we'll need R8 pristine for C stores later
             e.MovRR(X86Emitter.R10, X86Emitter.R8);
 
-            // Iter 17: 2x-unrolled K loop. Each loop body processes 2 K iterations
-            // back-to-back, giving the OoO engine more instruction-level parallelism
-            // and halving the loop overhead. Pointer advances: A += 48 (2*Mr*4),
-            // B += 128 (2*Nr*4), counter decrements by 2. If kc is odd, handle the
-            // last iteration after the main loop with a scalar-style single step.
+            // Iter 28 (REVERTED): tried adding 6 prefetcht0 hints on C rows here
+            // at kernel entry. Benchmark showed +1-7% regression on kc=512 shapes
+            // (Square 4608² +7.1%, DiT MLP up +3.6%) with no meaningful improvement
+            // elsewhere. Root cause: the natural load-modify-store in
+            // EmitGemmAccumStore at kernel exit already brings C rows into L1 via
+            // the HW prefetcher's next-line stride detector, and the extra 6
+            // prefetcht0s at entry consume L1d load ports during the first few
+            // K iterations when we're already bandwidth-bound on A/B loads. Net
+            // regression ~2-7% on the kc-dominated shapes. Reverted to iter 18c.
+
+            // Iter 18c: full K-unroll for small kc.
+            //
+            // For kc ≤ FullUnrollKcThreshold, emit all K iterations as straight-line code
+            // with constant displacements. No loop counter, no backward branch, no loop-
+            // closing overhead per K. libxsmm's signature optimization — eliminates the
+            // ~1 cycle branch cost × kc branches (≈ 128 cycles on kc=128 that we were
+            // paying per micro-kernel call) and lets the OoO engine see the entire FMA
+            // chain as one basic block.
+            //
+            // Threshold rationale: each K iteration emits ~14 instructions (avg ~4 bytes
+            // each) so 256 iterations ≈ 14 KB of code per kernel. Zen 2's L1I is 32 KB,
+            // so two or three such kernels co-resident stay hot. Each distinct ldc
+            // variation gets its own kernel — for DiT-XL we typically have 3 ldc values
+            // (256, 1152, 4608), so the hot-kernel set fits. For kc > 256 (e.g. DiT-block
+            // matmuls with Kc=512), we fall back to the iter-17 2×-unrolled loop.
+            //
+            // Iter 27 (reverted): tried raising the threshold from 128 to 256 to move
+            // Attn A·V (kc=256) into the full-unroll regime. Regressed A·V by +28%
+            // (162 µs → 208 µs on Zen 2). Root cause: 256 K iterations × 14 instructions/
+            // iter ≈ 3584 instr ≈ 30 KB of code per kernel, approaching Zen 2's 32 KB
+            // L1I limit. With ~13K micro-kernel invocations per A·V call, each invocation
+            // pays an I-cache miss, negating the branch-elimination benefit. The 2×-loop
+            // at kc=256 is smaller (fits L1I comfortably) and its 128 backward branches
+            // are branch-predicted well. Reverted to threshold=128.
+            //
+            // Target shapes after revert:
+            //   - Per-head Q·K^T [256,72]×[72,256]: kc=72  (fully unrolled — fits easily)
+            //   - Per-head A·V [256,256]×[256,72]:  kc=256 (2×-loop — faster on Zen 2)
+            //   - DiT-block Square:                  kc=512 (2×-loop — too big for full)
+            const int FullUnrollKcThreshold = 128;
+
+            if (kc <= FullUnrollKcThreshold)
+            {
+                // Straight-line code: emit kc K-iterations back-to-back with constant
+                // displacements off RCX (A) and RDX (B). No pointer advance, no loop
+                // counter, no Jne branch. RCX/RDX stay pointing at the panel base.
+                for (int p = 0; p < kc; p++)
+                {
+                    EmitGemmKIteration(e, p * Mr_bytes, p * Nr_bytes);
+                }
+
+                // Store accumulators into C as the final step.
+                EmitGemmAccumStore(e, ldcBytes);
+                e.Epilogue();
+                return e.Build();
+            }
+
+            // kc > FullUnrollKcThreshold — use the iter-17 2×-unrolled loop.
+            // Each loop body processes 2 K iterations back-to-back, giving the OoO engine
+            // more instruction-level parallelism and halving the loop overhead. Pointer
+            // advances: A += 48 (2*Mr*4), B += 128 (2*Nr*4), counter decrements by 2. If
+            // kc is odd, handle the last iteration after the main loop with a scalar-style
+            // single step.
+            //
+            // Iter 30 (REVERTED): tried extending this to a 4×-unrolled body for
+            // kc ≥ 256, hypothesizing loop-closing overhead was still a meaningful
+            // fraction of runtime at kc=512. Benchmark showed a consistent 1.8-10.9%
+            // REGRESSION across all shapes that moved to the 4× path, including the
+            // intended beneficiary (Square 4608² +5.3%, widening the gap to MKL
+            // from 1.10× to 1.16×). Root cause: Zen 2's FMA ports are already
+            // saturated at 2 FMA/cycle by the 2×-loop's 12 FMAs; loop overhead
+            // was already <10% of total cycles and the 4× body's extra bytes (56
+            // AVX instrs + disp32 loads at B+128/+192 for the 3rd/4th iterations)
+            // appear to bloat front-end bandwidth without a matching FMA-throughput
+            // gain. The 2×-loop was already near-optimal for this micro-architecture.
             int unrolledIters = kc / 2;
             int tail = kc & 1;
 
             if (unrolledIters > 0)
             {
-                // R9 counts unrolled iterations (down from kc/2 to 0)
-                // Main loop counter was set to kc by the caller (via R9); we override below.
-                // Actually R9 starts at kc from the prologue — we need to set it to unrolledIters.
-                // The prologue sets R9 from the argument (kc) already.
-                // We need to divide R9 by 2. Shift right by 1 is simplest but X86Emitter
-                // may not expose it — use SubImm32 pattern instead.
-                // Actually, since kc is baked at JIT time (one kernel per kc value),
-                // we can just set R9 = unrolledIters directly via a MOV with the constant.
+                // R9 counts unrolled iterations (down from kc/2 to 0).
+                // The prologue sets R9 from the kc argument; we override below
+                // since kc/2 is a baked compile-time constant per kernel.
                 e.MovImm32(X86Emitter.R9, unrolledIters);
 
                 int loopLabel = e.NewLabel();
                 e.BindLabel(loopLabel);
 
-                // === Iteration p ===
-                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);
-                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);
+                // Iteration p and p+1 via the shared helper.
+                EmitGemmKIteration(e, 0,        0);         // p+0
+                EmitGemmKIteration(e, Mr_bytes, Nr_bytes);  // p+1
 
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
-                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
-                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
-                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
-                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
-                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
-                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                // === Iteration p+1 ===
-                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 64);   // B[p+1, 0:7] at +64 bytes
-                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 96);   // B[p+1, 8:15] at +96 bytes
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 24);  // A[(p+1)*6+0] at +24 bytes
-                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 28);
-                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 32);
-                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 36);
-                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 40);
-                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 44);
-                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                // Advance A by 2*Mr*4=48 bytes, B by 2*Nr*4=128 bytes
-                e.AddImm32(X86Emitter.RCX, 48);
-                e.AddImm32(X86Emitter.RDX, 128);
+                // Advance A by 2*Mr*4 = 48 bytes, B by 2*Nr*4 = 128 bytes
+                e.AddImm32(X86Emitter.RCX, Mr_bytes * 2);
+                e.AddImm32(X86Emitter.RDX, Nr_bytes * 2);
 
                 // Decrement unrolled counter and loop
                 e.SubImm32(X86Emitter.R9, 1);
@@ -600,32 +657,7 @@ internal static class CpuJitKernels
             // Tail: if kc is odd, process one more iteration
             if (tail > 0)
             {
-                e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);
-                e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
-                e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
-                e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
-                e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
-                e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
-                e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
-
-                e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
-                e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
-                e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+                EmitGemmKIteration(e, 0, 0);
             }
 
             // === Store accumulated results back to C (load-add-store) ===
@@ -667,6 +699,69 @@ internal static class CpuJitKernels
         e.VmovupsStore(X86Emitter.YMM14, baseReg, disp);
         e.VmovupsStore(X86Emitter.YMM15, baseReg, disp + 32);
     }
+
+    // Iter 18c helpers: emit the core single-K-iteration FMA block and the final
+    // C store phase. Separated so the full-unroll path can emit many K-iterations
+    // back-to-back without the 2×-loop wrapper.
+
+    // Stride constants used by the full-unroll emit (displacements into packedA/packedB).
+    private const int Mr = 6;
+    private const int Nr = 16;
+    private const int Mr_bytes = Mr * sizeof(float);   // 24
+    private const int Nr_bytes = Nr * sizeof(float);   // 64
+
+    /// <summary>
+    /// Emit one K-iteration's worth of the 6×16 FMA kernel at the given A/B displacements.
+    /// Uses YMM0..YMM11 as the 12 accumulators, YMM12/YMM13 for B loads, YMM14 for A broadcasts.
+    /// RCX holds the packedA base, RDX holds the packedB base.
+    /// </summary>
+    private static void EmitGemmKIteration(X86Emitter e, int aDisp, int bDisp)
+    {
+        // Load B[p, 0:7] into YMM12, B[p, 8:15] into YMM13
+        e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, bDisp);
+        e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, bDisp + 32);
+
+        // 6 A broadcasts × 2 FMAs each — ping-pongs YMM14 so the JIT (x86 emitter in
+        // this case) emits the broadcasts interleaved with their FMAs.
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 0);
+        e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 4);
+        e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 8);
+        e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 12);
+        e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 16);
+        e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+        e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, aDisp + 20);
+        e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+        e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+    }
+
+    /// <summary>
+    /// Emit the 6-row C accumulate-and-store phase. R10 holds C base; ldcBytes is the
+    /// pre-computed byte stride between C rows (row * ldcBytes).
+    /// </summary>
+    private static void EmitGemmAccumStore(X86Emitter e, int ldcBytes)
+    {
+        EmitGemmStoreRow(e, X86Emitter.R10, 0, X86Emitter.YMM0, X86Emitter.YMM1);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes, X86Emitter.YMM2, X86Emitter.YMM3);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 2, X86Emitter.YMM4, X86Emitter.YMM5);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 3, X86Emitter.YMM6, X86Emitter.YMM7);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 4, X86Emitter.YMM8, X86Emitter.YMM9);
+        EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 5, X86Emitter.YMM10, X86Emitter.YMM11);
+    }
+
 
     /// <summary>
     /// Generates a JIT Sigmoid kernel using 5th-order polynomial approximation.
@@ -903,5 +998,166 @@ internal static class CpuJitKernels
             if (kvp.Value.IsValueCreated)
                 kvp.Value.Value.Buffer.Dispose();
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Iter 42: Fat kernel JIT — the whole M×N loop in one machine-code blob.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Generate the fat SgemmDirect kernel for a specific (mFull, n, k, lda, ldb, ldc)
+    /// shape. Entire outer M loop + outer N loop + inner 6×16 K-unrolled body
+    /// all baked into one native function.
+    ///
+    /// <para>Windows x64 StdCall ABI. Args: RCX=pA, RDX=pB, R8=pC.</para>
+    ///
+    /// <para>
+    /// Register usage inside the fat kernel:
+    ///   R12 = pA_row_base (advances by Mr*lda*4 per M iter)
+    ///   R13 = pB_base (constant)
+    ///   R14 = pC_row_base (advances by Mr*n*4 per M iter)
+    ///   RBX = M counter (compared to mFull)
+    ///   RAX = N counter (compared to n)
+    ///   RCX = pA inner (reset to R12 per M iter, stable through N loop)
+    ///   RDX = pB inner (reset to R13 per M iter, advances by Nr*4 per N iter)
+    ///   R8  = pC inner (reset to R14 per M iter, advances by Nr*4 per N iter)
+    ///   YMM0..YMM11 = 12 accumulators
+    ///   YMM12..YMM13 = B halves
+    ///   YMM14 = A broadcast scratch
+    /// </para>
+    /// <para>
+    /// R12-R15 and RBX are callee-saved (preserved by X86Emitter.Prologue/Epilogue).
+    /// RCX/RDX/R8 are caller-saved so we freely clobber them.
+    /// </para>
+    /// </summary>
+    private static ExecutableBuffer GenerateFatKernel(int mFull, int n, int k, int lda, int ldb, int ldc)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        // Save R12-R14 (callee-saved per Windows x64 ABI). Prologue() only
+        // saves RBX/RBP/XMM6-15 since most kernels don't use R12+. The fat
+        // kernel uses R12-R14 to hold pA/pB/pC bases across the outer loops,
+        // so we save/restore them manually here instead of in Prologue (which
+        // would add unnecessary overhead to every other JIT kernel).
+        e.Push(X86Emitter.R12);
+        e.Push(X86Emitter.R13);
+        e.Push(X86Emitter.R14);
+
+        int ldaBytes = lda * sizeof(float);
+        int ldbBytes = ldb * sizeof(float);
+        int ldcBytes = ldc * sizeof(float);
+        int nBytes = n * sizeof(float);
+
+        // Save input args to callee-saved registers.
+        e.MovRR(X86Emitter.R12, X86Emitter.RCX);   // R12 = pA row base
+        e.MovRR(X86Emitter.R13, X86Emitter.RDX);   // R13 = pB base (constant)
+        e.MovRR(X86Emitter.R14, X86Emitter.R8);    // R14 = pC row base
+
+        // M counter = 0 (stored in RBX, callee-saved)
+        e.MovImm32(X86Emitter.RBX, 0);
+
+        int mLoopLabel = e.NewLabel();
+        e.BindLabel(mLoopLabel);
+        {
+            // Refresh RCX/RDX/R8 for this M iteration.
+            e.MovRR(X86Emitter.RCX, X86Emitter.R12);   // pA inner (stable in N loop)
+            e.MovRR(X86Emitter.RDX, X86Emitter.R13);   // pB inner (advances per N)
+            e.MovRR(X86Emitter.R8,  X86Emitter.R14);   // pC inner (advances per N)
+            e.MovImm32(X86Emitter.RAX, 0);             // N counter = 0
+
+            int nLoopLabel = e.NewLabel();
+            e.BindLabel(nLoopLabel);
+            {
+                // === Inlined 6×16 micro-kernel body ===
+
+                // Zero the 12 accumulators (YMM0..YMM11).
+                for (int r = 0; r < 12; r++)
+                {
+                    e.Vxorps(r, r, r);
+                }
+
+                // Full K-unroll (k ≤ 128 per the caller's gate).
+                // Per K iter p: 2 vmovups B + 6 vbroadcastss A + 12 vfmadd231ps = 20 instr.
+                for (int p = 0; p < k; p++)
+                {
+                    int bDisp = p * ldbBytes;
+                    e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, bDisp);
+                    e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, bDisp + 32);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 1 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 2 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 3 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 5 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+                }
+
+                // Store phase — plain stores into C (caller cleared C).
+                // R8 is pC inner = pC_row_base + j*4.
+                e.VmovupsStore(X86Emitter.YMM0,  X86Emitter.R8, 0);
+                e.VmovupsStore(X86Emitter.YMM1,  X86Emitter.R8, 32);
+                e.VmovupsStore(X86Emitter.YMM2,  X86Emitter.R8, ldcBytes);
+                e.VmovupsStore(X86Emitter.YMM3,  X86Emitter.R8, ldcBytes + 32);
+                e.VmovupsStore(X86Emitter.YMM4,  X86Emitter.R8, ldcBytes * 2);
+                e.VmovupsStore(X86Emitter.YMM5,  X86Emitter.R8, ldcBytes * 2 + 32);
+                e.VmovupsStore(X86Emitter.YMM6,  X86Emitter.R8, ldcBytes * 3);
+                e.VmovupsStore(X86Emitter.YMM7,  X86Emitter.R8, ldcBytes * 3 + 32);
+                e.VmovupsStore(X86Emitter.YMM8,  X86Emitter.R8, ldcBytes * 4);
+                e.VmovupsStore(X86Emitter.YMM9,  X86Emitter.R8, ldcBytes * 4 + 32);
+                e.VmovupsStore(X86Emitter.YMM10, X86Emitter.R8, ldcBytes * 5);
+                e.VmovupsStore(X86Emitter.YMM11, X86Emitter.R8, ldcBytes * 5 + 32);
+
+                // Advance N: j += Nr
+                //   RDX (pB inner) += Nr*4 (16 floats = 64 bytes)
+                //   R8 (pC inner) += Nr*4
+                //   RAX (N counter) += Nr
+                e.AddImm32(X86Emitter.RDX, Nr * sizeof(float));
+                e.AddImm32(X86Emitter.R8,  Nr * sizeof(float));
+                e.AddImm32(X86Emitter.RAX, Nr);
+
+                // if (RAX < n) goto nLoopLabel
+                e.CmpImm32(X86Emitter.RAX, n);
+                e.Jl(nLoopLabel);
+            }
+
+            // Advance M: i += Mr
+            //   R12 (pA_row_base) += Mr*lda*4
+            //   R14 (pC_row_base) += Mr*n*4
+            //   RBX (M counter) += Mr
+            e.AddImm32(X86Emitter.R12, Mr * ldaBytes);
+            e.AddImm32(X86Emitter.R14, Mr * nBytes);
+            e.AddImm32(X86Emitter.RBX, Mr);
+
+            // if (RBX < mFull) goto mLoopLabel
+            e.CmpImm32(X86Emitter.RBX, mFull);
+            e.Jl(mLoopLabel);
+        }
+
+        // Restore R12-R14 in reverse push order before the standard Epilogue
+        // (which unwinds RBX/RBP/XMM6-15).
+        e.Pop(X86Emitter.R14);
+        e.Pop(X86Emitter.R13);
+        e.Pop(X86Emitter.R12);
+
+        e.Epilogue();
+        return e.Build();
     }
 }

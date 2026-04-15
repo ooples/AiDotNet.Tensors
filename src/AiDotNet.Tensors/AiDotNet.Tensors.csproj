@@ -56,16 +56,25 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="MKL.NET" Version="1.6.0" />
-    <PackageReference Include="MKL.NET.win-x64" Version="2022.0.0.115" />
+    <!--
+      External CPU math libraries REMOVED per the feat/finish-mkl-replacement
+      branch (Issue #131 completion + supply-chain-independence directive):
+        - MKL.NET + MKL.NET.win-x64 (110 MB Intel binary previously bundled)
+        - Native BLAS loader (cblas_sgemm via BlasProvider / CpuNativeBlas)
+        - MKL VML (VmlProvider)
+        - Intel oneDNN (OneDnnProvider — dnnl.dll)
+      All of the above are now stub classes that return false at every
+      entry point. The engine routes all matmul through SimdGemm's AVX2
+      blocked kernel + JIT micro-kernels; all element-wise transcendentals
+      through SimdKernels (Herumi exp, Pade sigmoid, vectorized tanh/log/...);
+      all Conv2D through FusedConv + SimdGemm / Winograd / SIMD-direct.
+
+      Per iter 18c benchmarks (docs/mkl-replacement/baseline/iter18c-results.md),
+      the in-house kernels are at 0.99-1.04× of MKL on every tracked DiT-XL
+      shape — 5 shapes beat MKL, 5 at parity, 0 meaningfully trailing.
+    -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
-
-  <!--
-    Intel oneDNN support for optimized CPU convolution, ReLU, sigmoid, and element-wise operations.
-    The native dnnl.dll is provided by the separate AiDotNet.Native.OneDNN package.
-    Install AiDotNet.Native.OneDNN to enable oneDNN acceleration (Windows x64 only, .NET Core+).
-  -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
@@ -73,11 +82,11 @@
   </ItemGroup>
 
   <!--
-    Native library acceleration packages are OPTIONAL.
-    Install AiDotNet.Native.OneDNN for CPU deep learning acceleration (convolution, ReLU, etc).
-    Install AiDotNet.Native.OpenBLAS for CPU BLAS acceleration.
-    Install AiDotNet.Native.CLBlast for OpenCL GPU acceleration.
-    The core package works without them using managed fallbacks.
+    GPU-side optional packages — separate supply-chain surface (users opt in
+    per-hardware): AiDotNet.Native.CLBlast (OpenCL), AiDotNet.Native.CUDA
+    (NVIDIA), AiDotNet.Native.ROCm (AMD), AiDotNet.Native.MoltenVK (macOS/iOS).
+    The core package works without any of them using managed fallbacks + the
+    in-house CPU kernels (SimdGemm / SimdKernels / FusedConv).
   -->
 
   <!-- Exclude files that require .NET Core intrinsics from .NET Framework builds -->
@@ -87,6 +96,10 @@
     <Compile Remove="Helpers\OneDnnProvider.cs" />
     <Compile Remove="Helpers\NativeMemoryManager.cs" />
     <Compile Remove="Helpers\FusedConvHelper.cs" />
+    <!-- SupabaseTelemetryClient needs System.Net.Http which was transitively brought in
+         by MKL.NET.win-x64 pre-removal. The telemetry path is only useful on net10.0
+         runtimes (the GPU backends we wire it into), so excluding it on net471 is safe. -->
+    <Compile Remove="Engines\DirectGpu\Telemetry\SupabaseTelemetryClient.cs" />
   </ItemGroup>
 
   <!--

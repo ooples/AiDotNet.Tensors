@@ -438,7 +438,7 @@ public class SpectralFilterTests
     // Performance: fused vs manual pipeline
     // ================================================================
 
-    [Theory]
+    [Theory(Skip = "Benchmark — run manually, not in CI. Asserts relative speedup which is flaky on non-exclusive runners where thermal/scheduler noise can make the fused path appear slower than the manual loop over small sample counts.")]
     [Trait("Category", "Performance")]
     [InlineData(16, 4, 32, 32)]
     public void SpectralFilterBatch_FasterThanManualLoop(int batch, int channels, int h, int w)

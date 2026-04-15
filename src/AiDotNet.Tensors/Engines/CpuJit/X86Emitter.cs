@@ -575,6 +575,36 @@ internal sealed class X86Emitter
     // [RSP+192..199] = alignment pad (8 bytes)
     private const int PrologueStackSize = 200; // 32 shadow + 160 XMM saves + 8 alignment pad
 
+    /// <summary>
+    /// PUSH reg. Uses 1 byte for RAX..RDI, 2 bytes for R8..R15 (REX.B prefix).
+    /// </summary>
+    public void Push(int reg)
+    {
+        if (reg < 8)
+        {
+            Emit((byte)(0x50 + reg));
+        }
+        else
+        {
+            Emit(0x41, (byte)(0x50 + (reg - 8)));
+        }
+    }
+
+    /// <summary>
+    /// POP reg. Inverse of <see cref="Push"/>.
+    /// </summary>
+    public void Pop(int reg)
+    {
+        if (reg < 8)
+        {
+            Emit((byte)(0x58 + reg));
+        }
+        else
+        {
+            Emit(0x41, (byte)(0x58 + (reg - 8)));
+        }
+    }
+
     public void Prologue()
     {
         // PUSH RBP
