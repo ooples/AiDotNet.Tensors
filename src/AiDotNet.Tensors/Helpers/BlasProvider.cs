@@ -41,16 +41,58 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal static class BlasProvider
 {
-    private static volatile bool _deterministicMode;
+    // Defaults to true (issue #164): deterministic-by-default. After the MKL.NET removal
+    // in #131/#163, every BLAS dispatch in this stub returns false anyway and routes the
+    // engine through SimdGemm — which is itself bit-exact across thread counts. The flag
+    // is therefore informational at the BLAS layer today, but it remains load-bearing
+    // for two consumers:
+    //   1. CompiledModelCache.ComputeShapeKey mixes IsDeterministicMode into the plan
+    //      key, so toggling the flag invalidates plans compiled under the opposite
+    //      setting (forward-safe for any future re-introduction of divergent kernels,
+    //      e.g. GPU paths that branch on determinism).
+    //   2. Public API contract: TensorCodecOptions.Deterministic and
+    //      AiDotNetEngine.SetDeterministicMode are observable consumer surfaces.
+    private static volatile bool _deterministicMode = true;
 
     /// <summary>
-    /// Returns whether deterministic mode is currently enabled. After the native
-    /// BLAS disable this is always effectively deterministic (the SimdGemm
-    /// blocked path is bit-exact across thread counts), but we preserve the
-    /// flag because callers of <see cref="SetDeterministicMode"/> have
-    /// historical semantics they may depend on.
+    /// Per-thread override of the process-wide <see cref="_deterministicMode"/>.
+    /// <para>
+    /// <c>null</c> (the default on every thread) means "inherit the process-wide setting."
+    /// A non-null value wins over the process-wide default for the current thread only,
+    /// letting one thread opt into or out of determinism without affecting any other
+    /// thread. Set via <see cref="SetThreadLocalDeterministicMode"/> — typically driven
+    /// by <c>TensorCodecOptions.SetCurrent</c>, which is itself thread-local.
+    /// </para>
+    /// <para>
+    /// In the post-MKL-removal build the override has no immediate dispatch effect
+    /// (everything routes through SimdGemm regardless), but it correctly threads
+    /// through the cache-key invariant in CompiledModelCache so per-thread plans are
+    /// segregated by the override. This guarantees forward-compatibility: when GPU or
+    /// other backends re-introduce determinism-divergent kernels, the override is
+    /// already wired end-to-end.
+    /// </para>
     /// </summary>
-    public static bool IsDeterministicMode => _deterministicMode;
+    [ThreadStatic]
+    private static bool? _threadLocalDeterministicOverride;
+
+    /// <summary>
+    /// Returns whether deterministic mode is currently enabled on the calling thread.
+    /// Reads the thread-local override first, falling back to the process-wide default.
+    /// </summary>
+    public static bool IsDeterministicMode => _threadLocalDeterministicOverride ?? _deterministicMode;
+
+    /// <summary>
+    /// Installs a per-thread determinism override, or clears it with <c>null</c>. The
+    /// override wins over the process-wide <see cref="SetDeterministicMode"/> value for
+    /// this thread only. Typically driven by <c>TensorCodecOptions.SetCurrent</c>, which
+    /// itself is thread-local.
+    /// </summary>
+    /// <param name="value">
+    /// <c>true</c> to force deterministic mode on this thread; <c>false</c> to allow
+    /// non-deterministic paths on this thread; <c>null</c> to clear the override and
+    /// inherit the process-wide setting.
+    /// </param>
+    public static void SetThreadLocalDeterministicMode(bool? value) => _threadLocalDeterministicOverride = value;
 
     public static void SetDeterministicMode(bool deterministic)
     {
