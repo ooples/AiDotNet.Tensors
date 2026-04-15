@@ -65,6 +65,15 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
 
+    // Iter 35 (reverted): tried a direct-access GemmDirectMicroKernel for
+    // small-matmul callers (k ≤ 128, lda/ldb/ldc baked). UnmanagedFunctionPointer
+    // delegate invoke carries ~40ns P/Invoke overhead per call — amortizes fine
+    // over Kc=512 packed micro-kernels (~4%) but is 22% of per-call time at k=72
+    // for direct kernels. C# DirectKernel6x16 (with [MethodImpl(HotInline)])
+    // gets inlined at the call site so dispatch is zero-cost, and RyuJIT emits
+    // essentially the same AVX2 machine code. A future "fat-kernel" JIT (one
+    // P/Invoke per full matmul instead of per-tile) could flip this — deferred.
+
     // Cache compiled kernels by (opId, aligned, length)
     // Uses Lazy<> to ensure only one kernel is generated per key (avoids ExecutableBuffer leak under contention)
     private static readonly ConcurrentDictionary<long, Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>> _cache = new();
@@ -164,6 +173,7 @@ internal static class CpuJitKernels
         }));
         return (GemmMicroKernel)entry.Value.Kernel;
     }
+
 
     /// <summary>
     /// Check if the current CPU and OS support our JIT kernels.
