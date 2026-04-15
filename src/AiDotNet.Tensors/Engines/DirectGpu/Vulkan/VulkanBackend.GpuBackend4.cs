@@ -1794,4 +1794,113 @@ public sealed unsafe partial class VulkanBackend
             ifftI?.Dispose(); zeroI?.Dispose();
         }
     }
+
+    // Issue #160 spectral perf kernels — Vulkan implementations.
+    public void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        // Kernel binding order is (imag, real, output); keep it stable and pass accordingly.
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.Atan2Elementwise, imag, real, output, n,
+            new uint[] { (uint)n }, sizeof(uint));
+    }
+
+    public void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.NormalizeRowsFused, input, output, rows,
+            new uint[] { (uint)rows, (uint)cols }, 2 * sizeof(uint));
+    }
+
+    public void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        if (batch <= 0 || fftSize <= 0) return;
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        // Apply mask to real and imag with single-buffer dispatches each
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.AnalyticSignalMaskScalar, specReal, outReal, total,
+            new uint[] { (uint)batch, (uint)fftSize, (uint)binLow, (uint)binHigh }, 4 * sizeof(uint));
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.AnalyticSignalMaskScalar, specImag, outImag, total,
+            new uint[] { (uint)batch, (uint)fftSize, (uint)binLow, (uint)binHigh }, 4 * sizeof(uint));
+    }
+
+    public void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.BispectrumReal, specReal, specImag, outReal, total,
+            new uint[] { (uint)maxF1, (uint)maxF2 }, 2 * sizeof(uint));
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.BispectrumImag, specReal, specImag, outImag, total,
+            new uint[] { (uint)maxF1, (uint)maxF2 }, 2 * sizeof(uint));
+    }
+
+    public void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.TrispectrumReal, specReal, specImag, outReal, total,
+            new uint[] { (uint)maxF1, (uint)maxF2, (uint)maxF3 }, 3 * sizeof(uint));
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.TrispectrumImag, specReal, specImag, outImag, total,
+            new uint[] { (uint)maxF1, (uint)maxF2, (uint)maxF3 }, 3 * sizeof(uint));
+    }
+
+    public void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        if (total <= 0) return;
+        uint invNbits = BitConverter.ToUInt32(BitConverter.GetBytes(invN), 0);
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.CavityBounceReal, workReal, workReal, total,
+            new uint[] { (uint)total, invNbits }, 2 * sizeof(uint));
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.ZeroBuffer, workImag, workImag, total,
+            new uint[] { (uint)total }, sizeof(uint));
+    }
+
+    public void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.WidebandLogBinPool, magBuf, output, total,
+            new uint[] { (uint)totalSegBatch, (uint)fftSize, (uint)numBins, (uint)usable }, 4 * sizeof(uint));
+    }
+
+    public void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.MelFilterbankApply, powerSpec, melFilters, melEnergy, total,
+            new uint[] { (uint)totalSegBatch, (uint)specBins, (uint)melBins }, 3 * sizeof(uint));
+    }
+
+    public void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        GlslUnaryOp(VulkanGlslSpectralPerfKernels.MfccLog1p, input, output, n,
+            new uint[] { (uint)n }, sizeof(uint));
+    }
+
+    public void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
+        GlslBinaryOp(VulkanGlslSpectralPerfKernels.PacPhaseBinMi, thetaPhase, gammaAmp, output, batch,
+            new uint[] { (uint)batch, (uint)numSamples, (uint)numGammaBands, (uint)gammaIdx }, 4 * sizeof(uint));
+    }
 }

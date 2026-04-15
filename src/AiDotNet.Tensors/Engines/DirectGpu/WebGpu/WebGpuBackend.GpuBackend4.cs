@@ -1521,5 +1521,134 @@ public sealed partial class WebGpuBackend
             ifftI?.Dispose(); zeroI?.Dispose();
         }
     }
+
+    // ============================================================================
+    // Issue #160 spectral perf kernels — WebGPU implementations.
+    // ============================================================================
+
+    public void Atan2Elementwise(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        // Kernel binding order is (imag, real, output) internally; keep it and pass accordingly.
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.Atan2Source,
+            "atan2_elementwise", imag, real, output,
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
+    public void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (rows <= 0 || cols <= 0) return;
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.NormalizeRowsSource,
+            "normalize_rows_fused", input, output,
+            new float[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(cols) }, rows).GetAwaiter().GetResult();
+    }
+
+    public void AnalyticSignalMask(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batch, int fftSize, int binLow, int binHigh)
+    {
+        if (batch <= 0 || fftSize <= 0) return;
+        if (binLow < 0 || binHigh < binLow || binHigh > fftSize)
+            throw new ArgumentOutOfRangeException(nameof(binHigh), $"Require 0 <= binLow ({binLow}) <= binHigh ({binHigh}) <= fftSize ({fftSize}).");
+        long totalL = (long)batch * fftSize;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pc = new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(fftSize),
+            BitConverter.Int32BitsToSingle(binLow), BitConverter.Int32BitsToSingle(binHigh) };
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.AnalyticSignalMaskSource,
+            "analytic_signal_mask", specReal, outReal, pc, total).GetAwaiter().GetResult();
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.AnalyticSignalMaskSource,
+            "analytic_signal_mask", specImag, outImag, pc, total).GetAwaiter().GetResult();
+    }
+
+    public void BispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0) return;
+        long totalL = (long)maxF1 * maxF2;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pcReal = new float[] { BitConverter.Int32BitsToSingle(maxF1), BitConverter.Int32BitsToSingle(maxF2), BitConverter.Int32BitsToSingle(0) };
+        var pcImag = new float[] { BitConverter.Int32BitsToSingle(maxF1), BitConverter.Int32BitsToSingle(maxF2), BitConverter.Int32BitsToSingle(1) };
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.BispectrumSource,
+            "bispectrum_gather", specReal, specImag, outReal, pcReal, total).GetAwaiter().GetResult();
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.BispectrumSource,
+            "bispectrum_gather", specReal, specImag, outImag, pcImag, total).GetAwaiter().GetResult();
+    }
+
+    public void TrispectrumGather(IGpuBuffer specReal, IGpuBuffer specImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int maxF1, int maxF2, int maxF3)
+    {
+        if (maxF1 <= 0 || maxF2 <= 0 || maxF3 <= 0) return;
+        long totalL = (long)maxF1 * maxF2 * maxF3;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        var pcReal = new float[] { BitConverter.Int32BitsToSingle(maxF1), BitConverter.Int32BitsToSingle(maxF2), BitConverter.Int32BitsToSingle(maxF3), BitConverter.Int32BitsToSingle(0) };
+        var pcImag = new float[] { BitConverter.Int32BitsToSingle(maxF1), BitConverter.Int32BitsToSingle(maxF2), BitConverter.Int32BitsToSingle(maxF3), BitConverter.Int32BitsToSingle(1) };
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.TrispectrumSource,
+            "trispectrum_gather", specReal, specImag, outReal, pcReal, total).GetAwaiter().GetResult();
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.TrispectrumSource,
+            "trispectrum_gather", specReal, specImag, outImag, pcImag, total).GetAwaiter().GetResult();
+    }
+
+    public void CavityBounceInplace(IGpuBuffer workReal, IGpuBuffer workImag, int total, float invN)
+    {
+        if (total <= 0) return;
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.CavityBounceSource,
+            "cavity_bounce_real", workReal, workReal,
+            new float[] { BitConverter.Int32BitsToSingle(total), invN }, total).GetAwaiter().GetResult();
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.ZeroBufferSource,
+            "zero_buffer", workImag, workImag,
+            new float[] { BitConverter.Int32BitsToSingle(total) }, total).GetAwaiter().GetResult();
+    }
+
+    public void WidebandLogBinPool(IGpuBuffer magBuf, IGpuBuffer output,
+        int totalSegBatch, int fftSize, int numBins, int usable)
+    {
+        if (totalSegBatch <= 0 || fftSize <= 0 || numBins <= 0 || usable <= 0) return;
+        long totalL = (long)totalSegBatch * numBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.WidebandLogBinPoolSource,
+            "wideband_log_bin_pool", magBuf, output,
+            new float[] { BitConverter.Int32BitsToSingle(totalSegBatch), BitConverter.Int32BitsToSingle(fftSize),
+                BitConverter.Int32BitsToSingle(numBins), BitConverter.Int32BitsToSingle(usable) }, total).GetAwaiter().GetResult();
+    }
+
+    public void MelFilterbankApply(IGpuBuffer powerSpec, IGpuBuffer melFilters, IGpuBuffer melEnergy,
+        int totalSegBatch, int specBins, int melBins)
+    {
+        if (totalSegBatch <= 0 || specBins <= 0 || melBins <= 0) return;
+        long totalL = (long)totalSegBatch * melBins;
+        if (totalL <= 0 || totalL > int.MaxValue) return;
+        int total = (int)totalL;
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.MelFilterbankSource,
+            "mel_filterbank_apply", powerSpec, melFilters, melEnergy,
+            new float[] { BitConverter.Int32BitsToSingle(totalSegBatch), BitConverter.Int32BitsToSingle(specBins),
+                BitConverter.Int32BitsToSingle(melBins) }, total).GetAwaiter().GetResult();
+    }
+
+    public void MfccLog1p(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.MfccLog1pSource,
+            "mfcc_log1p", input, output,
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
+    public void PacPhaseBinMi(IGpuBuffer thetaPhase, IGpuBuffer gammaAmp, IGpuBuffer output,
+        int batch, int numSamples, int numGammaBands, int gammaIdx)
+    {
+        if (batch <= 0) return;
+        if (numSamples <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numSamples), "numSamples must be positive.");
+        if (numGammaBands <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
+        if (gammaIdx < 0 || gammaIdx >= numGammaBands)
+            throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
+        Dispatch3BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.PacPhaseBinMiSource,
+            "pac_phase_bin_mi", thetaPhase, gammaAmp, output,
+            new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(numSamples),
+                BitConverter.Int32BitsToSingle(numGammaBands), BitConverter.Int32BitsToSingle(gammaIdx) }, batch).GetAwaiter().GetResult();
+    }
 }
 #endif
