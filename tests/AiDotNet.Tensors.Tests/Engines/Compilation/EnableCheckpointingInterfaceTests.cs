@@ -14,6 +14,20 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class EnableCheckpointingInterfaceTests
 {
+    /// <summary>
+    /// Asserts two floats agree within <paramref name="absTol"/> absolute tolerance OR
+    /// <paramref name="relTol"/> relative tolerance (whichever is looser). Decimal-place
+    /// rounding via <c>Assert.Equal(..., precision: n)</c> is brittle for large-magnitude
+    /// values; an abs-or-rel combination is the numerics-standard equivalence check.
+    /// </summary>
+    private static void AssertFloatClose(float expected, float actual, float absTol, float relTol, string context)
+    {
+        float diff = Math.Abs(expected - actual);
+        float threshold = Math.Max(absTol, relTol * Math.Max(Math.Abs(expected), Math.Abs(actual)));
+        Assert.True(diff <= threshold,
+            $"{context}: |{expected} - {actual}| = {diff} > tolerance {threshold}");
+    }
+
     [Fact]
     public void EnableCheckpointing_IsCallable_ViaPublicInterface()
     {
@@ -79,8 +93,12 @@ public class EnableCheckpointingInterfaceTests
             var lossBaseline = baseline.Step();
             var lossCheckpointed = checkpointed.Step();
 
-            // Loss values match within tolerance
-            Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 4);
+            // Loss values match within an explicit tolerance. precision-based
+            // Assert.Equal uses decimal-place rounding, which is brittle for
+            // large-magnitude values; an explicit combined absolute-or-relative
+            // tolerance expresses the intent directly and scales with magnitude.
+            AssertFloatClose(lossBaseline[0], lossCheckpointed[0], absTol: 1e-4f, relTol: 1e-4f,
+                context: "Loss scalar");
 
             // Gradient shapes match
             Assert.Equal(baseline.Gradients.Length, checkpointed.Gradients.Length);
@@ -92,6 +110,12 @@ public class EnableCheckpointingInterfaceTests
                 var gChk = checkpointed.Gradients[i];
                 Assert.NotNull(gBase);
                 Assert.NotNull(gChk);
+                // Codebase convention uses Tensor<T>._shape (internal to this assembly,
+                // tests compile via InternalsVisibleTo). The library's own XML doc
+                // example in CompiledModelCache.cs line 16 uses the same access pattern;
+                // migrating this file alone to .Shape.ToArray() would be inconsistent
+                // with the rest of the suite. A project-wide migration to the public
+                // Shape property is tracked as a separate cleanup.
                 Assert.Equal(gBase!._shape, gChk!._shape);
 
                 var baseData = gBase.GetDataArray();
@@ -99,7 +123,8 @@ public class EnableCheckpointingInterfaceTests
                 Assert.Equal(baseData.Length, chkData.Length);
                 for (int k = 0; k < baseData.Length; k++)
                 {
-                    Assert.Equal(baseData[k], chkData[k], precision: 4);
+                    AssertFloatClose(baseData[k], chkData[k], absTol: 1e-4f, relTol: 1e-4f,
+                        context: $"Gradient[{i}][{k}]");
                 }
             }
         }
@@ -170,9 +195,36 @@ public class EnableCheckpointingInterfaceTests
 
             Assert.False(float.IsNaN(lossBaseline[0]), "Baseline loss is NaN on deep graph");
             Assert.False(float.IsNaN(lossCheckpointed[0]), "Checkpointed loss is NaN on deep graph");
-            // Losses should agree on the same weights / input within tolerance, confirming
-            // the segmentation path does not change the forward computation semantically.
-            Assert.Equal(lossBaseline[0], lossCheckpointed[0], precision: 3);
+            // Losses should agree on the same weights / input within tolerance,
+            // confirming the segmentation path does not change the forward
+            // computation semantically.
+            AssertFloatClose(lossBaseline[0], lossCheckpointed[0], absTol: 1e-3f, relTol: 1e-3f,
+                context: "Deep-graph loss");
+
+            // Gradients should also agree across all 16 weight matrices — proving
+            // the checkpointed backward pass remains numerically equivalent when
+            // the segmentation machinery actually engages on a graph deep enough
+            // to produce multiple segments (auto segmentSize = sqrt(16) = 4,
+            // giving 4 segments).
+            Assert.Equal(baseline.Gradients.Length, checkpointed.Gradients.Length);
+            for (int i = 0; i < baseline.Gradients.Length; i++)
+            {
+                var gBase = baseline.Gradients[i];
+                var gChk = checkpointed.Gradients[i];
+                Assert.NotNull(gBase);
+                Assert.NotNull(gChk);
+                var baseData = gBase!.GetDataArray();
+                var chkData = gChk!.GetDataArray();
+                Assert.Equal(baseData.Length, chkData.Length);
+                // Looser tolerance on 16-deep matmul chain — accumulated FP drift
+                // across 16 layers × 4 segments is expected. 1e-3 abs-or-rel is
+                // still well below anything that would mask a real bug.
+                for (int k = 0; k < baseData.Length; k++)
+                {
+                    AssertFloatClose(baseData[k], chkData[k], absTol: 1e-3f, relTol: 1e-3f,
+                        context: $"Deep-graph gradient layer {i} element {k}");
+                }
+            }
         }
     }
 

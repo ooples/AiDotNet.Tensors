@@ -84,15 +84,18 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// to the non-checkpointed path within floating-point tolerance.
     /// </para>
     /// <para>
-    /// <b>SOURCE-BREAKING CHANGE WARNING:</b> adding this member to
-    /// <see cref="ICompiledTrainingPlan{T}"/> is a source-breaking change for any
-    /// downstream consumer that implements this interface directly (not just uses
-    /// it). The built-in <c>CompiledTrainingPlan&lt;T&gt;</c> in this assembly is
-    /// updated alongside this interface addition, but external implementers must
-    /// add a corresponding implementation when they pick up the change. Added per
-    /// Issue #165 where the downstream consumer needed interface-level access
-    /// (not a concrete-class cast) to route checkpointing through
-    /// <see cref="CompiledModelCache{T}"/>.
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #165):</b> adding this member to
+    /// <see cref="ICompiledTrainingPlan{T}"/> is both a source-breaking change for any
+    /// downstream consumer that implements this interface directly (not just uses it)
+    /// <b>and</b> a binary-breaking change for already-compiled external implementers
+    /// at runtime. The built-in <c>CompiledTrainingPlan&lt;T&gt;</c> in this assembly
+    /// is updated alongside this interface addition, so internal consumers are
+    /// unaffected — but third-party implementers must recompile against this assembly
+    /// and add a corresponding method. No default-interface-member polyfill is
+    /// provided because .NET Framework 4.7.1 (one of this library's target frameworks)
+    /// does not support default interface members. Added per Issue #165 where the
+    /// downstream consumer needed interface-level access (not a concrete-class cast)
+    /// to route checkpointing through <see cref="CompiledModelCache{T}"/>.
     /// </para>
     /// </remarks>
     void EnableCheckpointing(int segmentSize = 0);
