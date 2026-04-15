@@ -1,3 +1,5 @@
+using AiDotNet.Tensors.Helpers;
+
 namespace AiDotNet.Tensors.Engines.Optimization;
 
 /// <summary>
@@ -20,8 +22,29 @@ public sealed class TensorCodecOptions
     /// </summary>
     public static TensorCodecOptions Default => new();
 
-    /// <summary>Sets thread-local options. Pass null to revert to defaults.</summary>
-    public static void SetCurrent(TensorCodecOptions? options) => _current = options;
+    /// <summary>
+    /// Sets thread-local options. Pass null to revert to defaults.
+    /// <para>
+    /// Also installs a thread-local BLAS determinism override reflecting
+    /// <paramref name="options"/>'s <see cref="Deterministic"/> flag — so a caller
+    /// who does <c>SetCurrent(new TensorCodecOptions { Deterministic = false })</c>
+    /// actually observes the override end-to-end (it threads through the cache key
+    /// and any future determinism-divergent backend), without affecting any other
+    /// thread's policy. Passing null clears the override and the thread inherits
+    /// the process-wide default again.
+    /// </para>
+    /// <para>
+    /// <b>Mutation caveat:</b> mutating <c>Current.Deterministic</c> after
+    /// <c>SetCurrent</c> does NOT re-sync the BLAS override — the sync point is
+    /// <c>SetCurrent</c> itself. Call <c>SetCurrent</c> again after any post-install
+    /// mutation to take effect.
+    /// </para>
+    /// </summary>
+    public static void SetCurrent(TensorCodecOptions? options)
+    {
+        _current = options;
+        BlasProvider.SetThreadLocalDeterministicMode(options?.Deterministic);
+    }
 
     /// <summary>Master switch for auto-compilation. When false, all compilation is disabled
     /// and execution falls through to the eager path.</summary>
@@ -67,4 +90,32 @@ public sealed class TensorCodecOptions
 
     /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
     public bool EnableMixedPrecision { get; set; }
+
+    /// <summary>
+    /// When true, tensor operations route through deterministic code paths — floating-point
+    /// reductions (matmul, softmax, dot products, etc.) produce bit-identical results across
+    /// runs on the same hardware, regardless of thread count. Defaults to <c>true</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Design note — why default-on:</b> after the MKL.NET removal in #131/#163, every
+    /// CPU matmul routes through SimdGemm's bit-exact AVX2 blocked kernel; deterministic
+    /// matmul therefore costs nothing relative to the non-deterministic alternative.
+    /// Defaulting to deterministic gives reproducible training runs, unit tests that don't
+    /// drift, and CUDA-graph-safe kernels out of the box — with no performance tax to
+    /// justify keeping the user out of that mode.
+    /// </para>
+    /// <para>
+    /// <b>How to opt out:</b> set <c>Deterministic = false</c> on a <see cref="TensorCodecOptions"/>
+    /// instance and install it via <see cref="SetCurrent"/> for thread-local effect, or
+    /// call <c>AiDotNetEngine.SetDeterministicMode(false)</c> for process-wide effect.
+    /// </para>
+    /// <para>
+    /// <b>Cache invalidation:</b> the compile cache mixes the current deterministic state
+    /// (process-wide value or thread-local override, whichever wins) into the plan key,
+    /// so switching this setting invalidates any plans compiled under the opposite setting
+    /// automatically — no manual cache clear required.
+    /// </para>
+    /// </remarks>
+    public bool Deterministic { get; set; } = true;
 }

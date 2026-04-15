@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using AiDotNet.Tensors.Engines.Optimization;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -217,6 +218,16 @@ public sealed class CompiledModelCache<T> : IDisposable
             hash ^= shape[i];
             hash *= unchecked((long)0x100000001b3L);
         }
+
+        // Issue #164: mix in the current determinism state (process-wide value or
+        // thread-local override, whichever wins) so plans compiled under one mode
+        // are not served under the other. Today this matters mainly for forward
+        // compatibility — if a future backend re-introduces determinism-divergent
+        // kernels (GPU paths, parallel SimdGemm, etc.) the segregation is already
+        // in place. The bool collapses into a single bit XORed in, then mixed.
+        hash ^= BlasProvider.IsDeterministicMode ? 1L : 0L;
+        hash *= unchecked((long)0x100000001b3L);
+
         return hash;
     }
 }
