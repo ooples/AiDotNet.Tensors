@@ -118,7 +118,9 @@ internal static class SimdGemm
         int n)
     {
         c.Clear();
-        SgemmAdd(a, b, c, m, k, n);
+        // Iter 39: signal "we just cleared C" so the small-matmul fast path
+        // can use store-only kernels (saves 12 loads + 12 adds per micro-tile).
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: true);
     }
 
     /// <summary>
@@ -140,7 +142,7 @@ internal static class SimdGemm
         int m, int k, int n)
     {
         c.Clear();
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false, clearedOutput: true);
     }
 
     /// <summary>
@@ -157,7 +159,7 @@ internal static class SimdGemm
         int m, int k, int n)
     {
         c.Clear();
-        SgemmAdd(a, lda, transA, b, ldb, transB, c, m, k, n);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
     }
 
     /// <summary>
@@ -172,14 +174,20 @@ internal static class SimdGemm
         int m, int k, int n,
         float beta)
     {
+        bool clearedC = false;
         if (beta == 0f)
+        {
             c.Clear();
+            clearedC = true;
+        }
         else if (beta != 1f)
         {
             for (int i = 0; i < c.Length; i++)
                 c[i] *= beta;
         }
-        SgemmAdd(a, b, c, m, k, n);
+        // clearedC=true allows the small-matmul fast path to use store-only kernels
+        // (saves load-add per micro-tile). beta=1 uses load-add-store accumulate.
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: clearedC);
     }
 
     /// <summary>
@@ -207,7 +215,8 @@ internal static class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true);
+        // SgemmAdd is C += A·B by definition — do NOT pass clearedOutput=true here.
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: false);
     }
 
     /// <summary>
@@ -216,6 +225,13 @@ internal static class SimdGemm
     /// <see cref="SgemmSequential"/> (allowParallel=false). Threading the flag here
     /// avoids races on the global <see cref="UseParallelGemm"/> field when the
     /// caller is itself inside a parallel region.
+    ///
+    /// <paramref name="clearedOutput"/> (iter 39): when true, the caller has just
+    /// zeroed C, so SgemmDirect can use store-only kernels (skip the load-add at
+    /// kernel exit, saving ~10-15 µs per per-head-attn matmul). False for the
+    /// SgemmAdd accumulate path. SgemmTiled doesn't currently use this flag —
+    /// the packed micro-kernels still load-add-store because they accumulate
+    /// across multiple Kc-tiles into the same C location.
     /// </summary>
     [MethodImpl(Hot)]
     internal static void SgemmAddInternal(
@@ -223,7 +239,8 @@ internal static class SimdGemm
         ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> c,
         int m, int k, int n,
-        bool allowParallel)
+        bool allowParallel,
+        bool clearedOutput = false)
     {
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
@@ -251,7 +268,7 @@ internal static class SimdGemm
                 && k <= SmallMatmulKThreshold
                 && (n % 8 == 0))
             {
-                SgemmDirect(a, lda, b, ldb, c, m, k, n);
+                SgemmDirect(a, lda, b, ldb, c, m, k, n, clearedOutput);
                 return;
             }
 
@@ -320,7 +337,8 @@ internal static class SimdGemm
         ReadOnlySpan<float> a, int lda,
         ReadOnlySpan<float> b, int ldb,
         Span<float> c,
-        int m, int k, int n)
+        int m, int k, int n,
+        bool clearedOutput)
     {
         int mFull = (m / Mr) * Mr;
         int nFull = (n / Nr) * Nr;
@@ -355,51 +373,103 @@ internal static class SimdGemm
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
-            // Full-Mr rows: 6 rows at a time.
-            for (int i = 0; i < mFull; i += Mr)
+            // Iter 39: split the dispatch by clearedOutput. When the caller
+            // (Sgemm or Sgemm-with-beta=0 or SgemmSequential) just zeroed C,
+            // we use the store-only kernel that skips the load-add at exit
+            // (saves 12 loads + 12 adds per micro-tile call). When called
+            // via SgemmAdd (accumulate semantics, C may have prior values),
+            // we use the load-add-store kernel to preserve correctness.
+            if (clearedOutput)
             {
-                float* pARow = pAroot + i * lda;
-                float* pCRow = pCroot + i * n;
-
-                // Full-Nr columns: 16 cols at a time → hot 6×16 kernel.
-                int j = 0;
-                for (; j + Nr <= n; j += Nr)
+                // Store-only path — caller cleared C, so kernel can OVERWRITE.
+                for (int i = 0; i < mFull; i += Mr)
                 {
-                    DirectKernel6x16(pARow, lda, pBroot + j, ldb, pCRow + j, n, k);
+                    float* pARow = pAroot + i * lda;
+                    float* pCRow = pCroot + i * n;
+
+                    int j = 0;
+                    for (; j + Nr <= n; j += Nr)
+                    {
+                        DirectKernel6x16Store(pARow, lda, pBroot + j, ldb, pCRow + j, n, k);
+                    }
+
+                    int ncTail = n - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: Mr, ncActual: ncTail);
+                    }
                 }
 
-                // N-edge (nc ∈ [1, 15]) via the masked kernel.
-                int ncTail = n - j;
-                if (ncTail > 0)
+                int mcTailS = m - mFull;
+                if (mcTailS > 0)
                 {
-                    DirectKernelMxNMasked(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: Mr, ncActual: ncTail);
+                    float* pARow = pAroot + mFull * lda;
+                    float* pCRow = pCroot + mFull * n;
+
+                    int j = 0;
+                    for (; j + Nr <= n; j += Nr)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTailS, ncActual: Nr);
+                    }
+
+                    int ncTail = n - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTailS, ncActual: ncTail);
+                    }
                 }
             }
-
-            // M-edge (mc ∈ [1, 5]): remaining rows go through the masked kernel.
-            int mcTail = m - mFull;
-            if (mcTail > 0)
+            else
             {
-                float* pARow = pAroot + mFull * lda;
-                float* pCRow = pCroot + mFull * n;
-
-                int j = 0;
-                for (; j + Nr <= n; j += Nr)
+                // Accumulate path (load-add-store) — caller may have prior
+                // values in C (SgemmAdd or Sgemm-with-beta=1).
+                for (int i = 0; i < mFull; i += Mr)
                 {
-                    DirectKernelMxNMasked(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: Nr);
+                    float* pARow = pAroot + i * lda;
+                    float* pCRow = pCroot + i * n;
+
+                    int j = 0;
+                    for (; j + Nr <= n; j += Nr)
+                    {
+                        DirectKernel6x16(pARow, lda, pBroot + j, ldb, pCRow + j, n, k);
+                    }
+
+                    int ncTail = n - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMasked(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: Mr, ncActual: ncTail);
+                    }
                 }
 
-                // Corner: both M and N edges.
-                int ncTail = n - j;
-                if (ncTail > 0)
+                int mcTail = m - mFull;
+                if (mcTail > 0)
                 {
-                    DirectKernelMxNMasked(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: ncTail);
+                    float* pARow = pAroot + mFull * lda;
+                    float* pCRow = pCroot + mFull * n;
+
+                    int j = 0;
+                    for (; j + Nr <= n; j += Nr)
+                    {
+                        DirectKernelMxNMasked(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTail, ncActual: Nr);
+                    }
+
+                    int ncTail = n - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMasked(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTail, ncActual: ncTail);
+                    }
                 }
             }
         }
@@ -434,6 +504,14 @@ internal static class SimdGemm
         float* pA4 = pA + lda * 4;
         float* pA5 = pA + lda * 5;
 
+        // Iter 38/38b (REVERTED): tried pre-broadcasting 6 A's (REGRESSED 44%
+        // due to YMM register spilling — 12 accum + 2 B + 6 A = 20 needed,
+        // only 16 available) and a separate 2× K-unroll-only variant
+        // (NEUTRAL — RyuJIT already handles loop overhead at this density,
+        // adding manual unroll didn't help and added code volume).
+        // Reverted to iter 34 straight K-loop with broadcast→FMA interleaving
+        // which keeps live YMM count at 14 (each A broadcast dies after 2
+        // FMAs and recycles for the next row).
         for (int p = 0; p < k; p++)
         {
             var b0 = Avx.LoadVector256(pB);
@@ -584,6 +662,165 @@ internal static class SimdGemm
         var existing1 = Avx.MaskLoad(row + 8, m1);
         Avx.MaskStore(row, m0, Avx.Add(existing0, v0));
         Avx.MaskStore(row + 8, m1, Avx.Add(existing1, v1));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Iter 39: Store-only variants of the direct kernels. Identical FMA body
+    // to the load-add-store versions, but the store phase OVERWRITES C
+    // instead of accumulating. Caller (SgemmDirect with clearedOutput=true)
+    // guarantees C was zeroed before the call, so overwriting is correct.
+    // Saves 12 vmovups loads + 12 vaddps adds per micro-tile (about 24-36
+    // cycles on Zen 2 = 7-10 ns per call × 672 calls ≈ 5-7 µs per Q·K^T).
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Iter 39: store-only variant of <see cref="DirectKernel6x16"/>. Same
+    /// 12-accumulator FMA body, plain Avx.Store at exit (no load-add).
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void DirectKernel6x16Store(
+        float* pA, int lda,
+        float* pB, int ldb,
+        float* pC, int ldc,
+        int k)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            var a1 = Vector256.Create(pA1[p]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+
+            var a2 = Vector256.Create(pA2[p]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+
+            var a3 = Vector256.Create(pA3[p]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+
+            var a4 = Vector256.Create(pA4[p]);
+            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+
+            var a5 = Vector256.Create(pA5[p]);
+            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+
+            pB += ldb;
+        }
+
+        // Store-only: caller cleared C, so OVERWRITE not accumulate.
+        Avx.Store(pC + 0, c00); Avx.Store(pC + 8, c01); pC += ldc;
+        Avx.Store(pC + 0, c10); Avx.Store(pC + 8, c11); pC += ldc;
+        Avx.Store(pC + 0, c20); Avx.Store(pC + 8, c21); pC += ldc;
+        Avx.Store(pC + 0, c30); Avx.Store(pC + 8, c31); pC += ldc;
+        Avx.Store(pC + 0, c40); Avx.Store(pC + 8, c41); pC += ldc;
+        Avx.Store(pC + 0, c50); Avx.Store(pC + 8, c51);
+    }
+
+    /// <summary>
+    /// Iter 39: store-only variant of <see cref="DirectKernelMxNMasked"/>.
+    /// Same 12-accumulator FMA body with mcActual guards, plain MaskStore
+    /// at exit (no MaskLoad-add). Caller cleared C.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void DirectKernelMxNMaskedStore(
+        float* pA, int lda,
+        float* pB, int ldb,
+        float* pC, int ldc,
+        int k, int mcActual, int ncActual)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            if (mcActual > 1)
+            {
+                var a1 = Vector256.Create(pA1[p]);
+                c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+            }
+            if (mcActual > 2)
+            {
+                var a2 = Vector256.Create(pA2[p]);
+                c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+            }
+            if (mcActual > 3)
+            {
+                var a3 = Vector256.Create(pA3[p]);
+                c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+            }
+            if (mcActual > 4)
+            {
+                var a4 = Vector256.Create(pA4[p]);
+                c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+            }
+            if (mcActual > 5)
+            {
+                var a5 = Vector256.Create(pA5[p]);
+                c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            }
+
+            pB += ldb;
+        }
+
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+
+        // Store-only: plain MaskStore (no MaskLoad-add).
+        if (mcActual > 0) StoreMaskedRowDirect(pC,            mask0, mask1, c00, c01);
+        if (mcActual > 1) StoreMaskedRowDirect(pC + ldc,      mask0, mask1, c10, c11);
+        if (mcActual > 2) StoreMaskedRowDirect(pC + ldc * 2,  mask0, mask1, c20, c21);
+        if (mcActual > 3) StoreMaskedRowDirect(pC + ldc * 3,  mask0, mask1, c30, c31);
+        if (mcActual > 4) StoreMaskedRowDirect(pC + ldc * 4,  mask0, mask1, c40, c41);
+        if (mcActual > 5) StoreMaskedRowDirect(pC + ldc * 5,  mask0, mask1, c50, c51);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreMaskedRowDirect(
+        float* row, Vector256<float> m0, Vector256<float> m1,
+        Vector256<float> v0, Vector256<float> v1)
+    {
+        // Plain MaskStore — no MaskLoad-add. Caller guarantees C was cleared
+        // (zeros where ncActual == Nr; lane masking still preserves the
+        // surrounding-data invariant for partial-nc tiles where the masked-out
+        // lanes shouldn't be touched).
+        Avx.MaskStore(row, m0, v0);
+        Avx.MaskStore(row + 8, m1, v1);
     }
 
     /// <summary>
