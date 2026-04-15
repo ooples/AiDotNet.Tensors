@@ -68,4 +68,17 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float beta2 = 0.999f,
         float eps = 1e-8f,
         float weightDecay = 0f);
+
+    /// <summary>
+    /// Enables gradient checkpointing for this plan, reducing activation memory from
+    /// O(N) to O(sqrt(N)) at the cost of ~33% more compute (each segment's forward
+    /// runs twice during backward). Call once after compilation, before the training loop.
+    /// </summary>
+    /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
+    /// <remarks>
+    /// The implementation is idempotent per plan — the most recent call wins. The
+    /// checkpointing system wraps the forward actions; gradients remain numerically
+    /// equivalent to the non-checkpointed path within floating-point tolerance.
+    /// </remarks>
+    void EnableCheckpointing(int segmentSize = 0);
 }
