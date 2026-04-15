@@ -65,16 +65,18 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
 
-    // Iter 35 / 41 (both reverted): tried JIT-emitting a direct-access 6×16
-    // micro-kernel for k ≤ 128 (lda/ldb/ldc baked). Iter 35 used Delegate.Invoke
-    // (~40ns dispatch killed perf), iter 41 used `delegate* unmanaged[Stdcall]<>`
-    // (calli ~5 cycles) which saved 8 µs of dispatch but the JIT kernel itself
-    // was still 30 µs slower than iter 39's RyuJIT-inlined C# kernel.
+    // Iter 35 / 41 (both reverted): per-tile JIT kernels couldn't beat RyuJIT
+    // inlining because per-call dispatch overhead eats the small savings.
     //
-    // Conclusion: for small per-head matmuls, RyuJIT inlining + cross-call
-    // optimization beats hand-rolled JIT machine code. The 1.27× MKL gap is
-    // RyuJIT-vs-hand-tuned-asm territory — would need a true fat-kernel JIT
-    // (entire matmul in one code blob with outer loops in JIT) to close.
+    // Iter 42 — THE REAL FAT KERNEL: emit the ENTIRE SgemmDirect M×N loop as
+    // one machine-code blob. Outer loops, inner 6×16 micro-kernel body, and
+    // store phase all baked into one contiguous kernel. ONE dispatch per
+    // matmul (not 672). All of m/n/k/lda/ldb/ldc baked as immediates.
+    //
+    // Cache key (mFull, n, k, lda, ldb, ldc): mFull = (m/Mr)*Mr because the
+    // fat kernel only processes full 6-row blocks; caller handles M-edge in
+    // C# afterward using the existing masked kernel.
+    private static readonly ConcurrentDictionary<(int MFull, int N, int K, int Lda, int Ldb, int Ldc), Lazy<ExecutableBuffer>> _fatCache = new();
 
     // Cache compiled kernels by (opId, aligned, length)
     // Uses Lazy<> to ensure only one kernel is generated per key (avoids ExecutableBuffer leak under contention)
@@ -174,6 +176,28 @@ internal static class CpuJitKernels
             return (buf, (Delegate)buf.CreateDelegate<GemmMicroKernel>());
         }));
         return (GemmMicroKernel)entry.Value.Kernel;
+    }
+
+    /// <summary>
+    /// Iter 42: get function pointer to a FAT kernel that JIT-emits the
+    /// ENTIRE SgemmDirect M×N loop as one machine-code blob. ONE dispatch
+    /// per matmul (not 672 per-tile dispatches). Caller casts to
+    /// <c>delegate* unmanaged[Stdcall]&lt;float*, float*, float*, void&gt;</c>.
+    ///
+    /// <para>Preconditions: mFull % Mr==0 AND n % Nr==0 AND k ≤ 128 (full-unroll
+    /// cap). Caller handles M-edge (m - mFull rows) via the existing masked
+    /// kernel after the fat kernel returns. Kernel produces store-only output
+    /// so caller must have cleared C.</para>
+    /// </summary>
+    public static unsafe IntPtr GetFatKernelPtr(int mFull, int n, int k, int lda, int ldb, int ldc)
+    {
+        if (k <= 0 || k > 128) return IntPtr.Zero;
+        if (mFull <= 0 || n <= 0) return IntPtr.Zero;
+
+        var key = (mFull, n, k, lda, ldb, ldc);
+        var entry = _fatCache.GetOrAdd(key, _ => new Lazy<ExecutableBuffer>(() =>
+            GenerateFatKernel(mFull, n, k, lda, ldb, ldc)));
+        return new IntPtr(entry.Value.GetFunctionPointer());
     }
 
 
@@ -674,8 +698,10 @@ internal static class CpuJitKernels
     // back-to-back without the 2×-loop wrapper.
 
     // Stride constants used by the full-unroll emit (displacements into packedA/packedB).
-    private const int Mr_bytes = 24;  // Mr=6 × sizeof(float)
-    private const int Nr_bytes = 64;  // Nr=16 × sizeof(float)
+    private const int Mr = 6;
+    private const int Nr = 16;
+    private const int Mr_bytes = Mr * sizeof(float);   // 24
+    private const int Nr_bytes = Nr * sizeof(float);   // 64
 
     /// <summary>
     /// Emit one K-iteration's worth of the 6×16 FMA kernel at the given A/B displacements.
@@ -965,5 +991,166 @@ internal static class CpuJitKernels
             if (kvp.Value.IsValueCreated)
                 kvp.Value.Value.Buffer.Dispose();
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Iter 42: Fat kernel JIT — the whole M×N loop in one machine-code blob.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Generate the fat SgemmDirect kernel for a specific (mFull, n, k, lda, ldb, ldc)
+    /// shape. Entire outer M loop + outer N loop + inner 6×16 K-unrolled body
+    /// all baked into one native function.
+    ///
+    /// <para>Windows x64 StdCall ABI. Args: RCX=pA, RDX=pB, R8=pC.</para>
+    ///
+    /// <para>
+    /// Register usage inside the fat kernel:
+    ///   R12 = pA_row_base (advances by Mr*lda*4 per M iter)
+    ///   R13 = pB_base (constant)
+    ///   R14 = pC_row_base (advances by Mr*n*4 per M iter)
+    ///   RBX = M counter (compared to mFull)
+    ///   RAX = N counter (compared to n)
+    ///   RCX = pA inner (reset to R12 per M iter, stable through N loop)
+    ///   RDX = pB inner (reset to R13 per M iter, advances by Nr*4 per N iter)
+    ///   R8  = pC inner (reset to R14 per M iter, advances by Nr*4 per N iter)
+    ///   YMM0..YMM11 = 12 accumulators
+    ///   YMM12..YMM13 = B halves
+    ///   YMM14 = A broadcast scratch
+    /// </para>
+    /// <para>
+    /// R12-R15 and RBX are callee-saved (preserved by X86Emitter.Prologue/Epilogue).
+    /// RCX/RDX/R8 are caller-saved so we freely clobber them.
+    /// </para>
+    /// </summary>
+    private static ExecutableBuffer GenerateFatKernel(int mFull, int n, int k, int lda, int ldb, int ldc)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        // Save R12-R14 (callee-saved per Windows x64 ABI). Prologue() only
+        // saves RBX/RBP/XMM6-15 since most kernels don't use R12+. The fat
+        // kernel uses R12-R14 to hold pA/pB/pC bases across the outer loops,
+        // so we save/restore them manually here instead of in Prologue (which
+        // would add unnecessary overhead to every other JIT kernel).
+        e.Push(X86Emitter.R12);
+        e.Push(X86Emitter.R13);
+        e.Push(X86Emitter.R14);
+
+        int ldaBytes = lda * sizeof(float);
+        int ldbBytes = ldb * sizeof(float);
+        int ldcBytes = ldc * sizeof(float);
+        int nBytes = n * sizeof(float);
+
+        // Save input args to callee-saved registers.
+        e.MovRR(X86Emitter.R12, X86Emitter.RCX);   // R12 = pA row base
+        e.MovRR(X86Emitter.R13, X86Emitter.RDX);   // R13 = pB base (constant)
+        e.MovRR(X86Emitter.R14, X86Emitter.R8);    // R14 = pC row base
+
+        // M counter = 0 (stored in RBX, callee-saved)
+        e.MovImm32(X86Emitter.RBX, 0);
+
+        int mLoopLabel = e.NewLabel();
+        e.BindLabel(mLoopLabel);
+        {
+            // Refresh RCX/RDX/R8 for this M iteration.
+            e.MovRR(X86Emitter.RCX, X86Emitter.R12);   // pA inner (stable in N loop)
+            e.MovRR(X86Emitter.RDX, X86Emitter.R13);   // pB inner (advances per N)
+            e.MovRR(X86Emitter.R8,  X86Emitter.R14);   // pC inner (advances per N)
+            e.MovImm32(X86Emitter.RAX, 0);             // N counter = 0
+
+            int nLoopLabel = e.NewLabel();
+            e.BindLabel(nLoopLabel);
+            {
+                // === Inlined 6×16 micro-kernel body ===
+
+                // Zero the 12 accumulators (YMM0..YMM11).
+                for (int r = 0; r < 12; r++)
+                {
+                    e.Vxorps(r, r, r);
+                }
+
+                // Full K-unroll (k ≤ 128 per the caller's gate).
+                // Per K iter p: 2 vmovups B + 6 vbroadcastss A + 12 vfmadd231ps = 20 instr.
+                for (int p = 0; p < k; p++)
+                {
+                    int bDisp = p * ldbBytes;
+                    e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, bDisp);
+                    e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, bDisp + 32);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 1 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 2 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 3 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+                    e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 5 * ldaBytes + p * 4);
+                    e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+                    e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+                }
+
+                // Store phase — plain stores into C (caller cleared C).
+                // R8 is pC inner = pC_row_base + j*4.
+                e.VmovupsStore(X86Emitter.YMM0,  X86Emitter.R8, 0);
+                e.VmovupsStore(X86Emitter.YMM1,  X86Emitter.R8, 32);
+                e.VmovupsStore(X86Emitter.YMM2,  X86Emitter.R8, ldcBytes);
+                e.VmovupsStore(X86Emitter.YMM3,  X86Emitter.R8, ldcBytes + 32);
+                e.VmovupsStore(X86Emitter.YMM4,  X86Emitter.R8, ldcBytes * 2);
+                e.VmovupsStore(X86Emitter.YMM5,  X86Emitter.R8, ldcBytes * 2 + 32);
+                e.VmovupsStore(X86Emitter.YMM6,  X86Emitter.R8, ldcBytes * 3);
+                e.VmovupsStore(X86Emitter.YMM7,  X86Emitter.R8, ldcBytes * 3 + 32);
+                e.VmovupsStore(X86Emitter.YMM8,  X86Emitter.R8, ldcBytes * 4);
+                e.VmovupsStore(X86Emitter.YMM9,  X86Emitter.R8, ldcBytes * 4 + 32);
+                e.VmovupsStore(X86Emitter.YMM10, X86Emitter.R8, ldcBytes * 5);
+                e.VmovupsStore(X86Emitter.YMM11, X86Emitter.R8, ldcBytes * 5 + 32);
+
+                // Advance N: j += Nr
+                //   RDX (pB inner) += Nr*4 (16 floats = 64 bytes)
+                //   R8 (pC inner) += Nr*4
+                //   RAX (N counter) += Nr
+                e.AddImm32(X86Emitter.RDX, Nr * sizeof(float));
+                e.AddImm32(X86Emitter.R8,  Nr * sizeof(float));
+                e.AddImm32(X86Emitter.RAX, Nr);
+
+                // if (RAX < n) goto nLoopLabel
+                e.CmpImm32(X86Emitter.RAX, n);
+                e.Jl(nLoopLabel);
+            }
+
+            // Advance M: i += Mr
+            //   R12 (pA_row_base) += Mr*lda*4
+            //   R14 (pC_row_base) += Mr*n*4
+            //   RBX (M counter) += Mr
+            e.AddImm32(X86Emitter.R12, Mr * ldaBytes);
+            e.AddImm32(X86Emitter.R14, Mr * nBytes);
+            e.AddImm32(X86Emitter.RBX, Mr);
+
+            // if (RBX < mFull) goto mLoopLabel
+            e.CmpImm32(X86Emitter.RBX, mFull);
+            e.Jl(mLoopLabel);
+        }
+
+        // Restore R12-R14 in reverse push order before the standard Epilogue
+        // (which unwinds RBX/RBP/XMM6-15).
+        e.Pop(X86Emitter.R14);
+        e.Pop(X86Emitter.R13);
+        e.Pop(X86Emitter.R12);
+
+        e.Epilogue();
+        return e.Build();
     }
 }

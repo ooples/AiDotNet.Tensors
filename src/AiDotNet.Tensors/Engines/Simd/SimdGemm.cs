@@ -371,23 +371,53 @@ internal static class SimdGemm
         // inlined at the call site so dispatch cost is zero. Beating MKL on
         // per-head attn would need fat-kernel JIT (one P/Invoke per matmul).
 
-        // Iter 41 (REVERTED): tried calling a JIT-emitted direct kernel via
-        // `delegate* unmanaged[Stdcall]<>` (calli, ~5 cycles) instead of
-        // Delegate.Invoke (~40ns). The function-pointer trick did save ~8 µs
-        // of per-matmul dispatch (Q·K^T 144→136 vs iter 35's Delegate.Invoke
-        // version) but the JIT kernel itself was still 30 µs slower than
-        // iter 39's RyuJIT-inlined C# kernel (107 µs). Net regression.
-        //
-        // Lesson: for SMALL micro-kernels with high call frequency, RyuJIT
-        // inlining + cross-call optimization beats hand-rolled JIT + raw
-        // function-pointer dispatch. The remaining 1.27× MKL gap on per-head
-        // attention is RyuJIT-vs-hand-tuned-assembly territory — would need a
-        // true fat-kernel JIT (entire matmul in machine code, no per-tile
-        // dispatch) which is a multi-day infrastructure project.
+        // Iter 42: TRUE fat-kernel JIT — entire SgemmDirect M×N loop as ONE
+        // machine-code blob. One dispatch per matmul (not 672 per-tile calls).
+        // Gate: clearedOutput, k ≤ 128, n % Nr == 0, m ≥ Mr. The M-edge
+        // (m - mFull rows) is handled after the fat kernel by the existing
+        // C# masked kernel (rare path, ≤ 1 tile per matmul).
+        int mFullIter42 = (m / Mr) * Mr;
+        IntPtr fatFn = (clearedOutput
+            && (n % Nr == 0)
+            && mFullIter42 >= Mr
+            && k <= 128)
+            ? CpuJitKernels.GetFatKernelPtr(mFullIter42, n, k, lda, ldb, n)
+            : IntPtr.Zero;
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
-            if (clearedOutput)
+            if (fatFn != IntPtr.Zero)
+            {
+                // Iter 42: ONE JIT dispatch does the entire [mFullIter42, n]
+                // output region. Outer M and N loops are in machine code.
+                var fn = (delegate* unmanaged[Stdcall]<float*, float*, float*, void>)fatFn;
+                fn(pAroot, pBroot, pCroot);
+
+                // Handle M-edge in C# (≤ Mr-1 rows, at most one per matmul).
+                int mcTail42 = m - mFullIter42;
+                if (mcTail42 > 0)
+                {
+                    float* pARow = pAroot + mFullIter42 * lda;
+                    float* pCRow = pCroot + mFullIter42 * n;
+
+                    int j = 0;
+                    for (; j + Nr <= n; j += Nr)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTail42, ncActual: Nr);
+                    }
+
+                    int ncTail = n - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                            k, mcActual: mcTail42, ncActual: ncTail);
+                    }
+                }
+            }
+            else if (clearedOutput)
             {
                 // Store-only path — caller cleared C, so kernel can OVERWRITE.
                 for (int i = 0; i < mFull; i += Mr)
