@@ -325,28 +325,33 @@ internal static class SimdGemm
         int mFull = (m / Mr) * Mr;
         int nFull = (n / Nr) * Nr;
 
-        // Iter 35 (REVERTED): tried JIT-emitting the 6×16 direct kernel with
-        // k/lda/ldb/ldc all baked as immediates (full-unroll for k ≤ 128).
-        // Expected to beat the inlined C# kernel by eliminating C# compile
-        // overhead. Instead regressed Q·K^T by 34% (107µs → 144µs).
+        // Iter 37 (REVERTED): tried packing B into a 64B-aligned [numNrTiles,
+        // k, Nr] layout to convert strided B reads (ldb=256 for Q·K^T = 1024
+        // byte stride per K iter = 16 cache lines apart) into sequential
+        // 64-byte stride per K iter (1 cache line). Hypothesis: HW prefetcher
+        // would handle the sequential stream better, closing the 1.26× gap
+        // to MKL on per-head attention. Result: NEUTRAL on Q·K^T (107µs
+        // unchanged), slightly NEGATIVE on A·V (109µs → 122µs in Par=F).
         //
-        // Root cause: UnmanagedFunctionPointer-backed delegate invoke has
-        // ~40ns P/Invoke overhead per call. The PACKED JIT kernel
-        // (CpuJitKernels.GetGemmMicroKernel) absorbs this fine because each
-        // call does Kc=512 iterations ≈ 12K FMAs ≈ 1000ns of compute — 4%
-        // overhead. The DIRECT kernel at k=72 does only 864 FMAs ≈ 140ns
-        // per call — 22% overhead from the 40ns dispatch cost, net-negative
-        // vs the inlined [MethodImpl(HotInline)] C# variant.
+        // Why it failed: B = 73 KB for both per-head shapes. After the first
+        // Mr-tile pass through B, it's all in L2 (512KB) and stays there
+        // for the remaining 41 Mr-tile passes. L2 access ~12 cycles per
+        // cache line regardless of stride pattern. The HW prefetcher's
+        // "trouble with stride" only costs us when data has to come from L3
+        // or DRAM — for these L2-resident B matrices, stride doesn't matter.
+        // Packing added ~2-3 µs of overhead with no compensating speedup.
         //
-        // The C# DirectKernel6x16 gets RyuJIT-inlined at the call site
-        // here, so its dispatch cost is zero. RyuJIT emits essentially the
-        // same AVX2 machine code that the hand-rolled JIT would emit. The
-        // JIT kernel's theoretical advantages (full unroll, immediate disps)
-        // don't overcome the per-call barrier for small kernels.
+        // The remaining 1.26× gap is likely from:
+        //   1. MKL using a different micro-kernel layout (e.g. 4×24)
+        //   2. MKL using aligned loads (vmovaps) vs our vmovups
+        //   3. MKL hand-tuned instruction scheduling beyond what RyuJIT does
+        // None of those are easily addressable without a fat-kernel JIT.
         //
-        // The right path to beat MKL's 85µs on Q·K^T is a FAT-kernel JIT —
-        // emit the entire SgemmDirect M×N loop as one kernel so only ONE
-        // P/Invoke per matmul instead of 672. Deferred — significant effort.
+        // Iter 35 revert note (still relevant): tried JIT-emitting the 6×16
+        // direct kernel — regressed 34% on Q·K^T because P/Invoke overhead
+        // per call dominated at small k. The C# DirectKernel6x16 gets RyuJIT-
+        // inlined at the call site so dispatch cost is zero. Beating MKL on
+        // per-head attn would need fat-kernel JIT (one P/Invoke per matmul).
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
