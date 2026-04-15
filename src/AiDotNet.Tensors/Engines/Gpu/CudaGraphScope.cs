@@ -35,8 +35,11 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </remarks>
 public sealed class CudaGraphScope : IDisposable
 {
-    // Backend retained for future graph replay integration with batch execution
-    internal readonly IGpuBatchExecution Backend;
+    // Backend retained for future graph replay integration (batch execution,
+    // resource lifetime, device-memory validation). Capture/replay itself only
+    // uses _stream — the backend reference is carried for future enhancements
+    // and to tie the scope's lifetime to a specific GPU context.
+    internal readonly IDirectGpuBackend Backend;
     private readonly IntPtr _stream;
     private IntPtr _graph;
     private IntPtr _graphExec;
@@ -62,9 +65,15 @@ public sealed class CudaGraphScope : IDisposable
     /// <summary>
     /// Creates a new CUDA graph scope.
     /// </summary>
-    /// <param name="backend">The GPU backend to use for graph operations.</param>
+    /// <param name="backend">
+    /// The direct GPU backend to associate with this scope (typically a
+    /// <c>CudaBackend</c>). Any <see cref="IDirectGpuBackend"/> is accepted;
+    /// graph capture only uses the supplied CUDA <paramref name="stream"/>,
+    /// but the backend reference is retained for lifecycle management and
+    /// future batch-execution integration.
+    /// </param>
     /// <param name="stream">The CUDA stream to capture on. Must be a user-created stream, not the default/null stream (CUDA requires this for graph capture).</param>
-    public CudaGraphScope(IGpuBatchExecution backend, IntPtr stream)
+    public CudaGraphScope(IDirectGpuBackend backend, IntPtr stream)
     {
         Backend = backend ?? throw new ArgumentNullException(nameof(backend));
         if (stream == IntPtr.Zero)
