@@ -130,6 +130,12 @@ public static class AutotuneCache
     /// is safe because the winner for the same shape on the same hardware is
     /// expected to be deterministic.
     /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="winner"/> is null.</exception>
+    /// <exception cref="ArgumentException">The winner has a missing
+    /// <see cref="KernelChoice.Variant"/> or null
+    /// <see cref="KernelChoice.Parameters"/> — failing loudly here keeps the
+    /// <c>Store</c> → <c>Lookup</c> round-trip contract honest, instead of
+    /// writing a file that the reader would immediately reject as corruption.</exception>
     /// <exception cref="IOException">Thrown only for non-recoverable filesystem
     /// failures (disk full, read-only cache root). Callers who consider the
     /// cache optional should wrap in a try/catch.</exception>
@@ -137,8 +143,42 @@ public static class AutotuneCache
     {
         if (winner is null) throw new ArgumentNullException(nameof(winner));
 
+        // Boundary validation: reject the same "incomplete payload" shapes that
+        // Lookup's completeness guard refuses to return. Without this, a caller
+        // could store `new KernelChoice { Variant = null, Parameters = null }`,
+        // succeed, and then see Lookup() report a miss — silently breaking the
+        // round-trip contract. Fail loudly at the write boundary instead.
+        if (string.IsNullOrWhiteSpace(winner.Variant))
+            throw new ArgumentException(
+                "KernelChoice.Variant must be a non-empty, non-whitespace string. " +
+                "A winner without a variant identifier is not a valid cache entry.",
+                nameof(winner));
+        if (winner.Parameters is null)
+            throw new ArgumentException(
+                "KernelChoice.Parameters must not be null (use an empty dictionary " +
+                "if no tuned hyperparameters apply).",
+                nameof(winner));
+
+        // Persist a shallow copy rather than the caller's instance so we can:
+        //   (1) stamp CurrentSchemaVersion authoritatively — callers don't get
+        //       to write arbitrary SchemaVersion values that Lookup would then
+        //       reject (same round-trip contract as above).
+        //   (2) defensively copy Parameters so a later mutation by the caller
+        //       doesn't alter what ends up on disk (or doesn't, if we lose a
+        //       race with the write).
+        //   (3) leave the caller's object untouched — no surprising side effects.
+        var persisted = new KernelChoice
+        {
+            Variant        = winner.Variant,
+            Parameters     = new Dictionary<string, string>(winner.Parameters),
+            MeasuredGflops = winner.MeasuredGflops,
+            MeasuredTimeMs = winner.MeasuredTimeMs,
+            RecordedAtUtc  = winner.RecordedAtUtc,
+            SchemaVersion  = CurrentSchemaVersion,
+        };
+
         // Serialize outside the lock so we don't hold it across JSON work.
-        string json = JsonSerializer.Serialize(winner, _jsonOptions);
+        string json = JsonSerializer.Serialize(persisted, _jsonOptions);
 
         string finalPath = ResolvePath(kernelId, shape);
         string directory = Path.GetDirectoryName(finalPath)

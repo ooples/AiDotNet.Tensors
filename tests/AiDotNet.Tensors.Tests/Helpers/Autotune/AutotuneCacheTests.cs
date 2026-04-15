@@ -242,6 +242,78 @@ public sealed class AutotuneCacheTests : IDisposable
         Assert.Null(AutotuneCache.Lookup(Gemm, Shape256));
     }
 
+    // ── Store-side validation (round-trip contract) ─────────────────────────
+    //
+    // Lookup's completeness guard rejects JSON with null Variant / null
+    // Parameters / out-of-range SchemaVersion. The symmetric requirement on
+    // Store is: reject the same shapes at the write boundary so the public
+    // Store → Lookup round-trip contract holds for any input Store accepts.
+    // Otherwise a caller could Store garbage, get no error, then see a silent
+    // cache miss on the very next Lookup — the exact "works until it doesn't"
+    // class of bug this feature was built to prevent.
+
+    [Fact]
+    public void Store_WithNullVariant_ThrowsArgumentException()
+    {
+        var winner = MakeWinner();
+        winner.Variant = null!; // simulate a broken caller
+        var ex = Assert.Throws<ArgumentException>(() => AutotuneCache.Store(Gemm, Shape256, winner));
+        Assert.Equal("winner", ex.ParamName);
+    }
+
+    [Fact]
+    public void Store_WithWhitespaceVariant_ThrowsArgumentException()
+    {
+        var winner = MakeWinner();
+        winner.Variant = "   ";
+        Assert.Throws<ArgumentException>(() => AutotuneCache.Store(Gemm, Shape256, winner));
+    }
+
+    [Fact]
+    public void Store_WithNullParameters_ThrowsArgumentException()
+    {
+        var winner = MakeWinner();
+        winner.Parameters = null!;
+        var ex = Assert.Throws<ArgumentException>(() => AutotuneCache.Store(Gemm, Shape256, winner));
+        Assert.Equal("winner", ex.ParamName);
+    }
+
+    [Fact]
+    public void Store_StampsCurrentSchemaVersion_EvenWhenCallerSetsDifferentValue()
+    {
+        // A caller constructing a KernelChoice directly might set SchemaVersion
+        // to anything — a stale value bumped in a future library version, or
+        // an uninitialized 0. Store is authoritative: it writes
+        // CurrentSchemaVersion regardless, so the file is always readable
+        // by THIS binary on the next lookup.
+        var winner = MakeWinner();
+        winner.SchemaVersion = 999; // a value Lookup would reject as forward-incompat
+        AutotuneCache.Store(Gemm, Shape256, winner);
+
+        var loaded = AutotuneCache.Lookup(Gemm, Shape256);
+        Assert.NotNull(loaded);
+        // The persisted file must carry the current schema, not the caller's value.
+        Assert.Equal(1, loaded!.SchemaVersion);
+    }
+
+    [Fact]
+    public void Store_DoesNotMutateCallerWinnerInstance()
+    {
+        // Store persists a shallow copy — the caller's object must survive
+        // untouched. Protects against a subtle class of bug where the caller
+        // later reads winner.SchemaVersion and sees a value that Store
+        // overwrote.
+        var winner = MakeWinner();
+        winner.SchemaVersion = 42;
+        int originalSchema = winner.SchemaVersion;
+        var originalParamsRef = winner.Parameters;
+
+        AutotuneCache.Store(Gemm, Shape256, winner);
+
+        Assert.Equal(originalSchema, winner.SchemaVersion);
+        Assert.Same(originalParamsRef, winner.Parameters); // Parameters reference unchanged
+    }
+
     // ── Atomic-write semantics ───────────────────────────────────────────────
     [Fact]
     public void Store_LeavesNoTempFilesBehind()
