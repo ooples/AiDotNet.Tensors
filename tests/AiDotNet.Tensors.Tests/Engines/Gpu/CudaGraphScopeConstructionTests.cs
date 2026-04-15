@@ -31,13 +31,18 @@ public class CudaGraphScopeConstructionTests
     [Fact]
     public void Constructor_PublicSignature_TakesIDirectGpuBackend()
     {
-        var ctor = typeof(CudaGraphScope).GetConstructors(BindingFlags.Public | BindingFlags.Instance)
-            .Single();
+        // Look up the specific (IDirectGpuBackend, IntPtr) constructor by
+        // parameter types rather than asserting there is exactly one public
+        // constructor — that way a future overload (e.g. one that takes an
+        // additional options parameter) doesn't break this contract check
+        // as long as the documented signature still exists.
+        var ctor = typeof(CudaGraphScope).GetConstructor(
+            BindingFlags.Public | BindingFlags.Instance,
+            binder: null,
+            types: new[] { typeof(IDirectGpuBackend), typeof(IntPtr) },
+            modifiers: null);
 
-        var parameters = ctor.GetParameters();
-        Assert.Equal(2, parameters.Length);
-        Assert.Equal(typeof(IDirectGpuBackend), parameters[0].ParameterType);
-        Assert.Equal(typeof(IntPtr), parameters[1].ParameterType);
+        Assert.NotNull(ctor);
     }
 
     /// <summary>

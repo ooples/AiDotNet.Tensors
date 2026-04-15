@@ -20,8 +20,11 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// // Warmup run (required by CUDA graphs)
 /// var output = model.Forward(input);
 ///
-/// // Record the graph
-/// using var graph = new CudaGraphScope(backend);
+/// // Create a CUDA stream for capture (caller owns its lifetime).
+/// IntPtr stream = backend.CreateStream();
+///
+/// // Record the graph on that stream
+/// using var graph = new CudaGraphScope(backend, stream);
 /// graph.BeginCapture();
 /// var recorded = model.Forward(input);  // Operations are recorded, not executed
 /// graph.EndCapture();
