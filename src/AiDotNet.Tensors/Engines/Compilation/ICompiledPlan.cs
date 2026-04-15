@@ -68,4 +68,35 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float beta2 = 0.999f,
         float eps = 1e-8f,
         float weightDecay = 0f);
+
+    /// <summary>
+    /// Enables gradient checkpointing for this plan, reducing activation memory from
+    /// O(N) to O(sqrt(N)) at the cost of ~33% more compute (each segment's forward
+    /// runs twice during backward). Call once after compilation, before the training loop.
+    /// </summary>
+    /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
+    /// <remarks>
+    /// <para>
+    /// This setting is reconfigurable per plan: if called multiple times, the most
+    /// recent call determines the active checkpointing configuration (previous
+    /// segment-size choices are overwritten rather than merged). The checkpointing
+    /// system wraps the forward actions; gradients remain numerically equivalent
+    /// to the non-checkpointed path within floating-point tolerance.
+    /// </para>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #165):</b> adding this member to
+    /// <see cref="ICompiledTrainingPlan{T}"/> is both a source-breaking change for any
+    /// downstream consumer that implements this interface directly (not just uses it)
+    /// <b>and</b> a binary-breaking change for already-compiled external implementers
+    /// at runtime. The built-in <c>CompiledTrainingPlan&lt;T&gt;</c> in this assembly
+    /// is updated alongside this interface addition, so internal consumers are
+    /// unaffected — but third-party implementers must recompile against this assembly
+    /// and add a corresponding method. No default-interface-member polyfill is
+    /// provided because .NET Framework 4.7.1 (one of this library's target frameworks)
+    /// does not support default interface members. Added per Issue #165 where the
+    /// downstream consumer needed interface-level access (not a concrete-class cast)
+    /// to route checkpointing through <see cref="CompiledModelCache{T}"/>.
+    /// </para>
+    /// </remarks>
+    void EnableCheckpointing(int segmentSize = 0);
 }
