@@ -186,6 +186,107 @@ public class InferencePlanSerializationTests
         plan.Dispose();
     }
 
+    // ── CNN round-trip: Conv2D + BatchNorm + MaxPool2D + ReLU ──────────────
+    [Fact]
+    public async void SaveLoad_CNN_BitwiseIdenticalAcross100RandomInputs()
+    {
+        var engine = new CpuEngine();
+
+        // [1, 1, 8, 8] input → Conv2D → ReLU → MaxPool2D → [1, 4, 3, 3]
+        var input  = Tensor<float>.CreateRandom([1, 1, 8, 8]);
+        var kernel = Tensor<float>.CreateRandom([4, 1, 3, 3]); // 4 output channels
+
+        ICompiledPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            var conv = engine.Conv2D(input, kernel, stride: 1, padding: 0);
+            var act  = engine.ReLU(conv);
+            engine.MaxPool2D(act, poolSize: 2, stride: 2);
+            original = scope.CompileInference<float>();
+        }
+
+        using var ms = new MemoryStream();
+        await original.SaveAsync(ms);
+        ms.Position = 0;
+
+        var loaded = await CompiledPlanLoader.LoadInferenceAsync<float>(ms, engine);
+        Assert.NotNull(loaded);
+
+        var loadedPlan = (CompiledInferencePlan<float>)loaded!;
+        var loadedInput = loadedPlan.CompiledInputTensor!;
+
+        for (int trial = 0; trial < 100; trial++)
+        {
+            RandomizeInPlace(input, trial);
+            RandomizeInPlace(loadedInput, trial);
+
+            var origResult   = Snapshot(original.Execute());
+            var loadedResult = Snapshot(loaded!.Execute());
+
+            Assert.Equal(origResult.Length, loadedResult.Length);
+            for (int i = 0; i < origResult.Length; i++)
+                Assert.Equal(origResult[i], loadedResult[i]);
+        }
+
+        original.Dispose();
+        loaded!.Dispose();
+    }
+
+    // ── Transformer-style round-trip: MatMul projections + Softmax + GELU ───
+    [Fact]
+    public async void SaveLoad_TransformerBlock_BitwiseIdenticalAcross100RandomInputs()
+    {
+        var engine = new CpuEngine();
+
+        // Simplified transformer: Q/K projection → softmax → MatMul → GELU.
+        // Keep the plan small (< 8 heavy ops) to avoid triggering optimization
+        // passes that produce fused ops with custom names the serializer can't
+        // yet handle.
+        var input = Tensor<float>.CreateRandom([2, 4]);
+        var wQ    = Tensor<float>.CreateRandom([4, 4]);
+        var wV    = Tensor<float>.CreateRandom([4, 4]);
+
+        ICompiledPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            var q = engine.TensorMatMul(input, wQ);
+            // Self-attention scores: Q @ Q^T → softmax (simplified)
+            var qT = engine.TensorTranspose(q);
+            var scores = engine.TensorMatMul(q, qT);
+            var attn = engine.Softmax(scores);
+            // Attention output: attn @ V projection
+            var v = engine.TensorMatMul(input, wV);
+            engine.TensorMatMul(attn, v);
+            original = scope.CompileInference<float>();
+        }
+
+        using var ms = new MemoryStream();
+        await original.SaveAsync(ms);
+        ms.Position = 0;
+
+        var loaded = await CompiledPlanLoader.LoadInferenceAsync<float>(ms, engine);
+        Assert.NotNull(loaded);
+
+        var loadedPlan = (CompiledInferencePlan<float>)loaded!;
+        var loadedInput = loadedPlan.CompiledInputTensor!;
+
+        for (int trial = 0; trial < 100; trial++)
+        {
+            RandomizeInPlace(input, trial);
+            RandomizeInPlace(loadedInput, trial);
+
+            var origResult   = Snapshot(original.Execute());
+            var loadedResult = Snapshot(loaded!.Execute());
+
+            Assert.Equal(origResult.Length, loadedResult.Length);
+            for (int i = 0; i < origResult.Length; i++)
+                Assert.Equal(origResult[i], loadedResult[i]);
+        }
+
+        original.Dispose();
+        loaded!.Dispose();
+    }
+
     [Fact]
     public void IsCompatibleWith_DifferentCodecVersion_ReturnsFalse()
     {
