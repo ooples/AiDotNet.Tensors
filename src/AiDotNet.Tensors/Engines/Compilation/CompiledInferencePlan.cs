@@ -148,14 +148,53 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         int[] inputShape,
         Tensor<T>? compiledInputTensor)
     {
+        // Run TryBuildSpecializedForward on the deserialized steps so the
+        // loaded plan uses the same SIMD-tuned kernels as the original.
+        // Without this, the loaded plan's generic engine-method closures
+        // produce slightly different floating-point results due to
+        // accumulation-order differences (6th decimal place on MatMul).
+        // Graph-level optimization passes are NOT re-run — the saved plan
+        // was already optimized before serialization.
+        var pinnedHandles = new List<GCHandle>();
+        var specialized = new CompiledStep<T>[steps.Length];
+        for (int i = 0; i < steps.Length; i++)
+        {
+            var step = steps[i];
+            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles);
+            if (spec != null)
+            {
+                var output = step.OutputBuffer;
+                specialized[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) => spec(eng),
+                    output,
+                    step.Inputs,
+                    step.BackwardFn,
+                    step.SavedState);
+            }
+            else
+            {
+                specialized[i] = step;
+            }
+        }
+
+        // Clear LazySource on output tensors (same as Compile does).
+        foreach (var step in specialized)
+            step.OutputBuffer.LazySource = null;
+
+        var actualFinalOutput = specialized.Length > 0
+            ? specialized[specialized.Length - 1].OutputBuffer
+            : finalOutput;
+
         return new CompiledInferencePlan<T>(
-            steps, finalOutput, engine, inputShape,
-            handles: null, compiledInputTensor: compiledInputTensor);
+            specialized, actualFinalOutput, engine, inputShape,
+            handles: pinnedHandles, compiledInputTensor: compiledInputTensor);
     }
 
     // ── Internal accessors for serialization ────────────────────────────
     internal CompiledStep<T>[] Steps => _steps;
     internal int[] CompiledInputShape => _compiledInputShape;
+    internal Tensor<T>? CompiledInputTensor => _compiledInputTensor;
 
     /// <inheritdoc/>
     /// <remarks>

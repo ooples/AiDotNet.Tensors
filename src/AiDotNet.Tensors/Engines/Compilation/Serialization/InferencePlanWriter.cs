@@ -50,7 +50,7 @@ internal static class InferencePlanWriter
 
         // ── Tensor table ────────────────────────────────────────────────
         var tensorMap = TensorTableWriter.BuildMap(steps, compiledInputTensor);
-        TensorTableWriter.Write(writer, tensorMap, compiledInputTensor, parameterTensors: null);
+        TensorTableWriter.Write(writer, tensorMap, steps, compiledInputTensor, parameterTensors: null);
 
         // ── Op sequence ─────────────────────────────────────────────────
         writer.Write(steps.Length);

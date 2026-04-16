@@ -66,21 +66,32 @@ internal static class TensorTableWriter
     internal static void Write<T>(
         BinaryWriter writer,
         TensorIdMap<T> map,
+        CompiledStep<T>[] steps,
         Tensor<T>? compiledInputTensor,
         Tensor<T>[]? parameterTensors)
     {
         var tensors = map.Ordered;
         writer.Write(tensors.Count);
 
-        // Build a set of parameter tensor references for flag assignment.
+        // Build sets for flag assignment.
         var paramSet = new HashSet<Tensor<T>>(
             parameterTensors ?? Array.Empty<Tensor<T>>(),
             System.Collections.Generic.EqualityComparer<Tensor<T>>.Default);
 
+        // Build the set of tensors that are step OUTPUT buffers. Any tensor
+        // that appears in step Inputs but is NOT a step output AND is not the
+        // compiled-input leaf is a "frozen parameter" (weight captured at
+        // compile time) — its data must be serialized so the loaded plan
+        // can produce correct results without the original weight objects.
+        var outputBufferSet = new HashSet<Tensor<T>>(
+            System.Collections.Generic.EqualityComparer<Tensor<T>>.Default);
+        for (int s = 0; s < steps.Length; s++)
+            outputBufferSet.Add(steps[s].OutputBuffer);
+
         for (int i = 0; i < tensors.Count; i++)
         {
             var tensor = tensors[i];
-            int id = i; // sequential, matches registration order
+            int id = i;
 
             writer.Write(id);
 
@@ -89,18 +100,24 @@ internal static class TensorTableWriter
             for (int d = 0; d < tensor._shape.Length; d++)
                 writer.Write(tensor._shape[d]);
 
-            // Flags
-            byte flags = PlanFormatConstants.TensorFlagIntermediate;
-            bool isParam = paramSet.Contains(tensor);
+            // Classify this tensor.
+            bool isExplicitParam = paramSet.Contains(tensor);
             bool isLeaf = ReferenceEquals(tensor, compiledInputTensor);
+            bool isOutputBuffer = outputBufferSet.Contains(tensor);
 
-            if (isParam) flags = PlanFormatConstants.TensorFlagWeight;
-            else if (isLeaf) flags = PlanFormatConstants.TensorFlagLeafInput;
+            // A "frozen weight" is a tensor that:
+            //   1. Is not the compiled-input leaf (the user fills that)
+            //   2. Is not any step's output buffer (those are intermediate)
+            //   3. Appears as a step input (it was captured at compile time)
+            // OR is explicitly in the parameter set.
+            bool isFrozenWeight = isExplicitParam || (!isLeaf && !isOutputBuffer);
 
-            // Write data for weights (parameters) so model weights survive round-trip.
-            // Leaf inputs and intermediates are shape-only — the user supplies fresh
-            // input data, and intermediates are overwritten during Execute().
-            bool writeData = isParam;
+            byte flags;
+            if (isLeaf)        flags = PlanFormatConstants.TensorFlagLeafInput;
+            else if (isFrozenWeight) flags = PlanFormatConstants.TensorFlagWeight;
+            else               flags = PlanFormatConstants.TensorFlagIntermediate;
+
+            bool writeData = isFrozenWeight;
             if (writeData) flags |= PlanFormatConstants.TensorFlagHasData;
 
             writer.Write(flags);

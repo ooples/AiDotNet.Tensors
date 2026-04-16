@@ -48,7 +48,7 @@ internal static class TrainingPlanWriter
         // ── Tensor table ────────────────────────────────────────────────
         var tensorMap = TensorTableWriter.BuildMap(
             forwardSteps, inputTensor, plan.Parameters);
-        TensorTableWriter.Write(writer, tensorMap, inputTensor, plan.Parameters);
+        TensorTableWriter.Write(writer, tensorMap, forwardSteps, inputTensor, plan.Parameters);
 
         // ── Forward op sequence ─────────────────────────────────────────
         writer.Write(forwardSteps.Length);
