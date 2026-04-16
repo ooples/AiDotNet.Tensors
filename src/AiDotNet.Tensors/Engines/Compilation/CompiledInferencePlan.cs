@@ -497,6 +497,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new ConstantFoldingPass(),
             new ForwardCSEPass(),
             new ConvBnFusionPass(),
+            new DiffusionFusionPass(), // Patterns 11-14: GroupNorm+SiLU, Conv+Bias+SiLU, Add+GroupNorm (#181)
             new PointwiseFusionPass(),
             new AttentionFusionPass(),
             new BlasBatchPass(),
