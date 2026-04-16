@@ -14321,10 +14321,14 @@ public class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = GroupNorm(ci, cn, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // SavedState order MUST match BackwardFunctions<T>.GroupNormBackward's
+                // read order: [numGroups, mean, variance, epsilon]. Previously this was
+                // [mean, variance, numGroups, epsilon] causing InvalidCastException in
+                // backward (Tensor cast as int at savedState[0]). Fixed per #178.
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "GroupNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) => { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
-                    BackwardFunctions<T>.GroupNormBackward, new object[] { mean, variance, numGroups, epsilon });
+                    BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }
