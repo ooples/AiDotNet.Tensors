@@ -1,3 +1,7 @@
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -101,6 +105,29 @@ public interface ICompiledPlan<T> : IDisposable
     /// </para>
     /// </remarks>
     ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next);
+
+    /// <summary>
+    /// Serializes this plan to <paramref name="stream"/>. The output includes
+    /// the full operation graph, pre-allocated buffer shapes, model weights,
+    /// and a version stamp (format version + tensor-codec version + hardware
+    /// fingerprint). Load the result with
+    /// <see cref="CompiledPlanLoader.LoadInferenceAsync{T}"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #166):</b> adding this
+    /// member to <see cref="ICompiledPlan{T}"/> is both a source-breaking and
+    /// binary-breaking change for external implementers. Same rationale as
+    /// EnableCheckpointing (#165) — no DIM polyfill on net471.
+    /// </para>
+    /// </remarks>
+    Task SaveAsync(Stream stream, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns true when this plan's on-disk format, tensor-codec version,
+    /// element type, and hardware fingerprint all match the current runtime.
+    /// </summary>
+    bool IsCompatibleWith(PlanCompatibilityInfo info);
 }
 
 /// <summary>
@@ -180,4 +207,25 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// </para>
     /// </remarks>
     void EnableCheckpointing(int segmentSize = 0);
+
+    /// <summary>
+    /// Serializes this training plan to <paramref name="stream"/>. Includes
+    /// forward steps, backward functions, gradient buffer shapes, parameter
+    /// tensor data, and optimizer state (if configured). Load the result with
+    /// <see cref="CompiledPlanLoader.LoadTrainingAsync{T}"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #166):</b> same
+    /// rationale as <see cref="ICompiledPlan{T}.SaveAsync"/> — no DIM
+    /// polyfill on net471.
+    /// </para>
+    /// </remarks>
+    Task SaveAsync(Stream stream, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns true when this plan's on-disk format, tensor-codec version,
+    /// element type, and hardware fingerprint all match the current runtime.
+    /// </summary>
+    bool IsCompatibleWith(PlanCompatibilityInfo info);
 }
