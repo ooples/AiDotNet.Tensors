@@ -504,6 +504,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new SpectralDecompositionPass(),
             new DataflowFusionPass(),
             new MixedPrecisionPass(),
+            new OperatorReorderingPass(), // Reorder for cache locality (#182)
+            new MemoryPlanningPass(),     // Buffer reuse via lifetime analysis (#182)
+            new TileSchedulingPass(),     // L1/L2 tile sizing for GEMM/Conv (#182)
         };
 
         var current = steps;

@@ -23,9 +23,9 @@ public abstract class TensorBase<T> : IDisposable
     /// Was <c>readonly</c> historically. The <see langword="readonly"/> was removed to
     /// support <see cref="RebindStorageFrom"/>, which is the ONLY path that should
     /// reassign this field. Under all other circumstances this field is effectively
-    /// readonly — the rebind operation is narrow (plan stitching, issue #170) and
-    /// intentionally bypasses the usual "views share storage, storage itself is
-    /// immutable" invariant.
+    /// readonly — the rebind operation is narrow (plan stitching per issue #170 and
+    /// memory-planning buffer reuse per issue #182) and intentionally bypasses the
+    /// usual "views share storage, storage itself is immutable" invariant.
     /// </remarks>
     internal TensorStorage<T> _storage;
 
@@ -50,10 +50,13 @@ public abstract class TensorBase<T> : IDisposable
     /// Rebinds this tensor's backing storage to alias <paramref name="source"/>'s storage.
     /// After a successful rebind, both tensors read from and write to the <i>same</i>
     /// underlying <see cref="Vector{T}"/> and <see cref="TensorStorage{T}"/> — no data
-    /// copy, no new allocation. Narrow use case: plan stitching (<see cref="AiDotNet.Tensors.Engines.Compilation.ICompiledPlan{T}.ThenAsync"/>)
+    /// copy, no new allocation. Narrow use cases:
+    /// plan stitching (<see cref="AiDotNet.Tensors.Engines.Compilation.ICompiledPlan{T}.ThenAsync"/>
     /// needs the downstream plan's captured input to point at the upstream plan's
     /// captured output so execute-time operations see each other's results without
-    /// going through a boundary memcpy.
+    /// going through a boundary memcpy), and memory-planning buffer reuse
+    /// (issue #182 — intermediate activations whose live ranges don't overlap
+    /// are aliased to a shared backing buffer to cut peak memory).
     /// </summary>
     /// <param name="source">The tensor whose storage this tensor should alias.</param>
     /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
