@@ -24,6 +24,34 @@ internal static class TensorManipOperators
         r.Register(new Flatten<T>());
         r.Register(new Identity<T>());
         r.Register(new Shape<T>());
+        r.Register(new Cast<T>());
+    }
+
+    /// <summary>
+    /// ONNX Cast — reinterpret the input as a different element type.
+    /// Phase 1: only same-type casts are a true no-op; any cast where
+    /// <c>to</c> names a different CLR element type than <typeparamref name="T"/>
+    /// throws so the caller knows the model mixes precisions (which the
+    /// Phase 1 single-T plan can't represent).
+    /// </summary>
+    internal sealed class Cast<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Cast";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            int to = ctx.GetIntAttrAsInt(node, "to", 0);
+            // ONNX TensorProto.DataType: FLOAT=1, DOUBLE=11, INT32=6, INT64=7.
+            // Same-type → identity; cross-type needs mixed-precision plan support.
+            bool matches =
+                (to == 1 && typeof(T) == typeof(float)) ||
+                (to == 11 && typeof(T) == typeof(double));
+            if (!matches)
+                throw new NotSupportedException(
+                    $"Cast to ONNX type {to} from plan-wide T={typeof(T).Name} is not yet supported. " +
+                    "Phase 1 uses a single element type throughout; mixed-precision plans are Phase 2.");
+            ctx.PutTensor(node.Output[0], ctx.GetTensor(node.Input[0]));
+        }
     }
 
     /// <summary>
