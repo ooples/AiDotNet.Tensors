@@ -51,12 +51,22 @@ public sealed class OnnxImportResult<T> where T : unmanaged
     /// </summary>
     public IReadOnlyDictionary<string, Tensor<T>> Inputs { get; }
 
+    /// <summary>
+    /// The computed output tensors keyed by ONNX output name. After calling
+    /// <c>Plan.Execute()</c>, every declared graph output is populated —
+    /// read each via <c>result.Outputs["name"].AsSpan()</c>. ICompiledPlan's
+    /// Execute() returns only the last step's output; this dictionary is
+    /// the API for multi-output models (BERT, detection heads, etc.).
+    /// </summary>
+    public IReadOnlyDictionary<string, Tensor<T>> Outputs { get; }
+
     internal OnnxImportResult(
         ICompiledPlan<T>? plan,
         IReadOnlyList<string> unsupportedOperators,
         IReadOnlyDictionary<string, ShapeProfile> namedInputs,
         IReadOnlyDictionary<string, ShapeProfile> namedOutputs,
         IReadOnlyDictionary<string, Tensor<T>> inputs,
+        IReadOnlyDictionary<string, Tensor<T>> outputs,
         string producerName,
         long irVersion)
     {
@@ -65,6 +75,7 @@ public sealed class OnnxImportResult<T> where T : unmanaged
         NamedInputs = namedInputs ?? throw new ArgumentNullException(nameof(namedInputs));
         NamedOutputs = namedOutputs ?? throw new ArgumentNullException(nameof(namedOutputs));
         Inputs = inputs ?? throw new ArgumentNullException(nameof(inputs));
+        Outputs = outputs ?? throw new ArgumentNullException(nameof(outputs));
         ProducerName = producerName ?? string.Empty;
         IrVersion = irVersion;
     }

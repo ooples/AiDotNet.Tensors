@@ -86,31 +86,47 @@ public class BertExecuteTest
         FillFloat(result.Inputs["segment_ids:0"], segmentIds);
         FillFloat(result.Inputs["unique_ids_raw_output___9:0"], uniqueIds);
 
-        var ourOut = result.Plan!.Execute();
-        var ourFlat = new float[ourOut.AsSpan().Length];
-        ourOut.AsSpan().CopyTo(ourFlat);
-        _output.WriteLine($"Our output length: {ourFlat.Length}");
+        result.Plan!.Execute();
 
-        // Compare to the first ORT output (plan.Execute returns the last
-        // step — we match it against whichever ORT result has the same
-        // shape). This is a smoke check; full multi-output parity would
-        // need changes to our OnnxImportResult to expose each named
-        // output's tensor.
-        var matched = ortByName.Values.FirstOrDefault(v => v.Length == ourFlat.Length);
-        if (matched is null)
-        {
-            _output.WriteLine("Our output shape not found among ORT outputs; skipping element compare.");
-            return;
-        }
-        int mismatches = 0;
+        // Compare each declared ONNX output against the corresponding ORT
+        // result. OnnxImportResult.Outputs exposes every named graph output
+        // after Execute — Execute's single return value is one arbitrary
+        // step; the dictionary is the right way to read them all.
+        int totalMismatches = 0;
         float maxDiff = 0f;
-        for (int i = 0; i < matched.Length; i++)
+        foreach (var kv in ortByName)
         {
-            float d = Math.Abs(matched[i] - ourFlat[i]);
-            float scale = Math.Max(Math.Abs(matched[i]), 1f);
-            if (d > 1e-3f * scale) { mismatches++; if (d > maxDiff) maxDiff = d; }
+            var name = kv.Key;
+            var ortValues = kv.Value;
+            if (!result.Outputs.TryGetValue(name, out var outTensor))
+            {
+                _output.WriteLine($"  '{name}': missing from our outputs");
+                continue;
+            }
+            var ourFlat = new float[outTensor.AsSpan().Length];
+            outTensor.AsSpan().CopyTo(ourFlat);
+            if (ourFlat.Length != ortValues.Length)
+            {
+                _output.WriteLine($"  '{name}': length mismatch ours={ourFlat.Length} ort={ortValues.Length}");
+                continue;
+            }
+            int outputMismatches = 0;
+            float outputMaxDiff = 0f;
+            for (int i = 0; i < ortValues.Length; i++)
+            {
+                float d = Math.Abs(ortValues[i] - ourFlat[i]);
+                float scale = Math.Max(Math.Abs(ortValues[i]), 1f);
+                if (d > 1e-3f * scale)
+                {
+                    outputMismatches++;
+                    if (d > outputMaxDiff) outputMaxDiff = d;
+                }
+            }
+            _output.WriteLine($"  '{name}': {outputMismatches}/{ortValues.Length} diverge, max diff {outputMaxDiff}");
+            totalMismatches += outputMismatches;
+            if (outputMaxDiff > maxDiff) maxDiff = outputMaxDiff;
         }
-        _output.WriteLine($"Mismatches (1e-3 tol): {mismatches}/{matched.Length}, max diff {maxDiff}");
+        _output.WriteLine($"Total: {totalMismatches} mismatches, max diff {maxDiff}");
     }
 
     private static void FillFloat(LinearAlgebra.Tensor<float> placeholder, long[] source)

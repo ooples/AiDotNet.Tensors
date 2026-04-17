@@ -133,6 +133,7 @@ public static class OnnxImporter
                 namedInputs: namedInputs,
                 namedOutputs: namedOutputs,
                 inputs: inputTensors,
+                outputs: new Dictionary<string, Tensor<T>>(),
                 producerName: model.ProducerName ?? string.Empty,
                 irVersion: model.IrVersion);
         }
@@ -203,6 +204,9 @@ public static class OnnxImporter
             // would return an empty fallback tensor. Wrap each static final
             // output in a trivial Add-with-zero under GraphMode so every
             // graph output becomes a proper lazy node tied to a plan step.
+            // After this loop, tensorsByName[outputName] is the lazy-node
+            // version, which is what we expose via result.Outputs so users
+            // can read any declared output after plan.Execute().
             foreach (var outputVi in graph.Output)
             {
                 if (!tensorsByName.TryGetValue(outputVi.Name, out var outTensor)) continue;
@@ -219,12 +223,21 @@ public static class OnnxImporter
             TensorCodecOptions.SetCurrent(prevOpts);
         }
 
+        // Collect the declared graph outputs' tensors for the result.
+        // After plan.Execute() runs, each of these holds the final computed
+        // value for the corresponding ONNX output name.
+        var outputTensors = new Dictionary<string, Tensor<T>>(graph.Output.Count);
+        foreach (var vo in graph.Output)
+            if (tensorsByName.TryGetValue(vo.Name, out var t))
+                outputTensors[vo.Name] = t;
+
         return new OnnxImportResult<T>(
             plan: plan,
             unsupportedOperators: Array.Empty<string>(),
             namedInputs: namedInputs,
             namedOutputs: namedOutputs,
             inputs: inputTensors,
+            outputs: outputTensors,
             producerName: model.ProducerName ?? string.Empty,
             irVersion: model.IrVersion);
     }
