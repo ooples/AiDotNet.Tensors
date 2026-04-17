@@ -55,8 +55,14 @@ public class JitOptimizationPassTests
         // Whether the actual implementation achieves this depends on the
         // lastUse computation. Just verify the pass runs without crashing
         // and that the resulting steps still produce correct output.
-        for (int i = 0; i < steps.Length; i++)
-            steps[i].Execute(_engine, steps[i].OutputBuffer);
+        //
+        // Execute the OPTIMIZED plan (if the pass returned one) rather than
+        // the original — otherwise the test exercises the pre-planning chain
+        // and silently skips any correctness regression introduced by the
+        // pass's output (e.g. a buffer rebind with the wrong live range).
+        var stepsToRun = optimized ?? steps;
+        for (int i = 0; i < stepsToRun.Length; i++)
+            stepsToRun[i].Execute(_engine, stepsToRun[i].OutputBuffer);
 
         // Final output should be non-trivial (5 sigmoid applications)
         var finalData = buf4.AsSpan();

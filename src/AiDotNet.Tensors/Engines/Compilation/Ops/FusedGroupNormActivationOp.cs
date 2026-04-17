@@ -124,31 +124,48 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
         return (eng, output) =>
         {
             Tensor<T>? preActivation = null;
-            Tensor<T> mean, variance;
+            Tensor<T>? mean = null;
+            Tensor<T>? variance = null;
+            Tensor<T> tmpMean, tmpVariance;
 
             switch (activation)
             {
                 case GroupNormActivation.SiLU:
-                    // Fused kernel writes post-SiLU directly to output. We
-                    // separately run GroupNorm to capture mean/variance AND
-                    // the pre-activation tensor — SwishBackward needs the
-                    // pre-activation (h = GroupNorm(x)), not the raw input x.
+                    // Fused kernel writes post-SiLU directly to output — no
+                    // GroupNorm work needed for the forward value itself.
+                    // Only pay the extra GroupNorm cost (to capture
+                    // mean/variance + pre-activation for backward) when
+                    // savedState is non-null, i.e. the compiled-step path
+                    // that actually wires backward. Pure inference (savedState
+                    // null) skips the second pass entirely.
                     eng.GroupNormSwishInto(output, input, numGroups, gamma, beta, epsilon);
-                    preActivation = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                        out mean, out variance);
+                    if (savedState is not null)
+                    {
+                        preActivation = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
+                            out tmpMean, out tmpVariance);
+                        mean = tmpMean;
+                        variance = tmpVariance;
+                    }
                     break;
 
                 case GroupNormActivation.ReLU:
+                    // GroupNorm is required for the forward value here (no
+                    // fused ReLU-into kernel), so the work is unavoidable;
+                    // the mean/variance outs come along for free.
                     var gnResult = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                        out mean, out variance);
+                        out tmpMean, out tmpVariance);
                     var reluResult = eng.ReLU(gnResult);
                     reluResult.AsSpan().CopyTo(output.AsWritableSpan());
+                    mean = tmpMean;
+                    variance = tmpVariance;
                     break;
 
                 default: // Identity
                     var gnId = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                        out mean, out variance);
+                        out tmpMean, out tmpVariance);
                     gnId.AsSpan().CopyTo(output.AsWritableSpan());
+                    mean = tmpMean;
+                    variance = tmpVariance;
                     break;
             }
 
@@ -158,8 +175,8 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
 
             if (savedState is not null)
             {
-                savedState[1] = mean;
-                savedState[2] = variance;
+                if (mean is not null) savedState[1] = mean;
+                if (variance is not null) savedState[2] = variance;
                 if (preActivation is not null) savedState[5] = preActivation;
             }
         };
@@ -219,7 +236,16 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
 
         int numGroups = state[0] is int ng ? ng : 0;
         double epsilon = state[3] is double e ? e : 1e-5;
-        var activation = state[4] is int a ? (GroupNormActivation)a : GroupNormActivation.Identity;
+
+        // Reject unknown / version-skewed activation codes rather than
+        // silently falling through to Identity at forward time. Note:
+        // GroupNormActivation is byte-backed so the int stored via
+        // BuildSavedState must fit in a byte AND be a defined member.
+        if (state[4] is not int activationCode ||
+            activationCode < 0 || activationCode > byte.MaxValue ||
+            !Enum.IsDefined(typeof(GroupNormActivation), (byte)activationCode))
+            return null;
+        var activation = (GroupNormActivation)activationCode;
 
         if (numGroups <= 0) return null;
 
