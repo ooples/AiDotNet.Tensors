@@ -1,5 +1,6 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Onnx.Protos;
 using Google.Protobuf;
@@ -131,9 +132,25 @@ public static class OnnxImporter
         }
 
         // ── Trace the graph under GraphMode and compile ───────────────────
+        //
+        // ONNX models come from every ML toolchain (PyTorch, TF, JAX, ORT,
+        // Hugging Face optimum) — we can't assume graph shapes look like the
+        // in-house compiler's fusion patterns expect. Disable dataflow fusion
+        // and spectral decomposition for imported plans; they silently
+        // coalesce multi-op chains in ways that break when the graph
+        // producer doesn't match the exact shape the pass was written for.
+        // Individual op-level translators still route through all the fast
+        // paths inside CpuEngine (SIMD, BLAS-backed MatMul, fused Conv).
         CompiledInferencePlan<T> plan;
-        using (var scope = GraphMode.Enable())
+        var prevOpts = TensorCodecOptions.Current;
+        TensorCodecOptions.SetCurrent(new TensorCodecOptions
         {
+            EnableDataflowFusion = false,
+            EnableSpectralDecomposition = false,
+        });
+        try
+        {
+            using var scope = GraphMode.Enable();
             var ctx = new OnnxTranslationContext<T>(engine, tensorsByName, options);
             for (int i = 0; i < sortedNodes.Count; i++)
             {
@@ -143,6 +160,10 @@ public static class OnnxImporter
                 translator.Translate(ctx, node);
             }
             plan = scope.CompileInference<T>();
+        }
+        finally
+        {
+            TensorCodecOptions.SetCurrent(prevOpts);
         }
 
         return new OnnxImportResult<T>(
