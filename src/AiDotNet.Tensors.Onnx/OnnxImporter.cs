@@ -34,6 +34,18 @@ namespace AiDotNet.Tensors.Onnx;
 public static class OnnxImporter
 {
     /// <summary>
+    /// Parses an ONNX model and produces a compiled inference plan. Uses a
+    /// default <see cref="CpuEngine"/> — matches the Issue #169 API spec.
+    /// For control over the engine (e.g. passing a pre-configured GPU
+    /// backend), use the overload that takes an explicit <see cref="IEngine"/>.
+    /// </summary>
+    public static OnnxImportResult<T> Import<T>(
+        Stream onnxModel,
+        OnnxImportOptions? options = null)
+        where T : unmanaged
+        => Import<T>(onnxModel, new CpuEngine(), options);
+
+    /// <summary>
     /// Parses an ONNX model from a stream and produces a compiled inference
     /// plan. Currently supports <c>T = float</c> end-to-end; <c>T = double</c>
     /// converts float initializers on load.
