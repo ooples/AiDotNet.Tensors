@@ -233,10 +233,63 @@ internal static class TensorManipOperators
             var data = ctx.GetTensor(node.Input[0]);
             int axis = ctx.GetIntAttrAsInt(node, "axis", 0);
             if (axis < 0) axis += data.Rank;
-            // ONNX Gather's indices can be int32 or int64; IEngine.Gather wants Tensor<int>.
-            var rawIndices = ctx.GetTensor(node.Input[1]);
-            var intIndices = CastToIntTensor(rawIndices);
-            ctx.PutTensor(node.Output[0], ctx.Engine.Gather(data, intIndices, axis));
+            // ONNX Gather's indices can be int32 or int64; engine.Gather wants
+            // Tensor<int>. Our plan's T is float (BERT token IDs are stored
+            // as floats holding integer values), so the cast to int32 has to
+            // happen AT EXECUTE TIME — taking it at trace time captures the
+            // uninitialized placeholder (all zeros) instead of the caller's
+            // actual token IDs.
+            var indicesTensor = ctx.GetTensor(node.Input[1]);
+
+            // Output shape: data shape with axis dim replaced by indices
+            // shape (indices can be multi-dim, e.g. [B, S] gathering rows of
+            // [V, H] produces [B, S, H]).
+            int newRank = data.Rank - 1 + indicesTensor.Rank;
+            var outShape = new int[newRank];
+            int o = 0;
+            for (int i = 0; i < axis; i++) outShape[o++] = data._shape[i];
+            for (int i = 0; i < indicesTensor.Rank; i++) outShape[o++] = indicesTensor._shape[i];
+            for (int i = axis + 1; i < data.Rank; i++) outShape[o++] = data._shape[i];
+
+            var scope = Engines.Compilation.GraphMode.Current;
+            if (scope is null)
+            {
+                // Eager path — caller is inside a constant-folding block, so
+                // indices are real. Do the int cast here and call engine.Gather.
+                var intIndicesEager = CastToIntTensor(indicesTensor);
+                ctx.PutTensor(node.Output[0], ctx.Engine.Gather(data, intIndicesEager, axis));
+                return;
+            }
+
+            // Lazy path — record a BINARY LazyNode that takes both data and
+            // indices as tracked inputs. Passing indicesTensor via RecordBinary
+            // (rather than capturing it in the closure) tells the memory
+            // planner that indices are live through the Gather step — so it
+            // won't reuse the indices buffer for an earlier-finishing op.
+            var capturedData = data;
+            var capturedIndices = indicesTensor;
+            int capturedAxis = axis;
+            var lazy = scope.RecordBinary(Engines.Compilation.LazyNodeType.Custom,
+                "Gather", capturedData, capturedIndices, outShape,
+                (eng, output) =>
+                {
+                    // Read the indices as int32 at Execute time — capturedIndices
+                    // now has the actual values since Gather runs after the
+                    // upstream op that produced them.
+                    var idxSrc = capturedIndices.AsSpan();
+                    var idxArr = new int[idxSrc.Length];
+                    for (int i = 0; i < idxSrc.Length; i++)
+                    {
+                        double v = Convert.ToDouble(idxSrc[i]!);
+                        idxArr[i] = v >= int.MaxValue ? int.MaxValue
+                                  : v <= int.MinValue ? int.MinValue
+                                  : (int)Math.Round(v);
+                    }
+                    var intIndices = new Tensor<int>(capturedIndices._shape, new Vector<int>(idxArr));
+                    var r = eng.Gather(capturedData, intIndices, capturedAxis);
+                    r.AsSpan().CopyTo(output.AsWritableSpan());
+                });
+            ctx.PutTensor(node.Output[0], lazy);
         }
     }
 

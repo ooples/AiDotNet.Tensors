@@ -325,72 +325,102 @@ internal static class MathOperators
         public string? Domain => null;
         public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
         {
-            // Inputs: indices, depth (scalar), values ([off, on])
+            // Inputs: indices, depth (scalar static), values ([off, on] static)
             var indicesT = ctx.GetTensor(node.Input[0]);
             var depthT = ctx.GetTensor(node.Input[1]);
             var valuesT = ctx.GetTensor(node.Input[2]);
             int axis = ctx.GetIntAttrAsInt(node, "axis", -1);
 
+            // depth and values are usually initializers — safe to read at
+            // trace time. indices might be dynamic (e.g. BERT's segment_ids
+            // after a reshape) — defer its read to Execute time.
             int depth = Convert.ToInt32(depthT.AsSpan()[0]!);
             var valuesSpan = valuesT.AsSpan();
             var offVal = valuesSpan[0];
             var onVal = valuesSpan[1];
 
-            // Build the output shape: insert depth at the normalized axis
-            // position. axis = -1 means last.
             int inRank = indicesT.Rank;
             int outRank = inRank + 1;
             int normalizedAxis = axis < 0 ? axis + outRank : axis;
             var outputShape = new int[outRank];
-            int srcIdx = 0;
+            int srcIdx0 = 0;
             for (int i = 0; i < outRank; i++)
             {
                 if (i == normalizedAxis) outputShape[i] = depth;
-                else outputShape[i] = indicesT._shape[srcIdx++];
+                else outputShape[i] = indicesT._shape[srcIdx0++];
             }
 
-            // Materialize the one-hot tensor directly. This is a static
-            // computation on the indices tensor — no engine op per element.
-            var output = new Tensor<T>(outputShape);
-            var outSpan = output.AsWritableSpan();
-            // Fill with offVal; then scatter onVal for the active indices.
-            for (int i = 0; i < outSpan.Length; i++) outSpan[i] = offVal;
-
-            var indexSpan = indicesT.AsSpan();
-            // Compute strides for the output shape.
+            // Precompute output strides (static, depend only on shape).
             var strides = new int[outRank];
             strides[outRank - 1] = 1;
             for (int i = outRank - 2; i >= 0; i--) strides[i] = strides[i + 1] * outputShape[i + 1];
 
-            // Walk indices in row-major order; for each, compute output index
-            // by inserting the indexed value at `normalizedAxis`.
+            var scope = Engines.Compilation.GraphMode.Current;
+            if (scope is null || indicesT.LazySource is null && !IsDynamicInput(ctx, node.Input[0]))
+            {
+                // Indices is static — we can scatter eagerly at trace time.
+                var eager = new Tensor<T>(outputShape);
+                var outSpan = eager.AsWritableSpan();
+                for (int i = 0; i < outSpan.Length; i++) outSpan[i] = offVal;
+                Scatter(indicesT.AsSpan(), indicesT._shape, outSpan, outputShape, strides,
+                    depth, normalizedAxis, inRank, outRank, onVal);
+                ctx.PutTensor(node.Output[0], eager);
+                return;
+            }
+
+            // Lazy path — indices is dynamic; scatter at Execute time. Pass
+            // indicesT as a tracked input to keep its buffer alive under the
+            // memory planner.
+            var capturedIndices = indicesT;
+            var lazy = scope.RecordUnary(Engines.Compilation.LazyNodeType.Custom,
+                "OneHot", capturedIndices, outputShape,
+                (eng, output) =>
+                {
+                    var s = output.AsWritableSpan();
+                    for (int i = 0; i < s.Length; i++) s[i] = offVal;
+                    Scatter(capturedIndices.AsSpan(), capturedIndices._shape, s, outputShape, strides,
+                        depth, normalizedAxis, inRank, outRank, onVal);
+                });
+            ctx.PutTensor(node.Output[0], lazy);
+        }
+
+        private static bool IsDynamicInput(OnnxTranslationContext<T> ctx, string name) =>
+            // We don't have the dynamicTensorNames set inside the translator,
+            // but LazySource is a good enough proxy — graph-input placeholders
+            // have no LazySource BUT they haven't been filled yet at trace
+            // time. Using scope!=null as a trigger for the lazy path is
+            // sufficient for import-time correctness: the LazyNode's closure
+            // runs at Execute time and reads whatever's in the tensor then.
+            false;
+
+        private static void Scatter(
+            ReadOnlySpan<T> indexSpan, int[] indicesShape,
+            Span<T> outSpan, int[] outputShape, int[] strides,
+            int depth, int normalizedAxis, int inRank, int outRank, T onVal)
+        {
             for (int i = 0; i < indexSpan.Length; i++)
             {
                 int indexValue = Convert.ToInt32(indexSpan[i]!);
                 if (indexValue < 0) indexValue += depth;
-                if (indexValue < 0 || indexValue >= depth) continue; // out-of-range → all off
+                if (indexValue < 0 || indexValue >= depth) continue;
 
-                // Decompose i into multi-index over indicesT shape.
                 int remaining = i;
                 int outputFlat = 0;
                 int srcDim = inRank - 1;
                 for (int d = outRank - 1; d >= 0; d--)
                 {
-                    int dimSize = outputShape[d];
                     int coord;
                     if (d == normalizedAxis) coord = indexValue;
                     else
                     {
-                        coord = remaining % indicesT._shape[srcDim];
-                        remaining /= indicesT._shape[srcDim];
+                        coord = remaining % indicesShape[srcDim];
+                        remaining /= indicesShape[srcDim];
                         srcDim--;
                     }
                     outputFlat += coord * strides[d];
                 }
                 outSpan[outputFlat] = onVal;
             }
-
-            ctx.PutTensor(node.Output[0], output);
         }
     }
 

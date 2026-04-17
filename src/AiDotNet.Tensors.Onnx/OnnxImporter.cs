@@ -90,11 +90,23 @@ public static class OnnxImporter
         }
 
         // ── Resolve graph outputs (shape info only; not actually allocated) ─
+        // Graph outputs don't always carry declared shape metadata —
+        // intermediate-tensor names promoted by diagnostic tools (or
+        // ONNX-Runtime output-naming conventions) often omit it. We
+        // tolerate null shapes here since output shape is known at
+        // Execute time from the producing step.
         var namedOutputs = new Dictionary<string, ShapeProfile>(graph.Output.Count);
         for (int i = 0; i < graph.Output.Count; i++)
         {
             var vo = graph.Output[i];
-            var shape = ResolveShape(vo, options);
+            int[] shape;
+            try { shape = ResolveShape(vo, options); }
+            catch (InvalidDataException)
+            {
+                // Missing shape info on outputs is tolerated — set empty,
+                // caller reads the actual shape off the produced tensor.
+                shape = Array.Empty<int>();
+            }
             var elemType = ElementTypeName(vo.Type?.TensorType?.ElemType ?? 0);
             namedOutputs[vo.Name] = new ShapeProfile(vo.Name, shape, elemType);
         }
@@ -211,18 +223,25 @@ public static class OnnxImporter
                     translator.Translate(ctx, node);
                 }
             }
-            // If the model's declared output(s) were produced via constant
-            // folding, the plan would have zero recorded steps and Execute()
-            // would return an empty fallback tensor. Wrap each static final
-            // output in a trivial Add-with-zero under GraphMode so every
-            // graph output becomes a proper lazy node tied to a plan step.
-            // After this loop, tensorsByName[outputName] is the lazy-node
-            // version, which is what we expose via result.Outputs so users
-            // can read any declared output after plan.Execute().
+            // Every declared graph output needs to survive to the end of
+            // Plan.Execute(). Two problems the wrap handles:
+            //
+            //  1. Constant-folded outputs have no plan step, so Execute()
+            //     would return the empty fallback tensor.
+            //  2. Memory planning reuses buffers across non-overlapping op
+            //     lifetimes. If a node's output is consumed early by
+            //     downstream steps, the planner is free to reuse the same
+            //     storage for a later step — and the "output" tensor the
+            //     importer handed to result.Outputs then reads whatever
+            //     happens to be there at the end of execution.
+            //
+            // Adding a TensorAdd(x, 0) at the very end binds the output to
+            // a fresh buffer whose lifetime definitionally extends through
+            // the last plan step. This matches how ONNX Runtime handles
+            // output liveness (outputs are always live).
             foreach (var outputVi in graph.Output)
             {
                 if (!tensorsByName.TryGetValue(outputVi.Name, out var outTensor)) continue;
-                if (outTensor.LazySource is not null) continue; // already lazy → plan step exists
                 var zero = new Tensor<T>(outTensor._shape);
                 var wrapped = engine.TensorAdd(outTensor, zero);
                 tensorsByName[outputVi.Name] = wrapped;
