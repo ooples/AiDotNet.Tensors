@@ -9196,31 +9196,73 @@ public class CpuEngine : ITensorLevelEngine
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
 
-        // Initialize to zero
-        for (int i = 0; i < gradInputData.Length; i++)
-            gradInputData[i] = numOps.Zero;
-
-        // Note: Cannot parallelize across batch*channels because multiple output positions
-        // may map to the same input position within a channel. Parallelize across batches only.
-        Parallel.For(0, batch, b =>
+        // Cannot parallelize across (batch, channel) pairs because for MaxPool with
+        // overlapping windows, multiple output positions may scatter to the same
+        // input index within a channel. Parallel over batches is safe.
+        if (typeof(T) == typeof(float))
         {
-            for (int c = 0; c < channels; c++)
+            var fGradIn = (float[])(object)gradInputData;
+            var fGradOut = (float[])(object)gradOutputData;
+            Array.Clear(fGradIn, 0, fGradIn.Length);
+            Parallel.For(0, batch, b =>
             {
-                for (int oh = 0; oh < outputHeight; oh++)
+                for (int c = 0; c < channels; c++)
+                    for (int oh = 0; oh < outputHeight; oh++)
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int maxH = maxIndices[b, c, oh, ow, 0];
+                            int maxW = maxIndices[b, c, oh, ow, 1];
+                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
+                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
+                            fGradIn[gradInIdx] += fGradOut[gradOutIdx];
+                        }
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradIn = (double[])(object)gradInputData;
+            var dGradOut = (double[])(object)gradOutputData;
+            Array.Clear(dGradIn, 0, dGradIn.Length);
+            Parallel.For(0, batch, b =>
+            {
+                for (int c = 0; c < channels; c++)
+                    for (int oh = 0; oh < outputHeight; oh++)
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int maxH = maxIndices[b, c, oh, ow, 0];
+                            int maxW = maxIndices[b, c, oh, ow, 1];
+                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
+                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
+                            dGradIn[gradInIdx] += dGradOut[gradOutIdx];
+                        }
+            });
+        }
+        else
+        {
+            // Initialize to zero
+            for (int i = 0; i < gradInputData.Length; i++)
+                gradInputData[i] = numOps.Zero;
+
+            Parallel.For(0, batch, b =>
+            {
+                for (int c = 0; c < channels; c++)
                 {
-                    for (int ow = 0; ow < outputWidth; ow++)
+                    for (int oh = 0; oh < outputHeight; oh++)
                     {
-                        int maxH = maxIndices[b, c, oh, ow, 0];
-                        int maxW = maxIndices[b, c, oh, ow, 1];
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int maxH = maxIndices[b, c, oh, ow, 0];
+                            int maxW = maxIndices[b, c, oh, ow, 1];
 
-                        int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                        int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
+                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
+                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
 
-                        gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
+                            gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         return result;
     }
@@ -9305,40 +9347,106 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
-        T poolArea = numOps.FromDouble(poolH * poolW);
 
-        // Initialize to zero
-        for (int i = 0; i < gradInputData.Length; i++)
-            gradInputData[i] = numOps.Zero;
-
-        // Parallelize across batches (within a batch*channel, output positions scatter to overlapping input regions)
-        Parallel.For(0, batch, b =>
+        if (typeof(T) == typeof(float))
         {
-            for (int c = 0; c < channels; c++)
+            var fGradIn = (float[])(object)gradInputData;
+            var fGradOut = (float[])(object)gradOutputData;
+            float invPoolArea = 1f / (poolH * poolW);
+            Array.Clear(fGradIn, 0, fGradIn.Length);
+            Parallel.For(0, batch, b =>
             {
-                int inputBaseOffset = (b * channels + c) * height * width;
-                int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
-
-                for (int oh = 0; oh < outputHeight; oh++)
+                for (int c = 0; c < channels; c++)
                 {
-                    for (int ow = 0; ow < outputWidth; ow++)
+                    int inputBaseOffset = (b * channels + c) * height * width;
+                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    for (int oh = 0; oh < outputHeight; oh++)
                     {
-                        T grad = numOps.Divide(gradOutputData[outputBaseOffset + oh * outputWidth + ow], poolArea);
-
-                        for (int kh = 0; kh < poolH; kh++)
+                        for (int ow = 0; ow < outputWidth; ow++)
                         {
-                            int ih = oh * strideH + kh;
-                            for (int kw = 0; kw < poolW; kw++)
+                            float grad = fGradOut[outputBaseOffset + oh * outputWidth + ow] * invPoolArea;
+                            for (int kh = 0; kh < poolH; kh++)
                             {
-                                int iw = ow * strideW + kw;
-                                int gradInIdx = inputBaseOffset + ih * width + iw;
-                                gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], grad);
+                                int ih = oh * strideH + kh;
+                                for (int kw = 0; kw < poolW; kw++)
+                                {
+                                    int iw = ow * strideW + kw;
+                                    fGradIn[inputBaseOffset + ih * width + iw] += grad;
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradIn = (double[])(object)gradInputData;
+            var dGradOut = (double[])(object)gradOutputData;
+            double invPoolArea = 1.0 / (poolH * poolW);
+            Array.Clear(dGradIn, 0, dGradIn.Length);
+            Parallel.For(0, batch, b =>
+            {
+                for (int c = 0; c < channels; c++)
+                {
+                    int inputBaseOffset = (b * channels + c) * height * width;
+                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    for (int oh = 0; oh < outputHeight; oh++)
+                    {
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            double grad = dGradOut[outputBaseOffset + oh * outputWidth + ow] * invPoolArea;
+                            for (int kh = 0; kh < poolH; kh++)
+                            {
+                                int ih = oh * strideH + kh;
+                                for (int kw = 0; kw < poolW; kw++)
+                                {
+                                    int iw = ow * strideW + kw;
+                                    dGradIn[inputBaseOffset + ih * width + iw] += grad;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        else
+        {
+            T poolArea = numOps.FromDouble(poolH * poolW);
+
+            // Initialize to zero
+            for (int i = 0; i < gradInputData.Length; i++)
+                gradInputData[i] = numOps.Zero;
+
+            // Parallelize across batches (within a batch*channel, output positions scatter to overlapping input regions)
+            Parallel.For(0, batch, b =>
+            {
+                for (int c = 0; c < channels; c++)
+                {
+                    int inputBaseOffset = (b * channels + c) * height * width;
+                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+
+                    for (int oh = 0; oh < outputHeight; oh++)
+                    {
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            T grad = numOps.Divide(gradOutputData[outputBaseOffset + oh * outputWidth + ow], poolArea);
+
+                            for (int kh = 0; kh < poolH; kh++)
+                            {
+                                int ih = oh * strideH + kh;
+                                for (int kw = 0; kw < poolW; kw++)
+                                {
+                                    int iw = ow * strideW + kw;
+                                    int gradInIdx = inputBaseOffset + ih * width + iw;
+                                    gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], grad);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         return result;
     }
@@ -9634,60 +9742,173 @@ public class CpuEngine : ITensorLevelEngine
         var kernelData = kernel.GetDataArray();
         var outputData = new T[batch * outChannels * outputHeight * outputWidth];
 
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = numOps.Zero;
+        // ────────────────────────────────────────────────────────────────────
+        // Primitive fast paths: direct float/double arithmetic, no virtual
+        // dispatch. Thread-local scatter (each input contributes to a kernel-
+        // sized output patch) with parallel body, sequential merge.
+        //
+        // VAE decoder — directly in the #162 timing-out list — plus diffusion
+        // UNet upsample decoder blocks hit this op in every forward pass.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            var fInput = (float[])(object)inputData;
+            var fKernel = (float[])(object)kernelData;
+            var fOutput = (float[])(object)outputData;
+            int outLen = fOutput.Length;
+            var fLockObj = new object();
 
-        // Use thread-local accumulation to avoid lock contention
-        var lockObj = new object();
-        Parallel.For(0, batch * inChannels,
-            // Initialize thread-local storage
-            () => new T[batch * outChannels * outputHeight * outputWidth],
-            // Body
-            (idx, state, localOutput) =>
-            {
-                int b = idx / inChannels;
-                int ic = idx % inChannels;
-
-                for (int ih = 0; ih < height; ih++)
+            Parallel.For(0, batch * inChannels,
+                () => new float[outLen],
+                (idx, state, localOutput) =>
                 {
-                    for (int iw = 0; iw < width; iw++)
-                    {
-                        int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                        T inputVal = inputData[inputIdx];
+                    int b = idx / inChannels;
+                    int ic = idx % inChannels;
 
-                        for (int oc = 0; oc < outChannels; oc++)
+                    for (int ih = 0; ih < height; ih++)
+                    {
+                        for (int iw = 0; iw < width; iw++)
                         {
-                            for (int kh = 0; kh < kernelHeight; kh++)
+                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                            float inputVal = fInput[inputIdx];
+
+                            for (int oc = 0; oc < outChannels; oc++)
                             {
-                                for (int kw = 0; kw < kernelWidth; kw++)
+                                for (int kh = 0; kh < kernelHeight; kh++)
                                 {
                                     int oh = ih * strideH - padH + kh;
-                                    int ow = iw * strideW - padW + kw;
-
-                                    if (oh >= 0 && oh < outputHeight && ow >= 0 && ow < outputWidth)
+                                    if (oh < 0 || oh >= outputHeight) continue;
+                                    for (int kw = 0; kw < kernelWidth; kw++)
                                     {
+                                        int ow = iw * strideW - padW + kw;
+                                        if (ow < 0 || ow >= outputWidth) continue;
                                         int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
                                         int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                                        localOutput[outputIdx] = numOps.Add(localOutput[outputIdx], numOps.Multiply(inputVal, kernelData[kernelIdx]));
+                                        localOutput[outputIdx] += inputVal * fKernel[kernelIdx];
                                     }
                                 }
                             }
                         }
                     }
-                }
-                return localOutput;
-            },
-            // Merge thread-local results
-            (localOutput) =>
-            {
-                lock (lockObj)
+                    return localOutput;
+                },
+                (localOutput) =>
                 {
-                    for (int i = 0; i < outputData.Length; i++)
+                    lock (fLockObj)
                     {
-                        outputData[i] = numOps.Add(outputData[i], localOutput[i]);
+                        for (int i = 0; i < outLen; i++)
+                            fOutput[i] += localOutput[i];
                     }
-                }
-            });
+                });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dInput = (double[])(object)inputData;
+            var dKernel = (double[])(object)kernelData;
+            var dOutput = (double[])(object)outputData;
+            int outLen = dOutput.Length;
+            var dLockObj = new object();
+
+            Parallel.For(0, batch * inChannels,
+                () => new double[outLen],
+                (idx, state, localOutput) =>
+                {
+                    int b = idx / inChannels;
+                    int ic = idx % inChannels;
+
+                    for (int ih = 0; ih < height; ih++)
+                    {
+                        for (int iw = 0; iw < width; iw++)
+                        {
+                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                            double inputVal = dInput[inputIdx];
+
+                            for (int oc = 0; oc < outChannels; oc++)
+                            {
+                                for (int kh = 0; kh < kernelHeight; kh++)
+                                {
+                                    int oh = ih * strideH - padH + kh;
+                                    if (oh < 0 || oh >= outputHeight) continue;
+                                    for (int kw = 0; kw < kernelWidth; kw++)
+                                    {
+                                        int ow = iw * strideW - padW + kw;
+                                        if (ow < 0 || ow >= outputWidth) continue;
+                                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                        localOutput[outputIdx] += inputVal * dKernel[kernelIdx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return localOutput;
+                },
+                (localOutput) =>
+                {
+                    lock (dLockObj)
+                    {
+                        for (int i = 0; i < outLen; i++)
+                            dOutput[i] += localOutput[i];
+                    }
+                });
+        }
+        else
+        {
+            for (int i = 0; i < outputData.Length; i++)
+                outputData[i] = numOps.Zero;
+
+            // Use thread-local accumulation to avoid lock contention
+            var lockObj = new object();
+            Parallel.For(0, batch * inChannels,
+                // Initialize thread-local storage
+                () => new T[batch * outChannels * outputHeight * outputWidth],
+                // Body
+                (idx, state, localOutput) =>
+                {
+                    int b = idx / inChannels;
+                    int ic = idx % inChannels;
+
+                    for (int ih = 0; ih < height; ih++)
+                    {
+                        for (int iw = 0; iw < width; iw++)
+                        {
+                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                            T inputVal = inputData[inputIdx];
+
+                            for (int oc = 0; oc < outChannels; oc++)
+                            {
+                                for (int kh = 0; kh < kernelHeight; kh++)
+                                {
+                                    for (int kw = 0; kw < kernelWidth; kw++)
+                                    {
+                                        int oh = ih * strideH - padH + kh;
+                                        int ow = iw * strideW - padW + kw;
+
+                                        if (oh >= 0 && oh < outputHeight && ow >= 0 && ow < outputWidth)
+                                        {
+                                            int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                            int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                            localOutput[outputIdx] = numOps.Add(localOutput[outputIdx], numOps.Multiply(inputVal, kernelData[kernelIdx]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return localOutput;
+                },
+                // Merge thread-local results
+                (localOutput) =>
+                {
+                    lock (lockObj)
+                    {
+                        for (int i = 0; i < outputData.Length; i++)
+                        {
+                            outputData[i] = numOps.Add(outputData[i], localOutput[i]);
+                        }
+                    }
+                });
+        }
 
         var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
         DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, input, kernel,
@@ -9745,40 +9966,120 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var inputData = input.GetFlattenedData();
 
-        for (int i = 0; i < gradKernel.Length; i++)
-            gradKernel[i] = numOps.Zero;
+        // Parallelize over inChannels*outChannels since each (ic, oc) pair writes
+        // a disjoint [kernelHeight × kernelWidth] kernel slice. Primitive fast
+        // paths skip virtual dispatch for float/double.
+        int pairs = inChannels * outChannels;
 
-        for (int ic = 0; ic < inChannels; ic++)
+        if (typeof(T) == typeof(float))
         {
-            for (int oc = 0; oc < outChannels; oc++)
+            var fGradOut = (float[])(object)gradOutputData;
+            var fInput = (float[])(object)inputData;
+            var fGradKernel = (float[])(object)gradKernel;
+            Parallel.For(0, pairs, pair =>
             {
+                int ic = pair / outChannels;
+                int oc = pair % outChannels;
                 for (int kh = 0; kh < kernelHeight; kh++)
                 {
                     for (int kw = 0; kw < kernelWidth; kw++)
                     {
-                        T sum = numOps.Zero;
-
+                        float sum = 0f;
                         for (int b = 0; b < batch; b++)
                         {
                             for (int ih = 0; ih < height; ih++)
                             {
+                                int oh = ih * strideH - padH + kh;
+                                if (oh < 0 || oh >= outputHeight) continue;
                                 for (int iw = 0; iw < width; iw++)
                                 {
-                                    int oh = ih * strideH - padH + kh;
                                     int ow = iw * strideW - padW + kw;
-
-                                    if (oh >= 0 && oh < outputHeight && ow >= 0 && ow < outputWidth)
-                                    {
-                                        int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                        int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                                        sum = numOps.Add(sum, numOps.Multiply(gradOutputData[gradOutIdx], inputData[inputIdx]));
-                                    }
+                                    if (ow < 0 || ow >= outputWidth) continue;
+                                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    sum += fGradOut[gradOutIdx] * fInput[inputIdx];
                                 }
                             }
                         }
-
                         int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                        gradKernel[kernelIdx] = sum;
+                        fGradKernel[kernelIdx] = sum;
+                    }
+                }
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGradKernel = (double[])(object)gradKernel;
+            Parallel.For(0, pairs, pair =>
+            {
+                int ic = pair / outChannels;
+                int oc = pair % outChannels;
+                for (int kh = 0; kh < kernelHeight; kh++)
+                {
+                    for (int kw = 0; kw < kernelWidth; kw++)
+                    {
+                        double sum = 0.0;
+                        for (int b = 0; b < batch; b++)
+                        {
+                            for (int ih = 0; ih < height; ih++)
+                            {
+                                int oh = ih * strideH - padH + kh;
+                                if (oh < 0 || oh >= outputHeight) continue;
+                                for (int iw = 0; iw < width; iw++)
+                                {
+                                    int ow = iw * strideW - padW + kw;
+                                    if (ow < 0 || ow >= outputWidth) continue;
+                                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    sum += dGradOut[gradOutIdx] * dInput[inputIdx];
+                                }
+                            }
+                        }
+                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                        dGradKernel[kernelIdx] = sum;
+                    }
+                }
+            });
+        }
+        else
+        {
+            for (int i = 0; i < gradKernel.Length; i++)
+                gradKernel[i] = numOps.Zero;
+
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            T sum = numOps.Zero;
+
+                            for (int b = 0; b < batch; b++)
+                            {
+                                for (int ih = 0; ih < height; ih++)
+                                {
+                                    for (int iw = 0; iw < width; iw++)
+                                    {
+                                        int oh = ih * strideH - padH + kh;
+                                        int ow = iw * strideW - padW + kw;
+
+                                        if (oh >= 0 && oh < outputHeight && ow >= 0 && ow < outputWidth)
+                                        {
+                                            int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                            sum = numOps.Add(sum, numOps.Multiply(gradOutputData[gradOutIdx], inputData[inputIdx]));
+                                        }
+                                    }
+                                }
+                            }
+
+                            int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                            gradKernel[kernelIdx] = sum;
+                        }
                     }
                 }
             }
@@ -11043,54 +11344,143 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
 
-        // Initialize to zero
-        for (int i = 0; i < gradInputData.Length; i++)
-            gradInputData[i] = numOps.Zero;
-
-        // Parallel over (batch, inChannels) - each pair owns disjoint gradInput slices
-        // so direct writes are race-free without thread-local buffers
-        Parallel.For(0, batch * inChannels, idx =>
+        // Primitive fast paths for float/double. Parallel over (batch, inChannels)
+        // pairs — each pair owns a disjoint gradInput slice, so direct writes
+        // are race-free without thread-local buffers.
+        if (typeof(T) == typeof(float))
         {
-            int b = idx / inChannels;
-            int ic = idx % inChannels;
-
-            for (int oc = 0; oc < outChannels; oc++)
+            var fGradOut = (float[])(object)gradOutputData;
+            var fKernel = (float[])(object)kernelData;
+            var fGradInput = (float[])(object)gradInputData;
+            Parallel.For(0, batch * inChannels, idx =>
             {
-                for (int od = 0; od < outputDepth; od++)
+                int b = idx / inChannels;
+                int ic = idx % inChannels;
+                for (int oc = 0; oc < outChannels; oc++)
                 {
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    for (int od = 0; od < outputDepth; od++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
+                        for (int oh = 0; oh < outputHeight; oh++)
                         {
-                            int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
-                            T gradVal = gradOutputData[gradOutIdx];
-
-                            for (int kd = 0; kd < kernelDepth; kd++)
+                            for (int ow = 0; ow < outputWidth; ow++)
                             {
-                                int id = od * strideD + kd * dilationD - padD;
-                                if (id < 0 || id >= depth) continue;
-
-                                for (int kh = 0; kh < kernelHeight; kh++)
+                                int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                float gradVal = fGradOut[gradOutIdx];
+                                for (int kd = 0; kd < kernelDepth; kd++)
                                 {
-                                    int ih = oh * strideH + kh * dilationH - padH;
-                                    if (ih < 0 || ih >= height) continue;
-
-                                    for (int kw = 0; kw < kernelWidth; kw++)
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+                                    for (int kh = 0; kh < kernelHeight; kh++)
                                     {
-                                        int iw = ow * strideW + kw * dilationW - padW;
-                                        if (iw < 0 || iw >= width) continue;
-
-                                        int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
-                                        int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
-                                        gradInputData[inputIdx] = numOps.Add(gradInputData[inputIdx], numOps.Multiply(gradVal, kernelData[kernelIdx]));
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+                                        for (int kw = 0; kw < kernelWidth; kw++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                                            fGradInput[inputIdx] += gradVal * fKernel[kernelIdx];
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradOut = (double[])(object)gradOutputData;
+            var dKernel = (double[])(object)kernelData;
+            var dGradInput = (double[])(object)gradInputData;
+            Parallel.For(0, batch * inChannels, idx =>
+            {
+                int b = idx / inChannels;
+                int ic = idx % inChannels;
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    for (int od = 0; od < outputDepth; od++)
+                    {
+                        for (int oh = 0; oh < outputHeight; oh++)
+                        {
+                            for (int ow = 0; ow < outputWidth; ow++)
+                            {
+                                int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                double gradVal = dGradOut[gradOutIdx];
+                                for (int kd = 0; kd < kernelDepth; kd++)
+                                {
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+                                    for (int kh = 0; kh < kernelHeight; kh++)
+                                    {
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+                                        for (int kw = 0; kw < kernelWidth; kw++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                                            dGradInput[inputIdx] += gradVal * dKernel[kernelIdx];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        else
+        {
+            for (int i = 0; i < gradInputData.Length; i++)
+                gradInputData[i] = numOps.Zero;
+
+            Parallel.For(0, batch * inChannels, idx =>
+            {
+                int b = idx / inChannels;
+                int ic = idx % inChannels;
+
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    for (int od = 0; od < outputDepth; od++)
+                    {
+                        for (int oh = 0; oh < outputHeight; oh++)
+                        {
+                            for (int ow = 0; ow < outputWidth; ow++)
+                            {
+                                int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                T gradVal = gradOutputData[gradOutIdx];
+
+                                for (int kd = 0; kd < kernelDepth; kd++)
+                                {
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+
+                                    for (int kh = 0; kh < kernelHeight; kh++)
+                                    {
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+
+                                        for (int kw = 0; kw < kernelWidth; kw++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                                            gradInputData[inputIdx] = numOps.Add(gradInputData[inputIdx], numOps.Multiply(gradVal, kernelData[kernelIdx]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
@@ -11142,55 +11532,145 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
 
-        // Initialize to zero
-        for (int i = 0; i < gradKernelData.Length; i++)
-            gradKernelData[i] = numOps.Zero;
-
-        // Parallel over outChannels * inChannels for kernel gradient computation
-        Parallel.For(0, outChannels * inChannels, idx =>
+        // Primitive fast paths — each (oc, ic) pair owns a disjoint kernel slice.
+        if (typeof(T) == typeof(float))
         {
-            int oc = idx / inChannels;
-            int ic = idx % inChannels;
-
-            for (int kd = 0; kd < kernelDepth; kd++)
+            var fGradOut = (float[])(object)gradOutputData;
+            var fInput = (float[])(object)inputData;
+            var fGradKernel = (float[])(object)gradKernelData;
+            Parallel.For(0, outChannels * inChannels, idx =>
             {
-                for (int kh = 0; kh < kernelHeight; kh++)
+                int oc = idx / inChannels;
+                int ic = idx % inChannels;
+                for (int kd = 0; kd < kernelDepth; kd++)
                 {
-                    for (int kw = 0; kw < kernelWidth; kw++)
+                    for (int kh = 0; kh < kernelHeight; kh++)
                     {
-                        T sum = numOps.Zero;
-
-                        for (int b = 0; b < batch; b++)
+                        for (int kw = 0; kw < kernelWidth; kw++)
                         {
-                            for (int od = 0; od < outputDepth; od++)
+                            float sum = 0f;
+                            for (int b = 0; b < batch; b++)
                             {
-                                int id = od * strideD + kd * dilationD - padD;
-                                if (id < 0 || id >= depth) continue;
-
-                                for (int oh = 0; oh < outputHeight; oh++)
+                                for (int od = 0; od < outputDepth; od++)
                                 {
-                                    int ih = oh * strideH + kh * dilationH - padH;
-                                    if (ih < 0 || ih >= height) continue;
-
-                                    for (int ow = 0; ow < outputWidth; ow++)
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+                                    for (int oh = 0; oh < outputHeight; oh++)
                                     {
-                                        int iw = ow * strideW + kw * dilationW - padW;
-                                        if (iw < 0 || iw >= width) continue;
-
-                                        int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
-                                        int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
-                                        sum = numOps.Add(sum, numOps.Multiply(gradOutputData[gradOutIdx], inputData[inputIdx]));
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+                                        for (int ow = 0; ow < outputWidth; ow++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+                                            int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            sum += fGradOut[gradOutIdx] * fInput[inputIdx];
+                                        }
                                     }
                                 }
                             }
+                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                            fGradKernel[kernelIdx] = sum;
                         }
-
-                        int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
-                        gradKernelData[kernelIdx] = sum;
                     }
                 }
-            }
-        });
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGradKernel = (double[])(object)gradKernelData;
+            Parallel.For(0, outChannels * inChannels, idx =>
+            {
+                int oc = idx / inChannels;
+                int ic = idx % inChannels;
+                for (int kd = 0; kd < kernelDepth; kd++)
+                {
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            double sum = 0.0;
+                            for (int b = 0; b < batch; b++)
+                            {
+                                for (int od = 0; od < outputDepth; od++)
+                                {
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+                                    for (int oh = 0; oh < outputHeight; oh++)
+                                    {
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+                                        for (int ow = 0; ow < outputWidth; ow++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+                                            int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            sum += dGradOut[gradOutIdx] * dInput[inputIdx];
+                                        }
+                                    }
+                                }
+                            }
+                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                            dGradKernel[kernelIdx] = sum;
+                        }
+                    }
+                }
+            });
+        }
+        else
+        {
+            for (int i = 0; i < gradKernelData.Length; i++)
+                gradKernelData[i] = numOps.Zero;
+
+            Parallel.For(0, outChannels * inChannels, idx =>
+            {
+                int oc = idx / inChannels;
+                int ic = idx % inChannels;
+
+                for (int kd = 0; kd < kernelDepth; kd++)
+                {
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            T sum = numOps.Zero;
+
+                            for (int b = 0; b < batch; b++)
+                            {
+                                for (int od = 0; od < outputDepth; od++)
+                                {
+                                    int id = od * strideD + kd * dilationD - padD;
+                                    if (id < 0 || id >= depth) continue;
+
+                                    for (int oh = 0; oh < outputHeight; oh++)
+                                    {
+                                        int ih = oh * strideH + kh * dilationH - padH;
+                                        if (ih < 0 || ih >= height) continue;
+
+                                        for (int ow = 0; ow < outputWidth; ow++)
+                                        {
+                                            int iw = ow * strideW + kw * dilationW - padW;
+                                            if (iw < 0 || iw >= width) continue;
+
+                                            int gradOutIdx = (((b * outChannels + oc) * outputDepth + od) * outputHeight + oh) * outputWidth + ow;
+                                            int inputIdx = (((b * inChannels + ic) * depth + id) * height + ih) * width + iw;
+                                            sum = numOps.Add(sum, numOps.Multiply(gradOutputData[gradOutIdx], inputData[inputIdx]));
+                                        }
+                                    }
+                                }
+                            }
+
+                            int kernelIdx = (((oc * inChannels + ic) * kernelDepth + kd) * kernelHeight + kh) * kernelWidth + kw;
+                            gradKernelData[kernelIdx] = sum;
+                        }
+                    }
+                }
+            });
+        }
 
         return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernelData));
     }
@@ -15013,36 +15493,129 @@ public class CpuEngine : ITensorLevelEngine
         var rmsData = rms.GetDataArray();
         var gradGammaData = new T[featureSize];
         var gradInputData = new T[input.Length];
-        for (int f = 0; f < featureSize; f++) gradGammaData[f] = numOps.Zero;
 
-        for (int b = 0; b < batchSize; b++)
+        // ────────────────────────────────────────────────────────────────────
+        // Primitive fast paths — method stays generic <T>; float and double
+        // bypass INumericOperations<T> virtual dispatch. Used by LLaMA-style
+        // transformer training (every block has one RMSNorm).
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
         {
-            T invRms = numOps.Divide(numOps.One, rmsData[b]);
-            for (int f = 0; f < featureSize; f++)
+            var fGradOut = (float[])(object)gradOutputData;
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fRms = (float[])(object)rmsData;
+            var fGradGamma = (float[])(object)gradGammaData;
+            var fGradInput = (float[])(object)gradInputData;
+            int fs = featureSize;
+            float invFeatureSizeF = 1f / fs;
+
+            for (int b = 0; b < batchSize; b++)
             {
-                T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
-                gradGammaData[f] = numOps.Add(gradGammaData[f], numOps.Multiply(gradOutputData[b * featureSize + f], normalized));
+                int off = b * fs;
+                float invRms = 1f / fRms[b];
+                for (int f = 0; f < fs; f++)
+                {
+                    float normalized = fInput[off + f] * invRms;
+                    fGradGamma[f] += fGradOut[off + f] * normalized;
+                }
             }
+
+            Parallel.For(0, batchSize, b =>
+            {
+                int off = b * fs;
+                float invRms = 1f / fRms[b];
+                float sumCorrection = 0f;
+                for (int f = 0; f < fs; f++)
+                {
+                    float scaledGrad = fGamma[f] * fGradOut[off + f];
+                    float normalized = fInput[off + f] * invRms;
+                    sumCorrection += scaledGrad * normalized;
+                }
+                float meanCorrection = sumCorrection * invFeatureSizeF;
+                for (int f = 0; f < fs; f++)
+                {
+                    float scaledGrad = fGamma[f] * fGradOut[off + f];
+                    float normalized = fInput[off + f] * invRms;
+                    fGradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
+                }
+            });
         }
-
-        Parallel.For(0, batchSize, b =>
+        else if (typeof(T) == typeof(double))
         {
-            T invRms = numOps.Divide(numOps.One, rmsData[b]);
-            T sumCorrection = numOps.Zero;
-            for (int f = 0; f < featureSize; f++)
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dRms = (double[])(object)rmsData;
+            var dGradGamma = (double[])(object)gradGammaData;
+            var dGradInput = (double[])(object)gradInputData;
+            int fs = featureSize;
+            double invFeatureSizeD = 1.0 / fs;
+
+            for (int b = 0; b < batchSize; b++)
             {
-                T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[b * featureSize + f]);
-                T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
-                sumCorrection = numOps.Add(sumCorrection, numOps.Multiply(scaledGrad, normalized));
+                int off = b * fs;
+                double invRms = 1.0 / dRms[b];
+                for (int f = 0; f < fs; f++)
+                {
+                    double normalized = dInput[off + f] * invRms;
+                    dGradGamma[f] += dGradOut[off + f] * normalized;
+                }
             }
-            T meanCorrection = numOps.Divide(sumCorrection, numOps.FromDouble(featureSize));
-            for (int f = 0; f < featureSize; f++)
+
+            Parallel.For(0, batchSize, b =>
             {
-                T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[b * featureSize + f]);
-                T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
-                gradInputData[b * featureSize + f] = numOps.Multiply(invRms, numOps.Subtract(scaledGrad, numOps.Multiply(normalized, meanCorrection)));
+                int off = b * fs;
+                double invRms = 1.0 / dRms[b];
+                double sumCorrection = 0.0;
+                for (int f = 0; f < fs; f++)
+                {
+                    double scaledGrad = dGamma[f] * dGradOut[off + f];
+                    double normalized = dInput[off + f] * invRms;
+                    sumCorrection += scaledGrad * normalized;
+                }
+                double meanCorrection = sumCorrection * invFeatureSizeD;
+                for (int f = 0; f < fs; f++)
+                {
+                    double scaledGrad = dGamma[f] * dGradOut[off + f];
+                    double normalized = dInput[off + f] * invRms;
+                    dGradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
+                }
+            });
+        }
+        else
+        {
+            for (int f = 0; f < featureSize; f++) gradGammaData[f] = numOps.Zero;
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                T invRms = numOps.Divide(numOps.One, rmsData[b]);
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
+                    gradGammaData[f] = numOps.Add(gradGammaData[f], numOps.Multiply(gradOutputData[b * featureSize + f], normalized));
+                }
             }
-        });
+
+            Parallel.For(0, batchSize, b =>
+            {
+                T invRms = numOps.Divide(numOps.One, rmsData[b]);
+                T sumCorrection = numOps.Zero;
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[b * featureSize + f]);
+                    T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
+                    sumCorrection = numOps.Add(sumCorrection, numOps.Multiply(scaledGrad, normalized));
+                }
+                T meanCorrection = numOps.Divide(sumCorrection, numOps.FromDouble(featureSize));
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[b * featureSize + f]);
+                    T normalized = numOps.Multiply(inputData[b * featureSize + f], invRms);
+                    gradInputData[b * featureSize + f] = numOps.Multiply(invRms, numOps.Subtract(scaledGrad, numOps.Multiply(normalized, meanCorrection)));
+                }
+            });
+        }
 
         gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
         return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
@@ -17392,10 +17965,6 @@ public class CpuEngine : ITensorLevelEngine
         var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
         var countData = new int[outDimSize];
 
-        // Initialize
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = numOps.Zero;
-
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
             innerSize *= source._shape[i];
@@ -17406,37 +17975,112 @@ public class CpuEngine : ITensorLevelEngine
 
         int srcDimSize = source._shape[actualDim];
 
-        // Sum and count
-        for (int outer = 0; outer < outerSize; outer++)
+        if (typeof(T) == typeof(float))
         {
-            for (int d = 0; d < srcDimSize; d++)
+            var fSource = (float[])(object)sourceData;
+            var fOutput = (float[])(object)outputData;
+            Array.Clear(fOutput, 0, fOutput.Length);
+
+            for (int outer = 0; outer < outerSize; outer++)
             {
-                int targetIdx = indicesData[d % indicesData.Length];
-                if (targetIdx < 0 || targetIdx >= outDimSize) continue;
-
-                if (outer == 0) countData[targetIdx]++;
-
-                for (int inner = 0; inner < innerSize; inner++)
+                for (int d = 0; d < srcDimSize; d++)
                 {
-                    int srcIdx = outer * srcDimSize * innerSize + d * innerSize + inner;
-                    int dstIdx = outer * outDimSize * innerSize + targetIdx * innerSize + inner;
-                    outputData[dstIdx] = numOps.Add(outputData[dstIdx], sourceData[srcIdx]);
+                    int targetIdx = indicesData[d % indicesData.Length];
+                    if (targetIdx < 0 || targetIdx >= outDimSize) continue;
+                    if (outer == 0) countData[targetIdx]++;
+                    int srcBase = outer * srcDimSize * innerSize + d * innerSize;
+                    int dstBase = outer * outDimSize * innerSize + targetIdx * innerSize;
+                    for (int inner = 0; inner < innerSize; inner++)
+                        fOutput[dstBase + inner] += fSource[srcBase + inner];
+                }
+            }
+
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                for (int d = 0; d < outDimSize; d++)
+                {
+                    if (countData[d] > 0)
+                    {
+                        float invDivisor = 1f / countData[d];
+                        int baseIdx = outer * outDimSize * innerSize + d * innerSize;
+                        for (int inner = 0; inner < innerSize; inner++)
+                            fOutput[baseIdx + inner] *= invDivisor;
+                    }
                 }
             }
         }
-
-        // Divide by counts
-        for (int outer = 0; outer < outerSize; outer++)
+        else if (typeof(T) == typeof(double))
         {
-            for (int d = 0; d < outDimSize; d++)
+            var dSource = (double[])(object)sourceData;
+            var dOutput = (double[])(object)outputData;
+            Array.Clear(dOutput, 0, dOutput.Length);
+
+            for (int outer = 0; outer < outerSize; outer++)
             {
-                if (countData[d] > 0)
+                for (int d = 0; d < srcDimSize; d++)
                 {
-                    T divisor = numOps.FromDouble(countData[d]);
+                    int targetIdx = indicesData[d % indicesData.Length];
+                    if (targetIdx < 0 || targetIdx >= outDimSize) continue;
+                    if (outer == 0) countData[targetIdx]++;
+                    int srcBase = outer * srcDimSize * innerSize + d * innerSize;
+                    int dstBase = outer * outDimSize * innerSize + targetIdx * innerSize;
+                    for (int inner = 0; inner < innerSize; inner++)
+                        dOutput[dstBase + inner] += dSource[srcBase + inner];
+                }
+            }
+
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                for (int d = 0; d < outDimSize; d++)
+                {
+                    if (countData[d] > 0)
+                    {
+                        double invDivisor = 1.0 / countData[d];
+                        int baseIdx = outer * outDimSize * innerSize + d * innerSize;
+                        for (int inner = 0; inner < innerSize; inner++)
+                            dOutput[baseIdx + inner] *= invDivisor;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Initialize
+            for (int i = 0; i < outputData.Length; i++)
+                outputData[i] = numOps.Zero;
+
+            // Sum and count
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                for (int d = 0; d < srcDimSize; d++)
+                {
+                    int targetIdx = indicesData[d % indicesData.Length];
+                    if (targetIdx < 0 || targetIdx >= outDimSize) continue;
+
+                    if (outer == 0) countData[targetIdx]++;
+
                     for (int inner = 0; inner < innerSize; inner++)
                     {
-                        int idx = outer * outDimSize * innerSize + d * innerSize + inner;
-                        outputData[idx] = numOps.Divide(outputData[idx], divisor);
+                        int srcIdx = outer * srcDimSize * innerSize + d * innerSize + inner;
+                        int dstIdx = outer * outDimSize * innerSize + targetIdx * innerSize + inner;
+                        outputData[dstIdx] = numOps.Add(outputData[dstIdx], sourceData[srcIdx]);
+                    }
+                }
+            }
+
+            // Divide by counts
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                for (int d = 0; d < outDimSize; d++)
+                {
+                    if (countData[d] > 0)
+                    {
+                        T divisor = numOps.FromDouble(countData[d]);
+                        for (int inner = 0; inner < innerSize; inner++)
+                        {
+                            int idx = outer * outDimSize * innerSize + d * innerSize + inner;
+                            outputData[idx] = numOps.Divide(outputData[idx], divisor);
+                        }
                     }
                 }
             }
