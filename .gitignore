@@ -67,3 +67,4 @@ ehthumbs.db
 src/AiDotNet.Native.CUDA/runtimes/*/native/*.dll
 .claude/scheduled_tasks.lock
 .resnet50.log
+.bert100.log
