@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Optimization;
@@ -18,15 +19,83 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private readonly Tensor<T> _finalOutput;
     private readonly IEngine _engine;
     private readonly int[] _compiledInputShape;
+    // Reference to the tensor the plan was traced against — distinct from
+    // _compiledInputShape which is just a shape vector. After a ThenAsync
+    // rebind this tensor's storage is aliased to the upstream plan's final
+    // output, so downstream steps read data written by the upstream steps
+    // without a boundary copy. Null only for the degenerate empty-plan
+    // case (zero steps).
+    private readonly Tensor<T>? _compiledInputTensor;
     private readonly List<GCHandle> _pinnedHandles = new();
+
+    // Source plans that were stitched to form this plan — empty for plans
+    // constructed from a scope compile, length 2 for each ThenAsync result.
+    // Held for two reasons:
+    //   1. Keep A and B GC-reachable through the stitched plan's lifetime,
+    //      matching the xmldoc's "caller retains ownership" contract — the
+    //      caller cannot accidentally let the sources be collected while
+    //      the stitched plan is alive and in use.
+    //   2. Let Execute() detect the "caller disposed a source prematurely"
+    //      bug and throw a crisp ObjectDisposedException instead of running
+    //      over freed GC-handle memory.
+    // Initialized to an empty array (not null) so the Execute loop can
+    // unconditionally iterate.
+    private readonly CompiledInferencePlan<T>[] _sourcePlans;
+
     private bool _disposed;
 
-    private CompiledInferencePlan(CompiledStep<T>[] steps, Tensor<T> finalOutput, IEngine engine, int[] inputShape, List<GCHandle>? handles = null)
+    /// <summary>
+    /// Upstream final-output tensor that this plan was last stitched onto,
+    /// or <c>null</c> if this plan has never been a stitch target.
+    /// <see cref="ThenAsync"/> rebinds this plan's captured input to the
+    /// upstream's output, so a second stitch targeting this plan must
+    /// either reuse the same upstream tensor (idempotent; fine — the
+    /// associativity case <c>(A.Then B).Then C</c> vs <c>A.Then(B.Then C)</c>
+    /// rebinds every intermediate to the same target) or go through a fresh
+    /// compiled plan. Pointing the rebind at a different upstream would
+    /// silently rewire any earlier stitched pipeline — the bug we're
+    /// guarding against.
+    /// </summary>
+    private Tensor<T>? _lastStitchUpstream;
+
+    /// <summary>
+    /// Whether this plan has been disposed. Internal because
+    /// <see cref="ThenAsync"/>'s stitched-plan Execute uses it to detect
+    /// a caller who disposed a source plan while the stitched plan is
+    /// still alive.
+    /// </summary>
+    internal bool IsDisposed => _disposed;
+
+    /// <summary>
+    /// The output buffer produced by this plan's last step. Internal because
+    /// <see cref="ICompiledPlan{T}.ThenAsync"/>'s stitching machinery needs to
+    /// route data from this buffer into the next plan's captured input.
+    /// </summary>
+    internal Tensor<T> FinalOutputBuffer => _finalOutput;
+
+    /// <summary>
+    /// The captured-at-trace-time input tensor of this plan. Internal for the
+    /// same reason as <see cref="FinalOutputBuffer"/>: stitching needs to
+    /// rebind the downstream plan's storage to point at the upstream plan's
+    /// output. Null for empty plans (no steps to consume an input).
+    /// </summary>
+    internal Tensor<T>? CompiledInputTensor => _compiledInputTensor;
+
+    private CompiledInferencePlan(
+        CompiledStep<T>[] steps,
+        Tensor<T> finalOutput,
+        IEngine engine,
+        int[] inputShape,
+        Tensor<T>? compiledInputTensor,
+        List<GCHandle>? handles = null,
+        CompiledInferencePlan<T>[]? sourcePlans = null)
     {
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
         _compiledInputShape = inputShape;
+        _compiledInputTensor = compiledInputTensor;
+        _sourcePlans = sourcePlans ?? Array.Empty<CompiledInferencePlan<T>>();
         if (handles is not null)
             _pinnedHandles.AddRange(handles);
     }
@@ -44,15 +113,217 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para>
+    /// Implementation: we rebind <paramref name="next"/>'s captured input
+    /// tensor to share backing storage with <c>this.FinalOutputBuffer</c>
+    /// (via <see cref="TensorBase{T}.RebindStorageFrom"/>), then splice the
+    /// two plans' step arrays into one flat array —
+    /// <c>[this.steps, next.steps]</c>. No boundary step. The upstream plan's
+    /// last step writes into the same <see cref="Vector{T}"/> the downstream
+    /// plan's first step reads from, so data flows through without any
+    /// per-execute copy. Satisfies the issue's "same object reference,
+    /// no copy" semantic to the strongest degree possible given the existing
+    /// Tensor contract (Tensor OBJECT identity is not restored — the source
+    /// and target Tensor instances stay distinct — but they share a single
+    /// backing Vector and TensorStorage after rebind).
+    /// </para>
+    /// <para>
+    /// <b>Side effect on <paramref name="next"/>:</b> after this call,
+    /// <paramref name="next"/>'s captured input tensor is aliased to
+    /// <c>this.FinalOutputBuffer</c>. Running <paramref name="next"/>
+    /// standalone afterwards will read data produced by <c>this</c>'s last
+    /// execution, not whatever the caller might write into
+    /// <paramref name="next"/>'s input slot. The documented contract is:
+    /// once you stitch a plan into a pipeline, prefer to drive it through
+    /// the stitched plan's <see cref="Execute"/>.
+    /// </para>
+    /// </remarks>
+    public ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next)
+    {
+        if (next is null) throw new ArgumentNullException(nameof(next));
+
+        // Stitching needs to splice each plan's step array — that's a
+        // concrete-type concern, not interface-level. Reject foreign
+        // implementations cleanly rather than guessing.
+        if (next is not CompiledInferencePlan<T> nextPlan)
+            throw new NotSupportedException(
+                $"{nameof(ThenAsync)} requires the next plan to be a built-in CompiledInferencePlan<T>. " +
+                $"Got {next.GetType().FullName}. Third-party implementers can opt in by " +
+                "providing their own concrete-type stitcher.");
+
+        // Both sources must still be alive; stitching a disposed plan would
+        // splice references to freed GCHandles.
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot stitch from a disposed plan.");
+        if (nextPlan._disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot stitch onto a disposed plan.");
+
+        if (_steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot stitch from an empty plan (no steps to feed into next).", nameof(next));
+        if (nextPlan._steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot stitch into an empty plan (no steps to consume the upstream output).", nameof(next));
+        if (nextPlan._compiledInputTensor is null)
+            throw new ArgumentException(
+                "Next plan has no captured input tensor — it cannot be stitched onto.", nameof(next));
+
+        // Reject fan-out reuse from a DIFFERENT upstream. Stitching rebinds
+        // nextPlan's input storage to this plan's output; calling Then again
+        // on the same nextPlan from a different upstream would silently
+        // rewire any earlier stitched pipeline because nextPlan is shared by
+        // reference. Idempotent re-stitch to the same upstream is allowed —
+        // the associativity case (A.Then B).Then C vs A.Then(B.Then C) ends
+        // up rebinding every intermediate to the same target tensor.
+        if (nextPlan._lastStitchUpstream is not null &&
+            !ReferenceEquals(nextPlan._lastStitchUpstream, _finalOutput))
+        {
+            throw new InvalidOperationException(
+                "This plan has already been stitched onto a different upstream. " +
+                "Reusing it as a stitch target with a new upstream would rebind " +
+                "its input storage and silently invalidate the earlier pipeline. " +
+                "Recompile the downstream plan to get a fresh instance for each " +
+                "distinct upstream.");
+        }
+
+        // Validate at stitch time, not at execute time, per acceptance
+        // criterion #3. Compare _shape arrays element-wise so the error
+        // message can name the mismatching dim.
+        var thisOut  = _finalOutput._shape;
+        var nextIn   = nextPlan._compiledInputTensor._shape;
+        if (thisOut.Length != nextIn.Length || !ShapesEqual(thisOut, nextIn))
+            throw new ArgumentException(
+                $"Cannot stitch: this plan's output shape [{string.Join(", ", thisOut)}] " +
+                $"does not match next plan's input shape [{string.Join(", ", nextIn)}]. " +
+                "Stitching requires shape-equal boundary tensors.",
+                nameof(next));
+
+        // Rebind nextPlan's captured input to share storage with this plan's
+        // final output. After this point, writes to _finalOutput are
+        // immediately visible to nextPlan's first step's closure reads — no
+        // boundary memcpy, no intermediate materialization. RebindStorageFrom
+        // validates shape/contiguity/offset-zero and throws descriptively
+        // if the invariants don't hold (pre-filtered above, so in practice
+        // this is a belt-and-suspenders check).
+        nextPlan._compiledInputTensor.RebindStorageFrom(_finalOutput);
+        nextPlan._lastStitchUpstream = _finalOutput;
+
+        // Splice: [thisSteps..., nextSteps...]. No boundary step — the
+        // rebind above is a one-shot stitch-time operation, not a
+        // per-execute copy.
+        //
+        // Cross-engine handling: if the two plans were compiled against
+        // different engines (e.g. plan A with CpuEngine, plan B with
+        // DirectGpuEngine), running B's steps with A's engine produces
+        // wrong results — each op is dispatched to the wrong kernel set.
+        // The previous implementation handed the stitched plan's single
+        // _engine to every step's Execute, so cross-engine stitches silently
+        // computed garbage. Wrap each of nextPlan's steps in a shim that
+        // substitutes its original engine. Plan A's steps keep their
+        // engine binding via the outer loop.
+        var combined = new CompiledStep<T>[_steps.Length + nextPlan._steps.Length];
+        Array.Copy(_steps, 0, combined, 0, _steps.Length);
+        bool crossEngine = !ReferenceEquals(_engine, nextPlan._engine);
+        if (crossEngine)
+        {
+            Trace.WriteLine(
+                $"[CompiledInferencePlan] Stitching across engines: " +
+                $"{_engine.GetType().Name} → {nextPlan._engine.GetType().Name}. " +
+                "Next plan's steps will run against their original engine; " +
+                "the boundary tensor is aliased via RebindStorageFrom, so the " +
+                "device-transfer cost is paid by the first cross-engine read.");
+            var nextEngine = nextPlan._engine;
+            for (int i = 0; i < nextPlan._steps.Length; i++)
+            {
+                var original = nextPlan._steps[i];
+                var originalExecute = original.Execute;
+                // The outer loop passes _engine (plan A's) to this delegate;
+                // we ignore it and route to nextEngine (plan B's original).
+                Action<IEngine, Tensor<T>> rewrapped = (_, output) => originalExecute(nextEngine, output);
+                combined[_steps.Length + i] = new CompiledStep<T>(
+                    original.OpName,
+                    rewrapped,
+                    original.OutputBuffer,
+                    original.Inputs,
+                    original.BackwardFn,
+                    original.SavedState);
+            }
+        }
+        else
+        {
+            Array.Copy(nextPlan._steps, 0, combined, _steps.Length, nextPlan._steps.Length);
+        }
+
+        // The stitched plan inherits this plan's input shape (callers re-use
+        // their existing IsValid checks) but reports next plan's final
+        // output as its result. Pinned handles stay with the originals —
+        // the stitched plan owns no new pins, so its Dispose is a no-op
+        // for handles. The sourcePlans array holds strong references to
+        // every LEAF plan (not just the immediate operands): if this or
+        // nextPlan is itself a previously-stitched result, we flatten its
+        // leaves into the new array so the Execute disposed-source check
+        // sees every backing plan. Without this, A.Then(B).Then(C) would
+        // store only [stitchedAB, C] and disposing A silently leaves the
+        // outer pipeline running against freed GCHandles.
+        var leftSources = _sourcePlans.Length == 0
+            ? new[] { this }
+            : _sourcePlans;
+        var rightSources = nextPlan._sourcePlans.Length == 0
+            ? new[] { nextPlan }
+            : nextPlan._sourcePlans;
+        var stitchedSources = new CompiledInferencePlan<T>[leftSources.Length + rightSources.Length];
+        Array.Copy(leftSources, 0, stitchedSources, 0, leftSources.Length);
+        Array.Copy(rightSources, 0, stitchedSources, leftSources.Length, rightSources.Length);
+
+        return new CompiledInferencePlan<T>(
+            steps: combined,
+            finalOutput: nextPlan._finalOutput,
+            engine: _engine,
+            inputShape: (int[])_compiledInputShape.Clone(),
+            compiledInputTensor: _compiledInputTensor,
+            handles: null,
+            sourcePlans: stitchedSources);
+    }
+
+    private static bool ShapesEqual(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
+
     /// <summary>
     /// Executes the compiled plan. Runs each step's delegate in order.
     /// All buffers are pre-allocated - zero allocation during execution.
-    /// Throws ObjectDisposedException if the plan has been disposed.
+    /// Throws ObjectDisposedException if the plan has been disposed
+    /// OR if any stitched source plan has been disposed (stitched plans
+    /// share step references with their sources; running over a disposed
+    /// source's freed GCHandles would be undefined behaviour).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Execute()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+
+        // Stitched-plan guard: the steps array holds references into each
+        // source plan's pre-allocated buffers. If the caller disposed A or
+        // B while the stitched plan is still alive, their pinned GCHandles
+        // are freed and running over them silently corrupts memory. Raise
+        // a clean error instead. Iteration is zero-cost for the common
+        // non-stitched case because _sourcePlans is the sentinel empty array.
+        for (int i = 0; i < _sourcePlans.Length; i++)
+        {
+            if (_sourcePlans[i]._disposed)
+                throw new ObjectDisposedException(
+                    nameof(CompiledInferencePlan<T>),
+                    $"Stitched plan's source at index {i} has been disposed. " +
+                    "The caller must keep all plans passed to ThenAsync alive " +
+                    "for the lifetime of the stitched result.");
+        }
+
         var steps = _steps;
         var engine = _engine;
         for (int i = 0; i < steps.Length; i++)
@@ -102,8 +373,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var pinnedHandles = new List<GCHandle>();
 
         // Determine input shape from the first step's inputs (for IsValid check)
-        var inputShape = steps.Count > 0 && steps[0].Inputs.Length > 0
-            ? (int[])steps[0].Inputs[0]._shape.Clone()
+        // and capture the tensor reference itself for Then() stitching.
+        var inputTensor = steps.Count > 0 && steps[0].Inputs.Length > 0
+            ? steps[0].Inputs[0]
+            : null;
+        var inputShape = inputTensor is not null
+            ? (int[])inputTensor._shape.Clone()
             : Array.Empty<int>();
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
@@ -188,7 +463,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         // Use the last optimized step's output (may differ from original after fusion/spectral passes)
         var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, pinnedHandles);
+        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles);
     }
 
     /// <summary>

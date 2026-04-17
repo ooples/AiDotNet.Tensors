@@ -20,6 +20,87 @@ public interface ICompiledPlan<T> : IDisposable
 
     /// <summary>Number of compiled execution steps.</summary>
     int StepCount { get; }
+
+    /// <summary>
+    /// Composes this plan with <paramref name="next"/> into a single stitched
+    /// plan whose <see cref="Execute"/> runs <i>this</i>'s steps followed by
+    /// <i>next</i>'s steps as one flat delegate array. The intermediate
+    /// tensor (this plan's final output) shares backing storage with next's
+    /// captured input after the call, so data flows through without any new
+    /// <see cref="Tensor{T}"/> materialization or per-execute copy.
+    /// Production pipelines like
+    /// <c>tokenizer → encoder → transformer → classifier</c> become one
+    /// compiled kernel with no inter-plan materialization overhead.
+    /// </summary>
+    /// <param name="next">The plan to run after this one. Its captured input
+    /// shape must equal this plan's final output shape — validated at stitch
+    /// time, not at execute time.</param>
+    /// <returns>A new <see cref="ICompiledPlan{T}"/> whose
+    /// <see cref="Execute"/> is the composed pipeline. The stitched result
+    /// holds strong references to <c>this</c> and <paramref name="next"/>
+    /// (keeping them GC-reachable for the stitched plan's lifetime), but
+    /// does <b>not</b> take disposal ownership — disposing the stitched
+    /// plan releases its own resources and leaves the originals operable.
+    /// This lets a single plan participate in multiple stitched pipelines.
+    /// Disposing the originals <i>before</i> the stitched plan, however, is
+    /// a contract violation and will cause the stitched plan's
+    /// <see cref="Execute"/> to throw <see cref="ObjectDisposedException"/>
+    /// (rather than silently corrupt through freed GCHandles).</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="next"/> is null.</exception>
+    /// <exception cref="ObjectDisposedException"><c>this</c> or
+    /// <paramref name="next"/> has already been disposed.</exception>
+    /// <exception cref="ArgumentException">The output shape of this plan
+    /// does not match the input shape of <paramref name="next"/>; or either
+    /// plan has no steps to compose.</exception>
+    /// <exception cref="NotSupportedException"><paramref name="next"/> is not
+    /// the built-in <c>CompiledInferencePlan&lt;T&gt;</c>. Stitching is
+    /// implementation-specific because it needs to splice each plan's
+    /// internal step array; third-party implementers can opt in by
+    /// providing their own <c>ThenAsync</c> on a concrete subtype.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Naming — why <c>ThenAsync</c> without <see cref="System.Threading.Tasks.Task"/>?</b>
+    /// The name follows the issue #170 spec verbatim. The return type is
+    /// synchronous because stitch-time work (shape validation, storage
+    /// rebind, step-array splice) is trivial and there's no IO or long-
+    /// running compute to yield on. Runtime analyzers that flag the Async
+    /// suffix without a Task return (e.g. VSTHRD200) should be suppressed
+    /// at call sites if they're noisy.
+    /// </para>
+    /// <para>
+    /// <b>Semantics:</b> stitching is associative —
+    /// <c>(a.ThenAsync(b)).ThenAsync(c)</c> is structurally equivalent to
+    /// <c>a.ThenAsync(b.ThenAsync(c))</c> (same flat step sequence in the
+    /// same order) — and re-entrant: a stitched plan can be the operand of
+    /// another <c>ThenAsync</c> call. Each call validates shapes immediately
+    /// and throws at composition time rather than failing late at execute.
+    /// </para>
+    /// <para>
+    /// <b>Side effect on <paramref name="next"/>:</b> after this call,
+    /// <paramref name="next"/>'s captured input tensor shares backing
+    /// storage with <c>this</c>'s final output. Running
+    /// <paramref name="next"/> standalone afterwards will read data
+    /// produced by <c>this</c>'s most recent execution, not whatever the
+    /// caller writes into next's input. The documented pattern is: once a
+    /// plan is stitched into a pipeline, drive it through the stitched
+    /// plan's <see cref="Execute"/>.
+    /// </para>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #170):</b> adding
+    /// this member to <see cref="ICompiledPlan{T}"/> is both a
+    /// source-breaking change for any downstream consumer that implements
+    /// this interface directly (not just uses it) <b>and</b> a
+    /// binary-breaking change for already-compiled external implementers
+    /// at runtime. The built-in <c>CompiledInferencePlan&lt;T&gt;</c> in
+    /// this assembly is updated alongside this interface addition, so
+    /// internal consumers are unaffected — but third-party implementers
+    /// must recompile against this assembly and add a corresponding method.
+    /// No default-interface-member polyfill is provided because .NET
+    /// Framework 4.7.1 (one of this library's target frameworks) does not
+    /// support default interface members.
+    /// </para>
+    /// </remarks>
+    ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next);
 }
 
 /// <summary>

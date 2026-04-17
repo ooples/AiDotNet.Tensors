@@ -19,19 +19,107 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Shared storage for tensor data. Multiple views can reference the same storage.
     /// </summary>
-    internal readonly TensorStorage<T> _storage;
+    /// <remarks>
+    /// Was <c>readonly</c> historically. The <see langword="readonly"/> was removed to
+    /// support <see cref="RebindStorageFrom"/>, which is the ONLY path that should
+    /// reassign this field. Under all other circumstances this field is effectively
+    /// readonly — the rebind operation is narrow (plan stitching, issue #170) and
+    /// intentionally bypasses the usual "views share storage, storage itself is
+    /// immutable" invariant.
+    /// </remarks>
+    internal TensorStorage<T> _storage;
 
     /// <summary>
     /// Direct reference to underlying Vector for backward compatibility with existing engine code.
     /// All new code should prefer _storage methods.
     /// </summary>
-    protected readonly Vector<T> _data;
+    /// <remarks>
+    /// Was <c>readonly</c> historically — see <see cref="_storage"/>'s remarks for why
+    /// the modifier was dropped. Same narrow intent: only <see cref="RebindStorageFrom"/>
+    /// should ever reassign this field.
+    /// </remarks>
+    protected Vector<T> _data;
 
     /// <summary>
     /// Internal accessor for the backing vector. Used by DirectGpuTensorEngine to check
     /// activation cache without triggering CPU materialization.
     /// </summary>
     internal Vector<T> DataVector => _data;
+
+    /// <summary>
+    /// Rebinds this tensor's backing storage to alias <paramref name="source"/>'s storage.
+    /// After a successful rebind, both tensors read from and write to the <i>same</i>
+    /// underlying <see cref="Vector{T}"/> and <see cref="TensorStorage{T}"/> — no data
+    /// copy, no new allocation. Narrow use case: plan stitching (<see cref="AiDotNet.Tensors.Engines.Compilation.ICompiledPlan{T}.ThenAsync"/>)
+    /// needs the downstream plan's captured input to point at the upstream plan's
+    /// captured output so execute-time operations see each other's results without
+    /// going through a boundary memcpy.
+    /// </summary>
+    /// <param name="source">The tensor whose storage this tensor should alias.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="source"/> has a different
+    /// shape, is non-contiguous, or has a non-zero storage offset. Rebind is only
+    /// well-defined when the two buffers are flat-equivalent.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Side effect — identity transfer.</b> After this call, mutating the data of
+    /// either tensor is visible through the other. Callers who previously treated
+    /// <c>this</c> as an independent buffer must stop writing to it (any writes now
+    /// clobber <paramref name="source"/>'s contents as well).
+    /// </para>
+    /// <para>
+    /// <b>View caveat.</b> <see cref="Tensor{T}.Reshape"/>, <see cref="Tensor{T}.Transpose"/>
+    /// and other view-producing operations create new Tensor objects that capture the
+    /// <b>current</b> <see cref="_data"/> reference at the time of creation. Views
+    /// constructed before a rebind will continue to see the <i>old</i> storage; only
+    /// direct operations on <c>this</c> (and views constructed <i>after</i> the rebind)
+    /// see the new storage. This is intentional — the common stitching case passes the
+    /// input tensor directly to its first op (no pre-rebind views), so views are rare
+    /// in practice.
+    /// </para>
+    /// </remarks>
+    internal void RebindStorageFrom(TensorBase<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+
+        // Shape equality: the user-facing `Length` of both tensors must match
+        // element-for-element or the rebind would leave our `_shape`/`_strides`
+        // out of sync with the new storage. We accept any shape permutation
+        // the caller claims — strides/shape on `this` are untouched.
+        if (source._shape.Length != _shape.Length)
+            throw new ArgumentException(
+                $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
+                $"source has rank {source._shape.Length}.",
+                nameof(source));
+        for (int i = 0; i < _shape.Length; i++)
+        {
+            if (_shape[i] != source._shape[i])
+                throw new ArgumentException(
+                    $"Rebind requires same shape. This [{string.Join(", ", _shape)}] vs " +
+                    $"source [{string.Join(", ", source._shape)}].",
+                    nameof(source));
+        }
+
+        // Contiguity + zero-offset: the layout in `this` must describe a flat
+        // element range over the new storage. View tensors (non-contiguous
+        // strides, non-zero storage offset) would silently misread the aliased
+        // buffer. Fail loud instead of corrupt-quiet.
+        if (!IsContiguous || _storageOffset != 0)
+            throw new ArgumentException(
+                "Rebind target must be contiguous with zero storage offset; " +
+                "views are not supported.", nameof(source));
+        if (!source.IsContiguous || source._storageOffset != 0)
+            throw new ArgumentException(
+                "Rebind source must be contiguous with zero storage offset; " +
+                "views are not supported.", nameof(source));
+
+        // Atomic swap — both fields get the new backing together so an
+        // intervening read couldn't observe a half-rebound state. (This
+        // class's instances aren't thread-safe in the general case, but
+        // matching the two updates keeps intent explicit.)
+        _data = source._data;
+        _storage = source._storage;
+    }
 
     /// <summary>
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
