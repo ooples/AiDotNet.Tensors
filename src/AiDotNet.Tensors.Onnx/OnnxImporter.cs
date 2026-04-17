@@ -99,8 +99,20 @@ public static class OnnxImporter
             namedOutputs[vo.Name] = new ShapeProfile(vo.Name, shape, elemType);
         }
 
+        // ── Pre-pass: rewrite BERT-style GELU erf decomposition to fused
+        //    Gelu. Exports from tf2onnx / torch <= opset 19 emit
+        //    GELU(x) = 0.5·x·(1 + erf(x/√2)) as 5 ops (Div → Erf → Add → Mul
+        //    → Mul). Our A-S Erf approximation has only 1.5e-7 absolute
+        //    error but the engine's fused Gelu uses the same rational
+        //    approximation as ORT — rewriting gives bit-exact parity on
+        //    BERT logits instead of compounding through 12 transformer
+        //    layers. Only fires when the input to Div is a regular tensor
+        //    (not a constant) and the output of the final Mul has no other
+        //    consumers, so rewrite is semantically equivalent.
+        var rewrittenNodes = GeluPatternRewriter.Rewrite(graph.Node);
+
         // ── Topologically sort nodes ──────────────────────────────────────
-        var sortedNodes = TopologicalSort(graph, tensorsByName.Keys);
+        var sortedNodes = TopologicalSort(graph, tensorsByName.Keys, rewrittenNodes);
 
         // ── Dispatch translators for each node under GraphMode ────────────
         var registry = OnnxOpTranslatorRegistry<T>.BuildDefault();
@@ -340,32 +352,38 @@ public static class OnnxImporter
 
     // ─── Topological sort ────────────────────────────────────────────────
 
-    private static List<NodeProto> TopologicalSort(GraphProto graph, IEnumerable<string> seeded)
+    private static List<NodeProto> TopologicalSort(GraphProto graph, IEnumerable<string> seeded, IReadOnlyList<NodeProto>? nodesOverride = null)
+    {
+        var nodeList = nodesOverride ?? (IReadOnlyList<NodeProto>)graph.Node;
+        return TopologicalSortCore(nodeList, seeded);
+    }
+
+    private static List<NodeProto> TopologicalSortCore(IReadOnlyList<NodeProto> nodeList, IEnumerable<string> seeded)
     {
         // Seeded = tensor names already in the registry (initializers +
         // graph inputs). Any node whose inputs are all seeded can run first.
         var producedBy = new Dictionary<string, int>(); // output-name → node index
-        for (int i = 0; i < graph.Node.Count; i++)
+        for (int i = 0; i < nodeList.Count; i++)
         {
-            var n = graph.Node[i];
+            var n = nodeList[i];
             for (int j = 0; j < n.Output.Count; j++)
                 producedBy[n.Output[j]] = i;
         }
 
         var available = new HashSet<string>(seeded, StringComparer.Ordinal);
-        var visited = new bool[graph.Node.Count];
-        var sorted = new List<NodeProto>(graph.Node.Count);
+        var visited = new bool[nodeList.Count];
+        var sorted = new List<NodeProto>(nodeList.Count);
 
         // Iterative Kahn's-like sweep. Each pass emits every node whose inputs
         // are all available and marks its outputs as available for the next
         // pass. Guarded against infinite loops by requiring forward progress.
-        while (sorted.Count < graph.Node.Count)
+        while (sorted.Count < nodeList.Count)
         {
             bool progress = false;
-            for (int i = 0; i < graph.Node.Count; i++)
+            for (int i = 0; i < nodeList.Count; i++)
             {
                 if (visited[i]) continue;
-                var n = graph.Node[i];
+                var n = nodeList[i];
                 bool ready = true;
                 for (int j = 0; j < n.Input.Count; j++)
                 {
@@ -388,10 +406,10 @@ public static class OnnxImporter
             {
                 // Cycle or dangling input. List the first stuck node's
                 // missing input for diagnostics.
-                for (int i = 0; i < graph.Node.Count; i++)
+                for (int i = 0; i < nodeList.Count; i++)
                 {
                     if (visited[i]) continue;
-                    var n = graph.Node[i];
+                    var n = nodeList[i];
                     for (int j = 0; j < n.Input.Count; j++)
                     {
                         if (string.IsNullOrEmpty(n.Input[j])) continue;

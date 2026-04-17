@@ -48,7 +48,14 @@ internal static class ArithOperators
             {
                 // Collapse all leading batch dims into a single dim so the
                 // 3D-only engine kernel applies. Reshape is a storage-sharing
-                // view; the copy is free.
+                // view when the source is contiguous — but attention Q/K/V
+                // come out of TensorPermute (non-contiguous strided views),
+                // so Reshape across a dim-merge boundary WOULD reinterpret
+                // the strided layout as row-major and produce wrong values.
+                // The Permute GraphMode closure now materializes via
+                // Contiguous, so at Execute time these inputs are row-major
+                // — but their _shape still reflects the post-permute layout
+                // which is what we want for the Reshape here.
                 int batchA = 1;
                 for (int i = 0; i < a.Rank - 2; i++) batchA *= a._shape[i];
                 int batchB = 1;
