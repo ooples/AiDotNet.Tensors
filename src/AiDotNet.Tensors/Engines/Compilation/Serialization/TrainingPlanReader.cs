@@ -89,7 +89,16 @@ internal static class TrainingPlanReader
         int fpLen = reader.ReadInt32();
         RequireNonNegative(fpLen, nameof(fpLen));
         RequireWithinStream(bodyStream, fpLen, nameof(fpLen));
-        string hwFingerprint = Encoding.UTF8.GetString(reader.ReadBytes(fpLen));
+        // BinaryReader.ReadBytes returns a short array on truncated streams
+        // (silent short read) — validate length matches the requested count,
+        // matching the pattern in SavedStateSerializer.ReadString. Without
+        // this, a truncated fingerprint would decode to a short string and
+        // let the compatibility check compare against a wrong value.
+        var fpBytes = reader.ReadBytes(fpLen);
+        if (fpBytes.Length != fpLen)
+            throw new InvalidDataException(
+                $"Training plan hardware fingerprint was truncated: expected {fpLen} bytes, got {fpBytes.Length}.");
+        string hwFingerprint = Encoding.UTF8.GetString(fpBytes);
 
         // ── Compatibility check ─────────────────────────────────────────
         var compat = new PlanCompatibilityInfo
@@ -236,7 +245,11 @@ internal static class TrainingPlanReader
         int nameLen = reader.ReadInt32();
         RequireNonNegative(nameLen, nameof(nameLen));
         RequireWithinStream(bodyStream, nameLen, nameof(nameLen));
-        string opName = Encoding.UTF8.GetString(reader.ReadBytes(nameLen));
+        var nameBytes = reader.ReadBytes(nameLen);
+        if (nameBytes.Length != nameLen)
+            throw new InvalidDataException(
+                $"Training plan op name was truncated: expected {nameLen} bytes, got {nameBytes.Length}.");
+        string opName = Encoding.UTF8.GetString(nameBytes);
 
         int inputCount = reader.ReadInt32();
         RequireNonNegative(inputCount, nameof(inputCount));

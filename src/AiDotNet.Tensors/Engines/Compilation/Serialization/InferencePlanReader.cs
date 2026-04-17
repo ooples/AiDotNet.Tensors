@@ -85,6 +85,9 @@ internal static class InferencePlanReader
         RequireNonNegative(fpLen, nameof(fpLen));
         RequireWithinStream(bodyStream, fpLen, nameof(fpLen));
         var fpBytes = reader.ReadBytes(fpLen);
+        if (fpBytes.Length != fpLen)
+            throw new InvalidDataException(
+                $"Inference plan hardware fingerprint was truncated: expected {fpLen} bytes, got {fpBytes.Length}.");
         string hwFingerprint = Encoding.UTF8.GetString(fpBytes);
 
         // ── Compatibility check ─────────────────────────────────────────
@@ -139,6 +142,9 @@ internal static class InferencePlanReader
         RequireNonNegative(nameLen, nameof(nameLen));
         RequireWithinStream(bodyStream, nameLen, nameof(nameLen));
         var nameBytes = reader.ReadBytes(nameLen);
+        if (nameBytes.Length != nameLen)
+            throw new InvalidDataException(
+                $"Inference plan op name was truncated: expected {nameLen} bytes, got {nameBytes.Length}.");
         string opName = Encoding.UTF8.GetString(nameBytes);
 
         // Input tensor IDs
