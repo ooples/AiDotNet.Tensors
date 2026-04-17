@@ -45,6 +45,20 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private bool _disposed;
 
     /// <summary>
+    /// Upstream final-output tensor that this plan was last stitched onto,
+    /// or <c>null</c> if this plan has never been a stitch target.
+    /// <see cref="ThenAsync"/> rebinds this plan's captured input to the
+    /// upstream's output, so a second stitch targeting this plan must
+    /// either reuse the same upstream tensor (idempotent; fine — the
+    /// associativity case <c>(A.Then B).Then C</c> vs <c>A.Then(B.Then C)</c>
+    /// rebinds every intermediate to the same target) or go through a fresh
+    /// compiled plan. Pointing the rebind at a different upstream would
+    /// silently rewire any earlier stitched pipeline — the bug we're
+    /// guarding against.
+    /// </summary>
+    private Tensor<T>? _lastStitchUpstream;
+
+    /// <summary>
     /// Whether this plan has been disposed. Internal because
     /// <see cref="ThenAsync"/>'s stitched-plan Execute uses it to detect
     /// a caller who disposed a source plan while the stitched plan is
@@ -156,6 +170,24 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             throw new ArgumentException(
                 "Next plan has no captured input tensor — it cannot be stitched onto.", nameof(next));
 
+        // Reject fan-out reuse from a DIFFERENT upstream. Stitching rebinds
+        // nextPlan's input storage to this plan's output; calling Then again
+        // on the same nextPlan from a different upstream would silently
+        // rewire any earlier stitched pipeline because nextPlan is shared by
+        // reference. Idempotent re-stitch to the same upstream is allowed —
+        // the associativity case (A.Then B).Then C vs A.Then(B.Then C) ends
+        // up rebinding every intermediate to the same target tensor.
+        if (nextPlan._lastStitchUpstream is not null &&
+            !ReferenceEquals(nextPlan._lastStitchUpstream, _finalOutput))
+        {
+            throw new InvalidOperationException(
+                "This plan has already been stitched onto a different upstream. " +
+                "Reusing it as a stitch target with a new upstream would rebind " +
+                "its input storage and silently invalidate the earlier pipeline. " +
+                "Recompile the downstream plan to get a fresh instance for each " +
+                "distinct upstream.");
+        }
+
         // Validate at stitch time, not at execute time, per acceptance
         // criterion #3. Compare _shape arrays element-wise so the error
         // message can name the mismatching dim.
@@ -176,6 +208,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // if the invariants don't hold (pre-filtered above, so in practice
         // this is a belt-and-suspenders check).
         nextPlan._compiledInputTensor.RebindStorageFrom(_finalOutput);
+        nextPlan._lastStitchUpstream = _finalOutput;
 
         // Splice: [thisSteps..., nextSteps...]. No boundary step — the
         // rebind above is a one-shot stitch-time operation, not a
@@ -228,9 +261,22 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // output as its result. Pinned handles stay with the originals —
         // the stitched plan owns no new pins, so its Dispose is a no-op
         // for handles. The sourcePlans array holds strong references to
-        // this + nextPlan: it keeps the originals GC-reachable and lets
-        // Execute() check that neither source has been disposed before
-        // iterating the shared step array.
+        // every LEAF plan (not just the immediate operands): if this or
+        // nextPlan is itself a previously-stitched result, we flatten its
+        // leaves into the new array so the Execute disposed-source check
+        // sees every backing plan. Without this, A.Then(B).Then(C) would
+        // store only [stitchedAB, C] and disposing A silently leaves the
+        // outer pipeline running against freed GCHandles.
+        var leftSources = _sourcePlans.Length == 0
+            ? new[] { this }
+            : _sourcePlans;
+        var rightSources = nextPlan._sourcePlans.Length == 0
+            ? new[] { nextPlan }
+            : nextPlan._sourcePlans;
+        var stitchedSources = new CompiledInferencePlan<T>[leftSources.Length + rightSources.Length];
+        Array.Copy(leftSources, 0, stitchedSources, 0, leftSources.Length);
+        Array.Copy(rightSources, 0, stitchedSources, leftSources.Length, rightSources.Length);
+
         return new CompiledInferencePlan<T>(
             steps: combined,
             finalOutput: nextPlan._finalOutput,
@@ -238,7 +284,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             inputShape: (int[])_compiledInputShape.Clone(),
             compiledInputTensor: _compiledInputTensor,
             handles: null,
-            sourcePlans: new[] { this, nextPlan });
+            sourcePlans: stitchedSources);
     }
 
     private static bool ShapesEqual(int[] a, int[] b)

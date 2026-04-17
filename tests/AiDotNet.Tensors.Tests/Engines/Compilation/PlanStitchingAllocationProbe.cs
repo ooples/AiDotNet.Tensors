@@ -51,8 +51,8 @@ public class PlanStitchingAllocationProbe
         var inputB  = Tensor<float>.CreateRandom([16, 32]);
         var weightB = Tensor<float>.CreateRandom([32, 8]);
 
-        var planA = CompileMatMulSigmoid(engine, inputA, weightA);
-        var planB = CompileMatMulSigmoid(engine, inputB, weightB);
+        using var planA = CompileMatMulSigmoid(engine, inputA, weightA);
+        using var planB = CompileMatMulSigmoid(engine, inputB, weightB);
         using var stitched = planA.ThenAsync(planB);
 
         // Warm everything up so any first-call JIT/lazy-init costs are
@@ -79,9 +79,9 @@ public class PlanStitchingAllocationProbe
         Assert.True(delta < 256,
             $"Stitched Execute() allocated {delta} bytes — must be < 256 to prove no Tensor materialization between A and B. " +
             "Any new Tensor allocation would be thousands of bytes.");
-
-        planA.Dispose();
-        planB.Dispose();
+        // planA / planB / stitched are all `using var`, so they dispose in
+        // reverse-declaration order (stitched → planB → planA) when the method
+        // exits — including along any assertion-failure path.
     }
 }
 #endif
