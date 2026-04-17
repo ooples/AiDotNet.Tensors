@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net471</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Version>1.0.0-preview</Version>
+    <Title>AiDotNet.Tensors.Onnx</Title>
+    <Description>ONNX model importer for AiDotNet.Tensors. Parses ONNX protobuf files and produces a compiled inference plan (ICompiledPlan&lt;T&gt;) that runs through the AiDotNet.Tensors fusion + autotune stack. Supports the operator set needed for common image-classification and transformer models (ResNet, BERT, ViT).</Description>
+    <Company>Ooples Finance</Company>
+    <Authors>ooples</Authors>
+    <Copyright>Ooples Finance LLC 2025</Copyright>
+    <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
+    <PackageTags>tensors; onnx; model-import; inference; deep-learning</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Google.Protobuf + runtime for ONNX model parsing. The .proto schema
+         generates C# classes at build time via Grpc.Tools. -->
+    <PackageReference Include="Google.Protobuf" Version="3.28.3" />
+    <PackageReference Include="Grpc.Tools" Version="2.66.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Compile the vendored onnx.proto3 schema into generated C# classes. -->
+    <Protobuf Include="Protos\onnx.proto3" GrpcServices="None" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx.Tests" />
+  </ItemGroup>
+</Project>

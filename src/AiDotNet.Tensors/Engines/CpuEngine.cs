@@ -20319,7 +20319,11 @@ public class CpuEngine : ITensorLevelEngine
                 var outShape = new int[axes.Length];
                 for (int i = 0; i < axes.Length; i++) outShape[i] = tensor._shape[axes[i]];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorPermute", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Permute's eager path returns a strided view; .Contiguous()
+                    // materializes it into row-major memory so AsSpan doesn't
+                    // throw "non-contiguous" when copying into the pre-allocated
+                    // output. O(n) materialization cost, paid once per Execute.
+                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes).Contiguous(); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
             }
         }

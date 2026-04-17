@@ -1130,10 +1130,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Mean forward: pinned SumUnsafe + divide
+        // Mean forward: pinned SumUnsafe + divide.
+        // Only applies to full-tensor reductions where the output is a single
+        // scalar — the fast path writes one float to cOut[0]. Partial-axis
+        // reductions (e.g. ReduceMean over [2,3] for GlobalAveragePool, which
+        // keeps (N,C) slots) need the general path because the specialization
+        // would silently collapse all outputs into cOut[0].
         // A/B tested: Parallel.For overhead (0.43ms) exceeds single-thread (0.16ms) for 1M.
         // PyTorch likely uses SIMD sum with wider parallelism (internal thread pool).
-        if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float)
+            && step.OutputBuffer.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inHandle = PinAndTrack(
