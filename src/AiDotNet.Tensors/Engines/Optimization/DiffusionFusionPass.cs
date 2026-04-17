@@ -145,22 +145,48 @@ internal sealed class DiffusionFusionPass : ICpuOptimizationPass
         // rather than silently substituting defaults — defaults would produce
         // numerically wrong output for any conv with stride≠1, padding≠0, or
         // dilation≠1.
+        //
+        // Preserve asymmetric H/W params: Conv2DOp saves arrays of 1 or 2
+        // elements. A length-1 array means symmetric (strideH == strideW);
+        // a length-2 array means per-axis (strideH = s[0], strideW = s[1]).
+        // Reusing s[0] for both axes would change semantics for asymmetric
+        // convolutions like kernel=[3,5] with stride=[1,2].
         var convState = convStep.SavedState;
         if (convState is null || convState.Length < 3) return false;
         if (convState[0] is not int[] s || s.Length == 0) return false;
         if (convState[1] is not int[] p || p.Length == 0) return false;
         if (convState[2] is not int[] d || d.Length == 0) return false;
-        int stride = s[0];
-        int padding = p[0];
-        int dilation = d[0];
+        int strideH = s[0];
+        int strideW = s.Length > 1 ? s[1] : s[0];
+        int padH = p[0];
+        int padW = p.Length > 1 ? p[1] : p[0];
+        int dilationH = d[0];
+        int dilationW = d.Length > 1 ? d[1] : d[0];
 
-        // The bias is the second input to BroadcastAdd
-        var bias = addStep.Inputs.Length > 1 ? addStep.Inputs[1] : null;
+        // The fused kernel represents Conv2D + bias_add + activation. A
+        // generic broadcast-add (e.g. residual add, per-sample scaling, or
+        // 4-D skip-connection) has different semantics — rewriting it into
+        // a bias add would silently produce wrong output. Accept only the
+        // two bias-shaped patterns the fused op's execute path handles:
+        //   • rank-1  [out_channels]  (reshaped to [1, Cout, 1, 1] inside the op)
+        //   • rank-4  [1, out_channels, 1, 1]  (already broadcast-shaped)
+        // where out_channels comes from the filter shape [Cout, Cin/G, kH, kW].
+        if (addStep.Inputs.Length != 2) return false;
+        var bias = addStep.Inputs[1];
+        var filterShape = convStep.Inputs[1]._shape;
+        if (filterShape.Length == 0) return false;
+        int outChannels = filterShape[0];
+        if (outChannels <= 0) return false;
+        bool isRank1Bias = bias._shape.Length == 1 && bias._shape[0] == outChannels;
+        bool isRank4Bias = bias._shape.Length == 4
+            && bias._shape[0] == 1 && bias._shape[1] == outChannels
+            && bias._shape[2] == 1 && bias._shape[3] == 1;
+        if (!isRank1Bias && !isRank4Bias) return false;
 
         // Build fused op
         var fusedOp = new FusedConv2DBiasActivationOp<T>(
             convStep.Inputs[0], convStep.Inputs[1], bias,
-            stride, stride, padding, padding, dilation, dilation,
+            strideH, strideW, padH, padW, dilationH, dilationW,
             FusedActivationType.Swish);
 
         fused = fusedOp.ToCompiledStep(swishStep.OutputBuffer);
