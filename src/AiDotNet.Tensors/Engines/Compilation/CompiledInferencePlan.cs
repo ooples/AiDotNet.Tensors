@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Optimization;
@@ -179,9 +180,48 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // Splice: [thisSteps..., nextSteps...]. No boundary step — the
         // rebind above is a one-shot stitch-time operation, not a
         // per-execute copy.
+        //
+        // Cross-engine handling: if the two plans were compiled against
+        // different engines (e.g. plan A with CpuEngine, plan B with
+        // DirectGpuEngine), running B's steps with A's engine produces
+        // wrong results — each op is dispatched to the wrong kernel set.
+        // The previous implementation handed the stitched plan's single
+        // _engine to every step's Execute, so cross-engine stitches silently
+        // computed garbage. Wrap each of nextPlan's steps in a shim that
+        // substitutes its original engine. Plan A's steps keep their
+        // engine binding via the outer loop.
         var combined = new CompiledStep<T>[_steps.Length + nextPlan._steps.Length];
         Array.Copy(_steps, 0, combined, 0, _steps.Length);
-        Array.Copy(nextPlan._steps, 0, combined, _steps.Length, nextPlan._steps.Length);
+        bool crossEngine = !ReferenceEquals(_engine, nextPlan._engine);
+        if (crossEngine)
+        {
+            Trace.WriteLine(
+                $"[CompiledInferencePlan] Stitching across engines: " +
+                $"{_engine.GetType().Name} → {nextPlan._engine.GetType().Name}. " +
+                "Next plan's steps will run against their original engine; " +
+                "the boundary tensor is aliased via RebindStorageFrom, so the " +
+                "device-transfer cost is paid by the first cross-engine read.");
+            var nextEngine = nextPlan._engine;
+            for (int i = 0; i < nextPlan._steps.Length; i++)
+            {
+                var original = nextPlan._steps[i];
+                var originalExecute = original.Execute;
+                // The outer loop passes _engine (plan A's) to this delegate;
+                // we ignore it and route to nextEngine (plan B's original).
+                Action<IEngine, Tensor<T>> rewrapped = (_, output) => originalExecute(nextEngine, output);
+                combined[_steps.Length + i] = new CompiledStep<T>(
+                    original.OpName,
+                    rewrapped,
+                    original.OutputBuffer,
+                    original.Inputs,
+                    original.BackwardFn,
+                    original.SavedState);
+            }
+        }
+        else
+        {
+            Array.Copy(nextPlan._steps, 0, combined, _steps.Length, nextPlan._steps.Length);
+        }
 
         // The stitched plan inherits this plan's input shape (callers re-use
         // their existing IsValid checks) but reports next plan's final
