@@ -3,6 +3,74 @@ using AiDotNet.Tensors.Onnx.Protos;
 namespace AiDotNet.Tensors.Onnx.Operators;
 
 /// <summary>
+/// Resolves an ONNX 2D auto_pad attribute into a concrete symmetric [padH, padW]
+/// pair. Shared helpers for Conv / MaxPool / AveragePool translators.
+/// </summary>
+internal static class OnnxAutoPad
+{
+    /// <summary>
+    /// Resolve a Conv-style padding descriptor.
+    /// Priority: explicit <c>pads</c> → <c>auto_pad</c> derived → zero.
+    /// Rejects asymmetric resolutions (no engine support yet).
+    /// </summary>
+    internal static int[] Resolve2D(
+        string opName,
+        int[]? inputShape, int[] kernelShape, int[] strides,
+        string? autoPad, int[]? explicitPads)
+    {
+        // Explicit pads win if provided (ONNX spec: auto_pad is ignored when
+        // pads is set).
+        if (explicitPads is not null)
+        {
+            if (explicitPads.Length != 4)
+                throw new InvalidDataException(
+                    $"{opName} pads attribute has {explicitPads.Length} values; expected 4 (NCHW: [top, left, bottom, right]).");
+            if (explicitPads[0] != explicitPads[2] || explicitPads[1] != explicitPads[3])
+                throw new NotSupportedException(
+                    $"{opName} asymmetric padding [{string.Join(",", explicitPads)}] is a Phase 2 op.");
+            return new[] { explicitPads[0], explicitPads[1] };
+        }
+
+        // No explicit pads. Handle auto_pad.
+        switch (autoPad)
+        {
+            case null:
+            case "":
+            case "NOTSET":
+            case "VALID":
+                return new[] { 0, 0 };
+
+            case "SAME_UPPER":
+            case "SAME_LOWER":
+                if (inputShape is null || inputShape.Length < 4)
+                    throw new InvalidDataException(
+                        $"{opName} auto_pad={autoPad} requires known input spatial dims.");
+                int padH = TotalSamePad(inputShape[2], kernelShape[0], strides[0]);
+                int padW = TotalSamePad(inputShape[3], kernelShape[1], strides[1]);
+                // SAME_UPPER = extra goes to bottom/right; SAME_LOWER = to top/left.
+                // Either way the spec permits asymmetric splits; we only support
+                // the symmetric (even-total) case.
+                if ((padH & 1) != 0 || (padW & 1) != 0)
+                    throw new NotSupportedException(
+                        $"{opName} auto_pad={autoPad} would require asymmetric padding [{padH}, {padW}] total; Phase 1 supports only symmetric splits.");
+                return new[] { padH / 2, padW / 2 };
+
+            default:
+                throw new NotSupportedException(
+                    $"{opName} auto_pad={autoPad} is not recognized. Supported: NOTSET, VALID, SAME_UPPER, SAME_LOWER.");
+        }
+    }
+
+    private static int TotalSamePad(int inputSize, int kernelSize, int stride)
+    {
+        // Output size under SAME = ceil(input / stride) → required total pad.
+        int outputSize = (inputSize + stride - 1) / stride;
+        int total = Math.Max(0, (outputSize - 1) * stride + kernelSize - inputSize);
+        return total;
+    }
+}
+
+/// <summary>
 /// ONNX convolution / pooling operator translators: Conv, ConvTranspose,
 /// MaxPool, AveragePool, GlobalAveragePool.
 /// </summary>
@@ -47,17 +115,14 @@ internal static class ConvOperators
 
             var strides = ctx.GetIntArrayAttr(node, "strides") ?? new[] { 1, 1 };
             var dilations = ctx.GetIntArrayAttr(node, "dilations") ?? new[] { 1, 1 };
-            var pads = ctx.GetIntArrayAttr(node, "pads") ?? new[] { 0, 0, 0, 0 };
-            if (pads.Length != 4) throw new InvalidDataException(
-                $"Conv pads attribute has {pads.Length} values; expected 4 (NCHW: [top, left, bottom, right]).");
-            if (pads[0] != pads[2] || pads[1] != pads[3])
-                throw new NotSupportedException(
-                    $"Conv asymmetric padding [{string.Join(",", pads)}] is a Phase 2 op. " +
-                    "Most exporters emit symmetric padding.");
+            var kernelSpatial = new[] { kernel._shape[2], kernel._shape[3] };
+            var explicitPads = ctx.GetIntArrayAttr(node, "pads");
+            var autoPad = ctx.GetStringAttr(node, "auto_pad", null);
+            var padding = OnnxAutoPad.Resolve2D("Conv", input._shape, kernelSpatial, strides, autoPad, explicitPads);
 
             var result = ctx.Engine.Conv2D(input, kernel,
                 stride: strides,
-                padding: new[] { pads[0], pads[1] },
+                padding: padding,
                 dilation: dilations);
 
             if (hasBias)
@@ -94,15 +159,15 @@ internal static class ConvOperators
                 throw new NotSupportedException("ConvTranspose group != 1 is a Phase 2 op.");
 
             var strides = ctx.GetIntArrayAttr(node, "strides") ?? new[] { 1, 1 };
-            var pads = ctx.GetIntArrayAttr(node, "pads") ?? new[] { 0, 0, 0, 0 };
             var outputPadding = ctx.GetIntArrayAttr(node, "output_padding") ?? new[] { 0, 0 };
-            if (pads[0] != pads[2] || pads[1] != pads[3])
-                throw new NotSupportedException(
-                    $"ConvTranspose asymmetric padding [{string.Join(",", pads)}] is a Phase 2 op.");
+            var kernelSpatial = new[] { kernel._shape[2], kernel._shape[3] };
+            var explicitPads = ctx.GetIntArrayAttr(node, "pads");
+            var autoPad = ctx.GetStringAttr(node, "auto_pad", null);
+            var padding = OnnxAutoPad.Resolve2D("ConvTranspose", input._shape, kernelSpatial, strides, autoPad, explicitPads);
 
             var result = ctx.Engine.ConvTranspose2D(input, kernel,
                 stride: strides,
-                padding: new[] { pads[0], pads[1] },
+                padding: padding,
                 outputPadding: outputPadding);
 
             if (hasBias)
@@ -130,13 +195,14 @@ internal static class ConvOperators
             var kernelShape = ctx.GetIntArrayAttr(node, "kernel_shape")
                 ?? throw new InvalidDataException("MaxPool requires kernel_shape.");
             var strides = ctx.GetIntArrayAttr(node, "strides") ?? kernelShape;
-            var pads = ctx.GetIntArrayAttr(node, "pads") ?? new[] { 0, 0, 0, 0 };
             int ceilMode = ctx.GetIntAttrAsInt(node, "ceil_mode", 0);
             if (ceilMode != 0)
                 throw new NotSupportedException("MaxPool ceil_mode=1 is a Phase 2 op.");
-            if (pads[0] != pads[2] || pads[1] != pads[3])
-                throw new NotSupportedException(
-                    $"MaxPool asymmetric padding [{string.Join(",", pads)}] is a Phase 2 op.");
+
+            var explicitPads = ctx.GetIntArrayAttr(node, "pads");
+            var autoPad = ctx.GetStringAttr(node, "auto_pad", null);
+            var padding = OnnxAutoPad.Resolve2D("MaxPool", input._shape, kernelShape, strides, autoPad, explicitPads);
+
             // Engine API takes scalar poolSize/stride/padding. ResNet-50, BERT
             // and ViT all use square kernels; reject non-square here to fail
             // loudly if we ever see a real asymmetric pool.
@@ -146,7 +212,10 @@ internal static class ConvOperators
             if (strides[0] != strides[1])
                 throw new NotSupportedException(
                     $"MaxPool non-square stride [{string.Join(",", strides)}] is a Phase 2 op.");
-            var result = ctx.Engine.MaxPool2D(input, kernelShape[0], strides[0], pads[0]);
+            if (padding[0] != padding[1])
+                throw new NotSupportedException(
+                    $"MaxPool non-square padding [{padding[0]}, {padding[1]}] is a Phase 2 op.");
+            var result = ctx.Engine.MaxPool2D(input, kernelShape[0], strides[0], padding[0]);
             ctx.PutTensor(node.Output[0], result);
         }
     }
@@ -165,20 +234,24 @@ internal static class ConvOperators
             var kernelShape = ctx.GetIntArrayAttr(node, "kernel_shape")
                 ?? throw new InvalidDataException("AveragePool requires kernel_shape.");
             var strides = ctx.GetIntArrayAttr(node, "strides") ?? kernelShape;
-            var pads = ctx.GetIntArrayAttr(node, "pads") ?? new[] { 0, 0, 0, 0 };
             int ceilMode = ctx.GetIntAttrAsInt(node, "ceil_mode", 0);
             if (ceilMode != 0)
                 throw new NotSupportedException("AveragePool ceil_mode=1 is a Phase 2 op.");
-            if (pads[0] != pads[2] || pads[1] != pads[3])
-                throw new NotSupportedException(
-                    $"AveragePool asymmetric padding [{string.Join(",", pads)}] is a Phase 2 op.");
+
+            var explicitPads = ctx.GetIntArrayAttr(node, "pads");
+            var autoPad = ctx.GetStringAttr(node, "auto_pad", null);
+            var padding = OnnxAutoPad.Resolve2D("AveragePool", input._shape, kernelShape, strides, autoPad, explicitPads);
+
             if (kernelShape[0] != kernelShape[1])
                 throw new NotSupportedException(
                     $"AveragePool non-square kernel [{string.Join(",", kernelShape)}] is a Phase 2 op.");
             if (strides[0] != strides[1])
                 throw new NotSupportedException(
                     $"AveragePool non-square stride [{string.Join(",", strides)}] is a Phase 2 op.");
-            var result = ctx.Engine.AvgPool2D(input, kernelShape[0], strides[0], pads[0]);
+            if (padding[0] != padding[1])
+                throw new NotSupportedException(
+                    $"AveragePool non-square padding [{padding[0]}, {padding[1]}] is a Phase 2 op.");
+            var result = ctx.Engine.AvgPool2D(input, kernelShape[0], strides[0], padding[0]);
             ctx.PutTensor(node.Output[0], result);
         }
     }
