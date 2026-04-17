@@ -16967,6 +16967,179 @@ public class CpuEngine : ITensorLevelEngine
 
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 
+        // ────────────────────────────────────────────────────────────────────
+        // Primitive fast paths: direct float/double arithmetic, no virtual
+        // dispatch. Method signature stays generic <T>; non-primitive T falls
+        // through to the original scalar path below.
+        //
+        // Note on locks: the generic scalar path uses `lock (gradVData)` and
+        // `lock (gradKData)` inside the ki loop. The locks are unnecessary —
+        // each Parallel.For worker (one per batch*head) writes to a disjoint
+        // [seqK*headDim]-sized slice of gradVData/gradKData selected by its
+        // unique vOffset/kOffset. The primitive paths drop the locks, which
+        // also un-serializes the nominally-parallel outer loop (the locks
+        // reference the shared array object, so all workers were contending
+        // on the same monitor — effectively sequentializing the op).
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            FlashAttentionBackwardFloat(
+                (float[])(object)queryData, (float[])(object)keyData,
+                (float[])(object)valueData, (float[])(object)outputData,
+                (float[])(object)gradOutData, (float[])(object)statsData,
+                (float[])(object)gradQData, (float[])(object)gradKData,
+                (float[])(object)gradVData,
+                biasData is null ? null : (float[])(object)biasData,
+                biasBroadcastBatch, (float)scale, isCausal,
+                batch, heads, seqQ, headDim, seqK, BLOCK_Q, BLOCK_KV);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            FlashAttentionBackwardDouble(
+                (double[])(object)queryData, (double[])(object)keyData,
+                (double[])(object)valueData, (double[])(object)outputData,
+                (double[])(object)gradOutData, (double[])(object)statsData,
+                (double[])(object)gradQData, (double[])(object)gradKData,
+                (double[])(object)gradVData,
+                biasData is null ? null : (double[])(object)biasData,
+                biasBroadcastBatch, scale, isCausal,
+                batch, heads, seqQ, headDim, seqK, BLOCK_Q, BLOCK_KV);
+        }
+        else
+        {
+            Parallel.For(0, batch * heads, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+                int qOffset = (b * heads + h) * seqQ * headDim;
+                int kOffset = (b * heads + h) * seqK * headDim;
+                int vOffset = (b * heads + h) * seqK * headDim;
+                int oOffset = (b * heads + h) * seqQ * headDim;
+                int sOffset = (b * heads + h) * seqQ;
+
+                // Process in blocks (similar to forward, but recomputing attention)
+                for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += BLOCK_KV)
+                {
+                    int kvBlockEnd = Math.Min(kvBlockStart + BLOCK_KV, seqK);
+
+                    for (int qBlockStart = 0; qBlockStart < seqQ; qBlockStart += BLOCK_Q)
+                    {
+                        int qBlockEnd = Math.Min(qBlockStart + BLOCK_Q, seqQ);
+
+                        for (int qi = qBlockStart; qi < qBlockEnd; qi++)
+                        {
+                            if (isCausal && kvBlockStart > qi)
+                                continue;
+
+                            T logsumexp = statsData[sOffset + qi];
+
+                            // Recompute attention weights for this row segment
+                            for (int ki = kvBlockStart; ki < kvBlockEnd; ki++)
+                            {
+                                if (isCausal && ki > qi)
+                                    continue;
+
+                                // Recompute score
+                                T score = numOps.Zero;
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    score = numOps.Add(score, numOps.Multiply(
+                                        queryData[qOffset + qi * headDim + d],
+                                        keyData[kOffset + ki * headDim + d]));
+                                }
+                                score = numOps.Multiply(score, scaleFactor);
+
+                                // Add attention bias if provided (must match forward pass)
+                                if (hasBias && biasData is not null)
+                                {
+                                    int biasIdx = biasBroadcastBatch
+                                        ? (h * seqQ * seqK + qi * seqK + ki)
+                                        : (b * heads * seqQ * seqK + h * seqQ * seqK + qi * seqK + ki);
+                                    score = numOps.Add(score, biasData[biasIdx]);
+                                }
+
+                                // Recompute attention weight: exp(score - logsumexp)
+                                T attnWeight = numOps.Exp(numOps.Subtract(score, logsumexp));
+
+                                // Gradient w.r.t. V: attnWeight * gradOutput
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    T gradO = gradOutData[oOffset + qi * headDim + d];
+                                    int vIdx = vOffset + ki * headDim + d;
+                                    lock (gradVData) // Thread safety for accumulation
+                                    {
+                                        gradVData[vIdx] = numOps.Add(gradVData[vIdx], numOps.Multiply(attnWeight, gradO));
+                                    }
+                                }
+
+                                // Compute dS = attnWeight * (dO @ V - sum(attnWeight * dO @ V))
+                                // First compute dO @ v for this position
+                                T doV = numOps.Zero;
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    doV = numOps.Add(doV, numOps.Multiply(
+                                        gradOutData[oOffset + qi * headDim + d],
+                                        valueData[vOffset + ki * headDim + d]));
+                                }
+
+                                // Compute dO @ O for the full row (dot product with output)
+                                T doO = numOps.Zero;
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    doO = numOps.Add(doO, numOps.Multiply(
+                                        gradOutData[oOffset + qi * headDim + d],
+                                        outputData[oOffset + qi * headDim + d]));
+                                }
+
+                                // dS = attnWeight * (doV - doO)
+                                T dS = numOps.Multiply(attnWeight, numOps.Subtract(doV, doO));
+                                dS = numOps.Multiply(dS, scaleFactor);
+
+                                // Gradient w.r.t. Q: dS * K
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    int qIdx = qOffset + qi * headDim + d;
+                                    gradQData[qIdx] = numOps.Add(gradQData[qIdx],
+                                        numOps.Multiply(dS, keyData[kOffset + ki * headDim + d]));
+                                }
+
+                                // Gradient w.r.t. K: dS * Q
+                                for (int d = 0; d < headDim; d++)
+                                {
+                                    int kIdx = kOffset + ki * headDim + d;
+                                    lock (gradKData) // Thread safety for accumulation
+                                    {
+                                        gradKData[kIdx] = numOps.Add(gradKData[kIdx],
+                                            numOps.Multiply(dS, queryData[qOffset + qi * headDim + d]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
+
+        return gradOutput;
+    }
+
+    /// <summary>
+    /// Float fast path for <see cref="FlashAttentionBackward{T}"/>. Direct
+    /// float arithmetic; no virtual dispatch; writes to disjoint per-(b, h)
+    /// slices so no locks are needed.
+    /// </summary>
+    private static void FlashAttentionBackwardFloat(
+        float[] queryData, float[] keyData, float[] valueData, float[] outputData,
+        float[] gradOutData, float[] statsData,
+        float[] gradQData, float[] gradKData, float[] gradVData,
+        float[]? biasData, bool biasBroadcastBatch, float scaleFactor, bool isCausal,
+        int batch, int heads, int seqQ, int headDim, int seqK,
+        int BLOCK_Q, int BLOCK_KV)
+    {
         Parallel.For(0, batch * heads, bh =>
         {
             int b = bh / heads;
@@ -16977,113 +17150,151 @@ public class CpuEngine : ITensorLevelEngine
             int oOffset = (b * heads + h) * seqQ * headDim;
             int sOffset = (b * heads + h) * seqQ;
 
-            // Process in blocks (similar to forward, but recomputing attention)
             for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += BLOCK_KV)
             {
                 int kvBlockEnd = Math.Min(kvBlockStart + BLOCK_KV, seqK);
-
                 for (int qBlockStart = 0; qBlockStart < seqQ; qBlockStart += BLOCK_Q)
                 {
                     int qBlockEnd = Math.Min(qBlockStart + BLOCK_Q, seqQ);
-
                     for (int qi = qBlockStart; qi < qBlockEnd; qi++)
                     {
-                        if (isCausal && kvBlockStart > qi)
-                            continue;
+                        if (isCausal && kvBlockStart > qi) continue;
 
-                        T logsumexp = statsData[sOffset + qi];
+                        float logsumexp = statsData[sOffset + qi];
+                        int qRowOff = qOffset + qi * headDim;
+                        int oRowOff = oOffset + qi * headDim;
 
-                        // Recompute attention weights for this row segment
+                        // doO is independent of ki — hoist it out of the ki loop.
+                        // (The generic path recomputes it per ki; correctness-neutral
+                        // hoist that was already safe there too.)
+                        float doO = 0f;
+                        for (int d = 0; d < headDim; d++)
+                            doO += gradOutData[oRowOff + d] * outputData[oRowOff + d];
+
                         for (int ki = kvBlockStart; ki < kvBlockEnd; ki++)
                         {
-                            if (isCausal && ki > qi)
-                                continue;
+                            if (isCausal && ki > qi) continue;
 
-                            // Recompute score
-                            T score = numOps.Zero;
+                            int kRowOff = kOffset + ki * headDim;
+                            int vRowOff = vOffset + ki * headDim;
+
+                            float score = 0f;
                             for (int d = 0; d < headDim; d++)
-                            {
-                                score = numOps.Add(score, numOps.Multiply(
-                                    queryData[qOffset + qi * headDim + d],
-                                    keyData[kOffset + ki * headDim + d]));
-                            }
-                            score = numOps.Multiply(score, scaleFactor);
+                                score += queryData[qRowOff + d] * keyData[kRowOff + d];
+                            score *= scaleFactor;
 
-                            // Add attention bias if provided (must match forward pass)
-                            if (hasBias && biasData is not null)
+                            if (biasData is not null)
                             {
                                 int biasIdx = biasBroadcastBatch
                                     ? (h * seqQ * seqK + qi * seqK + ki)
                                     : (b * heads * seqQ * seqK + h * seqQ * seqK + qi * seqK + ki);
-                                score = numOps.Add(score, biasData[biasIdx]);
+                                score += biasData[biasIdx];
                             }
 
-                            // Recompute attention weight: exp(score - logsumexp)
-                            T attnWeight = numOps.Exp(numOps.Subtract(score, logsumexp));
+                            float attnWeight = MathF.Exp(score - logsumexp);
 
-                            // Gradient w.r.t. V: attnWeight * gradOutput
+                            float doV = 0f;
                             for (int d = 0; d < headDim; d++)
-                            {
-                                T gradO = gradOutData[oOffset + qi * headDim + d];
-                                int vIdx = vOffset + ki * headDim + d;
-                                lock (gradVData) // Thread safety for accumulation
-                                {
-                                    gradVData[vIdx] = numOps.Add(gradVData[vIdx], numOps.Multiply(attnWeight, gradO));
-                                }
-                            }
+                                doV += gradOutData[oRowOff + d] * valueData[vRowOff + d];
 
-                            // Compute dS = attnWeight * (dO @ V - sum(attnWeight * dO @ V))
-                            // First compute dO @ v for this position
-                            T doV = numOps.Zero;
+                            float dS = attnWeight * (doV - doO) * scaleFactor;
+
+                            // gradV += attnWeight * gradOutput — disjoint per (b, h), no lock.
                             for (int d = 0; d < headDim; d++)
-                            {
-                                doV = numOps.Add(doV, numOps.Multiply(
-                                    gradOutData[oOffset + qi * headDim + d],
-                                    valueData[vOffset + ki * headDim + d]));
-                            }
+                                gradVData[vRowOff + d] += attnWeight * gradOutData[oRowOff + d];
 
-                            // Compute dO @ O for the full row (dot product with output)
-                            T doO = numOps.Zero;
+                            // gradQ += dS * K (this worker owns the full gradQ slice for its qi row).
                             for (int d = 0; d < headDim; d++)
-                            {
-                                doO = numOps.Add(doO, numOps.Multiply(
-                                    gradOutData[oOffset + qi * headDim + d],
-                                    outputData[oOffset + qi * headDim + d]));
-                            }
+                                gradQData[qRowOff + d] += dS * keyData[kRowOff + d];
 
-                            // dS = attnWeight * (doV - doO)
-                            T dS = numOps.Multiply(attnWeight, numOps.Subtract(doV, doO));
-                            dS = numOps.Multiply(dS, scaleFactor);
-
-                            // Gradient w.r.t. Q: dS * K
+                            // gradK += dS * Q — also disjoint per (b, h).
                             for (int d = 0; d < headDim; d++)
-                            {
-                                int qIdx = qOffset + qi * headDim + d;
-                                gradQData[qIdx] = numOps.Add(gradQData[qIdx],
-                                    numOps.Multiply(dS, keyData[kOffset + ki * headDim + d]));
-                            }
-
-                            // Gradient w.r.t. K: dS * Q
-                            for (int d = 0; d < headDim; d++)
-                            {
-                                int kIdx = kOffset + ki * headDim + d;
-                                lock (gradKData) // Thread safety for accumulation
-                                {
-                                    gradKData[kIdx] = numOps.Add(gradKData[kIdx],
-                                        numOps.Multiply(dS, queryData[qOffset + qi * headDim + d]));
-                                }
-                            }
+                                gradKData[kRowOff + d] += dS * queryData[qRowOff + d];
                         }
                     }
                 }
             }
         });
+    }
 
-        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
+    /// <summary>Double fast path for <see cref="FlashAttentionBackward{T}"/>. Mirror of the float version.</summary>
+    private static void FlashAttentionBackwardDouble(
+        double[] queryData, double[] keyData, double[] valueData, double[] outputData,
+        double[] gradOutData, double[] statsData,
+        double[] gradQData, double[] gradKData, double[] gradVData,
+        double[]? biasData, bool biasBroadcastBatch, double scaleFactor, bool isCausal,
+        int batch, int heads, int seqQ, int headDim, int seqK,
+        int BLOCK_Q, int BLOCK_KV)
+    {
+        Parallel.For(0, batch * heads, bh =>
+        {
+            int b = bh / heads;
+            int h = bh % heads;
+            int qOffset = (b * heads + h) * seqQ * headDim;
+            int kOffset = (b * heads + h) * seqK * headDim;
+            int vOffset = (b * heads + h) * seqK * headDim;
+            int oOffset = (b * heads + h) * seqQ * headDim;
+            int sOffset = (b * heads + h) * seqQ;
 
-        return gradOutput;
+            for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += BLOCK_KV)
+            {
+                int kvBlockEnd = Math.Min(kvBlockStart + BLOCK_KV, seqK);
+                for (int qBlockStart = 0; qBlockStart < seqQ; qBlockStart += BLOCK_Q)
+                {
+                    int qBlockEnd = Math.Min(qBlockStart + BLOCK_Q, seqQ);
+                    for (int qi = qBlockStart; qi < qBlockEnd; qi++)
+                    {
+                        if (isCausal && kvBlockStart > qi) continue;
+
+                        double logsumexp = statsData[sOffset + qi];
+                        int qRowOff = qOffset + qi * headDim;
+                        int oRowOff = oOffset + qi * headDim;
+
+                        double doO = 0.0;
+                        for (int d = 0; d < headDim; d++)
+                            doO += gradOutData[oRowOff + d] * outputData[oRowOff + d];
+
+                        for (int ki = kvBlockStart; ki < kvBlockEnd; ki++)
+                        {
+                            if (isCausal && ki > qi) continue;
+
+                            int kRowOff = kOffset + ki * headDim;
+                            int vRowOff = vOffset + ki * headDim;
+
+                            double score = 0.0;
+                            for (int d = 0; d < headDim; d++)
+                                score += queryData[qRowOff + d] * keyData[kRowOff + d];
+                            score *= scaleFactor;
+
+                            if (biasData is not null)
+                            {
+                                int biasIdx = biasBroadcastBatch
+                                    ? (h * seqQ * seqK + qi * seqK + ki)
+                                    : (b * heads * seqQ * seqK + h * seqQ * seqK + qi * seqK + ki);
+                                score += biasData[biasIdx];
+                            }
+
+                            double attnWeight = Math.Exp(score - logsumexp);
+
+                            double doV = 0.0;
+                            for (int d = 0; d < headDim; d++)
+                                doV += gradOutData[oRowOff + d] * valueData[vRowOff + d];
+
+                            double dS = attnWeight * (doV - doO) * scaleFactor;
+
+                            for (int d = 0; d < headDim; d++)
+                                gradVData[vRowOff + d] += attnWeight * gradOutData[oRowOff + d];
+
+                            for (int d = 0; d < headDim; d++)
+                                gradQData[qRowOff + d] += dS * keyData[kRowOff + d];
+
+                            for (int d = 0; d < headDim; d++)
+                                gradKData[kRowOff + d] += dS * queryData[qRowOff + d];
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// <summary>
@@ -19381,20 +19592,61 @@ public class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var outputData = new T[flatBatch * newHeight * newWidth];
 
-        Parallel.For(0, flatBatch, fb =>
+        // Primitive fast paths — avoid the generic T[] array covariance check
+        // and let JIT generate specialized code for float/double. Even though
+        // Upsample is a pure copy with no arithmetic, the generic path still
+        // incurs a per-element type check for the array store.
+        if (typeof(T) == typeof(float))
         {
-            for (int oh = 0; oh < newHeight; oh++)
+            var fIn = (float[])(object)inputData;
+            var fOut = (float[])(object)outputData;
+            Parallel.For(0, flatBatch, fb =>
             {
-                int ih = oh / scaleH;
-                for (int ow = 0; ow < newWidth; ow++)
+                for (int oh = 0; oh < newHeight; oh++)
                 {
-                    int iw = ow / scaleW;
-                    int inputIdx = (fb * height + ih) * width + iw;
-                    int outputIdx = (fb * newHeight + oh) * newWidth + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
+                    int ih = oh / scaleH;
+                    for (int ow = 0; ow < newWidth; ow++)
+                    {
+                        int iw = ow / scaleW;
+                        fOut[(fb * newHeight + oh) * newWidth + ow] = fIn[(fb * height + ih) * width + iw];
+                    }
                 }
-            }
-        });
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dIn = (double[])(object)inputData;
+            var dOut = (double[])(object)outputData;
+            Parallel.For(0, flatBatch, fb =>
+            {
+                for (int oh = 0; oh < newHeight; oh++)
+                {
+                    int ih = oh / scaleH;
+                    for (int ow = 0; ow < newWidth; ow++)
+                    {
+                        int iw = ow / scaleW;
+                        dOut[(fb * newHeight + oh) * newWidth + ow] = dIn[(fb * height + ih) * width + iw];
+                    }
+                }
+            });
+        }
+        else
+        {
+            Parallel.For(0, flatBatch, fb =>
+            {
+                for (int oh = 0; oh < newHeight; oh++)
+                {
+                    int ih = oh / scaleH;
+                    for (int ow = 0; ow < newWidth; ow++)
+                    {
+                        int iw = ow / scaleW;
+                        int inputIdx = (fb * height + ih) * width + iw;
+                        int outputIdx = (fb * newHeight + oh) * newWidth + ow;
+                        outputData[outputIdx] = inputData[inputIdx];
+                    }
+                }
+            });
+        }
 
         // Create output shape preserving all leading dimensions
         var outputShape = new int[shape.Length];
