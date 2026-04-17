@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -43,9 +44,14 @@ public static class CompiledPlanLoader
             var plan = InferencePlanReader.Read<T>(stream, engine);
             return Task.FromResult<ICompiledPlan<T>?>(plan);
         }
-        catch (InvalidDataException)
+        catch (InvalidDataException ex)
         {
-            // Corruption, truncation, unreadable format — treat as miss.
+            // Corruption, truncation, unreadable format, or version mismatch —
+            // treat as a cache miss so the caller recompiles. Log the cause
+            // via Trace so operators can diagnose why warm-start isn't
+            // working (silently returning null would hide genuine file
+            // corruption behind a "just recompile" path).
+            Trace.WriteLine($"[CompiledPlanLoader] Inference plan load failed, recompiling: {ex.Message}");
             return Task.FromResult<ICompiledPlan<T>?>(null);
         }
     }
@@ -80,8 +86,9 @@ public static class CompiledPlanLoader
             var plan = TrainingPlanReader.Read<T>(stream, engine, parameters);
             return Task.FromResult<ICompiledTrainingPlan<T>?>(plan);
         }
-        catch (InvalidDataException)
+        catch (InvalidDataException ex)
         {
+            Trace.WriteLine($"[CompiledPlanLoader] Training plan load failed, recompiling: {ex.Message}");
             return Task.FromResult<ICompiledTrainingPlan<T>?>(null);
         }
     }

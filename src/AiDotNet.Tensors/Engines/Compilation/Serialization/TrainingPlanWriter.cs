@@ -80,7 +80,7 @@ internal static class TrainingPlanWriter
         stream.Write(bodyBytes, 0, bodyBytes.Length);
         using var footerWriter = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         footerWriter.Write((long)bodyBytes.Length);
-        footerWriter.Write((long)checksum);
+        footerWriter.Write(checksum); // ulong — reader uses ToUInt64
     }
 
     private static void WriteStep<T>(BinaryWriter writer, CompiledStep<T> step, TensorIdMap<T> tensorMap)

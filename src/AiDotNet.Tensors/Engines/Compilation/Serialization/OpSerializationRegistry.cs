@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -121,17 +122,19 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildLeakyReLU(Tensor<T>[] inputs, object[]? state)
     {
-        // LeakyReLU<T>(Tensor<T>, T alpha). SavedState[0] is the alpha as a double.
-        // We need to convert to T. Since we're in a generic context, use the
-        // Helpers.MathHelper pattern. For now, just call with the default.
+        // Extract alpha from savedState. The serializer writes it as a double
+        // (T-erased). The earlier implementation passed `default!` — for T=float
+        // that's 0.0f, which collapses LeakyReLU to a plain ReLU. The engine
+        // does not have a "use last-configured alpha" default; alpha must be
+        // supplied on every call. So deserialized plans silently changed
+        // behavior. Use MathHelper to convert double→T.
+        double alphaDouble = state is { Length: > 0 } && state[0] is double d ? d : 0.01;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T alpha = numOps.FromDouble(alphaDouble);
         var a = inputs[0];
         return (eng, output) =>
         {
-            // Use default alpha — the compiled plan's specialized closure already
-            // captured the correct alpha. On deserialization the engine's default
-            // (0.01) applies. If savedState has the alpha, a future enhancement
-            // can inject it.
-            var r = eng.LeakyReLU(a, default!);
+            var r = eng.LeakyReLU(a, alpha);
             r.AsSpan().CopyTo(output.AsWritableSpan());
         };
     }
@@ -177,20 +180,32 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildMean(Tensor<T>[] inputs, object[]? state)
     {
-        // IEngine doesn't have a direct Mean(tensor, axes) overload.
-        // Use ReduceSum + element-wise divide by count.
+        // IEngine.ReduceMean(tensor, axes, keepDims) computes the mean along the
+        // given axes. The earlier implementation called ReduceSum and copied it
+        // to output — that produced the sum, not the mean. Deserialized plans
+        // over- or under-predicted by a factor of N (where N = product of reduced
+        // axis lengths), silently producing wildly wrong outputs.
         int[]? axes = state is { Length: > 0 } && state[0] is int axis ? new[] { axis }
                     : state is { Length: > 0 } && state[0] is int[] axArr ? axArr
                     : null;
+        bool keepDims = state is { Length: > 1 } && state[1] is bool kd && kd;
         var a = inputs[0];
         return (eng, output) =>
         {
-            var sum = eng.ReduceSum(a, axes);
-            // Copy result — the engine doesn't expose mean directly for arbitrary axes,
-            // but the compiled plan's original closure handled this internally.
-            // For the common case (scalar mean), ReduceSum + manual divide is sufficient.
-            sum.AsSpan().CopyTo(output.AsWritableSpan());
+            // When axes is null, reduce over all axes to produce a scalar mean.
+            var r = axes is null
+                ? ScalarTensor(eng.TensorMean(a))
+                : eng.ReduceMean(a, axes, keepDims);
+            r.AsSpan().CopyTo(output.AsWritableSpan());
         };
+    }
+
+    /// <summary>Wraps a scalar T as a rank-0 (single-element) Tensor&lt;T&gt;.</summary>
+    private static Tensor<T> ScalarTensor(T value)
+    {
+        var t = new Tensor<T>(new[] { 1 });
+        t.AsWritableSpan()[0] = value;
+        return t;
     }
 
     // ════════════════════════════════════════════════════════════════════

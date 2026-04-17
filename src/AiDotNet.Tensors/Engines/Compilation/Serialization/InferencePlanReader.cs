@@ -34,7 +34,10 @@ internal static class InferencePlanReader
 
         // ── Footer validation ───────────────────────────────────────────
         long storedSize = BitConverter.ToInt64(allBytes, allBytes.Length - 16);
-        long storedChecksum = BitConverter.ToInt64(allBytes, allBytes.Length - 8);
+        // Checksum is written as a ulong (XXHash64 returns unsigned). Reading
+        // it as ToUInt64 keeps the types symmetrical between reader and writer
+        // and avoids the need for a signed reinterpret cast on the comparison.
+        ulong storedChecksum = BitConverter.ToUInt64(allBytes, allBytes.Length - 8);
         int bodyLength = allBytes.Length - 16;
 
         if (storedSize != bodyLength)
@@ -43,7 +46,7 @@ internal static class InferencePlanReader
                 $"actual body is {bodyLength}. File may be corrupt or truncated.");
 
         ulong computed = XXHash64.Compute(allBytes, 0, bodyLength);
-        if ((long)computed != storedChecksum)
+        if (computed != storedChecksum)
             throw new InvalidDataException(
                 "Plan file checksum mismatch — the file is corrupt. " +
                 "Delete and recompile.");
@@ -154,10 +157,15 @@ internal static class InferencePlanReader
 
     private static string ElementTypeCodeToName(byte code) => code switch
     {
-        PlanFormatConstants.ElementTypeFloat  => typeof(float).FullName!,
-        PlanFormatConstants.ElementTypeDouble => typeof(double).FullName!,
-        PlanFormatConstants.ElementTypeInt32  => typeof(int).FullName!,
-        PlanFormatConstants.ElementTypeInt64  => typeof(long).FullName!,
+        PlanFormatConstants.ElementTypeFloat   => typeof(float).FullName!,
+        PlanFormatConstants.ElementTypeDouble  => typeof(double).FullName!,
+        PlanFormatConstants.ElementTypeInt32   => typeof(int).FullName!,
+        PlanFormatConstants.ElementTypeInt64   => typeof(long).FullName!,
+        // System.Half exists on net5+ but not on net471. Use the well-known
+        // full name directly so the compatibility comparison matches whatever
+        // runtime the plan was originally written on, regardless of whether
+        // the current build can reference System.Half.
+        PlanFormatConstants.ElementTypeFloat16 => "System.Half",
         _ => $"unknown-{code}",
     };
 }

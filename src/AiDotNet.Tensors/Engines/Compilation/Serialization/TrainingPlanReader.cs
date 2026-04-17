@@ -52,14 +52,16 @@ internal static class TrainingPlanReader
 
         // ── Footer validation ───────────────────────────────────────────
         long storedSize = BitConverter.ToInt64(allBytes, allBytes.Length - 16);
-        long storedChecksum = BitConverter.ToInt64(allBytes, allBytes.Length - 8);
+        // Read checksum as ulong to stay symmetrical with the writer (XXHash64
+        // returns ulong). See InferencePlanReader for rationale.
+        ulong storedChecksum = BitConverter.ToUInt64(allBytes, allBytes.Length - 8);
         int bodyLength = allBytes.Length - 16;
 
         if (storedSize != bodyLength)
             throw new InvalidDataException("Plan file size mismatch.");
 
         ulong computed = XXHash64.Compute(allBytes, 0, bodyLength);
-        if ((long)computed != storedChecksum)
+        if (computed != storedChecksum)
             throw new InvalidDataException("Plan file checksum mismatch.");
 
         // ── Header ──────────────────────────────────────────────────────
@@ -195,10 +197,11 @@ internal static class InferencePlanReaderHelper
 {
     internal static string ElementTypeCodeToName(byte code) => code switch
     {
-        PlanFormatConstants.ElementTypeFloat  => typeof(float).FullName!,
-        PlanFormatConstants.ElementTypeDouble => typeof(double).FullName!,
-        PlanFormatConstants.ElementTypeInt32  => typeof(int).FullName!,
-        PlanFormatConstants.ElementTypeInt64  => typeof(long).FullName!,
+        PlanFormatConstants.ElementTypeFloat   => typeof(float).FullName!,
+        PlanFormatConstants.ElementTypeDouble  => typeof(double).FullName!,
+        PlanFormatConstants.ElementTypeInt32   => typeof(int).FullName!,
+        PlanFormatConstants.ElementTypeInt64   => typeof(long).FullName!,
+        PlanFormatConstants.ElementTypeFloat16 => "System.Half",
         _ => $"unknown-{code}",
     };
 }
