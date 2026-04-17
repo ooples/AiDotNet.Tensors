@@ -98,8 +98,20 @@ public class EndToEndModelTests
         var modelBytes = File.ReadAllBytes(GetModelPath(modelName));
         using var stream = new MemoryStream(modelBytes);
 
+        // Resolve common ONNX parametric batch dims to 1. Batch = "N" is the
+        // ResNet-50 / ImageNet convention; "batch_size" / "unk__XXX" appear in
+        // Hugging Face exports; sequence-length dims get the suggested concrete
+        // sizes from the model's declared shape (e.g. 256 for BERT SQuAD).
+        var options = new OnnxImportOptions
+        {
+            DimensionOverrides = new Dictionary<string, int>
+            {
+                ["N"] = 1, ["batch"] = 1, ["batch_size"] = 1,
+                ["sequence_length"] = 256, ["seq_len"] = 256,
+            },
+        };
         var engine = new CpuEngine();
-        var result = OnnxImporter.Import<float>(stream, engine);
+        var result = OnnxImporter.Import<float>(stream, engine, options);
         Assert.Empty(result.UnsupportedOperators);
         Assert.NotNull(result.Plan);
 
