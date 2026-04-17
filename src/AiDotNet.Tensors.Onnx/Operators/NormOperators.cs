@@ -90,8 +90,7 @@ internal static class NormOperators
             var centered = ctx.Engine.TensorBroadcastSubtract(x, meanView);
             var epsTensor = FillTensor(cShape, epsilon);
             var denom = ctx.Engine.TensorSqrt(ctx.Engine.TensorBroadcastAdd(varView, epsTensor));
-            var normalized = ctx.Engine.TensorDivide(centered, ctx.Engine.TensorBroadcastAdd(
-                denom, FillTensor(cShape, 0f))); // broadcast denom to match centered shape
+            var normalized = ctx.Engine.TensorBroadcastDivide(centered, denom);
             var scaled = ctx.Engine.TensorBroadcastMultiply(normalized, scaleView);
             var result = ctx.Engine.TensorBroadcastAdd(scaled, biasView);
             ctx.PutTensor(node.Output[0], result);
