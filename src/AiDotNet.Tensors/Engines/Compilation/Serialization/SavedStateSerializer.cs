@@ -126,16 +126,35 @@ internal static class SavedStateSerializer
             PlanFormatConstants.TagBool       => reader.ReadBoolean(),
             PlanFormatConstants.TagString     => ReadString(reader),
             PlanFormatConstants.TagByteArray  => ReadByteArray(reader),
-            PlanFormatConstants.TagTensorRef  => tensorTable[reader.ReadInt32()],
+            PlanFormatConstants.TagTensorRef  => ReadTensorRef(reader, tensorTable),
             _ => throw new InvalidDataException(
                 $"Unknown SavedState type tag 0x{tag:X2} — the file may be corrupt or " +
                 "from a newer format version that this binary cannot read."),
         };
     }
 
+    private static Tensor<T> ReadTensorRef<T>(BinaryReader reader, Tensor<T>[] tensorTable)
+    {
+        int id = reader.ReadInt32();
+        // Even though the header carries a checksum, an out-of-range tensor ID
+        // here would produce a confusing IndexOutOfRangeException deep in the
+        // replay path; surface it as InvalidDataException (same contract the
+        // tag switch uses) so corruption is caught at load time by the
+        // CompiledPlanLoader try/catch.
+        if ((uint)id >= (uint)tensorTable.Length)
+        {
+            throw new InvalidDataException(
+                $"SavedState tensor reference ID {id} is out of range " +
+                $"[0, {tensorTable.Length}). The plan file is corrupt.");
+        }
+        return tensorTable[id];
+    }
+
     private static int[] ReadInt32Array(BinaryReader reader)
     {
         int len = reader.ReadInt32();
+        if (len < 0)
+            throw new InvalidDataException($"SavedState int[] length {len} cannot be negative. The plan file is corrupt.");
         var arr = new int[len];
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadInt32();
@@ -145,6 +164,8 @@ internal static class SavedStateSerializer
     private static string ReadString(BinaryReader reader)
     {
         int len = reader.ReadInt32();
+        if (len < 0)
+            throw new InvalidDataException($"SavedState string length {len} cannot be negative. The plan file is corrupt.");
         var bytes = reader.ReadBytes(len);
         return Encoding.UTF8.GetString(bytes);
     }
@@ -152,6 +173,8 @@ internal static class SavedStateSerializer
     private static byte[] ReadByteArray(BinaryReader reader)
     {
         int len = reader.ReadInt32();
+        if (len < 0)
+            throw new InvalidDataException($"SavedState byte[] length {len} cannot be negative. The plan file is corrupt.");
         return reader.ReadBytes(len);
     }
 }

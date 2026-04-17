@@ -96,7 +96,38 @@ internal static class OpSerializationRegistry<T>
         };
     }
 
-    internal static bool IsSupported(OpType opType) => opType != OpType.Unknown;
+    /// <summary>
+    /// Returns true only for OpTypes that have an actual rebuild handler in
+    /// the switch above — NOT "anything except Unknown." Callers use this to
+    /// decide whether a plan is serializable without having to catch
+    /// <see cref="NotSupportedException"/> from a later rebuild, so the two
+    /// sides must stay exactly aligned. When adding a new rebuild case,
+    /// also add its OpType to the list below.
+    /// </summary>
+    internal static bool IsSupported(OpType opType) => opType switch
+    {
+        // Unary
+        OpType.Sigmoid or OpType.Tanh or OpType.ReLU or OpType.GELU or
+        OpType.Swish or OpType.Mish or OpType.Softplus or OpType.TensorExp or
+        OpType.TensorLog or OpType.TensorSqrt or OpType.TensorAbs or
+        OpType.TensorNegate or OpType.TensorTranspose or OpType.Floor or
+        OpType.Ceiling or OpType.Round or OpType.Sin or OpType.Cos or
+        // Binary
+        OpType.TensorAdd or OpType.TensorSubtract or OpType.TensorMultiply or
+        OpType.TensorDivide or OpType.TensorMax or OpType.TensorMatMul or
+        OpType.TensorBroadcastAdd or OpType.TensorBroadcastSubtract or
+        OpType.TensorBroadcastMultiply or OpType.BatchMatMul or
+        // Parameterized activations + reduce family
+        OpType.LeakyReLU or OpType.ELU or OpType.ReduceSum or OpType.Softmax or
+        OpType.Mean or
+        // Conv / pool / norm / attention / fused
+        OpType.Conv2D or OpType.MaxPool2D or OpType.AvgPool2D or
+        OpType.BatchNorm or OpType.LayerNorm or
+        OpType.ScaledDotProductAttention or OpType.FusedLinear or
+        // Loss
+        OpType.CrossEntropyLoss => true,
+        _ => false,
+    };
 
     // ════════════════════════════════════════════════════════════════════
     // Generic builders
@@ -283,10 +314,24 @@ internal static class OpSerializationRegistry<T>
     private static Action<IEngine, Tensor<T>> RebuildAttention(Tensor<T>[] inputs, object[]? state)
     {
         // IEngine.ScaledDotProductAttention<T>(q, k, v, mask?, scale?, out attnWeights)
+        //
+        // scale: recorded as savedState[0] (nullable double). Null means
+        // "use default 1/sqrt(d_k)" — the engine recomputes it from query rank.
+        // Preserving the explicit value matters for plans that override it
+        // (e.g. temperature-scaled attention).
+        //
+        // mask: NOT round-trippable through the current SavedStateSerializer —
+        // the supported tag set covers Tensor<T> but not Tensor<bool>, and
+        // mask tensors aren't carried through the Tensor<T>[] inputs array
+        // either. Plans compiled with a non-null mask load back with mask=null;
+        // callers who need mask persistence must re-compile from source. This
+        // is a known limitation tracked against issue #166 — fully fixing it
+        // needs a TagBoolTensor addition to SavedStateSerializer.
+        double? scale = state is { Length: > 0 } && state[0] is double sv ? sv : null;
         var q = inputs[0]; var k = inputs[1]; var v = inputs[2];
         return (eng, output) =>
         {
-            var r = eng.ScaledDotProductAttention(q, k, v, null, null, out _);
+            var r = eng.ScaledDotProductAttention(q, k, v, null, scale, out _);
             r.AsSpan().CopyTo(output.AsWritableSpan());
         };
     }

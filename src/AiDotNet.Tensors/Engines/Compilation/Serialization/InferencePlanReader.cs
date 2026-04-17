@@ -65,9 +65,14 @@ internal static class InferencePlanReader
         byte planType = reader.ReadByte();
         byte elementTypeCode = reader.ReadByte();
         int stepCount = reader.ReadInt32();
+        RequireNonNegative(stepCount, nameof(stepCount));
 
-        // Input shape
+        // Input shape. Rank bounded by the remaining body size — every rank
+        // entry consumes 4 bytes, so a corrupt file claiming 2^30 dims can't
+        // slip past RequireWithinStream.
         int inputRank = reader.ReadInt32();
+        RequireNonNegative(inputRank, nameof(inputRank));
+        RequireWithinStream(bodyStream, (long)inputRank * sizeof(int), nameof(inputRank));
         var inputShape = new int[inputRank];
         for (int i = 0; i < inputRank; i++)
             inputShape[i] = reader.ReadInt32();
@@ -75,8 +80,10 @@ internal static class InferencePlanReader
         // Tensor-codec version
         int codecVersion = reader.ReadInt32();
 
-        // Hardware fingerprint
+        // Hardware fingerprint — UTF-8 bytes, length-prefixed.
         int fpLen = reader.ReadInt32();
+        RequireNonNegative(fpLen, nameof(fpLen));
+        RequireWithinStream(bodyStream, fpLen, nameof(fpLen));
         var fpBytes = reader.ReadBytes(fpLen);
         string hwFingerprint = Encoding.UTF8.GetString(fpBytes);
 
@@ -112,7 +119,7 @@ internal static class InferencePlanReader
         var steps = new CompiledStep<T>[stepCount];
         for (int i = 0; i < stepCount; i++)
         {
-            steps[i] = ReadStep(reader, tensorTable, engine);
+            steps[i] = ReadStep(reader, tensorTable, engine, bodyStream);
         }
 
         // ── Construct plan ──────────────────────────────────────────────
@@ -121,7 +128,7 @@ internal static class InferencePlanReader
             steps, finalOutput, engine, inputShape, compiledInputTensor);
     }
 
-    private static CompiledStep<T> ReadStep<T>(BinaryReader reader, Tensor<T>[] tensorTable, IEngine engine)
+    private static CompiledStep<T> ReadStep<T>(BinaryReader reader, Tensor<T>[] tensorTable, IEngine engine, Stream bodyStream)
     {
         // OpType
         byte opTypeByte = reader.ReadByte();
@@ -129,20 +136,32 @@ internal static class InferencePlanReader
 
         // OpName
         int nameLen = reader.ReadInt32();
+        RequireNonNegative(nameLen, nameof(nameLen));
+        RequireWithinStream(bodyStream, nameLen, nameof(nameLen));
         var nameBytes = reader.ReadBytes(nameLen);
         string opName = Encoding.UTF8.GetString(nameBytes);
 
         // Input tensor IDs
         int inputCount = reader.ReadInt32();
+        RequireNonNegative(inputCount, nameof(inputCount));
+        RequireWithinStream(bodyStream, (long)inputCount * sizeof(int), nameof(inputCount));
         var inputs = new Tensor<T>[inputCount];
         for (int j = 0; j < inputCount; j++)
         {
             int tensorId = reader.ReadInt32();
+            if ((uint)tensorId >= (uint)tensorTable.Length)
+                throw new InvalidDataException(
+                    $"Step '{opName}' input {j} references tensor ID {tensorId} " +
+                    $"out of range [0, {tensorTable.Length}). The plan file is corrupt.");
             inputs[j] = tensorTable[tensorId];
         }
 
         // Output tensor ID
         int outputId = reader.ReadInt32();
+        if ((uint)outputId >= (uint)tensorTable.Length)
+            throw new InvalidDataException(
+                $"Step '{opName}' writes output tensor ID {outputId} " +
+                $"out of range [0, {tensorTable.Length}). The plan file is corrupt.");
         var outputBuffer = tensorTable[outputId];
 
         // SavedState
@@ -153,6 +172,28 @@ internal static class InferencePlanReader
             opType, inputs, outputBuffer, savedState);
 
         return new CompiledStep<T>(opName, execute, outputBuffer, inputs, backwardFn: null, savedState);
+    }
+
+    // ── Validation helpers ──────────────────────────────────────────────
+    // Used throughout the reader to keep file-provided counts/lengths from
+    // causing IndexOutOfRange or OutOfMemoryException. All failures raise
+    // InvalidDataException so the CompiledPlanLoader try/catch treats them
+    // as corrupt-file errors rather than unexpected exceptions.
+
+    private static void RequireNonNegative(int value, string name)
+    {
+        if (value < 0)
+            throw new InvalidDataException(
+                $"Plan file field '{name}' is negative ({value}). The file is corrupt.");
+    }
+
+    private static void RequireWithinStream(Stream bodyStream, long requiredBytes, string name)
+    {
+        long remaining = bodyStream.Length - bodyStream.Position;
+        if (requiredBytes > remaining)
+            throw new InvalidDataException(
+                $"Plan file field '{name}' requires {requiredBytes} bytes but only " +
+                $"{remaining} remain. The file is truncated or corrupt.");
     }
 
     private static string ElementTypeCodeToName(byte code) => code switch

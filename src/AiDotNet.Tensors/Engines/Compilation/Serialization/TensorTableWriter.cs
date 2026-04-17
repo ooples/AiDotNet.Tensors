@@ -1,5 +1,6 @@
 using System.IO;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -73,10 +74,15 @@ internal static class TensorTableWriter
         var tensors = map.Ordered;
         writer.Write(tensors.Count);
 
-        // Build sets for flag assignment.
+        // Build sets for flag assignment. Reference-equality everywhere —
+        // matches TensorIdMap and the rest of the autodiff/compilation code
+        // (e.g. BackwardCSEPass, CompiledBackwardGraph). Using Default here
+        // would silently switch to value equality if Tensor<T> ever gains an
+        // Equals override, misclassifying tensors with identical shape+data
+        // but different identity.
         var paramSet = new HashSet<Tensor<T>>(
             parameterTensors ?? Array.Empty<Tensor<T>>(),
-            System.Collections.Generic.EqualityComparer<Tensor<T>>.Default);
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Build the set of tensors that are step OUTPUT buffers. Any tensor
         // that appears in step Inputs but is NOT a step output AND is not the
@@ -84,7 +90,7 @@ internal static class TensorTableWriter
         // compile time) — its data must be serialized so the loaded plan
         // can produce correct results without the original weight objects.
         var outputBufferSet = new HashSet<Tensor<T>>(
-            System.Collections.Generic.EqualityComparer<Tensor<T>>.Default);
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int s = 0; s < steps.Length; s++)
             outputBufferSet.Add(steps[s].OutputBuffer);
 

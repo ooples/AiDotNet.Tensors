@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -17,7 +18,7 @@ public class TrainingPlanSerializationTests
 {
     // ── Training plan round-trip: forward + backward, gradients match ────────
     [Fact]
-    public async void SaveLoad_TrainingPlan_StepProducesSameLossAndGradients()
+    public async Task SaveLoad_TrainingPlan_StepProducesSameLossAndGradients()
     {
         var engine = new CpuEngine();
 
@@ -59,14 +60,14 @@ public class TrainingPlanSerializationTests
         Assert.False(float.IsNaN(loadedLossVal), "Loaded plan produced NaN loss");
         Assert.False(float.IsInfinity(loadedLossVal), "Loaded plan produced Infinity loss");
 
-        // The loaded plan should produce a non-trivially-close loss to the
-        // original. For a simple matmul + reduceSum graph both plans should
-        // produce approximately the same forward result if the weights and
-        // input tensors match. Allow wide tolerance because the backward
-        // re-compilation path may differ.
+        // Forward-pass loss (Step returns the loss from the pre-backward
+        // forward sweep) must match to within tight float precision. Only the
+        // gradient-build path is re-specialized during load, so forward
+        // numerics are bitwise-identical modulo reduction order — reduction-
+        // order variance is bounded well below 1e-4 relative for ReduceSum.
         Assert.True(
-            Math.Abs(origLossVal - loadedLossVal) < Math.Abs(origLossVal) * 0.5 + 1e-3,
-            $"Loss diverged too far: original={origLossVal}, loaded={loadedLossVal}");
+            Math.Abs(origLossVal - loadedLossVal) <= Math.Max(Math.Abs(origLossVal) * 1e-4f, 1e-5f),
+            $"Forward loss diverged: original={origLossVal}, loaded={loadedLossVal}");
 
         // Gradients should exist and be non-trivial.
         Assert.NotNull(loaded.Gradients);
@@ -86,7 +87,7 @@ public class TrainingPlanSerializationTests
 
     // ── Training plan with optimizer state ───────────────────────────────────
     [Fact]
-    public async void SaveLoad_TrainingPlanWithOptimizer_ProducesSameLoss()
+    public async Task SaveLoad_TrainingPlanWithOptimizer_ProducesSameLoss()
     {
         var engine = new CpuEngine();
         var input  = Tensor<float>.CreateRandom([4, 3]);

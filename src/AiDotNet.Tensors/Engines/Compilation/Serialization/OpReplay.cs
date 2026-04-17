@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -65,6 +66,7 @@ internal static class OpReplay
             // ── Parameterized activations ───────────────────────────
             OpType.ELU => engine.ELU(inputs[0],
                 savedState is { Length: > 0 } && savedState[0] is double d ? d : 1.0),
+            OpType.LeakyReLU => ReplayLeakyReLU(engine, inputs[0], savedState),
 
             // ── Reduce family ───────────────────────────────────────
             OpType.ReduceSum => engine.ReduceSum(inputs[0],
@@ -73,6 +75,7 @@ internal static class OpReplay
                 : null),
             OpType.Softmax => engine.Softmax(inputs[0],
                 savedState is { Length: > 0 } && savedState[0] is int a ? a : -1),
+            OpType.Mean => ReplayMean(engine, inputs[0], savedState),
 
             // ── Conv family ─────────────────────────────────────────
             OpType.Conv2D => engine.Conv2D(inputs[0], inputs[1],
@@ -83,6 +86,10 @@ internal static class OpReplay
                 savedState is { Length: > 0 } && savedState[0] is int[] ps && ps.Length > 0 ? ps[0] : 2,
                 savedState is { Length: > 1 } && savedState[1] is int[] st && st.Length > 0 ? st[0] :
                     (savedState is { Length: > 0 } && savedState[0] is int[] ps2 && ps2.Length > 0 ? ps2[0] : 2)),
+            OpType.AvgPool2D => engine.AvgPool2D(inputs[0],
+                savedState is { Length: > 0 } && savedState[0] is int[] aps && aps.Length > 0 ? aps[0] : 2,
+                savedState is { Length: > 1 } && savedState[1] is int[] ast && ast.Length > 0 ? ast[0] :
+                    (savedState is { Length: > 0 } && savedState[0] is int[] aps2 && aps2.Length > 0 ? aps2[0] : 2)),
 
             // ── Normalization ───────────────────────────────────────
             OpType.BatchNorm => engine.BatchNorm(inputs[0], inputs[1], inputs[2],
@@ -90,11 +97,64 @@ internal static class OpReplay
             OpType.LayerNorm => engine.LayerNorm(inputs[0], inputs[1], inputs[2],
                 savedState is { Length: > 2 } && savedState[2] is double le ? le : 1e-5, out _, out _),
 
+            // ── Attention ───────────────────────────────────────────
+            // Matches RebuildAttention: scale comes from savedState[0] (nullable
+            // double; null means "recompute from d_k"). Mask is not serialized
+            // through the current SavedStateSerializer tag set — plans with
+            // explicit masks load back with mask=null; see RebuildAttention for
+            // the full rationale. Attention weights out-param is discarded —
+            // only re-materialized under eager replay if a consumer explicitly
+            // records it, which the training replay path does not.
+            OpType.ScaledDotProductAttention => engine.ScaledDotProductAttention(
+                inputs[0], inputs[1], inputs[2],
+                mask: null,
+                scale: savedState is { Length: > 0 } && savedState[0] is double attnScale ? attnScale : null,
+                attentionWeights: out _),
+
+            // ── FusedLinear: input @ weight (+ bias) ────────────────
+            OpType.FusedLinear => ReplayFusedLinear(engine, inputs),
+
             // ── Loss ────────────────────────────────────────────────
             OpType.CrossEntropyLoss => engine.TensorCrossEntropyLoss(inputs[0], inputs[1]),
 
             _ => throw new NotSupportedException(
                 $"OpType {opType} ('{opName}') is not supported for training plan replay."),
         };
+    }
+
+    private static Tensor<T> ReplayLeakyReLU<T>(IEngine engine, Tensor<T> input, object[]? savedState)
+    {
+        // Alpha is serialized as double (T-erased). Convert back to T via the
+        // numeric-ops registry so T=float, double, Half, etc. all round-trip
+        // correctly. `default(T)` would collapse LeakyReLU to plain ReLU for
+        // numeric types — matches the gap that RebuildLeakyReLU was fixing.
+        double alphaDouble = savedState is { Length: > 0 } && savedState[0] is double d ? d : 0.01;
+        var alpha = MathHelper.GetNumericOperations<T>().FromDouble(alphaDouble);
+        return engine.LeakyReLU(input, alpha);
+    }
+
+    private static Tensor<T> ReplayMean<T>(IEngine engine, Tensor<T> input, object[]? savedState)
+    {
+        // Parallels RebuildMean: null-axes maps to a scalar TensorMean, wrapped
+        // in a rank-0 tensor so downstream consumers see a Tensor<T> regardless
+        // of the reduction shape.
+        int[]? axes = savedState is { Length: > 0 } && savedState[0] is int axis ? new[] { axis }
+                    : savedState is { Length: > 0 } && savedState[0] is int[] axArr ? axArr
+                    : null;
+        bool keepDims = savedState is { Length: > 1 } && savedState[1] is bool kd && kd;
+        if (axes is null)
+        {
+            var scalar = new Tensor<T>(new[] { 1 });
+            scalar.AsWritableSpan()[0] = engine.TensorMean(input);
+            return scalar;
+        }
+        return engine.ReduceMean(input, axes, keepDims);
+    }
+
+    private static Tensor<T> ReplayFusedLinear<T>(IEngine engine, Tensor<T>[] inputs)
+    {
+        // Decomposes to MatMul + optional BroadcastAdd. Mirror of RebuildFusedLinear.
+        var r = engine.TensorMatMul(inputs[0], inputs[1]);
+        return inputs.Length > 2 ? engine.TensorBroadcastAdd(r, inputs[2]) : r;
     }
 }

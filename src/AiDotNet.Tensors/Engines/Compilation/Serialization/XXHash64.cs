@@ -10,7 +10,7 @@ internal static class XXHash64
 {
     private const ulong Prime1 = 0x9E3779B185EBCA87UL;
     private const ulong Prime2 = 0x14DEF9DEA2F79CD6UL;
-    private const ulong Prime3 = 0x0000000165EBCA87UL; // not used in this variant
+    private const ulong Prime3 = 0x0000000165EBCA87UL;
     private const ulong Prime4 = 0x9E3779B185EBCA87UL;
     private const ulong Prime5 = 0x27D4EB2F165B7D76UL;
 

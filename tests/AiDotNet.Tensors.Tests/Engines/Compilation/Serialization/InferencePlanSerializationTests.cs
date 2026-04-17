@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -38,7 +39,7 @@ public class InferencePlanSerializationTests
 
     // ── MLP round-trip (acceptance criterion #1) ────────────────────────────
     [Fact]
-    public async void SaveLoad_MLP_BitwiseIdenticalAcross100RandomInputs()
+    public async Task SaveLoad_MLP_BitwiseIdenticalAcross100RandomInputs()
     {
         var engine = new CpuEngine();
 
@@ -96,7 +97,7 @@ public class InferencePlanSerializationTests
 
     // ── Negative: hardware fingerprint mismatch → null ──────────────────────
     [Fact]
-    public async void Load_WithMismatchedHardwareFingerprint_ReturnsNull()
+    public async Task Load_WithMismatchedHardwareFingerprint_ReturnsNull()
     {
         var engine = new CpuEngine();
         var input  = Tensor<float>.CreateRandom([2, 3]);
@@ -128,7 +129,7 @@ public class InferencePlanSerializationTests
 
     // ── Deterministic encoding: save twice → identical bytes ────────────────
     [Fact]
-    public async void Save_Twice_ProducesByteIdenticalOutput()
+    public async Task Save_Twice_ProducesByteIdenticalOutput()
     {
         var engine = new CpuEngine();
         var input  = Tensor<float>.CreateRandom([2, 3]);
@@ -152,7 +153,7 @@ public class InferencePlanSerializationTests
 
     // ── Empty/truncated stream → null ───────────────────────────────────────
     [Fact]
-    public async void Load_EmptyStream_ReturnsNull()
+    public async Task Load_EmptyStream_ReturnsNull()
     {
         var engine = new CpuEngine();
         using var ms = new MemoryStream(Array.Empty<byte>());
@@ -161,7 +162,7 @@ public class InferencePlanSerializationTests
     }
 
     [Fact]
-    public async void Load_TruncatedStream_ReturnsNull()
+    public async Task Load_TruncatedStream_ReturnsNull()
     {
         var engine = new CpuEngine();
         // Just the magic bytes + a few header bytes, not a valid plan.
@@ -188,7 +189,7 @@ public class InferencePlanSerializationTests
 
     // ── CNN round-trip: Conv2D + BatchNorm + MaxPool2D + ReLU ──────────────
     [Fact]
-    public async void SaveLoad_CNN_BitwiseIdenticalAcross100RandomInputs()
+    public async Task SaveLoad_CNN_BitwiseIdenticalAcross100RandomInputs()
     {
         var engine = new CpuEngine();
 
@@ -234,7 +235,7 @@ public class InferencePlanSerializationTests
 
     // ── Transformer-style round-trip: MatMul projections + Softmax + GELU ───
     [Fact]
-    public async void SaveLoad_TransformerBlock_BitwiseIdenticalAcross100RandomInputs()
+    public async Task SaveLoad_TransformerBlock_BitwiseIdenticalAcross100RandomInputs()
     {
         var engine = new CpuEngine();
 

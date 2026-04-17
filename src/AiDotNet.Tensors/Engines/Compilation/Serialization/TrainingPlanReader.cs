@@ -76,14 +76,19 @@ internal static class TrainingPlanReader
         byte planType = reader.ReadByte();
         byte elementTypeCode = reader.ReadByte();
         int stepCount = reader.ReadInt32();
+        RequireNonNegative(stepCount, nameof(stepCount));
 
         int inputRank = reader.ReadInt32();
+        RequireNonNegative(inputRank, nameof(inputRank));
+        RequireWithinStream(bodyStream, (long)inputRank * sizeof(int), nameof(inputRank));
         var inputShape = new int[inputRank];
         for (int i = 0; i < inputRank; i++)
             inputShape[i] = reader.ReadInt32();
 
         int codecVersion = reader.ReadInt32();
         int fpLen = reader.ReadInt32();
+        RequireNonNegative(fpLen, nameof(fpLen));
+        RequireWithinStream(bodyStream, fpLen, nameof(fpLen));
         string hwFingerprint = Encoding.UTF8.GetString(reader.ReadBytes(fpLen));
 
         // ── Compatibility check ─────────────────────────────────────────
@@ -104,12 +109,20 @@ internal static class TrainingPlanReader
         var tensorTable = TensorTableReader.Read<T>(reader);
 
         int savedStepCount = reader.ReadInt32();
+        RequireNonNegative(savedStepCount, nameof(savedStepCount));
+        // Cross-check the header's stepCount against the op-section count.
+        // Divergence means the writer mis-matched its own two fields, or the
+        // file was truncated mid-op-stream. Either way it's corrupt.
+        if (savedStepCount != stepCount)
+            throw new InvalidDataException(
+                $"Training plan step count mismatch: header says {stepCount}, op section says {savedStepCount}.");
         var rawOps = new RawOp[savedStepCount];
         for (int i = 0; i < savedStepCount; i++)
-            rawOps[i] = ReadRawOp<T>(reader, tensorTable);
+            rawOps[i] = ReadRawOp<T>(reader, tensorTable, bodyStream);
 
         // ── Read training extension: param IDs ──────────────────────────
         int paramCount = reader.ReadInt32();
+        RequireNonNegative(paramCount, nameof(paramCount));
         if (paramCount != callerParameters.Length)
             throw new InvalidDataException(
                 $"Parameter count mismatch: file has {paramCount}, caller supplied {callerParameters.Length}.");
@@ -121,14 +134,21 @@ internal static class TrainingPlanReader
         for (int i = 0; i < paramCount; i++)
         {
             int paramTensorId = reader.ReadInt32();
+            if ((uint)paramTensorId >= (uint)tensorTable.Length)
+                throw new InvalidDataException(
+                    $"Training plan parameter {i} references tensor ID {paramTensorId} " +
+                    $"out of range [0, {tensorTable.Length}). The file is corrupt.");
             tensorTable[paramTensorId] = callerParameters[i];
         }
 
         // ── Gradient buffer shapes (skip — the compiler allocates its own) ─
         int gradCount = reader.ReadInt32();
+        RequireNonNegative(gradCount, nameof(gradCount));
         for (int i = 0; i < gradCount; i++)
         {
             int gradRank = reader.ReadInt32();
+            RequireNonNegative(gradRank, nameof(gradRank));
+            RequireWithinStream(bodyStream, (long)gradRank * sizeof(int), nameof(gradRank));
             for (int d = 0; d < gradRank; d++) reader.ReadInt32();
         }
 
@@ -156,7 +176,37 @@ internal static class TrainingPlanReader
                 var op = rawOps[i];
                 var inputs = new Tensor<T>[op.InputIds.Length];
                 for (int j = 0; j < op.InputIds.Length; j++)
-                    inputs[j] = liveTensors[op.InputIds[j]]!;
+                {
+                    int inputId = op.InputIds[j];
+                    // Bounds-check before indexing so a truncated or fabricated
+                    // plan surfaces an InvalidDataException via the CompiledPlanLoader
+                    // try/catch instead of an IndexOutOfRangeException deep in
+                    // replay.
+                    if ((uint)inputId >= (uint)liveTensors.Length)
+                    {
+                        throw new InvalidDataException(
+                            $"Training plan op {i} ('{op.OpName}') references input tensor ID {inputId} " +
+                            $"which is out of range [0, {liveTensors.Length}). The plan file is corrupt.");
+                    }
+                    var inputTensor = liveTensors[inputId];
+                    if (inputTensor is null)
+                    {
+                        // Null means the tensor was never seeded from the tensor
+                        // table and no preceding op produced it — the graph is
+                        // topologically invalid.
+                        throw new InvalidDataException(
+                            $"Training plan op {i} ('{op.OpName}') consumes tensor ID {inputId} " +
+                            "before any producer ran. The plan file is corrupt.");
+                    }
+                    inputs[j] = inputTensor;
+                }
+
+                if ((uint)op.OutputId >= (uint)liveTensors.Length)
+                {
+                    throw new InvalidDataException(
+                        $"Training plan op {i} ('{op.OpName}') writes to output tensor ID {op.OutputId} " +
+                        $"which is out of range [0, {liveTensors.Length}). The plan file is corrupt.");
+                }
 
                 var output = OpReplay.ReplayThroughEngine(engine, op.OpType, op.OpName, inputs, op.SavedState);
                 if (output is not null)
@@ -167,14 +217,18 @@ internal static class TrainingPlanReader
         }
     }
 
-    private static RawOp ReadRawOp<T>(BinaryReader reader, Tensor<T>[] tensorTable)
+    private static RawOp ReadRawOp<T>(BinaryReader reader, Tensor<T>[] tensorTable, Stream bodyStream)
     {
         byte opTypeByte = reader.ReadByte();
         var opType = (OpType)opTypeByte;
         int nameLen = reader.ReadInt32();
+        RequireNonNegative(nameLen, nameof(nameLen));
+        RequireWithinStream(bodyStream, nameLen, nameof(nameLen));
         string opName = Encoding.UTF8.GetString(reader.ReadBytes(nameLen));
 
         int inputCount = reader.ReadInt32();
+        RequireNonNegative(inputCount, nameof(inputCount));
+        RequireWithinStream(bodyStream, (long)inputCount * sizeof(int), nameof(inputCount));
         var inputIds = new int[inputCount];
         for (int j = 0; j < inputCount; j++)
             inputIds[j] = reader.ReadInt32();
@@ -189,6 +243,27 @@ internal static class TrainingPlanReader
         var savedState = SavedStateSerializer.Read<T>(reader, tensorTable);
 
         return new RawOp(opType, opName, inputIds, outputId, savedState);
+    }
+
+    // ── Validation helpers ──────────────────────────────────────────────
+    // Mirror of InferencePlanReader's RequireNonNegative / RequireWithinStream.
+    // Keep both readers symmetric so corruption detection is consistent
+    // across inference-only and training plan files.
+
+    private static void RequireNonNegative(int value, string name)
+    {
+        if (value < 0)
+            throw new InvalidDataException(
+                $"Training plan field '{name}' is negative ({value}). The file is corrupt.");
+    }
+
+    private static void RequireWithinStream(Stream bodyStream, long requiredBytes, string name)
+    {
+        long remaining = bodyStream.Length - bodyStream.Position;
+        if (requiredBytes > remaining)
+            throw new InvalidDataException(
+                $"Training plan field '{name}' requires {requiredBytes} bytes but only " +
+                $"{remaining} remain. The file is truncated or corrupt.");
     }
 }
 
