@@ -497,12 +497,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new ConstantFoldingPass(),
             new ForwardCSEPass(),
             new ConvBnFusionPass(),
+            new DiffusionFusionPass(), // Patterns 11-14: GroupNorm+SiLU, Conv+Bias+SiLU, Add+GroupNorm (#181)
             new PointwiseFusionPass(),
             new AttentionFusionPass(),
             new BlasBatchPass(),
             new SpectralDecompositionPass(),
             new DataflowFusionPass(),
             new MixedPrecisionPass(),
+            new OperatorReorderingPass(), // Reorder for cache locality (#182)
+            new MemoryPlanningPass(),     // Buffer reuse via lifetime analysis (#182)
+            new TileSchedulingPass(),     // L1/L2 tile sizing for GEMM/Conv (#182)
         };
 
         var current = steps;
