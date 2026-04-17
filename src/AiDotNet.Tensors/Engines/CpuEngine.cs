@@ -14258,14 +14258,14 @@ public class CpuEngine : ITensorLevelEngine
         var gradInputData = new T[batchSize * featureSize];
 
         // ────────────────────────────────────────────────────────────────────
-        // Float fast path: direct array access, managed-float arithmetic.
-        // Mirror of the LayerNorm forward's typeof(T) == typeof(float) branch.
+        // Primitive fast paths: direct array access, no INumericOperations<T>
+        // virtual dispatch. Mirror of the LayerNorm forward's primitive
+        // branches. Method signature stays generic <T>; non-primitive T
+        // (complex, Half, int, etc.) falls through to the scalar path below.
         //
-        // The scalar path below walks gradGamma/gradBeta with sequential per-
-        // batch updates, then parallelizes gradInput. The float path keeps that
-        // structure but replaces every INumericOperations<T> virtual call with
-        // a direct float op — critical for transformer training since every
-        // LayerNorm layer pays this cost on every backward pass.
+        // Transformer training pays this op's cost on every backward step.
+        // Scientific consumers using T = double were on the scalar path — now
+        // they get the same dispatch-free treatment as float.
         // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
@@ -14332,6 +14332,69 @@ public class CpuEngine : ITensorLevelEngine
 
             // Same threshold used by the forward: below ~50K total elements the
             // Parallel.For dispatch cost exceeds the work.
+            if (batchSize * fs < 50_000)
+            {
+                for (int b = 0; b < batchSize; b++) ProcessBatch(b);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, ProcessBatch);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dMean = (double[])(object)meanData;
+            var dVar = (double[])(object)varData;
+            var dGradGamma = (double[])(object)gradGammaData;
+            var dGradBeta = (double[])(object)gradBetaData;
+            var dGradInput = (double[])(object)gradInputData;
+            int fs = featureSize;
+            double featureSizeD = fs;
+            double invFeatureSizeD = 1.0 / featureSizeD;
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                int off = b * fs;
+                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
+                double m = dMean[b];
+                for (int f = 0; f < fs; f++)
+                {
+                    double go = dGradOut[off + f];
+                    double normalized = (dInput[off + f] - m) * invStd;
+                    dGradGamma[f] += go * normalized;
+                    dGradBeta[f] += go;
+                }
+            }
+
+            void ProcessBatch(int b)
+            {
+                int off = b * fs;
+                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
+                double m = dMean[b];
+
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                for (int f = 0; f < fs; f++)
+                {
+                    double scaledGrad = dGamma[f] * dGradOut[off + f];
+                    sumGrad += scaledGrad;
+                    sumGradX += scaledGrad * (dInput[off + f] - m);
+                }
+
+                double scale = invStd * invFeatureSizeD;
+                for (int f = 0; f < fs; f++)
+                {
+                    double normalized = (dInput[off + f] - m) * invStd;
+                    double gradNorm = dGamma[f] * dGradOut[off + f];
+                    double term1 = featureSizeD * gradNorm;
+                    double term3 = normalized * invStd * sumGradX;
+                    dGradInput[off + f] = scale * (term1 - sumGrad - term3);
+                }
+            }
+
             if (batchSize * fs < 50_000)
             {
                 for (int b = 0; b < batchSize; b++) ProcessBatch(b);
