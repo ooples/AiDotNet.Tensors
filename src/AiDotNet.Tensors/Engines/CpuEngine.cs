@@ -15101,7 +15101,9 @@ public class CpuEngine : ITensorLevelEngine
         // intensity, no BLAS.
         //
         // Expected speedup matches the forward fix (~3.7× at DiT-XL shapes).
-        // Non-float T continues through the original scalar path below.
+        // Non-primitive T (complex, Half, int, etc.) continues through the
+        // original scalar path below. float and double both get primitive-typed
+        // fast paths that skip INumericOperations<T>'s virtual dispatch.
         // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
@@ -15118,6 +15120,23 @@ public class CpuEngine : ITensorLevelEngine
             gradQuery = (Tensor<T>)(object)gradQF;
             gradKey = (Tensor<T>)(object)gradKF;
             gradValue = (Tensor<T>)(object)gradVF;
+            return gradOutput;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var gradOutD = (Tensor<double>)(object)gradOutput;
+            var gradQD = ScaledDotProductAttentionBackwardDouble(
+                gradOutD,
+                (Tensor<double>)(object)query,
+                (Tensor<double>)(object)key,
+                (Tensor<double>)(object)value,
+                (Tensor<double>)(object)attentionWeights,
+                scale,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out var gradKD, out var gradVD);
+            gradQuery = (Tensor<T>)(object)gradQD;
+            gradKey = (Tensor<T>)(object)gradKD;
+            gradValue = (Tensor<T>)(object)gradVD;
             return gradOutput;
         }
 
@@ -15403,6 +15422,139 @@ public class CpuEngine : ITensorLevelEngine
         gradValue = TensorAllocator.Rent<float>(value._shape, new Vector<float>(gradVData));
         gradKey = TensorAllocator.Rent<float>(key._shape, new Vector<float>(gradKData));
         return TensorAllocator.Rent<float>(query._shape, new Vector<float>(gradQData));
+    }
+
+    /// <summary>
+    /// Double-only fast path for <see cref="ScaledDotProductAttentionBackward{T}"/>.
+    /// Same structure as <see cref="ScaledDotProductAttentionBackwardFloat"/>, but
+    /// uses <see cref="Im2ColHelper.MultiplyMatrixBlockedDouble"/> instead of
+    /// <see cref="Simd.SimdGemm.SgemmSequential"/> for the four matmul steps.
+    /// Direct double arithmetic in the softmax-backward pass replaces the
+    /// <see cref="INumericOperations{T}"/> virtual dispatch.
+    /// </summary>
+    /// <remarks>
+    /// <para>Double-precision consumers (scientific workloads, any code that
+    /// constructs tensors with <c>T = double</c>) were on the scalar path
+    /// before this — every SDPA backward call walked 4 triple-nested loops
+    /// via virtual dispatch. Now the dispatch cost is paid once per op
+    /// and the inner arithmetic goes direct-double, which the JIT can
+    /// auto-vectorize for the softmax-backward row sweep.</para>
+    /// <para>No double equivalent of <c>BlasProvider.TryGemmEx</c> exists,
+    /// so the transposed GEMMs always pre-transpose into scratch and call
+    /// the blocked kernel. That matches what the float path does when
+    /// <c>TryGemmEx</c> returns false.</para>
+    /// </remarks>
+    private Tensor<double> ScaledDotProductAttentionBackwardDouble(
+        Tensor<double> gradOutput,
+        Tensor<double> query,
+        Tensor<double> key,
+        Tensor<double> value,
+        Tensor<double> attentionWeights,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<double> gradKey,
+        out Tensor<double> gradValue)
+    {
+        int bhCount = batch * heads;
+        var gradOutD = gradOutput.GetFlattenedData();
+        var qD = query.GetFlattenedData();
+        var kD = key.GetFlattenedData();
+        var vD = value.GetFlattenedData();
+        var wD = attentionWeights.GetDataArray();
+
+        var gradQData = new double[batch * heads * seqQ * d_k];
+        var gradKData = new double[batch * heads * seqK * d_k];
+        var gradVData = new double[batch * heads * seqK * d_v];
+
+        int scratchLen = seqQ * seqK;
+
+        Parallel.For(0, bhCount, bh =>
+        {
+            int wOff = bh * seqQ * seqK;
+            int gOff = bh * seqQ * d_v;
+            int qOff = bh * seqQ * d_k;
+            int kOff = bh * seqK * d_k;
+            int vOff = bh * seqK * d_v;
+
+            // Step 1: gradV[seqK, d_v] = W^T[seqK, seqQ] @ gradOut[seqQ, d_v]
+            // MultiplyMatrixBlockedDouble doesn't support transA, so transpose W
+            // into scratch first. Same fallback pattern the float path takes
+            // when TryGemmEx is unavailable.
+            var wT = System.Buffers.ArrayPool<double>.Shared.Rent(seqK * seqQ);
+            try
+            {
+                for (int i = 0; i < seqQ; i++)
+                    for (int j = 0; j < seqK; j++)
+                        wT[j * seqQ + i] = wD[wOff + i * seqK + j];
+                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                    wT.AsSpan(0, seqK * seqQ),
+                    gradOutD.AsSpan(gOff, seqQ * d_v),
+                    gradVData.AsSpan(vOff, seqK * d_v),
+                    seqK, seqQ, d_v);
+            }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(wT); }
+
+            var gradWeights = System.Buffers.ArrayPool<double>.Shared.Rent(scratchLen);
+            try
+            {
+                // Step 2: gradWeights[seqQ, seqK] = gradOut[seqQ, d_v] @ V^T[d_v, seqK]
+                var vT = System.Buffers.ArrayPool<double>.Shared.Rent(d_v * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_v; j++)
+                            vT[j * seqK + i] = vD[vOff + i * d_v + j];
+                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                        gradOutD.AsSpan(gOff, seqQ * d_v),
+                        vT.AsSpan(0, d_v * seqK),
+                        gradWeights.AsSpan(0, seqQ * seqK),
+                        seqQ, d_v, seqK);
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(vT); }
+
+                // Step 3: softmax backward row-wise, scale folded in (same as float path).
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = i * seqK;
+                    int wRow = wOff + rowOff;
+                    double dotProduct = 0.0;
+                    for (int j = 0; j < seqK; j++)
+                        dotProduct += wD[wRow + j] * gradWeights[rowOff + j];
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double w = wD[wRow + j];
+                        gradWeights[rowOff + j] = scaleValue * w * (gradWeights[rowOff + j] - dotProduct);
+                    }
+                }
+
+                // Step 4: gradQ[seqQ, d_k] = gradScores[seqQ, seqK] @ K[seqK, d_k]
+                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                    gradWeights.AsSpan(0, seqQ * seqK),
+                    kD.AsSpan(kOff, seqK * d_k),
+                    gradQData.AsSpan(qOff, seqQ * d_k),
+                    seqQ, seqK, d_k);
+
+                // Step 5: gradK[seqK, d_k] = gradScores^T[seqK, seqQ] @ Q[seqQ, d_k]
+                var sT = System.Buffers.ArrayPool<double>.Shared.Rent(seqK * seqQ);
+                try
+                {
+                    for (int i = 0; i < seqQ; i++)
+                        for (int j = 0; j < seqK; j++)
+                            sT[j * seqQ + i] = gradWeights[i * seqK + j];
+                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                        sT.AsSpan(0, seqK * seqQ),
+                        qD.AsSpan(qOff, seqQ * d_k),
+                        gradKData.AsSpan(kOff, seqK * d_k),
+                        seqK, seqQ, d_k);
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(sT); }
+            }
+            finally { System.Buffers.ArrayPool<double>.Shared.Return(gradWeights, clearArray: false); }
+        });
+
+        gradValue = TensorAllocator.Rent<double>(value._shape, new Vector<double>(gradVData));
+        gradKey = TensorAllocator.Rent<double>(key._shape, new Vector<double>(gradKData));
+        return TensorAllocator.Rent<double>(query._shape, new Vector<double>(gradQData));
     }
 
     /// <summary>
