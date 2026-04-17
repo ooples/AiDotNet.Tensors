@@ -28,6 +28,56 @@ internal static class MathOperators
         r.Register(new OneHot<T>());
         r.Register(new Not<T>());
         r.Register(new Where<T>());
+        r.Register(new Reciprocal<T>());
+        r.Register(new ConstantOfShape<T>());
+    }
+
+    /// <summary>
+    /// ONNX Reciprocal — y = 1 / x, elementwise.
+    /// </summary>
+    internal sealed class Reciprocal<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Reciprocal";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            var x = ctx.GetTensor(node.Input[0]);
+            var ones = FillTensor<T>(x._shape, 1.0);
+            ctx.PutTensor(node.Output[0], ctx.Engine.TensorDivide(ones, x));
+        }
+    }
+
+    /// <summary>
+    /// ONNX ConstantOfShape — allocate a tensor of the given <c>shape</c>
+    /// (provided as int64 input tensor) filled with <c>value</c> (attribute,
+    /// default scalar 0). Materialized at import time since the shape comes
+    /// from an initializer-or-constant-folded source.
+    /// </summary>
+    internal sealed class ConstantOfShape<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "ConstantOfShape";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            var shapeT = ctx.GetTensor(node.Input[0]);
+            var shapeSpan = shapeT.AsSpan();
+            var shape = new int[shapeSpan.Length];
+            for (int i = 0; i < shapeSpan.Length; i++) shape[i] = Convert.ToInt32(shapeSpan[i]!);
+
+            // "value" attribute is a TensorProto with a single element. Default = 0.
+            var valueAttr = ctx.GetAttribute(node, "value");
+            double value = 0.0;
+            if (valueAttr is not null && valueAttr.T is not null)
+            {
+                // Extract the first element of the attribute tensor.
+                var constTensor = InitializerLoader.Load<T>(valueAttr.T);
+                var v = constTensor.AsSpan()[0];
+                ctx.PutTensor(node.Output[0], FillTensor<T>(shape,
+                    Convert.ToDouble(v!)));
+                return;
+            }
+            ctx.PutTensor(node.Output[0], FillTensor<T>(shape, value));
+        }
     }
 
     internal sealed class Sqrt<T> : IOnnxOpTranslator<T> where T : unmanaged

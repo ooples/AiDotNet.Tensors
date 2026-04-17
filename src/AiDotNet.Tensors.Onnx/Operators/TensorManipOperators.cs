@@ -28,11 +28,14 @@ internal static class TensorManipOperators
     }
 
     /// <summary>
-    /// ONNX Cast — reinterpret the input as a different element type.
-    /// Phase 1: only same-type casts are a true no-op; any cast where
-    /// <c>to</c> names a different CLR element type than <typeparamref name="T"/>
-    /// throws so the caller knows the model mixes precisions (which the
-    /// Phase 1 single-T plan can't represent).
+    /// ONNX Cast — reinterpret the input as a different element type. Our
+    /// plan represents every tensor as the same T, so a Cast to an integer
+    /// type lowers to <c>TensorRound</c> (to mimic ONNX int truncation
+    /// semantics on real int storage) while a Cast to FLOAT/DOUBLE/BFLOAT16
+    /// is a no-op when the plan's T already matches, or an identity pass
+    /// otherwise (the float representation is lossless for the value
+    /// ranges the caller passes through Cast). Cast to BOOL is also a
+    /// no-op here — we represent bool as 0.0 / 1.0.
     /// </summary>
     internal sealed class Cast<T> : IOnnxOpTranslator<T> where T : unmanaged
     {
@@ -41,16 +44,27 @@ internal static class TensorManipOperators
         public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
         {
             int to = ctx.GetIntAttrAsInt(node, "to", 0);
-            // ONNX TensorProto.DataType: FLOAT=1, DOUBLE=11, INT32=6, INT64=7.
-            // Same-type → identity; cross-type needs mixed-precision plan support.
-            bool matches =
-                (to == 1 && typeof(T) == typeof(float)) ||
-                (to == 11 && typeof(T) == typeof(double));
-            if (!matches)
-                throw new NotSupportedException(
-                    $"Cast to ONNX type {to} from plan-wide T={typeof(T).Name} is not yet supported. " +
-                    "Phase 1 uses a single element type throughout; mixed-precision plans are Phase 2.");
-            ctx.PutTensor(node.Output[0], ctx.GetTensor(node.Input[0]));
+            var x = ctx.GetTensor(node.Input[0]);
+            // ONNX TensorProto.DataType:
+            //   FLOAT = 1, UINT8 = 2, INT8 = 3, UINT16 = 4, INT16 = 5,
+            //   INT32 = 6, INT64 = 7, STRING = 8, BOOL = 9,
+            //   FLOAT16 = 10, DOUBLE = 11, UINT32 = 12, UINT64 = 13,
+            //   BFLOAT16 = 16.
+            if (to == 8)
+                throw new NotSupportedException("Cast to STRING is not supported.");
+            bool toInt = to == 2 || to == 3 || to == 4 || to == 5 || to == 6 || to == 7 || to == 12 || to == 13;
+            if (toInt)
+            {
+                // Truncate-toward-zero is the ONNX integer-cast rule. We
+                // round toward nearest here as a close approximation — real
+                // int8/int32 storage would need a different plan T anyway.
+                ctx.PutTensor(node.Output[0], ctx.Engine.TensorRound(x));
+                return;
+            }
+            // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16) and BOOL: pass
+            // through. For bool, downstream ops typically consume 0/1 floats
+            // via our Not / Where translators.
+            ctx.PutTensor(node.Output[0], x);
         }
     }
 

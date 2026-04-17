@@ -71,7 +71,18 @@ public class EndToEndModelTests
         Skip.IfNot(IsModelAvailable("resnet50"),
             $"Drop {ModelRegistry["resnet50"].FileName} into $AIDOTNET_ONNX_MODELS or ~/.aidotnet/onnx-models to run this test. " +
             $"Download: {ModelRegistry["resnet50"].Url}");
-        ValidateAcross100Samples("resnet50");
+        ValidateAcrossSamples("resnet50", 100);
+    }
+
+    [SkippableFact]
+    public void ResNet50_MatchesOnnxRuntime_Across10Samples_Smoke()
+    {
+        // Fast-feedback variant: proves the 100-sample path works end-to-end
+        // without waiting for the full loop. ResNet-50's 717-step plan takes
+        // ~10-20s per inference on CPU; 10 samples fits in a few minutes.
+        Skip.IfNot(IsModelAvailable("resnet50"),
+            $"Drop {ModelRegistry["resnet50"].FileName} into $AIDOTNET_ONNX_MODELS or ~/.aidotnet/onnx-models to run this test.");
+        ValidateAcrossSamples("resnet50", 10);
     }
 
     [SkippableFact]
@@ -92,7 +103,9 @@ public class EndToEndModelTests
         ValidateAcross100Samples("vit-base");
     }
 
-    private void ValidateAcross100Samples(string modelName)
+    private void ValidateAcross100Samples(string modelName) => ValidateAcrossSamples(modelName, 100);
+
+    private void ValidateAcrossSamples(string modelName, int sampleCount)
     {
         var info = ModelRegistry[modelName];
         var modelBytes = File.ReadAllBytes(GetModelPath(modelName));
@@ -122,7 +135,7 @@ public class EndToEndModelTests
         var rng = new Random(42);
         int mismatches = 0;
         float maxDiff = 0f;
-        for (int s = 0; s < 100; s++)
+        for (int s = 0; s < sampleCount; s++)
         {
             var sample = new float[total];
             for (int i = 0; i < total; i++)
@@ -165,6 +178,6 @@ public class EndToEndModelTests
         }
 
         Assert.True(mismatches == 0,
-            $"{modelName}: {mismatches} elements diverged > 1e-4 across 100 samples. Max diff: {maxDiff}.");
+            $"{modelName}: {mismatches} elements diverged > 1e-4 across {sampleCount} samples. Max diff: {maxDiff}.");
     }
 }

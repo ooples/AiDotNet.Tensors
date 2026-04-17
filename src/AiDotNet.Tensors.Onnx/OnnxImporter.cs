@@ -211,12 +211,18 @@ public static class OnnxImporter
                 shape[i] = resolved;
                 continue;
             }
-            // Unresolved. Return -1 for reporting purposes; caller must pass
-            // OverrideInputShapes or DimensionOverrides before Execute().
+            // Unresolved parametric dim. Fall back to DefaultParametricDim
+            // when the caller opted in — common for Hugging Face exports
+            // that autogenerate "unk__NNN" names for dims that would be
+            // obvious to a human (batch=1, etc.).
+            if (options.DefaultParametricDim.HasValue)
+            {
+                shape[i] = options.DefaultParametricDim.Value;
+                continue;
+            }
             throw new InvalidOperationException(
                 $"ONNX input '{vi.Name}' dim {i} is parametric ('{d.DimParam}') and was not resolved " +
-                "via OnnxImportOptions.DimensionOverrides or OverrideInputShapes. " +
-                "Phase 1 requires all input dims to be concrete at import time.");
+                "via OnnxImportOptions.DimensionOverrides, OverrideInputShapes, or DefaultParametricDim.");
         }
         return shape;
     }
