@@ -16893,6 +16893,19 @@ public class CpuEngine : ITensorLevelEngine
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (softmaxStats == null) throw new ArgumentNullException(nameof(softmaxStats));
 
+        if (query._shape.Length != 4)
+            throw new ArgumentException($"query must be rank-4 [batch, heads, seqQ, headDim], got rank {query._shape.Length}.", nameof(query));
+        if (key._shape.Length != 4)
+            throw new ArgumentException($"key must be rank-4 [batch, heads, seqK, headDim], got rank {key._shape.Length}.", nameof(key));
+        if (value._shape.Length != 4)
+            throw new ArgumentException($"value must be rank-4 [batch, heads, seqK, headDim], got rank {value._shape.Length}.", nameof(value));
+        if (output._shape.Length != 4)
+            throw new ArgumentException($"output must be rank-4 [batch, heads, seqQ, headDim], got rank {output._shape.Length}.", nameof(output));
+        if (gradOutput._shape.Length != 4)
+            throw new ArgumentException($"gradOutput must be rank-4 [batch, heads, seqQ, headDim], got rank {gradOutput._shape.Length}.", nameof(gradOutput));
+        if (softmaxStats._shape.Length != 3)
+            throw new ArgumentException($"softmaxStats must be rank-3 [batch, heads, seqQ], got rank {softmaxStats._shape.Length}.", nameof(softmaxStats));
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = query._shape[0];
@@ -16900,6 +16913,27 @@ public class CpuEngine : ITensorLevelEngine
         int seqQ = query._shape[2];
         int headDim = query._shape[3];
         int seqK = key._shape[2];
+
+        if (key._shape[0] != batch || key._shape[1] != heads || key._shape[3] != headDim)
+            throw new ArgumentException(
+                $"key shape [{string.Join(",", key._shape)}] must be [batch={batch}, heads={heads}, seqK, headDim={headDim}].",
+                nameof(key));
+        if (value._shape[0] != batch || value._shape[1] != heads || value._shape[2] != seqK || value._shape[3] != headDim)
+            throw new ArgumentException(
+                $"value shape [{string.Join(",", value._shape)}] must be [batch={batch}, heads={heads}, seqK={seqK}, headDim={headDim}].",
+                nameof(value));
+        if (output._shape[0] != batch || output._shape[1] != heads || output._shape[2] != seqQ || output._shape[3] != headDim)
+            throw new ArgumentException(
+                $"output shape [{string.Join(",", output._shape)}] must be [batch={batch}, heads={heads}, seqQ={seqQ}, headDim={headDim}].",
+                nameof(output));
+        if (gradOutput._shape[0] != batch || gradOutput._shape[1] != heads || gradOutput._shape[2] != seqQ || gradOutput._shape[3] != headDim)
+            throw new ArgumentException(
+                $"gradOutput shape [{string.Join(",", gradOutput._shape)}] must be [batch={batch}, heads={heads}, seqQ={seqQ}, headDim={headDim}].",
+                nameof(gradOutput));
+        if (softmaxStats._shape[0] != batch || softmaxStats._shape[1] != heads || softmaxStats._shape[2] != seqQ)
+            throw new ArgumentException(
+                $"softmaxStats shape [{string.Join(",", softmaxStats._shape)}] must be [batch={batch}, heads={heads}, seqQ={seqQ}].",
+                nameof(softmaxStats));
 
         T scaleFactor = numOps.FromDouble(scale);
 
