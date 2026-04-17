@@ -35,10 +35,15 @@ internal sealed class OperatorReorderingPass : ICpuOptimizationPass
 
         // Phase 1: Build dependency info
         // For each step, record which other steps it depends on (transitively
-        // through tensor references).
-        var producerOf = new Dictionary<int, int>(); // tensor hash → step index that produces it
+        // through tensor references). Must use reference identity — the earlier
+        // implementation keyed on RuntimeHelpers.GetHashCode(t) (an int), which
+        // loses tensor identity under hash collisions and can produce invalid
+        // schedules (two distinct tensors hashing equal would be treated as the
+        // same, dropping a real dependency or inventing a spurious one).
+        var refComparer = ReferenceEqualityComparer<Tensor<T>>.Instance;
+        var producerOf = new Dictionary<Tensor<T>, int>(refComparer);
         for (int i = 0; i < steps.Length; i++)
-            producerOf[RuntimeHelpers.GetHashCode(steps[i].OutputBuffer)] = i;
+            producerOf[steps[i].OutputBuffer] = i;
 
         // dependsOn[i] = set of step indices that step i reads from
         var dependsOn = new HashSet<int>[steps.Length];
@@ -47,8 +52,7 @@ internal sealed class OperatorReorderingPass : ICpuOptimizationPass
             dependsOn[i] = new HashSet<int>();
             for (int j = 0; j < steps[i].Inputs.Length; j++)
             {
-                int inputHash = RuntimeHelpers.GetHashCode(steps[i].Inputs[j]);
-                if (producerOf.TryGetValue(inputHash, out int prodIdx) && prodIdx != i)
+                if (producerOf.TryGetValue(steps[i].Inputs[j], out int prodIdx) && prodIdx != i)
                     dependsOn[i].Add(prodIdx);
             }
         }
@@ -77,14 +81,14 @@ internal sealed class OperatorReorderingPass : ICpuOptimizationPass
                 // Check that no step between latestProducer+1 and i depends on step i's output.
                 int targetPos = latestProducer + 1;
                 bool canMove = true;
-                int stepOutputHash = RuntimeHelpers.GetHashCode(step.OutputBuffer);
+                var stepOutput = step.OutputBuffer;
 
                 for (int k = targetPos; k < i; k++)
                 {
                     // Does step k depend on step i? (step i's output is step k's input)
                     for (int j = 0; j < reordered[k].Inputs.Length; j++)
                     {
-                        if (RuntimeHelpers.GetHashCode(reordered[k].Inputs[j]) == stepOutputHash)
+                        if (ReferenceEquals(reordered[k].Inputs[j], stepOutput))
                         {
                             canMove = false;
                             break;
@@ -111,22 +115,29 @@ internal sealed class OperatorReorderingPass : ICpuOptimizationPass
 
     private static void RebuildDependencies<T>(
         List<CompiledStep<T>> steps,
-        Dictionary<int, int> producerOf,
+        Dictionary<Tensor<T>, int> producerOf,
         HashSet<int>[] dependsOn)
     {
         producerOf.Clear();
         for (int i = 0; i < steps.Count; i++)
-            producerOf[RuntimeHelpers.GetHashCode(steps[i].OutputBuffer)] = i;
+            producerOf[steps[i].OutputBuffer] = i;
 
         for (int i = 0; i < steps.Count; i++)
         {
             dependsOn[i].Clear();
             for (int j = 0; j < steps[i].Inputs.Length; j++)
             {
-                int inputHash = RuntimeHelpers.GetHashCode(steps[i].Inputs[j]);
-                if (producerOf.TryGetValue(inputHash, out int prodIdx) && prodIdx != i)
+                if (producerOf.TryGetValue(steps[i].Inputs[j], out int prodIdx) && prodIdx != i)
                     dependsOn[i].Add(prodIdx);
             }
         }
+    }
+
+    /// <summary>Reference-equality comparer for tensor identity tracking.</summary>
+    private sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
+    {
+        public static readonly ReferenceEqualityComparer<TItem> Instance = new();
+        public bool Equals(TItem? x, TItem? y) => ReferenceEquals(x, y);
+        public int GetHashCode(TItem obj) => RuntimeHelpers.GetHashCode(obj);
     }
 }

@@ -67,6 +67,13 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
     /// <summary>Variance from forward — needed by backward.</summary>
     public Tensor<T>? Variance { get; set; }
 
+    /// <summary>
+    /// Pre-activation tensor (= GroupNorm output, before the fused activation)
+    /// from the last forward pass. Needed by SiLU backward since SwishBackward
+    /// requires the pre-activation — for Identity/ReLU this is not used.
+    /// </summary>
+    public Tensor<T>? PreActivation { get; set; }
+
     public FusedGroupNormActivationOp(
         Tensor<T> input,
         int numGroups,
@@ -94,6 +101,18 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
 
     public Action<IEngine, Tensor<T>> BuildForwardClosure()
     {
+        // Legacy closure with no savedState backfill. Callers needing backward
+        // should go through ToCompiledStep which shares the savedState array
+        // with the closure.
+        return BuildForwardClosureCore(savedState: null);
+    }
+
+    /// <summary>Core forward-closure factory shared by <see cref="BuildForwardClosure"/>
+    /// and <see cref="ToCompiledStep"/>. When <paramref name="savedState"/> is non-null,
+    /// the closure backfills slots [1], [2], and [5] with fresh mean/variance/pre-activation
+    /// so backward reads up-to-date tensors.</summary>
+    private Action<IEngine, Tensor<T>> BuildForwardClosureCore(object[]? savedState)
+    {
         var input = Input;
         var numGroups = NumGroups;
         var gamma = Gamma;
@@ -104,41 +123,45 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
 
         return (eng, output) =>
         {
+            Tensor<T>? preActivation = null;
+            Tensor<T> mean, variance;
+
             switch (activation)
             {
                 case GroupNormActivation.SiLU:
-                    // True fused kernel — one pass over the data.
+                    // Fused kernel writes post-SiLU directly to output. We
+                    // separately run GroupNorm to capture mean/variance AND
+                    // the pre-activation tensor — SwishBackward needs the
+                    // pre-activation (h = GroupNorm(x)), not the raw input x.
                     eng.GroupNormSwishInto(output, input, numGroups, gamma, beta, epsilon);
+                    preActivation = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
+                        out mean, out variance);
                     break;
 
                 case GroupNormActivation.ReLU:
-                    // GroupNorm + pointwise ReLU (still one CompiledStep).
                     var gnResult = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                        out var mean, out var variance);
-                    op.Mean = mean;
-                    op.Variance = variance;
+                        out mean, out variance);
                     var reluResult = eng.ReLU(gnResult);
                     reluResult.AsSpan().CopyTo(output.AsWritableSpan());
-                    return;
+                    break;
 
                 default: // Identity
                     var gnId = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                        out var meanId, out var varId);
-                    op.Mean = meanId;
-                    op.Variance = varId;
+                        out mean, out variance);
                     gnId.AsSpan().CopyTo(output.AsWritableSpan());
-                    return;
+                    break;
             }
 
-            // For SiLU path: compute mean/variance separately for backward.
-            // GroupNormSwishInto doesn't return them, so we run a separate
-            // GroupNorm just for the stats. This is the trade-off: forward is
-            // fast (one fused pass), but we need a second pass for backward
-            // stats. Future: extend GroupNormSwishInto to output mean/var.
-            var gnForStats = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
-                out var meanStat, out var varStat);
-            op.Mean = meanStat;
-            op.Variance = varStat;
+            op.Mean = mean;
+            op.Variance = variance;
+            op.PreActivation = preActivation;
+
+            if (savedState is not null)
+            {
+                savedState[1] = mean;
+                savedState[2] = variance;
+                if (preActivation is not null) savedState[5] = preActivation;
+            }
         };
     }
 
@@ -150,19 +173,38 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
 
     public object[]? BuildSavedState()
     {
-        // [numGroups, mean, variance, epsilon, activation]
-        return new object[] { NumGroups, Mean!, Variance!, Epsilon, (int)Activation };
+        // [numGroups, mean, variance, epsilon, activation, preActivation(SiLU only)]
+        // Mean/Variance/PreActivation slots start null at build time — the
+        // forward closure built by ToCompiledStep backfills them before
+        // backward reads. Leaving PreActivation null for Identity/ReLU is
+        // safe because the backward switch never dereferences it for those.
+        var savedState = new object[6];
+        savedState[0] = NumGroups;
+        if (Mean is not null) savedState[1] = Mean;
+        if (Variance is not null) savedState[2] = Variance;
+        savedState[3] = Epsilon;
+        savedState[4] = (int)Activation;
+        if (PreActivation is not null) savedState[5] = PreActivation;
+        return savedState;
     }
 
     public CompiledStep<T> ToCompiledStep(Tensor<T> outputBuffer)
     {
+        // Share one savedState array between the forward closure (which writes
+        // mean/variance/preActivation into it every forward) and the CompiledStep
+        // (which hands it to backward). Same pattern as GroupNormOp.
+        var sharedSavedState = BuildSavedState();
+        if (sharedSavedState is null)
+            throw new InvalidOperationException(
+                "FusedGroupNormActivationOp.BuildSavedState returned null; backward cannot be wired.");
+
         return new CompiledStep<T>(
             OpName,
-            BuildForwardClosure(),
+            BuildForwardClosureCore(sharedSavedState),
             outputBuffer,
             Inputs,
             GetBackwardFunction(),
-            BuildSavedState());
+            sharedSavedState);
     }
 
     // ── Factory ─────────────────────────────────────────────────────────
@@ -197,10 +239,27 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
         var epsilon = (double)savedState[3];
         var activation = (GroupNormActivation)(int)savedState[4];
 
-        // Step 1: undo activation gradient
+        // Step 1: undo activation gradient.
+        //
+        // SiLU's derivative σ(h) + h·σ(h)·(1-σ(h)) depends on the PRE-activation
+        // h = GroupNorm(x), not the raw input x. The previous code passed
+        // inputs[0] (raw input) to SwishBackward — that produced d/dy[SiLU(y)]
+        // evaluated at x, which is the wrong gradient. savedState[5] holds the
+        // cached pre-activation from the forward pass (see BuildForwardClosureCore).
+        //
+        // ReLU's derivative (1 iff input > 0) matches 1 iff output > 0, so
+        // ReluBackward can use `output` — no pre-activation needed.
+        //
+        // Identity: no activation, pass gradOutput through.
         var effectiveGrad = activation switch
         {
-            GroupNormActivation.SiLU => engine.SwishBackward(gradOutput, inputs[0]),
+            GroupNormActivation.SiLU => engine.SwishBackward(
+                gradOutput,
+                savedState.Length > 5 && savedState[5] is Tensor<T> preAct
+                    ? preAct
+                    : throw new InvalidOperationException(
+                        "FusedGroupNormActivation SiLU backward requires cached pre-activation; " +
+                        "step was not built via ToCompiledStep.")),
             GroupNormActivation.ReLU => engine.ReluBackward(gradOutput, output),
             _ => gradOutput,
         };

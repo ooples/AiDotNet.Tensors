@@ -80,6 +80,15 @@ public abstract class TensorBase<T> : IDisposable
     /// input tensor directly to its first op (no pre-rebind views), so views are rare
     /// in practice.
     /// </para>
+    /// <para>
+    /// <b>Refcount invariant.</b> Each <see cref="TensorBase{T}"/> instance holds
+    /// exactly one reference on its <see cref="_storage"/> (released in Dispose).
+    /// Rebinding must AddRef the new storage and Release the old one, in that order,
+    /// so a concurrent dispose of <paramref name="source"/> cannot drop the new storage
+    /// to zero between the two operations. Skipping refcount adjustment (as the earlier
+    /// implementation did) left the old storage leaked and the new storage one ref short,
+    /// leading to use-after-free when <paramref name="source"/> was disposed.
+    /// </para>
     /// </remarks>
     internal void RebindStorageFrom(TensorBase<T> source)
     {
@@ -116,12 +125,25 @@ public abstract class TensorBase<T> : IDisposable
                 "Rebind source must be contiguous with zero storage offset; " +
                 "views are not supported.", nameof(source));
 
-        // Atomic swap — both fields get the new backing together so an
-        // intervening read couldn't observe a half-rebound state. (This
-        // class's instances aren't thread-safe in the general case, but
-        // matching the two updates keeps intent explicit.)
-        _data = source._data;
+        // Fast path: already aliasing the same storage. Still refresh _data in
+        // case the source's _data field was swapped to a different Vector view
+        // (shouldn't happen with current code, but preserves source-of-truth).
+        if (ReferenceEquals(_storage, source._storage))
+        {
+            _data = source._data;
+            return;
+        }
+
+        // Acquire the new reference BEFORE releasing the old one. If we released
+        // first and source was the only live referent of its storage, it could
+        // be disposed concurrently and AddRef would throw ObjectDisposedException,
+        // leaving us with neither storage. Both fields update together so an
+        // intervening read couldn't observe a half-rebound state.
+        source._storage.AddRef();
+        var oldStorage = _storage;
         _storage = source._storage;
+        _data = source._data;
+        oldStorage.Release();
     }
 
     /// <summary>

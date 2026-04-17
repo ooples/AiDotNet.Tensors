@@ -206,17 +206,41 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
         var dilation = (int[])savedState[2];
         var activationType = (FusedActivationType)(int)savedState[3];
 
-        // Step 1: undo activation on gradOutput if needed
+        // Step 1: undo activation on gradOutput.
+        //
+        // Activation backward needs the PRE-activation tensor (= conv(x, k) + bias),
+        // NOT the raw conv input x. The previous code passed inputs[0] (conv input)
+        // to SwishBackward — that's the input to the FULL fused op, not the input
+        // to the activation. Computing d/dx[swish(conv_out)] uses conv_out, not x.
+        //
+        // Correctness per-activation:
+        //   ReLU:    relu'(x) = 1 iff x > 0. relu(x) > 0 iff x > 0, so ReluBackward
+        //            can use either `output` or pre-activation. `output` is already
+        //            materialized — cheapest correct choice.
+        //   Sigmoid: σ'(x) = σ(x)(1-σ(x)) = output * (1 - output). Uses `output`.
+        //   Swish:   swish'(x) = σ(x) + x*σ(x)*(1-σ(x)). Needs the pre-activation x
+        //            (= conv + bias). Not recoverable from `output` alone (output =
+        //            x*σ(x) and the map output↔x isn't invertible cheaply). We
+        //            recompute the pre-activation here. This adds one conv-forward
+        //            worth of work per backward, acceptable vs. either (a) allocating
+        //            a pre-activation-sized tensor in SavedState on every forward,
+        //            or (b) silently producing wrong gradients.
+        //
+        //   Unknown activation types: throw rather than pass gradOutput through
+        //   unchanged (that would silently compute wrong gradients for future
+        //   fused-activation additions).
         var effectiveGrad = gradOutput;
         if (activationType != FusedActivationType.None)
         {
-            // For the common case (SiLU, ReLU), pointwise backward
             effectiveGrad = activationType switch
             {
                 FusedActivationType.ReLU => engine.ReluBackward(gradOutput, output),
                 FusedActivationType.Sigmoid => engine.SigmoidBackward(gradOutput, output),
-                FusedActivationType.Swish => engine.SwishBackward(gradOutput, inputs[0]),
-                _ => gradOutput, // Fallback: pass through
+                FusedActivationType.Swish => ComputeSwishBackward(
+                    gradOutput, inputs, stride, padding, dilation, engine),
+                _ => throw new NotSupportedException(
+                    $"FusedConv2DBiasActivation backward for {activationType} is not implemented. " +
+                    "Add a case in the switch with the correct pre-activation wiring."),
             };
         }
 
@@ -236,5 +260,31 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
             var gradBias = engine.ReduceSum(effectiveGrad, new[] { 0, 2, 3 });
             DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
         }
+    }
+
+    /// <summary>
+    /// Recomputes the Swish pre-activation (= Conv2D(input, kernel) + bias) and
+    /// applies the engine's SwishBackward. Swish'(x) = σ(x) + x·σ(x)·(1-σ(x))
+    /// depends on the pre-activation x, not the post-activation output, so we
+    /// can't recover it from <c>output</c> alone.
+    ///
+    /// Cost: one conv-forward per backward pass. The alternative — caching the
+    /// pre-activation tensor in SavedState on every forward — would waste
+    /// memory on the common case where the step doesn't flow gradients.
+    /// </summary>
+    private static Tensor<T> ComputeSwishBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs,
+        int[] stride, int[] padding, int[] dilation, IEngine engine)
+    {
+        var preActivation = engine.Conv2D(inputs[0], inputs[1], stride, padding, dilation);
+        if (inputs.Length > 2 && inputs[2] is not null)
+        {
+            var bias = inputs[2];
+            var reshapedBias = bias.Rank == 1
+                ? bias.Reshape(new[] { 1, bias._shape[0], 1, 1 })
+                : bias;
+            preActivation = engine.TensorBroadcastAdd(preActivation, reshapedBias);
+        }
+        return engine.SwishBackward(gradOutput, preActivation);
     }
 }

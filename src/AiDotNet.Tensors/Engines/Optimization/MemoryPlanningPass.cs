@@ -36,15 +36,23 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
 
         // Phase 1: Compute tensor lifetimes
         // Map each tensor (by reference identity) to its last-use step index.
-        var lastUse = new Dictionary<object, int>(steps.Length * 2);
+        // Must use reference-equality semantics — two distinct tensors may have
+        // the same hash code or even compare Equal by value, but they're
+        // different buffers and must not share a lastUse slot. The earlier
+        // implementation keyed the dictionary on RuntimeHelpers.GetHashCode(t)
+        // (an int boxed to object), which collided across tensors and caused
+        // the dead-pool to treat live buffers as reclaimable — data corruption
+        // under any hash collision.
+        var lastUse = new Dictionary<Tensor<T>, int>(
+            steps.Length * 2, ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = 0; i < steps.Length; i++)
         {
             var step = steps[i];
             // The output buffer is "produced" at step i. Its "last use" is at
             // least i (it might also be consumed later).
-            SetLastUse(lastUse, step.OutputBuffer, i);
+            lastUse[step.OutputBuffer] = i;
             for (int j = 0; j < step.Inputs.Length; j++)
-                SetLastUse(lastUse, step.Inputs[j], i);
+                lastUse[step.Inputs[j]] = i;
         }
 
         // Phase 2: Greedy buffer reuse via dead-pool
@@ -88,7 +96,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
             for (int j = 0; j < step.Inputs.Length; j++)
             {
                 var inp = step.Inputs[j];
-                if (lastUse.TryGetValue(RuntimeHelpers.GetHashCode(inp), out int lu) && lu == i)
+                if (lastUse.TryGetValue(inp, out int lu) && lu == i)
                 {
                     // This input's lifetime just ended — add to dead pool
                     long k = BufferKey(inp);
@@ -103,7 +111,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
 
             // Also check if this step's output dies immediately (consumed
             // only by the next step, which is common for element-wise chains)
-            if (lastUse.TryGetValue(RuntimeHelpers.GetHashCode(output), out int outLu) && outLu == i)
+            if (lastUse.TryGetValue(output, out int outLu) && outLu == i)
             {
                 long k = BufferKey(output);
                 if (!deadPool.TryGetValue(k, out var p))
@@ -133,12 +141,6 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         for (int i = 0; i < target._shape.Length; i++)
             if (target._shape[i] != donor._shape[i]) return false;
         return true;
-    }
-
-    private static void SetLastUse(Dictionary<object, int> map, object tensor, int step)
-    {
-        int key = RuntimeHelpers.GetHashCode(tensor);
-        map[key] = step; // Overwrites with the latest step that uses this tensor
     }
 
     /// <summary>Reference-equality comparer for tensor identity tracking.</summary>

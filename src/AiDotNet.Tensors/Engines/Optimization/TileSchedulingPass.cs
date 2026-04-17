@@ -79,11 +79,17 @@ internal sealed class TileSchedulingPass : ICpuOptimizationPass
     /// + output tile fit in L2. The tile is for the output height/width
     /// dimensions.
     /// </summary>
-    internal static int ComputeConvSpatialTile(CompiledStep<float> step, int elementSize)
+    /// <remarks>
+    /// The computation only reads shape metadata (ints), so it's safe to make
+    /// this generic over T. The earlier split had a float-specific method and
+    /// a generic placeholder returning a hardcoded 8; overload resolution in
+    /// the generic caller (TryOptimize&lt;T&gt;) always picked the placeholder
+    /// regardless of the runtime T check, so the real tile sizing never ran.
+    /// </remarks>
+    internal static int ComputeConvSpatialTile<T>(CompiledStep<T> step, int elementSize)
     {
         if (step.Inputs.Length < 2) return 8;
 
-        int kernelH = step.Inputs[1]._shape.Length >= 4 ? step.Inputs[1]._shape[2] : 3;
         int channels = step.Inputs[0]._shape.Length >= 2 ? step.Inputs[0]._shape[1] : 1;
 
         // input_tile = (tileH + kernelH - 1) × tileW × channels × elementSize
@@ -94,9 +100,6 @@ internal sealed class TileSchedulingPass : ICpuOptimizationPass
         tile = Math.Max(4, Math.Min(tile, 64)); // Clamp [4, 64]
         return tile;
     }
-
-    /// <summary>Non-float overload placeholder.</summary>
-    internal static int ComputeConvSpatialTile<T>(CompiledStep<T> step, int elementSize) => 8;
 
     private static void AnnotateTileSize<T>(CompiledStep<T> step, int tileSize)
     {

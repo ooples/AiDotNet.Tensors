@@ -77,20 +77,22 @@ internal sealed class GroupNormOp<T> : ICompiledOp<T>
 
     public Action<IEngine, Tensor<T>> BuildForwardClosure()
     {
-        // Capture by value so the closure doesn't hold `this` alive.
+        // Legacy closure (no SavedState backfill). Callers that also need
+        // backward should go through ToCompiledStep, which wires the forward
+        // to mutate the shared savedState array so backward sees the fresh
+        // mean/variance. See BuildForwardClosureForStep for the shared-array
+        // variant.
         var input = Input;
         var numGroups = NumGroups;
         var gamma = Gamma;
         var beta = Beta;
         var epsilon = Epsilon;
-        var op = this; // For writing back mean/variance
+        var op = this;
 
         return (eng, output) =>
         {
             var result = eng.GroupNorm(input, numGroups, gamma, beta, epsilon, out var mean, out var variance);
             result.AsSpan().CopyTo(output.AsWritableSpan());
-
-            // Store mean/variance for backward pass.
             op.Mean = mean;
             op.Variance = variance;
         };
@@ -103,18 +105,56 @@ internal sealed class GroupNormOp<T> : ICompiledOp<T>
     {
         // Matches BackwardFunctions<T>.GroupNormBackward's read order:
         // [0] = numGroups (int), [1] = mean (Tensor), [2] = variance (Tensor), [3] = epsilon (double)
-        return new object[] { NumGroups, Mean!, Variance!, Epsilon };
+        //
+        // Slots [1] and [2] are filled in by the forward closure built by
+        // ToCompiledStep (it shares this array by reference). At step-build
+        // time Mean/Variance are null; backward only runs after at least one
+        // forward, so by the time the BackwardFunction reads savedState the
+        // slots are populated. If Mean/Variance happen to already be set
+        // (e.g. a second ToCompiledStep after a prior forward), include them.
+        var savedState = new object[4];
+        savedState[0] = NumGroups;
+        if (Mean is not null) savedState[1] = Mean;
+        if (Variance is not null) savedState[2] = Variance;
+        savedState[3] = Epsilon;
+        return savedState;
     }
 
     public CompiledStep<T> ToCompiledStep(Tensor<T> outputBuffer)
     {
+        // Build the savedState array ONCE and share its reference with both
+        // the forward closure (which writes mean/variance into it on every
+        // forward pass) and the CompiledStep (which hands it to backward).
+        // Without this sharing the CompiledStep would hold a stale array with
+        // null mean/variance, and backward would NRE or compute wrong grads.
+        var sharedSavedState = BuildSavedState();
+        if (sharedSavedState is null)
+            throw new InvalidOperationException("GroupNormOp.BuildSavedState returned null; backward cannot be wired.");
+
+        var input = Input;
+        var numGroups = NumGroups;
+        var gamma = Gamma;
+        var beta = Beta;
+        var epsilon = Epsilon;
+        var op = this;
+
+        Action<IEngine, Tensor<T>> forward = (eng, output) =>
+        {
+            var result = eng.GroupNorm(input, numGroups, gamma, beta, epsilon, out var mean, out var variance);
+            result.AsSpan().CopyTo(output.AsWritableSpan());
+            op.Mean = mean;
+            op.Variance = variance;
+            sharedSavedState[1] = mean;
+            sharedSavedState[2] = variance;
+        };
+
         return new CompiledStep<T>(
             OpName,
-            BuildForwardClosure(),
+            forward,
             outputBuffer,
             Inputs,
             GetBackwardFunction(),
-            BuildSavedState());
+            sharedSavedState);
     }
 
     // ── Factory: try to extract from an existing CompiledStep ──────────
