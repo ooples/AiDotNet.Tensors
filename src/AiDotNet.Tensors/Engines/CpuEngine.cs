@@ -15088,6 +15088,39 @@ public class CpuEngine : ITensorLevelEngine
         int seqK = key._shape[2];
         int d_v = value._shape[3];
 
+        // ────────────────────────────────────────────────────────────────────
+        // Fast path for float: BLAS-backed batched GEMMs, mirror of the SDPA
+        // forward fix (commit cd954be, Issue #162).
+        //
+        // The four matmul-shaped steps (gradV = W^T·gradOut, gradW = gradOut·V^T,
+        // gradQ = gradScores·K, gradK = gradScores^T·Q) are individually sized
+        // well above BLAS's 4096-FMA threshold for typical MHA, so each head
+        // runs through either MKL or our blocked AVX2 kernel. The softmax
+        // backward (gradScores = W·(gradW − row_dot)) stays in managed float
+        // arithmetic — it's a row-wise elementwise pass with trivial arithmetic
+        // intensity, no BLAS.
+        //
+        // Expected speedup matches the forward fix (~3.7× at DiT-XL shapes).
+        // Non-float T continues through the original scalar path below.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
+        {
+            var gradOutF = (Tensor<float>)(object)gradOutput;
+            var gradQF = ScaledDotProductAttentionBackwardFloat(
+                gradOutF,
+                (Tensor<float>)(object)query,
+                (Tensor<float>)(object)key,
+                (Tensor<float>)(object)value,
+                (Tensor<float>)(object)attentionWeights,
+                scale,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out var gradKF, out var gradVF);
+            gradQuery = (Tensor<T>)(object)gradQF;
+            gradKey = (Tensor<T>)(object)gradKF;
+            gradValue = (Tensor<T>)(object)gradVF;
+            return gradOutput;
+        }
+
         T scaleFactor = numOps.FromDouble(scale);
 
         var gradOutData = gradOutput.GetFlattenedData();
@@ -15189,6 +15222,187 @@ public class CpuEngine : ITensorLevelEngine
         gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
 
         return gradOutput;
+    }
+
+    /// <summary>
+    /// Float-only fast path for <see cref="ScaledDotProductAttentionBackward{T}"/>.
+    /// Counterpart to <see cref="ScaledDotProductAttentionFloat"/> — replaces the
+    /// generic method's scalar INumericOperations-dispatch triple-loops with four
+    /// BLAS SGEMMs per head plus a row-wise softmax-backward pass in managed float.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Layout:</b> Q/K/V/gradOut/weights are in row-major [B, H, seq, d] layout.
+    /// Within each (b, h) slice the helper issues four GEMMs plus one elementwise
+    /// softmax-backward pass.</para>
+    /// <para><b>Why separate from the forward helper:</b> the forward goes
+    /// Q·K^T → softmax → P·V (two GEMMs + softmax). The backward goes
+    /// gradV = W^T·gradOut, gradW = gradOut·V^T, softmax-bwd, gradQ = gradScores·K,
+    /// gradK = gradScores^T·Q — four GEMMs with different transpose combos. Keeping
+    /// them in one method would hide which step does what.</para>
+    /// <para><b>Scale application:</b> the forward bakes sqrt(d_k) into the scores
+    /// before softmax; for backward, the scale propagates through softmax to gradQ
+    /// and gradK (but NOT through gradV — V's gradient doesn't see the scale).
+    /// We multiply gradScores by scaleF before the gradQ/gradK GEMMs. One broadcast
+    /// scale per head is negligible compared to the GEMMs.</para>
+    /// </remarks>
+    private Tensor<float> ScaledDotProductAttentionBackwardFloat(
+        Tensor<float> gradOutput,
+        Tensor<float> query,
+        Tensor<float> key,
+        Tensor<float> value,
+        Tensor<float> attentionWeights,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<float> gradKey,
+        out Tensor<float> gradValue)
+    {
+        int bhCount = batch * heads;
+        var gradOutF = gradOutput.GetFlattenedData();
+        var qF = query.GetFlattenedData();
+        var kF = key.GetFlattenedData();
+        var vF = value.GetFlattenedData();
+        var wF = attentionWeights.GetDataArray();
+
+        var gradQData = new float[batch * heads * seqQ * d_k];
+        var gradKData = new float[batch * heads * seqK * d_k];
+        var gradVData = new float[batch * heads * seqK * d_v];
+
+        float scaleF = (float)scaleValue;
+
+        // Per-head scratch for gradWeights (seqQ × seqK). Rent from the pool —
+        // the upper bound is ~1 MB per head at DiT-XL shapes; renting keeps
+        // Parallel.For from churning the GC for each of bhCount workers.
+        int scratchLen = seqQ * seqK;
+
+        Parallel.For(0, bhCount, bh =>
+        {
+            int wOff = bh * seqQ * seqK;
+            int gOff = bh * seqQ * d_v;
+            int qOff = bh * seqQ * d_k;
+            int kOff = bh * seqK * d_k;
+            int vOff = bh * seqK * d_v;
+
+            // Step 1: gradV[seqK, d_v] = W^T[seqK, seqQ] @ gradOut[seqQ, d_v]
+            // Row-major Gemm: m=seqK, n=d_v, k=seqQ. A = weights viewed as
+            // [seqQ, seqK] with transA=true (so effectively [seqK, seqQ]).
+            // lda is the *original* row stride of A (seqK, since weights is
+            // stored row-major [seqQ, seqK]).
+            bool gemmedV = BlasProvider.TryGemmEx(
+                m: seqK, n: d_v, k: seqQ,
+                a: wF, aOffset: wOff, lda: seqK, transA: true,
+                b: gradOutF, bOffset: gOff, ldb: d_v, transB: false,
+                c: gradVData, cOffset: vOff, ldc: d_v);
+            if (!gemmedV)
+            {
+                // SimdGemm has no built-in transA support — transpose weights
+                // into scratch, then regular SGEMM.
+                var wT = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * seqQ);
+                try
+                {
+                    for (int i = 0; i < seqQ; i++)
+                        for (int j = 0; j < seqK; j++)
+                            wT[j * seqQ + i] = wF[wOff + i * seqK + j];
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        wT.AsSpan(0, seqK * seqQ),
+                        gradOutF.AsSpan(gOff, seqQ * d_v),
+                        gradVData.AsSpan(vOff, seqK * d_v),
+                        seqK, seqQ, d_v);
+                }
+                finally { System.Buffers.ArrayPool<float>.Shared.Return(wT); }
+            }
+
+            // Step 2: gradWeights[seqQ, seqK] = gradOut[seqQ, d_v] @ V^T[d_v, seqK]
+            // m=seqQ, n=seqK, k=d_v. B = value with transB=true; ldb is value's
+            // original row stride (d_v).
+            var gradWeights = System.Buffers.ArrayPool<float>.Shared.Rent(scratchLen);
+            try
+            {
+                bool gemmedW = BlasProvider.TryGemmEx(
+                    m: seqQ, n: seqK, k: d_v,
+                    a: gradOutF, aOffset: gOff, lda: d_v, transA: false,
+                    b: vF, bOffset: vOff, ldb: d_v, transB: true,
+                    c: gradWeights, cOffset: 0, ldc: seqK);
+                if (!gemmedW)
+                {
+                    var vT = System.Buffers.ArrayPool<float>.Shared.Rent(d_v * seqK);
+                    try
+                    {
+                        for (int i = 0; i < seqK; i++)
+                            for (int j = 0; j < d_v; j++)
+                                vT[j * seqK + i] = vF[vOff + i * d_v + j];
+                        Engines.Simd.SimdGemm.SgemmSequential(
+                            gradOutF.AsSpan(gOff, seqQ * d_v),
+                            vT.AsSpan(0, d_v * seqK),
+                            gradWeights.AsSpan(0, seqQ * seqK),
+                            seqQ, d_v, seqK);
+                    }
+                    finally { System.Buffers.ArrayPool<float>.Shared.Return(vT); }
+                }
+
+                // Step 3: softmax backward — row-wise. gradScores = W * (gradW - dot),
+                // where dot = sum_j(W[i,j] * gradW[i,j]) is the per-row inner product.
+                // We write gradScores in-place into gradWeights then premultiply by
+                // scaleF since both gradQ and gradK use gradScores·scale. Scaling
+                // once here avoids two elementwise passes after the GEMMs.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = i * seqK;
+                    int wRow = wOff + rowOff;
+                    float dotProduct = 0f;
+                    for (int j = 0; j < seqK; j++)
+                        dotProduct += wF[wRow + j] * gradWeights[rowOff + j];
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        float w = wF[wRow + j];
+                        gradWeights[rowOff + j] = scaleF * w * (gradWeights[rowOff + j] - dotProduct);
+                    }
+                }
+
+                // Step 4: gradQ[seqQ, d_k] = gradScores[seqQ, seqK] @ K[seqK, d_k]
+                // (scale already folded into gradScores).
+                bool gemmedQ = BlasProvider.TryGemmEx(
+                    m: seqQ, n: d_k, k: seqK,
+                    a: gradWeights, aOffset: 0, lda: seqK, transA: false,
+                    b: kF, bOffset: kOff, ldb: d_k, transB: false,
+                    c: gradQData, cOffset: qOff, ldc: d_k);
+                if (!gemmedQ)
+                {
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        gradWeights.AsSpan(0, seqQ * seqK),
+                        kF.AsSpan(kOff, seqK * d_k),
+                        gradQData.AsSpan(qOff, seqQ * d_k),
+                        seqQ, seqK, d_k);
+                }
+
+                // Step 5: gradK[seqK, d_k] = gradScores^T[seqK, seqQ] @ Q[seqQ, d_k]
+                bool gemmedK = BlasProvider.TryGemmEx(
+                    m: seqK, n: d_k, k: seqQ,
+                    a: gradWeights, aOffset: 0, lda: seqK, transA: true,
+                    b: qF, bOffset: qOff, ldb: d_k, transB: false,
+                    c: gradKData, cOffset: kOff, ldc: d_k);
+                if (!gemmedK)
+                {
+                    var sT = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * seqQ);
+                    try
+                    {
+                        for (int i = 0; i < seqQ; i++)
+                            for (int j = 0; j < seqK; j++)
+                                sT[j * seqQ + i] = gradWeights[i * seqK + j];
+                        Engines.Simd.SimdGemm.SgemmSequential(
+                            sT.AsSpan(0, seqK * seqQ),
+                            qF.AsSpan(qOff, seqQ * d_k),
+                            gradKData.AsSpan(kOff, seqK * d_k),
+                            seqK, seqQ, d_k);
+                    }
+                    finally { System.Buffers.ArrayPool<float>.Shared.Return(sT); }
+                }
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(gradWeights, clearArray: false); }
+        });
+
+        gradValue = TensorAllocator.Rent<float>(value._shape, new Vector<float>(gradVData));
+        gradKey = TensorAllocator.Rent<float>(key._shape, new Vector<float>(gradKData));
+        return TensorAllocator.Rent<float>(query._shape, new Vector<float>(gradQData));
     }
 
     /// <summary>
