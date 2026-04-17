@@ -9744,8 +9744,10 @@ public class CpuEngine : ITensorLevelEngine
 
         // ────────────────────────────────────────────────────────────────────
         // Primitive fast paths: direct float/double arithmetic, no virtual
-        // dispatch. Thread-local scatter (each input contributes to a kernel-
-        // sized output patch) with parallel body, sequential merge.
+        // dispatch. Gather form parallelized over (batch, outChannels) — each
+        // worker owns a disjoint output slice [b, oc, :, :], eliminating
+        // thread-local full-size buffers and the merge lock. Memory usage
+        // stays O(outLen) instead of O(threads × outLen).
         //
         // VAE decoder — directly in the #162 timing-out list — plus diffusion
         // UNet upsample decoder blocks hit this op in every forward pass.
@@ -9755,102 +9757,82 @@ public class CpuEngine : ITensorLevelEngine
             var fInput = (float[])(object)inputData;
             var fKernel = (float[])(object)kernelData;
             var fOutput = (float[])(object)outputData;
-            int outLen = fOutput.Length;
-            var fLockObj = new object();
 
-            Parallel.For(0, batch * inChannels,
-                () => new float[outLen],
-                (idx, state, localOutput) =>
+            Parallel.For(0, batch * outChannels, idx =>
+            {
+                int b = idx / outChannels;
+                int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    int b = idx / inChannels;
-                    int ic = idx % inChannels;
-
-                    for (int ih = 0; ih < height; ih++)
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int iw = 0; iw < width; iw++)
+                        float sum = 0f;
+                        for (int kh = 0; kh < kernelHeight; kh++)
                         {
-                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                            float inputVal = fInput[inputIdx];
-
-                            for (int oc = 0; oc < outChannels; oc++)
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
                             {
-                                for (int kh = 0; kh < kernelHeight; kh++)
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
                                 {
-                                    int oh = ih * strideH - padH + kh;
-                                    if (oh < 0 || oh >= outputHeight) continue;
-                                    for (int kw = 0; kw < kernelWidth; kw++)
-                                    {
-                                        int ow = iw * strideW - padW + kw;
-                                        if (ow < 0 || ow >= outputWidth) continue;
-                                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                                        localOutput[outputIdx] += inputVal * fKernel[kernelIdx];
-                                    }
+                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += fInput[inputIdx] * fKernel[kernelIdx];
                                 }
                             }
                         }
+                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                        fOutput[outputIdx] = sum;
                     }
-                    return localOutput;
-                },
-                (localOutput) =>
-                {
-                    lock (fLockObj)
-                    {
-                        for (int i = 0; i < outLen; i++)
-                            fOutput[i] += localOutput[i];
-                    }
-                });
+                }
+            });
         }
         else if (typeof(T) == typeof(double))
         {
             var dInput = (double[])(object)inputData;
             var dKernel = (double[])(object)kernelData;
             var dOutput = (double[])(object)outputData;
-            int outLen = dOutput.Length;
-            var dLockObj = new object();
 
-            Parallel.For(0, batch * inChannels,
-                () => new double[outLen],
-                (idx, state, localOutput) =>
+            Parallel.For(0, batch * outChannels, idx =>
+            {
+                int b = idx / outChannels;
+                int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    int b = idx / inChannels;
-                    int ic = idx % inChannels;
-
-                    for (int ih = 0; ih < height; ih++)
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int iw = 0; iw < width; iw++)
+                        double sum = 0d;
+                        for (int kh = 0; kh < kernelHeight; kh++)
                         {
-                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                            double inputVal = dInput[inputIdx];
-
-                            for (int oc = 0; oc < outChannels; oc++)
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
                             {
-                                for (int kh = 0; kh < kernelHeight; kh++)
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
                                 {
-                                    int oh = ih * strideH - padH + kh;
-                                    if (oh < 0 || oh >= outputHeight) continue;
-                                    for (int kw = 0; kw < kernelWidth; kw++)
-                                    {
-                                        int ow = iw * strideW - padW + kw;
-                                        if (ow < 0 || ow >= outputWidth) continue;
-                                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                                        localOutput[outputIdx] += inputVal * dKernel[kernelIdx];
-                                    }
+                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += dInput[inputIdx] * dKernel[kernelIdx];
                                 }
                             }
                         }
+                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                        dOutput[outputIdx] = sum;
                     }
-                    return localOutput;
-                },
-                (localOutput) =>
-                {
-                    lock (dLockObj)
-                    {
-                        for (int i = 0; i < outLen; i++)
-                            dOutput[i] += localOutput[i];
-                    }
-                });
+                }
+            });
         }
         else
         {
@@ -11346,12 +11328,15 @@ public class CpuEngine : ITensorLevelEngine
 
         // Primitive fast paths for float/double. Parallel over (batch, inChannels)
         // pairs — each pair owns a disjoint gradInput slice, so direct writes
-        // are race-free without thread-local buffers.
+        // are race-free without thread-local buffers. Explicit Array.Clear keeps
+        // intent clear and stays correct if the buffer source ever switches from
+        // `new T[]` to TensorAllocator.RentUninitialized.
         if (typeof(T) == typeof(float))
         {
             var fGradOut = (float[])(object)gradOutputData;
             var fKernel = (float[])(object)kernelData;
             var fGradInput = (float[])(object)gradInputData;
+            Array.Clear(fGradInput, 0, fGradInput.Length);
             Parallel.For(0, batch * inChannels, idx =>
             {
                 int b = idx / inChannels;
@@ -11395,6 +11380,7 @@ public class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             var dKernel = (double[])(object)kernelData;
             var dGradInput = (double[])(object)gradInputData;
+            Array.Clear(dGradInput, 0, dGradInput.Length);
             Parallel.For(0, batch * inChannels, idx =>
             {
                 int b = idx / inChannels;
