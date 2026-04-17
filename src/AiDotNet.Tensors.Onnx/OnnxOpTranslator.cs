@@ -78,6 +78,7 @@ public sealed class OnnxOpTranslatorRegistry<T> where T : unmanaged
         Operators.AttentionOperator.Register(r);
         Operators.RecurrentOperators.Register(r);
         Operators.QuantizedOperators.Register(r);
+        Operators.MathOperators.Register(r);
         return r;
     }
 }

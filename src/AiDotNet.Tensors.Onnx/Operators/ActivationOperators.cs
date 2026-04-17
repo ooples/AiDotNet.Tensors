@@ -17,7 +17,8 @@ internal static class ActivationOperators
         r.Register(new Softmax<T>());
         r.Register(new Gelu<T>());
         r.Register(new LeakyRelu<T>());
-        r.Register(new Erf<T>());
+        // Real Erf implementation is registered by MathOperators — BERT's
+        // pre-opset-20 GELU decomposition uses it, so the stub removed.
     }
 
     internal sealed class Relu<T> : IOnnxOpTranslator<T> where T : unmanaged
@@ -85,25 +86,4 @@ internal static class ActivationOperators
         }
     }
 
-    /// <summary>
-    /// ONNX Erf — used in the pre-opset-20 GELU decomposition
-    /// (0.5 * x * (1 + erf(x / sqrt(2)))). The engine has no direct Erf op;
-    /// we pattern-rewrite into an exact GELU when the downstream node chain
-    /// matches, otherwise emit the scalar erf loop. Phase 1 accepts the erf
-    /// path by asserting — most BERT/ViT exports use the fused Gelu op in
-    /// opset 20 or com.microsoft.Gelu. Upgrading to a full erf kernel is
-    /// tracked as a follow-up.
-    /// </summary>
-    internal sealed class Erf<T> : IOnnxOpTranslator<T> where T : unmanaged
-    {
-        public string OpType => "Erf";
-        public string? Domain => null;
-        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
-        {
-            throw new NotSupportedException(
-                "Bare Erf op encountered. Phase 1 supports fused GELU (op 'Gelu' in opset 20+ or " +
-                "com.microsoft.Gelu extension); BERT/ViT models exporting the pre-opset-20 " +
-                "Mul+Div+Erf+Add+Mul decomposition of GELU are not yet covered.");
-        }
-    }
 }

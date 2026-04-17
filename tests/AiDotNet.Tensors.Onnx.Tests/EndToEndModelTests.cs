@@ -96,12 +96,12 @@ public class EndToEndModelTests
     {
         var info = ModelRegistry[modelName];
         var modelBytes = File.ReadAllBytes(GetModelPath(modelName));
-        using var stream = new MemoryStream(modelBytes);
 
-        // Resolve common ONNX parametric batch dims to 1. Batch = "N" is the
-        // ResNet-50 / ImageNet convention; "batch_size" / "unk__XXX" appear in
-        // Hugging Face exports; sequence-length dims get the suggested concrete
-        // sizes from the model's declared shape (e.g. 256 for BERT SQuAD).
+        // Import + compile once. The imported plan reads fresh data from the
+        // input placeholder on every Execute, so we don't need to re-import
+        // per sample. ORT session is also opened once and reused — creating
+        // a new session per sample is the dominant cost when we do that.
+        using var stream = new MemoryStream(modelBytes);
         var options = new OnnxImportOptions
         {
             DimensionOverrides = new Dictionary<string, int>
@@ -118,6 +118,7 @@ public class EndToEndModelTests
         int total = 1;
         foreach (var d in info.InputShape) total *= d;
 
+        using var session = new Microsoft.ML.OnnxRuntime.InferenceSession(modelBytes);
         var rng = new Random(42);
         int mismatches = 0;
         float maxDiff = 0f;
@@ -127,8 +128,14 @@ public class EndToEndModelTests
             for (int i = 0; i < total; i++)
                 sample[i] = (float)(rng.NextDouble() * 2 - 1);
 
-            var ortOut = OnnxRuntimeReference.RunSingleOutput(modelBytes,
-                (info.InputName, info.InputShape, sample));
+            // Run ORT using the cached session (avoids re-parsing the
+            // 100-500 MB model on every call).
+            var ortTensor = new Microsoft.ML.OnnxRuntime.Tensors.DenseTensor<float>(sample, info.InputShape);
+            var feeds = new[] {
+                Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(info.InputName, ortTensor)
+            };
+            using var ortResults = session.Run(feeds);
+            var ortOut = ortResults.First().AsTensor<float>().ToArray();
 
             // Fill input placeholder; run our plan.
             sample.AsSpan().CopyTo(result.Inputs[info.InputName].AsWritableSpan());
@@ -146,6 +153,14 @@ public class EndToEndModelTests
                     mismatches++;
                     if (d > maxDiff) maxDiff = d;
                 }
+            }
+
+            // Drop intermediate allocations every few samples so the test
+            // runner doesn't accumulate GC pressure across the loop.
+            if ((s & 7) == 7)
+            {
+                GC.Collect(1, GCCollectionMode.Forced);
+                GC.WaitForPendingFinalizers();
             }
         }
 
