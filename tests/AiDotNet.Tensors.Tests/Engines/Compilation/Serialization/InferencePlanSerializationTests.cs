@@ -1,9 +1,11 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -108,23 +110,52 @@ public class InferencePlanSerializationTests
         using var ms = new MemoryStream();
         await plan.SaveAsync(ms);
 
-        // Corrupt the hardware fingerprint in the saved bytes. The fingerprint
-        // comes after the header fields. We'll just flip a byte in the middle
-        // of the stream to break the checksum, causing an InvalidDataException
-        // which the loader swallows as null.
+        // Rewrite just the fingerprint bytes in place (same length, mutated
+        // content) and recompute the footer checksum so the file is
+        // checksum-valid but its fingerprint no longer matches the runtime.
+        // This exercises the actual fingerprint-mismatch branch in
+        // CompiledPlanLoader, not the generic checksum-failure branch — the
+        // earlier version of this test flipped an arbitrary body byte, which
+        // could have asserted success on corruption alone even if the
+        // fingerprint check was removed.
         var bytes = ms.ToArray();
-        // Flip byte near the end of the body (before footer), which will
-        // break the checksum.
-        if (bytes.Length > 20)
-            bytes[bytes.Length / 2] ^= 0xFF;
+        var fpBytes = Encoding.UTF8.GetBytes(HardwareFingerprint.Current);
+        int fpOffset = IndexOf(bytes, fpBytes);
+        Assert.True(fpOffset >= 0,
+            "Test precondition: could not locate the serialized fingerprint in the saved bytes.");
+        // Mutate each byte so the resulting string can't accidentally equal
+        // the runtime fingerprint; stay in the printable ASCII range so
+        // Encoding.UTF8.GetString still decodes.
+        for (int i = 0; i < fpBytes.Length; i++)
+            bytes[fpOffset + i] = (byte)('A' + ((bytes[fpOffset + i] + 1) % 26));
+        // Recompute checksum over the mutated body (all bytes except the
+        // 16-byte footer = long length + ulong checksum).
+        const int FooterSize = sizeof(long) + sizeof(ulong);
+        int bodyLen = bytes.Length - FooterSize;
+        ulong newChecksum = XXHash64.Compute(bytes, 0, bodyLen);
+        BitConverter.GetBytes(newChecksum).CopyTo(bytes, bodyLen + sizeof(long));
 
         using var corrupted = new MemoryStream(bytes);
         var loaded = await CompiledPlanLoader.LoadInferenceAsync<float>(corrupted, engine);
 
-        // Corruption → checksum mismatch → InvalidDataException → null
+        // Valid checksum + wrong fingerprint → InvalidDataException → null
         Assert.Null(loaded);
 
         plan.Dispose();
+    }
+
+    private static int IndexOf(byte[] haystack, byte[] needle)
+    {
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != needle[j]) { match = false; break; }
+            }
+            if (match) return i;
+        }
+        return -1;
     }
 
     // ── Deterministic encoding: save twice → identical bytes ────────────────

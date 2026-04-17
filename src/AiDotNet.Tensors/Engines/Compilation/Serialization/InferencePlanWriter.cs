@@ -23,8 +23,12 @@ internal static class InferencePlanWriter
         int[] compiledInputShape,
         Tensor<T>? compiledInputTensor)
     {
-        // We write to a MemoryStream first so we can compute the checksum
-        // over the complete body, then flush to the real stream.
+        // Write the body to a MemoryStream first so we can hash it (XXHash64
+        // is one-shot, not incremental) before streaming to the destination.
+        // Hash + body-write both operate directly on the MemoryStream's
+        // internal buffer (GetBuffer/WriteTo) to avoid a second full-size
+        // allocation — previously a ToArray() call cloned the whole payload,
+        // turning save into an OOM risk for plans with serialized weights.
         using var body = new MemoryStream();
         using var writer = new BinaryWriter(body, Encoding.UTF8, leaveOpen: true);
 
@@ -61,13 +65,18 @@ internal static class InferencePlanWriter
 
         // ── Footer (checksum) ───────────────────────────────────────────
         writer.Flush();
-        var bodyBytes = body.ToArray();
-        ulong checksum = XXHash64.Compute(bodyBytes, 0, bodyBytes.Length);
+        int bodyLength = (int)body.Length;
+        // GetBuffer returns the MemoryStream's internal array directly (no
+        // copy); only the first bodyLength bytes are valid payload. This
+        // lets XXHash64.Compute hash in place without materializing a second
+        // array.
+        ulong checksum = XXHash64.Compute(body.GetBuffer(), 0, bodyLength);
 
-        // Now write body + footer to the real stream.
-        stream.Write(bodyBytes, 0, bodyBytes.Length);
+        // body.WriteTo streams the internal buffer straight to the output,
+        // also skipping an intermediate array allocation.
+        body.WriteTo(stream);
         using var footerWriter = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
-        footerWriter.Write((long)bodyBytes.Length);
+        footerWriter.Write((long)bodyLength);
         footerWriter.Write(checksum); // ulong — reader uses ToUInt64
     }
 

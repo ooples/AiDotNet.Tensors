@@ -76,6 +76,7 @@ internal static class PlanFormatConstants
     internal const byte TagFloat      = 0x06;
     internal const byte TagString     = 0x07;
     internal const byte TagByteArray  = 0x08;
+    internal const byte TagEnum       = 0x09; // assembly-qualified type name + int value
 
     // ── Tensor table flags ──────────────────────────────────────────────────
     internal const byte TensorFlagWeight       = 0x01; // model parameter

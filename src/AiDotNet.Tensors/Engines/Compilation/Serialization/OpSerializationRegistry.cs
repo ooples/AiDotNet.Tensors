@@ -1,3 +1,4 @@
+using System.IO;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -88,9 +89,11 @@ internal static class OpSerializationRegistry<T>
 
             // ── Ops not yet supported for serialization ─────────────────
             // These are valid OpTypes but their IEngine signatures need
-            // individual wiring. They'll throw at load time with a
-            // descriptive message so the caller knows to file a gap report.
-            _ => throw new NotSupportedException(
+            // individual wiring. Throw InvalidDataException so CompiledPlanLoader
+            // treats this as a cache miss and recompiles — a NotSupportedException
+            // would escape past the loader's catch clause and surface to the
+            // caller, breaking the "load-or-recompile" contract.
+            _ => throw new InvalidDataException(
                 $"OpType {opType} is not yet supported by the plan serialization registry. " +
                 "This plan cannot be deserialized. Re-compile from source instead."),
         };
@@ -136,6 +139,12 @@ internal static class OpSerializationRegistry<T>
     private static Action<IEngine, Tensor<T>> Unary(
         Tensor<T>[] inputs, Func<IEngine, Tensor<T>, Tensor<T>> op)
     {
+        // Corrupt/truncated plan files control inputCount. Fail early with
+        // InvalidDataException (the loader's cache-miss path) rather than
+        // let an IndexOutOfRangeException escape as a hard error.
+        if (inputs.Length != 1)
+            throw new InvalidDataException(
+                $"Unary op rebuild requires exactly 1 input, got {inputs.Length}.");
         var a = inputs[0];
         return (eng, output) => { var r = op(eng, a); r.AsSpan().CopyTo(output.AsWritableSpan()); };
     }
@@ -143,8 +152,27 @@ internal static class OpSerializationRegistry<T>
     private static Action<IEngine, Tensor<T>> Binary(
         Tensor<T>[] inputs, Func<IEngine, Tensor<T>, Tensor<T>, Tensor<T>> op)
     {
+        if (inputs.Length != 2)
+            throw new InvalidDataException(
+                $"Binary op rebuild requires exactly 2 inputs, got {inputs.Length}.");
         var a = inputs[0]; var b = inputs[1];
         return (eng, output) => { var r = op(eng, a, b); r.AsSpan().CopyTo(output.AsWritableSpan()); };
+    }
+
+    /// <summary>Shared arity check for rebuilders with a fixed input count.</summary>
+    private static void RequireInputs(Tensor<T>[] inputs, int expected, string opDescription)
+    {
+        if (inputs.Length != expected)
+            throw new InvalidDataException(
+                $"{opDescription} rebuild requires exactly {expected} input(s), got {inputs.Length}.");
+    }
+
+    /// <summary>Allows [min..max] inputs (used for ops with optional bias/etc).</summary>
+    private static void RequireInputsInRange(Tensor<T>[] inputs, int min, int max, string opDescription)
+    {
+        if (inputs.Length < min || inputs.Length > max)
+            throw new InvalidDataException(
+                $"{opDescription} rebuild requires {min}..{max} inputs, got {inputs.Length}.");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -153,6 +181,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildLeakyReLU(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "LeakyReLU");
         // Extract alpha from savedState. The serializer writes it as a double
         // (T-erased). The earlier implementation passed `default!` — for T=float
         // that's 0.0f, which collapses LeakyReLU to a plain ReLU. The engine
@@ -172,6 +201,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildELU(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "ELU");
         double alpha = state is { Length: > 0 } && state[0] is double d ? d : 1.0;
         var a = inputs[0];
         return (eng, output) =>
@@ -187,6 +217,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildReduceSum(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "ReduceSum");
         int[]? axes = state is { Length: > 0 } && state[0] is int axis ? new[] { axis }
                     : state is { Length: > 0 } && state[0] is int[] axArr ? axArr
                     : null;
@@ -200,6 +231,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildSoftmax(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "Softmax");
         int axis = state is { Length: > 0 } && state[0] is int a ? a : -1;
         var inp = inputs[0];
         return (eng, output) =>
@@ -211,6 +243,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildMean(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "Mean");
         // IEngine.ReduceMean(tensor, axes, keepDims) computes the mean along the
         // given axes. The earlier implementation called ReduceSum and copied it
         // to output — that produced the sum, not the mean. Deserialized plans
@@ -245,6 +278,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildConv2D(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 2, "Conv2D");
         int stride   = state is { Length: > 0 } && state[0] is int[] s && s.Length > 0 ? s[0] : 1;
         int padding  = state is { Length: > 1 } && state[1] is int[] p && p.Length > 0 ? p[0] : 0;
         int dilation = state is { Length: > 2 } && state[2] is int[] d && d.Length > 0 ? d[0] : 1;
@@ -258,6 +292,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildMaxPool2D(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "MaxPool2D");
         int poolSize = state is { Length: > 0 } && state[0] is int[] ps && ps.Length > 0 ? ps[0] : 2;
         int stride   = state is { Length: > 1 } && state[1] is int[] st && st.Length > 0 ? st[0] : poolSize;
         var input = inputs[0];
@@ -270,6 +305,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildAvgPool2D(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 1, "AvgPool2D");
         int poolSize = state is { Length: > 0 } && state[0] is int[] ps && ps.Length > 0 ? ps[0] : 2;
         int stride   = state is { Length: > 1 } && state[1] is int[] st && st.Length > 0 ? st[0] : poolSize;
         var input = inputs[0];
@@ -287,6 +323,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildBatchNorm(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 3, "BatchNorm");
         double eps = state is { Length: > 2 } && state[2] is double e ? e : 1e-5;
         var input = inputs[0]; var gamma = inputs[1]; var beta = inputs[2];
         return (eng, output) =>
@@ -298,6 +335,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildLayerNorm(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 3, "LayerNorm");
         double eps = state is { Length: > 2 } && state[2] is double e ? e : 1e-5;
         var input = inputs[0]; var gamma = inputs[1]; var beta = inputs[2];
         return (eng, output) =>
@@ -313,6 +351,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildAttention(Tensor<T>[] inputs, object[]? state)
     {
+        RequireInputs(inputs, 3, "ScaledDotProductAttention");
         // IEngine.ScaledDotProductAttention<T>(q, k, v, mask?, scale?, out attnWeights)
         //
         // scale: recorded as savedState[0] (nullable double). Null means
@@ -342,6 +381,7 @@ internal static class OpSerializationRegistry<T>
 
     private static Action<IEngine, Tensor<T>> RebuildFusedLinear(Tensor<T>[] inputs)
     {
+        RequireInputsInRange(inputs, 2, 3, "FusedLinear");
         var input = inputs[0]; var weight = inputs[1];
         var bias = inputs.Length > 2 ? inputs[2] : null;
         return (eng, output) =>

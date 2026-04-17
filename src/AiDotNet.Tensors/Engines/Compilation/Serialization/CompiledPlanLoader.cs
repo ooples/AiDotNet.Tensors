@@ -44,13 +44,15 @@ public static class CompiledPlanLoader
             var plan = InferencePlanReader.Read<T>(stream, engine);
             return Task.FromResult<ICompiledPlan<T>?>(plan);
         }
-        catch (InvalidDataException ex)
+        catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException)
         {
             // Corruption, truncation, unreadable format, or version mismatch —
-            // treat as a cache miss so the caller recompiles. Log the cause
-            // via Trace so operators can diagnose why warm-start isn't
-            // working (silently returning null would hide genuine file
-            // corruption behind a "just recompile" path).
+            // treat as a cache miss so the caller recompiles. EndOfStreamException
+            // covers truncated files where BinaryReader.Read* runs past EOF before
+            // any structural check triggers an InvalidDataException. Log the cause
+            // via Trace so operators can diagnose why warm-start isn't working
+            // (silently returning null would hide genuine file corruption behind
+            // a "just recompile" path).
             Trace.WriteLine($"[CompiledPlanLoader] Inference plan load failed, recompiling: {ex.Message}");
             return Task.FromResult<ICompiledPlan<T>?>(null);
         }
@@ -86,8 +88,10 @@ public static class CompiledPlanLoader
             var plan = TrainingPlanReader.Read<T>(stream, engine, parameters);
             return Task.FromResult<ICompiledTrainingPlan<T>?>(plan);
         }
-        catch (InvalidDataException ex)
+        catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException)
         {
+            // Same cache-miss contract as LoadInferenceAsync: corruption or
+            // truncation both surface as "recompile instead of use this plan".
             Trace.WriteLine($"[CompiledPlanLoader] Training plan load failed, recompiling: {ex.Message}");
             return Task.FromResult<ICompiledTrainingPlan<T>?>(null);
         }

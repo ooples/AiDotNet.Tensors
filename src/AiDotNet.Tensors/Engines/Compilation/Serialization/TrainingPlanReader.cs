@@ -209,8 +209,20 @@ internal static class TrainingPlanReader
                 }
 
                 var output = OpReplay.ReplayThroughEngine(engine, op.OpType, op.OpName, inputs, op.SavedState);
-                if (output is not null)
-                    liveTensors[op.OutputId] = output;
+                if (output is null)
+                {
+                    // ReplayThroughEngine returned null because this runtime
+                    // has no replay handler for the op — silently leaving the
+                    // producing step absent would let CompileTraining succeed
+                    // with a partial graph whose downstream steps read stale
+                    // or default tensors. Force the cache-miss path instead
+                    // so the caller recompiles from source.
+                    throw new InvalidDataException(
+                        $"Training plan op {i} ('{op.OpName}', {op.OpType}) is not supported by this runtime. " +
+                        "Re-compile from source instead of loading this plan.");
+                }
+
+                liveTensors[op.OutputId] = output;
             }
 
             return scope.CompileTraining<T>(callerParameters);

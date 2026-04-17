@@ -74,12 +74,16 @@ internal static class TrainingPlanWriter
         }
 
         // ── Footer ──────────────────────────────────────────────────────
+        // Avoid ToArray()'s second full-size copy — hash and write directly
+        // from the MemoryStream's internal buffer. See InferencePlanWriter
+        // for the matching rationale (OOM risk on plans with serialized
+        // parameter weights otherwise).
         writer.Flush();
-        var bodyBytes = body.ToArray();
-        ulong checksum = XXHash64.Compute(bodyBytes, 0, bodyBytes.Length);
-        stream.Write(bodyBytes, 0, bodyBytes.Length);
+        int bodyLength = (int)body.Length;
+        ulong checksum = XXHash64.Compute(body.GetBuffer(), 0, bodyLength);
+        body.WriteTo(stream);
         using var footerWriter = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
-        footerWriter.Write((long)bodyBytes.Length);
+        footerWriter.Write((long)bodyLength);
         footerWriter.Write(checksum); // ulong — reader uses ToUInt64
     }
 
