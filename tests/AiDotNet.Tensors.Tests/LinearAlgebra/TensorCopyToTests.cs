@@ -168,6 +168,103 @@ public class TensorCopyToTests
         Assert.Equal(new[] { 0.25f, 3.25f, 1.25f, 4.25f, 2.25f, 5.25f }, dst.ToArray());
     }
 
+    /// <summary>
+    /// Zero-length tensor: the logical contents span is empty, so CopyTo
+    /// must be a no-op (write nothing, not throw). Guards against a
+    /// regression where the outer loop's <c>i &lt; Length</c> precondition
+    /// gets rewritten in a way that still touches the destination for
+    /// <c>Length == 0</c>.
+    /// </summary>
+    [Fact]
+    public void ZeroLength_Copy_IsNoOp()
+    {
+        var src = new Tensor<double>([0, 3]);  // shape with a zero dim -> Length = 0
+        Assert.Equal(0, src.Length);
+
+        Span<double> dst = stackalloc double[4];
+        for (int i = 0; i < 4; i++) dst[i] = 42.0;
+
+        src.CopyTo(dst);  // must not throw and must not touch dst
+
+        for (int i = 0; i < 4; i++) Assert.Equal(42.0, dst[i]);
+    }
+
+    /// <summary>
+    /// Rank-0 tensor holds exactly one element and has an empty shape /
+    /// stride array. Verifies the stride-decomposition loop degenerates
+    /// gracefully (inner loop <c>d &lt; 0</c> never executes, srcIdx stays
+    /// at the storage offset, single element copied).
+    /// </summary>
+    [Fact]
+    public void Rank0Scalar_Copy_WritesSingleElement()
+    {
+        var src = new Tensor<double>(new int[] { });
+        Assert.Equal(0, src.Rank);
+        Assert.Equal(1, src.Length);
+        src.AsWritableSpan()[0] = 3.14;
+
+        Span<double> dst = stackalloc double[1];
+        src.CopyTo(dst);
+        Assert.Equal(3.14, dst[0]);
+    }
+
+    /// <summary>
+    /// Rank-4 coverage (NCHW mini-batch). The permute path exercises the
+    /// strided decomposition across four dimensions, which is the target
+    /// shape class for the motivating CIFAR / EuroSat loaders.
+    /// </summary>
+    [Fact]
+    public void Rank4AfterPermute_Copy_MatchesContiguousThenCopy()
+    {
+        // [N=2, C=3, H=2, W=2] — 24 elements, each distinct.
+        var nchw = new Tensor<double>([2, 3, 2, 2]);
+        for (int i = 0; i < nchw.Length; i++) nchw.AsWritableSpan()[i] = i;
+
+        // NCHW -> NHWC: axes [0, 2, 3, 1].
+        var nhwc = AiDotNetEngine.Current.TensorPermute(nchw, [0, 2, 3, 1]);
+        Assert.False(nhwc.IsContiguous);
+
+        Span<double> viaCopy = stackalloc double[nhwc.Length];
+        Span<double> viaContiguous = stackalloc double[nhwc.Length];
+
+        nhwc.CopyTo(viaCopy);
+        nhwc.Contiguous().AsSpan().CopyTo(viaContiguous);
+
+        // Byte-for-byte parity against the materialize-then-copy idiom.
+        for (int i = 0; i < nhwc.Length; i++)
+            Assert.Equal(viaContiguous[i], viaCopy[i]);
+
+        // Value-level spot check: NHWC[n,y,x,c] == NCHW[n,c,y,x].
+        for (int n = 0; n < 2; n++)
+            for (int c = 0; c < 3; c++)
+                for (int y = 0; y < 2; y++)
+                    for (int x = 0; x < 2; x++)
+                        Assert.Equal(nchw[n, c, y, x], nhwc[n, y, x, c]);
+    }
+
+    /// <summary>
+    /// Sparse tensors use a fundamentally different storage model
+    /// (coordinate / CSR / CSC indexing), so a row-major CopyTo isn't
+    /// well-defined. The implementation guards with
+    /// <c>ThrowIfSparse()</c>; verify the throw actually surfaces.
+    /// </summary>
+    [Fact]
+    public void SparseTensor_CopyTo_Throws()
+    {
+        // Minimal 2x2 sparse diagonal.
+        var sparse = new SparseTensor<double>(
+            rows: 2, columns: 2,
+            rowIndices: [0, 1],
+            columnIndices: [0, 1],
+            values: [1.0, 2.0]);
+
+        var dst = new double[sparse.Length];
+        // Base class ThrowIfSparse throws NotSupportedException; accept
+        // whichever exception type TensorBase<T>.ThrowIfSparse is configured
+        // to raise.
+        Assert.ThrowsAny<Exception>(() => sparse.CopyTo(dst.AsSpan()));
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Zero-allocation regression: CopyTo must not materialize an
