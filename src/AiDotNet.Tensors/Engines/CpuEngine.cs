@@ -11217,7 +11217,36 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
     {
-        // Use the core implementation directly - we don't need indices for simple forward
+        if (input == null) throw new ArgumentNullException(nameof(input));
+
+        // GraphMode recording was missing here — without it, MaxPool3D runs
+        // eagerly under a GraphMode scope and its output never makes it into
+        // the compiled plan. ONNX-imported 3D MaxPool plans had the final
+        // tensor buffer always zero because no step produced it.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must have 3 elements.", nameof(poolSize));
+                if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must have 3 elements.", nameof(stride));
+                if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must have 3 elements.", nameof(padding));
+
+                int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
+                int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
+                int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], outD, outH, outW };
+                var capturedInput = input;
+                var capturedPool = poolSize;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "MaxPool3D", input, outShape,
+                    (eng, output) => { var r = eng.MaxPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
+            }
+        }
+
         return MaxPool3DCore(input, poolSize, stride, padding);
     }
 
@@ -11474,6 +11503,28 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> AvgPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        // Mirror the MaxPool3D GraphMode-recording fix — without this, 3D
+        // avg-pool outputs are zero in a compiled plan.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
+                int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
+                int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], outD, outH, outW };
+                var capturedInput = input;
+                var capturedPool = poolSize;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool3D", input, outShape,
+                    (eng, output) => { var r = eng.AvgPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
+            }
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));

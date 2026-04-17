@@ -37,6 +37,52 @@ public class ConvTransposeTests
         AssertClose(ort, ours);
     }
 
+    [SkippableFact]
+    public void Conv3D_MatchesOnnxRuntime()
+    {
+        // 3D conv: input [1, 2, 4, 5, 5] (NCDHW), kernel [3, 2, 2, 3, 3]
+        // stride 1, pad 0. Output: [1, 3, 3, 3, 3].
+        Skip.IfNot(OnnxRuntimeReference.IsOrtAvailable);
+        var x = RandomArray(seed: 5201, n: 1 * 2 * 4 * 5 * 5);
+        var w = RandomArray(seed: 5202, n: 3 * 2 * 2 * 3 * 3);
+
+        var graph = new GraphProto { Name = "conv3d_test" };
+        graph.Input.Add(OnnxTestGraphBuilder.MakeValueInfo("X", new[] { 1, 2, 4, 5, 5 }, FLOAT));
+        graph.Initializer.Add(OnnxTestGraphBuilder.MakeInitializer("W", new[] { 3, 2, 2, 3, 3 }, w));
+        graph.Output.Add(OnnxTestGraphBuilder.MakeValueInfo("Y", new[] { 1, 3, 3, 3, 3 }, FLOAT));
+        var node = new NodeProto { OpType = "Conv" };
+        node.Input.Add("X"); node.Input.Add("W"); node.Output.Add("Y");
+        node.Attribute.Add(IntsAttr("kernel_shape", 2, 3, 3));
+        node.Attribute.Add(IntsAttr("strides", 1, 1, 1));
+        node.Attribute.Add(IntsAttr("pads", 0, 0, 0, 0, 0, 0));
+        graph.Node.Add(node);
+        var bytes = OnnxTestGraphBuilder.Serialize(OnnxTestGraphBuilder.WrapModel(graph));
+
+        var ort = OnnxRuntimeReference.RunSingleOutput(bytes, ("X", new[] { 1, 2, 4, 5, 5 }, x));
+        var ours = ImportAndExecute(bytes, ("X", x));
+        AssertClose(ort, ours);
+    }
+
+    [SkippableFact]
+    public void MaxPool3D_MatchesOnnxRuntime()
+    {
+        // 3D pool: input [1, 2, 4, 4, 4], kernel 2×2×2, stride 2. Output [1, 2, 2, 2, 2].
+        Skip.IfNot(OnnxRuntimeReference.IsOrtAvailable);
+        var x = RandomArray(seed: 5301, n: 1 * 2 * 4 * 4 * 4);
+        var graph = new GraphProto { Name = "maxpool3d_test" };
+        graph.Input.Add(OnnxTestGraphBuilder.MakeValueInfo("X", new[] { 1, 2, 4, 4, 4 }, FLOAT));
+        graph.Output.Add(OnnxTestGraphBuilder.MakeValueInfo("Y", new[] { 1, 2, 2, 2, 2 }, FLOAT));
+        var node = new NodeProto { OpType = "MaxPool" };
+        node.Input.Add("X"); node.Output.Add("Y");
+        node.Attribute.Add(IntsAttr("kernel_shape", 2, 2, 2));
+        node.Attribute.Add(IntsAttr("strides", 2, 2, 2));
+        graph.Node.Add(node);
+        var bytes = OnnxTestGraphBuilder.Serialize(OnnxTestGraphBuilder.WrapModel(graph));
+        var ort = OnnxRuntimeReference.RunSingleOutput(bytes, ("X", new[] { 1, 2, 4, 4, 4 }, x));
+        var ours = ImportAndExecute(bytes, ("X", x));
+        AssertClose(ort, ours);
+    }
+
     private static AttributeProto IntsAttr(string name, params long[] values)
     {
         var a = new AttributeProto { Name = name, Type = AttributeProto.Types.AttributeType.Ints };
