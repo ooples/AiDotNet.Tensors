@@ -14488,11 +14488,13 @@ public class CpuEngine : ITensorLevelEngine
         var gradInputData = new T[input.Length];
 
         // ────────────────────────────────────────────────────────────────────
-        // Float fast path: direct float arithmetic, no virtual dispatch.
-        // Mirror of the GroupNorm forward's typeof(T) == typeof(float) branch.
+        // Primitive fast paths: direct float/double arithmetic, no
+        // INumericOperations<T> virtual dispatch. Method signature stays
+        // generic <T>; non-primitive T falls through to the scalar path.
+        //
         // Diffusion UNet training pays this cost on every backward pass — SD15
         // UNet has ~40 GroupNorm layers and backward runs through all of them
-        // per training step.
+        // per training step. Consumers using T = double get the same treatment.
         // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
@@ -14587,6 +14589,89 @@ public class CpuEngine : ITensorLevelEngine
             // Batch typically small (1–16) for diffusion training, but each
             // batch's work is large (channels × spatialSize). Always parallel.
             Parallel.For(0, batch, ProcessBatch);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dMean = (double[])(object)meanData;
+            var dVar = (double[])(object)varData;
+            var dGradGamma = (double[])(object)gradGammaData;
+            var dGradBeta = (double[])(object)gradBetaData;
+            var dGradInput = (double[])(object)gradInputData;
+            double groupSizeD = groupSize;
+            double invGroupSizeD = 1.0 / groupSizeD;
+
+            for (int b = 0; b < batch; b++)
+            {
+                for (int g = 0; g < numGroups; g++)
+                {
+                    double groupMean = dMean[b * numGroups + g];
+                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
+                    int startChannel = g * channelsPerGroup;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        double gammaAcc = 0.0;
+                        double betaAcc = 0.0;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            double go = dGradOut[chanOffset + s];
+                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
+                            gammaAcc += go * normalized;
+                            betaAcc += go;
+                        }
+                        dGradGamma[channel] += gammaAcc;
+                        dGradBeta[channel] += betaAcc;
+                    }
+                }
+            }
+
+            void ProcessBatchD(int b)
+            {
+                for (int g = 0; g < numGroups; g++)
+                {
+                    double groupMean = dMean[b * numGroups + g];
+                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
+                    int startChannel = g * channelsPerGroup;
+
+                    double sumGrad = 0.0;
+                    double sumGradNorm = 0.0;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        double gammaC = dGamma[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            double scaledGrad = gammaC * dGradOut[chanOffset + s];
+                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
+                            sumGrad += scaledGrad;
+                            sumGradNorm += scaledGrad * normalized;
+                        }
+                    }
+
+                    double scale = invStd * invGroupSizeD;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        double gammaC = dGamma[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
+                            double gradNorm = gammaC * dGradOut[chanOffset + s];
+                            double term1 = groupSizeD * gradNorm;
+                            double term3 = normalized * sumGradNorm;
+                            dGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
+                        }
+                    }
+                }
+            }
+
+            Parallel.For(0, batch, ProcessBatchD);
         }
         else
         {
