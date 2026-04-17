@@ -1,6 +1,10 @@
 using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -405,6 +409,9 @@ public class PlanStitchingTests
         public bool IsValid(int[] inputShape) => true;
         public int StepCount => 0;
         public ICompiledPlan<float> ThenAsync(ICompiledPlan<float> next) => this;
+        public Task SaveAsync(Stream stream, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Stub does not support serialization.");
+        public bool IsCompatibleWith(PlanCompatibilityInfo info) => false;
         public void Dispose() { }
     }
 }

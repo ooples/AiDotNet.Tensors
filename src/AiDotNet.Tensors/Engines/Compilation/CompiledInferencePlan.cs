@@ -192,9 +192,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     // ── Internal accessors for serialization ────────────────────────────
+    // Note: CompiledInputTensor is already defined above for ThenAsync stitching.
     internal CompiledStep<T>[] Steps => _steps;
     internal int[] CompiledInputShape => _compiledInputShape;
-    internal Tensor<T>? CompiledInputTensor => _compiledInputTensor;
 
     /// <inheritdoc/>
     /// <remarks>
