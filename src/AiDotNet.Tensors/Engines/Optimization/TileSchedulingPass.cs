@@ -90,7 +90,13 @@ internal sealed class TileSchedulingPass : ICpuOptimizationPass
     {
         if (step.Inputs.Length < 2) return 8;
 
+        // Guard against malformed shape metadata: shape[1] can be 0 if the
+        // tensor hasn't been materialized yet, and Marshal.SizeOf<T> is >= 1
+        // for every valid T but be defensive here so the denominator never hits
+        // zero.
         int channels = step.Inputs[0]._shape.Length >= 2 ? step.Inputs[0]._shape[1] : 1;
+        channels = Math.Max(1, channels);
+        elementSize = Math.Max(1, elementSize);
 
         // input_tile = (tileH + kernelH - 1) × tileW × channels × elementSize
         // We want this + kernel + output_tile ≤ L2
@@ -103,14 +109,11 @@ internal sealed class TileSchedulingPass : ICpuOptimizationPass
 
     private static void AnnotateTileSize<T>(CompiledStep<T> step, int tileSize)
     {
-        // Store tile annotation in a way that doesn't interfere with existing
-        // SavedState. We use the step's OpName prefix convention: the specialized
-        // forward builder checks for tile annotations via a separate mechanism.
-        // For V1, we just compute and expose the tile size — the actual tiled
-        // execution is handled by SimdGemm's existing tile loop (which already
-        // uses similar sizing). This pass validates that the sizes are optimal.
-        //
-        // Future: wrap the step's Execute in a tiled loop nest that calls the
-        // engine method on sub-tiles.
+        // Persist the computed tile size on the step so downstream consumers
+        // (custom tiled GEMM / Conv closures) can read it. The default SimdGemm
+        // path does its own internal tiling and ignores this annotation, but
+        // leaving the computed value dangling made the whole pass a no-op —
+        // violating Issue #182's "observable effect" requirement.
+        step.TileSize = tileSize;
     }
 }

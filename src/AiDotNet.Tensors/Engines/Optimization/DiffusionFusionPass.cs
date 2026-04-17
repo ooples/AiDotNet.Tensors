@@ -140,12 +140,19 @@ internal sealed class DiffusionFusionPass : ICpuOptimizationPass
         if (!ReferenceEquals(convStep.OutputBuffer, addStep.Inputs[0])) return false;
         if (!ReferenceEquals(addStep.OutputBuffer, swishStep.Inputs[0])) return false;
 
-        // Extract conv params from SavedState
+        // Extract conv params from SavedState. Strict: if the shape of the
+        // saved state doesn't match what Conv2DOp writes, bail out of fusion
+        // rather than silently substituting defaults — defaults would produce
+        // numerically wrong output for any conv with stride≠1, padding≠0, or
+        // dilation≠1.
         var convState = convStep.SavedState;
         if (convState is null || convState.Length < 3) return false;
-        int stride   = convState[0] is int[] s && s.Length > 0 ? s[0] : 1;
-        int padding  = convState[1] is int[] p && p.Length > 0 ? p[0] : 0;
-        int dilation = convState[2] is int[] d && d.Length > 0 ? d[0] : 1;
+        if (convState[0] is not int[] s || s.Length == 0) return false;
+        if (convState[1] is not int[] p || p.Length == 0) return false;
+        if (convState[2] is not int[] d || d.Length == 0) return false;
+        int stride = s[0];
+        int padding = p[0];
+        int dilation = d[0];
 
         // The bias is the second input to BroadcastAdd
         var bias = addStep.Inputs.Length > 1 ? addStep.Inputs[1] : null;
@@ -188,9 +195,12 @@ internal sealed class DiffusionFusionPass : ICpuOptimizationPass
         var gnOp = GroupNormOp<T>.TryFromStep(gnStep);
         if (gnOp is null) return false;
 
-        // Build fused step using IEngine.AddGroupNormInto
+        // Build fused step using IEngine.AddGroupNormInto. A well-formed Add
+        // has exactly two distinct operands; a single-input Add is malformed
+        // and fusing it as GroupNorm(a + a) would silently double the input.
+        if (addStep.Inputs.Length < 2) return false;
         var addA = addStep.Inputs[0];
-        var addB = addStep.Inputs.Length > 1 ? addStep.Inputs[1] : addStep.Inputs[0];
+        var addB = addStep.Inputs[1];
         var gamma = gnOp.Gamma;
         var beta = gnOp.Beta;
         int numGroups = gnOp.NumGroups;
