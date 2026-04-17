@@ -65,6 +65,11 @@ public static class OnnxImporter
         //    older ONNX specs duplicated them) ──────────────────────────
         var namedInputs = new Dictionary<string, ShapeProfile>(graph.Input.Count);
         var inputTensors = new Dictionary<string, Tensor<T>>(graph.Input.Count);
+        // dynamicTensorNames tracks tensors whose values are only known at
+        // Execute time (graph inputs). They're eager storage-wise but
+        // constant-folding MUST NOT walk through them — downstream ops
+        // that depend on graph inputs have to stay under GraphMode.
+        var dynamicTensorNames = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < graph.Input.Count; i++)
         {
             var vi = graph.Input[i];
@@ -81,6 +86,7 @@ public static class OnnxImporter
             var placeholder = new Tensor<T>(shape);
             tensorsByName[vi.Name] = placeholder;
             inputTensors[vi.Name] = placeholder;
+            dynamicTensorNames.Add(vi.Name);
         }
 
         // ── Resolve graph outputs (shape info only; not actually allocated) ─
@@ -157,8 +163,55 @@ public static class OnnxImporter
                 var node = sortedNodes[i];
                 var translator = registry.Find(node.OpType,
                     string.IsNullOrEmpty(node.Domain) ? null : node.Domain)!;
-                translator.Translate(ctx, node);
+
+                // Constant-folding: if every input to this node is a
+                // *static* eager tensor — an initializer or an already-
+                // folded op's output, but NOT a graph-input placeholder —
+                // execute the translator outside GraphMode so its result
+                // is also static. This is how BERT-family shape-arithmetic
+                // subgraphs (Shape → Gather → Concat → Reshape) become
+                // constant tensors at import time, letting downstream ops
+                // like Reshape / OneHot / ConstantOfShape read their
+                // integer values via AsSpan without triggering Realize.
+                //
+                // Graph input placeholders are storage-wise eager but are
+                // tracked in dynamicTensorNames and break the fold — any
+                // subgraph that reaches a graph input has to stay under
+                // GraphMode.
+                if (AllInputsEagerAndStatic(node, tensorsByName, dynamicTensorNames))
+                {
+                    var savedScope = GraphMode.Current;
+                    GraphMode.SetCurrent(null);
+                    try
+                    {
+                        translator.Translate(ctx, node);
+                        // Mark every output as static so further nodes in
+                        // the fold-chain see it as foldable.
+                        foreach (var outName in node.Output)
+                            if (!string.IsNullOrEmpty(outName) && tensorsByName.TryGetValue(outName, out var t))
+                                t.LazySource = null; // belt-and-suspenders; eager ops already produce LazySource=null
+                    }
+                    finally { GraphMode.SetCurrent(savedScope); }
+                }
+                else
+                {
+                    translator.Translate(ctx, node);
+                }
             }
+            // If the model's declared output(s) were produced via constant
+            // folding, the plan would have zero recorded steps and Execute()
+            // would return an empty fallback tensor. Wrap each static final
+            // output in a trivial Add-with-zero under GraphMode so every
+            // graph output becomes a proper lazy node tied to a plan step.
+            foreach (var outputVi in graph.Output)
+            {
+                if (!tensorsByName.TryGetValue(outputVi.Name, out var outTensor)) continue;
+                if (outTensor.LazySource is not null) continue; // already lazy → plan step exists
+                var zero = new Tensor<T>(outTensor._shape);
+                var wrapped = engine.TensorAdd(outTensor, zero);
+                tensorsByName[outputVi.Name] = wrapped;
+            }
+
             plan = scope.CompileInference<T>();
         }
         finally
@@ -174,6 +227,29 @@ public static class OnnxImporter
             inputs: inputTensors,
             producerName: model.ProducerName ?? string.Empty,
             irVersion: model.IrVersion);
+    }
+
+    /// <summary>
+    /// Returns true when every non-empty input of the node is a STATIC
+    /// eager tensor — its LazySource is null AND it isn't a graph-input
+    /// placeholder. Initializers and outputs of previously-folded ops
+    /// qualify; graph inputs do not because their values are only known
+    /// at Execute time.
+    /// </summary>
+    private static bool AllInputsEagerAndStatic<T>(
+        NodeProto node,
+        Dictionary<string, Tensor<T>> tensorsByName,
+        HashSet<string> dynamicTensorNames)
+    {
+        for (int i = 0; i < node.Input.Count; i++)
+        {
+            var name = node.Input[i];
+            if (string.IsNullOrEmpty(name)) continue;
+            if (dynamicTensorNames.Contains(name)) return false;
+            if (!tensorsByName.TryGetValue(name, out var t)) return false;
+            if (t.LazySource is not null) return false;
+        }
+        return true;
     }
 
     // ─── Shape resolution ────────────────────────────────────────────────

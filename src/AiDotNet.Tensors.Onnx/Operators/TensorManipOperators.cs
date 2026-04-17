@@ -390,7 +390,17 @@ internal static class TensorManipOperators
     {
         var span = t.AsSpan();
         var result = new int[span.Length];
-        for (int i = 0; i < span.Length; i++) result[i] = Convert.ToInt32(span[i]!);
+        for (int i = 0; i < span.Length; i++)
+        {
+            // ONNX Slice uses INT_MAX / INT_MIN as "to end" sentinels on
+            // int64 "starts" / "ends" inputs. Loaded as float those look
+            // like ±9.2e18; clamp to int range so the downstream slice
+            // logic treats them as "clip to dim length" naturally.
+            double d = Convert.ToDouble(span[i]!);
+            if (d >= int.MaxValue) result[i] = int.MaxValue;
+            else if (d <= int.MinValue) result[i] = int.MinValue;
+            else result[i] = (int)Math.Round(d);
+        }
         return result;
     }
 

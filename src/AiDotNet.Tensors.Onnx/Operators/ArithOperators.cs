@@ -35,9 +35,49 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            var result = (a.Rank <= 2 && b.Rank <= 2)
-                ? ctx.Engine.TensorMatMul(a, b)
-                : ctx.Engine.TensorBatchMatMul(a, b);
+            Tensor<T> result;
+            if (a.Rank <= 2 && b.Rank <= 2)
+            {
+                result = ctx.Engine.TensorMatMul(a, b);
+            }
+            else if (a.Rank == 3 && (b.Rank == 2 || b.Rank == 3))
+            {
+                result = ctx.Engine.TensorBatchMatMul(a, b);
+            }
+            else if (a.Rank >= 3 && b.Rank >= 3 && a.Rank == b.Rank)
+            {
+                // Collapse all leading batch dims into a single dim so the
+                // 3D-only engine kernel applies. Reshape is a storage-sharing
+                // view; the copy is free.
+                int batchA = 1;
+                for (int i = 0; i < a.Rank - 2; i++) batchA *= a._shape[i];
+                int batchB = 1;
+                for (int i = 0; i < b.Rank - 2; i++) batchB *= b._shape[i];
+                if (batchA != batchB)
+                    throw new InvalidDataException(
+                        $"MatMul batch dims don't match: a.shape = [{string.Join(",", a._shape)}], b.shape = [{string.Join(",", b._shape)}]. " +
+                        "NumPy-style broadcasting across leading dims isn't yet supported.");
+                int mA = a._shape[a.Rank - 2];
+                int kA = a._shape[a.Rank - 1];
+                int kB = b._shape[b.Rank - 2];
+                int nB = b._shape[b.Rank - 1];
+                if (kA != kB)
+                    throw new InvalidDataException($"MatMul inner dim mismatch: {kA} vs {kB}.");
+                var a3 = ctx.Engine.Reshape(a, new[] { batchA, mA, kA });
+                var b3 = ctx.Engine.Reshape(b, new[] { batchB, kB, nB });
+                var r3 = ctx.Engine.TensorBatchMatMul(a3, b3);
+                // Reshape back to the original leading-batch form [a.shape[:-2], M, N].
+                var outShape = new int[a.Rank];
+                for (int i = 0; i < a.Rank - 2; i++) outShape[i] = a._shape[i];
+                outShape[a.Rank - 2] = mA;
+                outShape[a.Rank - 1] = nB;
+                result = ctx.Engine.Reshape(r3, outShape);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"MatMul with ranks a={a.Rank}, b={b.Rank} is not yet supported.");
+            }
             ctx.PutTensor(node.Output[0], result);
         }
     }

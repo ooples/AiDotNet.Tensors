@@ -2457,7 +2457,10 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, a._shape,
+                // Same broadcast-shape fix as TensorBroadcastMultiply —
+                // a._shape is not always the final broadcast shape.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastSubtractBackward);
             }
@@ -2510,7 +2513,9 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, a._shape,
+                // Same broadcast-shape fix as TensorBroadcastMultiply.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastDivideBackward);
             }
@@ -2540,7 +2545,14 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, a._shape,
+                // Broadcast output shape follows NumPy rules — must be computed
+                // from both operands, not just a._shape. The previous `a._shape`
+                // assumption held only when a was the "larger" operand; when
+                // b is broader (e.g. scalar * [B, H, S, D]), the recorded
+                // output buffer was too small and the eager TensorBroadcastMultiply
+                // inside the closure overran it with "Destination is too short".
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
