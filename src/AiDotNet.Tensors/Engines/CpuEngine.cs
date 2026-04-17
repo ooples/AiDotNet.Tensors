@@ -15497,6 +15497,12 @@ public class CpuEngine : ITensorLevelEngine
             var gradWeights = System.Buffers.ArrayPool<double>.Shared.Rent(scratchLen);
             try
             {
+                // Defensive zero of the rented region. MultiplyMatrixBlockedDouble
+                // today clears its `c` span internally, but an explicit clear here
+                // keeps this site correct if the helper ever gains accumulate-mode
+                // semantics (e.g. a beta-style BLAS variant). Cheap: O(seqQ*seqK).
+                gradWeights.AsSpan(0, scratchLen).Clear();
+
                 // Step 2: gradWeights[seqQ, seqK] = gradOut[seqQ, d_v] @ V^T[d_v, seqK]
                 var vT = System.Buffers.ArrayPool<double>.Shared.Rent(d_v * seqK);
                 try
