@@ -14476,7 +14476,6 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         int groupSize = channelsPerGroup * spatialSize;
-        T groupSizeT = numOps.FromDouble(groupSize);
 
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetFlattenedData();
@@ -14488,77 +14487,181 @@ public class CpuEngine : ITensorLevelEngine
         var gradBetaData = new T[channels];
         var gradInputData = new T[input.Length];
 
-        // Initialize gradGamma and gradBeta to zero
-        for (int c = 0; c < channels; c++)
+        // ────────────────────────────────────────────────────────────────────
+        // Float fast path: direct float arithmetic, no virtual dispatch.
+        // Mirror of the GroupNorm forward's typeof(T) == typeof(float) branch.
+        // Diffusion UNet training pays this cost on every backward pass — SD15
+        // UNet has ~40 GroupNorm layers and backward runs through all of them
+        // per training step.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
         {
-            gradGammaData[c] = numOps.Zero;
-            gradBetaData[c] = numOps.Zero;
-        }
+            var fGradOut = (float[])(object)gradOutputData;
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fMean = (float[])(object)meanData;
+            var fVar = (float[])(object)varData;
+            var fGradGamma = (float[])(object)gradGammaData;
+            var fGradBeta = (float[])(object)gradBetaData;
+            var fGradInput = (float[])(object)gradInputData;
+            float fEps = (float)epsilon;
+            float groupSizeF = groupSize;
+            float invGroupSizeF = 1f / groupSizeF;
 
-        // Compute gradGamma and gradBeta (sum across batch and spatial)
-        for (int b = 0; b < batch; b++)
+            // gradGamma / gradBeta: sum across (batch, spatial). Sequential
+            // across batches to avoid per-channel accumulator contention, but
+            // spatial inner loop runs on direct floats. We pre-compute invStd
+            // once per (b, g) to avoid recomputing inside the spatial loop.
+            for (int b = 0; b < batch; b++)
+            {
+                for (int g = 0; g < numGroups; g++)
+                {
+                    float groupMean = fMean[b * numGroups + g];
+                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
+                    int startChannel = g * channelsPerGroup;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        float gammaAcc = 0f;
+                        float betaAcc = 0f;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float go = fGradOut[chanOffset + s];
+                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
+                            gammaAcc += go * normalized;
+                            betaAcc += go;
+                        }
+                        fGradGamma[channel] += gammaAcc;
+                        fGradBeta[channel] += betaAcc;
+                    }
+                }
+            }
+
+            // gradInput: parallel over batch. Each batch writes a disjoint
+            // [b*channels*spatialSize, (b+1)*channels*spatialSize) slice.
+            void ProcessBatch(int b)
+            {
+                for (int g = 0; g < numGroups; g++)
+                {
+                    float groupMean = fMean[b * numGroups + g];
+                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
+                    int startChannel = g * channelsPerGroup;
+
+                    // Pass 1: sumGrad and sumGradNorm over the group.
+                    float sumGrad = 0f;
+                    float sumGradNorm = 0f;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        float gammaC = fGamma[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float scaledGrad = gammaC * fGradOut[chanOffset + s];
+                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
+                            sumGrad += scaledGrad;
+                            sumGradNorm += scaledGrad * normalized;
+                        }
+                    }
+
+                    // Pass 2: write gradInput.
+                    float scale = invStd * invGroupSizeF;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
+                        float gammaC = fGamma[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
+                            float gradNorm = gammaC * fGradOut[chanOffset + s];
+                            float term1 = groupSizeF * gradNorm;
+                            float term3 = normalized * sumGradNorm;
+                            fGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
+                        }
+                    }
+                }
+            }
+
+            // Batch typically small (1–16) for diffusion training, but each
+            // batch's work is large (channels × spatialSize). Always parallel.
+            Parallel.For(0, batch, ProcessBatch);
+        }
+        else
         {
+            T groupSizeT = numOps.FromDouble(groupSize);
+
+            // Initialize gradGamma and gradBeta to zero
             for (int c = 0; c < channels; c++)
             {
-                int g = c / channelsPerGroup;
-                T groupMean = meanData[b * numGroups + g];
-                T groupVar = varData[b * numGroups + g];
-                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
-
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * (channels * spatialSize) + c * spatialSize + s;
-                    T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
-                    gradGammaData[c] = numOps.Add(gradGammaData[c], numOps.Multiply(gradOutputData[idx], normalized));
-                    gradBetaData[c] = numOps.Add(gradBetaData[c], gradOutputData[idx]);
-                }
+                gradGammaData[c] = numOps.Zero;
+                gradBetaData[c] = numOps.Zero;
             }
-        }
 
-        // Compute gradInput using the group norm backward formula
-        Parallel.For(0, batch, b =>
-        {
-            for (int g = 0; g < numGroups; g++)
+            // Compute gradGamma and gradBeta (sum across batch and spatial)
+            for (int b = 0; b < batch; b++)
             {
-                T groupMean = meanData[b * numGroups + g];
-                T groupVar = varData[b * numGroups + g];
-                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
-
-                // Compute sum of scaled gradients and sum of scaled gradients times normalized values for this group
-                T sumGrad = numOps.Zero;
-                T sumGradNorm = numOps.Zero;
-
-                int startChannel = g * channelsPerGroup;
-                for (int c = 0; c < channelsPerGroup; c++)
+                for (int c = 0; c < channels; c++)
                 {
-                    int channel = startChannel + c;
+                    int g = c / channelsPerGroup;
+                    T groupMean = meanData[b * numGroups + g];
+                    T groupVar = varData[b * numGroups + g];
+                    T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
+
                     for (int s = 0; s < spatialSize; s++)
                     {
-                        int idx = b * (channels * spatialSize) + channel * spatialSize + s;
-                        T scaledGrad = numOps.Multiply(gammaData[channel], gradOutputData[idx]);
+                        int idx = b * (channels * spatialSize) + c * spatialSize + s;
                         T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
-                        sumGrad = numOps.Add(sumGrad, scaledGrad);
-                        sumGradNorm = numOps.Add(sumGradNorm, numOps.Multiply(scaledGrad, normalized));
-                    }
-                }
-
-                // Compute gradient for each element in this group
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channel = startChannel + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * (channels * spatialSize) + channel * spatialSize + s;
-                        T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
-                        T gradNorm = numOps.Multiply(gammaData[channel], gradOutputData[idx]);
-                        T term1 = numOps.Multiply(groupSizeT, gradNorm);
-                        T term2 = sumGrad;
-                        T term3 = numOps.Multiply(normalized, sumGradNorm);
-                        gradInputData[idx] = numOps.Multiply(numOps.Divide(invStd, groupSizeT), numOps.Subtract(numOps.Subtract(term1, term2), term3));
+                        gradGammaData[c] = numOps.Add(gradGammaData[c], numOps.Multiply(gradOutputData[idx], normalized));
+                        gradBetaData[c] = numOps.Add(gradBetaData[c], gradOutputData[idx]);
                     }
                 }
             }
-        });
+
+            // Compute gradInput using the group norm backward formula
+            Parallel.For(0, batch, b =>
+            {
+                for (int g = 0; g < numGroups; g++)
+                {
+                    T groupMean = meanData[b * numGroups + g];
+                    T groupVar = varData[b * numGroups + g];
+                    T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
+
+                    T sumGrad = numOps.Zero;
+                    T sumGradNorm = numOps.Zero;
+
+                    int startChannel = g * channelsPerGroup;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            int idx = b * (channels * spatialSize) + channel * spatialSize + s;
+                            T scaledGrad = numOps.Multiply(gammaData[channel], gradOutputData[idx]);
+                            T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
+                            sumGrad = numOps.Add(sumGrad, scaledGrad);
+                            sumGradNorm = numOps.Add(sumGradNorm, numOps.Multiply(scaledGrad, normalized));
+                        }
+                    }
+
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            int idx = b * (channels * spatialSize) + channel * spatialSize + s;
+                            T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
+                            T gradNorm = numOps.Multiply(gammaData[channel], gradOutputData[idx]);
+                            T term1 = numOps.Multiply(groupSizeT, gradNorm);
+                            T term2 = sumGrad;
+                            T term3 = numOps.Multiply(normalized, sumGradNorm);
+                            gradInputData[idx] = numOps.Multiply(numOps.Divide(invStd, groupSizeT), numOps.Subtract(numOps.Subtract(term1, term2), term3));
+                        }
+                    }
+                }
+            });
+        }
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
