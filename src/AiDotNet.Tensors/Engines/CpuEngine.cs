@@ -14246,7 +14246,6 @@ public class CpuEngine : ITensorLevelEngine
         if (batchDims == 0) batchSize = 1;
 
         int featureSize = gamma.Length;
-        T featureSizeT = numOps.FromDouble(featureSize);
 
         var gradOutputData = gradOutput.GetFlattenedData();
         var inputData = input.GetFlattenedData();
@@ -14257,47 +14256,198 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[featureSize];
         var gradBetaData = new T[featureSize];
         var gradInputData = new T[batchSize * featureSize];
-        // CLR zeros new T[] already — no explicit clearing needed
 
-        // Compute gradGamma and gradBeta
-        for (int b = 0; b < batchSize; b++)
+        // ────────────────────────────────────────────────────────────────────
+        // Primitive fast paths: direct array access, no INumericOperations<T>
+        // virtual dispatch. Mirror of the LayerNorm forward's primitive
+        // branches. Method signature stays generic <T>; non-primitive T
+        // (complex, Half, int, etc.) falls through to the scalar path below.
+        //
+        // Transformer training pays this op's cost on every backward step.
+        // Scientific consumers using T = double were on the scalar path — now
+        // they get the same dispatch-free treatment as float.
+        // ────────────────────────────────────────────────────────────────────
+        if (typeof(T) == typeof(float))
         {
-            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
-            for (int f = 0; f < featureSize; f++)
+            var fGradOut = (float[])(object)gradOutputData;
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fMean = (float[])(object)meanData;
+            var fVar = (float[])(object)varData;
+            var fGradGamma = (float[])(object)gradGammaData;
+            var fGradBeta = (float[])(object)gradBetaData;
+            var fGradInput = (float[])(object)gradInputData;
+            float fEps = (float)epsilon;
+            int fs = featureSize;
+            float featureSizeF = fs;
+            float invFeatureSizeF = 1f / featureSizeF;
+
+            // gradGamma / gradBeta: sum across batches. Left sequential to avoid
+            // cross-thread contention on the [featureSize] accumulators. For
+            // typical transformer LN (featureSize ≈ hidden dim ≈ 768–4096 and
+            // batchSize × seq ≈ 1k–4k), the sequential pass is memory-bound, not
+            // compute-bound, so threading doesn't help.
+            for (int b = 0; b < batchSize; b++)
             {
-                int idx = b * featureSize + f;
-                T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], meanData[b]), invStd);
-                gradGammaData[f] = numOps.Add(gradGammaData[f], numOps.Multiply(gradOutputData[idx], normalized));
-                gradBetaData[f] = numOps.Add(gradBetaData[f], gradOutputData[idx]);
+                int off = b * fs;
+                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
+                float m = fMean[b];
+                for (int f = 0; f < fs; f++)
+                {
+                    float go = fGradOut[off + f];
+                    float normalized = (fInput[off + f] - m) * invStd;
+                    fGradGamma[f] += go * normalized;
+                    fGradBeta[f] += go;
+                }
+            }
+
+            // gradInput: per-batch two-pass (sum reductions, then per-element).
+            // Safe to parallelize over batches since each batch writes to a
+            // disjoint [b*fs, (b+1)*fs) slice of gradInput.
+            void ProcessBatch(int b)
+            {
+                int off = b * fs;
+                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
+                float m = fMean[b];
+
+                float sumGrad = 0f;
+                float sumGradX = 0f;
+                for (int f = 0; f < fs; f++)
+                {
+                    float scaledGrad = fGamma[f] * fGradOut[off + f];
+                    sumGrad += scaledGrad;
+                    sumGradX += scaledGrad * (fInput[off + f] - m);
+                }
+
+                float scale = invStd * invFeatureSizeF;
+                for (int f = 0; f < fs; f++)
+                {
+                    float normalized = (fInput[off + f] - m) * invStd;
+                    float gradNorm = fGamma[f] * fGradOut[off + f];
+                    float term1 = featureSizeF * gradNorm;
+                    float term3 = normalized * invStd * sumGradX;
+                    fGradInput[off + f] = scale * (term1 - sumGrad - term3);
+                }
+            }
+
+            // Same threshold used by the forward: below ~50K total elements the
+            // Parallel.For dispatch cost exceeds the work.
+            if (batchSize * fs < 50_000)
+            {
+                for (int b = 0; b < batchSize; b++) ProcessBatch(b);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, ProcessBatch);
             }
         }
-
-        // Compute gradInput
-        Parallel.For(0, batchSize, b =>
+        else if (typeof(T) == typeof(double))
         {
-            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
-            T sumGrad = numOps.Zero;
-            T sumGradX = numOps.Zero;
+            var dGradOut = (double[])(object)gradOutputData;
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dMean = (double[])(object)meanData;
+            var dVar = (double[])(object)varData;
+            var dGradGamma = (double[])(object)gradGammaData;
+            var dGradBeta = (double[])(object)gradBetaData;
+            var dGradInput = (double[])(object)gradInputData;
+            int fs = featureSize;
+            double featureSizeD = fs;
+            double invFeatureSizeD = 1.0 / featureSizeD;
 
-            for (int f = 0; f < featureSize; f++)
+            for (int b = 0; b < batchSize; b++)
             {
-                int idx = b * featureSize + f;
-                T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[idx]);
-                sumGrad = numOps.Add(sumGrad, scaledGrad);
-                sumGradX = numOps.Add(sumGradX, numOps.Multiply(scaledGrad, numOps.Subtract(inputData[idx], meanData[b])));
+                int off = b * fs;
+                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
+                double m = dMean[b];
+                for (int f = 0; f < fs; f++)
+                {
+                    double go = dGradOut[off + f];
+                    double normalized = (dInput[off + f] - m) * invStd;
+                    dGradGamma[f] += go * normalized;
+                    dGradBeta[f] += go;
+                }
             }
 
-            for (int f = 0; f < featureSize; f++)
+            void ProcessBatch(int b)
             {
-                int idx = b * featureSize + f;
-                T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], meanData[b]), invStd);
-                T gradNorm = numOps.Multiply(gammaData[f], gradOutputData[idx]);
-                T term1 = numOps.Multiply(featureSizeT, gradNorm);
-                T term2 = sumGrad;
-                T term3 = numOps.Multiply(normalized, numOps.Multiply(invStd, sumGradX));
-                gradInputData[idx] = numOps.Multiply(numOps.Divide(invStd, featureSizeT), numOps.Subtract(numOps.Subtract(term1, term2), term3));
+                int off = b * fs;
+                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
+                double m = dMean[b];
+
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                for (int f = 0; f < fs; f++)
+                {
+                    double scaledGrad = dGamma[f] * dGradOut[off + f];
+                    sumGrad += scaledGrad;
+                    sumGradX += scaledGrad * (dInput[off + f] - m);
+                }
+
+                double scale = invStd * invFeatureSizeD;
+                for (int f = 0; f < fs; f++)
+                {
+                    double normalized = (dInput[off + f] - m) * invStd;
+                    double gradNorm = dGamma[f] * dGradOut[off + f];
+                    double term1 = featureSizeD * gradNorm;
+                    double term3 = normalized * invStd * sumGradX;
+                    dGradInput[off + f] = scale * (term1 - sumGrad - term3);
+                }
             }
-        });
+
+            if (batchSize * fs < 50_000)
+            {
+                for (int b = 0; b < batchSize; b++) ProcessBatch(b);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, ProcessBatch);
+            }
+        }
+        else
+        {
+            T featureSizeT = numOps.FromDouble(featureSize);
+
+            // Compute gradGamma and gradBeta
+            for (int b = 0; b < batchSize; b++)
+            {
+                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
+                for (int f = 0; f < featureSize; f++)
+                {
+                    int idx = b * featureSize + f;
+                    T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], meanData[b]), invStd);
+                    gradGammaData[f] = numOps.Add(gradGammaData[f], numOps.Multiply(gradOutputData[idx], normalized));
+                    gradBetaData[f] = numOps.Add(gradBetaData[f], gradOutputData[idx]);
+                }
+            }
+
+            // Compute gradInput
+            Parallel.For(0, batchSize, b =>
+            {
+                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
+                T sumGrad = numOps.Zero;
+                T sumGradX = numOps.Zero;
+
+                for (int f = 0; f < featureSize; f++)
+                {
+                    int idx = b * featureSize + f;
+                    T scaledGrad = numOps.Multiply(gammaData[f], gradOutputData[idx]);
+                    sumGrad = numOps.Add(sumGrad, scaledGrad);
+                    sumGradX = numOps.Add(sumGradX, numOps.Multiply(scaledGrad, numOps.Subtract(inputData[idx], meanData[b])));
+                }
+
+                for (int f = 0; f < featureSize; f++)
+                {
+                    int idx = b * featureSize + f;
+                    T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], meanData[b]), invStd);
+                    T gradNorm = numOps.Multiply(gammaData[f], gradOutputData[idx]);
+                    T term1 = numOps.Multiply(featureSizeT, gradNorm);
+                    T term2 = sumGrad;
+                    T term3 = numOps.Multiply(normalized, numOps.Multiply(invStd, sumGradX));
+                    gradInputData[idx] = numOps.Multiply(numOps.Divide(invStd, featureSizeT), numOps.Subtract(numOps.Subtract(term1, term2), term3));
+                }
+            });
+        }
 
         gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradBetaData));
