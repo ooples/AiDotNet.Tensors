@@ -192,6 +192,91 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Copies the tensor's logical contents, in row-major order, into
+    /// <paramref name="destination"/>. Handles both contiguous and strided
+    /// (e.g., post-<see cref="Transpose()"/> / post-permute) layouts without
+    /// allocating an intermediate contiguous tensor.
+    /// </summary>
+    /// <param name="destination">Destination span. Must have length at least
+    /// <see cref="TensorBase{T}.Length"/>.</param>
+    /// <exception cref="ArgumentException"><paramref name="destination"/> is shorter than
+    /// <see cref="TensorBase{T}.Length"/>.</exception>
+    /// <exception cref="NotSupportedException">This tensor is a <see cref="SparseTensor{T}"/>.</exception>
+    /// <remarks>
+    /// <para>
+    /// Use this instead of <c>Contiguous().AsSpan().CopyTo(dst)</c> when the
+    /// goal is to spill a logical tensor into a flat buffer. The
+    /// materialize-then-copy idiom allocates a second full-size tensor and
+    /// does two passes over the data; <c>CopyTo</c> does one pass straight
+    /// into the destination. For a strided [3,32,32] permuted-to-HWC tensor
+    /// this roughly halves both allocation count and per-element work.
+    /// </para>
+    /// <para>
+    /// Bulk path: when this tensor is contiguous (with or without a storage
+    /// offset), the copy reduces to a single <see cref="Span{T}"/>-level
+    /// <c>CopyTo</c>, which on modern runtimes lowers to <c>memmove</c>.
+    /// Strided path: uses cached row-major strides to decompose the flat
+    /// destination index into per-axis indices, matching
+    /// <see cref="Contiguous"/>'s fallback arithmetic so behavior is
+    /// identical.
+    /// </para>
+    /// <para>
+    /// The destination need not match this tensor's shape rank; only length
+    /// matters. Writes exactly <see cref="TensorBase{T}.Length"/> elements
+    /// starting at <c>destination[0]</c>; any trailing elements of a larger
+    /// destination are left untouched.
+    /// </para>
+    /// </remarks>
+    public void CopyTo(Span<T> destination)
+    {
+        ThrowIfSparse();
+        if (destination.Length < Length)
+        {
+            throw new ArgumentException(
+                $"Destination span is too small: need {Length} elements, got {destination.Length}.",
+                nameof(destination));
+        }
+
+        if (IsContiguous)
+        {
+            // Fast path for contiguous tensors (with or without storage
+            // offset) — a single Span<T>.CopyTo delegates to Buffer.Memmove.
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(destination);
+            return;
+        }
+
+        // Strided fallback. Identical decomposition to Contiguous() so the
+        // two methods stay behaviorally consistent — any future
+        // optimization that applies to one should be applied to the other.
+        var srcData = _data.GetDataArray();
+        var rowMajorStrides = RowMajorStrides;
+        int rank = Rank;
+        int len = Length;
+        int offset = _storageOffset;
+
+        for (int i = 0; i < len; i++)
+        {
+            int srcIdx = offset;
+            int remaining = i;
+            for (int d = 0; d < rank; d++)
+            {
+                int dimIndex = remaining / rowMajorStrides[d];
+                remaining -= dimIndex * rowMajorStrides[d];
+                srcIdx += dimIndex * _strides[d];
+            }
+            destination[i] = srcData[srcIdx];
+        }
+    }
+
+    /// <summary>
+    /// Overload of <see cref="CopyTo(Span{T})"/> that accepts a
+    /// <see cref="Memory{T}"/> destination.
+    /// </summary>
+    /// <param name="destination">Destination memory. Must have length at least
+    /// <see cref="TensorBase{T}.Length"/>.</param>
+    public void CopyTo(Memory<T> destination) => CopyTo(destination.Span);
+
+    /// <summary>
     /// Inserts a size-1 dimension at the specified axis. O(1) view — no data copy.
     /// </summary>
     /// <param name="axis">The position at which to insert the new dimension (0 to Rank inclusive).</param>
