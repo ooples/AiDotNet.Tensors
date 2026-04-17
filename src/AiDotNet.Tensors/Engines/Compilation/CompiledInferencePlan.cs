@@ -1,7 +1,12 @@
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Optimization;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -23,7 +28,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // _compiledInputShape which is just a shape vector. After a ThenAsync
     // rebind this tensor's storage is aliased to the upstream plan's final
     // output, so downstream steps read data written by the upstream steps
-    // without a boundary copy. Null only for the degenerate empty-plan
+    // without a boundary copy. Also serialized so a deserialized plan can
+    // be re-stitched or re-bound. Null only for the degenerate empty-plan
     // case (zero steps).
     private readonly Tensor<T>? _compiledInputTensor;
     private readonly List<GCHandle> _pinnedHandles = new();
@@ -112,6 +118,83 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return true;
     }
 
+    /// <inheritdoc/>
+    public Task SaveAsync(Stream stream, CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        cancellationToken.ThrowIfCancellationRequested();
+
+        InferencePlanWriter.Write(stream, _steps, _finalOutput, _compiledInputShape, _compiledInputTensor);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
+    public bool IsCompatibleWith(PlanCompatibilityInfo info)
+    {
+        return info.GetIncompatibilityReason<T>() is null;
+    }
+
+    /// <summary>
+    /// Internal factory for the deserialization path — constructs a plan from
+    /// pre-built steps without running the compiler or optimization passes.
+    /// The steps' closures were reconstructed by the op registry; the tensor
+    /// buffers were reconstituted from the tensor table. This is the "zero
+    /// warmup" entry point: load from disk → ready to Execute() immediately.
+    /// </summary>
+    internal static CompiledInferencePlan<T> CreateFromDeserialized(
+        CompiledStep<T>[] steps,
+        Tensor<T> finalOutput,
+        IEngine engine,
+        int[] inputShape,
+        Tensor<T>? compiledInputTensor)
+    {
+        // Run TryBuildSpecializedForward on the deserialized steps so the
+        // loaded plan uses the same SIMD-tuned kernels as the original.
+        // Without this, the loaded plan's generic engine-method closures
+        // produce slightly different floating-point results due to
+        // accumulation-order differences (6th decimal place on MatMul).
+        // Graph-level optimization passes are NOT re-run — the saved plan
+        // was already optimized before serialization.
+        var pinnedHandles = new List<GCHandle>();
+        var specialized = new CompiledStep<T>[steps.Length];
+        for (int i = 0; i < steps.Length; i++)
+        {
+            var step = steps[i];
+            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles);
+            if (spec != null)
+            {
+                var output = step.OutputBuffer;
+                specialized[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) => spec(eng),
+                    output,
+                    step.Inputs,
+                    step.BackwardFn,
+                    step.SavedState);
+            }
+            else
+            {
+                specialized[i] = step;
+            }
+        }
+
+        // Clear LazySource on output tensors (same as Compile does).
+        foreach (var step in specialized)
+            step.OutputBuffer.LazySource = null;
+
+        var actualFinalOutput = specialized.Length > 0
+            ? specialized[specialized.Length - 1].OutputBuffer
+            : finalOutput;
+
+        return new CompiledInferencePlan<T>(
+            specialized, actualFinalOutput, engine, inputShape,
+            handles: pinnedHandles, compiledInputTensor: compiledInputTensor);
+    }
+
+    // ── Internal accessors for serialization ────────────────────────────
+    // Note: CompiledInputTensor is already defined above for ThenAsync stitching.
+    internal CompiledStep<T>[] Steps => _steps;
+    internal int[] CompiledInputShape => _compiledInputShape;
 
     /// <inheritdoc/>
     /// <remarks>
@@ -373,7 +456,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var pinnedHandles = new List<GCHandle>();
 
         // Determine input shape from the first step's inputs (for IsValid check)
-        // and capture the tensor reference itself for Then() stitching.
+        // and capture the tensor reference itself for Then() stitching + serialization.
         var inputTensor = steps.Count > 0 && steps[0].Inputs.Length > 0
             ? steps[0].Inputs[0]
             : null;

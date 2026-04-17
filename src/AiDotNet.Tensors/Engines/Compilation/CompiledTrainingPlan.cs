@@ -1,6 +1,10 @@
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
@@ -41,6 +45,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private T[]? _cachedLossGradDestArray;
     private readonly Tensor<T>? _lossGradDest; // Pre-allocated gradient buffer for loss output
 
+    // Retained for plan serialization (issue #166). The forward actions are
+    // specialized closures built from these steps — they're fast but lose
+    // the structural metadata (OpType, Inputs, SavedState) that SaveAsync
+    // needs to write. Storing both costs ~N*sizeof(ref) extra per plan,
+    // which is negligible relative to the pre-allocated tensor buffers.
+    private readonly CompiledStep<T>[]? _forwardSteps;
+    private readonly int[]? _compiledInputShape;
+    private readonly Tensor<T>? _compiledInputTensor;
+
     private CompiledTrainingPlan(
         Action<IEngine>[] forwardActions,
         Action<IEngine>[] backwardActions,
@@ -52,7 +65,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Tensor<T> lossGradSeed,
         int[]? genericGradIndices = null,
         Tensor<T>? lossGradDest = null,
-        List<GCHandle>? pinnedHandles = null)
+        List<GCHandle>? pinnedHandles = null,
+        CompiledStep<T>[]? forwardSteps = null,
+        int[]? compiledInputShape = null,
+        Tensor<T>? compiledInputTensor = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -63,6 +79,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _gradients = gradients;
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
+        _forwardSteps = forwardSteps;
+        _compiledInputShape = compiledInputShape;
+        _compiledInputTensor = compiledInputTensor;
         _lossGradDest = lossGradDest;
         if (pinnedHandles is not null)
             _pinnedHandles.AddRange(pinnedHandles);
@@ -263,6 +282,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         };
     }
 
+    /// <inheritdoc/>
+    public Task SaveAsync(Stream stream, CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        cancellationToken.ThrowIfCancellationRequested();
+
+        TrainingPlanWriter.Write(stream, this);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
+    public bool IsCompatibleWith(PlanCompatibilityInfo info)
+    {
+        return info.GetIncompatibilityReason<T>() is null;
+    }
+
+    // ── Internal accessors for serialization ────────────────────────────
+    internal Action<IEngine>[] ForwardActions => _forwardActions;
+    internal Action<IEngine>[] BackwardActions => _backwardActions;
+    internal Tensor<T> LossOutput => _lossOutput;
+    internal Tensor<T>[] Parameters => _parameters;
+    internal Tensor<T>[] PreAllocatedGrads => _preAllocatedGrads;
+    internal CompiledStep<T>[]? ForwardStepsForSerialization => _forwardSteps;
+    internal int[]? SerializedInputShape => _compiledInputShape;
+    internal Tensor<T>? SerializedInputTensor => _compiledInputTensor;
+
     internal static CompiledTrainingPlan<T> Compile(
         LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters)
     {
@@ -436,6 +481,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         //   FusedOptimizer.AppendFusedUpdates(plan.BackwardActions, params, grads, lr)
         // This avoids hard-coding the learning rate into the compiled plan.
 
+        // Determine compiled input shape/tensor from the forward steps.
+        Tensor<T>? compiledInputTensor = forwardSteps.Count > 0 && forwardSteps[0].Inputs.Length > 0
+            ? forwardSteps[0].Inputs[0] : null;
+        int[] compiledInputShape = compiledInputTensor is not null
+            ? (int[])compiledInputTensor._shape.Clone() : Array.Empty<int>();
+
         return new CompiledTrainingPlan<T>(
             forwardActions,
             backwardActions.ToArray(),
@@ -447,7 +498,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lossGradSeed,
             genericGradIndices,
             gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
-            pinnedHandles);
+            pinnedHandles,
+            forwardSteps.ToArray(),
+            compiledInputShape,
+            compiledInputTensor);
     }
 
     /// <summary>
