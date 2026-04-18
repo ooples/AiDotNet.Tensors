@@ -21475,27 +21475,42 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
 
-        // GraphMode: execute eagerly and record each split result individually
+        // GraphMode: record each split result as its own lazy node. We must
+        // NOT perform the eager split here — that would force AsSpan on the
+        // input tensor, which triggers Realize on its entire upstream lazy
+        // chain. For ONNX import specifically, that chain may include ops
+        // that read from graph-input placeholders; realizing them before the
+        // caller has filled those placeholders bakes placeholder=0 data into
+        // those nodes' IsRealized state, which the later plan replay cannot
+        // undo (AsSpan subsequently returns whatever the upstream step wrote,
+        // which IS correct — but ONLY because the plan's step delegate
+        // overwrites the buffer; meanwhile any op whose closure captured a
+        // pre-realize snapshot of the data — e.g. a specialization that pins
+        // inputA.GetDataArray() during compile — now holds a stale array).
+        // Shape is all we need at record time, and that comes from
+        // tensor._shape directly.
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                if (axis < 0) axis = tensor._shape.Length + axis;
+                int axisSizeLazy = tensor._shape[axis];
+                if (axisSizeLazy % numSplits != 0)
+                    throw new ArgumentException(
+                        $"Cannot split axis of size {axisSizeLazy} into {numSplits} equal parts");
+                int splitSizeLazy = axisSizeLazy / numSplits;
+
                 var ct = tensor; int cn = numSplits; int ca = axis;
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                var eagerResults = TensorSplit(ct, cn, ca);
-                GraphMode.SetCurrent(savedScope);
-                // Record each split as a separate lazy node
-                var lazyResults = new Tensor<T>[eagerResults.Length];
-                for (int s = 0; s < eagerResults.Length; s++)
+                var lazyResults = new Tensor<T>[numSplits];
+                for (int s = 0; s < numSplits; s++)
                 {
                     int splitIdx = s;
-                    var eager = eagerResults[s];
-                    lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, eager._shape,
+                    var outShape = (int[])tensor._shape.Clone();
+                    outShape[ca] = splitSizeLazy;
+                    lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, outShape,
                         (eng, output) => { var r = eng.TensorSplit(ct, cn, ca)[splitIdx]; r.AsSpan().CopyTo(output.AsWritableSpan()); },
                         BackwardFunctions<T>.SplitBackward, new object[] { numSplits, axis, s });
-                    eager.AsSpan().CopyTo(lazyResults[s].AsWritableSpan());
                 }
                 return lazyResults;
             }

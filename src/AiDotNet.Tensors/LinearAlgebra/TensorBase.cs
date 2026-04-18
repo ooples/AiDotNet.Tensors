@@ -792,13 +792,41 @@ public abstract class TensorBase<T> : IDisposable
 
     /// <summary>
     /// Gets the underlying array. For views, returns a fresh contiguous copy.
+    /// NOTE: intentionally does NOT call EnsureMaterialized on the simple-
+    /// layout path. Callers that pin this array for use at plan-replay time
+    /// (specialization compile) must NOT force Realize at compile time —
+    /// Realize with placeholder=0 inputs snapshots each upstream node with
+    /// IsRealized=true, which then makes certain specializations' pinned
+    /// array reads observe pre-user-fill data across subsequent executes
+    /// (BERT-SQuAD × 100 sample bug). Callers that NEED live data read a
+    /// copy (view case) — ToArray below still materializes in that path,
+    /// which is correct because ToArray's very purpose is returning data.
     /// </summary>
     internal T[] GetDataArray()
     {
-        EnsureMaterialized();
-
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
             return ToArray();
+        return _storage.GetDataArray();
+    }
+
+    /// <summary>
+    /// Gets the BACKING storage array without triggering lazy realization
+    /// and without ever returning a copy. Returns <c>null</c> when the
+    /// tensor's layout is not a simple contiguous-at-offset-0-whose-storage-
+    /// length-matches-logical-length view of its backing storage — in which
+    /// case callers that need a live pin must skip their specialization and
+    /// fall back to the general AsSpan-based path. Live callers (the
+    /// TryBuildSpecializedForward pinners) use this to avoid the Realize-
+    /// triggered-during-compile cascade that bakes placeholder=0 data into
+    /// every upstream IsRealized node (issue surfaced by BERT-SQuAD × 100
+    /// sample replay: first execute correct, subsequent executes returned
+    /// the first execute's output verbatim because some specialization
+    /// pinned a ToArray snapshot taken during compile-time realize).
+    /// </summary>
+    internal T[]? GetLiveBackingArrayOrNull()
+    {
+        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
+            return null;
         return _storage.GetDataArray();
     }
 
