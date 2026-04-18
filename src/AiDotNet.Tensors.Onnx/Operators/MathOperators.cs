@@ -530,26 +530,40 @@ internal static class MathOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            // Lower to |a - b| < tol mapped through a step function. Can't use
-            // exact equality on floats generally, but since our plan carries
-            // integer-valued inputs through float storage (Cast semantics in
-            // MathOperators.cs:46-67), bit-for-bit equality is what ViT's
-            // opset-14 Equal expects when the two sides are both ints.
-            // Implementation: Equal(a,b) = Not(abs(a - b) > 0) which lowers to
-            // (1 - Sign(Abs(a - b))) under our numeric ops. But Sign may not
-            // be registered; simpler is the branchless: compute diff, compare
-            // to zero elementwise in a small eager helper. For BERT/ViT this
-            // op chain typically runs at import-time constant folding (shape
-            // arithmetic), so the eager path below is also the common one.
-            var shape = ShapesEqual(a._shape, b._shape)
+            // Bit-for-bit equality mapped to 0/1 float. Any read of A/B
+            // must happen at Execute time (deferred-read idiom); otherwise
+            // we'd capture the placeholder-zero state from trace time and
+            // emit a constant "all-equal" mask. Broadcasting uses the
+            // Engine's native broadcast-subtract, then a closure compares
+            // the difference against zero per-element into the output.
+            var outShape = ShapesEqual(a._shape, b._shape)
                 ? a._shape
                 : ComputeBroadcastShape(a._shape, b._shape);
-            // Eager compute via broadcast subtract + elementwise-is-zero map.
+            var scope = Engines.Compilation.GraphMode.Current;
+            var capturedA = a;
+            var capturedB = b;
+            if (scope is null)
+            {
+                ctx.PutTensor(node.Output[0], EqualElementwise(ctx.Engine, capturedA, capturedB, outShape));
+                return;
+            }
+            var lazy = scope.RecordBinary(Engines.Compilation.LazyNodeType.Custom,
+                "Equal", capturedA, capturedB, outShape,
+                (eng, output) =>
+                {
+                    var r = EqualElementwise(eng, capturedA, capturedB, outShape);
+                    r.AsSpan().CopyTo(output.AsWritableSpan());
+                });
+            ctx.PutTensor(node.Output[0], lazy);
+        }
+
+        private static Tensor<T> EqualElementwise(AiDotNet.Tensors.Engines.IEngine engine,
+            Tensor<T> a, Tensor<T> b, int[] outShape)
+        {
             var diff = ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorSubtract(a, b)
-                : ctx.Engine.TensorBroadcastSubtract(a, b);
-            // Elementwise: result = (diff == 0) ? 1.0 : 0.0.
-            var result = new Tensor<T>(shape);
+                ? engine.TensorSubtract(a, b)
+                : engine.TensorBroadcastSubtract(a, b);
+            var result = new Tensor<T>(outShape);
             var ops = MathHelper.GetNumericOperations<T>();
             var srcSpan = diff.AsSpan();
             var dstSpan = result.AsWritableSpan();
@@ -557,7 +571,7 @@ internal static class MathOperators
             var one = ops.One;
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = ops.Equals(srcSpan[i], zero) ? one : zero;
-            ctx.PutTensor(node.Output[0], result);
+            return result;
         }
     }
 

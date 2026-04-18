@@ -33,6 +33,32 @@ internal static class OnnxTestHelpers
         return arr;
     }
 
+    /// <summary>
+    /// Import + execute variant that returns a specific graph output by name
+    /// from <see cref="OnnxImportResult{T}.Outputs"/>. Use this for
+    /// multi-output models where <c>Plan.Execute()</c>'s single return
+    /// might be a different output than the one under test.
+    /// </summary>
+    internal static float[] ImportAndExecuteNamed(byte[] modelBytes, string outputName, params (string name, float[] data)[] inputs)
+    {
+        using var stream = new MemoryStream(modelBytes);
+        var engine = new CpuEngine();
+        var result = OnnxImporter.Import<float>(stream, engine);
+        Assert.Empty(result.UnsupportedOperators);
+        Assert.NotNull(result.Plan);
+        foreach (var (name, data) in inputs)
+        {
+            var t = result.Inputs[name];
+            data.AsSpan().CopyTo(t.AsWritableSpan());
+        }
+        result.Plan!.Execute();
+        Assert.True(result.Outputs.TryGetValue(outputName, out var tensor),
+            $"Output '{outputName}' not found in result.Outputs.");
+        var arr = new float[tensor!.AsSpan().Length];
+        tensor.AsSpan().CopyTo(arr);
+        return arr;
+    }
+
     internal static float[] RandomArray(int seed, int n, float lo = -1f, float hi = 1f)
     {
         var rng = new Random(seed);

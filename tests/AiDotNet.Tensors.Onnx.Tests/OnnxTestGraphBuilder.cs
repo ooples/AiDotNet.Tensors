@@ -88,6 +88,24 @@ internal static class OnnxTestGraphBuilder
         return t;
     }
 
+    // Overload: allow MakeInitializer(name, shape, long[]) to route to the
+    // int64 path without forcing callers to remember the separate method
+    // name. Tests that feed int64 tensor inputs (Reshape shape vectors,
+    // Slice starts/ends, etc.) can write MakeInitializer(..., new long[]{…}).
+    internal static TensorProto MakeInitializer(string name, int[] shape, long[] data)
+        => MakeInt64Initializer(name, shape, data);
+
+    // Raw-data int8 initializer for quantized-op parity tests.
+    internal static TensorProto MakeInitializerInt8(string name, int[] shape, sbyte[] data)
+    {
+        var t = new TensorProto { Name = name, DataType = (int)TensorProto.Types.DataType.Int8 };
+        foreach (var d in shape) t.Dims.Add(d);
+        var bytes = new byte[data.Length];
+        for (int i = 0; i < data.Length; i++) bytes[i] = (byte)data[i];
+        t.RawData = ByteString.CopyFrom(bytes);
+        return t;
+    }
+
     /// <summary>
     /// Wraps a GraphProto in a minimal ModelProto with IR version and opset
     /// that ONNX Runtime accepts. Opset 13 is the baseline most modern
