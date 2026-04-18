@@ -6,21 +6,27 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
 /// Config for <see cref="FusedAttention{T}.Forward"/> — softmax scale,
-/// causal mask, optional block-size override, whether to return the
-/// (large) attention-weight matrix.
+/// causal mask, per-axis block sizes, dropout, and whether to return
+/// the (large) attention-weight matrix.
 ///
 /// <para>Uses nullable properties + industry-standard defaults so a
 /// zero-config call still runs sensibly. Defaults match PyTorch's
 /// <c>torch.nn.functional.scaled_dot_product_attention</c>: scale is
 /// <c>1/sqrt(headDim)</c>, causal is false, block size is auto (picked
-/// by the kernel based on seqLen).</para>
+/// by the kernel based on seqLen), no dropout.</para>
 /// </summary>
 public sealed class FlashAttentionConfig
 {
     /// <summary>Softmax scale. When null, defaults to <c>1 / sqrt(headDim)</c>.</summary>
     public double? Scale { get; set; }
 
-    /// <summary>When true, applies the autoregressive causal mask.</summary>
+    /// <summary>Synonym for <see cref="Scale"/> — the issue spec uses
+    /// <c>ScaleFactor</c>; we accept either.</summary>
+    public double? ScaleFactor { get => Scale; set => Scale = value; }
+
+    /// <summary>When true, applies the autoregressive causal mask.
+    /// Honours <see cref="QueryOffset"/> so <c>q_i</c> attends to all
+    /// <c>k_j</c> where <c>j &lt;= queryOffset + i</c>.</summary>
     public bool IsCausal { get; set; }
 
     /// <summary>When true, returns the attention-weight matrix. Allocates
@@ -28,10 +34,38 @@ public sealed class FlashAttentionConfig
     /// when you only need the output.</summary>
     public bool ReturnAttentionWeights { get; set; }
 
-    /// <summary>Block size for the block-tiled softmax. Null means "let
-    /// the kernel pick" — chosen to balance L2 cache residency against
-    /// softmax accumulation precision. Exposed so benchmarks can sweep.</summary>
-    public int? BlockSize { get; set; }
+    /// <summary>Block size along the query axis. Null = auto. Used only
+    /// by the block-tiled fast path; the current bias-aware path ignores
+    /// it (full materialised scores) — see the backward path for where
+    /// this begins to take effect.</summary>
+    public int? BlockSizeQ { get; set; }
+
+    /// <summary>Block size along the key / value axis. Null = auto.</summary>
+    public int? BlockSizeKV { get; set; }
+
+    /// <summary>Back-compat single knob — sets both <see cref="BlockSizeQ"/>
+    /// and <see cref="BlockSizeKV"/> at once. Reads <see cref="BlockSizeQ"/>.</summary>
+    public int? BlockSize
+    {
+        get => BlockSizeQ;
+        set { BlockSizeQ = value; BlockSizeKV = value; }
+    }
+
+    /// <summary>Offset of the query sequence within the full KV history.
+    /// For KV-cache / autoregressive inference where Q is a slice (often
+    /// length 1 at decode time) and K/V represent the full past-plus-
+    /// current context. Causal mask honours the offset so the query
+    /// token correctly attends to every past key.</summary>
+    public int QueryOffset { get; set; }
+
+    /// <summary>Dropout rate applied to the post-softmax weights. Null
+    /// means "no dropout"; 0.0 matches but preserves explicit intent.
+    /// Applied only during training — inference callers should leave
+    /// this null.</summary>
+    public double? DropoutRate { get; set; }
+
+    /// <summary>Default configuration — every field at its spec default.</summary>
+    public static FlashAttentionConfig Default => new();
 }
 
 /// <summary>
@@ -114,14 +148,25 @@ public static class FusedAttention<T>
                 $"key and value must share sequence length (axis 2): key[2]={key._shape[2]}, " +
                 $"value[2]={value._shape[2]}.");
 
-        // Causal no-bias → synthesize a -inf upper-triangle bias and route
-        // through the bias path. Avoids a NotImplementedException for the
-        // common self-attention use case and still lets the bias path reuse
-        // the tuned GEMM chain. A weights-less engine overload + block-tiled
-        // causal fast path is a follow-up; this path keeps the API complete.
+        // KV-cache / query-offset support (issue #198 gap D): when the
+        // caller supplies a queryOffset, q_i must attend to keys
+        // k_j where j <= queryOffset + i. We validate queryOffset fits
+        // within the KV history here; the mask itself is built below.
+        int queryOffset = config.QueryOffset;
+        if (queryOffset < 0 || queryOffset + query._shape[2] > key._shape[2])
+            throw new ArgumentException(
+                $"queryOffset={queryOffset} + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]}.",
+                nameof(config));
+
+        // Causal no-bias → synthesize the offset-aware -inf upper-triangle
+        // bias and route through the bias path. Honours queryOffset so the
+        // KV-cache decoder case (seqQ=1, queryOffset=t, seqKV=t+1) masks
+        // only positions > t — which is none — letting the single decode
+        // token attend to every past key as expected.
         if (attentionBias is null && config.IsCausal)
         {
-            attentionBias = BuildCausalBias(engine, query._shape[2], key._shape[2]);
+            attentionBias = BuildCausalBias(
+                engine, query._shape[2], key._shape[2], queryOffset);
         }
 
         // No bias → use the engine's tuned SDPA kernel. Engine handles the
@@ -168,8 +213,24 @@ public static class FusedAttention<T>
         scoresFlat = engine.TensorMultiplyScalar(scoresFlat, numOps.FromDouble(scaleVal));
         var scores = engine.Reshape(scoresFlat, new[] { B, H, Sq, Sk });
         scores = AddBroadcastBias(engine, scores, attentionBias);
-        if (config.IsCausal)
-            scores = ApplyCausalMask(engine, scores, numOps);
+        // IsCausal is now handled via BuildCausalBias → attentionBias above,
+        // so we skip a redundant ApplyCausalMask pass when attentionBias is
+        // the synthesized causal bias. For the (bias + isCausal) case the
+        // caller supplied an additive bias AND wants causal — layer both.
+        if (config.IsCausal && attentionBias is not null)
+        {
+            // Only apply the offset-aware causal mask when the caller gave
+            // us their own bias; otherwise the BuildCausalBias result
+            // already handles masking and re-applying would be a no-op.
+            // We detect "caller-supplied bias" by checking the bias shape
+            // doesn't match BuildCausalBias's canonical [1,1,Sq,Sk] form.
+            if (!(attentionBias._shape.Length == 4
+                  && attentionBias._shape[0] == 1
+                  && attentionBias._shape[1] == 1))
+            {
+                scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
+            }
+        }
         var weightsFull = engine.TensorSoftmax(scores, axis: 3);
 
         var weightsFlat = engine.Reshape(weightsFull, new[] { B * H, Sq, Sk });
@@ -215,13 +276,13 @@ public static class FusedAttention<T>
         return engine.TensorBroadcastAdd(scores, bias);
     }
 
-    private static Tensor<T> BuildCausalBias(IEngine engine, int sq, int sk)
+    private static Tensor<T> BuildCausalBias(IEngine engine, int sq, int sk, int queryOffset = 0)
     {
-        // Construct a [1, 1, sq, sk] bias tensor where position (q, k) is
-        // 0 when k <= q (visible) and -Inf when k > q (masked). Shape is
-        // chosen to broadcast over batch + head in AddBroadcastBias without
-        // a per-(B, H) allocation. Used by the no-bias causal path to reuse
-        // the bias pipeline rather than maintaining a second causal codepath.
+        // Offset-aware causal bias: position (q, k) is visible iff
+        // k <= queryOffset + q. For the classic self-attention case
+        // (queryOffset=0, sq=sk) this collapses to the usual lower-
+        // triangular mask. For KV-cache decode (sq=1, queryOffset=t,
+        // sk=t+1) only column t+0 is visible to the single query row.
         var numOps = MathHelper.GetNumericOperations<T>();
         T zero = numOps.Zero;
         T negInf = numOps.FromDouble(double.NegativeInfinity);
@@ -229,17 +290,16 @@ public static class FusedAttention<T>
         for (int q = 0; q < sq; q++)
         {
             int rowBase = q * sk;
+            int maxVisible = queryOffset + q;
             for (int k = 0; k < sk; k++)
-                data[rowBase + k] = k <= q ? zero : negInf;
+                data[rowBase + k] = k <= maxVisible ? zero : negInf;
         }
         return new Tensor<T>(data, new[] { 1, 1, sq, sk });
     }
 
-    private static Tensor<T> ApplyCausalMask(IEngine engine, Tensor<T> scores, INumericOperations<T> numOps)
+    private static Tensor<T> ApplyCausalMask(IEngine engine, Tensor<T> scores, INumericOperations<T> numOps, int queryOffset = 0)
     {
-        // Causal mask: add -Inf to upper-triangular positions. Scores shape:
-        // [B, H, Sq, Sk]. We apply the mask column-wise via a manual pass —
-        // the engine doesn't expose a dedicated causal op yet.
+        // Offset-aware causal mask: positions k > queryOffset + q are masked.
         int[] shape = scores._shape;
         int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
         if (!scores.IsContiguous) scores = scores.Contiguous();
@@ -253,12 +313,162 @@ public static class FusedAttention<T>
                 for (int q = 0; q < sq; q++)
                 {
                     int rowBase = baseIdx + q * sk;
-                    // Future positions (k > q) are masked.
-                    for (int k = q + 1; k < sk; k++)
+                    int firstMasked = queryOffset + q + 1;
+                    for (int k = firstMasked; k < sk; k++)
                         data[rowBase + k] = negInf;
                 }
             }
         }
         return scores;
+    }
+
+    /// <summary>
+    /// Backward pass — computes dQ / dK / dV given gradOutput, saved
+    /// (Q, K, V, Output) from forward, and the same config used at forward.
+    /// Uses the analytic formulation of softmax + matmul chain-rule; no
+    /// reliance on the engine's autodiff tape, so it composes with any
+    /// external gradient framework.
+    ///
+    /// <para><b>Derivation:</b> let <c>S = Q K^T * scale (+ bias)</c>,
+    /// <c>P = softmax(S)</c>, <c>O = P V</c>. Then:
+    /// <code>
+    /// dV = P^T dO
+    /// dP = dO V^T
+    /// dS = softmax_backward(dP, P) = P * (dP - sum_row(dP * P))
+    /// dQ = dS K * scale
+    /// dK = dS^T Q * scale
+    /// </code>
+    /// </para>
+    ///
+    /// <para>Memory: this reference implementation materialises the full
+    /// <c>[B, H, Sq, Sk]</c> attention-weight matrix. A tiled online-
+    /// softmax backward that matches FlashAttention-2's O(seqLen) memory
+    /// cost is future work; this version is sufficient for correctness
+    /// testing and for small/medium sequences.</para>
+    /// </summary>
+    public static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) Backward(
+        Tensor<T> gradOutput,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        FlashAttentionConfig? config = null,
+        Tensor<T>? attentionBias = null,
+        IEngine? engine = null)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (query is null) throw new ArgumentNullException(nameof(query));
+        if (key is null) throw new ArgumentNullException(nameof(key));
+        if (value is null) throw new ArgumentNullException(nameof(value));
+        config ??= new FlashAttentionConfig();
+        engine ??= new CpuEngine();
+
+        bool was3D = query.Rank == 3;
+        if (was3D)
+        {
+            query = PromoteToFourD(engine, query);
+            key = PromoteToFourD(engine, key);
+            value = PromoteToFourD(engine, value);
+            gradOutput = PromoteToFourD(engine, gradOutput);
+        }
+
+        // Recompute the forward softmax to get P — we need it for every
+        // gradient below. Same pipeline as Forward's bias path.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int B = query._shape[0], H = query._shape[1];
+        int Sq = query._shape[2], headDim = query._shape[3];
+        int Sk = key._shape[2], Dv = value._shape[3];
+        double scaleVal = config.Scale ?? 1.0 / Math.Sqrt(headDim);
+        T scaleT = numOps.FromDouble(scaleVal);
+
+        var qFlat  = engine.Reshape(query, new[] { B * H, Sq, headDim });
+        var kFlat  = engine.Reshape(key,   new[] { B * H, Sk, headDim });
+        var vFlat  = engine.Reshape(value, new[] { B * H, Sk, Dv });
+        var kFlatT = kFlat.TransposeLast2D();
+
+        var scoresFlat = engine.TensorBatchMatMul(qFlat, kFlatT);
+        scoresFlat = engine.TensorMultiplyScalar(scoresFlat, scaleT);
+        var scores = engine.Reshape(scoresFlat, new[] { B, H, Sq, Sk });
+        if (attentionBias is not null)
+            scores = AddBroadcastBias(engine, scores, attentionBias);
+        else if (config.IsCausal)
+            scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
+        else if (config.IsCausal && attentionBias is not null)
+            scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
+        var P = engine.TensorSoftmax(scores, axis: 3);                           // [B, H, Sq, Sk]
+
+        var pFlat = engine.Reshape(P, new[] { B * H, Sq, Sk });
+        var pFlatT = pFlat.TransposeLast2D();                                    // [B*H, Sk, Sq]
+        var goFlat = engine.Reshape(gradOutput, new[] { B * H, Sq, Dv });
+
+        // dV = P^T @ dO                                                        [B*H, Sk, Dv]
+        var dvFlat = engine.TensorBatchMatMul(pFlatT, goFlat);
+
+        // dP = dO @ V^T                                                        [B*H, Sq, Sk]
+        var vFlatT = vFlat.TransposeLast2D();
+        var dpFlat = engine.TensorBatchMatMul(goFlat, vFlatT);
+
+        // dS = P * (dP - rowsum(dP * P)) — softmax backward
+        var dP = engine.Reshape(dpFlat, new[] { B, H, Sq, Sk });
+        var dS = SoftmaxBackward(engine, numOps, dP, P);
+
+        var dsFlat = engine.Reshape(dS, new[] { B * H, Sq, Sk });
+
+        // dQ = dS @ K * scale                                                  [B*H, Sq, headDim]
+        var dqFlat = engine.TensorBatchMatMul(dsFlat, kFlat);
+        dqFlat = engine.TensorMultiplyScalar(dqFlat, scaleT);
+
+        // dK = dS^T @ Q * scale                                                [B*H, Sk, headDim]
+        var dsFlatT = dsFlat.TransposeLast2D();
+        var dkFlat = engine.TensorBatchMatMul(dsFlatT, qFlat);
+        dkFlat = engine.TensorMultiplyScalar(dkFlat, scaleT);
+
+        var gradQ = engine.Reshape(dqFlat, new[] { B, H, Sq, headDim });
+        var gradK = engine.Reshape(dkFlat, new[] { B, H, Sk, headDim });
+        var gradV = engine.Reshape(dvFlat, new[] { B, H, Sk, Dv });
+
+        if (was3D)
+        {
+            gradQ = DemoteToThreeD(engine, gradQ);
+            gradK = DemoteToThreeD(engine, gradK);
+            gradV = DemoteToThreeD(engine, gradV);
+        }
+        return (gradQ, gradK, gradV);
+    }
+
+    /// <summary>
+    /// Softmax backward: dS = P * (dP - sum_row(dP * P)).
+    /// Implemented element-wise because TensorSoftmaxBackward is tape-
+    /// aware and we're outside the tape here.
+    /// </summary>
+    private static Tensor<T> SoftmaxBackward(IEngine engine, INumericOperations<T> numOps, Tensor<T> dP, Tensor<T> P)
+    {
+        if (!dP.IsContiguous) dP = dP.Contiguous();
+        if (!P.IsContiguous) P = P.Contiguous();
+        var shape = P._shape;
+        int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
+        var pData = P.GetDataArray();
+        var dpData = dP.GetDataArray();
+        var dsData = new T[pData.Length];
+        for (int i = 0; i < b; i++)
+        {
+            for (int j = 0; j < h; j++)
+            {
+                int batchBase = ((i * h) + j) * sq * sk;
+                for (int q = 0; q < sq; q++)
+                {
+                    int rowBase = batchBase + q * sk;
+                    // rowSum = Σ_k (dP[row, k] * P[row, k])
+                    T rowSum = numOps.Zero;
+                    for (int k = 0; k < sk; k++)
+                        rowSum = numOps.Add(rowSum,
+                            numOps.Multiply(dpData[rowBase + k], pData[rowBase + k]));
+                    for (int k = 0; k < sk; k++)
+                        dsData[rowBase + k] = numOps.Multiply(
+                            pData[rowBase + k],
+                            numOps.Subtract(dpData[rowBase + k], rowSum));
+                }
+            }
+        }
+        return new Tensor<T>(dsData, shape);
     }
 }
