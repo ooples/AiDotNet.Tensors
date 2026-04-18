@@ -326,6 +326,135 @@ public static class AutotuneCache
     }
 
     /// <summary>
+    /// One-call warmup of every kernel registered in
+    /// <see cref="AutotuneKernelCatalog"/> at the supplied representative
+    /// shapes. Callers don't need to know Tensors-internal KernelIds or
+    /// variant spaces — the catalog supplies both. For each (kernel, shape)
+    /// that isn't already cached, every registered variant is benchmarked
+    /// and the highest-GFLOPS winner is persisted.
+    /// </summary>
+    /// <param name="representativeInputShapes">Shapes to warm up each
+    /// kernel at. When null, a conservative default set covering common
+    /// MLP/transformer matmul dims is used.</param>
+    /// <param name="progress">Receives a per-entry progress line
+    /// (<c>"warmed {kernel.ToFileStem()} @ {shape} → {variant} ({gflops:F1} GFLOPS)"</c>).</param>
+    /// <param name="ct">Cancellation.</param>
+    public static Task<AutotuneWarmupReport> WarmupCommonKernelsAsync(
+        IEnumerable<int[]>? representativeInputShapes = null,
+        IProgress<string>? progress = null,
+        CancellationToken ct = default)
+    {
+        return WarmupInternalAsync(
+            AutotuneKernelCatalog.Entries,
+            representativeInputShapes ?? DefaultRepresentativeShapes(),
+            progress,
+            ct);
+    }
+
+    /// <summary>
+    /// Variant of <see cref="WarmupCommonKernelsAsync"/> that limits the
+    /// warmup to catalog entries whose <see cref="KernelId.Category"/>
+    /// matches <paramref name="category"/>. Use when you only care about
+    /// one op family (e.g. <c>"gemm"</c>) and want to skip the rest.
+    /// </summary>
+    public static Task<AutotuneWarmupReport> WarmupCategoryAsync(
+        string category,
+        IEnumerable<int[]> representativeInputShapes,
+        IProgress<string>? progress = null,
+        CancellationToken ct = default)
+    {
+        if (category is null) throw new ArgumentNullException(nameof(category));
+        if (representativeInputShapes is null) throw new ArgumentNullException(nameof(representativeInputShapes));
+        return WarmupInternalAsync(
+            AutotuneKernelCatalog.EntriesForCategory(category),
+            representativeInputShapes,
+            progress,
+            ct);
+    }
+
+    private static async Task<AutotuneWarmupReport> WarmupInternalAsync(
+        IReadOnlyList<AutotuneCatalogEntry> entries,
+        IEnumerable<int[]> shapes,
+        IProgress<string>? progress,
+        CancellationToken ct)
+    {
+        var shapeList = (shapes as IReadOnlyList<int[]>) ?? shapes.ToArray();
+        var shapeProfiles = new ShapeProfile[shapeList.Count];
+        for (int i = 0; i < shapeList.Count; i++)
+            shapeProfiles[i] = new ShapeProfile(shapeList[i]);
+
+        var best = new Dictionary<string, double>();
+        int kernelsWarmed = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Sequential outer loop (per-variant benchmarking is already the
+        // parallel unit of work; running two distinct kernels concurrently
+        // on the same cores causes false contention and noise). If we ever
+        // want multi-GPU warmup, the catalog entry can internally parallelise
+        // across devices.
+        foreach (var entry in entries)
+        {
+            ct.ThrowIfCancellationRequested();
+            bool anyFreshBenchmark = false;
+            foreach (var shape in shapeProfiles)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (Lookup(entry.Id, shape) is { } existing)
+                {
+                    best[ReportKey(entry.Id, shape)] = existing.MeasuredGflops;
+                    progress?.Report($"cached {entry.Id.ToFileStem()} @ {shape.ToFileStem()} ({existing.Variant}, {existing.MeasuredGflops:F1} GFLOPS)");
+                    continue;
+                }
+
+                // Benchmark every variant, keep the highest-GFLOPS winner.
+                string bestVariant = "";
+                double bestGflops = double.NegativeInfinity;
+                foreach (var variant in entry.Variants(shape))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    double g = await entry.BenchmarkVariant(shape, variant, ct).ConfigureAwait(false);
+                    if (g > bestGflops)
+                    {
+                        bestGflops = g;
+                        bestVariant = variant;
+                    }
+                }
+
+                if (bestGflops > 0)
+                {
+                    var choice = new KernelChoice
+                    {
+                        Variant = bestVariant,
+                        MeasuredGflops = bestGflops,
+                    };
+                    TryStore(entry.Id, shape, choice);
+                    best[ReportKey(entry.Id, shape)] = bestGflops;
+                    anyFreshBenchmark = true;
+                    progress?.Report($"warmed {entry.Id.ToFileStem()} @ {shape.ToFileStem()} → {bestVariant} ({bestGflops:F1} GFLOPS)");
+                }
+            }
+            if (anyFreshBenchmark) kernelsWarmed++;
+        }
+        sw.Stop();
+        return new AutotuneWarmupReport(kernelsWarmed, shapeProfiles.Length, sw.Elapsed, best);
+    }
+
+    private static string ReportKey(KernelId id, ShapeProfile shape)
+        => $"{id.ToFileStem()}@{shape.ToFileStem()}";
+
+    private static int[][] DefaultRepresentativeShapes() => new[]
+    {
+        // Common MLP / single-token inference shapes. GEMM (M, N, K) is
+        // interpreted by each catalog entry. For 2-D input-activation
+        // shapes the entry can treat indices as (batch, features).
+        new[] { 1, 784 },
+        new[] { 32, 784 },
+        new[] { 128, 784 },
+        new[] { 1, 768 },    // BERT-base hidden dim
+        new[] { 32, 768 },
+    };
+
+    /// <summary>
     /// Deletes every cache file under the current hardware fingerprint's
     /// directory. Intended for tests and for operators who want to force a
     /// full re-tune (e.g. after a driver upgrade on the same hardware that
