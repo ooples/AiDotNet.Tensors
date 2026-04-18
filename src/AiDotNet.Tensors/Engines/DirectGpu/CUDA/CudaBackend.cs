@@ -23,6 +23,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // cuDNN helpers — lazily initialized on first Conv2D call that routes
+    // through the cuDNN dispatch path. Kept private so disposal is linked
+    // to this backend's lifetime; the helpers' cuDNN handles survive
+    // repeated kernel invocations (workspace reuse + descriptor cache).
+    private CuDnnContext? _cudnnContext;
+    private CuDnnConvolution? _cudnnConv;
     private CudaStream? _defaultStream;
     private IntPtr _activationModule;
     private IntPtr _convolutionModule;
@@ -2970,12 +2976,36 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        // Record dispatch path. Today all Conv2D calls run through the
-        // hand-written kernels below (Winograd / tiled / im2col). The
-        // cuDNN dispatch (gated by CudaDispatchPolicy.UseCudnnForConv)
-        // lands when CuDnnConvolution gains a GPU-buffer variant — this
-        // scope already distinguishes the path in telemetry so the flip
-        // is a drop-in change.
+        // cuDNN fast path (issue #201). Gated on the UseCudnnForConv
+        // policy + CuDnnConvolution.IsAvailable at init. Dispatches the
+        // GPU-pointer variant directly — caller-owned input / kernel /
+        // output buffers, no host round-trip. Scope is opened here so
+        // PerformanceProfiler stats distinguish "Conv2D.cuDNN" vs
+        // "Conv2D.generic" for consumers verifying which path ran.
+        if (CudaDispatchPolicy.UseCudnnForConv)
+        {
+            using var _profileCudnn = CudaDispatchPolicy.Scope("Conv2D", useVendor: true);
+            using var _ctxCudnn = PushContext();
+            EnsureCudnnConv();
+            // Stream affinity: cuDNN kernels launch onto this backend's
+            // default stream so they interleave correctly with the
+            // surrounding Cuda ops.
+            CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream);
+            _cudnnConv!.Conv2DForwardGpu(
+                inputDevPtr: input.Handle,
+                filterDevPtr: kernel.Handle,
+                outputDevPtr: output.Handle,
+                n: batch, c: inChannels, h: inHeight, w: inWidth,
+                k: outChannels, filterH: kernelH, filterW: kernelW,
+                outputHeight: outHeight, outputWidth: outWidth,
+                padH: padH, padW: padW,
+                strideH: strideH, strideW: strideW,
+                dilationH: dilationH, dilationW: dilationW);
+            return;
+        }
+
+        // Generic-kernel path — Winograd / tiled / im2col — when the policy
+        // opts out (debug / forced-generic) or cuDNN isn't available.
         using var _profile = CudaDispatchPolicy.Scope(
             "Conv2D",
             useVendor: false);
@@ -3086,6 +3116,17 @@ public sealed class CudaBackend : IAsyncGpuBackend
             dArgs[17] = &dilationW;
             LaunchKernel3D(cudaKernel, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, dArgs, 0);
         }
+    }
+
+    /// <summary>Lazily spin up the cuDNN context + convolution helper on
+    /// the first call that routes Conv2D through the vendor path. Both
+    /// live for the lifetime of this backend and are released in
+    /// <see cref="Dispose"/>.</summary>
+    private void EnsureCudnnConv()
+    {
+        if (_cudnnConv is not null) return;
+        _cudnnContext ??= new CuDnnContext();
+        _cudnnConv = new CuDnnConvolution(_cudnnContext);
     }
 
     public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -10816,6 +10857,19 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _disposed = true;
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
+
+        // cuDNN helper disposes its workspace + context. Only created if
+        // Conv2D routed through the vendor path at least once.
+        if (_cudnnConv is not null)
+        {
+            _cudnnConv.Dispose();
+            _cudnnConv = null;
+        }
+        if (_cudnnContext is not null)
+        {
+            _cudnnContext.Dispose();
+            _cudnnContext = null;
+        }
 
         if (_cublasHandle != IntPtr.Zero)
         {
