@@ -1,3 +1,5 @@
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Onnx.Protos;
@@ -388,6 +390,26 @@ internal static class ConvOperators
             // Conv gets the symmetric residual.
             var zero = default(T);
             var (paddedInput, symmetricPad) = OnnxAutoPad.ApplyAsymmetricND(ctx.Engine, input, pad, spatialRank, zero);
+
+            // Layout policy (C10): auto-promote to NCHWc8 when the shape
+            // qualifies and we can keep the whole Conv in the packed kernel.
+            // The *with-bias* case needs an NCHWc-aware bias add (coming as
+            // ConvBiasBn fusion in C9); until then, only pack when bias is
+            // absent so the unfused bias-add doesn't see a packed tensor.
+            // Also skipped under GraphMode — the eager ReorderToNchwc call
+            // forces the padded-input placeholder to realize before the plan
+            // has filled it, baking zeros into the packed buffer.
+            if (typeof(T) == typeof(float)
+                && spatialRank == 2
+                && group == 1
+                && !hasBias
+                && !GraphMode.IsActive
+                && paddedInput.Layout == LinearAlgebra.TensorLayout.Nchw
+                && paddedInput._shape[1] % LayoutPlanner.PreferredCBlock == 0
+                && kernel._shape[0] % LayoutPlanner.PreferredCBlock == 0)
+            {
+                paddedInput = ctx.Engine.ReorderToNchwc(paddedInput, LinearAlgebra.TensorLayout.Nchwc8);
+            }
 
             Tensor<T> result;
             if (group == 1)

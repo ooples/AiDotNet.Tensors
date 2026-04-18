@@ -2058,6 +2058,27 @@ public class CpuEngine : ITensorLevelEngine
         if (x.Rank != 4)
             throw new ArgumentException($"BatchNormInference requires rank-4 input, got rank {x.Rank}.");
 
+        // GraphMode: record lazy node — never execute eagerly, or the plan
+        // would bake placeholder data into the frozen BN output.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance;
+                double capE = epsilon;
+                return scope.RecordVariadic(LazyNodeType.Custom, "BatchNormInference",
+                    new[] { x, gamma, beta, mean, variance }, x._shape,
+                    (eng, output) =>
+                    {
+                        var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = r.Layout;
+                    },
+                    savedState: new object[] { epsilon });
+            }
+        }
+
         // Float fast paths — the common case for ONNX vision models.
         if (typeof(T) == typeof(float))
         {
@@ -24092,10 +24113,17 @@ public class CpuEngine : ITensorLevelEngine
         // Step 1: Conv2D
         var result = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
 
-        // Step 2: Add bias if provided
+        // Step 2: Add bias if provided. Right-align broadcast: a rank-1
+        // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
+        // with the NCHW result's channel axis, not the innermost (W) dim.
         if (bias != null)
         {
-            result = TensorBroadcastAdd(result, bias);
+            var biasView = bias;
+            if (bias.Rank == 1 && result.Rank == 4 && bias._shape[0] == result._shape[1])
+            {
+                biasView = Reshape(bias, new[] { 1, bias._shape[0], 1, 1 });
+            }
+            result = TensorBroadcastAdd(result, biasView);
         }
 
         // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)

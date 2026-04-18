@@ -213,6 +213,26 @@ public static class OnnxImporter
                 var translator = registry.Find(node.OpType,
                     string.IsNullOrEmpty(node.Domain) ? null : node.Domain)!;
 
+                // Layout policy (C10): if this op requires NCHW but an input
+                // arrives in a packed NCHWc layout (emitted by an upstream
+                // Conv2D fast path), auto-unpack before translation. Keeps
+                // shape-changing / matmul ops from silently reading packed
+                // physical memory as if it were NCHW.
+                if (LayoutPlanner.RequiresNchw(node.OpType))
+                {
+                    for (int inIdx = 0; inIdx < node.Input.Count; inIdx++)
+                    {
+                        var inName = node.Input[inIdx];
+                        if (string.IsNullOrEmpty(inName)) continue;
+                        if (tensorsByName.TryGetValue(inName, out var t) &&
+                            t.Layout != LinearAlgebra.TensorLayout.Nchw &&
+                            t.Rank == 4)
+                        {
+                            tensorsByName[inName] = engine.ReorderToNchw(t);
+                        }
+                    }
+                }
+
                 // Constant-folding: if every input to this node is a
                 // *static* eager tensor — an initializer or an already-
                 // folded op's output, but NOT a graph-input placeholder —
