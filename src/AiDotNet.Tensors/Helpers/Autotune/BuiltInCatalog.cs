@@ -41,6 +41,15 @@ internal static class BuiltInCatalog
 {
     public static readonly KernelId SGEMM = new("gemm", "cpu-simd-sgemm");
 
+    // Registration latch MUST be set only AFTER Register() successfully
+    // completes. The previous Interlocked.Exchange-then-Register ordering
+    // had two failure modes: (a) a concurrent caller could observe
+    // _registered == 1 while Register() was still in flight and call
+    // AutotuneCache.Lookup before the catalog entry was installed, and
+    // (b) if Register() threw, _registered stayed at 1 forever and the
+    // registration could never be retried. Fix via double-checked locking
+    // with Volatile.Write after the successful registration completes.
+    private static readonly object _registerGate = new();
     private static int _registered;
 
     /// <summary>Idempotently registers the built-in catalog entries.
@@ -48,17 +57,24 @@ internal static class BuiltInCatalog
     /// registry is warm before any Warmup call.</summary>
     public static void EnsureRegistered()
     {
-        if (Interlocked.Exchange(ref _registered, 1) == 1) return;
-        AutotuneKernelCatalog.Register(new AutotuneCatalogEntry(
-            SGEMM,
-            variants: SgemmVariants,
-            benchmarkVariant: BenchmarkSgemmVariant));
+        if (Volatile.Read(ref _registered) == 1) return;
+        lock (_registerGate)
+        {
+            if (_registered == 1) return;
+            AutotuneKernelCatalog.Register(new AutotuneCatalogEntry(
+                SGEMM,
+                variants: SgemmVariants,
+                benchmarkVariant: BenchmarkSgemmVariant));
+            // Publish only after Register() succeeds. If Register throws,
+            // _registered stays 0 and the next caller retries.
+            Volatile.Write(ref _registered, 1);
+        }
     }
 
     /// <summary>Test hook — forces re-registration on the next EnsureRegistered
     /// call. Needed by AutotuneKernelCatalog.Clear tests so the module-init
     /// registrations don't shadow a Clear.</summary>
-    public static void ResetRegistrationForTests() => Interlocked.Exchange(ref _registered, 0);
+    public static void ResetRegistrationForTests() => Volatile.Write(ref _registered, 0);
 
     private static IEnumerable<string> SgemmVariants(ShapeProfile shape)
     {
@@ -94,9 +110,21 @@ internal static class BuiltInCatalog
         }
         if (m <= 0 || n <= 0 || k <= 0) return Task.FromResult(0.0);
 
-        var a = new float[m * k];
-        var b = new float[k * n];
-        var c = new float[m * n];
+        // Compute allocation sizes in long so we can detect int-overflow
+        // from large shapes BEFORE calling `new float[...]`. Overflowing
+        // sizes would either wrap to a small/negative allocation (wrong
+        // benchmark output) or push memory pressure into the tens of GB.
+        // Return 0.0 (the agreed "not applicable" signal) so the warmup
+        // driver skips this variant at this shape instead of throwing.
+        long aLen = (long)m * k;
+        long bLen = (long)k * n;
+        long cLen = (long)m * n;
+        if (aLen > int.MaxValue || bLen > int.MaxValue || cLen > int.MaxValue)
+            return Task.FromResult(0.0);
+
+        var a = new float[(int)aLen];
+        var b = new float[(int)bLen];
+        var c = new float[(int)cLen];
         var rng = new Random(0x515EE + variant.GetHashCode());
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
