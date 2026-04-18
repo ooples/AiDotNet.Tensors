@@ -232,6 +232,34 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     Tensor<T> Step();
 
     /// <summary>
+    /// CUDA-Graph-capture-safe counterpart to <see cref="Step"/>: runs forward +
+    /// backward, writes the final loss into <paramref name="lossOutput"/>, and
+    /// leaves gradients in <see cref="Gradients"/>. No per-call allocation of the
+    /// loss tensor — the captured graph records a memcpy node that lands in
+    /// <paramref name="lossOutput"/>'s backing memory on every replay.
+    /// </summary>
+    /// <param name="lossOutput">Caller-owned tensor whose shape equals the
+    /// plan's loss-tensor shape.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="lossOutput"/> is null.</exception>
+    /// <exception cref="ArgumentException">Shape mismatch against the plan's loss output.</exception>
+    /// <exception cref="ObjectDisposedException">Plan has been disposed.</exception>
+    void StepInto(Tensor<T> lossOutput);
+
+    /// <summary>
+    /// Copies caller input data into this plan's captured input buffer(s).
+    /// Same semantics as <see cref="ICompiledPlan{T}.SetInputs"/> — one
+    /// memcpy per call, kernels see the new data next <see cref="Step"/>.
+    /// Enables CUDA Graph capture of training loops where the input buffer
+    /// is refilled between replays.
+    /// </summary>
+    /// <param name="inputs">Inputs in captured order.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="inputs"/> is null.</exception>
+    /// <exception cref="ArgumentException">Length doesn't match the plan's
+    /// captured-input count or any input's shape doesn't match.</exception>
+    /// <exception cref="ObjectDisposedException">Plan has been disposed.</exception>
+    void SetInputs(Tensor<T>[] inputs);
+
+    /// <summary>
     /// Gradient tensors for each parameter, in the same order as the parameters
     /// passed to compilation. Updated after each Step() call.
     /// </summary>

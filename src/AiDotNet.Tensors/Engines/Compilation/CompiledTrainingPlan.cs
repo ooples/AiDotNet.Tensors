@@ -103,6 +103,63 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
+    /// <inheritdoc/>
+    public void StepInto(Tensor<T> lossOutput)
+    {
+        if (lossOutput is null) throw new ArgumentNullException(nameof(lossOutput));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        ValidateShapesMatch(_lossOutput, lossOutput, nameof(lossOutput));
+
+        // Run the plan into its internal loss buffer, then copy into the
+        // caller's buffer. Copy (not rebind) because specialized backward
+        // kernels capture gradient array references at compile time — a
+        // post-compile storage swap would leave those closures pointing
+        // at the old buffer. Under CUDA graph capture the copy becomes a
+        // device memcpy node and replays deterministically.
+        Step();
+        _lossOutput.AsSpan().CopyTo(lossOutput.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void SetInputs(Tensor<T>[] inputs)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+
+        // Training plan today captures at most a single input tensor (the
+        // graph-input placeholder of the traced forward pass). Multi-input
+        // graphs are tracked identically to the inference plan — per-name
+        // writes via the scope's captured references remain the path for
+        // N>1. Error naming mirrors the inference plan's shape.
+        int expected = _compiledInputTensor is null ? 0 : 1;
+        if (inputs.Length != expected)
+            throw new ArgumentException(
+                $"This plan was compiled with {expected} captured input(s); got {inputs.Length}.",
+                nameof(inputs));
+        if (expected == 0) return; // Zero-input plans accept empty as a no-op.
+
+        var src = inputs[0] ?? throw new ArgumentException(
+            "inputs[0] is null.", nameof(inputs));
+        ValidateShapesMatch(_compiledInputTensor!, src, "inputs[0]");
+        src.AsSpan().CopyTo(_compiledInputTensor!.AsWritableSpan());
+    }
+
+    private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
+    {
+        if (expected._shape.Length != actual._shape.Length)
+            throw new ArgumentException(
+                $"{paramName} rank {actual._shape.Length} != plan rank {expected._shape.Length}.",
+                paramName);
+        for (int i = 0; i < expected._shape.Length; i++)
+        {
+            if (expected._shape[i] != actual._shape[i])
+                throw new ArgumentException(
+                    $"{paramName} shape [{string.Join(", ", actual._shape)}] " +
+                    $"!= plan shape [{string.Join(", ", expected._shape)}].",
+                    paramName);
+        }
+    }
+
     // Fused optimizer state
     private Action? _optimizerUpdate;
     private int _optimizerStep;
