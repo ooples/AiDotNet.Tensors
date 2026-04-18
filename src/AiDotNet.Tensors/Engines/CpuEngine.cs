@@ -2435,6 +2435,31 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        // Generic trailing-repeat fast path — same rationale as
+        // TensorBroadcastMultiply. The DiT AdaLN shift path hits this every
+        // block × every inference step × every Predict, so the prior indexer-
+        // per-element fallback was a major transformer perf bug.
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = res.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, a, b, BackwardFunctions<T>.BroadcastAddBackward);
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb)); }
+            return res;
+        }
+
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
         var result = a.BroadcastAdd(b);
         DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, a, b, BackwardFunctions<T>.BroadcastAddBackward);
@@ -2549,33 +2574,112 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        // Fast path for [N,M] * [M] or [N,M] * [1,M] scaling pattern
-        if (typeof(T) == typeof(float) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        // Generic trailing-repeat fast path (float + double + any T with SIMD numOps).
+        // Covers the AdaLN / transformer-bias shape pattern where b's shape is a
+        // trailing suffix of a's shape with leading dims all 1 — e.g.
+        //   [B, S, H] * [1, 1, H]   (DiT AdaLN)
+        //   [N, M]    * [1, M]      (dense bias)
+        //   [N, M]    * [M]         (dense bias, rank-dropped)
+        // For these, broadcasting is just repeating b across a.Length / b.Length
+        // tiles, each an elementwise multiply — a perfect fit for the SIMD
+        // numOps.Multiply(Span,Span,Span) kernel (Vector256<double> AVX2/FMA).
+        // Without this, the generic Tensor<T>.BroadcastMultiply at rank > 2
+        // falls back to an indexer-per-element loop that dominates transformer
+        // wall clock at ~100x slower than SIMD.
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            int rows = a._shape[0], cols = a._shape[1];
-            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
-            if (cols == bCols)
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = res.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
             {
-                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-                var af = (float[])(object)a.GetDataArray();
-                var bf = (float[])(object)b.GetDataArray();
-                var rf = (float[])(object)res.GetDataArray();
-                for (int r = 0; r < rows; r++)
-                {
-                    int off = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rf[off + c] = af[off + c] * bf[c];
-                }
-                DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
-                return res;
+                int off = t * bTileSize;
+                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
+            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+            return res;
         }
 
         var result = a.BroadcastMultiply(b);
         DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorBroadcastMultiply(ca, cb)); }
         return result;
+    }
+
+    /// <summary>
+    /// Detects the "trailing-repeat" broadcast pattern where <paramref name="b"/>
+    /// broadcasts over <paramref name="a"/> by matching a trailing suffix of
+    /// <paramref name="a"/>'s shape, with any preceding dimensions all equal to 1.
+    /// The caller can then treat the broadcast as <c>a.Length / b.Length</c>
+    /// tiles of <c>b.Length</c> elementwise ops — the dominant shape pattern for
+    /// transformer AdaLN / dense-bias and the fundamental reason we don't want
+    /// to route these through the generic indexer-based fallback.
+    /// </summary>
+    /// <remarks>
+    /// Returns false for the Conv2D bias pattern <c>[B, C, H, W] op [1, C, 1, 1]</c>
+    /// because the broadcast is across the middle of the shape, not the trailing
+    /// suffix — that case has its own dedicated fast path elsewhere.
+    /// </remarks>
+    private static bool TryBroadcastTrailingRepeat<T>(Tensor<T> a, Tensor<T> b, out int tileSize)
+    {
+        tileSize = 0;
+        if (!a.IsContiguous || !b.IsContiguous) return false;
+        if (b.Rank == 0 || a.Rank < b.Rank) return false;
+        if (b.Length == 0 || a.Length % b.Length != 0) return false;
+
+        // Determine the longest trailing suffix of b whose dims are all > 1 and
+        // exactly match a's corresponding trailing dims — this is the "inner"
+        // tile that gets repeated across the outer dims. All b dims to the left
+        // of that suffix must be 1 (those are the broadcast axes). Any a dim on
+        // the left is arbitrary — it contributes to the tile count.
+        //
+        // Example shapes that succeed:
+        //   a=[B, S, H], b=[1, 1, H]          → tile = H        (DiT AdaLN)
+        //   a=[B, S, H], b=[H]                → tile = H        (rank-dropped bias)
+        //   a=[N, M],    b=[1, M]             → tile = M        (dense bias)
+        //   a=[B, H, W], b=[1, H, W]          → tile = H*W      (per-sample feature)
+        // Rejected (needs a different fast path or the general fallback):
+        //   a=[B, C, H, W], b=[1, C, 1, 1]    (broadcast in middle — Conv bias)
+        int aRank = a.Rank;
+        int bRank = b.Rank;
+        int offset = aRank - bRank;
+
+        // Walk b's dims right-to-left, find where the trailing "all-matching"
+        // suffix ends (i.e. first index from the left where b dim != a dim).
+        int splitPoint = bRank;
+        for (int i = bRank - 1; i >= 0; i--)
+        {
+            if (b._shape[i] == a._shape[offset + i])
+            {
+                splitPoint = i;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // All dims in b to the left of splitPoint must be 1 (broadcast axes).
+        for (int i = 0; i < splitPoint; i++)
+        {
+            if (b._shape[i] != 1) return false;
+        }
+
+        // Compute tile size = product of trailing matching dims.
+        int ts = 1;
+        for (int i = splitPoint; i < bRank; i++) ts *= b._shape[i];
+        if (ts == 0 || ts != b.Length) return false;
+
+        // Tile must tile a.Length evenly (should follow from the structural
+        // check, but guard anyway against zero-dim edge cases).
+        if (a.Length % ts != 0) return false;
+
+        tileSize = ts;
+        return true;
     }
 
     /// <inheritdoc/>
@@ -2876,25 +2980,13 @@ public class CpuEngine : ITensorLevelEngine
             if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, destination.Data, 0, m, n, p))
                 return;
 
-            // Fallback: compute via numOps into destination spans
+            // SIMD-blocked fallback (see TensorMatMul2D for rationale).
+            // MultiplyBlocked accumulates, so pre-zero the destination.
             var numOps = MathHelper.GetNumericOperations<T>();
-            var aSpan = a.AsSpan();
-            var bSpan = b.AsSpan();
-            var dstSpan = destination.AsWritableSpan();
-            dstSpan.Clear();
-
-            for (int i = 0; i < m; i++)
-            {
-                for (int k = 0; k < n; k++)
-                {
-                    T aVal = aSpan[i * n + k];
-                    for (int j = 0; j < p; j++)
-                    {
-                        dstSpan[i * p + j] = numOps.Add(dstSpan[i * p + j],
-                            numOps.Multiply(aVal, bSpan[k * p + j]));
-                    }
-                }
-            }
+            destination.AsWritableSpan().Clear();
+            MatrixMultiplyHelper.MultiplyBlocked(
+                numOps, a.Data, b.Data, destination.Data,
+                m, n, p, n, p, p);
             return;
         }
 
@@ -8511,25 +8603,20 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Fallback to parallel loops for non-float/double or when BLAS unavailable
-        // Must zero for accumulation pattern
+        // Fallback when TryGemm declines (non-float/double, below BLAS threshold,
+        // or — critically — Tensor<double> on every shape because BlasProvider is
+        // disabled and SimdGemm only ships an Sgemm path). Route through
+        // MatrixMultiplyHelper.MultiplyBlocked, which uses numOps.MultiplyAdd as
+        // its inner kernel. For Tensor<double>, that dispatches to
+        // SimdKernels.ScalarMultiplyAdd's AVX2/FMA Vector256<double> kernel —
+        // 50–100× faster than the naive Parallel.For triple-loop on AVX2 hosts.
+        // For other T, MultiplyBlocked still beats the naive loop via cache
+        // tiling + the numOps.MultiplyAdd virtual call's per-span amortization.
+        // MatrixMultiplyHelper.MultiplyBlocked accumulates (c += a·b) and does
+        // NOT clear the destination. Pre-clear result here so the accumulation
+        // starts from zero and we get matmul (c = a·b), not c += a·b.
         result.AsWritableSpan().Clear();
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
-        var rData = result.GetDataArray();
-
-        Parallel.For(0, m, i =>
-        {
-            for (int j = 0; j < p; j++)
-            {
-                T sum = numOps.Zero;
-                for (int k = 0; k < n; k++)
-                {
-                    sum = numOps.Add(sum, numOps.Multiply(aData[i * n + k], bData[k * p + j]));
-                }
-                rData[i * p + j] = sum;
-            }
-        });
+        MatrixMultiplyHelper.MultiplyBlocked(numOps, a.Data, b.Data, result.Data, m, n, p, n, p, p);
 
         return result;
     }
@@ -8615,18 +8702,16 @@ public class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            for (int i = 0; i < m; i++)
-            {
-                for (int j = 0; j < p; j++)
-                {
-                    T sum = numOps.Zero;
-                    for (int k = 0; k < n; k++)
-                    {
-                        sum = numOps.Add(sum, numOps.Multiply(aData[aOffset + i * n + k], bData[k * p + j]));
-                    }
-                    rData[resultOffset + i * p + j] = sum;
-                }
-            }
+            // SIMD-blocked fallback (see TensorMatMul2D for rationale). Pre-zero
+            // the slice since MultiplyBlocked accumulates. allowParallel:false
+            // because we're already inside a Parallel.For over batch — letting
+            // MultiplyBlocked spawn a second tier would oversubscribe.
+            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            MatrixMultiplyHelper.MultiplyBlocked(
+                numOps, a.Data, b.Data, result.Data,
+                m, n, p, n, p, p,
+                aOffset: aOffset, bOffset: 0, cOffset: resultOffset,
+                allowParallel: false);
         });
 
         return result;
@@ -8694,18 +8779,15 @@ public class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            for (int i = 0; i < m; i++)
-            {
-                for (int j = 0; j < p; j++)
-                {
-                    T sum = numOps.Zero;
-                    for (int k = 0; k < n; k++)
-                    {
-                        sum = numOps.Add(sum, numOps.Multiply(aData[aOffset + i * n + k], bData[bOffset + k * p + j]));
-                    }
-                    rData[resultOffset + i * p + j] = sum;
-                }
-            }
+            // SIMD-blocked fallback (see TensorMatMul2D for rationale). Pre-zero
+            // the slice since MultiplyBlocked accumulates. allowParallel:false
+            // because we're already inside a Parallel.For over batch.
+            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            MatrixMultiplyHelper.MultiplyBlocked(
+                numOps, a.Data, b.Data, result.Data,
+                m, n, p, n, p, p,
+                aOffset: aOffset, bOffset: bOffset, cOffset: resultOffset,
+                allowParallel: false);
         });
 
         return result;
@@ -14649,32 +14731,39 @@ public class CpuEngine : ITensorLevelEngine
         }
         else
         {
-        // Generic path for non-float types
+        // Generic T path — uses numOps.Sum (SIMD via SimdKernels.Sum for float/double)
+        // for the mean/variance reductions instead of a scalar accumulation loop,
+        // and uses span slicing for the output write pass. For double this takes
+        // each batch from ~3 × featureSize virtual calls (6144 for hidden=2048)
+        // down to 3 × SIMD reductions + 1 scalar output-write. Same structural
+        // principle as the other fallback fixes: no scalar loops for float/double.
+        T featureSizeT = numOps.FromDouble(featureSize);
         Parallel.For(0, batchSize, b =>
         {
             int offset = b * featureSize;
-            T featureSizeT = numOps.FromDouble(featureSize);
+            var inSlice = inputData.AsSpan(offset, featureSize);
 
-            T sum = numOps.Zero;
-            for (int f = 0; f < featureSize; f++)
-                sum = numOps.Add(sum, inputData[offset + f]);
+            T sum = numOps.Sum(inSlice);
             T m = numOps.Divide(sum, featureSizeT);
             meanData[b] = m;
 
+            // Variance: still scalar-per-element because we need (x-m)² and there's
+            // no fused primitive. Still uses local `m` to avoid re-computation.
             T sumSq = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
             {
-                T diff = numOps.Subtract(inputData[offset + f], m);
+                T diff = numOps.Subtract(inSlice[f], m);
                 sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
             }
             T v = numOps.Divide(sumSq, featureSizeT);
             varData[b] = v;
 
             T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(v, eps)));
+            var outSlice = outputData.AsSpan(offset, featureSize);
             for (int f = 0; f < featureSize; f++)
             {
-                T normalized = numOps.Multiply(numOps.Subtract(inputData[offset + f], m), invStd);
-                outputData[offset + f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
+                T normalized = numOps.Multiply(numOps.Subtract(inSlice[f], m), invStd);
+                outSlice[f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
             }
         });
         }
@@ -15689,6 +15778,27 @@ public class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)resultF;
         }
 
+        // Double-precision fast path mirrors the float version. Uses
+        // MatrixMultiplyHelper.MultiplyBlocked as the GEMM kernel — the helper's
+        // numOps.MultiplyAdd inner kernel dispatches to SimdKernels'
+        // AVX2/FMA Vector256<double> path, so each per-head GEMM runs at SIMD
+        // throughput instead of the scalar virtual-dispatch triple-loop the
+        // generic-T fallback below would otherwise hit. For Pika21 / DiT-XL at
+        // double precision this collapses ~75M scalar virtual FMAs per SDPA
+        // call (× 24-28 blocks × 50 inference steps) into batched SIMD GEMMs.
+        if (typeof(T) == typeof(double))
+        {
+            var resultD = ScaledDotProductAttentionDouble(
+                (Tensor<double>)(object)query,
+                (Tensor<double>)(object)key,
+                (Tensor<double>)(object)value,
+                mask, scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out var weightsD);
+            attentionWeights = (Tensor<T>)(object)weightsD;
+            return (Tensor<T>)(object)resultD;
+        }
+
         T scaleFactor = numOps.FromDouble(scaleVal);
 
         // Compute attention scores: Q @ K^T -> [batch, heads, seqQ, seqK]
@@ -15952,6 +16062,141 @@ public class CpuEngine : ITensorLevelEngine
             // every slot in the next rental) and clearing a 16 MB buffer would
             // undo the allocation savings.
             System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// SIMD-backed double-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
+    /// Replaces the scalar virtual-dispatch triple-loop with two SIMD-blocked DGEMMs per head
+    /// (Q·K^T then P·V), parallelized across batch*heads. Uses
+    /// <see cref="MatrixMultiplyHelper.MultiplyBlocked"/> as the kernel because BlasProvider
+    /// is disabled and SimdGemm only ships an Sgemm path; MultiplyBlocked's inner
+    /// numOps.MultiplyAdd dispatches to SimdKernels' AVX2/FMA Vector256&lt;double&gt; kernel.
+    /// <para>
+    /// Mirrors the structure of <see cref="ScaledDotProductAttentionFloat"/> exactly so the
+    /// two paths stay easy to keep in sync. The K^T transpose is materialized into a per-head
+    /// scratch buffer because MultiplyBlocked has no transposed-B variant.
+    /// </para>
+    /// </summary>
+    private Tensor<double> ScaledDotProductAttentionDouble(
+        Tensor<double> query,
+        Tensor<double> key,
+        Tensor<double> value,
+        Tensor<bool>? mask,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<double> attentionWeights)
+    {
+        int bhCount = batch * heads;
+        // Use the stride-aware accessor on all three operands for consistency.
+        // Contiguous() was already called on the public entry point, so the
+        // three calls return identical data today — but keeping them on the
+        // same accessor guards against divergence if the contract ever changes
+        // or a future caller forgets the contiguity contract.
+        var qd = query.GetFlattenedData();
+        var kd = key.GetFlattenedData();
+        var vd = value.GetFlattenedData();
+        var doubleOps = MathHelper.GetNumericOperations<double>();
+
+        // scoresData is internal scratch — rent from ArrayPool to amortize the
+        // per-call allocation across the SDPA hot path (24-28 calls per DiT
+        // forward × 50 inference steps).
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
+        try
+        {
+            var weightsData = new double[scoresLen];
+            var outputData = new double[bhCount * seqQ * d_v];
+            double negInfD = double.NegativeInfinity;
+
+            Parallel.For(0, bhCount, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+                int qOff = bh * seqQ * d_k;
+                int kOff = bh * seqK * d_k;
+                int sOff = bh * seqQ * seqK;
+
+                // ──── Step 1: scores = Q @ K^T.
+                // MultiplyBlocked has no transposed-B variant, so materialize K^T
+                // into a per-head scratch buffer rented from ArrayPool. allowParallel:
+                // false because we're already inside Parallel.For(bhCount).
+                var kt = System.Buffers.ArrayPool<double>.Shared.Rent(d_k * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kd[kOff + i * d_k + j];
+
+                    var scoresSlice = new Memory<double>(scoresData, sOff, seqQ * seqK);
+                    scoresSlice.Span.Clear();
+                    MatrixMultiplyHelper.MultiplyBlocked(
+                        doubleOps,
+                        new ReadOnlyMemory<double>(qd, qOff, seqQ * d_k),
+                        new ReadOnlyMemory<double>(kt, 0, d_k * seqK),
+                        scoresSlice,
+                        seqQ, d_k, seqK,
+                        d_k, seqK, seqK,
+                        allowParallel: false);
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(kt, clearArray: false); }
+
+                // ──── Step 2: fused scale + mask + numerically-stable softmax.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    double maxVal = negInfD;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double v = scoresData[rowOff + j] * scaleValue;
+                        if (mask != null && !mask[b, h, i, j]) v = negInfD;
+                        if (v > maxVal) maxVal = v;
+                        scoresData[rowOff + j] = v;
+                    }
+                    if (double.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++)
+                            weightsData[rowOff + j] = 0d;
+                        continue;
+                    }
+                    double sumExp = 0d;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double e = Math.Exp(scoresData[rowOff + j] - maxVal);
+                        weightsData[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    double inv = sumExp != 0d ? 1d / sumExp : 0d;
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] *= inv;
+                }
+
+                // ──── Step 3: output = weights @ V (no transpose).
+                int wOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+                var outSlice = new Memory<double>(outputData, oOff, seqQ * d_v);
+                outSlice.Span.Clear();
+                MatrixMultiplyHelper.MultiplyBlocked(
+                    doubleOps,
+                    new ReadOnlyMemory<double>(weightsData, wOff, seqQ * seqK),
+                    new ReadOnlyMemory<double>(vd, vOff, seqK * d_v),
+                    outSlice,
+                    seqQ, seqK, d_v,
+                    seqK, d_v, d_v,
+                    allowParallel: false);
+            });
+
+            attentionWeights = TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, seqK },
+                new Vector<double>(weightsData));
+            return TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, d_v },
+                new Vector<double>(outputData));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
         }
     }
 
