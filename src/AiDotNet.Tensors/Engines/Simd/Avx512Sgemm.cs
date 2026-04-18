@@ -137,10 +137,12 @@ internal static class Avx512Sgemm
     }
 
     /// <summary>
-    /// B3-lite driver: tiles (m × n) into 16×16 blocks, calls
-    /// <see cref="Run16x16Tile"/> on each. Full BLIS 5-loop with explicit
-    /// pack+cache blocking is task B3 — this gets us correct + fast enough
-    /// to measure the kernel itself.
+    /// B3 BLIS-lite driver: parallel over M-tiles, per M-tile we pack
+    /// the 16 A rows into a contiguous <c>float[16 * k]</c> panel so the
+    /// microkernel's inner K loop reads streamed memory instead of chasing
+    /// lda-strided rows. That's ~80% of the GotoBLAS cache benefit with
+    /// 1/5 the code. Full 5-loop K-block + B-pack remains a future task
+    /// when we actually measure GEMMs past 4096×4096.
     /// </summary>
     private static unsafe void RunTiledMnAligned(
         ReadOnlySpan<float> a, int lda,
@@ -149,7 +151,6 @@ internal static class Avx512Sgemm
     {
         int mTiles = m / 16;
         int nTiles = n / 16;
-        // C was cleared upstream (SimdGemm entry), so tiles start at zero.
         fixed (float* aBase = a)
         fixed (float* bBase = b)
         fixed (float* cBase = c)
@@ -157,43 +158,61 @@ internal static class Avx512Sgemm
             var aPtr = aBase;
             var bPtr = bBase;
             var cPtr = cBase;
-            int totalTiles = mTiles * nTiles;
-            if (allowParallel && totalTiles >= 8)
+            int kLocal = k, nLocal = n, ldaLocal = lda, ldbLocal = ldb;
+            int nTilesLocal = nTiles;
+            if (allowParallel && mTiles >= 2)
             {
-                // Local ptrs for capture safety under Parallel.For.
-                float* aLocal = aPtr; float* bLocal = bPtr; float* cLocal = cPtr;
-                int ldaLocal = lda, ldbLocal = ldb, nLocal = n, kLocal = k;
-                Parallel.For(0, totalTiles, tile =>
+                float* aOuter = aPtr; float* bOuter = bPtr; float* cOuter = cPtr;
+                Parallel.For(0, mTiles, mt =>
                 {
-                    int mt = tile / nTiles;
-                    int nt = tile % nTiles;
-                    Run16x16Tile(
-                        aLocal + mt * 16 * ldaLocal,
-                        ldaLocal,
-                        bLocal + nt * 16,
-                        ldbLocal,
-                        cLocal + mt * 16 * nLocal + nt * 16,
-                        nLocal,
-                        kLocal);
+                    var packed = new float[16 * kLocal];
+                    fixed (float* pPtr = packed)
+                    {
+                        PackARowMajor16(aOuter + mt * 16 * ldaLocal, ldaLocal, pPtr, kLocal);
+                        for (int nt = 0; nt < nTilesLocal; nt++)
+                        {
+                            Run16x16Tile(
+                                pPtr, kLocal,
+                                bOuter + nt * 16, ldbLocal,
+                                cOuter + mt * 16 * nLocal + nt * 16, nLocal,
+                                kLocal);
+                        }
+                    }
                 });
             }
             else
             {
-                for (int mt = 0; mt < mTiles; mt++)
+                var packed = new float[16 * k];
+                fixed (float* pPtr = packed)
                 {
-                    for (int nt = 0; nt < nTiles; nt++)
+                    for (int mt = 0; mt < mTiles; mt++)
                     {
-                        Run16x16Tile(
-                            aPtr + mt * 16 * lda,
-                            lda,
-                            bPtr + nt * 16,
-                            ldb,
-                            cPtr + mt * 16 * n + nt * 16,
-                            n,
-                            k);
+                        PackARowMajor16(aPtr + mt * 16 * lda, lda, pPtr, k);
+                        for (int nt = 0; nt < nTiles; nt++)
+                        {
+                            Run16x16Tile(
+                                pPtr, k,
+                                bPtr + nt * 16, ldb,
+                                cPtr + mt * 16 * n + nt * 16, n,
+                                k);
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Copies 16 rows of A starting at <paramref name="src"/> (row stride
+    /// <paramref name="lda"/>) into <paramref name="dst"/> as a contiguous
+    /// <c>[16][k]</c> block. After packing, the microkernel reads each row
+    /// at stride <c>k</c> with perfect prefetch behaviour.
+    /// </summary>
+    private static unsafe void PackARowMajor16(float* src, int lda, float* dst, int k)
+    {
+        for (int i = 0; i < 16; i++)
+        {
+            Buffer.MemoryCopy(src + i * lda, dst + i * k, sizeof(float) * k, sizeof(float) * k);
         }
     }
 #endif
