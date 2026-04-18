@@ -344,6 +344,11 @@ public static class AutotuneCache
         IProgress<string>? progress = null,
         CancellationToken ct = default)
     {
+        // Lazy register built-in entries (GEMM variant select, …) the first
+        // time any warmup runs. Tests that Clear() the catalog don't get
+        // re-seeded automatically — they call BuiltInCatalog.EnsureRegistered
+        // or accept an empty catalog.
+        BuiltInCatalog.EnsureRegistered();
         return WarmupInternalAsync(
             AutotuneKernelCatalog.Entries,
             representativeInputShapes ?? DefaultRepresentativeShapes(),
@@ -365,6 +370,7 @@ public static class AutotuneCache
     {
         if (category is null) throw new ArgumentNullException(nameof(category));
         if (representativeInputShapes is null) throw new ArgumentNullException(nameof(representativeInputShapes));
+        BuiltInCatalog.EnsureRegistered();
         return WarmupInternalAsync(
             AutotuneKernelCatalog.EntriesForCategory(category),
             representativeInputShapes,
