@@ -84,14 +84,26 @@ internal sealed class LazyGraphCompiler
                 }
             }
 
-            // Keep nodes that either have consumers or are terminal (last node, no consumers = output)
+            // Keep every node that either has a consumer OR is a leaf (no
+            // downstream op consumes its output) — every leaf is potentially
+            // a graph output and MUST survive DCE. The prior implementation
+            // only kept the SINGLE last node in the list as terminal, which
+            // worked for single-output scoped traces (TensorCodec's default
+            // usage) but silently dropped every-other-graph-output for
+            // multi-output compilations like ONNX models. Surfaced by
+            // BERT-SQuAD × 100 sample replay: after the OnnxImporter wrapped
+            // every declared graph output in TensorAdd(x, 0), DCE kept only
+            // the final wrap as compiled, leaving all other output wraps
+            // uncompiled — their output tensors' LazySource stayed alive,
+            // auto-materialization via AsSpan triggered Realize-cascade at
+            // first read but NOT on subsequent executes (IsRealized=true
+            // blocks re-realize), so those outputs froze at run-1's values.
             var result = new List<ILazyNode>(nodes.Count);
-            var lastNode = nodes[nodes.Count - 1];
             foreach (var node in nodes)
             {
                 bool hasConsumers = consumers.ContainsKey(node) && consumers[node] > 0;
-                bool isTerminal = ReferenceEquals(node, lastNode);
-                if (hasConsumers || isTerminal)
+                bool isLeaf = !hasConsumers;
+                if (hasConsumers || isLeaf)
                     result.Add(node);
             }
 
