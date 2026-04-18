@@ -118,6 +118,13 @@ internal static class SimdGemm
         int n)
     {
         c.Clear();
+        // B1: single gate. Avx512Sgemm.CanUse checks CPU + TFM. Falls back
+        // to the AVX2 path internally until the B2/B3 kernel ships.
+        if (Avx512Sgemm.CanUse)
+        {
+            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: true);
+            return;
+        }
         // Iter 39: signal "we just cleared C" so the small-matmul fast path
         // can use store-only kernels (saves 12 loads + 12 adds per micro-tile).
         SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: true);
