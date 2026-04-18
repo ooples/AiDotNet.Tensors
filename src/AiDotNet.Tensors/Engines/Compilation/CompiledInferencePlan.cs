@@ -416,6 +416,77 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return _finalOutput;
     }
 
+    /// <inheritdoc/>
+    public void ExecuteInto(Tensor<T> output)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+
+        // Validate shape up front so we throw before any step runs. Same
+        // shape guards RebindStorageFrom would raise, but surfaced here so
+        // the exception trace points at the user's call site.
+        ValidateShapesMatch(_finalOutput, output, nameof(output));
+
+        // Run the plan into its internal buffer, then copy the final tensor's
+        // data into the caller's buffer. Copy (not rebind) because many
+        // specialized kernel paths capture array references at compile time
+        // via GetDataArray() closure — a post-compile storage rebind would
+        // not reach those closures, leaving the caller's buffer untouched.
+        // The extra copy is one memcpy of the output-tensor size per call;
+        // under CUDA graph capture it's recorded as a device memcpy node and
+        // replays correctly every iteration.
+        Execute();
+        _finalOutput.AsSpan().CopyTo(output.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void SetInputs(Tensor<T>[] inputs)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        if (_compiledInputTensor is null)
+            throw new NotSupportedException(
+                "SetInputs is not supported on empty plans (no captured input tensor).");
+        // Scope: today the plan tracks a single captured input (the one the
+        // LazyTensorScope was traced against). Multi-input graphs — e.g. ONNX
+        // models with multiple placeholders — remain on the existing per-name
+        // tensor-span path. Tightening this check produces a crisp error
+        // instead of silently ignoring extra inputs.
+        if (inputs.Length != 1)
+            throw new ArgumentException(
+                $"This plan was compiled with 1 captured input; got {inputs.Length}. " +
+                "Multi-input graphs should set each input by writing to its " +
+                "per-name tensor span (see OnnxImportResult.Inputs).",
+                nameof(inputs));
+        var src = inputs[0] ?? throw new ArgumentException(
+            "inputs[0] is null.", nameof(inputs));
+        ValidateShapesMatch(_compiledInputTensor, src, "inputs[0]");
+
+        // Copy (not rebind): the specialized kernels capture the captured
+        // input's array reference at compile time (see
+        // CompiledTrainingPlan.TryBuildSpecializedForward), so a storage
+        // rebind after compile is invisible to them. Copying refreshes the
+        // captured buffer in-place — the kernels read the new data next
+        // Execute and stay graph-capture-safe.
+        src.AsSpan().CopyTo(_compiledInputTensor.AsWritableSpan());
+    }
+
+    private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
+    {
+        if (expected._shape.Length != actual._shape.Length)
+            throw new ArgumentException(
+                $"{paramName} rank {actual._shape.Length} != plan rank {expected._shape.Length}.",
+                paramName);
+        for (int i = 0; i < expected._shape.Length; i++)
+        {
+            if (expected._shape[i] != actual._shape[i])
+                throw new ArgumentException(
+                    $"{paramName} shape [{string.Join(", ", actual._shape)}] " +
+                    $"!= plan shape [{string.Join(", ", expected._shape)}].",
+                    paramName);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

@@ -19,6 +19,84 @@ public interface ICompiledPlan<T> : IDisposable
     /// <summary>Executes the compiled plan and returns the output tensor.</summary>
     Tensor<T> Execute();
 
+    /// <summary>
+    /// Executes the compiled plan with the final output written into
+    /// <paramref name="output"/>. Runs every step, then memcpy's the plan's
+    /// internal final-output buffer into <paramref name="output"/>'s
+    /// storage — one fixed memcpy per call, no per-call allocation of the
+    /// output tensor. This is the primitive that makes
+    /// <see cref="ICompiledPlan{T}"/> safely composable with CUDA Graph
+    /// capture: the captured graph records both the step kernels and the
+    /// final memcpy node; each Replay writes into
+    /// <paramref name="output"/>'s backing pointer the same way.
+    /// </summary>
+    /// <param name="output">A caller-owned tensor whose shape equals this plan's
+    /// final output shape. Must be contiguous with zero storage offset.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="output"/> is null.</exception>
+    /// <exception cref="ArgumentException">Shape of <paramref name="output"/>
+    /// does not match this plan's final output shape.</exception>
+    /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Usage pattern — CUDA graph capture:</b>
+    /// <code>
+    /// var plan = cache.GetOrCompileInference(shape, trace);
+    /// var outputBuf = engine.AllocateTensor&lt;float&gt;(plan.OutputShape);
+    /// // Warm-up 2 runs outside capture (stream-sync hygiene)
+    /// plan.ExecuteInto(outputBuf);
+    /// plan.ExecuteInto(outputBuf);
+    /// using var scope = new CudaGraphScope(backend, streamHandle);
+    /// scope.BeginCapture();
+    /// plan.ExecuteInto(outputBuf);
+    /// scope.EndCapture();
+    /// foreach (var batch in batches)
+    /// {
+    ///     plan.SetInputs(new[] { inputBuf.CopyFrom(batch) });
+    ///     scope.Replay();                      // zero dispatch, zero alloc
+    ///     outputBuf.CopyTo(results);
+    /// }
+    /// </code>
+    /// </para>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE (issue #199):</b> same rationale as
+    /// <see cref="ThenAsync"/> / <see cref="SaveAsync"/> — adding a member to
+    /// a public interface is breaking for external implementers, no DIM
+    /// polyfill on net471. Built-in <c>CompiledInferencePlan&lt;T&gt;</c> is
+    /// updated in the same PR.
+    /// </para>
+    /// </remarks>
+    void ExecuteInto(Tensor<T> output);
+
+    /// <summary>
+    /// Copies the caller's input data into this plan's captured input
+    /// buffers. After this call subsequent <see cref="Execute"/> /
+    /// <see cref="ExecuteInto"/> read the updated data — one fixed memcpy
+    /// per call, no per-call allocation of the captured input tensor.
+    /// Implementation uses copy rather than storage rebind so the specialized
+    /// kernel paths (which capture array references at compile time) pick
+    /// up the new data correctly. Under CUDA Graph capture the copy is
+    /// recorded as a device memcpy node and replays deterministically.
+    /// </summary>
+    /// <param name="inputs">Array of input tensors in graph-input order. For
+    /// a single-input plan (the common inference case), pass
+    /// <c>new[] { myInput }</c>. Each input must have the same rank, shape,
+    /// and contiguity as the corresponding captured input.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="inputs"/> is
+    /// null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="inputs"/> length
+    /// doesn't match the plan's captured-input count, or any input's shape
+    /// doesn't match the captured input.</exception>
+    /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
+    /// <exception cref="NotSupportedException">The plan has no captured
+    /// input tensor (empty-plan degenerate case).</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE (issue #199):</b> see
+    /// <see cref="ExecuteInto"/>.
+    /// </para>
+    /// </remarks>
+    void SetInputs(Tensor<T>[] inputs);
+
     /// <summary>Checks whether this plan is valid for the given input shape.</summary>
     bool IsValid(int[] inputShape);
 
