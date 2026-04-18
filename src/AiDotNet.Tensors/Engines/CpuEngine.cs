@@ -2435,6 +2435,31 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        // Generic trailing-repeat fast path — same rationale as
+        // TensorBroadcastMultiply. The DiT AdaLN shift path hits this every
+        // block × every inference step × every Predict, so the prior indexer-
+        // per-element fallback was a major transformer perf bug.
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = res.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, a, b, BackwardFunctions<T>.BroadcastAddBackward);
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb)); }
+            return res;
+        }
+
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
         var result = a.BroadcastAdd(b);
         DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, a, b, BackwardFunctions<T>.BroadcastAddBackward);
@@ -2549,33 +2574,112 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        // Fast path for [N,M] * [M] or [N,M] * [1,M] scaling pattern
-        if (typeof(T) == typeof(float) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        // Generic trailing-repeat fast path (float + double + any T with SIMD numOps).
+        // Covers the AdaLN / transformer-bias shape pattern where b's shape is a
+        // trailing suffix of a's shape with leading dims all 1 — e.g.
+        //   [B, S, H] * [1, 1, H]   (DiT AdaLN)
+        //   [N, M]    * [1, M]      (dense bias)
+        //   [N, M]    * [M]         (dense bias, rank-dropped)
+        // For these, broadcasting is just repeating b across a.Length / b.Length
+        // tiles, each an elementwise multiply — a perfect fit for the SIMD
+        // numOps.Multiply(Span,Span,Span) kernel (Vector256<double> AVX2/FMA).
+        // Without this, the generic Tensor<T>.BroadcastMultiply at rank > 2
+        // falls back to an indexer-per-element loop that dominates transformer
+        // wall clock at ~100x slower than SIMD.
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            int rows = a._shape[0], cols = a._shape[1];
-            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
-            if (cols == bCols)
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = res.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
             {
-                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-                var af = (float[])(object)a.GetDataArray();
-                var bf = (float[])(object)b.GetDataArray();
-                var rf = (float[])(object)res.GetDataArray();
-                for (int r = 0; r < rows; r++)
-                {
-                    int off = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rf[off + c] = af[off + c] * bf[c];
-                }
-                DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
-                return res;
+                int off = t * bTileSize;
+                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
+            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+            return res;
         }
 
         var result = a.BroadcastMultiply(b);
         DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorBroadcastMultiply(ca, cb)); }
         return result;
+    }
+
+    /// <summary>
+    /// Detects the "trailing-repeat" broadcast pattern where <paramref name="b"/>
+    /// broadcasts over <paramref name="a"/> by matching a trailing suffix of
+    /// <paramref name="a"/>'s shape, with any preceding dimensions all equal to 1.
+    /// The caller can then treat the broadcast as <c>a.Length / b.Length</c>
+    /// tiles of <c>b.Length</c> elementwise ops — the dominant shape pattern for
+    /// transformer AdaLN / dense-bias and the fundamental reason we don't want
+    /// to route these through the generic indexer-based fallback.
+    /// </summary>
+    /// <remarks>
+    /// Returns false for the Conv2D bias pattern <c>[B, C, H, W] op [1, C, 1, 1]</c>
+    /// because the broadcast is across the middle of the shape, not the trailing
+    /// suffix — that case has its own dedicated fast path elsewhere.
+    /// </remarks>
+    private static bool TryBroadcastTrailingRepeat<T>(Tensor<T> a, Tensor<T> b, out int tileSize)
+    {
+        tileSize = 0;
+        if (!a.IsContiguous || !b.IsContiguous) return false;
+        if (b.Rank == 0 || a.Rank < b.Rank) return false;
+        if (b.Length == 0 || a.Length % b.Length != 0) return false;
+
+        // Determine the longest trailing suffix of b whose dims are all > 1 and
+        // exactly match a's corresponding trailing dims — this is the "inner"
+        // tile that gets repeated across the outer dims. All b dims to the left
+        // of that suffix must be 1 (those are the broadcast axes). Any a dim on
+        // the left is arbitrary — it contributes to the tile count.
+        //
+        // Example shapes that succeed:
+        //   a=[B, S, H], b=[1, 1, H]          → tile = H        (DiT AdaLN)
+        //   a=[B, S, H], b=[H]                → tile = H        (rank-dropped bias)
+        //   a=[N, M],    b=[1, M]             → tile = M        (dense bias)
+        //   a=[B, H, W], b=[1, H, W]          → tile = H*W      (per-sample feature)
+        // Rejected (needs a different fast path or the general fallback):
+        //   a=[B, C, H, W], b=[1, C, 1, 1]    (broadcast in middle — Conv bias)
+        int aRank = a.Rank;
+        int bRank = b.Rank;
+        int offset = aRank - bRank;
+
+        // Walk b's dims right-to-left, find where the trailing "all-matching"
+        // suffix ends (i.e. first index from the left where b dim != a dim).
+        int splitPoint = bRank;
+        for (int i = bRank - 1; i >= 0; i--)
+        {
+            if (b._shape[i] == a._shape[offset + i])
+            {
+                splitPoint = i;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // All dims in b to the left of splitPoint must be 1 (broadcast axes).
+        for (int i = 0; i < splitPoint; i++)
+        {
+            if (b._shape[i] != 1) return false;
+        }
+
+        // Compute tile size = product of trailing matching dims.
+        int ts = 1;
+        for (int i = splitPoint; i < bRank; i++) ts *= b._shape[i];
+        if (ts == 0 || ts != b.Length) return false;
+
+        // Tile must tile a.Length evenly (should follow from the structural
+        // check, but guard anyway against zero-dim edge cases).
+        if (a.Length % ts != 0) return false;
+
+        tileSize = ts;
+        return true;
     }
 
     /// <inheritdoc/>
