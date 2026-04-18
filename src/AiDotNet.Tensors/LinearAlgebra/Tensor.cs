@@ -159,32 +159,46 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
-        // Materialize: copy data from strided layout to contiguous row-major
         var result = new Tensor<T>(_shape);
-        var srcData = _data.GetDataArray();
-        var dstData = result._data.AsWritableSpan();
+        var dstSpan = result._data.AsWritableSpan();
 
         if (IsContiguous)
         {
             // Contiguous with offset — simple bulk copy
-            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstData);
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstSpan);
+            return result;
         }
-        else
-        {
-            // Non-contiguous — use cached row-major strides to decompose flat index
-            var rowMajorStrides = RowMajorStrides;
 
-            for (int i = 0; i < Length; i++)
+        // Non-contiguous materialization — "odometer" stride walk.
+        // Previous implementation decomposed each flat destination index via
+        // N divisions per element, which dominated DiT forward wall clock
+        // whenever a permuted/sliced tensor reached a Contiguous() call (the
+        // SelfAttention output → DenseLayer.Forward path hits this). The
+        // odometer replaces N divisions with at most one per-axis increment:
+        // each step rolls the counter like a car odometer, and srcIdx tracks
+        // the current strided source offset incrementally — no divisions at
+        // all on the hot path.
+        var srcSpan = _data.AsSpan();
+        int rank = Rank;
+        int length = Length;
+        if (rank == 0 || length == 0) return result;
+
+        Span<int> counter = stackalloc int[rank];
+        int srcIdx = _storageOffset;
+        for (int flat = 0; flat < length; flat++)
+        {
+            dstSpan[flat] = srcSpan[srcIdx];
+
+            // Increment counter with rightmost-axis carry, and update srcIdx
+            // incrementally using the stride deltas so no mul/div is required
+            // except on a wrap.
+            for (int d = rank - 1; d >= 0; d--)
             {
-                int srcIdx = _storageOffset;
-                int remaining = i;
-                for (int d = 0; d < Rank; d++)
-                {
-                    int dimIndex = remaining / rowMajorStrides[d];
-                    remaining -= dimIndex * rowMajorStrides[d];
-                    srcIdx += dimIndex * _strides[d];
-                }
-                dstData[i] = srcData[srcIdx];
+                counter[d]++;
+                srcIdx += _strides[d];
+                if (counter[d] < _shape[d]) break;
+                counter[d] = 0;
+                srcIdx -= _strides[d] * _shape[d];
             }
         }
 
