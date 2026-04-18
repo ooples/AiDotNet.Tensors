@@ -15976,9 +15976,14 @@ public class CpuEngine : ITensorLevelEngine
         out Tensor<double> attentionWeights)
     {
         int bhCount = batch * heads;
+        // Use the stride-aware accessor on all three operands for consistency.
+        // Contiguous() was already called on the public entry point, so the
+        // three calls return identical data today — but keeping them on the
+        // same accessor guards against divergence if the contract ever changes
+        // or a future caller forgets the contiguity contract.
         var qd = query.GetFlattenedData();
         var kd = key.GetFlattenedData();
-        var vd = value.GetDataArray();
+        var vd = value.GetFlattenedData();
         var doubleOps = MathHelper.GetNumericOperations<double>();
 
         // scoresData is internal scratch — rent from ArrayPool to amortize the

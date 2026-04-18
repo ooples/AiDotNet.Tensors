@@ -102,6 +102,12 @@ public class TensorMatMulSimdFallbackTests
         var rng = new Random(7);
         var aData = new double[n * n];
         for (int i = 0; i < aData.Length; i++) aData[i] = rng.NextDouble();
+        // Snapshot the input before the matmul. Since Tensor<T> can be
+        // constructed to alias the supplied array, a regression that
+        // accidentally mutates the input in place would otherwise pass —
+        // the result would always equal the (mutated) input. Asserting
+        // against the snapshot catches that class of bug.
+        var aSnapshot = (double[])aData.Clone();
 
         var identity = new double[n * n];
         for (int i = 0; i < n; i++) identity[i * n + i] = 1.0;
@@ -111,10 +117,12 @@ public class TensorMatMulSimdFallbackTests
 
         var result = _engine.TensorMatMul(a, id);
         var actual = result.GetDataArray();
+        var inputAfter = a.GetDataArray();
 
-        for (int i = 0; i < aData.Length; i++)
+        for (int i = 0; i < aSnapshot.Length; i++)
         {
-            Assert.Equal(aData[i], actual[i], precision: 12);
+            Assert.Equal(aSnapshot[i], actual[i], precision: 12);
+            Assert.Equal(aSnapshot[i], inputAfter[i], precision: 12);
         }
     }
 
