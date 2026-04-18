@@ -9051,6 +9051,36 @@ public class CpuEngine : ITensorLevelEngine
         // NCHWc conv kernel. Each lane broadcasts one input channel and
         // FMAs against the matching 8-wide kernel row — this is the path
         // ORT/oneDNN use to get close to peak FMA throughput on AVX2.
+        // NCHWc16 (AVX-512) fast path — preferred when the runtime has
+        // Avx512F and the shapes are aligned to cBlock=16. Double the FMA
+        // throughput per cycle vs the cb=8 Vector256 kernel.
+        if (typeof(T) == typeof(float) &&
+            input.Layout == LinearAlgebra.TensorLayout.Nchwc16 &&
+            inChannels % Simd.NchwcConv2D16.CBlock == 0 &&
+            outChannels % Simd.NchwcConv2D16.CBlock == 0)
+        {
+            int kernelLen16 = outChannels * inChannels * kernelHeight * kernelWidth;
+            var packedKernel16 = new float[kernelLen16];
+            Simd.NchwcReorder.KernelToOihwIo(
+                (float[])(object)kernelData,
+                packedKernel16,
+                outChannels, inChannels, kernelHeight, kernelWidth,
+                Simd.NchwcConv2D16.CBlock);
+            Simd.NchwcConv2D16.Run(
+                (float[])(object)inputData,
+                packedKernel16,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+            result.Layout = LinearAlgebra.TensorLayout.Nchwc16;
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            return result;
+        }
+
         if (typeof(T) == typeof(float) &&
             input.Layout == LinearAlgebra.TensorLayout.Nchwc8 &&
             inChannels % Simd.NchwcConv2D.CBlock == 0 &&
