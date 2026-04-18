@@ -118,4 +118,28 @@ public sealed class TensorCodecOptions
     /// </para>
     /// </remarks>
     public bool Deterministic { get; set; } = true;
+
+    /// <summary>
+    /// When true (default) <see cref="Engines.DirectGpu.DirectGpuEngine.Conv2D"/>
+    /// routes through the cuDNN wrapper on a CUDA backend when cuDNN is
+    /// available; set to false to force the generic CUDA kernel. Opt-out
+    /// exists mostly for debugging and for reproducing numerical behaviour
+    /// that differs between cuDNN and the hand-written kernel (~ULP at the
+    /// last accumulation).
+    /// </summary>
+    public bool UseCudnn { get; set; } = true;
+
+    /// <summary>
+    /// When true (default) <see cref="Engines.DirectGpu.DirectGpuEngine.BatchNorm"/>
+    /// routes through the cuDNN BatchNorm wrapper on a CUDA backend when
+    /// cuDNN is available; set to false to force the generic kernel.
+    /// </summary>
+    public bool UseCudnnBatchNorm { get; set; } = true;
+
+    /// <summary>
+    /// When true (default) matmul / batched GEMM routes through the cuBLAS
+    /// wrapper on a CUDA backend when cuBLAS is available; set to false to
+    /// force the generic kernel.
+    /// </summary>
+    public bool UseCublas { get; set; } = true;
 }

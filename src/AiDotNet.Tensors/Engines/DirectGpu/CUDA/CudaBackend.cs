@@ -841,6 +841,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);
+        // Record dispatch path for telemetry. MatMul always runs through
+        // cuBLAS on the CUDA backend today (the opt-out would fall back to
+        // a hand-written kernel when wired); labels let downstream users
+        // verify the path via PerformanceProfiler.GetStats("MatMul.cuBLAS").
+        using var _profile = CudaDispatchPolicy.Scope(
+            "MatMul",
+            useVendor: CudaDispatchPolicy.UseCublasForMatMul);
         var output = AllocateBuffer(M * N);
         Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
         return output;
@@ -2961,6 +2968,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        // Record dispatch path. Today all Conv2D calls run through the
+        // hand-written kernels below (Winograd / tiled / im2col). The
+        // cuDNN dispatch (gated by CudaDispatchPolicy.UseCudnnForConv)
+        // lands when CuDnnConvolution gains a GPU-buffer variant — this
+        // scope already distinguishes the path in telemetry so the flip
+        // is a drop-in change.
+        using var _profile = CudaDispatchPolicy.Scope(
+            "Conv2D",
+            useVendor: false);
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
@@ -4393,6 +4409,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("batchnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batchnorm_forward");
 
+        // Dispatch path telemetry — see Conv2D for the rationale.
+        using var _profile = CudaDispatchPolicy.Scope(
+            "BatchNorm",
+            useVendor: false);
         using var _ = PushContext();
         uint gridX = (uint)channels;
         IntPtr inputPtr = input.Handle;
