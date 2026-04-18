@@ -92,10 +92,10 @@ public interface ICompiledPlan<T> : IDisposable
     /// null.</exception>
     /// <exception cref="ArgumentException"><paramref name="inputs"/> length
     /// doesn't match the plan's captured-input count, or any input's shape
-    /// doesn't match the captured input.</exception>
+    /// doesn't match the captured input. A zero-input plan accepts
+    /// <c>Array.Empty&lt;Tensor&lt;T&gt;&gt;()</c> as a no-op — the length
+    /// check still applies, so any other length throws.</exception>
     /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
-    /// <exception cref="NotSupportedException">The plan has no captured
-    /// input tensor (empty-plan degenerate case).</exception>
     /// <remarks>
     /// <para>
     /// <b>BINARY/SOURCE-BREAKING CHANGE (issue #199):</b> see

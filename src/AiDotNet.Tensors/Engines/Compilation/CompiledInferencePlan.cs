@@ -471,13 +471,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
-        if (_compiledInputTensors.Length == 0)
-            throw new NotSupportedException(
-                "SetInputs is not supported on empty plans (no captured input tensors).");
-        // Generalize to N captured inputs so SetInputs stays correct when
-        // Compile() grows multi-input support. Today the array length is
-        // always 1, but structuring the check this way means adding a second
-        // captured input later requires zero changes here.
+        // The uniform length-match check below handles every case: zero-input
+        // plans accept SetInputs(Array.Empty<Tensor<T>>()) as a no-op, N-input
+        // plans require exactly N, and the error names the expected count.
+        // No special case for empty plans — callers get one consistent
+        // contract across 0-, 1-, and future N-input graphs.
         if (inputs.Length != _compiledInputTensors.Length)
             throw new ArgumentException(
                 $"This plan was compiled with {_compiledInputTensors.Length} captured input(s); " +
