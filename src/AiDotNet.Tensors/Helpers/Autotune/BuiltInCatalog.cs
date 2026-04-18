@@ -22,6 +22,20 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// shape." Empty catalog trivially satisfies this; this class makes the
 /// claim load-bearing by actually registering a kernel that benchmarks
 /// and stores.</para>
+///
+/// <para><b>Concurrency contract — run warmup BEFORE serving traffic.</b>
+/// The <c>SGEMM</c> benchmark below toggles the process-wide
+/// <see cref="SimdGemm.UseParallelGemm"/> flag to measure each variant and
+/// restores it before returning. This is safe only when no other thread is
+/// calling <c>SimdGemm.Sgemm</c> concurrently with the warmup; a concurrent
+/// GEMM caller would observe the wrong parallelism choice for the duration
+/// of the benchmark, producing correct results but degraded (or inflated)
+/// throughput attributable to the wrong variant. In practice warmup is
+/// a startup-time operation run before the application handles requests,
+/// so this window is empty. Future follow-up: introduce a scoped override
+/// on <see cref="SimdGemm"/> (e.g.
+/// <c>SimdGemm.WithParallelGemm(bool, Action)</c>) and route the benchmark
+/// through it so concurrent callers are never perturbed.</para>
 /// </summary>
 internal static class BuiltInCatalog
 {
@@ -92,11 +106,16 @@ internal static class BuiltInCatalog
         SimdGemm.Sgemm(a, b, c, m, k, n);
         ct.ThrowIfCancellationRequested();
 
-        // Measure. Toggle the parallel switch per variant — a proper
-        // scoped override wrapper would be cleaner but SimdGemm exposes
-        // only the static flag today. Temporary mutation is isolated by
-        // BenchmarkVariant being called sequentially from the warmup
-        // driver, and we restore before return.
+        // Measure. Toggle the process-wide parallel switch per variant.
+        // SimdGemm exposes only the global flag today — save/restore bounds
+        // the mutation to this benchmark. CALLER CONTRACT (see class
+        // docstring): warmup must run when no other thread is calling
+        // SimdGemm.Sgemm; a concurrent caller during this window would see
+        // the wrong parallelism choice (correct results, wrong throughput
+        // for that one call). The warmup driver calls BenchmarkVariant
+        // sequentially so variants don't fight each other; a future scoped
+        // SimdGemm.WithParallelGemm(...) helper will make this robust
+        // against concurrent application callers too.
         bool savedParallel = SimdGemm.UseParallelGemm;
         SimdGemm.UseParallelGemm = variant == "parallel";
         const int iters = 5;

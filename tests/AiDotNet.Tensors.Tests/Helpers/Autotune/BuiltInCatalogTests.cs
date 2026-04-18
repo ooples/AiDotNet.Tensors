@@ -6,6 +6,18 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 
 /// <summary>
+/// xUnit collection that pins <see cref="BuiltInCatalogTests"/> to serial
+/// execution. Each test mutates process-wide shared state
+/// (<c>AIDOTNET_AUTOTUNE_CACHE_PATH</c> env var, the static
+/// <see cref="AutotuneKernelCatalog"/>, and the one-shot
+/// <see cref="BuiltInCatalog"/> registration latch); parallel xUnit workers
+/// would race on all three. Mirrors the <see cref="AutotuneCacheTests"/>
+/// and <see cref="AutotuneWarmupTests"/> patterns.
+/// </summary>
+[CollectionDefinition("BuiltInCatalogTests", DisableParallelization = true)]
+public sealed class BuiltInCatalogTestsCollection { }
+
+/// <summary>
 /// Issue #200 acceptance spec: "After WarmupCommonKernelsAsync completes,
 /// AutotuneCache.Lookup(id, shape) returns a non-null KernelChoice for
 /// every common kernel at every supplied shape."
@@ -15,7 +27,8 @@ namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 /// select), warmup actually benchmarks and stores, second run is a
 /// fast no-op on cache hit.</para>
 /// </summary>
-public class BuiltInCatalogTests : IDisposable
+[Collection("BuiltInCatalogTests")]
+public sealed class BuiltInCatalogTests : IDisposable
 {
     private readonly string _cacheDir;
     private readonly string? _prevEnv;
@@ -54,7 +67,7 @@ public class BuiltInCatalogTests : IDisposable
             Assert.NotNull(choice);
             Assert.False(string.IsNullOrEmpty(choice!.Variant));
             Assert.True(choice.MeasuredGflops > 0,
-                $"Expected positive GFLOPS for {BuiltInCatalog.SGEMM.ToFileStem()}@{string.Join('x', s)}");
+                $"Expected positive GFLOPS for {BuiltInCatalog.SGEMM.ToFileStem()}@{string.Join("x", s)}");
         }
     }
 
