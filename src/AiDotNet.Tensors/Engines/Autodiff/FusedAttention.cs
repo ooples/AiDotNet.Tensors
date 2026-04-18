@@ -92,8 +92,47 @@ public static class FusedAttention<T>
             throw new ArgumentException(
                 $"Attention inputs must be rank-3 or rank-4; got query rank {query.Rank}.");
 
+        // Per-dim shape agreement. The bias path below derives B/H/headDim/Sk
+        // from `query` and then reshapes `key`/`value` using those dims —
+        // without this check, inputs like q:[1,2,S,D] vs k:[2,1,S,D] would be
+        // silently reinterpreted into a wrong batch/head split rather than
+        // rejected, producing numerically wrong attention with no exception.
+        if (query._shape[0] != key._shape[0] || query._shape[0] != value._shape[0])
+            throw new ArgumentException(
+                $"query/key/value batch dims must match: query[0]={query._shape[0]}, " +
+                $"key[0]={key._shape[0]}, value[0]={value._shape[0]}.");
+        if (query._shape[1] != key._shape[1] || query._shape[1] != value._shape[1])
+            throw new ArgumentException(
+                $"query/key/value head dims must match: query[1]={query._shape[1]}, " +
+                $"key[1]={key._shape[1]}, value[1]={value._shape[1]}.");
+        if (query._shape[3] != key._shape[3])
+            throw new ArgumentException(
+                $"query and key must share headDim (last axis): query[3]={query._shape[3]}, " +
+                $"key[3]={key._shape[3]}.");
+        if (key._shape[2] != value._shape[2])
+            throw new ArgumentException(
+                $"key and value must share sequence length (axis 2): key[2]={key._shape[2]}, " +
+                $"value[2]={value._shape[2]}.");
+
+        // Causal no-bias → synthesize a -inf upper-triangle bias and route
+        // through the bias path. Avoids a NotImplementedException for the
+        // common self-attention use case and still lets the bias path reuse
+        // the tuned GEMM chain. A weights-less engine overload + block-tiled
+        // causal fast path is a follow-up; this path keeps the API complete.
+        if (attentionBias is null && config.IsCausal)
+        {
+            attentionBias = BuildCausalBias(engine, query._shape[2], key._shape[2]);
+        }
+
         // No bias → use the engine's tuned SDPA kernel. Engine handles the
         // fast float/double BLAS path; returns attention weights via out.
+        //
+        // Note on memory: the engine overload always materializes the
+        // [B,H,Sq,Sk] weights tensor internally via the out parameter; we
+        // discard it when ReturnAttentionWeights is false. A
+        // true weights-less engine overload is a follow-up — flagged so the
+        // public config docstring doesn't overclaim the memory win for
+        // ReturnAttentionWeights=false on the no-bias path.
         if (attentionBias is null)
         {
             var result = engine.ScaledDotProductAttention(
@@ -102,20 +141,11 @@ public static class FusedAttention<T>
             if (was3D)
                 result = DemoteToThreeD(engine, result);
             // Respect ReturnAttentionWeights: if caller didn't ask, null out
-            // to avoid leaking a potentially large tensor.
+            // to avoid leaking a potentially large tensor to the caller
+            // (the engine still allocated it internally — see note above).
             Tensor<T>? returnedWeights = config.ReturnAttentionWeights
                 ? (was3D ? DemoteToThreeD(engine, weights) : weights)
                 : null;
-            // TODO: causal masking is supported by the engine's mask
-            // parameter on SDPA. Lighter-weight causal form (no materialised
-            // bool mask) is future work; for now emulate by passing a causal
-            // bool mask — but that only kicks in for bias==null here, and the
-            // engine-level ScaledDotProductAttention above does not yet take
-            // a causal-flag overload. Tracked in a follow-up.
-            if (config.IsCausal)
-                throw new NotImplementedException(
-                    "IsCausal currently requires attentionBias with -Inf upper-triangle. " +
-                    "Block-tiled causal fast path is tracked separately.");
             return (result, returnedWeights);
         }
 
@@ -183,6 +213,26 @@ public static class FusedAttention<T>
         // Engine TensorBroadcastAdd handles the broadcast rules —
         // bias can be [B, H, Sq, Sk], [H, Sq, Sk], [1, 1, Sq, Sk], etc.
         return engine.TensorBroadcastAdd(scores, bias);
+    }
+
+    private static Tensor<T> BuildCausalBias(IEngine engine, int sq, int sk)
+    {
+        // Construct a [1, 1, sq, sk] bias tensor where position (q, k) is
+        // 0 when k <= q (visible) and -Inf when k > q (masked). Shape is
+        // chosen to broadcast over batch + head in AddBroadcastBias without
+        // a per-(B, H) allocation. Used by the no-bias causal path to reuse
+        // the bias pipeline rather than maintaining a second causal codepath.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T zero = numOps.Zero;
+        T negInf = numOps.FromDouble(double.NegativeInfinity);
+        var data = new T[sq * sk];
+        for (int q = 0; q < sq; q++)
+        {
+            int rowBase = q * sk;
+            for (int k = 0; k < sk; k++)
+                data[rowBase + k] = k <= q ? zero : negInf;
+        }
+        return new Tensor<T>(data, new[] { 1, 1, sq, sk });
     }
 
     private static Tensor<T> ApplyCausalMask(IEngine engine, Tensor<T> scores, INumericOperations<T> numOps)
