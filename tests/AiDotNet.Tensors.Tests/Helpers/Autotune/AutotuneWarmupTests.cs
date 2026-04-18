@@ -6,23 +6,53 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 
 /// <summary>
+/// xUnit collection that pins <see cref="AutotuneWarmupTests"/> to serial
+/// execution. Each test mutates process-wide shared state
+/// (<c>AIDOTNET_AUTOTUNE_CACHE_PATH</c> env var + the static
+/// <see cref="AutotuneKernelCatalog"/>); parallel workers would otherwise
+/// race on both. Mirrors the <see cref="AutotuneCacheTests"/> pattern.
+/// </summary>
+[CollectionDefinition("AutotuneWarmupTests", DisableParallelization = true)]
+public sealed class AutotuneWarmupTestsCollection { }
+
+/// <summary>
 /// Tests for issue #200 — <see cref="AutotuneCache.WarmupCommonKernelsAsync"/>
 /// and <see cref="AutotuneCache.WarmupCategoryAsync"/>. Uses a synthetic
 /// <see cref="AutotuneCatalogEntry"/> so tests are deterministic and don't
 /// depend on host-specific BLAS.
 /// </summary>
-public class AutotuneWarmupTests
+[Collection("AutotuneWarmupTests")]
+public sealed class AutotuneWarmupTests : IDisposable
 {
-    // Each test isolates itself by clearing the catalog up front; they also
-    // write to a sandbox autotune cache path so the host's real cache is
-    // untouched.
+    private const string EnvVar = "AIDOTNET_AUTOTUNE_CACHE_PATH";
+    private readonly string _tempRoot;
+    private readonly string? _originalEnv;
+
     public AutotuneWarmupTests()
     {
+        // Snapshot the prior env var so Dispose can restore it — otherwise a
+        // CI runner that preset the var loses its setting after the first
+        // test runs. Save-and-restore matches AutotuneCacheTests.
+        _originalEnv = Environment.GetEnvironmentVariable(EnvVar);
         AutotuneKernelCatalog.Clear();
-        // Redirect the cache to a per-test temp dir via env var. Kept for
-        // the duration of the test; another test clearing it is fine.
-        var tmp = Path.Combine(Path.GetTempPath(), "aidotnet-autotune-test-" + Guid.NewGuid().ToString("N"));
-        Environment.SetEnvironmentVariable("AIDOTNET_AUTOTUNE_CACHE_PATH", tmp);
+        _tempRoot = Path.Combine(
+            Path.GetTempPath(),
+            "aidotnet-autotune-test-" + Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable(EnvVar, _tempRoot);
+    }
+
+    public void Dispose()
+    {
+        Environment.SetEnvironmentVariable(EnvVar, _originalEnv);
+        AutotuneKernelCatalog.Clear();
+        try
+        {
+            if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, recursive: true);
+        }
+        catch
+        {
+            // Best-effort cleanup — OS may hold a handle briefly after Dispose.
+        }
     }
 
     [Fact]

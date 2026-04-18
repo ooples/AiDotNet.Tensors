@@ -82,6 +82,15 @@ internal sealed class AutotuneCatalogEntry
         Func<ShapeProfile, IEnumerable<string>> variants,
         Func<ShapeProfile, string, CancellationToken, Task<double>> benchmarkVariant)
     {
+        // KernelId is a readonly record struct (value type) so it can never be
+        // null — but its Category/Name strings can be. Catalog consumers build
+        // cache filenames from those strings, and a null here would corrupt
+        // the cache path. Fail fast at construction instead of handing the
+        // problem to the filesystem layer.
+        if (id.Category is null)
+            throw new ArgumentException("KernelId.Category must not be null.", nameof(id));
+        if (id.Name is null)
+            throw new ArgumentException("KernelId.Name must not be null.", nameof(id));
         Id = id;
         Variants = variants ?? throw new ArgumentNullException(nameof(variants));
         BenchmarkVariant = benchmarkVariant ?? throw new ArgumentNullException(nameof(benchmarkVariant));
