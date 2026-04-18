@@ -8612,8 +8612,9 @@ public class CpuEngine : ITensorLevelEngine
         // 50–100× faster than the naive Parallel.For triple-loop on AVX2 hosts.
         // For other T, MultiplyBlocked still beats the naive loop via cache
         // tiling + the numOps.MultiplyAdd virtual call's per-span amortization.
-        // MultiplyBlocked clears the destination internally only when needed; we
-        // clear here because it accumulates into c.
+        // MatrixMultiplyHelper.MultiplyBlocked accumulates (c += a·b) and does
+        // NOT clear the destination. Pre-clear result here so the accumulation
+        // starts from zero and we get matmul (c = a·b), not c += a·b.
         result.AsWritableSpan().Clear();
         MatrixMultiplyHelper.MultiplyBlocked(numOps, a.Data, b.Data, result.Data, m, n, p, n, p, p);
 

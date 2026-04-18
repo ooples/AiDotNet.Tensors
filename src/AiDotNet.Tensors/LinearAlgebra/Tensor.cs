@@ -2032,11 +2032,18 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int aOff = maxRank - aRank;
         int bOff = maxRank - bRank;
 
-        // Materialize both operands contiguously so we can index by flat offset.
-        var aContig = a.IsContiguous ? a : a.Contiguous();
-        var bContig = b.IsContiguous ? b : b.Contiguous();
-        var aSpan = aContig._data.AsSpan();
-        var bSpan = bContig._data.AsSpan();
+        // Materialize both operands as zero-offset contiguous buffers so we
+        // can index by flat offset. A contiguous VIEW can still have a
+        // non-zero _storageOffset (e.g. a slice of a larger tensor with row-
+        // major layout); reading _data.AsSpan() from index 0 would then
+        // return garbage from before the view's start. Force offset==0 via
+        // Contiguous() in that case, and slice the resulting span by
+        // (offset, logical length) to also handle ArrayPool-backed buffers
+        // that over-allocate past Length.
+        var aContig = (a.IsContiguous && a._storageOffset == 0) ? a : a.Contiguous();
+        var bContig = (b.IsContiguous && b._storageOffset == 0) ? b : b.Contiguous();
+        var aSpan = aContig._data.AsSpan().Slice(aContig._storageOffset, aContig.Length);
+        var bSpan = bContig._data.AsSpan().Slice(bContig._storageOffset, bContig.Length);
         var rSpan = result._data.AsWritableSpan();
 
         // Broadcast stride per axis: operand's row-major stride if its dim
