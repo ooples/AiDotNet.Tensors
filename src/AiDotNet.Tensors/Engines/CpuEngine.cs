@@ -6066,6 +6066,23 @@ public class CpuEngine : ITensorLevelEngine
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
+        // NCHWc8 float fast path — SIMD per-lane reduce. Gated before the
+        // gradient-tape branch: inference-only, no backward needed here.
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0
+            && GradientTape<T>.Current is null)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)result;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.MaxPoolNchwc8(
+                srcF.AsSpan(), dstF.AsWritableSpan(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding);
+            return result;
+        }
+
         // When tape is active, use WithIndices variant so backward can access max indices
         var tape = GradientTape<T>.Current;
         if (tape is not null)
@@ -6195,6 +6212,24 @@ public class CpuEngine : ITensorLevelEngine
 
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
+
+        // NCHWc8 float fast path: one SIMD add per source cell, one FMA per
+        // output cell for the divide. count_include_pad=0 is the engine's
+        // default (pad cells excluded from the average).
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)result;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.AvgPoolNchwc8(
+                srcF.AsSpan(), dstF.AsWritableSpan(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding,
+                countIncludePad: false);
+            return result;
+        }
 
         // Float fast path: direct array access, no virtual dispatch
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
@@ -26440,6 +26475,22 @@ public class CpuEngine : ITensorLevelEngine
         int height = input._shape[2];
         int width = input._shape[3];
         int spatialSize = height * width;
+
+        // NCHWc8 float fast path. Output is [N, C, 1, 1] so we stay NCHW on
+        // the result — pool collapses the spatial dim, leaving the packed
+        // channel layout ambiguous; downstream FC/gemm wants plain NCHW.
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var flat = new Tensor<float>(new[] { batch, channels });
+            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.AsSpan(), flat.AsWritableSpan(),
+                batch, channels, height, width);
+            var reshaped = flat.Reshape(new[] { batch, channels, 1, 1 });
+            reshaped.Layout = LinearAlgebra.TensorLayout.Nchw;
+            return (Tensor<T>)(object)reshaped;
+        }
 
         var inputData = input.GetFlattenedData();
         var resultData = new T[batch * channels];
