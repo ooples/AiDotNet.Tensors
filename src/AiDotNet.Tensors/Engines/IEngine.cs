@@ -1924,6 +1924,25 @@ public interface IEngine
     Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape);
 
     /// <summary>
+    /// Reorders a 4-D NCHW tensor (shape <c>[N, C, H, W]</c>) into NCHWc
+    /// channel-packed layout. The returned tensor's
+    /// <see cref="LinearAlgebra.TensorBase{T}.Layout"/> is set to match
+    /// <paramref name="targetLayout"/> so layout-aware op dispatchers can
+    /// route through the channel-packed fast paths. Requires
+    /// <c>C % cBlock == 0</c>.
+    /// </summary>
+    /// <typeparam name="T">Element type; AVX2+FMA float fast path is
+    /// provided. Other T falls back to the scalar reorder.</typeparam>
+    Tensor<T> ReorderToNchwc<T>(Tensor<T> tensor, LinearAlgebra.TensorLayout targetLayout);
+
+    /// <summary>
+    /// Inverse of <see cref="ReorderToNchwc{T}"/> — returns an NCHWc tensor
+    /// back to NCHW (<c>[N, C, H, W]</c>). If the input is already NCHW,
+    /// returns it unchanged.
+    /// </summary>
+    Tensor<T> ReorderToNchw<T>(Tensor<T> tensor);
+
+    /// <summary>
     /// Performs batched matrix multiplication on 3D tensors.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

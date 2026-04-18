@@ -1918,6 +1918,136 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> ReorderToNchwc<T>(Tensor<T> tensor, LinearAlgebra.TensorLayout targetLayout)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!targetLayout.IsChannelPacked())
+            throw new ArgumentException($"Target layout {targetLayout} is not a channel-packed layout.", nameof(targetLayout));
+        if (tensor.Layout == targetLayout) return tensor;
+        if (tensor.Rank != 4)
+            throw new ArgumentException($"NCHWc reorder requires rank-4 input, got rank {tensor.Rank}.");
+        int cBlock = targetLayout.CBlock();
+        int n = tensor._shape[0], c = tensor._shape[1], h = tensor._shape[2], w = tensor._shape[3];
+        if (c % cBlock != 0)
+            throw new ArgumentException($"NCHWc reorder requires C ({c}) divisible by cBlock ({cBlock}).");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedLayout = targetLayout;
+                var capturedCBlock = cBlock;
+                var capturedShape = (int[])tensor._shape.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReorderToNchwc(captured, capturedLayout);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = capturedLayout;
+                    });
+            }
+        }
+
+        // Eager path. Shape stays the same flat-length; we just rearrange.
+        var result = new Tensor<T>(tensor._shape) { Layout = targetLayout };
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = (Tensor<float>)(object)tensor;
+            var dstF = (Tensor<float>)(object)result;
+            Simd.NchwcReorder.ToNchwc(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+        }
+        else
+        {
+            // Generic scalar reorder — same index math as the float path.
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            int hw = h * w;
+            int outerC = c / cBlock;
+            for (int ni = 0; ni < n; ni++)
+            {
+                int srcN = ni * c * hw;
+                int dstN = ni * c * hw;
+                for (int oc = 0; oc < outerC; oc++)
+                {
+                    int srcOc = srcN + oc * cBlock * hw;
+                    int dstOc = dstN + oc * hw * cBlock;
+                    for (int p = 0; p < hw; p++)
+                    {
+                        int dstBase = dstOc + p * cBlock;
+                        for (int cb = 0; cb < cBlock; cb++)
+                            dst[dstBase + cb] = src[srcOc + cb * hw + p];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReorderToNchw<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Layout == LinearAlgebra.TensorLayout.Nchw) return tensor;
+        if (tensor.Rank != 4)
+            throw new ArgumentException($"NCHWc → NCHW reorder requires rank-4 input, got rank {tensor.Rank}.");
+        int cBlock = tensor.Layout.CBlock();
+        int n = tensor._shape[0], c = tensor._shape[1], h = tensor._shape[2], w = tensor._shape[3];
+        if (c % cBlock != 0)
+            throw new ArgumentException($"NCHWc → NCHW reorder requires C ({c}) divisible by cBlock ({cBlock}).");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedShape = (int[])tensor._shape.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReorderToNchw(captured);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = LinearAlgebra.TensorLayout.Nchw;
+                    });
+            }
+        }
+
+        var result = new Tensor<T>(tensor._shape) { Layout = LinearAlgebra.TensorLayout.Nchw };
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = (Tensor<float>)(object)tensor;
+            var dstF = (Tensor<float>)(object)result;
+            Simd.NchwcReorder.ToNchw(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+        }
+        else
+        {
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            int hw = h * w;
+            int outerC = c / cBlock;
+            for (int ni = 0; ni < n; ni++)
+            {
+                int srcN = ni * c * hw;
+                int dstN = ni * c * hw;
+                for (int oc = 0; oc < outerC; oc++)
+                {
+                    int srcOc = srcN + oc * hw * cBlock;
+                    int dstOc = dstN + oc * cBlock * hw;
+                    for (int p = 0; p < hw; p++)
+                    {
+                        int srcBase = srcOc + p * cBlock;
+                        for (int cb = 0; cb < cBlock; cb++)
+                            dst[dstOc + cb * hw + p] = src[srcBase + cb];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

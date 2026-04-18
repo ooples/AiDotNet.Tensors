@@ -47,6 +47,18 @@ public abstract class TensorBase<T> : IDisposable
     internal Vector<T> DataVector => _data;
 
     /// <summary>
+    /// Physical memory layout of this tensor's data. Default
+    /// <see cref="TensorLayout.Nchw"/> (standard row-major). The
+    /// channel-packed variants (<see cref="TensorLayout.Nchwc8"/>,
+    /// <see cref="TensorLayout.Nchwc16"/>) are produced by the engine's
+    /// <c>ReorderToNchwc</c> primitive and consumed by the matching
+    /// NCHWc op fast paths. The layout is advisory metadata — storage is
+    /// still a flat <see cref="Vector{T}"/>; the layout field tells the
+    /// dispatcher how to interpret the flat elements.
+    /// </summary>
+    public TensorLayout Layout { get; internal set; } = TensorLayout.Nchw;
+
+    /// <summary>
     /// Rebinds this tensor's backing storage to alias <paramref name="source"/>'s storage.
     /// After a successful rebind, both tensors read from and write to the <i>same</i>
     /// underlying <see cref="Vector{T}"/> and <see cref="TensorStorage{T}"/> — no data
