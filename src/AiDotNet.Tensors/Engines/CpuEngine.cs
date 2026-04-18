@@ -15666,6 +15666,27 @@ public class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)resultF;
         }
 
+        // Double-precision fast path mirrors the float version. Uses
+        // MatrixMultiplyHelper.MultiplyBlocked as the GEMM kernel — the helper's
+        // numOps.MultiplyAdd inner kernel dispatches to SimdKernels'
+        // AVX2/FMA Vector256<double> path, so each per-head GEMM runs at SIMD
+        // throughput instead of the scalar virtual-dispatch triple-loop the
+        // generic-T fallback below would otherwise hit. For Pika21 / DiT-XL at
+        // double precision this collapses ~75M scalar virtual FMAs per SDPA
+        // call (× 24-28 blocks × 50 inference steps) into batched SIMD GEMMs.
+        if (typeof(T) == typeof(double))
+        {
+            var resultD = ScaledDotProductAttentionDouble(
+                (Tensor<double>)(object)query,
+                (Tensor<double>)(object)key,
+                (Tensor<double>)(object)value,
+                mask, scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v,
+                out var weightsD);
+            attentionWeights = (Tensor<T>)(object)weightsD;
+            return (Tensor<T>)(object)resultD;
+        }
+
         T scaleFactor = numOps.FromDouble(scaleVal);
 
         // Compute attention scores: Q @ K^T -> [batch, heads, seqQ, seqK]
@@ -15929,6 +15950,136 @@ public class CpuEngine : ITensorLevelEngine
             // every slot in the next rental) and clearing a 16 MB buffer would
             // undo the allocation savings.
             System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// SIMD-backed double-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
+    /// Replaces the scalar virtual-dispatch triple-loop with two SIMD-blocked DGEMMs per head
+    /// (Q·K^T then P·V), parallelized across batch*heads. Uses
+    /// <see cref="MatrixMultiplyHelper.MultiplyBlocked"/> as the kernel because BlasProvider
+    /// is disabled and SimdGemm only ships an Sgemm path; MultiplyBlocked's inner
+    /// numOps.MultiplyAdd dispatches to SimdKernels' AVX2/FMA Vector256&lt;double&gt; kernel.
+    /// <para>
+    /// Mirrors the structure of <see cref="ScaledDotProductAttentionFloat"/> exactly so the
+    /// two paths stay easy to keep in sync. The K^T transpose is materialized into a per-head
+    /// scratch buffer because MultiplyBlocked has no transposed-B variant.
+    /// </para>
+    /// </summary>
+    private Tensor<double> ScaledDotProductAttentionDouble(
+        Tensor<double> query,
+        Tensor<double> key,
+        Tensor<double> value,
+        Tensor<bool>? mask,
+        double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
+        out Tensor<double> attentionWeights)
+    {
+        int bhCount = batch * heads;
+        var qd = query.GetFlattenedData();
+        var kd = key.GetFlattenedData();
+        var vd = value.GetDataArray();
+        var doubleOps = MathHelper.GetNumericOperations<double>();
+
+        // scoresData is internal scratch — rent from ArrayPool to amortize the
+        // per-call allocation across the SDPA hot path (24-28 calls per DiT
+        // forward × 50 inference steps).
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
+        try
+        {
+            var weightsData = new double[scoresLen];
+            var outputData = new double[bhCount * seqQ * d_v];
+            double negInfD = double.NegativeInfinity;
+
+            Parallel.For(0, bhCount, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+                int qOff = bh * seqQ * d_k;
+                int kOff = bh * seqK * d_k;
+                int sOff = bh * seqQ * seqK;
+
+                // ──── Step 1: scores = Q @ K^T.
+                // MultiplyBlocked has no transposed-B variant, so materialize K^T
+                // into a per-head scratch buffer rented from ArrayPool. allowParallel:
+                // false because we're already inside Parallel.For(bhCount).
+                var kt = System.Buffers.ArrayPool<double>.Shared.Rent(d_k * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kd[kOff + i * d_k + j];
+
+                    var scoresSlice = new Memory<double>(scoresData, sOff, seqQ * seqK);
+                    scoresSlice.Span.Clear();
+                    MatrixMultiplyHelper.MultiplyBlocked(
+                        doubleOps,
+                        new ReadOnlyMemory<double>(qd, qOff, seqQ * d_k),
+                        new ReadOnlyMemory<double>(kt, 0, d_k * seqK),
+                        scoresSlice,
+                        seqQ, d_k, seqK,
+                        d_k, seqK, seqK,
+                        allowParallel: false);
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(kt, clearArray: false); }
+
+                // ──── Step 2: fused scale + mask + numerically-stable softmax.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    double maxVal = negInfD;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double v = scoresData[rowOff + j] * scaleValue;
+                        if (mask != null && !mask[b, h, i, j]) v = negInfD;
+                        if (v > maxVal) maxVal = v;
+                        scoresData[rowOff + j] = v;
+                    }
+                    if (double.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++)
+                            weightsData[rowOff + j] = 0d;
+                        continue;
+                    }
+                    double sumExp = 0d;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double e = Math.Exp(scoresData[rowOff + j] - maxVal);
+                        weightsData[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    double inv = sumExp != 0d ? 1d / sumExp : 0d;
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] *= inv;
+                }
+
+                // ──── Step 3: output = weights @ V (no transpose).
+                int wOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+                var outSlice = new Memory<double>(outputData, oOff, seqQ * d_v);
+                outSlice.Span.Clear();
+                MatrixMultiplyHelper.MultiplyBlocked(
+                    doubleOps,
+                    new ReadOnlyMemory<double>(weightsData, wOff, seqQ * seqK),
+                    new ReadOnlyMemory<double>(vd, vOff, seqK * d_v),
+                    outSlice,
+                    seqQ, seqK, d_v,
+                    seqK, d_v, d_v,
+                    allowParallel: false);
+            });
+
+            attentionWeights = TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, seqK },
+                new Vector<double>(weightsData));
+            return TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, d_v },
+                new Vector<double>(outputData));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
         }
     }
 
