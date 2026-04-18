@@ -178,6 +178,32 @@ internal static class OnnxAutoPad
     }
 
     /// <summary>
+    /// Pre-pads the input along every spatial axis with the FULL
+    /// (asymmetric-aware) amount so the subsequent pool/conv can run with
+    /// engine-level padding=0. Used by <c>AveragePool</c> with
+    /// <c>count_include_pad=1</c>: moving the padding out of the engine's
+    /// pool makes the kernel-window denominator always equal the full
+    /// kernel area (the "include-pad" semantic ONNX requires).
+    /// </summary>
+    internal static Tensor<T> ApplyPadAllAxes<T>(
+        Engines.IEngine engine, Tensor<T> input, OnnxPaddingND pad, int spatialRank, T padValue) where T : unmanaged
+    {
+        bool nonZero = false;
+        for (int i = 0; i < spatialRank; i++)
+            if (pad.Begins[i] != 0 || pad.Ends[i] != 0) { nonZero = true; break; }
+        if (!nonZero) return input;
+        if (spatialRank == 2)
+            return engine.Pad(input, pad.Begins[0], pad.Ends[0], pad.Begins[1], pad.Ends[1], padValue);
+        var fullPad = new int[input.Rank * 2];
+        for (int i = 0; i < spatialRank; i++)
+        {
+            fullPad[(2 + i) * 2] = pad.Begins[i];
+            fullPad[(2 + i) * 2 + 1] = pad.Ends[i];
+        }
+        return engine.TensorConstantPad(input, fullPad, padValue);
+    }
+
+    /// <summary>
     /// Legacy 2D wrapper retained for callers that want the 2D-specific
     /// struct shape. New code should use <see cref="ResolveND"/> directly.
     /// </summary>
@@ -458,8 +484,6 @@ internal static class ConvOperators
 
             int spatialRank = input.Rank - 2;
             int group = ctx.GetIntAttrAsInt(node, "group", 1);
-            if (group != 1)
-                throw new NotSupportedException("ConvTranspose group != 1 is not yet supported.");
 
             var strides = ctx.GetIntArrayAttr(node, "strides") ?? new int[spatialRank];
             for (int i = 0; i < strides.Length; i++) if (strides[i] == 0) strides[i] = 1;
@@ -469,13 +493,81 @@ internal static class ConvOperators
             var explicitPads = ctx.GetIntArrayAttr(node, "pads");
             var autoPad = ctx.GetStringAttr(node, "auto_pad", null);
             var pad = OnnxAutoPad.ResolveND("ConvTranspose", input._shape, kernelSpatial, strides, spatialRank, autoPad, explicitPads);
-            if (!pad.IsSymmetric)
-                throw new NotSupportedException(
-                    $"ConvTranspose asymmetric padding [{string.Join(",", pad.Begins)},{string.Join(",", pad.Ends)}] not yet supported — transposed conv geometry requires pre-crop, not pre-pad.");
 
-            Tensor<T> result = spatialRank == 2
-                ? ctx.Engine.ConvTranspose2D(input, kernel, stride: strides, padding: pad.Begins, outputPadding: outputPadding)
-                : ctx.Engine.ConvTranspose3D(input, kernel, stride: strides, padding: pad.Begins, outputPadding: outputPadding);
+            // For ConvTranspose, "padding" in ONNX crops the output from both
+            // ends. The engine's ConvTranspose takes a single "padding" value
+            // applied symmetrically (pad on each end). For asymmetric pad we
+            // pass the larger (or symmetric residual) to the engine, then
+            // slice the result to remove any extra crop.
+            int[] symPad = new int[spatialRank];
+            int[] extraBegin = new int[spatialRank];
+            int[] extraEnd = new int[spatialRank];
+            bool anyAsym = false;
+            for (int i = 0; i < spatialRank; i++)
+            {
+                symPad[i] = Math.Min(pad.Begins[i], pad.Ends[i]);
+                extraBegin[i] = pad.Begins[i] - symPad[i];
+                extraEnd[i] = pad.Ends[i] - symPad[i];
+                if (extraBegin[i] != 0 || extraEnd[i] != 0) anyAsym = true;
+            }
+
+            Tensor<T> result;
+            if (group == 1)
+            {
+                result = spatialRank == 2
+                    ? ctx.Engine.ConvTranspose2D(input, kernel, stride: strides, padding: symPad, outputPadding: outputPadding)
+                    : ctx.Engine.ConvTranspose3D(input, kernel, stride: strides, padding: symPad, outputPadding: outputPadding);
+            }
+            else
+            {
+                // Grouped/depthwise ConvTranspose: split input along C_in and
+                // kernel along the group axis of its first dim (ONNX packs
+                // [C_in, C_out/group, kH, kW]). Each group gets a slice of
+                // input and a slice of kernel, produce a per-group output,
+                // concat along C_out.
+                if (input._shape[1] % group != 0)
+                    throw new InvalidDataException(
+                        $"ConvTranspose Cin ({input._shape[1]}) must be divisible by group ({group}).");
+                if (kernel._shape[0] % group != 0)
+                    throw new InvalidDataException(
+                        $"ConvTranspose kernel first dim ({kernel._shape[0]}) must be divisible by group ({group}).");
+                int cInPerGroup = input._shape[1] / group;
+                int kFirstPerGroup = kernel._shape[0] / group;
+                var parts = new List<Tensor<T>>(group);
+                for (int g = 0; g < group; g++)
+                {
+                    var inSliceStart = new int[input.Rank];
+                    var inSliceLen = (int[])input._shape.Clone();
+                    inSliceStart[1] = g * cInPerGroup;
+                    inSliceLen[1] = cInPerGroup;
+                    var inSlice = ctx.Engine.TensorSlice(input, inSliceStart, inSliceLen);
+
+                    var kSliceStart = new int[kernel.Rank];
+                    var kSliceLen = (int[])kernel._shape.Clone();
+                    kSliceStart[0] = g * kFirstPerGroup;
+                    kSliceLen[0] = kFirstPerGroup;
+                    var kSlice = ctx.Engine.TensorSlice(kernel, kSliceStart, kSliceLen);
+
+                    var groupOut = spatialRank == 2
+                        ? ctx.Engine.ConvTranspose2D(inSlice, kSlice, stride: strides, padding: symPad, outputPadding: outputPadding)
+                        : ctx.Engine.ConvTranspose3D(inSlice, kSlice, stride: strides, padding: symPad, outputPadding: outputPadding);
+                    parts.Add(groupOut);
+                }
+                result = ctx.Engine.Concat(parts, axis: 1);
+            }
+
+            // Apply asymmetric extra crop as a slice if needed.
+            if (anyAsym)
+            {
+                var cropStart = new int[result.Rank];
+                var cropLen = (int[])result._shape.Clone();
+                for (int i = 0; i < spatialRank; i++)
+                {
+                    cropStart[2 + i] = extraBegin[i];
+                    cropLen[2 + i] = Math.Max(0, result._shape[2 + i] - extraBegin[i] - extraEnd[i]);
+                }
+                result = ctx.Engine.TensorSlice(result, cropStart, cropLen);
+            }
 
             if (hasBias)
             {
@@ -518,13 +610,27 @@ internal static class ConvOperators
 
             if (spatialRank == 2)
             {
-                if (kernelShape[0] != kernelShape[1])
-                    throw new NotSupportedException($"MaxPool 2D non-square kernel [{string.Join(",", kernelShape)}] is a Phase 3 op.");
-                if (strides[0] != strides[1])
-                    throw new NotSupportedException($"MaxPool 2D non-square stride [{string.Join(",", strides)}] is a Phase 3 op.");
-                if (symmetricPad[0] != symmetricPad[1])
-                    throw new NotSupportedException($"MaxPool 2D residual non-square padding [{symmetricPad[0]}, {symmetricPad[1]}] is a Phase 3 op.");
-                ctx.PutTensor(node.Output[0], ctx.Engine.MaxPool2D(paddedInput, kernelShape[0], strides[0], symmetricPad[0]));
+                bool squareKernel = kernelShape[0] == kernelShape[1];
+                bool squareStride = strides[0] == strides[1];
+                bool squarePad = symmetricPad[0] == symmetricPad[1];
+                if (squareKernel && squareStride && squarePad)
+                {
+                    ctx.PutTensor(node.Output[0], ctx.Engine.MaxPool2D(paddedInput, kernelShape[0], strides[0], symmetricPad[0]));
+                }
+                else
+                {
+                    // Non-square 2D → promote to 5D (treat as depth=1 3D) and
+                    // call the 3D path which takes int[] per-axis parameters.
+                    var in4 = paddedInput._shape; // [N, C, H, W]
+                    var promoted = ctx.Engine.Reshape(paddedInput, new[] { in4[0], in4[1], 1, in4[2], in4[3] });
+                    var pool3D = ctx.Engine.MaxPool3D(promoted,
+                        poolSize: new[] { 1, kernelShape[0], kernelShape[1] },
+                        stride: new[] { 1, strides[0], strides[1] },
+                        padding: new[] { 0, symmetricPad[0], symmetricPad[1] });
+                    var o5 = pool3D._shape; // [N, C, 1, oH, oW]
+                    var demoted = ctx.Engine.Reshape(pool3D, new[] { o5[0], o5[1], o5[3], o5[4] });
+                    ctx.PutTensor(node.Output[0], demoted);
+                }
             }
             else
             {
@@ -557,20 +663,48 @@ internal static class ConvOperators
             var pad = OnnxAutoPad.ResolveND("AveragePool", input._shape, kernelShape, strides, spatialRank, autoPad, explicitPads, ceilMode: ceilMode != 0);
 
             int countIncludePad = ctx.GetIntAttrAsInt(node, "count_include_pad", 0);
-            if (countIncludePad != 0 && !pad.IsAllZero)
-                throw new NotSupportedException("AveragePool count_include_pad=1 with non-zero padding is not yet supported.");
             var zero = default(T);
-            var (paddedInput, symmetricPad) = OnnxAutoPad.ApplyAsymmetricND(ctx.Engine, input, pad, spatialRank, zero);
+            // count_include_pad=1 makes the average denominator the full
+            // kernel area at every output cell (padded zeros count). Engine
+            // AvgPool's "padding" param implements the count_include_pad=0
+            // semantics (padded cells excluded from denominator), so when
+            // count_include_pad=1 and pad is non-zero we pre-pad manually
+            // with zeros and drop engine-level padding to 0 — that way the
+            // kernel window always sees the full area and divides by it.
+            Tensor<T> paddedInput;
+            int[] symmetricPad;
+            if (countIncludePad != 0 && !pad.IsAllZero)
+            {
+                paddedInput = OnnxAutoPad.ApplyPadAllAxes(ctx.Engine, input, pad, spatialRank, zero);
+                symmetricPad = new int[spatialRank]; // zero-padding from the engine's POV.
+            }
+            else
+            {
+                (paddedInput, symmetricPad) = OnnxAutoPad.ApplyAsymmetricND(ctx.Engine, input, pad, spatialRank, zero);
+            }
 
             if (spatialRank == 2)
             {
-                if (kernelShape[0] != kernelShape[1])
-                    throw new NotSupportedException($"AveragePool 2D non-square kernel [{string.Join(",", kernelShape)}] is a Phase 3 op.");
-                if (strides[0] != strides[1])
-                    throw new NotSupportedException($"AveragePool 2D non-square stride [{string.Join(",", strides)}] is a Phase 3 op.");
-                if (symmetricPad[0] != symmetricPad[1])
-                    throw new NotSupportedException($"AveragePool 2D residual non-square padding [{symmetricPad[0]}, {symmetricPad[1]}] is a Phase 3 op.");
-                ctx.PutTensor(node.Output[0], ctx.Engine.AvgPool2D(paddedInput, kernelShape[0], strides[0], symmetricPad[0]));
+                bool squareKernel = kernelShape[0] == kernelShape[1];
+                bool squareStride = strides[0] == strides[1];
+                bool squarePad = symmetricPad[0] == symmetricPad[1];
+                if (squareKernel && squareStride && squarePad)
+                {
+                    ctx.PutTensor(node.Output[0], ctx.Engine.AvgPool2D(paddedInput, kernelShape[0], strides[0], symmetricPad[0]));
+                }
+                else
+                {
+                    // Non-square 2D → promote to 5D and use the 3D path.
+                    var in4 = paddedInput._shape;
+                    var promoted = ctx.Engine.Reshape(paddedInput, new[] { in4[0], in4[1], 1, in4[2], in4[3] });
+                    var pool3D = ctx.Engine.AvgPool3D(promoted,
+                        poolSize: new[] { 1, kernelShape[0], kernelShape[1] },
+                        stride: new[] { 1, strides[0], strides[1] },
+                        padding: new[] { 0, symmetricPad[0], symmetricPad[1] });
+                    var o5 = pool3D._shape;
+                    var demoted = ctx.Engine.Reshape(pool3D, new[] { o5[0], o5[1], o5[3], o5[4] });
+                    ctx.PutTensor(node.Output[0], demoted);
+                }
             }
             else
             {

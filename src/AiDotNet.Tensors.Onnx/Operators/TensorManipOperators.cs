@@ -195,9 +195,6 @@ internal static class TensorManipOperators
             int[] steps = node.Input.Count > 4 && ctx.HasTensor(node.Input[4])
                 ? ToInt32Array(ctx.GetTensor(node.Input[4]))
                 : Fill(1, startsT._shape[0]);
-            for (int i = 0; i < steps.Length; i++)
-                if (steps[i] != 1)
-                    throw new NotSupportedException("Slice with non-unit step is a Phase 2 op.");
 
             var starts = ToInt32Array(startsT);
             var ends   = ToInt32Array(endsT);
@@ -210,20 +207,103 @@ internal static class TensorManipOperators
                 throw new InvalidDataException(
                     $"Slice expected starts/ends/axes/steps to all have the same length; got " +
                     $"{starts.Length}/{ends.Length}/{axes.Length}/{steps.Length}.");
-            // Build full [rank] start + length arrays defaulting to the whole tensor.
+            // Build full [rank] start + length + step arrays defaulting to
+            // the whole tensor with unit step. Non-unit (including negative)
+            // steps are honored below via a strided scatter.
             var fullStart = new int[data.Rank];
             var fullLen = (int[])data._shape.Clone();
+            var fullStep = new int[data.Rank];
+            for (int i = 0; i < data.Rank; i++) fullStep[i] = 1;
+            bool anyNonUnitStep = false;
             for (int i = 0; i < axes.Length; i++)
             {
                 int ax = axes[i] < 0 ? axes[i] + data.Rank : axes[i];
-                int s = starts[i] < 0 ? starts[i] + data._shape[ax] : starts[i];
-                int e = ends[i] < 0 ? ends[i] + data._shape[ax] : ends[i];
-                s = Math.Max(0, Math.Min(s, data._shape[ax]));
-                e = Math.Max(0, Math.Min(e, data._shape[ax]));
+                int step = steps[i];
+                if (step == 0)
+                    throw new InvalidDataException("Slice step must be non-zero.");
+                int dim = data._shape[ax];
+                int s = starts[i] < 0 ? starts[i] + dim : starts[i];
+                int e = ends[i] < 0 ? ends[i] + dim : ends[i];
+                if (step > 0)
+                {
+                    s = Math.Max(0, Math.Min(s, dim));
+                    e = Math.Max(0, Math.Min(e, dim));
+                }
+                else
+                {
+                    // For negative step, valid range is [-1, dim-1] (ONNX
+                    // spec). Clamp defensively.
+                    s = Math.Max(-1, Math.Min(s, dim - 1));
+                    e = Math.Max(-1, Math.Min(e, dim - 1));
+                }
                 fullStart[ax] = s;
-                fullLen[ax] = Math.Max(0, e - s);
+                fullLen[ax] = step > 0
+                    ? (e > s ? (e - s + step - 1) / step : 0)
+                    : (s > e ? (s - e + (-step) - 1) / (-step) : 0);
+                fullStep[ax] = step;
+                if (step != 1) anyNonUnitStep = true;
             }
-            ctx.PutTensor(node.Output[0], ctx.Engine.TensorSlice(data, fullStart, fullLen));
+            if (!anyNonUnitStep)
+            {
+                ctx.PutTensor(node.Output[0], ctx.Engine.TensorSlice(data, fullStart, fullLen));
+                return;
+            }
+            // Strided Slice — engine has no native non-unit-step op. Compose
+            // via a per-element strided scatter recorded as a LazyNode so
+            // the read of `data` happens at Execute time (matches the
+            // deferred-read idiom used by Gather/OneHot).
+            var outShape = (int[])fullLen.Clone();
+            int outSize = 1;
+            for (int i = 0; i < outShape.Length; i++) outSize *= outShape[i];
+            var capturedData = data;
+            var capturedStart = fullStart;
+            var capturedLen = fullLen;
+            var capturedStep = fullStep;
+            var scope = Engines.Compilation.GraphMode.Current;
+            if (scope is null)
+            {
+                // Eager path.
+                var eagerResult = new LinearAlgebra.Tensor<T>(outShape);
+                StridedCopy(capturedData, eagerResult, capturedStart, capturedLen, capturedStep);
+                ctx.PutTensor(node.Output[0], eagerResult);
+                return;
+            }
+            var lazy = scope.RecordUnary(Engines.Compilation.LazyNodeType.Custom,
+                "Slice", data, outShape,
+                (eng, output) => StridedCopy(capturedData, output, capturedStart, capturedLen, capturedStep));
+            ctx.PutTensor(node.Output[0], lazy);
+        }
+
+        /// <summary>
+        /// Copies elements of <paramref name="src"/> at starts/step strides
+        /// into <paramref name="dst"/>. Generic over rank; uses a flat
+        /// output-index to multi-index walk so any rank + negative step
+        /// combination is correct.
+        /// </summary>
+        private static void StridedCopy(LinearAlgebra.Tensor<T> src, LinearAlgebra.Tensor<T> dst,
+            int[] start, int[] len, int[] step)
+        {
+            var srcSpan = src.AsSpan();
+            var dstSpan = dst.AsWritableSpan();
+            int rank = start.Length;
+            var srcStrides = new int[rank];
+            int s = 1;
+            for (int i = rank - 1; i >= 0; i--) { srcStrides[i] = s; s *= src._shape[i]; }
+            int dstLen = dstSpan.Length;
+            var coord = new int[rank];
+            for (int outIdx = 0; outIdx < dstLen; outIdx++)
+            {
+                int rem = outIdx;
+                for (int i = rank - 1; i >= 0; i--)
+                {
+                    coord[i] = rem % len[i];
+                    rem /= len[i];
+                }
+                int srcIdx = 0;
+                for (int i = 0; i < rank; i++)
+                    srcIdx += (start[i] + coord[i] * step[i]) * srcStrides[i];
+                dstSpan[outIdx] = srcSpan[srcIdx];
+            }
         }
     }
 
@@ -236,7 +316,26 @@ internal static class TensorManipOperators
             int axis = ctx.GetIntAttrAsInt(node, "axis", 0);
             var tensors = new List<Tensor<T>>(node.Input.Count);
             for (int i = 0; i < node.Input.Count; i++) tensors.Add(ctx.GetTensor(node.Input[i]));
-            if (axis < 0) axis += tensors[0].Rank;
+            // tf2onnx and some HF exports emit Concat across operands whose
+            // ranks differ (ONNX Runtime auto-aligns; the ONNX spec itself
+            // requires matching rank). Prepend size-1 axes to each operand
+            // until every tensor reaches the maximum rank in the list, then
+            // forward to the engine's same-rank Concat.
+            int maxRank = 0;
+            for (int i = 0; i < tensors.Count; i++)
+                if (tensors[i].Rank > maxRank) maxRank = tensors[i].Rank;
+            for (int i = 0; i < tensors.Count; i++)
+            {
+                if (tensors[i].Rank < maxRank)
+                {
+                    int pad = maxRank - tensors[i].Rank;
+                    var padShape = new int[maxRank];
+                    for (int k = 0; k < pad; k++) padShape[k] = 1;
+                    for (int k = pad; k < maxRank; k++) padShape[k] = tensors[i]._shape[k - pad];
+                    tensors[i] = ctx.Engine.Reshape(tensors[i], padShape);
+                }
+            }
+            if (axis < 0) axis += maxRank;
             ctx.PutTensor(node.Output[0], ctx.Engine.Concat(tensors, axis));
         }
     }
@@ -261,23 +360,44 @@ internal static class TensorManipOperators
                 splitSizes = ToInt32Array(ctx.GetTensor(node.Input[1]));
             else
                 splitSizes = ctx.GetIntArrayAttr(node, "split");
+            if (splitSizes is not null && splitSizes.Length != numOutputs)
+                throw new InvalidDataException(
+                    $"Split sizes length {splitSizes.Length} != number of outputs {numOutputs}.");
+            // Check uniformity — if every piece is the same size, route
+            // through the fast engine.TensorSplit path. Non-uniform falls
+            // through to per-piece engine.TensorSlice below.
+            bool uniform = splitSizes is null;
             if (splitSizes is not null)
             {
-                if (splitSizes.Length != numOutputs)
-                    throw new InvalidDataException(
-                        $"Split sizes length {splitSizes.Length} != number of outputs {numOutputs}.");
+                uniform = true;
                 for (int i = 1; i < splitSizes.Length; i++)
-                    if (splitSizes[i] != splitSizes[0])
-                        throw new NotSupportedException(
-                            $"Split with non-uniform sizes [{string.Join(",", splitSizes)}] " +
-                            "is not yet supported; only evenly-sized splits are covered.");
+                    if (splitSizes[i] != splitSizes[0]) { uniform = false; break; }
             }
-            var parts = ctx.Engine.TensorSplit(x, numOutputs, axis);
-            if (parts.Length != numOutputs)
+            if (uniform)
+            {
+                var parts = ctx.Engine.TensorSplit(x, numOutputs, axis);
+                if (parts.Length != numOutputs)
+                    throw new InvalidDataException(
+                        $"Split produced {parts.Length} parts but node has {numOutputs} outputs.");
+                for (int i = 0; i < numOutputs; i++)
+                    ctx.PutTensor(node.Output[i], parts[i]);
+                return;
+            }
+            // Non-uniform split: emit one TensorSlice per piece.
+            if (splitSizes!.Sum() != x._shape[axis])
                 throw new InvalidDataException(
-                    $"Split produced {parts.Length} parts but node has {numOutputs} outputs.");
+                    $"Split sizes [{string.Join(",", splitSizes!)}] sum {splitSizes!.Sum()} " +
+                    $"!= axis {axis} size {x._shape[axis]}.");
+            int offset = 0;
             for (int i = 0; i < numOutputs; i++)
-                ctx.PutTensor(node.Output[i], parts[i]);
+            {
+                var fullStart = new int[x.Rank];
+                var fullLen = (int[])x._shape.Clone();
+                fullStart[axis] = offset;
+                fullLen[axis] = splitSizes![i];
+                ctx.PutTensor(node.Output[i], ctx.Engine.TensorSlice(x, fullStart, fullLen));
+                offset += splitSizes![i];
+            }
         }
     }
 

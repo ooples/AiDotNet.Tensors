@@ -201,8 +201,11 @@ internal static class InitializerLoader
                 throw new NotSupportedException($"Unsupported integer ONNX type {proto.DataType}.");
         }
 
-        // Convert long → T. For T = float/double this is straightforward; for
-        // other T we rely on the numeric ops registry.
+        // Convert long → T. The common float/double paths write directly
+        // via MemoryMarshal for zero-alloc; every other T uses the numeric
+        // ops registry's FromDouble, which handles int8/int16/int32/int64,
+        // uint8/16/32/64, Half, BFloat16, decimal — every type exposed
+        // through MathHelper.GetNumericOperations.
         if (typeof(T) == typeof(float))
         {
             var fDst = MemoryMarshal.Cast<T, float>(dst);
@@ -215,8 +218,8 @@ internal static class InitializerLoader
         }
         else
         {
-            throw new NotSupportedException(
-                $"Integer ONNX initializer → T={typeof(T).Name} conversion isn't implemented yet.");
+            var ops = Helpers.MathHelper.GetNumericOperations<T>();
+            for (int i = 0; i < n; i++) dst[i] = ops.FromDouble(asLong[i]);
         }
     }
 }

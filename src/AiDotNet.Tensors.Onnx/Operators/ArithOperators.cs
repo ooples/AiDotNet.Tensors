@@ -35,57 +35,106 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
+
+            // ONNX MatMul spec: rank-1 operands get a singleton dim
+            // prepended (a) / appended (b) for the matmul, then removed from
+            // the output. E.g. Pow-1 cases: a=[K] · b=[K,N] → [N]; a=[M,K] ·
+            // b=[K] → [M]; a=[K] · b=[K] → [] scalar.
+            bool aWasVector = a.Rank == 1;
+            bool bWasVector = b.Rank == 1;
+            if (aWasVector) a = ctx.Engine.Reshape(a, new[] { 1, a._shape[0] });
+            if (bWasVector) b = ctx.Engine.Reshape(b, new[] { b._shape[0], 1 });
+
             Tensor<T> result;
-            if (a.Rank <= 2 && b.Rank <= 2)
+            if (a.Rank == 2 && b.Rank == 2)
             {
                 result = ctx.Engine.TensorMatMul(a, b);
             }
-            else if (a.Rank == 3 && (b.Rank == 2 || b.Rank == 3))
+            else
             {
-                result = ctx.Engine.TensorBatchMatMul(a, b);
-            }
-            else if (a.Rank >= 3 && b.Rank >= 3 && a.Rank == b.Rank)
-            {
-                // Collapse all leading batch dims into a single dim so the
-                // 3D-only engine kernel applies. Reshape is a storage-sharing
-                // view when the source is contiguous — but attention Q/K/V
-                // come out of TensorPermute (non-contiguous strided views),
-                // so Reshape across a dim-merge boundary WOULD reinterpret
-                // the strided layout as row-major and produce wrong values.
-                // The Permute GraphMode closure now materializes via
-                // Contiguous, so at Execute time these inputs are row-major
-                // — but their _shape still reflects the post-permute layout
-                // which is what we want for the Reshape here.
-                int batchA = 1;
-                for (int i = 0; i < a.Rank - 2; i++) batchA *= a._shape[i];
-                int batchB = 1;
-                for (int i = 0; i < b.Rank - 2; i++) batchB *= b._shape[i];
-                if (batchA != batchB)
-                    throw new InvalidDataException(
-                        $"MatMul batch dims don't match: a.shape = [{string.Join(",", a._shape)}], b.shape = [{string.Join(",", b._shape)}]. " +
-                        "NumPy-style broadcasting across leading dims isn't yet supported.");
+                // Full-rank batched matmul with NumPy broadcasting over the
+                // leading dims. Pad the smaller-rank operand with leading
+                // ones, then broadcast each batch axis to the max size,
+                // collapse the batch dims, run a 3D batched matmul, and
+                // reshape back to the broadcast batch shape + [M, N].
                 int mA = a._shape[a.Rank - 2];
                 int kA = a._shape[a.Rank - 1];
                 int kB = b._shape[b.Rank - 2];
                 int nB = b._shape[b.Rank - 1];
                 if (kA != kB)
                     throw new InvalidDataException($"MatMul inner dim mismatch: {kA} vs {kB}.");
-                var a3 = ctx.Engine.Reshape(a, new[] { batchA, mA, kA });
-                var b3 = ctx.Engine.Reshape(b, new[] { batchB, kB, nB });
+                int maxBatchRank = Math.Max(a.Rank, b.Rank) - 2;
+                // Right-aligned broadcast shape over the leading dims.
+                var batchShape = new int[maxBatchRank];
+                for (int i = 0; i < maxBatchRank; i++)
+                {
+                    int aDim = (i < maxBatchRank - (a.Rank - 2)) ? 1 : a._shape[i - (maxBatchRank - (a.Rank - 2))];
+                    int bDim = (i < maxBatchRank - (b.Rank - 2)) ? 1 : b._shape[i - (maxBatchRank - (b.Rank - 2))];
+                    if (aDim != bDim && aDim != 1 && bDim != 1)
+                        throw new InvalidDataException(
+                            $"MatMul batch shapes aren't broadcast-compatible: " +
+                            $"a.shape=[{string.Join(",", a._shape)}] b.shape=[{string.Join(",", b._shape)}].");
+                    batchShape[i] = Math.Max(aDim, bDim);
+                }
+                int totalBatch = 1;
+                for (int i = 0; i < maxBatchRank; i++) totalBatch *= batchShape[i];
+
+                // Broadcast each operand to the full batch shape (if already
+                // matching shape, no-op).
+                var aFull = new int[maxBatchRank + 2];
+                for (int i = 0; i < maxBatchRank; i++) aFull[i] = batchShape[i];
+                aFull[maxBatchRank] = mA; aFull[maxBatchRank + 1] = kA;
+                var bFull = new int[maxBatchRank + 2];
+                for (int i = 0; i < maxBatchRank; i++) bFull[i] = batchShape[i];
+                bFull[maxBatchRank] = kB; bFull[maxBatchRank + 1] = nB;
+
+                var aBroad = ShapesEqualND(a._shape, aFull)
+                    ? a
+                    : ctx.Engine.TensorBroadcastAdd(a, new Tensor<T>(aFull));
+                var bBroad = ShapesEqualND(b._shape, bFull)
+                    ? b
+                    : ctx.Engine.TensorBroadcastAdd(b, new Tensor<T>(bFull));
+
+                var a3 = ctx.Engine.Reshape(aBroad, new[] { totalBatch, mA, kA });
+                var b3 = ctx.Engine.Reshape(bBroad, new[] { totalBatch, kB, nB });
                 var r3 = ctx.Engine.TensorBatchMatMul(a3, b3);
-                // Reshape back to the original leading-batch form [a.shape[:-2], M, N].
-                var outShape = new int[a.Rank];
-                for (int i = 0; i < a.Rank - 2; i++) outShape[i] = a._shape[i];
-                outShape[a.Rank - 2] = mA;
-                outShape[a.Rank - 1] = nB;
+
+                var outShape = new int[maxBatchRank + 2];
+                for (int i = 0; i < maxBatchRank; i++) outShape[i] = batchShape[i];
+                outShape[maxBatchRank] = mA;
+                outShape[maxBatchRank + 1] = nB;
                 result = ctx.Engine.Reshape(r3, outShape);
             }
-            else
+
+            // Undo the rank-1 temp reshapes: drop the prepended / appended
+            // singleton in the result shape.
+            if (aWasVector || bWasVector)
             {
-                throw new NotSupportedException(
-                    $"MatMul with ranks a={a.Rank}, b={b.Rank} is not yet supported.");
+                var srcShape = result._shape;
+                // Post-matmul shape is [..., M, N]. aWasVector means we
+                // prepended 1 → M=1 to drop; bWasVector means we appended 1
+                // → N=1 to drop.
+                int newRank = srcShape.Length - (aWasVector ? 1 : 0) - (bWasVector ? 1 : 0);
+                if (newRank < 0) newRank = 0;
+                var finalShape = new int[newRank];
+                int write = 0;
+                for (int r = 0; r < srcShape.Length; r++)
+                {
+                    bool dropM = aWasVector && r == srcShape.Length - 2;
+                    bool dropN = bWasVector && r == srcShape.Length - 1;
+                    if (dropM || dropN) continue;
+                    finalShape[write++] = srcShape[r];
+                }
+                result = ctx.Engine.Reshape(result, finalShape);
             }
             ctx.PutTensor(node.Output[0], result);
+        }
+
+        private static bool ShapesEqualND(int[] a, int[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
         }
     }
 

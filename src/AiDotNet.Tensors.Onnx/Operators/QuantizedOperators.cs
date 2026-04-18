@@ -166,7 +166,37 @@ internal static class QuantizedOperators
             }
             else
             {
-                throw new NotSupportedException("QLinearConv group>1 is not yet supported.");
+                // Grouped QLinearConv: slice float-dequantized input and
+                // kernel along their channel/output axes, run per-group
+                // Conv2D, concat the outputs along C_out. Mirrors the
+                // grouped-ConvTranspose path in ConvOperators.
+                if (paddedInput._shape[1] % group != 0)
+                    throw new InvalidDataException(
+                        $"QLinearConv Cin ({paddedInput._shape[1]}) must be divisible by group ({group}).");
+                if (wF._shape[0] % group != 0)
+                    throw new InvalidDataException(
+                        $"QLinearConv Cout ({wF._shape[0]}) must be divisible by group ({group}).");
+                int cInPerGroup = paddedInput._shape[1] / group;
+                int cOutPerGroup = wF._shape[0] / group;
+                var parts = new List<Tensor<T>>(group);
+                for (int g = 0; g < group; g++)
+                {
+                    var inSliceStart = new int[paddedInput.Rank];
+                    var inSliceLen = (int[])paddedInput._shape.Clone();
+                    inSliceStart[1] = g * cInPerGroup;
+                    inSliceLen[1] = cInPerGroup;
+                    var inSlice = ctx.Engine.TensorSlice(paddedInput, inSliceStart, inSliceLen);
+
+                    var kSliceStart = new int[wF.Rank];
+                    var kSliceLen = (int[])wF._shape.Clone();
+                    kSliceStart[0] = g * cOutPerGroup;
+                    kSliceLen[0] = cOutPerGroup;
+                    var kSlice = ctx.Engine.TensorSlice(wF, kSliceStart, kSliceLen);
+
+                    parts.Add(ctx.Engine.Conv2D(inSlice, kSlice,
+                        stride: strides, padding: symmetricPad, dilation: dilations));
+                }
+                convResult = ctx.Engine.Concat(parts, axis: 1);
             }
 
             // Bias is int32, pre-scaled by x_scale * w_scale. Convert back
@@ -190,9 +220,25 @@ internal static class QuantizedOperators
     }
 
     /// <summary>
-    /// ONNX DynamicQuantizeLinear — computes per-tensor scale/zero_point
-    /// from min/max then quantizes to uint8. Not common in inference models
-    /// but appears in some transformer exports.
+    /// ONNX DynamicQuantizeLinear — computes per-tensor <c>y_scale</c> and
+    /// <c>y_zero_point</c> at runtime from the input's min/max, then
+    /// quantizes to uint8. Common in HuggingFace quantized text encoders
+    /// that run the scale derivation inside the graph (no pre-computed
+    /// quantization params).
+    /// <para>
+    /// Formula per ONNX spec:
+    /// <code>
+    ///   adjusted_min = min(0, reduce_min(x))
+    ///   adjusted_max = max(0, reduce_max(x))
+    ///   y_scale = (adjusted_max - adjusted_min) / 255
+    ///   intermediate_zp = 0 - adjusted_min / y_scale
+    ///   y_zero_point = clamp(round(intermediate_zp), 0, 255)
+    ///   y = clamp(round(x / y_scale) + y_zero_point, 0, 255)
+    /// </code>
+    /// </para>
+    /// We defer every engine op to a lazy closure so the runtime min/max
+    /// read is captured at Execute time rather than at trace (matching the
+    /// Gather/OneHot deferred-read idiom).
     /// </summary>
     internal sealed class DynamicQuantizeLinear<T> : IOnnxOpTranslator<T> where T : unmanaged
     {
@@ -200,9 +246,100 @@ internal static class QuantizedOperators
         public string? Domain => null;
         public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
         {
-            throw new NotSupportedException(
-                "DynamicQuantizeLinear requires runtime min/max reduction + scale derivation; " +
-                "it's on the Phase 3 follow-up list because it introduces data-dependent shape/value flow.");
+            var x = ctx.GetTensor(node.Input[0]);
+            var ops = Helpers.MathHelper.GetNumericOperations<T>();
+            var engine = ctx.Engine;
+            var scope = Engines.Compilation.GraphMode.Current;
+
+            // Output shapes: y matches x; y_scale is scalar [1]; y_zero_point is scalar [1].
+            var yShape = x._shape;
+            var scalarShape = new[] { 1 };
+
+            // Core computation in a single closure — returned as a lazy
+            // tensor of scalarShape holding the derived scale. We compute
+            // scale + zp + the quantized output inline and cache them into
+            // separate output tensors via closures that all capture `x`.
+            var capturedX = x;
+            void ComputeAll(out Tensor<T> yOut, out Tensor<T> scaleOut, out Tensor<T> zpOut)
+            {
+                var xSpan = capturedX.AsSpan();
+                T minV = xSpan.Length > 0 ? xSpan[0] : ops.Zero;
+                T maxV = xSpan.Length > 0 ? xSpan[0] : ops.Zero;
+                for (int i = 1; i < xSpan.Length; i++)
+                {
+                    var v = xSpan[i];
+                    if (Convert.ToDouble(v!) < Convert.ToDouble(minV!)) minV = v;
+                    if (Convert.ToDouble(v!) > Convert.ToDouble(maxV!)) maxV = v;
+                }
+                double adjMin = Math.Min(0.0, Convert.ToDouble(minV!));
+                double adjMax = Math.Max(0.0, Convert.ToDouble(maxV!));
+                double scale = (adjMax - adjMin) / 255.0;
+                if (scale <= 0.0) scale = 1.0; // degenerate all-zero input
+                double interZp = 0.0 - adjMin / scale;
+                double zp = Math.Round(interZp);
+                if (zp < 0) zp = 0; if (zp > 255) zp = 255;
+
+                yOut = new Tensor<T>(yShape);
+                var yDst = yOut.AsWritableSpan();
+                for (int i = 0; i < xSpan.Length; i++)
+                {
+                    double xv = Convert.ToDouble(xSpan[i]!);
+                    double q = Math.Round(xv / scale) + zp;
+                    if (q < 0) q = 0; if (q > 255) q = 255;
+                    yDst[i] = ops.FromDouble(q);
+                }
+                scaleOut = new Tensor<T>(scalarShape);
+                scaleOut.AsWritableSpan()[0] = ops.FromDouble(scale);
+                zpOut = new Tensor<T>(scalarShape);
+                zpOut.AsWritableSpan()[0] = ops.FromDouble(zp);
+            }
+
+            if (scope is null)
+            {
+                ComputeAll(out var yEager, out var sEager, out var zpEager);
+                ctx.PutTensor(node.Output[0], yEager);
+                if (node.Output.Count > 1 && !string.IsNullOrEmpty(node.Output[1]))
+                    ctx.PutTensor(node.Output[1], sEager);
+                if (node.Output.Count > 2 && !string.IsNullOrEmpty(node.Output[2]))
+                    ctx.PutTensor(node.Output[2], zpEager);
+                return;
+            }
+
+            // Record three lazy nodes, one per output — each reads x at
+            // Execute time, runs the full quant computation, and copies the
+            // relevant piece into its own output buffer. The cost of
+            // triple-computing is acceptable because DynamicQuantizeLinear
+            // appears ≤1-2× per model.
+            var yLazy = scope.RecordUnary(Engines.Compilation.LazyNodeType.Custom,
+                "DynamicQuantizeLinear.y", x, yShape,
+                (eng, output) =>
+                {
+                    ComputeAll(out var yC, out _, out _);
+                    yC.AsSpan().CopyTo(output.AsWritableSpan());
+                });
+            ctx.PutTensor(node.Output[0], yLazy);
+            if (node.Output.Count > 1 && !string.IsNullOrEmpty(node.Output[1]))
+            {
+                var sLazy = scope.RecordUnary(Engines.Compilation.LazyNodeType.Custom,
+                    "DynamicQuantizeLinear.scale", x, scalarShape,
+                    (eng, output) =>
+                    {
+                        ComputeAll(out _, out var sC, out _);
+                        sC.AsSpan().CopyTo(output.AsWritableSpan());
+                    });
+                ctx.PutTensor(node.Output[1], sLazy);
+            }
+            if (node.Output.Count > 2 && !string.IsNullOrEmpty(node.Output[2]))
+            {
+                var zpLazy = scope.RecordUnary(Engines.Compilation.LazyNodeType.Custom,
+                    "DynamicQuantizeLinear.zp", x, scalarShape,
+                    (eng, output) =>
+                    {
+                        ComputeAll(out _, out _, out var zpC);
+                        zpC.AsSpan().CopyTo(output.AsWritableSpan());
+                    });
+                ctx.PutTensor(node.Output[2], zpLazy);
+            }
         }
     }
 

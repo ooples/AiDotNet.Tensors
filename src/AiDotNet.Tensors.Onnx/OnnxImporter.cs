@@ -140,6 +140,9 @@ public static class OnnxImporter
 
         // ── Dispatch translators for each node under GraphMode ────────────
         var registry = OnnxOpTranslatorRegistry<T>.BuildDefault();
+        // Let callers add/override translators via the options hook so they
+        // can plug in custom-op handlers without forking the importer.
+        options.ConfigureRegistry?.Invoke(registry);
         var unsupported = new List<string>();
 
         // First pass: catalog unsupported operators. If any, we return early
