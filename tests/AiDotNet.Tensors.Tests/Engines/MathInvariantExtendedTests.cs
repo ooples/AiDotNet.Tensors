@@ -118,16 +118,23 @@ public class MathInvariantExtendedTests
     [Fact]
     public void Copy_RentedSource_TightlySizedDestination_DoesNotOverrun()
     {
-        // Pick a size that the ArrayPool typically rounds up to a larger
-        // bucket on net5+. 17 is small enough to live well below the
-        // 1024-element pool threshold, but the construction below uses
-        // TensorAllocator.Rent whose ArrayPool path triggers at >= the
-        // configured threshold; force a larger shape so the pool actually
-        // hands back an oversized array.
-        const int N = 1024;
+        // TensorAllocator.Rent only routes through ArrayPool at or above
+        // ArrayPoolThresholdValue elements. Below that, Rent returns an
+        // exactly-sized backing array and the test passes even on the
+        // pre-fix (buggy) implementation — making the regression check
+        // toothless. Force a size past the threshold so the pool actually
+        // hands back an over-allocated bucket, then hard-assert that
+        // over-allocation occurred before proceeding.
+        int N = Math.Max(TensorAllocator.ArrayPoolThresholdValue + 1, 1025);
         var src = TensorAllocator.Rent<float>(new[] { N });
         try
         {
+            int backingLength = src.GetDataArray().Length;
+            Assert.True(
+                backingLength > src.Length,
+                $"Test precondition failed: backing length {backingLength} must exceed logical length {src.Length}. " +
+                $"ArrayPool did not over-allocate at N={N}; this run would pass even on the buggy pre-fix impl.");
+
             // Fill source with a known pattern.
             var srcWritable = src.AsWritableSpan();
             for (int i = 0; i < N; i++) srcWritable[i] = i + 0.5f;
@@ -136,9 +143,8 @@ public class MathInvariantExtendedTests
             var dst = new Tensor<float>(new float[N], new[] { N });
 
             // Pre-fix this throws ArgumentException("Destination array was
-            // not long enough...") on every CI runner where the pooled
-            // backing array exceeds N. Post-fix it copies exactly N
-            // elements.
+            // not long enough...") because the impl indexed by backing-array
+            // length. Post-fix it copies exactly src.Length elements.
             E.TensorCopy(src, dst);
 
             var dstSpan = dst.AsSpan();
