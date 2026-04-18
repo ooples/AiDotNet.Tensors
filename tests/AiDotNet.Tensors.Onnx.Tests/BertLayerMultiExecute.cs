@@ -132,6 +132,7 @@ public class BertLayerMultiExecute
         string? firstFrozen = null;
         int firstFrozenIdx = -1;
         int nodeIdx = 0;
+        var frozenByOpType = new Dictionary<string, int>();
         foreach (var node in graph.Node)
         {
             foreach (var outName in node.Output)
@@ -141,41 +142,58 @@ public class BertLayerMultiExecute
                 if (!ortS1.TryGetValue(outName, out var ortValues)) continue;
                 if (!result.Outputs.TryGetValue(outName, out var ours1)) continue;
                 var ours1Arr = ours1.AsSpan().ToArray();
-                if (ours1Arr.Length != s0.Length) continue;
+                if (ours1Arr.Length != s0.Length || ours1Arr.Length != ortValues.Length) continue;
+                if (ours1Arr.Length == 0) continue;
 
                 checkedNodes++;
                 bool ortDiffersFromS0 = false;
                 bool oursIdenticalToS0 = true;
                 for (int i = 0; i < ours1Arr.Length; i++)
                 {
-                    if (ours1Arr[i] != s0[i]) { oursIdenticalToS0 = false; }
-                    if (ortValues.Length > i && Math.Abs(ortValues[i] - s0[i]) > 1e-4f) ortDiffersFromS0 = true;
+                    if (ours1Arr[i] != s0[i]) oursIdenticalToS0 = false;
+                    if (Math.Abs(ortValues[i] - s0[i]) > 1e-4f) ortDiffersFromS0 = true;
                     if (!oursIdenticalToS0 && ortDiffersFromS0) break;
                 }
 
                 if (oursIdenticalToS0 && ortDiffersFromS0)
                 {
                     frozen++;
+                    frozenByOpType[node.OpType] = (frozenByOpType.TryGetValue(node.OpType, out var prev) ? prev : 0) + 1;
                     if (firstFrozen == null)
                     {
                         firstFrozen = outName;
                         firstFrozenIdx = nodeIdx;
-                        _output.WriteLine($"FIRST FROZEN NODE: [{node.OpType}] '{outName}'");
+                        _output.WriteLine($"FIRST FROZEN NODE: [{node.OpType}] '{outName}' (len={ours1Arr.Length})");
                         _output.WriteLine($"  node #{nodeIdx}, inputs=[{string.Join(", ", node.Input)}]");
-                        _output.WriteLine($"  our-s0[0..3]: {s0[0]:F4} {s0[1]:F4} {s0[2]:F4}");
-                        _output.WriteLine($"  our-s1[0..3]: {ours1Arr[0]:F4} {ours1Arr[1]:F4} {ours1Arr[2]:F4}");
-                        _output.WriteLine($"  ort-s1[0..3]: {ortValues[0]:F4} {ortValues[1]:F4} {ortValues[2]:F4}");
+                        int n = Math.Min(3, ours1Arr.Length);
+                        string s0s = string.Join(" ", Enumerable.Range(0, n).Select(i => s0[i].ToString("F4")));
+                        string ourss = string.Join(" ", Enumerable.Range(0, n).Select(i => ours1Arr[i].ToString("F4")));
+                        string orts = string.Join(" ", Enumerable.Range(0, n).Select(i => ortValues[i].ToString("F4")));
+                        _output.WriteLine($"  our-s0[0..{n}]: {s0s}");
+                        _output.WriteLine($"  our-s1[0..{n}]: {ourss}");
+                        _output.WriteLine($"  ort-s1[0..{n}]: {orts}");
                     }
                 }
                 else if (!oursIdenticalToS0)
                 {
                     correctlyChanged++;
+                    if (correctlyChanged <= 5)
+                    {
+                        _output.WriteLine($"CHANGED: [{node.OpType}] '{outName}' (len={ours1Arr.Length})");
+                        int n = Math.Min(3, ours1Arr.Length);
+                        string s0s = string.Join(" ", Enumerable.Range(0, n).Select(i => s0[i].ToString("F4")));
+                        string ourss = string.Join(" ", Enumerable.Range(0, n).Select(i => ours1Arr[i].ToString("F4")));
+                        string orts = string.Join(" ", Enumerable.Range(0, n).Select(i => ortValues[i].ToString("F4")));
+                        _output.WriteLine($"  s0={s0s} ours1={ourss} ort1={orts}");
+                    }
                 }
             }
             nodeIdx++;
         }
 
         _output.WriteLine($"Checked {checkedNodes}, frozen {frozen}, correctlyChanged {correctlyChanged}");
+        foreach (var kv in frozenByOpType.OrderByDescending(k => k.Value))
+            _output.WriteLine($"  frozen by op: {kv.Key} × {kv.Value}");
     }
 
     private static void FillFloat(LinearAlgebra.Tensor<float> placeholder, long[] source)
