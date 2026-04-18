@@ -1,7 +1,9 @@
 using System;
+using System.Threading.Tasks;
+#if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-using System.Threading.Tasks;
+#endif
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -78,7 +80,11 @@ internal static class NchwcConv2D
         var kArr = kernel.ToArray();
         var outArr = new float[output.Length];
 
+#if NET5_0_OR_GREATER
         bool useSimd = Avx2.IsSupported && Fma.IsSupported;
+#else
+        bool useSimd = false; // net471: no Runtime.Intrinsics — scalar only.
+#endif
 
         Parallel.For(0, totalTasks, taskIdx =>
         {
@@ -91,14 +97,18 @@ internal static class NchwcConv2D
             // stackalloc-in-loop (CA2014) and keeps allocations linear
             // in task count, not oH*oW.
             var scalarAcc = new float[CBlock];
+#if NET5_0_OR_GREATER
             var simdStore = new float[CBlock];
+#endif
 
             for (int oh = 0; oh < _oH; oh++)
             {
                 for (int ow = 0; ow < _oW; ow++)
                 {
                     int outIdx = oBase + oh * _outStrideH + ow * _outStrideW;
+#if NET5_0_OR_GREATER
                     var acc = Vector256<float>.Zero;
+#endif
                     if (!useSimd) Array.Clear(scalarAcc, 0, CBlock);
 
                     for (int icg = 0; icg < _cgIn; icg++)
@@ -117,6 +127,7 @@ internal static class NchwcConv2D
                                 if ((uint)iw >= (uint)_W) continue;
                                 int inIdx = inHBase + iw * _inStrideW;
                                 int kIdx = kHBase + kw * _kStrideKw;
+#if NET5_0_OR_GREATER
                                 if (useSimd)
                                 {
                                     for (int icb = 0; icb < CBlock; icb++)
@@ -131,6 +142,7 @@ internal static class NchwcConv2D
                                     }
                                 }
                                 else
+#endif
                                 {
                                     for (int icb = 0; icb < CBlock; icb++)
                                     {
@@ -144,12 +156,14 @@ internal static class NchwcConv2D
                         }
                     }
 
+#if NET5_0_OR_GREATER
                     if (useSimd)
                     {
                         acc.CopyTo(simdStore);
                         for (int ocb = 0; ocb < CBlock; ocb++) outArr[outIdx + ocb] = simdStore[ocb];
                     }
                     else
+#endif
                     {
                         for (int ocb = 0; ocb < CBlock; ocb++) outArr[outIdx + ocb] = scalarAcc[ocb];
                     }

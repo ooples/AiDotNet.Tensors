@@ -1943,6 +1943,21 @@ public interface IEngine
     Tensor<T> ReorderToNchw<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Inference-mode batch normalization with pre-computed running statistics.
+    /// Fuses the six broadcast ops (sub, add, sqrt, div, mul, add) of the naive
+    /// form into a single <c>out = scale' * x + bias'</c> pass with
+    /// <c>scale' = gamma / sqrt(var + eps)</c>. Honours <c>x.Layout</c>: the
+    /// NCHWc8 fast path processes 8-wide lanes with Vector256 FMA.
+    /// </summary>
+    /// <param name="x">Input tensor, rank-4 NCHW or NCHWc.</param>
+    /// <param name="gamma">Scale, shape [C].</param>
+    /// <param name="beta">Bias, shape [C].</param>
+    /// <param name="mean">Running mean, shape [C].</param>
+    /// <param name="variance">Running variance, shape [C].</param>
+    /// <param name="epsilon">Numerical stabiliser.</param>
+    Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon);
+
+    /// <summary>
     /// Performs batched matrix multiplication on 3D tensors.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

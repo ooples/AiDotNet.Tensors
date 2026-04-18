@@ -2048,6 +2048,80 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (x.Rank != 4)
+            throw new ArgumentException($"BatchNormInference requires rank-4 input, got rank {x.Rank}.");
+
+        // Float fast paths — the common case for ONNX vision models.
+        if (typeof(T) == typeof(float))
+        {
+            int C = x._shape[1];
+            int H = x._shape[2];
+            int W = x._shape[3];
+            int N = x._shape[0];
+            var xf = (Tensor<float>)(object)x;
+            var gammaF = (Tensor<float>)(object)gamma;
+            var betaF  = (Tensor<float>)(object)beta;
+            var meanF  = (Tensor<float>)(object)mean;
+            var varF   = (Tensor<float>)(object)variance;
+            var result = new Tensor<float>(x._shape) { Layout = x.Layout };
+            if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
+            {
+                Simd.NchwcBatchNorm.RunNchwc8(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+            }
+            else
+            {
+                Simd.NchwcBatchNorm.RunNchw(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+            }
+            return (Tensor<T>)(object)result;
+        }
+
+        // Generic scalar fallback for non-float T. Pre-combine scale/bias, then FMA.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
+        int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
+        int spatial = hh * ww;
+        var gData = gamma.GetDataArray();
+        var bData = beta.GetDataArray();
+        var mData = mean.GetDataArray();
+        var vData = variance.GetDataArray();
+        var scaleArr = new T[cc];
+        var biasArr = new T[cc];
+        for (int c = 0; c < cc; c++)
+        {
+            T s = numOps.Divide(gData[c], numOps.Sqrt(numOps.Add(vData[c], eps)));
+            scaleArr[c] = s;
+            biasArr[c] = numOps.Subtract(bData[c], numOps.Multiply(s, mData[c]));
+        }
+        var outT = new Tensor<T>(x._shape) { Layout = x.Layout };
+        var inSpan = x.AsSpan();
+        var outSpan = outT.AsWritableSpan();
+        for (int ni = 0; ni < nn; ni++)
+        {
+            for (int c = 0; c < cc; c++)
+            {
+                int baseIdx = (ni * cc + c) * spatial;
+                T s = scaleArr[c], b2 = biasArr[c];
+                for (int sp = 0; sp < spatial; sp++)
+                    outSpan[baseIdx + sp] = numOps.Add(numOps.Multiply(inSpan[baseIdx + sp], s), b2);
+            }
+        }
+        return outT;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

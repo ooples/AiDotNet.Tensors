@@ -90,9 +90,17 @@ internal static class NormOperators
             var varT  = ctx.GetTensor(node.Input[4]);   // [C]
             float epsilon = ctx.GetFloatAttr(node, "epsilon", 1e-5f);
 
-            // normalize = (x - mean) / sqrt(var + eps)
-            // Shape: x is [N,C,H,W] for conv BN; mean/var are [C]. We reshape
-            // per-channel stats to [1,C,1,1] so broadcast math aligns with x.
+            // Rank-4 (NCHW or NCHWc): use the fused engine kernel — one FMA per
+            // element vs six broadcast ops with the generic decomposition.
+            if (x.Rank == 4)
+            {
+                var r4 = ctx.Engine.BatchNormInference(x, scale, bias, mean, varT, epsilon);
+                ctx.PutTensor(node.Output[0], r4);
+                return;
+            }
+
+            // Rank != 4 (e.g. 2D/3D BN on MLPs): fall back to the broadcast
+            // decomposition, which stays correct across arbitrary ranks.
             var cShape = MakePerChannelShape(x._shape, scale._shape.Length);
             var meanView = ctx.Engine.Reshape(mean, cShape);
             var varView  = ctx.Engine.Reshape(varT, cShape);
