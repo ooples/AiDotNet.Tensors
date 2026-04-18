@@ -34,17 +34,24 @@ public sealed class FlashAttentionConfig
     /// when you only need the output.</summary>
     public bool ReturnAttentionWeights { get; set; }
 
-    /// <summary>Block size along the query axis. Null = auto. Used only
-    /// by the block-tiled fast path; the current bias-aware path ignores
-    /// it (full materialised scores) — see the backward path for where
-    /// this begins to take effect.</summary>
+    /// <summary>Block size along the query axis. Null = auto.
+    /// <para><b>RESERVED.</b> Forward currently dispatches to the engine's
+    /// tuned SDPA kernel (no bias) or a GEMM chain (with bias); neither
+    /// reads this value today. Persisted on the config so existing callers
+    /// and the future block-tiled fast path agree on the knob — setting it
+    /// is harmless but has no effect on the hot path. Wire-through lands
+    /// with the block-tiled bias-aware kernel.</para></summary>
     public int? BlockSizeQ { get; set; }
 
-    /// <summary>Block size along the key / value axis. Null = auto.</summary>
+    /// <summary>Block size along the key / value axis. Null = auto.
+    /// <para><b>RESERVED.</b> Same status as <see cref="BlockSizeQ"/>:
+    /// unread by the current Forward paths, persisted for future block-
+    /// tiled kernels.</para></summary>
     public int? BlockSizeKV { get; set; }
 
     /// <summary>Back-compat single knob — sets both <see cref="BlockSizeQ"/>
-    /// and <see cref="BlockSizeKV"/> at once. Reads <see cref="BlockSizeQ"/>.</summary>
+    /// and <see cref="BlockSizeKV"/> at once. Reads <see cref="BlockSizeQ"/>.
+    /// <para><b>RESERVED</b> — see <see cref="BlockSizeQ"/>.</para></summary>
     public int? BlockSize
     {
         get => BlockSizeQ;
@@ -91,11 +98,37 @@ public sealed class FlashAttentionConfig
 /// </summary>
 public static class FusedAttention<T>
 {
+    // Supported element types. Attention uses fractional scale
+    // (1/sqrt(headDim)), softmax probabilities, and -Inf causal masks —
+    // none of which are meaningful for integer T. The IEngine's
+    // ScaledDotProductAttention and the engine's softmax only ship
+    // float / double / Half code paths; passing int/long would either
+    // quantize the scale to zero or throw deep inside numOps.FromDouble.
+    // Fail fast at entry with an actionable message instead of producing
+    // silent garbage or a misleading exception from the numeric-ops layer.
+    private static readonly HashSet<Type> s_supportedTypes = new()
+    {
+        typeof(float), typeof(double), typeof(System.Half),
+    };
+
+    private static void EnsureSupportedElementType()
+    {
+        if (!s_supportedTypes.Contains(typeof(T)))
+            throw new NotSupportedException(
+                $"FusedAttention<{typeof(T).Name}> is not supported. The implementation relies on " +
+                "fractional softmax scale, softmax probabilities, and -Inf causal masks — use " +
+                "float, double, or System.Half as the element type.");
+    }
+
     /// <summary>
     /// Forward pass. Returns (Output, AttentionWeights) — weights is null
     /// unless <see cref="FlashAttentionConfig.ReturnAttentionWeights"/> is
     /// set.
     /// </summary>
+    /// <exception cref="NotSupportedException">
+    /// <typeparamref name="T"/> is not a floating-point type
+    /// (<c>float</c>, <c>double</c>, or <c>System.Half</c>).
+    /// </exception>
     public static (Tensor<T> Output, Tensor<T>? AttentionWeights) Forward(
         Tensor<T> query,
         Tensor<T> key,
@@ -104,6 +137,7 @@ public static class FusedAttention<T>
         Tensor<T>? attentionBias = null,
         IEngine? engine = null)
     {
+        EnsureSupportedElementType();
         if (query is null) throw new ArgumentNullException(nameof(query));
         if (key   is null) throw new ArgumentNullException(nameof(key));
         if (value is null) throw new ArgumentNullException(nameof(value));
@@ -346,6 +380,10 @@ public static class FusedAttention<T>
     /// cost is future work; this version is sufficient for correctness
     /// testing and for small/medium sequences.</para>
     /// </summary>
+    /// <exception cref="NotSupportedException">
+    /// <typeparamref name="T"/> is not a floating-point type
+    /// (<c>float</c>, <c>double</c>, or <c>System.Half</c>).
+    /// </exception>
     public static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) Backward(
         Tensor<T> gradOutput,
         Tensor<T> query,
@@ -355,6 +393,7 @@ public static class FusedAttention<T>
         Tensor<T>? attentionBias = null,
         IEngine? engine = null)
     {
+        EnsureSupportedElementType();
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (query is null) throw new ArgumentNullException(nameof(query));
         if (key is null) throw new ArgumentNullException(nameof(key));
