@@ -5,6 +5,18 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
+/// xUnit collection that pins <see cref="CudaDispatchPolicyTests"/> to serial
+/// execution. The Scope_* tests flip
+/// <see cref="PerformanceProfiler"/>.<c>Instance.Enabled</c> and call
+/// <c>Clear()</c> — those mutate process-wide singleton state; parallel
+/// workers would race on Enabled flips and see each other's recorded stats.
+/// Mirrors the <c>BlasGlobalState</c> pattern used by
+/// <see cref="DeterministicModeTests"/>.
+/// </summary>
+[CollectionDefinition("CudaDispatchPolicyTests", DisableParallelization = true)]
+public sealed class CudaDispatchPolicyTestsCollection { }
+
+/// <summary>
 /// Tests for issue #201 — <see cref="CudaDispatchPolicy"/> and the
 /// <c>UseCudnn</c> / <c>UseCudnnBatchNorm</c> / <c>UseCublas</c> opt-out
 /// flags on <see cref="TensorCodecOptions"/>.
@@ -14,7 +26,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// backend initialises successfully, so the flag semantics are testable
 /// without GPU hardware.</para>
 /// </summary>
-public class CudaDispatchPolicyTests
+[Collection("CudaDispatchPolicyTests")]
+public sealed class CudaDispatchPolicyTests
 {
     [Fact]
     public void DefaultOptions_UseCudnnAndUseCublas_AreTrue()
@@ -80,6 +93,7 @@ public class CudaDispatchPolicyTests
         // records the operation. We verify by clearing profiler stats,
         // opening + disposing the scope, and checking that GetStats
         // returns a hit under the expected label.
+        bool priorEnabled = PerformanceProfiler.Instance.Enabled;
         PerformanceProfiler.Instance.Enabled = true;
         PerformanceProfiler.Instance.Clear();
         try
@@ -95,13 +109,14 @@ public class CudaDispatchPolicyTests
         finally
         {
             PerformanceProfiler.Instance.Clear();
-            PerformanceProfiler.Instance.Enabled = false;
+            PerformanceProfiler.Instance.Enabled = priorEnabled;
         }
     }
 
     [Fact]
     public void Scope_MatMulWithVendor_LabelsAsCuBLAS()
     {
+        bool priorEnabled = PerformanceProfiler.Instance.Enabled;
         PerformanceProfiler.Instance.Enabled = true;
         PerformanceProfiler.Instance.Clear();
         try
@@ -113,13 +128,14 @@ public class CudaDispatchPolicyTests
         finally
         {
             PerformanceProfiler.Instance.Clear();
-            PerformanceProfiler.Instance.Enabled = false;
+            PerformanceProfiler.Instance.Enabled = priorEnabled;
         }
     }
 
     [Fact]
     public void Scope_ConvWithVendor_LabelsAsCuDNN()
     {
+        bool priorEnabled = PerformanceProfiler.Instance.Enabled;
         PerformanceProfiler.Instance.Enabled = true;
         PerformanceProfiler.Instance.Clear();
         try
@@ -130,7 +146,7 @@ public class CudaDispatchPolicyTests
         finally
         {
             PerformanceProfiler.Instance.Clear();
-            PerformanceProfiler.Instance.Enabled = false;
+            PerformanceProfiler.Instance.Enabled = priorEnabled;
         }
     }
 }

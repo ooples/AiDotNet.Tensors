@@ -121,18 +121,27 @@ public sealed class TensorCodecOptions
 
     /// <summary>
     /// When true (default) <see cref="Engines.DirectGpu.DirectGpuEngine.Conv2D"/>
-    /// routes through the cuDNN wrapper on a CUDA backend when cuDNN is
-    /// available; set to false to force the generic CUDA kernel. Opt-out
-    /// exists mostly for debugging and for reproducing numerical behaviour
-    /// that differs between cuDNN and the hand-written kernel (~ULP at the
-    /// last accumulation).
+    /// is eligible for cuDNN dispatch on a CUDA backend when the cuDNN
+    /// GPU-pointer wiring is active and the runtime has cuDNN available; set
+    /// to false to force the generic CUDA kernel. Opt-out exists mostly for
+    /// debugging and for reproducing numerical behaviour that differs between
+    /// cuDNN and the hand-written kernel (~ULP at the last accumulation).
+    /// <para><b>Current runtime behaviour:</b> this flag expresses intent —
+    /// Conv2D still executes the generic CUDA kernel on all paths until the
+    /// cuDNN GPU-pointer wiring lands. When that wiring ships, flipping this
+    /// to <c>false</c> will force the existing generic kernel and the default
+    /// <c>true</c> will start routing through cuDNN.</para>
     /// </summary>
     public bool UseCudnn { get; set; } = true;
 
     /// <summary>
     /// When true (default) <see cref="Engines.DirectGpu.DirectGpuEngine.BatchNorm"/>
-    /// routes through the cuDNN BatchNorm wrapper on a CUDA backend when
-    /// cuDNN is available; set to false to force the generic kernel.
+    /// is eligible for cuDNN BatchNorm dispatch on a CUDA backend when the
+    /// cuDNN GPU-pointer wiring is active and the runtime has cuDNN available;
+    /// set to false to force the generic kernel.
+    /// <para><b>Current runtime behaviour:</b> like <see cref="UseCudnn"/>,
+    /// this is a policy flag — BatchNorm still executes the generic CUDA
+    /// kernel until the cuDNN GPU-pointer wiring lands.</para>
     /// </summary>
     public bool UseCudnnBatchNorm { get; set; } = true;
 

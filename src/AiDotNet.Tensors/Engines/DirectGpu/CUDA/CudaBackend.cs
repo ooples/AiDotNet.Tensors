@@ -841,13 +841,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);
-        // Record dispatch path for telemetry. MatMul always runs through
-        // cuBLAS on the CUDA backend today (the opt-out would fall back to
-        // a hand-written kernel when wired); labels let downstream users
-        // verify the path via PerformanceProfiler.GetStats("MatMul.cuBLAS").
+        // Telemetry scope must reflect the path that actually executed, not
+        // the policy flag — Gemm below is unconditionally cuBLAS, so label
+        // the scope "MatMul.cuBLAS" regardless of UseCublasForMatMul. When a
+        // handwritten GEMM fallback lands later and MatMul branches on the
+        // flag, move this scope into each branch so profiler stats match
+        // the kernel that ran.
         using var _profile = CudaDispatchPolicy.Scope(
             "MatMul",
-            useVendor: CudaDispatchPolicy.UseCublasForMatMul);
+            useVendor: true);
         var output = AllocateBuffer(M * N);
         Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
         return output;
