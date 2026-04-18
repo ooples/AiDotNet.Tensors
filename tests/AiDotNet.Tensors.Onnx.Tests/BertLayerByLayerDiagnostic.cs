@@ -62,7 +62,9 @@ public class BertLayerByLayerDiagnostic
 
         var modifiedBytes = model.ToByteArray();
 
-        // Inputs: same as BertExecuteTest — batch=1, seq=256.
+        // Inputs: match the failing 100-sample test's s=0 inputs exactly —
+        // random input_ids AND random mask (~90% 1) + mixed segments. The
+        // prior diagnostic used all-1 mask and passed, masking the real bug.
         const int batch = 1, seq = 256;
         var rng = new Random(42);
         var inputIds = new long[batch * seq];
@@ -72,9 +74,12 @@ public class BertLayerByLayerDiagnostic
         for (int i = 0; i < inputIds.Length; i++)
         {
             inputIds[i] = rng.Next(1, 30000);
-            inputMask[i] = 1;
+            inputMask[i] = rng.NextDouble() < 0.9 ? 1 : 0;
             segmentIds[i] = i < seq / 2 ? 0 : 1;
         }
+        int maskZeros = 0;
+        for (int i = 0; i < inputMask.Length; i++) if (inputMask[i] == 0) maskZeros++;
+        _output.WriteLine($"Mask zeros: {maskZeros}/{inputMask.Length}");
 
         // Run ORT with native int64 inputs.
         using var session = new InferenceSession(modifiedBytes);

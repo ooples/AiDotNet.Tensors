@@ -285,6 +285,11 @@ internal static class TensorManipOperators
                                   : v <= int.MinValue ? int.MinValue
                                   : (int)Math.Round(v);
                     }
+                    if (GatherDebug.Enabled)
+                    {
+                        int stepNo = System.Threading.Interlocked.Increment(ref GatherDebug.StepCounter);
+                        GatherDebug.Log($"step#{stepNo} Gather ilen={idxArr.Length} idx[0..3]={(idxArr.Length > 0 ? idxArr[0] : -1)},{(idxArr.Length > 1 ? idxArr[1] : -1)},{(idxArr.Length > 2 ? idxArr[2] : -1)}");
+                    }
                     var intIndices = new Tensor<int>(capturedIndices._shape, new Vector<int>(idxArr));
                     var r = eng.Gather(capturedData, intIndices, capturedAxis);
                     r.AsSpan().CopyTo(output.AsWritableSpan());
