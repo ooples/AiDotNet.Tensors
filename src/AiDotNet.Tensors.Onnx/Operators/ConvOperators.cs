@@ -344,6 +344,9 @@ internal static class ConvOperators
             if (input.Rank != 4 && input.Rank != 5)
                 throw new NotSupportedException(
                     $"Conv supports 4D (NCHW) or 5D (NCDHW) input; got rank {input.Rank}.");
+            if (kernel.Rank != input.Rank)
+                throw new InvalidDataException(
+                    $"Conv kernel rank {kernel.Rank} must match input rank {input.Rank}.");
 
             int spatialRank = input.Rank - 2;
             int group = ctx.GetIntAttrAsInt(node, "group", 1);

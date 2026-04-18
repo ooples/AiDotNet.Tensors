@@ -13,11 +13,12 @@ public sealed class OnnxTranslationContext<T> where T : unmanaged
 {
     private readonly Dictionary<string, Tensor<T>> _tensorsByName;
 
-    internal OnnxTranslationContext(IEngine engine, Dictionary<string, Tensor<T>> tensorsByName, OnnxImportOptions options)
+    internal OnnxTranslationContext(IEngine engine, Dictionary<string, Tensor<T>> tensorsByName, OnnxImportOptions options, long defaultOpset = 13)
     {
         Engine = engine;
         _tensorsByName = tensorsByName;
         Options = options;
+        DefaultOpset = defaultOpset;
     }
 
     /// <summary>The engine against which engine ops are traced.</summary>
@@ -25,6 +26,16 @@ public sealed class OnnxTranslationContext<T> where T : unmanaged
 
     /// <summary>The options passed to the importer.</summary>
     public OnnxImportOptions Options { get; }
+
+    /// <summary>
+    /// Opset version for the default ONNX domain (""), as declared by the
+    /// model's opset_import entries. Translators whose default-attribute
+    /// semantics changed with opset version (e.g. <c>Softmax</c>'s axis
+    /// default flipped from 1 to -1 at opset 13) read this to pick the
+    /// right default. Falls back to 13 (the modern default) when the
+    /// model declares no opset.
+    /// </summary>
+    public long DefaultOpset { get; }
 
     /// <summary>
     /// Resolves a tensor by its ONNX name. Tensors come from three sources,

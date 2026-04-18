@@ -63,32 +63,36 @@ registry.Register(new MyCustomOpTranslator());
 // registry-override plumbing is scheduled as a follow-up.)
 ```
 
-## Phase 1 operator coverage
+## Operator coverage
 
 | Family | Ops |
 |---|---|
-| Arithmetic | `MatMul`, `Gemm`, `Add`, `Sub`, `Mul`, `Div` |
-| Activation | `Relu`, `Sigmoid`, `Tanh`, `Softmax`, `Gelu`, `LeakyRelu` |
-| Normalization | `LayerNormalization`, `BatchNormalization` (inference) |
-| Convolution | `Conv`, `ConvTranspose`, `MaxPool`, `AveragePool`, `GlobalAveragePool` |
-| Tensor manipulation | `Reshape`, `Transpose`, `Slice`, `Concat`, `Split`, `Gather`, `Squeeze`, `Unsqueeze`, `Constant`, `Flatten`, `Identity`, `Shape`, `Cast` (same-type) |
-| Attention | `com.microsoft.Attention` |
+| Arithmetic | `MatMul` (incl. 4D×4D), `Gemm`, `Add`, `Sub`, `Mul`, `Div` — all with NumPy broadcasting |
+| Activation | `Relu`, `Sigmoid`, `Tanh`, `Softmax` (opset-aware axis default), `Gelu` (both `approximate=none` and `=tanh`), `LeakyRelu` |
+| Normalization | `LayerNormalization` (2- and 3-input forms), `BatchNormalization` (inference) |
+| Convolution | `Conv` (incl. grouped / depthwise, 2D + 3D, asymmetric pads, `ceil_mode`), `ConvTranspose`, `MaxPool`, `AveragePool`, `GlobalAveragePool` |
+| Tensor manipulation | `Reshape`, `Transpose`, `Slice`, `Concat`, `Split`, `Gather`, `Squeeze`, `Unsqueeze`, `Constant`, `Flatten`, `Identity`, `Shape`, `Cast` |
+| Math | `Sqrt`, `Pow`, `Abs`, `Neg`, `Exp`, `Log`, `Erf`, `Reciprocal`, `ReduceSum`, `ReduceMean`, `Min`, `Max`, `OneHot`, `Not`, `Where`, `ConstantOfShape`, `Equal`, `Expand` |
+| Recurrent | `LSTM`, `GRU` (forward direction, seq-first layout, default activations) |
+| Quantized | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `QLinearConv` (per-tensor and per-axis) |
+| Attention | `com.microsoft.Attention` (packed 3-in / 1-out form) |
 
-Supported attributes cover the common set used by ResNet-50 / BERT-base
-/ ViT-B/16 exports: `auto_pad` (NOTSET / VALID / SAME_UPPER / SAME_LOWER),
-symmetric `pads`, `strides`, `dilations`, `kernel_shape`, `group=1`,
-Gemm `alpha`/`beta`/`transA`/`transB`, Softmax `axis`, LeakyRelu
-`alpha`, Slice with unit step, LayerNorm last-axis.
+Supported attributes cover what ResNet-50 / BERT-base / ViT-B/16 and the
+typical HF / tf2onnx export pipelines emit: `auto_pad` (NOTSET / VALID /
+SAME_UPPER / SAME_LOWER), symmetric + asymmetric `pads`, `strides`,
+`dilations`, `kernel_shape`, `group`, Gemm `alpha`/`beta`/`transA`/`transB`,
+opset-aware Softmax `axis` default (1 pre-opset-13, -1 opset-13+), LeakyRelu
+`alpha`, per-axis `QuantizeLinear`/`DequantizeLinear` `axis`, LSTM `direction`,
+GRU `direction`, LayerNorm last-axis.
 
-## Known limitations (Phase 2 / 3)
+## Known limitations (follow-up)
 
-- Grouped / depthwise convolution (`group > 1`) — MobileNet support
-  follows in Phase 2.
-- Asymmetric padding, `ceil_mode = 1`.
 - Non-unit `Slice` strides.
-- Bare `Erf` op (outside the opset-20 `Gelu` fused form).
-- Quantized ops (`QLinearConv`, `QLinearMatMul`) — Phase 2.
-- Recurrent ops (`LSTM`, `GRU`) — Phase 2.
+- Custom recurrent activations, `clip`, LSTM `input_forget`, GRU
+  `linear_before_reset` — rejected with `NotSupportedException`.
+- Bidirectional / reverse-direction recurrent (`direction != forward`).
+- `DynamicQuantizeLinear` (requires runtime min/max reduction; Phase 3).
+- Grouped / per-axis `QLinearConv` with `group > 1`.
 - Mask round-trip in `ScaledDotProductAttention` — requires extending
   `SavedStateSerializer` with a `Tensor<bool>` tag; plans re-load with
   `mask = null`.

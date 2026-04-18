@@ -133,6 +133,14 @@ internal static class InitializerLoader
             $"ONNX initializer '{proto.Name}' has no double data.");
     }
 
+    private static void ValidateRawDataSize(TensorProto proto, int expectedBytes)
+    {
+        if (proto.RawData.Length != expectedBytes)
+            throw new InvalidDataException(
+                $"ONNX initializer '{proto.Name}' raw_data size {proto.RawData.Length} does not match " +
+                $"expected {expectedBytes} bytes.");
+    }
+
     private static void LoadInt<T>(TensorProto proto, Span<T> dst, int n) where T : unmanaged
     {
         // Integer initializers are almost always small (shape tensors, axes,
@@ -144,6 +152,7 @@ internal static class InitializerLoader
             case INT32:
                 if (!proto.RawData.IsEmpty)
                 {
+                    ValidateRawDataSize(proto, n * sizeof(int));
                     var srcI = MemoryMarshal.Cast<byte, int>(proto.RawData.Span);
                     for (int i = 0; i < n; i++) asLong[i] = srcI[i];
                 }
@@ -155,6 +164,7 @@ internal static class InitializerLoader
             case INT64:
                 if (!proto.RawData.IsEmpty)
                 {
+                    ValidateRawDataSize(proto, n * sizeof(long));
                     var srcL = MemoryMarshal.Cast<byte, long>(proto.RawData.Span);
                     for (int i = 0; i < n; i++) asLong[i] = srcL[i];
                 }
@@ -166,6 +176,7 @@ internal static class InitializerLoader
             case INT8:
                 if (!proto.RawData.IsEmpty)
                 {
+                    ValidateRawDataSize(proto, n * sizeof(sbyte));
                     var srcS = MemoryMarshal.Cast<byte, sbyte>(proto.RawData.Span);
                     for (int i = 0; i < n; i++) asLong[i] = srcS[i];
                 }
@@ -177,6 +188,7 @@ internal static class InitializerLoader
             case UINT8:
                 if (!proto.RawData.IsEmpty)
                 {
+                    ValidateRawDataSize(proto, n * sizeof(byte));
                     var srcB = proto.RawData.Span;
                     for (int i = 0; i < n; i++) asLong[i] = srcB[i];
                 }

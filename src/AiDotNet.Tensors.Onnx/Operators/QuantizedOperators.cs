@@ -46,16 +46,23 @@ internal static class QuantizedOperators
             var yZeroPoint = node.Input.Count > 2 && ctx.HasTensor(node.Input[2])
                 ? ctx.GetTensor(node.Input[2]) : null;
 
-            var scaled = DivideByScale(ctx, x, yScale);
+            int qAxis = ResolveQuantAxis(ctx, node, x.Rank);
+            var scaled = DivideByScale(ctx, x, yScale, qAxis);
             var rounded = ctx.Engine.TensorRound(scaled);
-            var shifted = yZeroPoint is null ? rounded : AddScalarOrPerAxis(ctx, rounded, yZeroPoint);
-            // Saturate to the output type's range. Without explicit zero_point,
-            // the destination is int8 (range [-128, 127]); ONNX uses the dtype
-            // of y_zero_point to determine int8 vs uint8. We can't observe
-            // that here (we flattened everything to float), so clamp to the
-            // wider int8 range and trust the caller's scale/zero-point to
-            // keep values in range.
-            ctx.PutTensor(node.Output[0], Clamp(ctx, shifted, -128, 127));
+            var shifted = yZeroPoint is null ? rounded : AddScalarOrPerAxis(ctx, rounded, yZeroPoint, qAxis);
+            // Saturate to the destination type's range. ONNX uses the dtype
+            // of y_zero_point to select int8 ([-128, 127]) vs uint8 ([0, 255]).
+            // We flatten everything to float at import, so we can't read the
+            // ONNX TensorProto dtype directly here — instead we heuristically
+            // infer uint8 when any zero_point value exceeds the int8 max or
+            // every value is non-negative and exceeds int8 min. On a uint8
+            // y_zero_point being [0..255] and an int8 one being [-128..127],
+            // the first observation that falls outside int8 range flips us to
+            // uint8. When no zero_point is provided, ONNX defaults to int8.
+            bool isUint8 = yZeroPoint is not null && AnyValueExceedsInt8Max(yZeroPoint);
+            int lo = isUint8 ? 0 : -128;
+            int hi = isUint8 ? 255 : 127;
+            ctx.PutTensor(node.Output[0], Clamp(ctx, shifted, lo, hi));
         }
     }
 
@@ -73,8 +80,9 @@ internal static class QuantizedOperators
             var xZeroPoint = node.Input.Count > 2 && ctx.HasTensor(node.Input[2])
                 ? ctx.GetTensor(node.Input[2]) : null;
 
-            var shifted = xZeroPoint is null ? x : SubScalarOrPerAxis(ctx, x, xZeroPoint);
-            var scaled = MultiplyByScale(ctx, shifted, xScale);
+            int qAxis = ResolveQuantAxis(ctx, node, x.Rank);
+            var shifted = xZeroPoint is null ? x : SubScalarOrPerAxis(ctx, x, xZeroPoint, qAxis);
+            var scaled = MultiplyByScale(ctx, shifted, xScale, qAxis);
             ctx.PutTensor(node.Output[0], scaled);
         }
     }
@@ -201,83 +209,96 @@ internal static class QuantizedOperators
     // ─── Shared arithmetic helpers ─────────────────────────────────────
 
     /// <summary>
+    /// Reads the ONNX per-axis quantization axis attribute (default 1) and
+    /// normalizes negative values against the input rank. ONNX tolerates
+    /// the default axis=1 even for rank-0 / rank-1 inputs when the scale
+    /// is a scalar (axis is ignored on that path) — so the out-of-range
+    /// check is deferred to the per-axis broadcast helpers, which report
+    /// a more actionable error citing both the offending axis and the
+    /// scale shape that needed it.
+    /// </summary>
+    private static int ResolveQuantAxis<T>(OnnxTranslationContext<T> ctx, NodeProto node, int inputRank) where T : unmanaged
+    {
+        int axis = ctx.GetIntAttrAsInt(node, "axis", 1);
+        if (axis < 0) axis += inputRank;
+        return axis;
+    }
+
+    /// <summary>
     /// Multiplies <paramref name="x"/> by <paramref name="scale"/>. When the
     /// scale is a scalar ([1]) we broadcast-multiply; when it's a rank-1
-    /// vector we broadcast along the channel dim (ONNX per-axis convention
-    /// — axis is typically 1 for NCHW weights).
+    /// vector we broadcast along <paramref name="axis"/> (ONNX per-axis
+    /// convention — defaults to 1 for NCHW weights, 0 for transposed conv
+    /// weights, etc).
     /// </summary>
-    private static Tensor<T> MultiplyByScale<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> scale) where T : unmanaged
+    private static Tensor<T> MultiplyByScale<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> scale, int axis = 1) where T : unmanaged
     {
         if (scale.Rank == 0 || (scale.Rank == 1 && scale._shape[0] == 1))
         {
-            // Scalar scale; broadcast.
             return ctx.Engine.TensorBroadcastMultiply(x, scale);
         }
-        // Per-axis scale: scale shape [C]. Reshape to [1, C, 1, 1, ...] so
-        // it broadcasts along dim 1 of x.
-        if (scale.Rank == 1 && x.Rank >= 2 && scale._shape[0] == x._shape[1])
+        if (scale.Rank == 1 && x.Rank >= 1 && axis < x.Rank && scale._shape[0] == x._shape[axis])
         {
-            var axisShape = new int[x.Rank];
-            axisShape[0] = 1; axisShape[1] = scale._shape[0];
-            for (int i = 2; i < x.Rank; i++) axisShape[i] = 1;
-            var reshaped = ctx.Engine.Reshape(scale, axisShape);
+            var reshaped = ReshapeForAxisBroadcast(ctx, scale, x.Rank, axis);
             return ctx.Engine.TensorBroadcastMultiply(x, reshaped);
         }
         throw new NotSupportedException(
-            $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} is not supported.");
+            $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
     }
 
-    private static Tensor<T> DivideByScale<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> scale) where T : unmanaged
+    private static Tensor<T> DivideByScale<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> scale, int axis = 1) where T : unmanaged
     {
-        // Dividing by a small scale is common; expressed as mul by reciprocal
-        // for the scalar case so we can reuse the broadcast-multiply path.
         if (scale.Rank == 0 || (scale.Rank == 1 && scale._shape[0] == 1))
         {
             var reciprocal = Reciprocal(ctx, scale);
             return ctx.Engine.TensorBroadcastMultiply(x, reciprocal);
         }
-        if (scale.Rank == 1 && x.Rank >= 2 && scale._shape[0] == x._shape[1])
+        if (scale.Rank == 1 && x.Rank >= 1 && axis < x.Rank && scale._shape[0] == x._shape[axis])
         {
-            var axisShape = new int[x.Rank];
-            axisShape[0] = 1; axisShape[1] = scale._shape[0];
-            for (int i = 2; i < x.Rank; i++) axisShape[i] = 1;
-            var reshaped = ctx.Engine.Reshape(scale, axisShape);
+            var reshaped = ReshapeForAxisBroadcast(ctx, scale, x.Rank, axis);
             return ctx.Engine.TensorBroadcastDivide(x, reshaped);
         }
         throw new NotSupportedException(
-            $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} is not supported.");
+            $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
     }
 
-    private static Tensor<T> AddScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp) where T : unmanaged
+    private static Tensor<T> AddScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp, int axis = 1) where T : unmanaged
     {
         if (zp.Rank == 0 || (zp.Rank == 1 && zp._shape[0] == 1))
             return ctx.Engine.TensorBroadcastAdd(x, zp);
-        if (zp.Rank == 1 && x.Rank >= 2 && zp._shape[0] == x._shape[1])
+        if (zp.Rank == 1 && x.Rank >= 1 && axis < x.Rank && zp._shape[0] == x._shape[axis])
         {
-            var axisShape = new int[x.Rank];
-            axisShape[0] = 1; axisShape[1] = zp._shape[0];
-            for (int i = 2; i < x.Rank; i++) axisShape[i] = 1;
-            var reshaped = ctx.Engine.Reshape(zp, axisShape);
+            var reshaped = ReshapeForAxisBroadcast(ctx, zp, x.Rank, axis);
             return ctx.Engine.TensorBroadcastAdd(x, reshaped);
         }
         throw new NotSupportedException(
-            $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} is not supported.");
+            $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
     }
 
-    private static Tensor<T> SubScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp) where T : unmanaged
+    private static Tensor<T> SubScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp, int axis = 1) where T : unmanaged
     {
         if (zp.Rank == 0 || (zp.Rank == 1 && zp._shape[0] == 1))
             return ctx.Engine.TensorBroadcastSubtract(x, zp);
-        if (zp.Rank == 1 && x.Rank >= 2 && zp._shape[0] == x._shape[1])
+        if (zp.Rank == 1 && x.Rank >= 1 && axis < x.Rank && zp._shape[0] == x._shape[axis])
         {
-            var axisShape = new int[x.Rank];
-            axisShape[0] = 1; axisShape[1] = zp._shape[0];
-            for (int i = 2; i < x.Rank; i++) axisShape[i] = 1;
-            var reshaped = ctx.Engine.Reshape(zp, axisShape);
+            var reshaped = ReshapeForAxisBroadcast(ctx, zp, x.Rank, axis);
             return ctx.Engine.TensorBroadcastSubtract(x, reshaped);
         }
         throw new NotSupportedException(
-            $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} is not supported.");
+            $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
+    }
+
+    /// <summary>
+    /// Reshapes a rank-1 per-axis vector of length N to a rank-<paramref name="outputRank"/>
+    /// shape with N at <paramref name="axis"/> and 1 elsewhere — the layout
+    /// <c>TensorBroadcast{Add,Sub,Multiply,Divide}</c> expects.
+    /// </summary>
+    private static Tensor<T> ReshapeForAxisBroadcast<T>(OnnxTranslationContext<T> ctx, Tensor<T> vec, int outputRank, int axis) where T : unmanaged
+    {
+        var axisShape = new int[outputRank];
+        for (int i = 0; i < outputRank; i++) axisShape[i] = 1;
+        axisShape[axis] = vec._shape[0];
+        return ctx.Engine.Reshape(vec, axisShape);
     }
 
     private static Tensor<T> Reciprocal<T>(OnnxTranslationContext<T> ctx, Tensor<T> scalar) where T : unmanaged
@@ -292,6 +313,26 @@ internal static class QuantizedOperators
         var one = ops.FromDouble(1.0);
         for (int i = 0; i < src.Length; i++) dst[i] = ops.Divide(one, src[i]);
         return result;
+    }
+
+    /// <summary>
+    /// Heuristically detects uint8 (as opposed to int8) quantization by
+    /// checking whether any zero-point value exceeds the int8 max (127).
+    /// ONNX's actual int8/uint8 selector is the zero_point's TensorProto
+    /// dtype, which we've lost by flattening everything to float T at
+    /// import; the value-range heuristic is correct in practice because
+    /// valid int8 zero_points are always ≤127 and valid uint8 zero_points
+    /// are always ≥0 (with ≥128 routinely seen for asymmetric uint8).
+    /// </summary>
+    private static bool AnyValueExceedsInt8Max<T>(Tensor<T> zeroPoint) where T : unmanaged
+    {
+        var span = zeroPoint.AsSpan();
+        for (int i = 0; i < span.Length; i++)
+        {
+            double v = Convert.ToDouble(span[i]!);
+            if (v > 127.0 || v < -128.0) return true;
+        }
+        return false;
     }
 
     private static Tensor<T> Clamp<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, double lo, double hi) where T : unmanaged

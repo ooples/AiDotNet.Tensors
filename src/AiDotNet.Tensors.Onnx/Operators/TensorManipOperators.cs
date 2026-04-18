@@ -55,10 +55,15 @@ internal static class TensorManipOperators
             bool toInt = to == 2 || to == 3 || to == 4 || to == 5 || to == 6 || to == 7 || to == 12 || to == 13;
             if (toInt)
             {
-                // Truncate-toward-zero is the ONNX integer-cast rule. We
-                // round toward nearest here as a close approximation — real
-                // int8/int32 storage would need a different plan T anyway.
-                ctx.PutTensor(node.Output[0], ctx.Engine.TensorRound(x));
+                // ONNX integer cast = truncate-toward-zero
+                // (1.9 → 1, -1.9 → -1). Implement as sign(x) * floor(abs(x))
+                // since the engine has no native trunc-to-int kernel but
+                // does have Floor and Abs. (Using TensorRound here would
+                // round 1.5 → 2 and diverge from ONNX.)
+                var absX = ctx.Engine.TensorAbs(x);
+                var floored = ctx.Engine.TensorFloor(absX);
+                var sign = ctx.Engine.TensorSign(x);
+                ctx.PutTensor(node.Output[0], ctx.Engine.TensorMultiply(sign, floored));
                 return;
             }
             // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16) and BOOL: pass
@@ -81,14 +86,22 @@ internal static class TensorManipOperators
         {
             var data = ctx.GetTensor(node.Input[0]);
             var shapeTensor = ctx.GetTensor(node.Input[1]);
-            var newShape = ExtractInt64Shape(shapeTensor, data._shape);
+            // ONNX 14+: allowzero=1 means a 0 in the shape tensor stays a
+            // literal 0 dimension instead of the default "copy input dim"
+            // sentinel. Default (0) preserves the legacy behaviour.
+            bool allowZero = ctx.GetIntAttrAsInt(node, "allowzero", 0) != 0;
+            var newShape = ExtractInt64Shape(shapeTensor, data._shape, allowZero);
             ctx.PutTensor(node.Output[0], ctx.Engine.Reshape(data, newShape));
         }
 
         // ONNX Reshape uses sentinel values in the shape tensor:
-        //   0 = copy the corresponding dim from the input
-        //   -1 = infer this dim so the total element count matches
-        internal static int[] ExtractInt64Shape(Tensor<T> shapeTensor, int[] inputShape)
+        //   0 = copy the corresponding dim from the input (opset < 14, or
+        //       opset 14+ with allowzero=0). When allowzero=1 a 0 stays
+        //       literal zero (valid when the graph genuinely wants an empty
+        //       dimension — producers like HuggingFace attention-mask paths
+        //       occasionally emit this).
+        //   -1 = infer this dim so the total element count matches.
+        internal static int[] ExtractInt64Shape(Tensor<T> shapeTensor, int[] inputShape, bool allowZero = false)
         {
             int rank = shapeTensor._shape[0];
             var raw = new int[rank];
@@ -101,7 +114,14 @@ internal static class TensorManipOperators
             long known = 1;
             for (int i = 0; i < rank; i++)
             {
-                if (raw[i] == 0) { result[i] = inputShape[i]; known *= result[i]; }
+                if (raw[i] == 0)
+                {
+                    // allowzero=0 (default): copy the corresponding input dim
+                    // (requires a corresponding axis exists in input). With
+                    // allowzero=1 the 0 is a literal dimension.
+                    result[i] = allowZero ? 0 : (i < inputShape.Length ? inputShape[i] : 0);
+                    known *= result[i];
+                }
                 else if (raw[i] == -1)
                 {
                     if (inferAt != -1) throw new InvalidDataException(
@@ -114,6 +134,16 @@ internal static class TensorManipOperators
             {
                 long total = 1;
                 for (int i = 0; i < inputShape.Length; i++) total *= inputShape[i];
+                // Guard against divide-by-zero when the product of known
+                // dims contains a 0 (e.g. allowzero=1 with -1 in the same
+                // shape). In that case the -1 cannot be meaningfully
+                // inferred — the ONNX spec says the element count must
+                // match, which it does only vacuously when either side is
+                // zero. Surface a crisp error instead of a runtime crash.
+                if (known == 0)
+                    throw new InvalidDataException(
+                        $"Reshape cannot infer dim {inferAt}: the product of known dims is zero " +
+                        "(typically allowzero=1 combined with a -1 entry or a zero-length input).");
                 if (total % known != 0) throw new InvalidDataException(
                     $"Reshape cannot infer dim {inferAt}: total elements {total} not divisible by " +
                     $"product of known dims {known}.");
@@ -171,6 +201,15 @@ internal static class TensorManipOperators
 
             var starts = ToInt32Array(startsT);
             var ends   = ToInt32Array(endsT);
+            // ONNX Slice requires starts, ends, axes (and steps, if present)
+            // to all have the same length — each entry describes one sliced
+            // axis. A length mismatch would IndexOutOfRange a few lines down;
+            // fail fast with a clear diagnostic so the offending node is
+            // identifiable.
+            if (starts.Length != ends.Length || starts.Length != axes.Length || steps.Length != axes.Length)
+                throw new InvalidDataException(
+                    $"Slice expected starts/ends/axes/steps to all have the same length; got " +
+                    $"{starts.Length}/{ends.Length}/{axes.Length}/{steps.Length}.");
             // Build full [rank] start + length arrays defaulting to the whole tensor.
             var fullStart = new int[data.Rank];
             var fullLen = (int[])data._shape.Clone();
@@ -212,9 +251,27 @@ internal static class TensorManipOperators
             int axis = ctx.GetIntAttrAsInt(node, "axis", 0);
             if (axis < 0) axis += x.Rank;
             int numOutputs = node.Output.Count;
-            // opset 13 moved `split` from attribute to second input.
-            // Non-uniform splits aren't supported by IEngine.TensorSplit;
-            // require the evenly-split case.
+            // Opset 13 moved `split` sizes from attribute to second input.
+            // When present, verify each piece is the same size — our engine
+            // only supports uniform splits today. The older attribute-based
+            // form (opset < 13) is also supported: inspect the attribute,
+            // enforce the same uniformity contract.
+            int[]? splitSizes = null;
+            if (node.Input.Count > 1 && ctx.HasTensor(node.Input[1]))
+                splitSizes = ToInt32Array(ctx.GetTensor(node.Input[1]));
+            else
+                splitSizes = ctx.GetIntArrayAttr(node, "split");
+            if (splitSizes is not null)
+            {
+                if (splitSizes.Length != numOutputs)
+                    throw new InvalidDataException(
+                        $"Split sizes length {splitSizes.Length} != number of outputs {numOutputs}.");
+                for (int i = 1; i < splitSizes.Length; i++)
+                    if (splitSizes[i] != splitSizes[0])
+                        throw new NotSupportedException(
+                            $"Split with non-uniform sizes [{string.Join(",", splitSizes)}] " +
+                            "is not yet supported; only evenly-sized splits are covered.");
+            }
             var parts = ctx.Engine.TensorSplit(x, numOutputs, axis);
             if (parts.Length != numOutputs)
                 throw new InvalidDataException(
@@ -353,11 +410,25 @@ internal static class TensorManipOperators
                 throw new InvalidDataException("Unsqueeze requires 'axes' as attribute or second input.");
 
             int newRank = x.Rank + axes.Length;
-            // Normalize negative axes into final-rank space.
+            // Normalize negative axes into final-rank space, validate each
+            // falls inside [0, newRank) — ONNX requires axes to be unique
+            // and within [-output_rank, output_rank-1]. Duplicates or
+            // out-of-range values silently corrupt the newShape scan below
+            // (srcIdx tracking breaks), so fail fast with a clear error.
             var normalized = new int[axes.Length];
             for (int i = 0; i < axes.Length; i++)
-                normalized[i] = axes[i] < 0 ? axes[i] + newRank : axes[i];
+            {
+                int ax = axes[i] < 0 ? axes[i] + newRank : axes[i];
+                if (ax < 0 || ax >= newRank)
+                    throw new InvalidDataException(
+                        $"Unsqueeze axis {axes[i]} out of range for output rank {newRank}.");
+                normalized[i] = ax;
+            }
             Array.Sort(normalized);
+            for (int i = 1; i < normalized.Length; i++)
+                if (normalized[i] == normalized[i - 1])
+                    throw new InvalidDataException(
+                        $"Unsqueeze axes must be unique; got duplicate {normalized[i]}.");
 
             var newShape = new int[newRank];
             int srcIdx = 0, axIdx = 0;

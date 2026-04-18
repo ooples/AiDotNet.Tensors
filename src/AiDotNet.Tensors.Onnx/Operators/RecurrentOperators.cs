@@ -297,6 +297,46 @@ internal static class RecurrentOperators
         if (layout != 0)
             throw new NotSupportedException(
                 $"{opName} layout={layout} is not yet supported. Only seq-first layout=0 is covered.");
+
+        // Our LSTM translator hardcodes sigmoid/tanh/tanh (LSTM) and
+        // sigmoid/tanh (GRU) activations. Custom activations override those
+        // and can't be honored without threading them through the engine op,
+        // so reject anything set.
+        var activations = ctx.GetAttribute(node, "activations");
+        if (activations is not null && activations.Strings.Count > 0)
+            throw new NotSupportedException(
+                $"{opName} custom 'activations' attribute is not yet supported. " +
+                "Only the default activation set (sigmoid/tanh/tanh for LSTM, sigmoid/tanh for GRU) is covered.");
+        var alpha = ctx.GetAttribute(node, "activation_alpha");
+        if (alpha is not null && alpha.Floats.Count > 0)
+            throw new NotSupportedException(
+                $"{opName} 'activation_alpha' attribute is not yet supported.");
+        var beta = ctx.GetAttribute(node, "activation_beta");
+        if (beta is not null && beta.Floats.Count > 0)
+            throw new NotSupportedException(
+                $"{opName} 'activation_beta' attribute is not yet supported.");
+        // Saturation clip and LSTM's peephole input/forget coupling are not
+        // implemented — a non-default value silently changes numerics.
+        var clip = ctx.GetAttribute(node, "clip");
+        if (clip is not null)
+            throw new NotSupportedException(
+                $"{opName} 'clip' attribute is not yet supported.");
+        if (opName == "LSTM")
+        {
+            int inputForget = ctx.GetIntAttrAsInt(node, "input_forget", 0);
+            if (inputForget != 0)
+                throw new NotSupportedException(
+                    $"{opName} input_forget={inputForget} is not yet supported. " +
+                    "Only the default input_forget=0 (independent input/forget gates) is covered.");
+        }
+        if (opName == "GRU")
+        {
+            int linearBeforeReset = ctx.GetIntAttrAsInt(node, "linear_before_reset", 0);
+            if (linearBeforeReset != 0)
+                throw new NotSupportedException(
+                    $"{opName} linear_before_reset={linearBeforeReset} is not yet supported. " +
+                    "Only the default linear_before_reset=0 (standard pre-reset Wh·h variant) is covered.");
+        }
     }
 
     /// <summary>

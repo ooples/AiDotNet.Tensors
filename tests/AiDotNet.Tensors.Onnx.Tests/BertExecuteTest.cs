@@ -43,7 +43,10 @@ public class BertExecuteTest
         var result = OnnxImporter.Import<float>(stream, engine, options);
         Assert.Empty(result.UnsupportedOperators);
         Assert.NotNull(result.Plan);
-        _output.WriteLine($"Plan step count: {result.Plan.StepCount}");
+        // ICompiledPlan<T> holds pinned GCHandles + backing arrays; dispose
+        // when the test finishes instead of leaking through to the next run.
+        using var plan = result.Plan!;
+        _output.WriteLine($"Plan step count: {plan.StepCount}");
 
         // Build a tiny sample: batch=1, seq=256. token ids are small
         // integers (~30k vocab), masks/segments are 0/1.
@@ -86,28 +89,31 @@ public class BertExecuteTest
         FillFloat(result.Inputs["segment_ids:0"], segmentIds);
         FillFloat(result.Inputs["unique_ids_raw_output___9:0"], uniqueIds);
 
-        result.Plan!.Execute();
+        plan.Execute();
 
         // Compare each declared ONNX output against the corresponding ORT
         // result. OnnxImportResult.Outputs exposes every named graph output
         // after Execute — Execute's single return value is one arbitrary
-        // step; the dictionary is the right way to read them all.
+        // step; the dictionary is the right way to read them all. The
+        // comparison matches by NAME (not by flattened length), so
+        // multi-output models can't accidentally compare the wrong pair.
         int totalMismatches = 0;
         float maxDiff = 0f;
+        var failures = new List<string>();
         foreach (var kv in ortByName)
         {
             var name = kv.Key;
             var ortValues = kv.Value;
             if (!result.Outputs.TryGetValue(name, out var outTensor))
             {
-                _output.WriteLine($"  '{name}': missing from our outputs");
+                failures.Add($"'{name}' missing from our outputs");
                 continue;
             }
             var ourFlat = new float[outTensor.AsSpan().Length];
             outTensor.AsSpan().CopyTo(ourFlat);
             if (ourFlat.Length != ortValues.Length)
             {
-                _output.WriteLine($"  '{name}': length mismatch ours={ourFlat.Length} ort={ortValues.Length}");
+                failures.Add($"'{name}' length mismatch ours={ourFlat.Length} ort={ortValues.Length}");
                 continue;
             }
             int outputMismatches = 0;
@@ -127,6 +133,12 @@ public class BertExecuteTest
             if (outputMaxDiff > maxDiff) maxDiff = outputMaxDiff;
         }
         _output.WriteLine($"Total: {totalMismatches} mismatches, max diff {maxDiff}");
+        // Actually ASSERT — the earlier version only logged, which meant any
+        // regression in BERT parity would have shown up silently in the
+        // stdout log while the test kept reporting green.
+        Assert.Empty(failures);
+        Assert.True(totalMismatches == 0,
+            $"BERT single inference: {totalMismatches} elements exceeded 1e-3 tolerance; max diff {maxDiff}.");
     }
 
     private static void FillFloat(LinearAlgebra.Tensor<float> placeholder, long[] source)

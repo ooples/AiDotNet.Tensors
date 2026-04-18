@@ -28,6 +28,13 @@ internal static class AttentionOperator
             var input = ctx.GetTensor(node.Input[0]);      // [batch, seq, hidden]
             var weights = ctx.GetTensor(node.Input[1]);    // [hidden, 3*hidden]
             var bias = ctx.GetTensor(node.Input[2]);       // [3*hidden]
+            // Reject optional extras (mask_index, past, attention_bias) and
+            // multi-output variants — silently ignoring them produces wrong
+            // numerics. Phase 1 supports only the packed 3-in / 1-out form.
+            if (node.Input.Count > 3 || node.Output.Count > 1)
+                throw new NotSupportedException(
+                    "Phase 1 Attention only supports the packed 3-input / 1-output form " +
+                    "without mask_index, past, or attention_bias.");
             int numHeads = ctx.GetIntAttrAsInt(node, "num_heads", 0);
             if (numHeads <= 0)
                 throw new InvalidDataException(
@@ -39,6 +46,11 @@ internal static class AttentionOperator
             int batch = input._shape[0];
             int seq = input._shape[1];
             int hidden = input._shape[2];
+            // Reject non-divisible hidden size — silently truncating headDim
+            // via integer division would corrupt the reshape + SDPA output.
+            if (hidden % numHeads != 0)
+                throw new InvalidDataException(
+                    $"com.microsoft.Attention: hidden size {hidden} must be divisible by num_heads {numHeads}.");
             int headDim = hidden / numHeads;
 
             // Project to [batch, seq, 3*hidden] then split along last dim.

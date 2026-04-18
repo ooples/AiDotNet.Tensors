@@ -77,7 +77,7 @@ public class VitImportTest
         _output.WriteLine($"Plan step count: {result.Plan.StepCount}");
 
         var inputName = result.NamedInputs.Keys.First();
-        var inputShape = result.NamedInputs[inputName].Shape;
+        var inputShape = result.NamedInputs[inputName].ToShapeArray();
         int total = 1; foreach (var d in inputShape) total *= d;
         var sample = new float[total];
         var rng = new Random(42);

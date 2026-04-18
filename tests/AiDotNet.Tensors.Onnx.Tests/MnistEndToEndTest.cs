@@ -46,7 +46,7 @@ public class MnistEndToEndTest
 
         // MNIST input is [1, 1, 28, 28] float.
         var inputName = result.NamedInputs.Keys.First();
-        var inputShape = result.NamedInputs[inputName].Shape;
+        var inputShape = result.NamedInputs[inputName].ToShapeArray();
         Assert.Equal(new[] { 1, 1, 28, 28 }, inputShape);
 
         int total = 1;
@@ -100,7 +100,27 @@ public class MnistEndToEndTest
 
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
         var bytes = await http.GetByteArrayAsync(url);
-        File.WriteAllBytes(path, bytes);
+
+        // Atomic write: a crash/kill/concurrent test between
+        // File.WriteAllBytes starting and returning would leave a truncated
+        // .onnx at `path`, which silently fails later runs with a protobuf
+        // parse error. Write to a sibling temp name in the same directory
+        // (so Move/Replace stays on one filesystem and can be atomic) then
+        // swap into place.
+        var tmp = Path.Combine(cacheDir, $"{fileName}.{Guid.NewGuid():N}.tmp");
+        File.WriteAllBytes(tmp, bytes);
+        try
+        {
+            if (File.Exists(path))
+                File.Replace(tmp, path, destinationBackupFileName: null);
+            else
+                File.Move(tmp, path);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+
         return bytes;
     }
 }

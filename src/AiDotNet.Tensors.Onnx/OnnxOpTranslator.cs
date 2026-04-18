@@ -63,9 +63,13 @@ public sealed class OnnxOpTranslatorRegistry<T> where T : unmanaged
 
     /// <summary>
     /// Builds a registry populated with every built-in translator shipped
-    /// in this assembly. The full Phase 1 operator set — arithmetic,
-    /// activations, normalizations, convolutions, tensor manipulation,
-    /// and the com.microsoft.Attention extension.
+    /// in this assembly: Phase 1 (arithmetic, activations, normalizations,
+    /// convolutions, tensor manipulation, com.microsoft.Attention) plus
+    /// the Phase 2/3 recurrent (LSTM, GRU), quantized (QuantizeLinear,
+    /// DequantizeLinear, QLinearMatMul, QLinearConv), and math
+    /// (Sqrt, Pow, Abs, Neg, Exp, Log, Erf, Reciprocal, ReduceSum,
+    /// ReduceMean, Min, Max, OneHot, Not, Where, ConstantOfShape,
+    /// Equal, Expand) translators.
     /// </summary>
     public static OnnxOpTranslatorRegistry<T> BuildDefault()
     {

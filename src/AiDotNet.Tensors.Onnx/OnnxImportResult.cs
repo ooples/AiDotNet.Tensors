@@ -18,7 +18,7 @@ public sealed class OnnxImportResult<T> where T : unmanaged
     /// <summary>
     /// The compiled inference plan, or <c>null</c> if any operator was
     /// unsupported. Execute with <c>Plan.Execute()</c> after writing the
-    /// input data into the buffer returned by <see cref="NamedInputs"/>.
+    /// input data into the buffers exposed by <see cref="Inputs"/>.
     /// </summary>
     public ICompiledPlan<T>? Plan { get; }
 

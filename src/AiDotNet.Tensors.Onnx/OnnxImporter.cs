@@ -194,7 +194,16 @@ public static class OnnxImporter
         try
         {
             using var scope = GraphMode.Enable();
-            var ctx = new OnnxTranslationContext<T>(engine, tensorsByName, options);
+            // Resolve the default-domain opset version from the model's
+            // opset_import list. Softmax and a handful of other translators
+            // need this to pick the correct per-opset attribute defaults.
+            long defaultOpset = 13;
+            for (int i = 0; i < model.OpsetImport.Count; i++)
+            {
+                var o = model.OpsetImport[i];
+                if (string.IsNullOrEmpty(o.Domain)) { defaultOpset = o.Version; break; }
+            }
+            var ctx = new OnnxTranslationContext<T>(engine, tensorsByName, options, defaultOpset);
             for (int i = 0; i < sortedNodes.Count; i++)
             {
                 var node = sortedNodes[i];

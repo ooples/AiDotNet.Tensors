@@ -71,7 +71,9 @@ public class ResNet50ImportOnlyTest
             DimensionOverrides = new Dictionary<string, int> { ["N"] = 1 },
         };
         var result = OnnxImporter.Import<float>(stream, engine, options);
-        _output.WriteLine($"Plan step count: {result.Plan!.StepCount}");
+        Assert.Empty(result.UnsupportedOperators);
+        Assert.NotNull(result.Plan);
+        _output.WriteLine($"Plan step count: {result.Plan.StepCount}");
 
         var inputShape = new[] { 1, 3, 224, 224 };
         int total = 1; foreach (var d in inputShape) total *= d;

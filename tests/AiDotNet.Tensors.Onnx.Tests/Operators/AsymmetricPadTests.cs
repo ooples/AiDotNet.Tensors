@@ -92,7 +92,7 @@ public class AsymmetricPadTests
     }
 
     [SkippableFact]
-    public void GroupedConv_4Groups_MatchesOnnxRuntime()
+    public void GroupedConv_2Groups_MatchesOnnxRuntime()
     {
         // Classic grouped conv: group=2, Cin=4, Cout=6. Input [1, 4, 6, 6],
         // kernel [6, 2, 3, 3] (each output channel sees Cin/group = 2 input

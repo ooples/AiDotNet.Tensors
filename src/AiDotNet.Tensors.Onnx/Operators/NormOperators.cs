@@ -37,7 +37,19 @@ internal static class NormOperators
                     "Phase 1 import requires last-axis normalization (which BERT/ViT/ResNet all use).");
             float epsilon = ctx.GetFloatAttr(node, "epsilon", 1e-5f);
             var scale = ctx.GetTensor(node.Input[1]);
-            var bias = ctx.GetTensor(node.Input[2]);
+            // ONNX LayerNormalization accepts either 2 inputs (X, Scale) or
+            // 3 inputs (X, Scale, B). For the 2-input form, synthesize a
+            // zero bias of the same shape as scale so the engine call stays
+            // on the single validated path.
+            Tensor<T> bias;
+            if (node.Input.Count >= 3 && !string.IsNullOrEmpty(node.Input[2]))
+            {
+                bias = ctx.GetTensor(node.Input[2]);
+            }
+            else
+            {
+                bias = new Tensor<T>(scale._shape);
+            }
             var y = ctx.Engine.LayerNorm(x, scale, bias, epsilon, out _, out _);
             ctx.PutTensor(node.Output[0], y);
         }

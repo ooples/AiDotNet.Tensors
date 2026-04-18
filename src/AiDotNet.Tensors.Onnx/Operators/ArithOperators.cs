@@ -204,7 +204,7 @@ internal static class ArithOperators
         }
     }
 
-    /// <summary>ONNX Div — elementwise divide.</summary>
+    /// <summary>ONNX Div — elementwise divide with NumPy broadcasting.</summary>
     internal sealed class Div<T> : IOnnxOpTranslator<T> where T : unmanaged
     {
         public string OpType => "Div";
@@ -214,7 +214,10 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            ctx.PutTensor(node.Output[0], ctx.Engine.TensorDivide(a, b));
+            var result = ShapesEqual(a._shape, b._shape)
+                ? ctx.Engine.TensorDivide(a, b)
+                : ctx.Engine.TensorBroadcastDivide(a, b);
+            ctx.PutTensor(node.Output[0], result);
         }
     }
 
