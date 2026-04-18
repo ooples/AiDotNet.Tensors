@@ -30,6 +30,8 @@ internal static class MathOperators
         r.Register(new Where<T>());
         r.Register(new Reciprocal<T>());
         r.Register(new ConstantOfShape<T>());
+        r.Register(new Equal<T>());
+        r.Register(new Expand<T>());
     }
 
     /// <summary>
@@ -477,6 +479,90 @@ internal static class MathOperators
                 ? ctx.Engine.TensorAdd(a, b)
                 : ctx.Engine.TensorBroadcastAdd(a, b);
         }
+    }
+
+    /// <summary>
+    /// ONNX Equal — elementwise A == B, returns bool. Plan-T representation
+    /// of bool is float 0.0 / 1.0. Broadcasts per ONNX/NumPy rules.
+    /// </summary>
+    internal sealed class Equal<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Equal";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            var a = ctx.GetTensor(node.Input[0]);
+            var b = ctx.GetTensor(node.Input[1]);
+            // Lower to |a - b| < tol mapped through a step function. Can't use
+            // exact equality on floats generally, but since our plan carries
+            // integer-valued inputs through float storage (Cast semantics in
+            // MathOperators.cs:46-67), bit-for-bit equality is what ViT's
+            // opset-14 Equal expects when the two sides are both ints.
+            // Implementation: Equal(a,b) = Not(abs(a - b) > 0) which lowers to
+            // (1 - Sign(Abs(a - b))) under our numeric ops. But Sign may not
+            // be registered; simpler is the branchless: compute diff, compare
+            // to zero elementwise in a small eager helper. For BERT/ViT this
+            // op chain typically runs at import-time constant folding (shape
+            // arithmetic), so the eager path below is also the common one.
+            var shape = ShapesEqual(a._shape, b._shape)
+                ? a._shape
+                : ComputeBroadcastShape(a._shape, b._shape);
+            // Eager compute via broadcast subtract + elementwise-is-zero map.
+            var diff = ShapesEqual(a._shape, b._shape)
+                ? ctx.Engine.TensorSubtract(a, b)
+                : ctx.Engine.TensorBroadcastSubtract(a, b);
+            // Elementwise: result = (diff == 0) ? 1.0 : 0.0.
+            var result = new Tensor<T>(shape);
+            var ops = MathHelper.GetNumericOperations<T>();
+            var srcSpan = diff.AsSpan();
+            var dstSpan = result.AsWritableSpan();
+            var zero = ops.Zero;
+            var one = ops.One;
+            for (int i = 0; i < dstSpan.Length; i++)
+                dstSpan[i] = ops.Equals(srcSpan[i], zero) ? one : zero;
+            ctx.PutTensor(node.Output[0], result);
+        }
+    }
+
+    /// <summary>
+    /// ONNX Expand — broadcast `input` to `shape` (second input, int64 vector).
+    /// Shape is often rank-bumping: [1,1,3] → [2,1,3] → broadcasts axis 0 from
+    /// 1 to 2. Uses <c>TensorBroadcastAdd</c> with a zero tensor of the target
+    /// shape — same idiom as the output-wrap in <c>OnnxImporter</c>.
+    /// </summary>
+    internal sealed class Expand<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Expand";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            var input = ctx.GetTensor(node.Input[0]);
+            var shapeT = ctx.GetTensor(node.Input[1]);
+            var targetShape = ToIntArray(shapeT);
+            // ONNX Expand uses NumPy broadcast rules: input shape is
+            // right-aligned against target, each axis either matches or is 1.
+            // If input shape is already target, it's a no-op.
+            if (ShapesEqual(input._shape, targetShape))
+            {
+                ctx.PutTensor(node.Output[0], input);
+                return;
+            }
+            var zero = new Tensor<T>(targetShape);
+            ctx.PutTensor(node.Output[0], ctx.Engine.TensorBroadcastAdd(input, zero));
+        }
+    }
+
+    private static int[] ComputeBroadcastShape(int[] a, int[] b)
+    {
+        int rank = Math.Max(a.Length, b.Length);
+        var result = new int[rank];
+        for (int i = 0; i < rank; i++)
+        {
+            int ai = i < a.Length ? a[a.Length - 1 - i] : 1;
+            int bi = i < b.Length ? b[b.Length - 1 - i] : 1;
+            result[rank - 1 - i] = Math.Max(ai, bi);
+        }
+        return result;
     }
 
     // ─── helpers ────────────────────────────────────────────────────────
