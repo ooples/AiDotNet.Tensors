@@ -1421,6 +1421,12 @@ public sealed class CuDnnConvolution : IDisposable
 {
     private readonly CuDnnContext _context;
     private readonly bool _ownsContext;
+    // Workspace is shared across all Forward/Backward calls on this instance
+    // and is resized in-place when a larger size is needed. Serialize the
+    // "ensure-workspace + launch-kernel" critical section so a concurrent
+    // call can't reallocate the device buffer while another call still has
+    // the pointer in flight inside cudnnConvolutionForward.
+    private readonly object _workspaceLock = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
     private bool _disposed;
@@ -1518,29 +1524,36 @@ public sealed class CuDnnConvolution : IDisposable
             _context.CopyToDevice(gpuInput, input);
             _context.CopyToDevice(gpuFilter, filter);
 
-            // Allocate workspace if needed
-            IntPtr workspace = IntPtr.Zero;
-            if (workspaceSize > 0)
+            // Serialize workspace acquisition and the forward launch —
+            // same rationale as the GPU-pointer Forward overload below.
+            // Without this, a concurrent Forward call on the same
+            // CuDnnConvolution instance can realloc the workspace mid-
+            // kernel and invalidate our workspace pointer.
+            lock (_workspaceLock)
             {
-                EnsureWorkspace(workspaceSize);
-                workspace = _workspace;
+                IntPtr workspace = IntPtr.Zero;
+                if (workspaceSize > 0)
+                {
+                    EnsureWorkspaceUnlocked(workspaceSize);
+                    workspace = _workspace;
+                }
+
+                // Execute convolution
+                float alpha = 1.0f;
+                float beta = 0.0f;
+
+                status = CuDnnNative.cudnnConvolutionForward(
+                    _context.Handle,
+                    ref alpha,
+                    inputDesc.Handle, gpuInput.DevicePtr,
+                    filterDesc.Handle, gpuFilter.DevicePtr,
+                    convDesc.Handle,
+                    algo,
+                    workspace, workspaceSize,
+                    ref beta,
+                    outputDesc.Handle, gpuOutput.DevicePtr);
+                CuDnnContext.CheckStatus(status, "ConvolutionForward");
             }
-
-            // Execute convolution
-            float alpha = 1.0f;
-            float beta = 0.0f;
-
-            status = CuDnnNative.cudnnConvolutionForward(
-                _context.Handle,
-                ref alpha,
-                inputDesc.Handle, gpuInput.DevicePtr,
-                filterDesc.Handle, gpuFilter.DevicePtr,
-                convDesc.Handle,
-                algo,
-                workspace, workspaceSize,
-                ref beta,
-                outputDesc.Handle, gpuOutput.DevicePtr);
-            CuDnnContext.CheckStatus(status, "ConvolutionForward");
 
             // Copy result back
             var output = new float[outputSize];
@@ -1623,29 +1636,42 @@ public sealed class CuDnnConvolution : IDisposable
             CuDnnContext.CheckStatus(status, "GetConvolutionForwardWorkspaceSize");
         }
 
-        IntPtr workspace = IntPtr.Zero;
-        if (workspaceSize > 0)
+        // Serialize workspace acquisition and the forward launch so a
+        // concurrent call can't reallocate _workspace while this call is
+        // still using the pointer inside cuDNN. Future follow-up: per-call
+        // workspace pool if contention on the shared buffer becomes a real
+        // hot-path bottleneck.
+        lock (_workspaceLock)
         {
-            EnsureWorkspace(workspaceSize);
-            workspace = _workspace;
-        }
+            IntPtr workspace = IntPtr.Zero;
+            if (workspaceSize > 0)
+            {
+                EnsureWorkspaceUnlocked(workspaceSize);
+                workspace = _workspace;
+            }
 
-        float alpha = 1.0f;
-        float beta = 0.0f;
-        status = CuDnnNative.cudnnConvolutionForward(
-            _context.Handle,
-            ref alpha,
-            inputDesc.Handle, inputDevPtr,
-            filterDesc.Handle, filterDevPtr,
-            convDesc.Handle,
-            algo,
-            workspace, workspaceSize,
-            ref beta,
-            outputDesc.Handle, outputDevPtr);
-        CuDnnContext.CheckStatus(status, "ConvolutionForward");
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            status = CuDnnNative.cudnnConvolutionForward(
+                _context.Handle,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                filterDesc.Handle, filterDevPtr,
+                convDesc.Handle,
+                algo,
+                workspace, workspaceSize,
+                ref beta,
+                outputDesc.Handle, outputDevPtr);
+            CuDnnContext.CheckStatus(status, "ConvolutionForward");
+        }
     }
 
-    private void EnsureWorkspace(ulong requiredSize)
+    /// <summary>
+    /// Grows the workspace if needed. Caller MUST hold <see cref="_workspaceLock"/>;
+    /// that invariant is how we serialize resize-vs-in-flight-kernel across
+    /// concurrent convolution calls.
+    /// </summary>
+    private void EnsureWorkspaceUnlocked(ulong requiredSize)
     {
         if (_workspaceSize >= requiredSize) return;
 

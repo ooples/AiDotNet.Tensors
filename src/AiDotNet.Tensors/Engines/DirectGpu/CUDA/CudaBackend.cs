@@ -29,6 +29,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
     // repeated kernel invocations (workspace reuse + descriptor cache).
     private CuDnnContext? _cudnnContext;
     private CuDnnConvolution? _cudnnConv;
+    // Guards EnsureCudnnConv lazy-init against concurrent first callers.
+    // Without this, two threads entering EnsureCudnnConv simultaneously
+    // can both observe _cudnnConv == null and construct separate
+    // CuDnnContext/CuDnnConvolution instances — leaking the losing one
+    // and ending up with two threads working against different contexts.
+    private readonly object _cudnnInitLock = new();
     private CudaStream? _defaultStream;
     private IntPtr _activationModule;
     private IntPtr _convolutionModule;
@@ -2989,8 +2995,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
             EnsureCudnnConv();
             // Stream affinity: cuDNN kernels launch onto this backend's
             // default stream so they interleave correctly with the
-            // surrounding Cuda ops.
-            CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream);
+            // surrounding Cuda ops. Check the status — if stream binding
+            // silently fails, subsequent cuDNN work runs with wrong
+            // stream ordering and produces nondeterministic results.
+            CuDnnContext.CheckStatus(
+                CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
+                "cudnnSetStream");
             _cudnnConv!.Conv2DForwardGpu(
                 inputDevPtr: input.Handle,
                 filterDevPtr: kernel.Handle,
@@ -3121,12 +3131,20 @@ public sealed class CudaBackend : IAsyncGpuBackend
     /// <summary>Lazily spin up the cuDNN context + convolution helper on
     /// the first call that routes Conv2D through the vendor path. Both
     /// live for the lifetime of this backend and are released in
-    /// <see cref="Dispose"/>.</summary>
+    /// <see cref="Dispose"/>. Thread-safe via double-checked locking so
+    /// concurrent Conv2D calls on the first dispatch can't each
+    /// double-initialize the cuDNN helper.</summary>
     private void EnsureCudnnConv()
     {
         if (_cudnnConv is not null) return;
-        _cudnnContext ??= new CuDnnContext();
-        _cudnnConv = new CuDnnConvolution(_cudnnContext);
+        lock (_cudnnInitLock)
+        {
+            // Re-check inside the lock — another thread may have won the
+            // race to construct and we'd otherwise leak its instance.
+            if (_cudnnConv is not null) return;
+            _cudnnContext ??= new CuDnnContext();
+            _cudnnConv = new CuDnnConvolution(_cudnnContext);
+        }
     }
 
     public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
