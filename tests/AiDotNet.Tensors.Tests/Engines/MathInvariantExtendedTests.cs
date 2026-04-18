@@ -100,6 +100,56 @@ public class MathInvariantExtendedTests
     // ================================================================
     [Fact] public void Copy_ContentEqual() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); AE(dst, src); }
     [Fact] public void Copy_Independent() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); var sd = src.GetDataArray(); sd[0] += 100f; Assert.NotEqual(100f + dst.GetDataArray()[0], dst.GetDataArray()[0]); }
+
+    /// <summary>
+    /// Regression: TensorCopy must respect the source's logical Length, not
+    /// the underlying GetDataArray() length. ArrayPool / TensorAllocator can
+    /// return a backing array larger than the tensor's Length (per
+    /// VectorBase.GetDataArray docstring: "may be larger than Length when
+    /// backed by ArrayPool. Callers MUST index by Length."). The previous
+    /// implementation used <c>Array.Copy(src, dst, sourceArray.Length)</c>,
+    /// which would attempt to copy the full backing-array length and throw
+    /// "Destination array was not long enough" whenever the source was
+    /// over-allocated and destination was tightly sized. This test allocates
+    /// the source via TensorAllocator.Rent (which goes through the pool
+    /// path and may return an over-allocated buffer) and writes into a
+    /// tightly-sized destination.
+    /// </summary>
+    [Fact]
+    public void Copy_RentedSource_TightlySizedDestination_DoesNotOverrun()
+    {
+        // Pick a size that the ArrayPool typically rounds up to a larger
+        // bucket on net5+. 17 is small enough to live well below the
+        // 1024-element pool threshold, but the construction below uses
+        // TensorAllocator.Rent whose ArrayPool path triggers at >= the
+        // configured threshold; force a larger shape so the pool actually
+        // hands back an oversized array.
+        const int N = 1024;
+        var src = TensorAllocator.Rent<float>(new[] { N });
+        try
+        {
+            // Fill source with a known pattern.
+            var srcWritable = src.AsWritableSpan();
+            for (int i = 0; i < N; i++) srcWritable[i] = i + 0.5f;
+
+            // Destination is a plain new Tensor<T> with exactly N elements.
+            var dst = new Tensor<float>(new float[N], new[] { N });
+
+            // Pre-fix this throws ArgumentException("Destination array was
+            // not long enough...") on every CI runner where the pooled
+            // backing array exceeds N. Post-fix it copies exactly N
+            // elements.
+            E.TensorCopy(src, dst);
+
+            var dstSpan = dst.AsSpan();
+            for (int i = 0; i < N; i++)
+                Assert.True(System.Math.Abs(dstSpan[i] - (i + 0.5f)) < Tol, $"[{i}] expected {i + 0.5f} got {dstSpan[i]}");
+        }
+        finally
+        {
+            TensorAllocator.Return(src);
+        }
+    }
     [Fact] public void Fill_AllSameValue() { var t = new Tensor<float>(new float[64], [64]); E.TensorFill(t, 3.14f); var d = t.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.Equal(3.14f, d[i], Tol); }
 
     // ================================================================
