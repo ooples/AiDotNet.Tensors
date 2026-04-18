@@ -152,6 +152,63 @@ public sealed class AutocastScope : IDisposable
     }
 
     /// <summary>
+    /// True iff the configured policy forces <paramref name="layerName"/>
+    /// into FP32. Consumed by training-loop orchestration to bypass
+    /// autocast bookkeeping for FP32-pinned layers (matches PyTorch's
+    /// <c>torch.cuda.amp.autocast(enabled=False)</c> nested scope).
+    /// </summary>
+    public bool ShouldUseFP32(string layerName)
+        => Policy?.GetLayerPrecision(layerName) == PrecisionMode.Float32;
+
+    /// <summary>
+    /// True iff the layer's effective precision is MORE precise than the
+    /// scope-wide <see cref="Precision"/>. Layers matching this predicate
+    /// run in FP32 / FP16 / BF16 rather than the default. Typical callers:
+    /// training-loop wrappers that decide whether to insert a cast around
+    /// a layer's compute.
+    /// </summary>
+    public bool ShouldUseHigherPrecision(string layerName)
+    {
+        if (Policy is null) return false;
+        var layerPrec = Policy.GetLayerPrecision(layerName);
+        return PrecisionRank(layerPrec) > PrecisionRank(Precision);
+    }
+
+    /// <summary>Cast an FP16 tensor to FP32 (pure-CPU widen).</summary>
+    public static LinearAlgebra.Tensor<float> CastToFP32(LinearAlgebra.Tensor<Half> fp16)
+    {
+        if (fp16 is null) throw new ArgumentNullException(nameof(fp16));
+        var result = new LinearAlgebra.Tensor<float>(fp16._shape);
+        var src = fp16.AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
+        return result;
+    }
+
+    /// <summary>Cast an FP32 tensor to FP16 (pure-CPU narrow).</summary>
+    public static LinearAlgebra.Tensor<Half> CastToFP16(LinearAlgebra.Tensor<float> fp32)
+    {
+        if (fp32 is null) throw new ArgumentNullException(nameof(fp32));
+        var result = new LinearAlgebra.Tensor<Half>(fp32._shape);
+        var src = fp32.AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = (Half)src[i];
+        return result;
+    }
+
+    // Higher rank = more precise. Used by ShouldUseHigherPrecision to
+    // compare layer vs scope precision.
+    private static int PrecisionRank(PrecisionMode m) => m switch
+    {
+        PrecisionMode.Float32     => 4,
+        PrecisionMode.BFloat16    => 3,
+        PrecisionMode.Float16     => 2,
+        PrecisionMode.Float8E5M2  => 1,
+        PrecisionMode.Float8E4M3  => 0,
+        _                          => 0,
+    };
+
+    /// <summary>
     /// Operations that benefit from fp16 compute (PyTorch allowlist).
     /// Norms, losses, softmax, and reductions must stay fp32 for numerical stability.
     /// </summary>
