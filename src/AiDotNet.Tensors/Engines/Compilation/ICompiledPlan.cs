@@ -38,12 +38,19 @@ public interface ICompiledPlan<T> : IDisposable
     /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
     /// <remarks>
     /// <para>
-    /// <b>Usage pattern — CUDA graph capture:</b>
+    /// <b>Usage pattern — CUDA graph capture:</b> the caller owns the output
+    /// buffer, so allocate it with a shape you already know (the graph's
+    /// output shape is fixed at trace time). If you don't have the shape
+    /// in hand, call <see cref="Execute"/> once first — its returned tensor
+    /// carries the final shape and you can allocate a matching buffer from
+    /// it for subsequent <c>ExecuteInto</c> calls.
     /// <code>
     /// var plan = cache.GetOrCompileInference(shape, trace);
-    /// var outputBuf = engine.AllocateTensor&lt;float&gt;(plan.OutputShape);
-    /// // Warm-up 2 runs outside capture (stream-sync hygiene)
-    /// plan.ExecuteInto(outputBuf);
+    /// // Derive the output shape from one warm-up Execute, or pass a
+    /// // caller-known shape directly.
+    /// var first = plan.Execute();
+    /// var outputBuf = engine.AllocateTensor&lt;float&gt;(first.Shape.ToArray());
+    /// // A second warm-up run outside capture (stream-sync hygiene)
     /// plan.ExecuteInto(outputBuf);
     /// using var scope = new CudaGraphScope(backend, streamHandle);
     /// scope.BeginCapture();
