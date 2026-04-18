@@ -20022,6 +20022,44 @@ public class CpuEngine : ITensorLevelEngine
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
 
+        // NCHWc8 fast path: channel-axis concat where every input is
+        // NCHWc8 and each C is divisible by the cBlock. Physical layout is
+        // [N, cg, H, W, 8], so concat along cg is contiguous-block memcpy
+        // per-batch — no index math per element.
+        bool nchwcChannelConcat =
+            typeof(T) == typeof(float) &&
+            axis == 1 &&
+            rank == 4 &&
+            tensors.All(t => t.Layout == LinearAlgebra.TensorLayout.Nchwc8 &&
+                             t._shape[1] % Simd.NchwcPool.CBlock == 0);
+        if (nchwcChannelConcat)
+        {
+            int cb = Simd.NchwcPool.CBlock;
+            int N = firstShape[0], H = firstShape[2], W = firstShape[3];
+            int cgOut = totalAxisSize / cb;
+            int outImageStride = cgOut * H * W * cb; // floats per batch image
+            var outF = (T[])(object)outputData;
+            int dstCgOffset = 0;
+            foreach (var t in tensors)
+            {
+                int cgIn = t._shape[1] / cb;
+                int inImageStride = cgIn * H * W * cb;
+                var srcF = (Tensor<float>)(object)t;
+                var srcData = srcF.GetDataArray();
+                int copyPerImage = cgIn * H * W * cb;
+                for (int n = 0; n < N; n++)
+                {
+                    int dstBase = n * outImageStride + dstCgOffset * H * W * cb;
+                    int srcBase = n * inImageStride;
+                    Array.Copy(srcData, srcBase, (float[])(object)outF, dstBase, copyPerImage);
+                }
+                dstCgOffset += cgIn;
+            }
+            var packedResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+            packedResult.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            return packedResult;
+        }
+
         var outputStrides = ComputeStrides(outputShape);
 
         int axisOffset = 0;
@@ -21917,6 +21955,45 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Cannot split axis of size {axisSize} into {numSplits} equal parts");
 
         int splitSize = axisSize / numSplits;
+
+        // NCHWc8 fast path: channel-axis split on a packed tensor. Slicing
+        // logical axis=1 on the raw Tensor does the wrong thing (physical
+        // layout is [N, cg, H, W, 8]), so we cut per-channel-group with
+        // direct memcpy when splitSize is a multiple of the cBlock.
+        if (typeof(T) == typeof(float)
+            && tensor.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && tensor.Rank == 4
+            && axis == 1
+            && splitSize % Simd.NchwcPool.CBlock == 0)
+        {
+            int cb = Simd.NchwcPool.CBlock;
+            int N = tensor._shape[0], H = tensor._shape[2], W = tensor._shape[3];
+            int cgTotal = axisSize / cb;
+            int cgPerSplit = splitSize / cb;
+            int inImageStride = cgTotal * H * W * cb;
+            int outImageStride = cgPerSplit * H * W * cb;
+            int copyPerImage = outImageStride;
+            var srcF = (Tensor<float>)(object)tensor;
+            var srcData = srcF.GetDataArray();
+            var packedResults = new Tensor<T>[numSplits];
+            for (int i = 0; i < numSplits; i++)
+            {
+                var splitShape = (int[])tensor._shape.Clone();
+                splitShape[1] = splitSize;
+                var dst = new Tensor<float>(splitShape) { Layout = LinearAlgebra.TensorLayout.Nchwc8 };
+                var dstData = dst.GetDataArray();
+                int srcCgStart = i * cgPerSplit;
+                for (int n = 0; n < N; n++)
+                {
+                    int srcBase = n * inImageStride + srcCgStart * H * W * cb;
+                    int dstBase = n * outImageStride;
+                    Array.Copy(srcData, srcBase, dstData, dstBase, copyPerImage);
+                }
+                packedResults[i] = (Tensor<T>)(object)dst;
+            }
+            return packedResults;
+        }
+
         var results = new Tensor<T>[numSplits];
 
         for (int i = 0; i < numSplits; i++)
