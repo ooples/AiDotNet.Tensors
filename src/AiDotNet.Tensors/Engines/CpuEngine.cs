@@ -8915,6 +8915,43 @@ public class CpuEngine : ITensorLevelEngine
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();
 
+        // NCHWc fast path: when the caller pre-reordered input + kernel into
+        // channel-packed layout (input.Layout == Nchwc8 and kernel's
+        // first-axis group is divisible by 8), route through the direct
+        // NCHWc conv kernel. Each lane broadcasts one input channel and
+        // FMAs against the matching 8-wide kernel row — this is the path
+        // ORT/oneDNN use to get close to peak FMA throughput on AVX2.
+        if (typeof(T) == typeof(float) &&
+            input.Layout == LinearAlgebra.TensorLayout.Nchwc8 &&
+            inChannels % Simd.NchwcConv2D.CBlock == 0 &&
+            outChannels % Simd.NchwcConv2D.CBlock == 0)
+        {
+            // Kernel must be in OIHWio packed form. Detect via a conservative
+            // shape check: if it's stored flat with length outC * inC * kH * kW
+            // we reorder on-the-fly. The proper ConvBn-NCHWc fusion path
+            // will pre-reorder the kernel into a constant initializer.
+            int kernelLen = outChannels * inChannels * kernelHeight * kernelWidth;
+            var packedKernel = new float[kernelLen];
+            Simd.NchwcReorder.KernelToOihwIo(
+                (float[])(object)kernelData,
+                packedKernel,
+                outChannels, inChannels, kernelHeight, kernelWidth,
+                Simd.NchwcConv2D.CBlock);
+            Simd.NchwcConv2D.Run(
+                (float[])(object)inputData,
+                packedKernel,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+            result.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            return result;
+        }
+
         // Fast path: im2col + SimdGemm for float tensors. The naive nested-
         // loop kernel below is O(batch × outC × outH × outW × inC × kH × kW)
         // of scalar multiplies — NO vectorization, NO cache blocking. Real
@@ -26563,50 +26600,50 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSigmoid<T>(Tensor<T> tensor)
     {
-        return Sigmoid(tensor);
+        var r = Sigmoid(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorReLU<T>(Tensor<T> tensor)
     {
-        return ReLU(tensor);
+        var r = ReLU(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorGELU<T>(Tensor<T> tensor)
     {
-        return GELU(tensor);
+        var r = GELU(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSiLU<T>(Tensor<T> tensor)
     {
         // SiLU (Sigmoid Linear Unit) is mathematically equivalent to Swish
-        return Swish(tensor);
+        var r = Swish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTanh<T>(Tensor<T> tensor)
     {
-        return Tanh(tensor);
+        var r = Tanh(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-        return LeakyReLU(tensor, alpha);
+        var r = LeakyReLU(tensor, alpha); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorMish<T>(Tensor<T> tensor)
     {
-        return Mish(tensor);
+        var r = Mish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHardSwish<T>(Tensor<T> tensor)
     {
-        return HardSwish(tensor);
+        var r = HardSwish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     #endregion
