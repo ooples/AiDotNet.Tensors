@@ -1781,6 +1781,40 @@ public partial class CpuEngine
         }, "TensorLgamma");
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
+    {
+        // v1: only n=0 (digamma) and n=1 (trigamma). Higher orders are a
+        // follow-up — they need the Hurwitz zeta function for full accuracy.
+        if (n == 0) return TensorDigamma(tensor);
+        if (n != 1)
+            throw new System.NotImplementedException(
+                $"Polygamma for n={n} is not yet implemented (n=0 digamma and n=1 trigamma only; refs #210 follow-up).");
+
+        return ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            // Trigamma via recurrence-up for small x, then asymptotic series.
+            // ψ'(x) = ψ'(x+1) + 1/x². Shift until x ≥ 6 so the tail series
+            // converges rapidly:
+            //   ψ'(x) ≈ 1/x + 1/(2x²) + Σ B_{2k} / x^(2k+1), k ≥ 1
+            //         = 1/x + 1/(2x²) + 1/(6x³) - 1/(30x⁵) + 1/(42x⁷) − …
+            double shift = 0.0;
+            while (xd < 6.0)
+            {
+                shift += 1.0 / (xd * xd);
+                xd += 1.0;
+            }
+            double inv = 1.0 / xd;
+            double inv2 = inv * inv;
+            double series = inv + 0.5 * inv2
+                + inv2 * inv * (1.0 / 6.0
+                  - inv2 * (1.0 / 30.0
+                    - inv2 * (1.0 / 42.0)));
+            return ops.FromDouble(shift + series);
+        }, "TensorPolygamma");
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorErfinv<T>(Tensor<T> tensor)
         => ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();

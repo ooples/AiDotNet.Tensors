@@ -6514,6 +6514,13 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorErfinv<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// Polygamma function ψ^{(n)}(x) (torch.special.polygamma). v1 supports
+    /// n=0 (alias for digamma) and n=1 (trigamma). Higher orders throw
+    /// NotImplementedException until the Hurwitz zeta path lands.
+    /// </summary>
+    Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor);
+
     /// <summary>Modified Bessel function of the first kind, order 0 (torch.special.i0).</summary>
     Tensor<T> TensorI0<T>(Tensor<T> tensor);
 

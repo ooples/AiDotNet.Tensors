@@ -97,7 +97,7 @@ internal static class OpRegistry
         "TensorErfc", "TensorXlogy", "TensorXlog1py",
         "TensorLgamma", "TensorDigamma",
         "TensorErfinv", "TensorI0", "TensorI1", "TensorI0e", "TensorI1e",
-        "TensorFrexp",
+        "TensorFrexp", "TensorPolygamma",
 
         // Parity-210 sort / order stats (non-differentiable category below
         // also lists the scalar-returning ones; the tensor-returning ones
