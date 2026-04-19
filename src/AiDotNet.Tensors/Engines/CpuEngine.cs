@@ -22127,42 +22127,34 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Parse einsum notation
-        var parts = subscripts.Replace(" ", "").Split(new[] { "->" }, StringSplitOptions.None);
-        if (parts.Length != 2)
-            throw new ArgumentException("Einsum subscripts must contain '->'");
-
-        var inputSubscripts = parts[0].Split(new[] { ',' }, StringSplitOptions.None);
-        var outputSubscripts = parts[1];
-
-        if (inputSubscripts.Length != tensors.Length)
-            throw new ArgumentException($"Expected {inputSubscripts.Length} tensors but got {tensors.Length}");
-
-        // Handle common cases directly for efficiency
+        // Fast-paths for common patterns that already have tuned kernels.
+        // Strip whitespace only for pattern-matching; the generic parser
+        // handles whitespace itself.
+        var normalized = subscripts.Replace(" ", "");
         if (tensors.Length == 2)
         {
             // Batched matrix multiplication: bij,bjk->bik
-            if (subscripts == "bij,bjk->bik")
+            if (normalized == "bij,bjk->bik")
             {
                 return BatchMatMul(tensors[0], tensors[1]);
             }
             // Matrix multiplication: ij,jk->ik
-            if (subscripts == "ij,jk->ik")
+            if (normalized == "ij,jk->ik")
             {
                 return TensorMatMul(tensors[0], tensors[1]);
             }
             // Batched outer product: bi,bj->bij
-            if (subscripts == "bi,bj->bij")
+            if (normalized == "bi,bj->bij")
             {
                 return TensorBatchOuterProduct(tensors[0], tensors[1]);
             }
             // Outer product: i,j->ij
-            if (subscripts == "i,j->ij")
+            if (normalized == "i,j->ij")
             {
                 return TensorOuterProduct(tensors[0], tensors[1]);
             }
             // Batched dot: bi,bi->b
-            if (subscripts == "bi,bi->b")
+            if (normalized == "bi,bi->b")
             {
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];
@@ -22180,8 +22172,16 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // General einsum implementation is complex - throw for unsupported patterns
-        throw new NotImplementedException($"Einsum pattern '{subscripts}' not implemented. Use specific tensor operations instead.");
+        // General path: parse -> bind shapes -> choose contraction order ->
+        // execute. The hardcoded fast-paths above still win on speed since
+        // they route to our tuned GEMM/BatchMatMul kernels; the generic path
+        // is the correctness floor for every other equation.
+        var equation = Engines.Einsum.EinsumEquation.Parse(subscripts);
+        var shapes = new int[tensors.Length][];
+        for (int i = 0; i < tensors.Length; i++) shapes[i] = tensors[i].Shape.ToArray();
+        var binding = Engines.Einsum.EinsumShapeBinding.Bind(equation, shapes);
+        var path = Engines.Einsum.EinsumPathOptimizer.Greedy(binding);
+        return Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
     }
 
     /// <inheritdoc/>
