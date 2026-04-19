@@ -3426,6 +3426,33 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// MaskedSelect backward: scatter the incoming 1-D gradient back to the
+    /// original tensor shape at mask-true positions; zero elsewhere.
+    /// </summary>
+    internal static void MaskedSelectBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mask = (Tensor<Bit>)savedState[0];
+        var inputShape = (int[])savedState[1];
+
+        var grad = new Tensor<T>(inputShape);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var dest = grad.AsWritableSpan();
+        var src = gradOutput.AsSpan();
+        var maskSpan = mask.AsSpan();
+        var zero = numOps.Zero;
+
+        int r = 0;
+        for (int i = 0; i < maskSpan.Length; i++)
+        {
+            dest[i] = (bool)maskSpan[i] ? src[r++] : zero;
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
     /// Backward for the general einsum path. For an n-operand forward
     ///     out = einsum("X_1,X_2,...,X_n -> Y", A_1, A_2, ..., A_n)
     /// the gradient w.r.t. the i-th input is

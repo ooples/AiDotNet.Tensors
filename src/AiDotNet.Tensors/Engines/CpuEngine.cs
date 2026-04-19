@@ -23636,6 +23636,40 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor._shape.SequenceEqual(mask._shape))
+            throw new ArgumentException(
+                $"MaskedSelect requires mask shape [{string.Join(", ", mask._shape)}] " +
+                $"to match tensor shape [{string.Join(", ", tensor._shape)}].");
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
+        var src = tensor.AsSpan();
+        var maskSpan = mask.AsSpan();
+        // First pass: count true entries.
+        int n = 0;
+        for (int i = 0; i < maskSpan.Length; i++) if ((bool)maskSpan[i]) n++;
+
+        var result = new Tensor<T>(new[] { n });
+        var dest = result.AsWritableSpan();
+        // Second pass: copy selected elements in order.
+        int w = 0;
+        for (int i = 0; i < maskSpan.Length; i++)
+        {
+            if ((bool)maskSpan[i]) dest[w++] = src[i];
+        }
+
+        DifferentiableOps.RecordUnary(
+            "TensorMaskedSelect", result, tensor,
+            BackwardFunctions<T>.MaskedSelectBackward,
+            savedState: new object[] { mask, tensor._shape });
+        return result;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));

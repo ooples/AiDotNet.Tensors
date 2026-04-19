@@ -75,7 +75,7 @@ internal static class OpRegistry
 
         // Scatter/Gather
         "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
-        "TensorIndexSelect", "TensorMaskedFill",
+        "TensorIndexSelect", "TensorMaskedFill", "TensorMaskedSelect",
 
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",

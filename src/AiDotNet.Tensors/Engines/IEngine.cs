@@ -6290,6 +6290,34 @@ public interface IEngine
     Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value);
 
     /// <summary>
+    /// Masked select: returns a 1D tensor containing elements of
+    /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
+    /// <see cref="Bit.True"/>. Mirrors <c>torch.masked_select</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Source tensor.</param>
+    /// <param name="mask">Bit-packed mask of the same shape as <paramref name="tensor"/>.</param>
+    /// <returns>A 1-D tensor of length <c>count(mask == Bit.True)</c>.</returns>
+    /// <remarks>
+    /// <para>
+    /// For Beginners: picks the elements of <paramref name="tensor"/> whose
+    /// corresponding <paramref name="mask"/> position is set, and lays them
+    /// out as a flat vector. Commonly used to extract the "valid" part of a
+    /// padded sequence or the non-zero entries of a sparse activation.
+    /// </para>
+    /// <para>Backward: gradient is scattered back to the original shape —
+    /// non-masked positions receive zero, masked positions receive the
+    /// incoming flat gradient.</para>
+    /// <para>
+    /// We use <see cref="Bit"/> (bit-packed) rather than <c>bool</c> so the
+    /// mask tensor costs 1 bit per position instead of a full byte — a
+    /// noticeable win on attention masks and long sequences. PyTorch stores
+    /// masks as full <c>bool</c> tensors.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
