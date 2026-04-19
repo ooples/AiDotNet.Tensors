@@ -94,6 +94,9 @@ internal static class OpRegistry
         // sit here as stubs with no backward).
         "TensorSort",
 
+        // Parity-210 indexing family (forward only in v1)
+        "TensorIndexAdd", "TensorIndexFill", "TensorMaskedScatter",
+
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
         "ComplexMagnitudeSquared",

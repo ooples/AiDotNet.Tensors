@@ -393,6 +393,136 @@ public partial class CpuEngine
     }
 
     // ==================================================================
+    // Indexing family
+    // ==================================================================
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorIndexAdd<T>(
+        Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
+        if (indices.Rank != 1) throw new ArgumentException("indices must be 1-D");
+        if (source._shape[axis] != indices._shape[0])
+            throw new ArgumentException(
+                $"source.shape[{axis}]={source._shape[axis]} must match indices.length={indices._shape[0]}");
+        for (int k = 0; k < rank; k++)
+        {
+            if (k != axis && source._shape[k] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var srcData = source.AsSpan();
+        var idxData = indices.AsSpan();
+
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int dstAxis = tensor._shape[axis];
+        int srcAxis = source._shape[axis];
+        int dstAxisStride = innerSize;
+        int srcAxisStride = innerSize;
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int dstOuter = outer * dstAxis * dstAxisStride;
+            int srcOuter = outer * srcAxis * srcAxisStride;
+            for (int i = 0; i < idxData.Length; i++)
+            {
+                int target = idxData[i];
+                if (target < 0 || target >= dstAxis)
+                    throw new IndexOutOfRangeException(
+                        $"indices[{i}]={target} out of range for axis size {dstAxis}");
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int dstPos = dstOuter + target * dstAxisStride + inner;
+                    int srcPos = srcOuter + i * srcAxisStride + inner;
+                    dst[dstPos] = ops.Add(dst[dstPos], srcData[srcPos]);
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorIndexFill<T>(
+        Tensor<T> tensor, int axis, Tensor<int> indices, T value)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
+        if (indices.Rank != 1) throw new ArgumentException("indices must be 1-D");
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var idxData = indices.AsSpan();
+
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int axisSize = tensor._shape[axis];
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int outerBase = outer * axisSize * innerSize;
+            for (int i = 0; i < idxData.Length; i++)
+            {
+                int target = idxData[i];
+                if (target < 0 || target >= axisSize)
+                    throw new IndexOutOfRangeException(
+                        $"indices[{i}]={target} out of range for axis size {axisSize}");
+                for (int inner = 0; inner < innerSize; inner++)
+                    dst[outerBase + target * innerSize + inner] = value;
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorMaskedScatter<T>(
+        Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (!tensor._shape.SequenceEqual(mask._shape))
+            throw new ArgumentException(
+                $"mask shape [{string.Join(", ", mask._shape)}] must match tensor shape [{string.Join(", ", tensor._shape)}]");
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var maskData = mask.AsSpan();
+        var srcData = source.AsSpan();
+
+        int sourceCursor = 0;
+        for (int i = 0; i < maskData.Length; i++)
+        {
+            if ((bool)maskData[i])
+            {
+                if (sourceCursor >= srcData.Length)
+                    throw new ArgumentException("source has fewer elements than mask-true count");
+                dst[i] = srcData[sourceCursor++];
+            }
+        }
+        return result;
+    }
+
+    // ==================================================================
     // Sort / order statistics
     // ==================================================================
 

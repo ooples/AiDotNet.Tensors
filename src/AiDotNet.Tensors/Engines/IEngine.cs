@@ -6428,6 +6428,27 @@ public interface IEngine
     Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max);
 
     /// <summary>
+    /// Add values from <paramref name="source"/> into <paramref name="tensor"/>
+    /// at positions specified by <paramref name="indices"/> along
+    /// <paramref name="axis"/> (torch.index_add). Duplicate indices accumulate.
+    /// </summary>
+    Tensor<T> TensorIndexAdd<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source);
+
+    /// <summary>
+    /// Fill positions at <paramref name="indices"/> along <paramref name="axis"/>
+    /// with <paramref name="value"/> (torch.index_fill).
+    /// </summary>
+    Tensor<T> TensorIndexFill<T>(Tensor<T> tensor, int axis, Tensor<int> indices, T value);
+
+    /// <summary>
+    /// Scatter elements from <paramref name="source"/> into
+    /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
+    /// <see cref="Bit.True"/>, consuming the source in row-major order
+    /// (torch.masked_scatter).
+    /// </summary>
+    Tensor<T> TensorMaskedScatter<T>(Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
