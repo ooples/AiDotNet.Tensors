@@ -6360,6 +6360,18 @@ public interface IEngine
     /// <summary>1-D vector inner product Σ a[i]·b[i] (torch.linalg.vecdot).</summary>
     T TensorVecDot<T>(Tensor<T> a, Tensor<T> b);
 
+    /// <summary>Sum of the main diagonal of a 2-D tensor (torch.trace).</summary>
+    T TensorTrace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Place the last-dim values on the diagonal of a new (rank+1) tensor
+    /// (torch.diag_embed). <paramref name="offset"/> shifts the diagonal
+    /// (positive = super-diagonal, negative = sub-diagonal). Output's last
+    /// two dims both have length <c>L + |offset|</c>, where <c>L</c> is the
+    /// input's last-dim size.
+    /// </summary>
+    Tensor<T> TensorDiagEmbed<T>(Tensor<T> tensor, int offset = 0);
+
     /// <summary>
     /// Vector cross product a × b along <paramref name="dim"/> (torch.cross /
     /// torch.linalg.cross). The named dim must have size 3.

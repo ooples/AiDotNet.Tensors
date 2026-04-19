@@ -634,6 +634,61 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual T TensorTrace<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank != 2) throw new ArgumentException("Trace requires a 2-D tensor");
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        int rows = tensor._shape[0];
+        int cols = tensor._shape[1];
+        int n = System.Math.Min(rows, cols);
+        T acc = ops.Zero;
+        for (int i = 0; i < n; i++) acc = ops.Add(acc, src[i * cols + i]);
+        return acc;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDiagEmbed<T>(Tensor<T> tensor, int offset = 0)
+    {
+        // Take a rank-R tensor whose last dim has length L, and embed it as
+        // the diagonal of a square R+1-rank tensor whose last two dims are
+        // (L + |offset|). Mirrors torch.diag_embed for offset=0.
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 1) throw new ArgumentException("DiagEmbed requires rank >= 1");
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        int rank = tensor.Rank;
+        int diagLen = tensor._shape[rank - 1];
+        int matSize = diagLen + System.Math.Abs(offset);
+
+        var outShape = new int[rank + 1];
+        for (int i = 0; i < rank - 1; i++) outShape[i] = tensor._shape[i];
+        outShape[rank - 1] = matSize;
+        outShape[rank] = matSize;
+
+        var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+        var dst = result.AsWritableSpan();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var zero = ops.Zero;
+        for (int i = 0; i < dst.Length; i++) dst[i] = zero;
+
+        var src = tensor.AsSpan();
+        int batchSize = 1; for (int k = 0; k < rank - 1; k++) batchSize *= tensor._shape[k];
+        for (int b = 0; b < batchSize; b++)
+            for (int i = 0; i < diagLen; i++)
+            {
+                int row = offset >= 0 ? i : i - offset;
+                int col = offset >= 0 ? i + offset : i;
+                int dstPos = b * matSize * matSize + row * matSize + col;
+                int srcPos = b * diagLen + i;
+                dst[dstPos] = src[srcPos];
+            }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
