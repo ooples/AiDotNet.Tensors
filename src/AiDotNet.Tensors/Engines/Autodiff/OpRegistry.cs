@@ -81,6 +81,7 @@ internal static class OpRegistry
         "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
         "TensorDot", "TensorVecDot", "TensorCross", "TensorMeshgrid",
         "TensorMultiDot", "TensorTrace", "TensorDiagEmbed", "TensorAddMM",
+        "TensorCartesianProd",
         "TensorFliplr", "TensorFlipud", "TensorRot90",
         "TensorSwapAxes", "TensorMoveDim",
         "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",

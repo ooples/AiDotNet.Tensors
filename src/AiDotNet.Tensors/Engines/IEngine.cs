@@ -6396,6 +6396,12 @@ public interface IEngine
     /// </summary>
     Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij");
 
+    /// <summary>
+    /// Cartesian product of N 1-D tensors (torch.cartesian_prod). Output
+    /// shape is [∏ lengths, N]; each row is one combination.
+    /// </summary>
+    Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors);
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 

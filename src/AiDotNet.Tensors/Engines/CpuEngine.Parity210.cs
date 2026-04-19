@@ -617,6 +617,50 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length == 0)
+            throw new ArgumentException("CartesianProd requires at least one tensor");
+        foreach (var t in tensors)
+        {
+            if (t == null) throw new ArgumentNullException(nameof(tensors));
+            if (t.Rank != 1) throw new ArgumentException("CartesianProd requires 1-D inputs");
+        }
+
+        int d = tensors.Length;
+        long totalLong = 1;
+        for (int k = 0; k < d; k++) totalLong *= tensors[k]._shape[0];
+        if (totalLong > int.MaxValue)
+            throw new OverflowException("CartesianProd output size overflows Int32");
+        int total = (int)totalLong;
+
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { total, d });
+        var dst = result.AsWritableSpan();
+
+        var sizes = new int[d];
+        for (int k = 0; k < d; k++) sizes[k] = tensors[k]._shape[0];
+
+        // Walk the multi-index row-major.
+        var idx = new int[d];
+        for (int row = 0; row < total; row++)
+        {
+            for (int k = 0; k < d; k++)
+            {
+                dst[row * d + k] = tensors[k][idx[k]];
+            }
+            // increment
+            for (int k = d - 1; k >= 0; k--)
+            {
+                idx[k]++;
+                if (idx[k] < sizes[k]) break;
+                idx[k] = 0;
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
