@@ -67,6 +67,59 @@ def _time_sort(shape_str, axis, warmup, iters):
     return times
 
 
+def _time_topk(shape_str, k, axis, warmup, iters):
+    x = torch.randn(*_parse_shape(shape_str), dtype=torch.float32)
+    for _ in range(warmup):
+        _ = torch.topk(x, k=k, dim=axis)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = torch.topk(x, k=k, dim=axis)
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)
+    return times
+
+
+def _time_index_select(shape_str, k, axis, warmup, iters):
+    x = torch.randn(*_parse_shape(shape_str), dtype=torch.float32)
+    idx = torch.randint(0, x.shape[axis], (k,), dtype=torch.int64)
+    for _ in range(warmup):
+        _ = torch.index_select(x, axis, idx)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = torch.index_select(x, axis, idx)
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)
+    return times
+
+
+def _time_special(op_name, shape_str, warmup, iters):
+    fn = {
+        'erfc': torch.special.erfc,
+        'lgamma': torch.special.gammaln,
+        'digamma': torch.special.digamma,
+        'i0': torch.special.i0,
+        'erfinv': torch.special.erfinv,
+    }[op_name]
+    # erfinv wants inputs in (-1,1); lgamma / digamma want positive.
+    if op_name == 'erfinv':
+        x = torch.rand(*_parse_shape(shape_str), dtype=torch.float32) * 1.8 - 0.9
+    elif op_name in ('lgamma', 'digamma'):
+        x = torch.rand(*_parse_shape(shape_str), dtype=torch.float32) * 9.9 + 0.1
+    else:
+        x = torch.randn(*_parse_shape(shape_str), dtype=torch.float32)
+    for _ in range(warmup):
+        _ = fn(x)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = fn(x)
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)
+    return times
+
+
 def main():
     line = sys.stdin.readline().strip()
     if not line:
@@ -87,6 +140,14 @@ def main():
     elif op == 'sort':
         shape, axis = args.split(';', 1)
         times = _time_sort(shape, int(axis), warmup, iters)
+    elif op == 'topk':
+        shape, k, axis = args.split(';', 2)
+        times = _time_topk(shape, int(k), int(axis), warmup, iters)
+    elif op == 'index_select':
+        shape, k, axis = args.split(';', 2)
+        times = _time_index_select(shape, int(k), int(axis), warmup, iters)
+    elif op in ('erfc', 'lgamma', 'digamma', 'i0', 'erfinv'):
+        times = _time_special(op, args, warmup, iters)
     else:
         sys.stderr.write(f"unsupported op: {op}\n")
         sys.exit(2)
