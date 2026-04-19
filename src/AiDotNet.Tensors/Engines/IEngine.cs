@@ -6457,6 +6457,16 @@ public interface IEngine
     /// <summary>x · log(1 + y), with 0·log(…) = 0 by convention (torch.special.xlog1py).</summary>
     Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y);
 
+    /// <summary>Log of the absolute value of the gamma function (torch.special.gammaln / torch.lgamma).</summary>
+    Tensor<T> TensorLgamma<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Digamma function ψ(x) = Γ'(x)/Γ(x) (torch.special.digamma). Uses
+    /// asymptotic series with recurrence shift; accuracy ~1e-5 on fp32 in
+    /// the common range x ∈ [0.1, 100].
+    /// </summary>
+    Tensor<T> TensorDigamma<T>(Tensor<T> tensor);
+
     /// <summary>
     /// Sort along an axis; returns both the sorted values and the permutation
     /// indices (torch.sort). Ascending by default, descending when

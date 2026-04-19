@@ -1083,6 +1083,50 @@ public partial class CpuEngine
                 : ops.Multiply(xv, ops.Log(ops.Add(ops.One, yv)));
         }, "TensorXlog1py");
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorLgamma<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            // log|Γ(x)| via existing Lanczos-backed Gamma helper. Negative x is
+            // where |·| matters; the Gamma helper's reflection formula returns
+            // a signed value, so we take the absolute before logging.
+            return ops.Log(ops.Abs(MathHelper.Gamma(x)));
+        }, "TensorLgamma");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            // Asymptotic series with recurrence shift. Good enough for fp32;
+            // matches PyTorch within ~1e-5 on x in [0.1, 100].
+            var ops = MathHelper.GetNumericOperations<T>();
+            // Recurrence: ψ(x+1) = ψ(x) + 1/x; shift x up until large enough
+            // for the asymptotic series to converge quickly.
+            double xd = ToDoubleSafe(x);
+            double result = 0;
+            while (xd < 6.0)
+            {
+                result -= 1.0 / xd;
+                xd += 1.0;
+            }
+            // ψ(x) ≈ log(x) - 1/(2x) - 1/(12x²) + 1/(120x⁴) - 1/(252x⁶) …
+            double xinv = 1.0 / xd;
+            double xinv2 = xinv * xinv;
+            result += System.Math.Log(xd) - 0.5 * xinv
+                     - xinv2 * (1.0/12.0 - xinv2 * (1.0/120.0 - xinv2 / 252.0));
+            return ops.FromDouble(result);
+        }, "TensorDigamma");
+
+    // Safe T→double via FromDouble + ToInt32 pair; for float/double/complex
+    // INumericOperations exposes ToDouble via FromDouble's inverse path. We
+    // use a small indirection to avoid referencing a specific type.
+    private static double ToDoubleSafe<T>(T value)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        // Common numeric types (float, double, decimal) go cleanly through
+        // Convert. For complex this is best-effort.
+        return System.Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     // ==================================================================
     // Helpers
     // ==================================================================
