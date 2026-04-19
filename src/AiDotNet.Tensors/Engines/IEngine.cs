@@ -6551,6 +6551,18 @@ public interface IEngine
     Tensor<T> TensorMaskedScatter<T>(Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source);
 
     /// <summary>
+    /// Scatter with a reduction at each target slot (torch.scatter_reduce).
+    /// Supported modes: sum, prod, mean, amin, amax. When
+    /// <paramref name="includeSelf"/> is false, target positions that any
+    /// index touches are first reset to the reduction identity (0 for
+    /// sum/mean, 1 for prod, ±∞ equivalents for amin/amax) before
+    /// accumulating.
+    /// </summary>
+    Tensor<T> TensorScatterReduce<T>(
+        Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source,
+        ScatterReduceMode mode, bool includeSelf = true);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

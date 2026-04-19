@@ -103,6 +103,7 @@ internal static class OpRegistry
 
         // Parity-210 indexing family (forward only in v1)
         "TensorIndexAdd", "TensorIndexFill", "TensorMaskedScatter",
+        "TensorScatterReduce",
         "TensorBroadcastTo",
         "TensorTake", "TensorTakeAlongDim",
 

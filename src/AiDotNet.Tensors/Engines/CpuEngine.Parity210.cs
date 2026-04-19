@@ -8,6 +8,25 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
+/// Reduction modes for <see cref="IEngine.TensorScatterReduce{T}"/>.
+/// Mirrors the PyTorch string arg set of <c>torch.scatter_reduce</c>:
+/// "sum", "prod", "mean", "amin", "amax".
+/// </summary>
+public enum ScatterReduceMode
+{
+    /// <summary>Sum values mapped to the same target slot.</summary>
+    Sum,
+    /// <summary>Multiply values mapped to the same target slot.</summary>
+    Prod,
+    /// <summary>Arithmetic mean over values mapped to the same target slot.</summary>
+    Mean,
+    /// <summary>Minimum over values mapped to the same target slot.</summary>
+    AMin,
+    /// <summary>Maximum over values mapped to the same target slot.</summary>
+    AMax
+}
+
+/// <summary>
 /// Parity-210 op additions — movement, cumulative, comparison, clamp,
 /// special math, element-wise binary, indexing completeness. Kept in a
 /// separate partial to avoid bloating CpuEngine.cs.
@@ -801,6 +820,130 @@ public partial class CpuEngine
                     dst[outerBase + target * innerSize + inner] = value;
             }
         }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorScatterReduce<T>(
+        Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source,
+        ScatterReduceMode mode, bool includeSelf = true)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        if (!indices._shape.SequenceEqual(source._shape))
+            throw new ArgumentException("indices and source must have the same shape");
+        if (indices.Rank != rank)
+            throw new ArgumentException("indices/source must match tensor rank");
+        for (int k = 0; k < rank; k++)
+        {
+            if (k != dim && indices._shape[k] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"indices.shape[{k}]={indices._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var srcData = source.AsSpan();
+        var idxData = indices.AsSpan();
+
+        // For mean mode, track per-target counts including (optionally) self.
+        int[]? counts = mode == ScatterReduceMode.Mean ? new int[result.Length] : null;
+        if (counts is not null && includeSelf)
+            for (int i = 0; i < counts.Length; i++) counts[i] = 1;
+
+        // If !includeSelf, wipe target positions that any index touches so
+        // reduction starts from "no observations yet" at those slots.
+        bool[]? touched = !includeSelf ? new bool[result.Length] : null;
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int dstAxis = tensor._shape[dim];
+        int srcAxis = source._shape[dim];
+
+        // First pass: when !includeSelf, reset touched positions to identity.
+        if (!includeSelf)
+        {
+            T identity = mode switch
+            {
+                ScatterReduceMode.Sum or ScatterReduceMode.Mean => ops.Zero,
+                ScatterReduceMode.Prod => ops.One,
+                ScatterReduceMode.AMin => ops.MaxValue,
+                ScatterReduceMode.AMax => ops.MinValue,
+                _ => ops.Zero
+            };
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                int outerBase = outer * dstAxis * innerSize;
+                for (int i = 0; i < srcAxis; i++)
+                {
+                    int baseIdx = outer * srcAxis * innerSize + i * innerSize;
+                    for (int inner = 0; inner < innerSize; inner++)
+                    {
+                        int target = idxData[baseIdx + inner];
+                        if (target < 0 || target >= dstAxis) continue;
+                        int dstPos = outerBase + target * innerSize + inner;
+                        if (!touched![dstPos])
+                        {
+                            dst[dstPos] = identity;
+                            touched[dstPos] = true;
+                            if (counts is not null) counts[dstPos] = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Main pass: apply reduction.
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int outerBase = outer * dstAxis * innerSize;
+            for (int i = 0; i < srcAxis; i++)
+            {
+                int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int target = idxData[srcBase + inner];
+                    if (target < 0 || target >= dstAxis)
+                        throw new IndexOutOfRangeException(
+                            $"indices out of range at linear {srcBase + inner}");
+                    int dstPos = outerBase + target * innerSize + inner;
+                    T s = srcData[srcBase + inner];
+                    switch (mode)
+                    {
+                        case ScatterReduceMode.Sum:
+                        case ScatterReduceMode.Mean:
+                            dst[dstPos] = ops.Add(dst[dstPos], s);
+                            if (counts is not null) counts[dstPos]++;
+                            break;
+                        case ScatterReduceMode.Prod:
+                            dst[dstPos] = ops.Multiply(dst[dstPos], s);
+                            break;
+                        case ScatterReduceMode.AMin:
+                            if (ops.LessThan(s, dst[dstPos])) dst[dstPos] = s;
+                            break;
+                        case ScatterReduceMode.AMax:
+                            if (ops.GreaterThan(s, dst[dstPos])) dst[dstPos] = s;
+                            break;
+                    }
+                }
+            }
+        }
+
+        if (mode == ScatterReduceMode.Mean && counts is not null)
+        {
+            for (int i = 0; i < dst.Length; i++)
+                if (counts[i] > 0)
+                    dst[i] = ops.Divide(dst[i], ops.FromDouble(counts[i]));
+        }
+
         return result;
     }
 
