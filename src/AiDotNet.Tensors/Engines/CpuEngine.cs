@@ -9317,7 +9317,17 @@ public class CpuEngine : ITensorLevelEngine
                 // im2col: for each output position (oh, ow) and each kernel
                 // cell (ic, kh, kw), write input[b, ic, ih, iw] (or 0 on
                 // padding) to col[(ic*kH*kW + kh*kW + kw), oh*oW + ow].
-                for (int ic = 0; ic < inC; ic++)
+                //
+                // The outer ic loop is embarrassingly parallel — different
+                // input channels write to disjoint col rows. For ResNet
+                // stage1 (inC=64, col buffer 7.2 MB) the serial im2col was
+                // ~3 ms = 2.4 GB/s, ~10× below RAM peak on a 16-core box.
+                // Parallelising the ic loop distributes the memory-bound
+                // copy across cores. Gate at inC × K × N ≥ 1 M to avoid
+                // paying task-pool dispatch on small shapes (stage3/stage4
+                // im2col is already sub-millisecond).
+                long im2colOps = (long)inC * kH * kW * oH * oW;
+                void CopyChannel(int ic)
                 {
                     for (int kh = 0; kh < kH; kh++)
                     {
@@ -9346,6 +9356,16 @@ public class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
+
+                if (im2colOps >= 1_000_000L)
+                {
+                    Parallel.For(0, inC, CopyChannel);
+                }
+                else
+                {
+                    for (int ic = 0; ic < inC; ic++) CopyChannel(ic);
+                }
+
                 // Output slice for this image: [outC, oH*oW] starting at
                 // (b * outC * N) in the packed NCHW output.
                 int outOff = b * outC * N;
