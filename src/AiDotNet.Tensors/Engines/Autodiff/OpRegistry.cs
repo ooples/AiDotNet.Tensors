@@ -152,7 +152,7 @@ internal static class OpRegistry
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
         "TensorIsClose", "TensorAllClose", "TensorIsIn", "TensorAminmax",
-        "TensorIsFinite", "TensorIsNan", "TensorIsInf",
+        "TensorIsFinite", "TensorIsNan", "TensorIsInf", "TensorNanToNum",
         "TensorLogicalAnd", "TensorLogicalOr", "TensorLogicalXor", "TensorLogicalNot",
         "TensorTriu", "TensorTril", "TensorNonzero", "TensorCountNonzero",
         "TensorKthvalue", "TensorMedian", "TensorNanMedian", "TensorMode",

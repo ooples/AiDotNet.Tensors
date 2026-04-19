@@ -1185,6 +1185,36 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorNanToNum<T>(
+        Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+        var dst = result.AsWritableSpan();
+
+        double defaultNan = nan ?? 0.0;
+        // PyTorch defaults posinf / neginf to the max/min finite of the dtype
+        // when not supplied. We use float.MaxValue / -float.MaxValue which is
+        // finite both in fp32 and fp64 (and saturates cleanly for narrower
+        // types via FromDouble).
+        double defaultPosInf = posinf ?? (double)float.MaxValue;
+        double defaultNegInf = neginf ?? -(double)float.MaxValue;
+
+        for (int i = 0; i < src.Length; i++)
+        {
+            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
+            if (double.IsNaN(d)) dst[i] = ops.FromDouble(defaultNan);
+            else if (double.IsPositiveInfinity(d)) dst[i] = ops.FromDouble(defaultPosInf);
+            else if (double.IsNegativeInfinity(d)) dst[i] = ops.FromDouble(defaultNegInf);
+            else dst[i] = src[i];
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

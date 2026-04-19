@@ -6508,6 +6508,14 @@ public interface IEngine
     /// <summary>Element-wise test for finite values — neither NaN nor ±∞ (torch.isfinite).</summary>
     Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// Replace NaN / +∞ / −∞ with finite substitutes (torch.nan_to_num).
+    /// Null parameters fall back to the PyTorch defaults: NaN → 0,
+    /// +∞ → dtype-max, −∞ → dtype-min (approximated here via double extremes
+    /// then saturated by the numeric ops).
+    /// </summary>
+    Tensor<T> TensorNanToNum<T>(Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null);
+
     /// <summary>Element-wise NaN test (torch.isnan).</summary>
     Tensor<Bit> TensorIsNan<T>(Tensor<T> tensor);
 
