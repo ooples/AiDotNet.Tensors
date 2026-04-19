@@ -1799,6 +1799,18 @@ public partial class CpuEngine
                     $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
         }
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = axis; var ci = indices; var cs = source;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorIndexAdd", tensor, source, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorIndexAdd(ct, ca, ci, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.IndexAddBackward, new object[] { ca, ci });
+            }
+        }
+
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
@@ -1911,6 +1923,18 @@ public partial class CpuEngine
             if (k != axis && source._shape[k] != tensor._shape[k])
                 throw new ArgumentException(
                     $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = axis; var ci = indices; var cs = source;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorIndexCopy", tensor, source, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorIndexCopy(ct, ca, ci, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.IndexCopyBackward, new object[] { ca, ci });
+            }
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -2269,6 +2293,18 @@ public partial class CpuEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException(
                 $"mask shape [{string.Join(", ", mask._shape)}] must match tensor shape [{string.Join(", ", tensor._shape)}]");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var cm = mask; var cs = source;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorMaskedScatter", tensor, source, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorMaskedScatter(ct, cm, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MaskedScatterBackward, new object[] { cm });
+            }
+        }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
