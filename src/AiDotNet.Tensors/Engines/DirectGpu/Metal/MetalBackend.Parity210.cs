@@ -320,4 +320,163 @@ public sealed partial class MetalBackend : IParity210Backend
         encoder.SetBytes(d, 5);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
+
+    // -----------------------------------------------------------------------
+    // Indexing (take / index_add / index_copy / index_fill / masked_scatter)
+    // Uses Metal's atomic_float for index_add; requires MSL 2.4+.
+    // -----------------------------------------------------------------------
+
+    public void Parity210TakeLinear(
+        IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
+        int outSize, int inputLinearLen)
+    {
+        ThrowIfDisposed();
+        RequireMetal3(input, indicesInt32, output, out var inBuf, out var idxBuf, out var oBuf);
+        var pipeline = GetParity210Pipeline("parity210_take_linear");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(outSize);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        encoder.SetBuffer(idxBuf, 1);
+        encoder.SetBuffer(oBuf, 2);
+        encoder.SetBytes(outSize, 3);
+        encoder.SetBytes(inputLinearLen, 4);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void Parity210TakeAlongDim(
+        IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
+        int outerSize, int idxAxis, int innerSize, int srcAxis)
+    {
+        ThrowIfDisposed();
+        RequireMetal3(input, indicesInt32, output, out var inBuf, out var idxBuf, out var oBuf);
+        int total = outerSize * idxAxis * innerSize;
+        var pipeline = GetParity210Pipeline("parity210_take_along_dim");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        encoder.SetBuffer(idxBuf, 1);
+        encoder.SetBuffer(oBuf, 2);
+        encoder.SetBytes(outerSize, 3);
+        encoder.SetBytes(idxAxis, 4);
+        encoder.SetBytes(innerSize, 5);
+        encoder.SetBytes(srcAxis, 6);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void Parity210IndexAdd(
+        IGpuBuffer output, IGpuBuffer indicesInt32, IGpuBuffer source,
+        int outerSize, int dstAxis, int innerSize, int idxLen)
+    {
+        ThrowIfDisposed();
+        RequireMetal3(output, indicesInt32, source, out var oBuf, out var idxBuf, out var sBuf);
+        int total = outerSize * idxLen * innerSize;
+        var pipeline = GetParity210Pipeline("parity210_index_add");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(oBuf, 0);
+        encoder.SetBuffer(idxBuf, 1);
+        encoder.SetBuffer(sBuf, 2);
+        encoder.SetBytes(outerSize, 3);
+        encoder.SetBytes(dstAxis, 4);
+        encoder.SetBytes(innerSize, 5);
+        encoder.SetBytes(idxLen, 6);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void Parity210IndexCopy(
+        IGpuBuffer output, IGpuBuffer indicesInt32, IGpuBuffer source,
+        int outerSize, int dstAxis, int innerSize, int idxLen)
+    {
+        ThrowIfDisposed();
+        RequireMetal3(output, indicesInt32, source, out var oBuf, out var idxBuf, out var sBuf);
+        int total = outerSize * idxLen * innerSize;
+        var pipeline = GetParity210Pipeline("parity210_index_copy");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(oBuf, 0);
+        encoder.SetBuffer(idxBuf, 1);
+        encoder.SetBuffer(sBuf, 2);
+        encoder.SetBytes(outerSize, 3);
+        encoder.SetBytes(dstAxis, 4);
+        encoder.SetBytes(innerSize, 5);
+        encoder.SetBytes(idxLen, 6);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void Parity210IndexFill(
+        IGpuBuffer output, IGpuBuffer indicesInt32, float fillValue,
+        int outerSize, int dstAxis, int innerSize, int idxLen)
+    {
+        ThrowIfDisposed();
+        RequireMetalPair(output, indicesInt32, out var oBuf, out var idxBuf);
+        int total = outerSize * idxLen * innerSize;
+        var pipeline = GetParity210Pipeline("parity210_index_fill");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(oBuf, 0);
+        encoder.SetBuffer(idxBuf, 1);
+        encoder.SetBytes(fillValue, 2);
+        encoder.SetBytes(outerSize, 3);
+        encoder.SetBytes(dstAxis, 4);
+        encoder.SetBytes(innerSize, 5);
+        encoder.SetBytes(idxLen, 6);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void Parity210MaskedScatter(
+        IGpuBuffer output, IGpuBuffer maskInt8, IGpuBuffer prefixSumInt32,
+        IGpuBuffer source, int total)
+    {
+        ThrowIfDisposed();
+        if (output is not MetalGpuBuffer oBuf || maskInt8 is not MetalGpuBuffer mBuf
+            || prefixSumInt32 is not MetalGpuBuffer pBuf || source is not MetalGpuBuffer sBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetParity210Pipeline("parity210_masked_scatter");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(oBuf, 0);
+        encoder.SetBuffer(mBuf, 1);
+        encoder.SetBuffer(pBuf, 2);
+        encoder.SetBuffer(sBuf, 3);
+        encoder.SetBytes(total, 4);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    // -----------------------------------------------------------------------
+    // Clamp tensor-bounds
+    // -----------------------------------------------------------------------
+
+    public void Parity210ClampMinMax(
+        IGpuBuffer input, IGpuBuffer lo, IGpuBuffer hi, IGpuBuffer output,
+        int size, bool hasLo, bool hasHi)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer oBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetParity210Pipeline("parity210_clamp_min_max");
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        // lo / hi may be null when hasLo / hasHi are false — reuse the input
+        // buffer in that slot so the kernel has valid pointers even though
+        // the has* flag tells it to skip those reads.
+        var loBuf = (lo as MetalGpuBuffer) ?? inBuf;
+        var hiBuf = (hi as MetalGpuBuffer) ?? inBuf;
+        encoder.SetBuffer(loBuf, 1);
+        encoder.SetBuffer(hiBuf, 2);
+        encoder.SetBuffer(oBuf, 3);
+        encoder.SetBytes(size, 4);
+        encoder.SetBytes(hasLo ? 1 : 0, 5);
+        encoder.SetBytes(hasHi ? 1 : 0, 6);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
 }

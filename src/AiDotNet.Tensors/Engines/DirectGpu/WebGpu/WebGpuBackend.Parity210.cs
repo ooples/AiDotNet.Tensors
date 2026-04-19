@@ -272,5 +272,79 @@ public sealed partial class WebGpuBackend
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
+
+    // -----------------------------------------------------------------------
+    // Indexing: Take / IndexCopy / IndexFill. IndexAdd + MaskedScatter are
+    // intentionally skipped — core WebGPU has no atomic<f32>, and the
+    // prefix-sum write pattern for MaskedScatter would need a separate
+    // preprocessing pass plus storage-buffer aliasing that's still spec-
+    // gated. See Parity210Kernels.cs skip-with-reason convention.
+    // -----------------------------------------------------------------------
+
+    public async Task Parity210TakeLinearAsync(
+        IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
+        int outSize, int inputLinearLen)
+    {
+        var pipelineId = await GetOrCreatePipelineAsync(
+            Parity210ModuleKey + ":TakeLinear", WebGpuParity210Kernels.TakeLinear, "main");
+        using var uniforms = new WebGpuBuffer(UniformInts(outSize, inputLinearLen),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(input), AsWgpu(indicesInt32), AsWgpu(output));
+        var (wg, _) = _device.CalculateWorkgroups1D(outSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task Parity210TakeAlongDimAsync(
+        IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
+        int outerSize, int idxAxis, int innerSize, int srcAxis)
+    {
+        int total = outerSize * idxAxis * innerSize;
+        var pipelineId = await GetOrCreatePipelineAsync(
+            Parity210ModuleKey + ":TakeAlongDim", WebGpuParity210Kernels.TakeAlongDim, "main");
+        using var uniforms = new WebGpuBuffer(UniformInts(outerSize, idxAxis, innerSize, srcAxis),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(input), AsWgpu(indicesInt32), AsWgpu(output));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task Parity210IndexCopyAsync(
+        IGpuBuffer output, IGpuBuffer indicesInt32, IGpuBuffer source,
+        int outerSize, int dstAxis, int innerSize, int idxLen)
+    {
+        int total = outerSize * idxLen * innerSize;
+        var pipelineId = await GetOrCreatePipelineAsync(
+            Parity210ModuleKey + ":IndexCopy", WebGpuParity210Kernels.IndexCopy, "main");
+        using var uniforms = new WebGpuBuffer(UniformInts(outerSize, dstAxis, innerSize, idxLen),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(output), AsWgpu(indicesInt32), AsWgpu(source));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task Parity210IndexFillAsync(
+        IGpuBuffer output, IGpuBuffer indicesInt32, float fillValue,
+        int outerSize, int dstAxis, int innerSize, int idxLen)
+    {
+        int total = outerSize * idxLen * innerSize;
+        var pipelineId = await GetOrCreatePipelineAsync(
+            Parity210ModuleKey + ":IndexFill", WebGpuParity210Kernels.IndexFill, "main");
+        // Uniform struct: { outerSize: i32, dstAxis: i32, innerSize: i32, idxLen: i32, fillValue: f32 }
+        // Pad to 8-element block for the 16-byte vector alignment std140 expects.
+        var padded = new float[8];
+        padded[0] = System.BitConverter.Int32BitsToSingle(outerSize);
+        padded[1] = System.BitConverter.Int32BitsToSingle(dstAxis);
+        padded[2] = System.BitConverter.Int32BitsToSingle(innerSize);
+        padded[3] = System.BitConverter.Int32BitsToSingle(idxLen);
+        padded[4] = fillValue;
+        using var uniforms = new WebGpuBuffer(padded, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(output), AsWgpu(indicesInt32));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
 }
 #endif
