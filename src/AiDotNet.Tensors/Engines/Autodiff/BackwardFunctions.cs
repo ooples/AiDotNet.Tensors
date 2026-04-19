@@ -3493,38 +3493,150 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
-    /// <summary>CumProd backward (not yet supported in v1).</summary>
+    /// <summary>
+    /// CumProd backward. For y_i = ∏_{j≤i} x_j, we have
+    ///   dy_i/dx_k = y_i / x_k   (for k ≤ i)  — valid only when x_k ≠ 0.
+    /// So dL/dx_k = Σ_{i≥k} dL/dy_i · (y_i / x_k).
+    /// This v1 implementation routes through a per-axis loop on CPU; it's
+    /// correct but not fast. Zero inputs produce NaN — a caveat matching
+    /// PyTorch's cumprod-backward semantics.
+    /// </summary>
     internal static void CumProdBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Deferred: backward requires careful treatment of zeros in the input.
-        // Call site catches NotImplementedException and surfaces a clear error.
-        throw new NotImplementedException("CumProd backward is not yet implemented (refs #210 follow-up).");
+        int axis = (int)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var y = output.AsSpan();
+        var dY = gradOutput.AsSpan();
+        var dX = grad.AsWritableSpan();
+
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        int axisLen = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+                for (int k = 0; k < axisLen; k++)
+                {
+                    int xPos = outer * axisLen * innerSize + k * innerSize + inner;
+                    T acc = ops.Zero;
+                    for (int i = k; i < axisLen; i++)
+                    {
+                        int yPos = outer * axisLen * innerSize + i * innerSize + inner;
+                        acc = ops.Add(acc, ops.Multiply(dY[yPos], ops.Divide(y[yPos], src[xPos])));
+                    }
+                    dX[xPos] = acc;
+                }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
-    /// <summary>CumMax backward: gradient flows to argmax of the running max.</summary>
+    /// <summary>
+    /// CumMax backward: gradient flows to the position that *set* the running
+    /// max at each output index. When the same argmax wins multiple steps,
+    /// the contributions accumulate on that input position.
+    /// </summary>
     internal static void CumMaxBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
-    {
-        throw new NotImplementedException("CumMax backward is not yet implemented (refs #210 follow-up).");
-    }
+        => CumExtremaBackward(gradOutput, inputs, output, savedState, engine, grads, isMax: true);
 
-    /// <summary>CumMin backward: symmetric to CumMax.</summary>
+    /// <summary>CumMin backward: symmetric to CumMax (argmin).</summary>
     internal static void CumMinBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+        => CumExtremaBackward(gradOutput, inputs, output, savedState, engine, grads, isMax: false);
+
+    private static void CumExtremaBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads,
+        bool isMax)
     {
-        throw new NotImplementedException("CumMin backward is not yet implemented (refs #210 follow-up).");
+        int axis = (int)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var dY = gradOutput.AsSpan();
+        var dX = grad.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < dX.Length; i++) dX[i] = zero;
+
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        int axisLen = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                int argExt = 0;
+                T currExt = src[outer * axisLen * innerSize + inner];
+                for (int i = 0; i < axisLen; i++)
+                {
+                    int pos = outer * axisLen * innerSize + i * innerSize + inner;
+                    var v = src[pos];
+                    bool updates = isMax ? ops.GreaterThan(v, currExt) : ops.LessThan(v, currExt);
+                    if (i == 0 || updates)
+                    {
+                        currExt = v;
+                        argExt = i;
+                    }
+                    int argPos = outer * axisLen * innerSize + argExt * innerSize + inner;
+                    dX[argPos] = ops.Add(dX[argPos], dY[pos]);
+                }
+            }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
-    /// <summary>LogCumSumExp backward.</summary>
+    /// <summary>
+    /// LogCumSumExp backward. Using softmax relationship:
+    ///   y_i = log Σ_{j≤i} exp(x_j)
+    ///   dy_i/dx_k = exp(x_k - y_i)   for k ≤ i.
+    /// So dL/dx_k = Σ_{i≥k} dL/dy_i · exp(x_k - y_i).
+    /// </summary>
     internal static void LogCumSumExpBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        throw new NotImplementedException("LogCumSumExp backward is not yet implemented (refs #210 follow-up).");
+        int axis = (int)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var y = output.AsSpan();
+        var dY = gradOutput.AsSpan();
+        var dX = grad.AsWritableSpan();
+
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        int axisLen = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+                for (int k = 0; k < axisLen; k++)
+                {
+                    int xPos = outer * axisLen * innerSize + k * innerSize + inner;
+                    T acc = ops.Zero;
+                    for (int i = k; i < axisLen; i++)
+                    {
+                        int yPos = outer * axisLen * innerSize + i * innerSize + inner;
+                        acc = ops.Add(acc, ops.Multiply(dY[yPos], ops.Exp(ops.Subtract(src[xPos], y[yPos]))));
+                    }
+                    dX[xPos] = acc;
+                }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
     /// <summary>ClampMin backward: gradient passes only where x &gt;= min.</summary>
