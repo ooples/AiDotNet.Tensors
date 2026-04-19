@@ -6543,6 +6543,17 @@ public interface IEngine
     Tensor<T> TensorIndexFill<T>(Tensor<T> tensor, int axis, Tensor<int> indices, T value);
 
     /// <summary>
+    /// Copy slices from <paramref name="source"/> into <paramref name="tensor"/>
+    /// at positions specified by <paramref name="indices"/> along
+    /// <paramref name="axis"/> (torch.index_copy). Overwrites instead of
+    /// accumulates — duplicate indices keep the last written value.
+    /// </summary>
+    Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source);
+
+    /// <summary>Broadcast <paramref name="tensor"/> to the shape of <paramref name="other"/> (torch.expand_as).</summary>
+    Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other);
+
+    /// <summary>
     /// Scatter elements from <paramref name="source"/> into
     /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
     /// <see cref="Bit.True"/>, consuming the source in row-major order

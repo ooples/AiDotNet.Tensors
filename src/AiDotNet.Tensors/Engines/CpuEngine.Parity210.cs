@@ -788,6 +788,69 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorIndexCopy<T>(
+        Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
+        if (indices.Rank != 1) throw new ArgumentException("indices must be 1-D");
+        if (source._shape[axis] != indices._shape[0])
+            throw new ArgumentException(
+                $"source.shape[{axis}]={source._shape[axis]} must match indices.length={indices._shape[0]}");
+        for (int k = 0; k < rank; k++)
+        {
+            if (k != axis && source._shape[k] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var srcData = source.AsSpan();
+        var idxData = indices.AsSpan();
+
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int dstAxis = tensor._shape[axis];
+        int srcAxis = source._shape[axis];
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int dstOuter = outer * dstAxis * innerSize;
+            int srcOuter = outer * srcAxis * innerSize;
+            for (int i = 0; i < idxData.Length; i++)
+            {
+                int target = idxData[i];
+                if (target < 0 || target >= dstAxis)
+                    throw new IndexOutOfRangeException(
+                        $"indices[{i}]={target} out of range for axis size {dstAxis}");
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int dstPos = dstOuter + target * innerSize + inner;
+                    int srcPos = srcOuter + i * innerSize + inner;
+                    dst[dstPos] = srcData[srcPos];
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (other == null) throw new ArgumentNullException(nameof(other));
+        return TensorBroadcastTo(tensor, other._shape);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorIndexFill<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {

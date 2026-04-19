@@ -102,9 +102,9 @@ internal static class OpRegistry
         "TensorSort",
 
         // Parity-210 indexing family (forward only in v1)
-        "TensorIndexAdd", "TensorIndexFill", "TensorMaskedScatter",
-        "TensorScatterReduce",
-        "TensorBroadcastTo",
+        "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy",
+        "TensorMaskedScatter", "TensorScatterReduce",
+        "TensorBroadcastTo", "TensorExpandAs",
         "TensorTake", "TensorTakeAlongDim",
 
         // Complex
