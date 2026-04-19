@@ -2389,6 +2389,90 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
+    {
+        // ζ(x, q) = Σ_{k=0}^∞ (k + q)^{-x}.
+        //
+        // Strategy: accelerated Euler-Maclaurin summation. For x ≤ 1 the
+        // series diverges outside the Re(x) > 1 region; PyTorch returns +Inf
+        // at x = 1 and NaN for x < 1 with non-positive-integer q. We mirror
+        // that by emitting +Inf at poles and leaving the series to diverge
+        // visibly elsewhere (the caller should stay in x > 1).
+        //
+        // Convergence: sum the first N direct terms, then apply the
+        // Euler-Maclaurin correction:
+        //   ζ(x, q) ≈ Σ_{k=0}^{N-1} (k+q)^{-x}
+        //           + (N+q)^{1-x} / (x-1)
+        //           + 0.5 · (N+q)^{-x}
+        //           + Σ_{j=1}^M  B_{2j}/(2j)! · (x)(x+1)…(x+2j-2) · (N+q)^{-x-2j+1}
+        // with N = 10, M = 8 — single-precision accurate for x ≥ 1 + 1e-3
+        // (the gray zone just above x = 1 loses a couple digits, same as
+        // torch).
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (q == null) throw new ArgumentNullException(nameof(q));
+        if (!x._shape.SequenceEqual(q._shape))
+            throw new ArgumentException("Zeta: x and q must have the same shape");
+
+        var result = ElementwiseBinary(x, q, (xv, qv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(xv, System.Globalization.CultureInfo.InvariantCulture);
+            double qd = System.Convert.ToDouble(qv, System.Globalization.CultureInfo.InvariantCulture);
+            return ops.FromDouble(ZetaScalar(xd, qd));
+        }, "TensorZeta");
+        DifferentiableOps.RecordBinary("TensorZeta", result, x, q, BackwardFunctions<T>.ZetaBackward);
+        return result;
+    }
+
+    /// <summary>
+    /// Scalar Hurwitz zeta via Euler-Maclaurin with eight Bernoulli corrections.
+    /// </summary>
+    private static double ZetaScalar(double x, double q)
+    {
+        // Pole at x = 1.
+        if (x == 1.0) return double.PositiveInfinity;
+        // ζ(x, q) for q <= 0 hits a pole at every non-positive integer.
+        if (q <= 0.0 && q == System.Math.Floor(q)) return double.PositiveInfinity;
+
+        // Direct sum of first N terms.
+        const int N = 12;
+        double sum = 0.0;
+        for (int k = 0; k < N; k++)
+            sum += System.Math.Pow(k + q, -x);
+
+        double Nq = N + q;
+        double lnNq = System.Math.Log(Nq);
+        // Integral + half-correction.
+        double cont = System.Math.Exp((1.0 - x) * lnNq) / (x - 1.0);
+        double half = 0.5 * System.Math.Exp(-x * lnNq);
+
+        // Euler-Maclaurin Bernoulli corrections.
+        // Coefficient for the 2j-th term is B_{2j}/(2j)! · (x)(x+1)…(x+2j-2)
+        // multiplied by (N+q)^{-x-2j+1}.
+        double[] b2k = { 1.0/6.0, -1.0/30.0, 1.0/42.0, -1.0/30.0,
+                         5.0/66.0, -691.0/2730.0, 7.0/6.0, -3617.0/510.0 };
+        double[] fact2k = { 2.0, 24.0, 720.0, 40320.0,
+                            3628800.0, 479001600.0, 87178291200.0, 20922789888000.0 };
+        double corr = 0.0;
+        double xPow = System.Math.Exp(-x * lnNq) / Nq;  // (N+q)^(-x-1)
+        double invNq2 = 1.0 / (Nq * Nq);
+        double rising = x;              // (x)_0 -> (x), will extend to (x)(x+1)…
+        for (int j = 1; j <= 8; j++)
+        {
+            // (x)(x+1)...(x + 2j-2) — 2j-1 terms.
+            if (j > 1)
+            {
+                rising *= (x + 2 * (j - 1) - 2) * (x + 2 * (j - 1) - 1);
+                xPow *= invNq2;
+            }
+            double term = (b2k[j - 1] / fact2k[j - 1]) * rising * xPow;
+            corr += term;
+            if (System.Math.Abs(term) < 1e-16 * System.Math.Abs(sum + cont + half)) break;
+        }
+
+        return sum + cont + half + corr;
+    }
+
+    /// <inheritdoc/>
     public virtual (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));

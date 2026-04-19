@@ -6710,6 +6710,13 @@ public interface IEngine
     Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
+    /// Hurwitz zeta function ζ(x, q) = Σ_{k=0}^∞ 1 / (k + q)^x.
+    /// When q is omitted (passed as 1), this reduces to the Riemann zeta.
+    /// Matches <c>torch.special.zeta(x, q)</c>.
+    /// </summary>
+    Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).

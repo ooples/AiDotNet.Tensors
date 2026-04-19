@@ -4551,6 +4551,30 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Hurwitz zeta backward.  ∂ζ(x, q)/∂q = -x · ζ(x+1, q).  The ∂/∂x
+    /// branch requires a derivative w.r.t. the zeta function's first
+    /// argument which doesn't have a closed form; PyTorch marks it
+    /// non-differentiable in x as well, so we route the x-gradient to zero.
+    /// </summary>
+    internal static void ZetaBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var x = inputs[0];
+        var q = inputs[1];
+        // dL/dq = gradOutput · (-x · ζ(x+1, q))
+        var ops = MathHelper.GetNumericOperations<T>();
+        var xPlusOne = engine.TensorAddScalar(x, ops.One);
+        var zetaXp1 = engine.TensorZeta(xPlusOne, q);
+        var mx = engine.TensorNegate(x);
+        var factor = engine.TensorMultiply(mx, zetaXp1);
+        var gradQ = engine.TensorMultiply(gradOutput, factor);
+        DifferentiableOps.AccumulateGrad(grads, q, gradQ, engine);
+        // dL/dx is marked non-differentiable (PyTorch raises at runtime); we
+        // contribute zero to keep chained graphs numerically stable.
+    }
+
+    /// <summary>
     /// Polygamma backward: d/dx polygamma(n, x) = polygamma(n+1, x).
     /// savedState[0] = n (int).
     /// </summary>
