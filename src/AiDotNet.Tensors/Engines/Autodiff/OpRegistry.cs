@@ -213,6 +213,14 @@ internal static class OpRegistry
 
         // Rounding (non-differentiable, STE would need explicit annotation)
         "TensorFloor", "TensorCeiling", "TensorRound",
+
+        // Layout reorders (pure data movement, not a differentiable op —
+        // any gradient propagates through the inverse layout reorder)
+        "ReorderToNchwc", "ReorderToNchw",
+
+        // Inference-only BatchNorm (training-mode BatchNorm uses the
+        // separate BatchNormBackward path above)
+        "BatchNormInference",
     };
 
     /// <summary>
