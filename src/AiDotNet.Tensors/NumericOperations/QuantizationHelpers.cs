@@ -262,4 +262,320 @@ public static class QuantizationHelpers
             dst[i] = src[byteIdx].GetLane(laneIdx) * scale.Scales[g];
         }
     }
+
+    // ──────────── Int2 symmetric per-group ────────────
+
+    /// <summary>
+    /// Quantize to 2-bit with per-group symmetric scaling. Step magnitude
+    /// cap is 1 (range [-2, 1] on the dequant side); groupSize default 16
+    /// matches GGUF Q2_K sub-block size.
+    /// </summary>
+    public static QuantizationScale QuantizeInt2(
+        ReadOnlySpan<float> src,
+        Span<PackedInt2> dst,
+        int groupSize = 16)
+    {
+        if (groupSize <= 0 || groupSize % PackedInt2.ValuesPerByte != 0)
+            throw new ArgumentException(
+                $"groupSize must be positive and a multiple of {PackedInt2.ValuesPerByte}.",
+                nameof(groupSize));
+        int expectedDst = (src.Length + PackedInt2.ValuesPerByte - 1) / PackedInt2.ValuesPerByte;
+        if (dst.Length < expectedDst)
+            throw new ArgumentException(
+                $"dst must hold at least {expectedDst} packed bytes.", nameof(dst));
+
+        int groups = (src.Length + groupSize - 1) / groupSize;
+        var scales = new float[groups];
+        // Map absmax to 1 (Int2.MaxValue) so abs values saturate to ±1 × scale;
+        // int2 -2 gives slight asymmetric headroom for negatives, tolerated.
+        for (int g = 0; g < groups; g++)
+        {
+            int start = g * groupSize;
+            int end = Math.Min(start + groupSize, src.Length);
+            float absMax = 0f;
+            for (int i = start; i < end; i++)
+                absMax = Math.Max(absMax, Math.Abs(src[i]));
+            scales[g] = absMax == 0f ? 1f : absMax;
+        }
+
+        // Pack — 4 int2 values per byte.
+        Span<int> quads = stackalloc int[PackedInt2.ValuesPerByte];
+        for (int b = 0; b < expectedDst; b++)
+        {
+            quads.Clear();
+            for (int lane = 0; lane < PackedInt2.ValuesPerByte; lane++)
+            {
+                int idx = b * PackedInt2.ValuesPerByte + lane;
+                if (idx >= src.Length) break;
+                int g = idx / groupSize;
+                float invScale = scales[g] == 0f ? 0f : 1f / scales[g];
+                int q = (int)Math.Round(src[idx] * invScale);
+                if (q < PackedInt2.MinValue) q = PackedInt2.MinValue;
+                if (q > PackedInt2.MaxValue) q = PackedInt2.MaxValue;
+                quads[lane] = q;
+            }
+            dst[b] = PackedInt2.FromInts(quads[0], quads[1], quads[2], quads[3]);
+        }
+
+        return new QuantizationScale(scales, groupSize);
+    }
+
+    /// <summary>Inverse of <see cref="QuantizeInt2"/>.</summary>
+    public static void DequantizeInt2(
+        ReadOnlySpan<PackedInt2> src, QuantizationScale scale, Span<float> dst)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        int gs = scale.GroupSize;
+        for (int i = 0; i < dst.Length; i++)
+        {
+            int byteIdx = i / PackedInt2.ValuesPerByte;
+            int laneIdx = i % PackedInt2.ValuesPerByte;
+            int g = i / gs;
+            dst[i] = src[byteIdx].GetLane(laneIdx) * scale.Scales[g];
+        }
+    }
+
+    // ──────────── Int3 symmetric per-group ────────────
+
+    /// <summary>
+    /// Quantize to 3-bit per-group. Output is a 3-byte block for every
+    /// 8 consecutive values (<see cref="PackedInt3Block"/>). Group size
+    /// must be a multiple of 8.
+    /// </summary>
+    public static QuantizationScale QuantizeInt3(
+        ReadOnlySpan<float> src,
+        Span<PackedInt3Block> dst,
+        int groupSize = 32)
+    {
+        if (groupSize <= 0 || groupSize % PackedInt3Block.ValuesPerBlock != 0)
+            throw new ArgumentException(
+                $"groupSize must be a positive multiple of {PackedInt3Block.ValuesPerBlock}.",
+                nameof(groupSize));
+        int expectedBlocks = (src.Length + PackedInt3Block.ValuesPerBlock - 1) / PackedInt3Block.ValuesPerBlock;
+        if (dst.Length < expectedBlocks)
+            throw new ArgumentException(
+                $"dst must hold at least {expectedBlocks} 3-byte blocks.", nameof(dst));
+
+        int groups = (src.Length + groupSize - 1) / groupSize;
+        var scales = new float[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int start = g * groupSize;
+            int end = Math.Min(start + groupSize, src.Length);
+            float absMax = 0f;
+            for (int i = start; i < end; i++)
+                absMax = Math.Max(absMax, Math.Abs(src[i]));
+            // Max positive is 3; use it to map the range.
+            scales[g] = absMax == 0f ? 1f : absMax / 3f;
+        }
+
+        Span<int> block = stackalloc int[PackedInt3Block.ValuesPerBlock];
+        for (int bl = 0; bl < expectedBlocks; bl++)
+        {
+            block.Clear();
+            for (int lane = 0; lane < PackedInt3Block.ValuesPerBlock; lane++)
+            {
+                int idx = bl * PackedInt3Block.ValuesPerBlock + lane;
+                if (idx >= src.Length) break;
+                int g = idx / groupSize;
+                float invScale = scales[g] == 0f ? 0f : 1f / scales[g];
+                int q = (int)Math.Round(src[idx] * invScale);
+                if (q < PackedInt3Block.MinValue) q = PackedInt3Block.MinValue;
+                if (q > PackedInt3Block.MaxValue) q = PackedInt3Block.MaxValue;
+                block[lane] = q;
+            }
+            dst[bl] = PackedInt3Block.FromInts(block);
+        }
+        return new QuantizationScale(scales, groupSize);
+    }
+
+    /// <summary>Inverse of <see cref="QuantizeInt3"/>.</summary>
+    public static void DequantizeInt3(
+        ReadOnlySpan<PackedInt3Block> src, QuantizationScale scale, Span<float> dst)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        int gs = scale.GroupSize;
+        for (int i = 0; i < dst.Length; i++)
+        {
+            int blockIdx = i / PackedInt3Block.ValuesPerBlock;
+            int laneIdx = i % PackedInt3Block.ValuesPerBlock;
+            int g = i / gs;
+            dst[i] = src[blockIdx].GetLane(laneIdx) * scale.Scales[g];
+        }
+    }
+
+    // ──────────── NF4 (QLoRA NormalFloat-4) ────────────
+
+    /// <summary>
+    /// Quantize to NF4 (non-uniform 4-bit) with per-group absmax
+    /// scaling. Reuses <see cref="PackedInt4"/> storage layout
+    /// (two nibbles per byte); the nibble value is a
+    /// <see cref="NormalFloat4.Table"/> index in [0, 15].
+    /// </summary>
+    public static QuantizationScale QuantizeNF4(
+        ReadOnlySpan<float> src,
+        Span<PackedInt4> dst,
+        int groupSize = 64)
+    {
+        if (groupSize <= 0 || (groupSize & 1) != 0)
+            throw new ArgumentException("groupSize must be a positive even integer.", nameof(groupSize));
+        int expectedDst = (src.Length + 1) / 2;
+        if (dst.Length < expectedDst)
+            throw new ArgumentException($"dst must hold at least {expectedDst} packed bytes.", nameof(dst));
+
+        int groups = (src.Length + groupSize - 1) / groupSize;
+        var scales = new float[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int start = g * groupSize;
+            int end = Math.Min(start + groupSize, src.Length);
+            float absMax = 0f;
+            for (int i = start; i < end; i++)
+                absMax = Math.Max(absMax, Math.Abs(src[i]));
+            scales[g] = absMax == 0f ? 1f : absMax;
+        }
+
+        for (int i = 0; i < src.Length; i++)
+        {
+            int g = i / groupSize;
+            float normalized = scales[g] == 0f ? 0f : src[i] / scales[g];
+            int index = NormalFloat4.ToIndex(normalized);
+
+            int dstByte = i >> 1;
+            bool hi = (i & 1) == 1;
+            int existing = dst[dstByte].RawValue;
+            int mask = hi ? 0x0F : 0xF0;
+            int shift = hi ? 4 : 0;
+            int merged = (existing & mask) | ((index & 0x0F) << shift);
+            dst[dstByte] = new PackedInt4((byte)merged);
+        }
+        return new QuantizationScale(scales, groupSize);
+    }
+
+    /// <summary>Inverse of <see cref="QuantizeNF4"/>.</summary>
+    public static void DequantizeNF4(
+        ReadOnlySpan<PackedInt4> src, QuantizationScale scale, Span<float> dst)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        int gs = scale.GroupSize;
+        for (int i = 0; i < dst.Length; i++)
+        {
+            int byteIdx = i >> 1;
+            int nibble = (i & 1) == 0
+                ? (src[byteIdx].RawValue & 0x0F)
+                : ((src[byteIdx].RawValue >> 4) & 0x0F);
+            int g = i / gs;
+            dst[i] = NormalFloat4.FromIndex(nibble) * scale.Scales[g];
+        }
+    }
+
+    // ──────────── FP4 (MXFP4 E2M1) ────────────
+
+    /// <summary>
+    /// Quantize to FP4 (1s/2e/1m, MXFP4). Like NF4 but uses a float
+    /// value table instead of a normal-quantile table.
+    /// </summary>
+    public static QuantizationScale QuantizeFp4(
+        ReadOnlySpan<float> src,
+        Span<PackedInt4> dst,
+        int groupSize = 32)
+    {
+        if (groupSize <= 0 || (groupSize & 1) != 0)
+            throw new ArgumentException("groupSize must be a positive even integer.", nameof(groupSize));
+        int expectedDst = (src.Length + 1) / 2;
+        if (dst.Length < expectedDst)
+            throw new ArgumentException($"dst must hold at least {expectedDst} packed bytes.", nameof(dst));
+
+        int groups = (src.Length + groupSize - 1) / groupSize;
+        var scales = new float[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int start = g * groupSize;
+            int end = Math.Min(start + groupSize, src.Length);
+            float absMax = 0f;
+            for (int i = start; i < end; i++)
+                absMax = Math.Max(absMax, Math.Abs(src[i]));
+            // FP4 max representable is 6.
+            scales[g] = absMax == 0f ? 1f : absMax / 6f;
+        }
+
+        for (int i = 0; i < src.Length; i++)
+        {
+            int g = i / groupSize;
+            float normalized = scales[g] == 0f ? 0f : src[i] / scales[g];
+            int index = Fp4E2M1.ToIndex(normalized);
+
+            int dstByte = i >> 1;
+            bool hi = (i & 1) == 1;
+            int existing = dst[dstByte].RawValue;
+            int mask = hi ? 0x0F : 0xF0;
+            int shift = hi ? 4 : 0;
+            int merged = (existing & mask) | ((index & 0x0F) << shift);
+            dst[dstByte] = new PackedInt4((byte)merged);
+        }
+        return new QuantizationScale(scales, groupSize);
+    }
+
+    /// <summary>Inverse of <see cref="QuantizeFp4"/>.</summary>
+    public static void DequantizeFp4(
+        ReadOnlySpan<PackedInt4> src, QuantizationScale scale, Span<float> dst)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        int gs = scale.GroupSize;
+        for (int i = 0; i < dst.Length; i++)
+        {
+            int byteIdx = i >> 1;
+            int nibble = (i & 1) == 0
+                ? (src[byteIdx].RawValue & 0x0F)
+                : ((src[byteIdx].RawValue >> 4) & 0x0F);
+            int g = i / gs;
+            dst[i] = Fp4E2M1.FromIndex(nibble) * scale.Scales[g];
+        }
+    }
+
+    // ──────────── QAT: fake-quantize with straight-through estimator ────────────
+
+    /// <summary>
+    /// Fake-quantize forward: quantize + dequantize + write back to
+    /// <paramref name="dst"/>. Used by quantization-aware training
+    /// (QAT) where the forward pass sees a quantized approximation but
+    /// the straight-through estimator (gradient identity through the
+    /// fake-quant) lets backward flow the full-precision gradient.
+    /// Caller is expected to wire the gradient itself (trivial — it's
+    /// an identity copy).
+    /// </summary>
+    public static void FakeQuantizeInt4(
+        ReadOnlySpan<float> src, Span<float> dst, int groupSize = 32)
+    {
+        int packedLen = (src.Length + 1) / 2;
+        Span<PackedInt4> tmp = packedLen <= 256
+            ? stackalloc PackedInt4[packedLen]
+            : new PackedInt4[packedLen];
+        var scale = QuantizeInt4(src, tmp, groupSize);
+        DequantizeInt4(tmp, scale, dst);
+    }
+
+    /// <summary>FP8-style fake-quantize for NF4.</summary>
+    public static void FakeQuantizeNF4(
+        ReadOnlySpan<float> src, Span<float> dst, int groupSize = 64)
+    {
+        int packedLen = (src.Length + 1) / 2;
+        Span<PackedInt4> tmp = packedLen <= 256
+            ? stackalloc PackedInt4[packedLen]
+            : new PackedInt4[packedLen];
+        var scale = QuantizeNF4(src, tmp, groupSize);
+        DequantizeNF4(tmp, scale, dst);
+    }
+
+    /// <summary>Fake-quantize for Int1 (BitNet's sign-STE).</summary>
+    public static void FakeQuantizeInt1(
+        ReadOnlySpan<float> src, Span<float> dst, int groupSize = 0)
+    {
+        int packedLen = (src.Length + 7) / 8;
+        Span<PackedInt1> tmp = packedLen <= 256
+            ? stackalloc PackedInt1[packedLen]
+            : new PackedInt1[packedLen];
+        var scale = QuantizeInt1(src, tmp, groupSize);
+        DequantizeInt1(tmp, scale, dst);
+    }
 }
