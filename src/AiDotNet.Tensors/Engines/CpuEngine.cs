@@ -1889,6 +1889,67 @@ public class CpuEngine : ITensorLevelEngine
     #region Tensor Operations (Phase B: Epic 3)
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
+
+        // Tier 1: exact shape match → identity. Zero cost.
+        if (ShapesEqual1D(input._shape, targetShape)) return input;
+
+        // Tier 2: target only differs from source by PREPENDING size-1 axes
+        // (source shape == target tail, all extra target leading axes == 1).
+        // This is a pure reshape — no broadcasting actually happens, just
+        // rank realignment. Dispatches to Reshape which is GraphMode-aware
+        // and performs zero data copy.
+        //
+        // This path owns the BERT MatMul weight-broadcast cost: a 2-D weight
+        // [K, N] becoming a batched [1, K, N] for rank-compatible matmul.
+        int rankDiff = targetShape.Length - input.Rank;
+        if (rankDiff >= 0)
+        {
+            bool leadingAllOne = true;
+            for (int i = 0; i < rankDiff; i++)
+                if (targetShape[i] != 1) { leadingAllOne = false; break; }
+            if (leadingAllOne)
+            {
+                bool tailMatches = true;
+                for (int i = 0; i < input.Rank; i++)
+                    if (targetShape[rankDiff + i] != input._shape[i]) { tailMatches = false; break; }
+                if (tailMatches) return Reshape(input, targetShape);
+            }
+        }
+
+        // Validate broadcast compatibility before falling through — want a crisp
+        // error with both shapes, not a confusing downstream failure.
+        int maxRank = Math.Max(input.Rank, targetShape.Length);
+        for (int i = 0; i < maxRank; i++)
+        {
+            int srcDim = (i < maxRank - input.Rank)         ? 1 : input._shape[i - (maxRank - input.Rank)];
+            int tgtDim = (i < maxRank - targetShape.Length) ? 1 : targetShape[i - (maxRank - targetShape.Length)];
+            if (srcDim != tgtDim && srcDim != 1)
+                throw new ArgumentException(
+                    $"BroadcastTo: cannot broadcast shape [{string.Join(",", input._shape)}] to " +
+                    $"[{string.Join(",", targetShape)}] — source dim {srcDim} at axis {i} must equal target dim {tgtDim} or be 1.");
+        }
+
+        // Tier 3: general broadcast (genuine size-1 → size-N expansion at
+        // some axis). Fall through to the existing broadcast kernel via a
+        // zero-add. Equivalent cost to the old idiom; callers used to
+        // allocate the zero tensor themselves which made Tier 1 / Tier 2
+        // fast paths unreachable. Now the primitive handles Tier 1/2
+        // correctly and only burns the full kernel when genuinely needed.
+        return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+    }
+
+    private static bool ShapesEqual1D(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

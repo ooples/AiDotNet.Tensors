@@ -343,10 +343,12 @@ internal static class MathOperators
         if (!ShapesEqual(a._shape, b._shape))
         {
             var targetShape = ComputeBroadcastShape(a._shape, b._shape);
-            if (!ShapesEqual(a._shape, targetShape))
-                a = ctx.Engine.TensorBroadcastAdd(a, new Tensor<T>(targetShape));
-            if (!ShapesEqual(b._shape, targetShape))
-                b = ctx.Engine.TensorBroadcastAdd(b, new Tensor<T>(targetShape));
+            // TensorBroadcastTo handles identity / leading-1s / general
+            // broadcast with the correct fast paths; replaces the old
+            // TensorBroadcastAdd(x, zeros(target)) idiom that skipped
+            // those fast paths and forced a full element-wise add.
+            a = ctx.Engine.TensorBroadcastTo(a, targetShape);
+            b = ctx.Engine.TensorBroadcastTo(b, targetShape);
         }
         return isMax ? ctx.Engine.TensorMax(a, b) : ctx.Engine.TensorMin(a, b);
     }

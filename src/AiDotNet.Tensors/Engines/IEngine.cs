@@ -1924,6 +1924,38 @@ public interface IEngine
     Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape);
 
     /// <summary>
+    /// Broadcasts <paramref name="input"/> to <paramref name="targetShape"/> under NumPy
+    /// broadcasting rules (right-align dims; each source dim must match the target
+    /// or be 1; missing leading dims are treated as 1). Returns a tensor with
+    /// <paramref name="targetShape"/>.
+    /// <para>
+    /// This is a proper broadcast primitive — callers should use it instead of the
+    /// <c>TensorBroadcastAdd(x, new Tensor&lt;T&gt;(targetShape))</c> idiom, which allocates
+    /// a zero tensor and performs a full element-wise add purely to materialize a
+    /// broadcast. Those idioms are O(prod(targetShape)) time + 2× memory traffic; this
+    /// primitive short-circuits the common cases:
+    /// </para>
+    /// <list type="number">
+    ///   <item><b>Identity</b>: source shape equals target → returned as-is, zero cost.</item>
+    ///   <item><b>Leading-1s</b>: source shape matches target tail and target only adds
+    ///   leading size-1 axes → dispatches to <see cref="Reshape"/>, zero data copy.
+    ///   This path owns the BERT MatMul bias-broadcast cost (weight <c>[K, N]</c> →
+    ///   batched <c>[1, K, N]</c>), which profiling showed as 99.6% of plan time under the
+    ///   old idiom.</item>
+    ///   <item><b>General broadcast</b>: genuine size-1 → size-N expansion along some
+    ///   axis — materialized via the existing broadcast kernel. Equivalent cost to the
+    ///   old idiom, which is acceptable because real expansion cases are rare vs.
+    ///   leading-axis alignment.</item>
+    /// </list>
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="input">The source tensor.</param>
+    /// <param name="targetShape">The target shape to broadcast to.</param>
+    /// <returns>A tensor of shape <paramref name="targetShape"/> holding the broadcasted values.</returns>
+    /// <exception cref="ArgumentException">Thrown when shapes are not broadcast-compatible.</exception>
+    Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape);
+
+    /// <summary>
     /// Reorders a 4-D NCHW tensor (shape <c>[N, C, H, W]</c>) into NCHWc
     /// channel-packed layout. The returned tensor's
     /// <see cref="LinearAlgebra.TensorBase{T}.Layout"/> is set to match

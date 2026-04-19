@@ -346,6 +346,70 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     /// <summary>
+    /// Per-step timing instrumentation for systematic-debugging Phase 1
+    /// (identify which compiled steps dominate plan cost). Runs the same
+    /// step-loop as <see cref="Execute"/> but times each step individually
+    /// with Stopwatch and accumulates per-step ticks across <paramref name="iters"/>
+    /// measurement iterations. Warms up for <paramref name="warmup"/> full
+    /// plan runs first so JIT / cache effects are amortised.
+    ///
+    /// <para>Internal because this is a diagnostic tool — not part of the
+    /// public ICompiledPlan contract. The bookkeeping per-step (~20 ns for
+    /// two Stopwatch.GetTimestamp calls) would be visible on workloads with
+    /// sub-µs steps, so we DON'T fold this into the production Execute path.</para>
+    ///
+    /// <para>Returns a tuple per step: the OpName of the underlying lazy op
+    /// (same string the LazyNode carried), and the average wall-clock ms
+    /// that step took across the measurement iterations.</para>
+    /// </summary>
+    internal (string OpName, double AvgMs)[] ProfilePerStep(int warmup, int iters)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
+        if (iters <= 0) throw new ArgumentOutOfRangeException(nameof(iters));
+
+        var steps = _steps;
+        var engine = _engine;
+
+        // Warm up — run the full plan N times so JIT / CPU cache / branch
+        // predictor / allocator state matches steady-state conditions.
+        for (int w = 0; w < warmup; w++)
+        {
+            for (int i = 0; i < steps.Length; i++)
+                steps[i].Execute(engine, steps[i].OutputBuffer);
+        }
+
+        var tickSums = new long[steps.Length];
+        for (int it = 0; it < iters; it++)
+        {
+            // Match Execute's stitched-disposal safety even in the profiling
+            // path — a caller profiling a stitched plan whose source was
+            // disposed mid-run should see the same crisp error, not a crash.
+            for (int s = 0; s < _sourcePlans.Length; s++)
+            {
+                if (_sourcePlans[s]._disposed)
+                    throw new ObjectDisposedException(
+                        nameof(CompiledInferencePlan<T>),
+                        $"Stitched plan's source at index {s} has been disposed during profiling.");
+            }
+
+            for (int k = 0; k < steps.Length; k++)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                steps[k].Execute(engine, steps[k].OutputBuffer);
+                long t1 = Stopwatch.GetTimestamp();
+                tickSums[k] += (t1 - t0);
+            }
+        }
+
+        double tickToMs = 1000.0 / Stopwatch.Frequency;
+        var result = new (string, double)[steps.Length];
+        for (int k = 0; k < steps.Length; k++)
+            result[k] = (steps[k].OpName, tickSums[k] * tickToMs / iters);
+        return result;
+    }
+
+    /// <summary>
     /// Compiles a lazy tensor scope into an inference plan.
     /// Runs optimization passes, pre-allocates all buffers, and builds step array.
     /// </summary>

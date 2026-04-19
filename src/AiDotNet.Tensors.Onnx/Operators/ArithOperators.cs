@@ -88,12 +88,15 @@ internal static class ArithOperators
                 for (int i = 0; i < maxBatchRank; i++) bFull[i] = batchShape[i];
                 bFull[maxBatchRank] = kB; bFull[maxBatchRank + 1] = nB;
 
-                var aBroad = ShapesEqualND(a._shape, aFull)
-                    ? a
-                    : ctx.Engine.TensorBroadcastAdd(a, new Tensor<T>(aFull));
-                var bBroad = ShapesEqualND(b._shape, bFull)
-                    ? b
-                    : ctx.Engine.TensorBroadcastAdd(b, new Tensor<T>(bFull));
+                // Use TensorBroadcastTo (the proper broadcast primitive)
+                // instead of the old TensorBroadcastAdd(x, zeros(target))
+                // idiom. For the common BERT case where a 2-D weight
+                // broadcasts to batched [1, K, N], TensorBroadcastTo's
+                // leading-1s fast path dispatches to Reshape → zero data
+                // copy, eliminating a 1.1-second step/exec (99.6% of plan
+                // time) diagnosed via OpLevelPerfHarness on 2026-04-19.
+                var aBroad = ctx.Engine.TensorBroadcastTo(a, aFull);
+                var bBroad = ctx.Engine.TensorBroadcastTo(b, bFull);
 
                 var a3 = ctx.Engine.Reshape(aBroad, new[] { totalBatch, mA, kA });
                 var b3 = ctx.Engine.Reshape(bBroad, new[] { totalBatch, kB, nB });

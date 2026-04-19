@@ -245,6 +245,7 @@ internal static class OpRegistry
         "TensorConv2D",      // -> Conv2D (records)
 
         // Composed from recorded sub-ops (backward through constituents)
+        "TensorBroadcastTo", // -> Reshape or TensorBroadcastAdd (both record)
         "TensorLogSumExp",   // ReduceMax + BroadcastSubtract + TensorExp + ReduceSum + TensorLog + TensorAdd
         "TensorNorm",        // TensorMultiply + ReduceSum + TensorSqrt
         "TensorNormalize",   // TensorNorm + TensorDivide
