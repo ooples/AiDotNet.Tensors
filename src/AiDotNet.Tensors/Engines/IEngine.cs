@@ -6380,6 +6380,23 @@ public interface IEngine
     /// <summary>Depth split (torch.dsplit).</summary>
     Tensor<T>[] TensorDSplit<T>(Tensor<T> tensor, int sections);
 
+    /// <summary>Broadcast <paramref name="tensor"/> to <paramref name="shape"/> (torch.broadcast_to).</summary>
+    Tensor<T> TensorBroadcastTo<T>(Tensor<T> tensor, int[] shape);
+
+    /// <summary>
+    /// Pick elements from the flattened tensor at the positions specified by
+    /// <paramref name="indices"/> (torch.take). Output shape matches
+    /// <paramref name="indices"/>.
+    /// </summary>
+    Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices);
+
+    /// <summary>
+    /// Gather along <paramref name="dim"/>: for every non-<paramref name="dim"/>
+    /// position, index into the source via the matching position in
+    /// <paramref name="indices"/> (torch.take_along_dim).
+    /// </summary>
+    Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim);
+
     /// <summary>Cumulative product along <paramref name="axis"/> (torch.cumprod).</summary>
     Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis);
 

@@ -366,6 +366,124 @@ public partial class CpuEngine
         return TensorSplit(tensor, sections, 2);
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorBroadcastTo<T>(Tensor<T> tensor, int[] shape)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        int srcRank = tensor.Rank;
+        int dstRank = shape.Length;
+        if (dstRank < srcRank)
+            throw new ArgumentException("Broadcast target rank must be >= source rank");
+
+        // Right-align source shape against target. A source dim must either
+        // equal the target dim or be 1 (broadcast).
+        var padded = new int[dstRank];
+        int offset = dstRank - srcRank;
+        for (int i = 0; i < dstRank; i++)
+        {
+            int srcDim = i < offset ? 1 : tensor._shape[i - offset];
+            if (srcDim != shape[i] && srcDim != 1)
+                throw new ArgumentException(
+                    $"Cannot broadcast dim {srcDim} (source idx {i - offset}) to {shape[i]}");
+            padded[i] = srcDim;
+        }
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
+        var dst = result.AsWritableSpan();
+        var src = tensor.AsSpan();
+
+        int outTotal = result.Length;
+        var srcStrides = new int[dstRank];
+        // Compute source strides treating broadcast (size-1) dims as stride 0.
+        int stride = 1;
+        for (int i = dstRank - 1; i >= 0; i--)
+        {
+            srcStrides[i] = padded[i] == 1 ? 0 : stride;
+            stride *= padded[i];
+        }
+        var idx = new int[dstRank];
+        for (int linear = 0; linear < outTotal; linear++)
+        {
+            int srcPos = 0;
+            for (int k = 0; k < dstRank; k++) srcPos += idx[k] * srcStrides[k];
+            dst[linear] = src[srcPos];
+            for (int k = dstRank - 1; k >= 0; k--)
+            {
+                idx[k]++;
+                if (idx[k] < shape[k]) break;
+                idx[k] = 0;
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var idx = indices.AsSpan();
+        var result = new Tensor<T>(indices._shape);
+        var dst = result.AsWritableSpan();
+        int total = src.Length;
+        for (int i = 0; i < idx.Length; i++)
+        {
+            int pos = idx[i];
+            if (pos < 0 || pos >= total)
+                throw new IndexOutOfRangeException(
+                    $"indices[{i}]={pos} out of range for flattened tensor length {total}");
+            dst[i] = src[pos];
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        if (indices.Rank != rank)
+            throw new ArgumentException("indices must have the same rank as tensor");
+        for (int k = 0; k < rank; k++)
+        {
+            if (k != dim && indices._shape[k] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"indices.shape[{k}]={indices._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var idx = indices.AsSpan();
+        var result = new Tensor<T>(indices._shape);
+        var dst = result.AsWritableSpan();
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int srcAxis = tensor._shape[dim];
+        int idxAxis = indices._shape[dim];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idxAxis; i++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int idxPos = outer * idxAxis * innerSize + i * innerSize + inner;
+                    int target = idx[idxPos];
+                    if (target < 0 || target >= srcAxis)
+                        throw new IndexOutOfRangeException(
+                            $"indices out of range at linear {idxPos}");
+                    int srcPos = outer * srcAxis * innerSize + target * innerSize + inner;
+                    dst[idxPos] = src[srcPos];
+                }
+        return result;
+    }
+
     // ==================================================================
     // Cumulative ops
     // ==================================================================
