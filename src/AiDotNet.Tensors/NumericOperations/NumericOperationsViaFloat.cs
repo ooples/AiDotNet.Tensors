@@ -115,6 +115,19 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
     private delegate void BinaryFloatKernel(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> dst);
     private void BinaryViaFloat(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> destination, BinaryFloatKernel kernel)
     {
+        // Pooled scratch buffers are sized to x.Length and indexed with
+        // AsSpan(0, len). Without these checks a short y would leave the
+        // tail of yf filled with stale ArrayPool contents and the SIMD
+        // kernel would compute garbage; a short destination would surface
+        // as IndexOutOfRangeException instead of a documented ArgumentException.
+        if (y.Length != x.Length)
+            throw new ArgumentException(
+                $"y length {y.Length} must match x length {x.Length}.", nameof(y));
+        if (destination.Length < x.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= x length {x.Length}.",
+                nameof(destination));
+
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] yf = ArrayPool<float>.Shared.Rent(len);
@@ -137,6 +150,13 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
     // Reduction ops: rent one float scratch, compute, quantize result.
     public virtual T Dot(ReadOnlySpan<T> x, ReadOnlySpan<T> y)
     {
+        // Same rationale as BinaryViaFloat — rented scratch is sized to
+        // x.Length, so a short y would read stale pool data and a long y
+        // would silently ignore the overflow. Validate before renting.
+        if (y.Length != x.Length)
+            throw new ArgumentException(
+                $"y length {y.Length} must match x length {x.Length}.", nameof(y));
+
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] yf = ArrayPool<float>.Shared.Rent(len);
@@ -195,6 +215,14 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
     private delegate void UnaryKernel(ReadOnlySpan<float> x, Span<float> dst);
     private void UnaryViaFloat(ReadOnlySpan<T> x, Span<T> destination, UnaryKernel kernel)
     {
+        // FromFloatSpanImpl is indexed up to x.Length; short destination
+        // would surface as IndexOutOfRangeException with no hint to the
+        // caller. Fail fast with the documented ArgumentException.
+        if (destination.Length < x.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= x length {x.Length}.",
+                nameof(destination));
+
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] df = ArrayPool<float>.Shared.Rent(len);
@@ -213,6 +241,11 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
 
     private void UnaryViaFloatScalar(ReadOnlySpan<T> x, Span<T> destination, Func<float, float> fn)
     {
+        if (destination.Length < x.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= x length {x.Length}.",
+                nameof(destination));
+
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] df = ArrayPool<float>.Shared.Rent(len);
@@ -240,6 +273,10 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
 
     public virtual T CosineSimilarity(ReadOnlySpan<T> x, ReadOnlySpan<T> y)
     {
+        if (y.Length != x.Length)
+            throw new ArgumentException(
+                $"y length {y.Length} must match x length {x.Length}.", nameof(y));
+
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] yf = ArrayPool<float>.Shared.Rent(len);
@@ -321,18 +358,38 @@ public abstract class NumericOperationsViaFloat<T> : INumericOperations<T>
     }
 
     public virtual void ToFloatSpan(ReadOnlySpan<T> source, Span<float> destination)
-        => ToFloatSpanImpl(source, destination);
+    {
+        if (destination.Length < source.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= source length {source.Length}.",
+                nameof(destination));
+        ToFloatSpanImpl(source, destination);
+    }
 
     public virtual void FromFloatSpan(ReadOnlySpan<float> source, Span<T> destination)
-        => FromFloatSpanImpl(source, destination);
+    {
+        if (destination.Length < source.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= source length {source.Length}.",
+                nameof(destination));
+        FromFloatSpanImpl(source, destination);
+    }
 
     public virtual void ToHalfSpan(ReadOnlySpan<T> source, Span<Half> destination)
     {
+        if (destination.Length < source.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= source length {source.Length}.",
+                nameof(destination));
         for (int i = 0; i < source.Length; i++) destination[i] = (Half)ToFloatImpl(source[i]);
     }
 
     public virtual void FromHalfSpan(ReadOnlySpan<Half> source, Span<T> destination)
     {
+        if (destination.Length < source.Length)
+            throw new ArgumentException(
+                $"destination length {destination.Length} must be >= source length {source.Length}.",
+                nameof(destination));
         for (int i = 0; i < source.Length; i++) destination[i] = FromFloatImpl((float)source[i]);
     }
 
