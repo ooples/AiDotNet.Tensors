@@ -2524,74 +2524,94 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (ax, bx) => {
+    {
+        var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Sqrt(ops.Add(ops.Multiply(ax, ax), ops.Multiply(bx, bx)));
         }, "TensorHypot");
+        DifferentiableOps.RecordBinary("TensorHypot", result, a, b, BackwardFunctions<T>.HypotBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCopysign<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (ax, bx) => {
+    {
+        var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             var sign = ops.SignOrZero(bx);
             var mag = ops.Abs(ax);
-            // Treat sign==0 (zero b) as positive, matching IEEE copysign on +0.
             return ops.LessThan(sign, ops.Zero) ? ops.Negate(mag) : mag;
         }, "TensorCopysign");
+        DifferentiableOps.RecordBinary("TensorCopysign", result, a, b, BackwardFunctions<T>.CopysignBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFmod<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (ax, bx) => {
-            // IEEE: result has same sign as dividend (a).
+    {
+        var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             if (ops.Equals(bx, ops.Zero)) return ops.Zero;
             var q = TruncateTowardZero(ops.Divide(ax, bx));
             return ops.Subtract(ax, ops.Multiply(q, bx));
         }, "TensorFmod");
+        DifferentiableOps.RecordBinary("TensorFmod", result, a, b, BackwardFunctions<T>.FmodBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (ax, bx) => {
-            // Python-style: result has same sign as divisor (b).
+    {
+        var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             if (ops.Equals(bx, ops.Zero)) return ops.Zero;
             var q = ops.Floor(ops.Divide(ax, bx));
             return ops.Subtract(ax, ops.Multiply(q, bx));
         }, "TensorRemainder");
+        DifferentiableOps.RecordBinary("TensorRemainder", result, a, b, BackwardFunctions<T>.RemainderBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (ax, bx) =>
+    {
+        var result = ElementwiseBinary(a, b, (ax, bx) =>
             MathHelper.GetNumericOperations<T>().Power(ax, bx), "TensorFloatPower");
+        DifferentiableOps.RecordBinary("TensorFloatPower", result, a, b, BackwardFunctions<T>.FloatPowerBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogAddExp<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (av, bv) => {
+    {
+        var result = ElementwiseBinary(a, b, (av, bv) => {
             var ops = MathHelper.GetNumericOperations<T>();
-            // Numerically stable: max + log(1 + exp(-|a-b|)).
-            var larger = ops.GreaterThan(av, bv) ? av : bv;
-            var smaller = ops.GreaterThan(av, bv) ? bv : av;
-            var diff = ops.Subtract(smaller, larger);  // ≤ 0
-            // log(1 + exp(diff)) — use log1p for accuracy.
-            var expDiff = ops.Exp(diff);
-            return ops.Add(larger, ops.Log(ops.Add(ops.One, expDiff)));
-        }, "TensorLogAddExp");
-
-    /// <inheritdoc/>
-    public virtual Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b)
-        => ElementwiseBinary(a, b, (av, bv) => {
-            var ops = MathHelper.GetNumericOperations<T>();
-            // log2(2^a + 2^b) = log2(2^(max) · (1 + 2^(min-max))) = max + log2(1 + 2^(min-max))
             var larger = ops.GreaterThan(av, bv) ? av : bv;
             var smaller = ops.GreaterThan(av, bv) ? bv : av;
             var diff = ops.Subtract(smaller, larger);
-            // 2^diff = exp(diff · ln 2)
+            var expDiff = ops.Exp(diff);
+            return ops.Add(larger, ops.Log(ops.Add(ops.One, expDiff)));
+        }, "TensorLogAddExp");
+        DifferentiableOps.RecordBinary("TensorLogAddExp", result, a, b, BackwardFunctions<T>.LogAddExpBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b)
+    {
+        var result = ElementwiseBinary(a, b, (av, bv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            var larger = ops.GreaterThan(av, bv) ? av : bv;
+            var smaller = ops.GreaterThan(av, bv) ? bv : av;
+            var diff = ops.Subtract(smaller, larger);
             var ln2 = ops.FromDouble(System.Math.Log(2.0));
             var pow2 = ops.Exp(ops.Multiply(diff, ln2));
-            // log2(1 + pow2) = log(1 + pow2) / ln 2
             var log1p = ops.Log(ops.Add(ops.One, pow2));
             return ops.Add(larger, ops.Divide(log1p, ln2));
         }, "TensorLogAddExp2");
+        DifferentiableOps.RecordBinary("TensorLogAddExp2", result, a, b, BackwardFunctions<T>.LogAddExp2Backward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
@@ -2609,10 +2629,11 @@ public partial class CpuEngine
         var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
-            // x * 2^e. Compute via Power(2.0, e) then multiply.
             double scale = System.Math.Pow(2.0, e[i]);
             dst[i] = ops.Multiply(src[i], ops.FromDouble(scale));
         }
+        DifferentiableOps.RecordUnary("TensorLdexp", result, x,
+            BackwardFunctions<T>.LdexpBackward, new object[] { exp });
         return result;
     }
 
@@ -2702,38 +2723,49 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfc<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Subtract(ops.One, MathHelper.Erf(x));
         }, "TensorErfc");
+        DifferentiableOps.RecordUnary("TensorErfc", result, tensor, BackwardFunctions<T>.ErfcBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorXlogy<T>(Tensor<T> x, Tensor<T> y)
-        => ElementwiseBinary(x, y, (xv, yv) => {
+    {
+        var result = ElementwiseBinary(x, y, (xv, yv) => {
             var ops = MathHelper.GetNumericOperations<T>();
-            // x * log(y) with the convention 0 * log(0) = 0.
             return ops.Equals(xv, ops.Zero) ? ops.Zero : ops.Multiply(xv, ops.Log(yv));
         }, "TensorXlogy");
+        DifferentiableOps.RecordBinary("TensorXlogy", result, x, y, BackwardFunctions<T>.XlogyBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y)
-        => ElementwiseBinary(x, y, (xv, yv) => {
+    {
+        var result = ElementwiseBinary(x, y, (xv, yv) => {
             var ops = MathHelper.GetNumericOperations<T>();
-            // x * log(1 + y) with 0 * log(...) = 0.
             return ops.Equals(xv, ops.Zero)
                 ? ops.Zero
                 : ops.Multiply(xv, ops.Log(ops.Add(ops.One, yv)));
         }, "TensorXlog1py");
+        DifferentiableOps.RecordBinary("TensorXlog1py", result, x, y, BackwardFunctions<T>.Xlog1pyBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLgamma<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
-            // log|Γ(x)| via existing Lanczos-backed Gamma helper. Negative x is
-            // where |·| matters; the Gamma helper's reflection formula returns
-            // a signed value, so we take the absolute before logging.
             return ops.Log(ops.Abs(MathHelper.Gamma(x)));
         }, "TensorLgamma");
+        DifferentiableOps.RecordUnary("TensorLgamma", result, tensor, BackwardFunctions<T>.LgammaBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
@@ -2771,7 +2803,8 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfinv<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double y = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
             if (y >= 1.0) return ops.FromDouble(double.PositiveInfinity);
@@ -2792,14 +2825,16 @@ public partial class CpuEngine
             }
             return ops.FromDouble(xs);
         }, "TensorErfinv");
+        DifferentiableOps.RecordUnary("TensorErfinv", result, tensor, BackwardFunctions<T>.ErfinvBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI0<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            // Series: I₀(x) = Σ_{k=0}^∞ (x/2)^(2k) / (k!)².
-            // 25 terms cover |x| up to ~15 with fp64 precision.
             double halfX = xd / 2.0;
             double halfSq = halfX * halfX;
             double term = 1.0;
@@ -2812,16 +2847,19 @@ public partial class CpuEngine
             }
             return ops.FromDouble(sum);
         }, "TensorI0");
+        DifferentiableOps.RecordUnary("TensorI0", result, tensor, BackwardFunctions<T>.I0Backward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI1<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            // Series: I₁(x) = (x/2) · Σ_{k=0}^∞ (x/2)^(2k) / (k! · (k+1)!).
             double halfX = xd / 2.0;
             double halfSq = halfX * halfX;
-            double term = 1.0;   // k=0: 1 / (0! · 1!) = 1
+            double term = 1.0;
             double sum = 1.0;
             for (int k = 1; k < 25; k++)
             {
@@ -2831,6 +2869,9 @@ public partial class CpuEngine
             }
             return ops.FromDouble(halfX * sum);
         }, "TensorI1");
+        DifferentiableOps.RecordUnary("TensorI1", result, tensor, BackwardFunctions<T>.I1Backward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI0e<T>(Tensor<T> tensor)
@@ -2906,30 +2947,26 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
-            // Asymptotic series with recurrence shift. Good enough for fp32;
-            // matches PyTorch within ~1e-5 on x in [0.1, 100].
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
-            // Recurrence: ψ(x+1) = ψ(x) + 1/x; shift x up until large enough
-            // for the asymptotic series to converge quickly.
             double xd = ToDoubleSafe(x);
-            double result = 0;
+            double acc = 0;
             while (xd < 6.0)
             {
-                result -= 1.0 / xd;
+                acc -= 1.0 / xd;
                 xd += 1.0;
             }
-            // ψ(x) ≈ log(x) - 1/(2x) - 1/(12x²) + 1/(120x⁴) - 1/(252x⁶) …
             double xinv = 1.0 / xd;
             double xinv2 = xinv * xinv;
-            result += System.Math.Log(xd) - 0.5 * xinv
-                     - xinv2 * (1.0/12.0 - xinv2 * (1.0/120.0 - xinv2 / 252.0));
-            return ops.FromDouble(result);
+            acc += System.Math.Log(xd) - 0.5 * xinv
+                     - xinv2 * (1.0 / 12.0 - xinv2 * (1.0 / 120.0 - xinv2 / 252.0));
+            return ops.FromDouble(acc);
         }, "TensorDigamma");
+        DifferentiableOps.RecordUnary("TensorDigamma", result, tensor, BackwardFunctions<T>.DigammaBackward);
+        return result;
+    }
 
-    // Safe T→double via FromDouble + ToInt32 pair; for float/double/complex
-    // INumericOperations exposes ToDouble via FromDouble's inverse path. We
-    // use a small indirection to avoid referencing a specific type.
     private static double ToDoubleSafe<T>(T value)
     {
         var ops = MathHelper.GetNumericOperations<T>();
