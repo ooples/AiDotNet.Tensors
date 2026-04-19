@@ -2357,6 +2357,26 @@ public partial class CpuEngine
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
 
+        // Float32 inner-most-axis fast path: route through SortKernels' SIMD
+        // bitonic (short axes) or Array.Sort pair-sort (longer axes) without
+        // boxing into a (T,int) struct array.
+        if (typeof(T) == typeof(float) && innerSize == 1 && !descending)
+        {
+            float[] srcFloatArr = (float[])(object)input.GetDataArray();
+            float[] valFloatArr = (float[])(object)valuesOut.GetDataArray();
+            int[] idxArr = indicesOut.GetDataArray();
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                int baseIdx = outer * axisSize;
+                var vSlice = valFloatArr.AsSpan(baseIdx, axisSize);
+                var iSlice = idxArr.AsSpan(baseIdx, axisSize);
+                srcFloatArr.AsSpan(baseIdx, axisSize).CopyTo(vSlice);
+                for (int a = 0; a < axisSize; a++) iSlice[a] = a;
+                Simd.SortKernels.SortFloatWithIndicesAscending(vSlice, iSlice);
+            }
+            return (valuesOut, indicesOut);
+        }
+
         var buffer = new (T value, int index)[axisSize];
         for (int outer = 0; outer < outerSize; outer++)
             for (int inner = 0; inner < innerSize; inner++)
@@ -2918,27 +2938,42 @@ public partial class CpuEngine
         if (sortedSequence.Rank != 1)
             throw new ArgumentException("SearchSorted expects a 1-D sorted sequence");
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         if (!sortedSequence.IsContiguous) sortedSequence = sortedSequence.Contiguous();
         if (!values.IsContiguous) values = values.Contiguous();
-        var seq = sortedSequence.AsSpan();
-        var vs = values.AsSpan();
         var result = new Tensor<int>(values._shape);
         var dst = result.AsWritableSpan();
 
-        for (int i = 0; i < vs.Length; i++)
+        // Float32 fast path: route through SortKernels which uses AVX2
+        // popcount-masked comparison for short sequences and a branchless
+        // binary search for longer ones.
+        if (typeof(T) == typeof(float))
+        {
+            float[] seqArr = (float[])(object)sortedSequence.GetDataArray();
+            float[] vsArr = (float[])(object)values.GetDataArray();
+            ReadOnlySpan<float> seqSpan = seqArr;
+            if (right)
+                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
+            else
+                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var seqT = sortedSequence.AsSpan();
+        var vsT = values.AsSpan();
+        for (int i = 0; i < vsT.Length; i++)
         {
             // Branchless-ready binary search; returns insertion index.
-            int lo = 0, hi = seq.Length;
-            var v = vs[i];
+            int lo = 0, hi = seqT.Length;
+            var v = vsT[i];
             while (lo < hi)
             {
                 int mid = lo + ((hi - lo) >> 1);
                 // right=false → lower bound: split at seq[mid] >= v (v <= seq[mid]).
                 // right=true  → upper bound: split at seq[mid] >  v (v <  seq[mid]).
                 bool beforeMid = right
-                    ? numOps.LessThan(v, seq[mid])
-                    : numOps.LessThanOrEquals(v, seq[mid]);
+                    ? numOps.LessThan(v, seqT[mid])
+                    : numOps.LessThanOrEquals(v, seqT[mid]);
                 if (beforeMid) hi = mid; else lo = mid + 1;
             }
             dst[i] = lo;
