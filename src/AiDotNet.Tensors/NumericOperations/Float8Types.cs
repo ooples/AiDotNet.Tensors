@@ -76,13 +76,18 @@ public readonly struct Float8E4M3 : IEquatable<Float8E4M3>, IComparable<Float8E4
     public static Float8E4M3 FromFloat(float value)
     {
         if (float.IsNaN(value)) return NaN;
-        if (value == 0f) return Zero;
+
+        // Preserve the sign of zero. `value == 0f` is true for both
+        // +0 and -0, so we must inspect the raw bit pattern rather
+        // than collapsing everything to the positive-zero encoding.
+        uint bits = FloatBits.SingleToUInt32Bits(value);
+        if ((bits & 0x7FFF_FFFFu) == 0)
+            return (bits & 0x8000_0000u) == 0 ? Zero : new Float8E4M3((byte)SignMask);
 
         // Saturate on Inf — E4M3 has no Inf encoding, clamp to MaxFinite.
         if (float.IsInfinity(value))
             return value > 0 ? MaxFinite : MinFinite;
 
-        uint bits = FloatBits.SingleToUInt32Bits(value);
         uint sign = (bits >> 31) & 0x1;
         int exp = (int)((bits >> 23) & 0xFF) - 127 + ExponentBias; // re-bias 127 → 7
         uint mantissa23 = bits & 0x7FFFFF;
@@ -203,11 +208,15 @@ public readonly struct Float8E5M2 : IEquatable<Float8E5M2>, IComparable<Float8E5
     public static Float8E5M2 FromFloat(float value)
     {
         if (float.IsNaN(value)) return NaN;
-        if (value == 0f) return Zero;
+
+        // Preserve the sign of zero — E5M2 has both +0 and -0 encodings.
+        uint bits = FloatBits.SingleToUInt32Bits(value);
+        if ((bits & 0x7FFF_FFFFu) == 0)
+            return (bits & 0x8000_0000u) == 0 ? Zero : new Float8E5M2((byte)SignMask);
+
         if (float.IsInfinity(value))
             return value > 0 ? PositiveInfinity : NegativeInfinity;
 
-        uint bits = FloatBits.SingleToUInt32Bits(value);
         uint sign = (bits >> 31) & 0x1;
         int exp = (int)((bits >> 23) & 0xFF) - 127 + ExponentBias;
         uint mantissa23 = bits & 0x7FFFFF;

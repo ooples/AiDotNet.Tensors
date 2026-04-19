@@ -1941,6 +1941,112 @@ public sealed class CuDnnBatchNorm : IDisposable
         }
     }
 
+    /// <summary>
+    /// GPU-pointer variant of <see cref="ForwardInference"/>. No host
+    /// round-trip — all tensors are already resident on the device and
+    /// the caller owns output allocation. Called from
+    /// <c>CudaBackend.BatchNorm</c> when the cuDNN dispatch is enabled.
+    /// </summary>
+    public void ForwardInferenceGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        IntPtr scaleDevPtr, IntPtr biasDevPtr,
+        IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alpha = 1f, beta = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationForwardInference(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alpha, ref beta,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, outputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr, biasDevPtr,
+            runningMeanDevPtr, runningVarDevPtr,
+            epsilon);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationForwardInferenceGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer training-mode BatchNorm. Writes saved mean / inv-var
+    /// for the backward pass and updates running stats in place.
+    /// </summary>
+    public void ForwardTrainingGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        IntPtr scaleDevPtr, IntPtr biasDevPtr,
+        IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
+        IntPtr saveMeanDevPtr, IntPtr saveInvVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alpha = 1f, beta = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationForwardTraining(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alpha, ref beta,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, outputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr, biasDevPtr,
+            momentum,
+            runningMeanDevPtr, runningVarDevPtr,
+            epsilon,
+            saveMeanDevPtr, saveInvVarDevPtr);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationForwardTrainingGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer BatchNorm backward. Produces dX / dScale / dBias
+    /// given dY and the saved forward stats.
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr inputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
+        IntPtr scaleDevPtr, IntPtr gradScaleDevPtr, IntPtr gradBiasDevPtr,
+        IntPtr savedMeanDevPtr, IntPtr savedInvVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alphaD = 1f, betaD = 0f, alphaP = 1f, betaP = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationBackward(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alphaD, ref betaD, ref alphaP, ref betaP,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, gradOutputDevPtr,
+            xDesc.Handle, gradInputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr,
+            gradScaleDevPtr, gradBiasDevPtr,
+            epsilon,
+            savedMeanDevPtr, savedInvVarDevPtr);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationBackwardGpu");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
