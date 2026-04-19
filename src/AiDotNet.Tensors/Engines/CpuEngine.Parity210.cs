@@ -1953,8 +1953,8 @@ public partial class CpuEngine
                 }
             }
         }
-        DifferentiableOps.RecordUnary(
-            "TensorIndexAdd", result, tensor,
+        DifferentiableOps.RecordBinary(
+            "TensorIndexAdd", result, tensor, source,
             BackwardFunctions<T>.IndexAddBackward,
             savedState: new object[] { axis, indices });
         return result;

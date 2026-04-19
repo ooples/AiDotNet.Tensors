@@ -4192,17 +4192,54 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// IndexAdd backward: dL/dinput = gradOutput (clone); dL/dsource = gather
-    /// gradOutput at the scatter positions.
-    /// v1 stores only the input's grad contribution here; source grad is a
-    /// follow-up when the op is re-wired through RecordBinary.
+    /// IndexAdd backward.  Forward is <c>result = input; result[idx] += source</c>
+    /// along <paramref name="savedState"/>[0] (axis).
+    ///   dL/d(input)  = gradOutput (identity — input is added verbatim)
+    ///   dL/d(source) = gather(gradOutput, axis, indices) — each source row
+    ///                  contributes to exactly one output row at indices[i],
+    ///                  so its gradient is gradOutput at that row.
+    /// savedState[0] = axis, savedState[1] = indices tensor.
     /// </summary>
     internal static void IndexAddBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // dL/d(input tensor) = dL/d(output) because result = input + scattered(source).
+        // dL/d(input) = dL/d(output) — `input` is the zeroth input.
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+
+        // dL/d(source) is only propagated when the forward recorded both
+        // inputs (RecordBinary path). When only the input was recorded
+        // (legacy RecordUnary call), inputs.Length == 1 and we skip this.
+        if (inputs.Length < 2) return;
+        int axis = (int)savedState[0];
+        var indices = (Tensor<int>)savedState[1];
+        var source = inputs[1];
+        // Gather at the same indices rebuilds source's gradient: each source
+        // row i contributes to output row indices[i]. Inlined rather than
+        // using TensorIndexSelect because that op is currently 2-D-only.
+        int rank = gradOutput.Rank;
+        if (axis < 0) axis += rank;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var srcGrad = new Tensor<T>(source._shape);
+        var sd = srcGrad.AsWritableSpan();
+        var go = gradOutput.AsSpan();
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= gradOutput._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= gradOutput._shape[k];
+        int goAxis = gradOutput._shape[axis];
+        var idxSpan = indices.AsSpan();
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idxSpan.Length; i++)
+            {
+                int target = idxSpan[i];
+                if (target < 0 || target >= goAxis) continue;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int goPos = outer * goAxis * innerSize + target * innerSize + inner;
+                    int sdPos = outer * idxSpan.Length * innerSize + i * innerSize + inner;
+                    sd[sdPos] = go[goPos];
+                }
+            }
+        DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
     /// <summary>
