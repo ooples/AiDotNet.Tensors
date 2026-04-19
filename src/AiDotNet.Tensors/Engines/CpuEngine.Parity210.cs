@@ -581,6 +581,19 @@ public partial class CpuEngine
             throw new ArgumentException(
                 $"input shape must be [{m}, {n}]; got [{input._shape[0]}, {input._shape[1]}]");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var ca = a; var cb = b; var al = alpha; var be = beta;
+                var opsHelper = MathHelper.GetNumericOperations<T>();
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMM", new[] { input, a, b }, new[] { m, n },
+                    (eng, output) => { var r = eng.TensorAddMM(ci, ca, cb, al, be); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AddMMBackward, new object[] { opsHelper.ToDouble(al), opsHelper.ToDouble(be) });
+            }
+        }
+
         var ops = MathHelper.GetNumericOperations<T>();
         var matmul = TensorMatMul(a, b);
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, n });
@@ -1018,6 +1031,25 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank < 1) throw new ArgumentException("DiagEmbed requires rank >= 1");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var co = offset;
+                int r = tensor.Rank;
+                int dl = tensor._shape[r - 1];
+                int ms = dl + System.Math.Abs(co);
+                var oShape = new int[r + 1];
+                for (int i = 0; i < r - 1; i++) oShape[i] = tensor._shape[i];
+                oShape[r - 1] = ms;
+                oShape[r] = ms;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagEmbed", tensor, oShape,
+                    (eng, output) => { var res = eng.TensorDiagEmbed(ct, co); res.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.DiagEmbedBackward, new object[] { co });
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         int rank = tensor.Rank;
         int diagLen = tensor._shape[rank - 1];
@@ -1063,6 +1095,18 @@ public partial class CpuEngine
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
         if (a._shape[dim] != 3)
             throw new ArgumentException($"Cross requires size 3 along dim {dim}; got {a._shape[dim]}");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b; var cd = dim;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorCross", a, b, (int[])a._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorCross(ca, cb, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CrossBackward, new object[] { cd });
+            }
+        }
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
@@ -1296,6 +1340,17 @@ public partial class CpuEngine
         Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var cn = nan; var cpi = posinf; var cni = neginf;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorNanToNum", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorNanToNum(ct, cn, cpi, cni); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NanToNumBackward);
+            }
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var src = tensor.AsSpan();
@@ -1376,6 +1431,17 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var cd = diagonal;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorTriu", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorTriu(ct, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TriuBackward, new object[] { cd });
+            }
+        }
         var result = TriangularFill(tensor, diagonal, keepUpper: true);
         DifferentiableOps.RecordUnary(
             "TensorTriu", result, tensor, BackwardFunctions<T>.TriuBackward,
@@ -1386,6 +1452,17 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTril<T>(Tensor<T> tensor, int diagonal = 0)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var cd = diagonal;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorTril", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorTril(ct, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TrilBackward, new object[] { cd });
+            }
+        }
         var result = TriangularFill(tensor, diagonal, keepUpper: false);
         DifferentiableOps.RecordUnary(
             "TensorTril", result, tensor, BackwardFunctions<T>.TrilBackward,
@@ -2551,6 +2628,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorHypot", a, b,
+            eng => eng.TensorHypot(a, b), BackwardFunctions<T>.HypotBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Sqrt(ops.Add(ops.Multiply(ax, ax), ops.Multiply(bx, bx)));
@@ -2562,6 +2642,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCopysign<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorCopysign", a, b,
+            eng => eng.TensorCopysign(a, b), BackwardFunctions<T>.CopysignBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             var sign = ops.SignOrZero(bx);
@@ -2575,6 +2658,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFmod<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorFmod", a, b,
+            eng => eng.TensorFmod(a, b), BackwardFunctions<T>.FmodBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             if (ops.Equals(bx, ops.Zero)) return ops.Zero;
@@ -2588,6 +2674,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorRemainder", a, b,
+            eng => eng.TensorRemainder(a, b), BackwardFunctions<T>.RemainderBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (ax, bx) => {
             var ops = MathHelper.GetNumericOperations<T>();
             if (ops.Equals(bx, ops.Zero)) return ops.Zero;
@@ -2601,6 +2690,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorFloatPower", a, b,
+            eng => eng.TensorFloatPower(a, b), BackwardFunctions<T>.FloatPowerBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (ax, bx) =>
             MathHelper.GetNumericOperations<T>().Power(ax, bx), "TensorFloatPower");
         DifferentiableOps.RecordBinary("TensorFloatPower", result, a, b, BackwardFunctions<T>.FloatPowerBackward);
@@ -2610,6 +2702,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogAddExp<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorLogAddExp", a, b,
+            eng => eng.TensorLogAddExp(a, b), BackwardFunctions<T>.LogAddExpBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (av, bv) => {
             var ops = MathHelper.GetNumericOperations<T>();
             var larger = ops.GreaterThan(av, bv) ? av : bv;
@@ -2625,6 +2720,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b)
     {
+        var lazy = TryRecordLazyBinary("TensorLogAddExp2", a, b,
+            eng => eng.TensorLogAddExp2(a, b), BackwardFunctions<T>.LogAddExp2Backward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(a, b, (av, bv) => {
             var ops = MathHelper.GetNumericOperations<T>();
             var larger = ops.GreaterThan(av, bv) ? av : bv;
@@ -2750,6 +2848,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfc<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorErfc", tensor,
+            eng => eng.TensorErfc(tensor), BackwardFunctions<T>.ErfcBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Subtract(ops.One, MathHelper.Erf(x));
@@ -2761,6 +2862,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorXlogy<T>(Tensor<T> x, Tensor<T> y)
     {
+        var lazy = TryRecordLazyBinary("TensorXlogy", x, y,
+            eng => eng.TensorXlogy(x, y), BackwardFunctions<T>.XlogyBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(x, y, (xv, yv) => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Equals(xv, ops.Zero) ? ops.Zero : ops.Multiply(xv, ops.Log(yv));
@@ -2772,6 +2876,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y)
     {
+        var lazy = TryRecordLazyBinary("TensorXlog1py", x, y,
+            eng => eng.TensorXlog1py(x, y), BackwardFunctions<T>.Xlog1pyBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseBinary(x, y, (xv, yv) => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Equals(xv, ops.Zero)
@@ -2785,6 +2892,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLgamma<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorLgamma", tensor,
+            eng => eng.TensorLgamma(tensor), BackwardFunctions<T>.LgammaBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             return ops.Log(ops.Abs(MathHelper.Gamma(x)));
@@ -2848,6 +2958,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfinv<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorErfinv", tensor,
+            eng => eng.TensorErfinv(tensor), BackwardFunctions<T>.ErfinvBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double y = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
@@ -2876,6 +2989,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI0<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorI0", tensor,
+            eng => eng.TensorI0(tensor), BackwardFunctions<T>.I0Backward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
@@ -2898,6 +3014,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI1<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorI1", tensor,
+            eng => eng.TensorI1(tensor), BackwardFunctions<T>.I1Backward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
@@ -2920,6 +3039,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI0e<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorI0e", tensor,
+            eng => eng.TensorI0e(tensor), BackwardFunctions<T>.I0eBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             // I₀ with exponential scaling: e^(-|x|) · I₀(x). Safe for large x
             // where I₀ overflows.
@@ -2945,6 +3067,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI1e<T>(Tensor<T> tensor)
     {
+        var lazy = TryRecordLazyUnary("TensorI1e", tensor,
+            eng => eng.TensorI1e(tensor), BackwardFunctions<T>.I1eBackward);
+        if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
@@ -3107,6 +3232,40 @@ public partial class CpuEngine
         var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++) dst[i] = f(src[i]);
         return result;
+    }
+
+    /// <summary>
+    /// LazyTensorScope capture helper for unary element-wise parity-210 ops.
+    /// Returns null if graph mode is not active; callers fall through to the
+    /// eager implementation when null is returned.
+    /// </summary>
+    private static Tensor<T>? TryRecordLazyUnary<T>(
+        string opName, Tensor<T> input, Func<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backward = null, object[]? savedState = null)
+    {
+        if (!GraphMode.IsActive) return null;
+        var scope = GraphMode.Current;
+        if (scope == null) return null;
+        return scope.RecordUnary(LazyNodeType.Custom, opName, input, (int[])input._shape.Clone(),
+            (eng, output) => { var r = execute(eng); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+            backward, savedState);
+    }
+
+    /// <summary>
+    /// LazyTensorScope capture helper for binary element-wise parity-210 ops.
+    /// Output shape is inferred from operand a (callers ensure a and b broadcast
+    /// to a.Shape).  Returns null when graph mode is not active.
+    /// </summary>
+    private static Tensor<T>? TryRecordLazyBinary<T>(
+        string opName, Tensor<T> a, Tensor<T> b, Func<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backward = null, object[]? savedState = null)
+    {
+        if (!GraphMode.IsActive) return null;
+        var scope = GraphMode.Current;
+        if (scope == null) return null;
+        return scope.RecordBinary(LazyNodeType.Custom, opName, a, b, (int[])a._shape.Clone(),
+            (eng, output) => { var r = execute(eng); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+            backward, savedState);
     }
 
     private static Tensor<T> ElementwiseBinary<T>(
