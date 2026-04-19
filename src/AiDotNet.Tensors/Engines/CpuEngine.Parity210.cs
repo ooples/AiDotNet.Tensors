@@ -589,6 +589,12 @@ public partial class CpuEngine
         var dst = result.AsWritableSpan();
         for (int i = 0; i < dst.Length; i++)
             dst[i] = ops.Add(ops.Multiply(alpha, mmSrc[i]), ops.Multiply(beta, inSrc[i]));
+        // Stash alpha/beta as double so we're robust to T being a reference
+        // type — AddMMBackward reconstructs them via ops.FromDouble.
+        DifferentiableOps.RecordIfActive<T>(
+            "TensorAddMM", result, new[] { input, a, b },
+            BackwardFunctions<T>.AddMMBackward,
+            savedState: new object[] { ops.ToDouble(alpha), ops.ToDouble(beta) });
         return result;
     }
 
@@ -1039,6 +1045,9 @@ public partial class CpuEngine
                 int srcPos = b * diagLen + i;
                 dst[dstPos] = src[srcPos];
             }
+        DifferentiableOps.RecordUnary(
+            "TensorDiagEmbed", result, tensor, BackwardFunctions<T>.DiagEmbedBackward,
+            savedState: new object[] { offset });
         return result;
     }
 
@@ -1080,6 +1089,9 @@ public partial class CpuEngine
                 dst[b1] = ops.Subtract(ops.Multiply(az, bx), ops.Multiply(ax, bz));
                 dst[b2] = ops.Subtract(ops.Multiply(ax, by), ops.Multiply(ay, bx));
             }
+        DifferentiableOps.RecordBinary(
+            "TensorCross", result, a, b, BackwardFunctions<T>.CrossBackward,
+            savedState: new object[] { dim });
         return result;
     }
 
@@ -1306,6 +1318,8 @@ public partial class CpuEngine
             else if (double.IsNegativeInfinity(d)) dst[i] = ops.FromDouble(defaultNegInf);
             else dst[i] = src[i];
         }
+        DifferentiableOps.RecordUnary(
+            "TensorNanToNum", result, tensor, BackwardFunctions<T>.NanToNumBackward);
         return result;
     }
 
@@ -1361,11 +1375,23 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0)
-        => TriangularFill(tensor, diagonal, keepUpper: true);
+    {
+        var result = TriangularFill(tensor, diagonal, keepUpper: true);
+        DifferentiableOps.RecordUnary(
+            "TensorTriu", result, tensor, BackwardFunctions<T>.TriuBackward,
+            savedState: new object[] { diagonal });
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTril<T>(Tensor<T> tensor, int diagonal = 0)
-        => TriangularFill(tensor, diagonal, keepUpper: false);
+    {
+        var result = TriangularFill(tensor, diagonal, keepUpper: false);
+        DifferentiableOps.RecordUnary(
+            "TensorTril", result, tensor, BackwardFunctions<T>.TrilBackward,
+            savedState: new object[] { diagonal });
+        return result;
+    }
 
     private Tensor<T> TriangularFill<T>(Tensor<T> tensor, int diagonal, bool keepUpper)
     {
@@ -2777,7 +2803,7 @@ public partial class CpuEngine
             throw new System.NotImplementedException(
                 $"Polygamma for n={n} is not yet implemented (n=0 digamma and n=1 trigamma only; refs #210 follow-up).");
 
-        return ElementwiseUnary(tensor, x => {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
             // Trigamma via recurrence-up for small x, then asymptotic series.
@@ -2799,6 +2825,24 @@ public partial class CpuEngine
                     - inv2 * (1.0 / 42.0)));
             return ops.FromDouble(shift + series);
         }, "TensorPolygamma");
+        // d/dx polygamma(n, x) = polygamma(n+1, x). We only support n∈{0,1}
+        // so the derivative is polygamma(n+1, x) which is n=1 or n=2. Since
+        // n=2 isn't implemented, we only record backward when n=0 so the
+        // chain via DigammaBackward (TensorDigamma already handled) works.
+        // For n=1 we stash savedState but PolygammaBackward will throw when
+        // it tries polygamma(2) — acceptable since forward disallows n>1.
+        if (n == 0)
+        {
+            // TensorDigamma already records DigammaBackward so this branch
+            // doesn't need a separate recording.
+        }
+        else
+        {
+            DifferentiableOps.RecordUnary(
+                "TensorPolygamma", result, tensor, BackwardFunctions<T>.PolygammaBackward,
+                savedState: new object[] { n });
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -2875,7 +2919,8 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI0e<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             // I₀ with exponential scaling: e^(-|x|) · I₀(x). Safe for large x
             // where I₀ overflows.
             var ops = MathHelper.GetNumericOperations<T>();
@@ -2893,10 +2938,14 @@ public partial class CpuEngine
             }
             return ops.FromDouble(System.Math.Exp(-absX) * sum);
         }, "TensorI0e");
+        DifferentiableOps.RecordUnary("TensorI0e", result, tensor, BackwardFunctions<T>.I0eBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorI1e<T>(Tensor<T> tensor)
-        => ElementwiseUnary(tensor, x => {
+    {
+        var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
             double absX = System.Math.Abs(xd);
@@ -2912,6 +2961,9 @@ public partial class CpuEngine
             }
             return ops.FromDouble(System.Math.Exp(-absX) * halfX * sum);
         }, "TensorI1e");
+        DifferentiableOps.RecordUnary("TensorI1e", result, tensor, BackwardFunctions<T>.I1eBackward);
+        return result;
+    }
 
     /// <inheritdoc/>
     public virtual (Tensor<T> Mantissa, Tensor<int> Exponent) TensorFrexp<T>(Tensor<T> tensor)

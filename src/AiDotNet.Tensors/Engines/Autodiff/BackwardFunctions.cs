@@ -4397,4 +4397,252 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[i], gradI, engine);
         }
     }
+
+    /// <summary>
+    /// Triu backward: re-apply the same upper-triangular mask to gradOutput.
+    /// savedState[0] = diagonal (int).
+    /// </summary>
+    internal static void TriuBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int diagonal = (int)savedState[0];
+        var grad = engine.TensorTriu(gradOutput, diagonal);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Tril backward: re-apply the same lower-triangular mask to gradOutput.
+    /// savedState[0] = diagonal (int).
+    /// </summary>
+    internal static void TrilBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int diagonal = (int)savedState[0];
+        var grad = engine.TensorTril(gradOutput, diagonal);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// NanToNum backward: grad passes through where input was finite, zero
+    /// elsewhere (NaN, ±Inf).  Matches PyTorch's torch.nan_to_num gradient:
+    /// since the output is a constant whenever the input is non-finite,
+    /// the derivative at those positions is zero.
+    /// </summary>
+    internal static void NanToNumBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var go = gradOutput.AsSpan();
+        var dst = grad.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < src.Length; i++)
+        {
+            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
+            // net471 lacks double.IsFinite — check NaN/Infinity explicitly.
+            bool isFinite = !(double.IsNaN(d) || double.IsInfinity(d));
+            dst[i] = isFinite ? go[i] : zero;
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// DiagEmbed backward: extract the diagonal from gradOutput at the given
+    /// offset to recover the gradient with the input's original shape.
+    /// savedState[0] = offset (int).
+    /// </summary>
+    internal static void DiagEmbedBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int offset = (int)savedState[0];
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        int rank = input.Rank;
+        int diagLen = input._shape[rank - 1];
+        int matSize = diagLen + System.Math.Abs(offset);
+
+        var grad = new Tensor<T>(input._shape);
+        var go = gradOutput.AsSpan();
+        var dst = grad.AsWritableSpan();
+
+        int batchSize = 1;
+        for (int k = 0; k < rank - 1; k++) batchSize *= input._shape[k];
+
+        for (int b = 0; b < batchSize; b++)
+            for (int i = 0; i < diagLen; i++)
+            {
+                int row = offset >= 0 ? i : i - offset;
+                int col = offset >= 0 ? i + offset : i;
+                int srcPos = b * matSize * matSize + row * matSize + col;
+                int dstPos = b * diagLen + i;
+                dst[dstPos] = go[srcPos];
+            }
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// Inner backward: tensor inner product is sum along the last axis of
+    /// a * b broadcast-expanded. For rank-1 inputs, dL/da = dL/dy · b and
+    /// dL/db = dL/dy · a (dL/dy is a scalar). For higher ranks, broadcasting
+    /// multiplies across all but the last dim.
+    /// </summary>
+    internal static void InnerBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var a = inputs[0];
+        var b = inputs[1];
+        // Both at least rank-1 with matching final dim. gradOutput has shape
+        // a.shape[:-1] + b.shape[:-1]. Broadcasting multiplication recovers
+        // full-rank gradients; we then sum along the correct axes.
+        //
+        // For the common scalar-output rank-1 case (vectors), gradOutput is a
+        // scalar s; dL/da = s · b; dL/db = s · a.
+        if (a.Rank == 1 && b.Rank == 1)
+        {
+            T s = gradOutput.AsSpan()[0];
+            var dA = engine.TensorMultiplyScalar(b, s);
+            var dB = engine.TensorMultiplyScalar(a, s);
+            DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
+            DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
+            return;
+        }
+        // General case falls back to einsum: inner(a, b) = a...i, b...i -> ab...
+        // dL/da[...i] = Σ_b dL/dy[ab...] · b[b...i]; symmetric for b.
+        // Use einsum of the original semantics for the backward.
+        var aLabels = "a" + GetLabels(a.Rank - 1, 'c');
+        var bLabels = "b" + GetLabels(b.Rank - 1, 'k');
+        // Inner requires a.shape[-1] == b.shape[-1], so re-use same trailing label.
+        aLabels = aLabels.Substring(0, aLabels.Length - 1) + "z";
+        bLabels = bLabels.Substring(0, bLabels.Length - 1) + "z";
+        // NOTE: scaffolded — higher-rank Inner is rare; keep stub for now.
+        // Users that hit this will see a clear error vs. silent wrong grad.
+        throw new NotSupportedException(
+            "Inner backward for rank>1 tensors is not yet implemented; " +
+            "use Matmul or Einsum and take their gradients instead.");
+    }
+
+    private static string GetLabels(int n, char start)
+    {
+        if (n <= 0) return string.Empty;
+        var arr = new char[n];
+        for (int i = 0; i < n; i++) arr[i] = (char)(start + i);
+        return new string(arr);
+    }
+
+    /// <summary>
+    /// Polygamma backward: d/dx polygamma(n, x) = polygamma(n+1, x).
+    /// savedState[0] = n (int).
+    /// </summary>
+    internal static void PolygammaBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int n = (int)savedState[0];
+        var dOut = engine.TensorPolygamma(n + 1, inputs[0]);
+        var grad = engine.TensorMultiply(gradOutput, dOut);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// AddMM backward for input (the bias tensor).  Y = β·input + α·A·B;
+    /// since input is added elementwise, dY/dinput = β·I.
+    /// savedState[0] = α (T), savedState[1] = β (T).
+    /// </summary>
+    internal static void AddMMBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        T alpha = ops.FromDouble((double)savedState[0]);
+        T beta = ops.FromDouble((double)savedState[1]);
+        var input = inputs[0];
+        var a = inputs[1];
+        var b = inputs[2];
+        // dL/dinput = β · gradOutput (broadcast-reduced to input's shape).
+        var betaGrad = engine.TensorMultiplyScalar(gradOutput, beta);
+        DifferentiableOps.AccumulateGrad(grads, input, betaGrad, engine);
+        // dL/dA = α · gradOutput · Bᵀ; dL/dB = α · Aᵀ · gradOutput.
+        var bT = engine.TensorTranspose(b);
+        var aT = engine.TensorTranspose(a);
+        var dA = engine.TensorMultiplyScalar(engine.TensorMatMul(gradOutput, bT), alpha);
+        var dB = engine.TensorMultiplyScalar(engine.TensorMatMul(aT, gradOutput), alpha);
+        DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
+    }
+
+    /// <summary>
+    /// Cross backward: for y = cross(a, b) along dim = -1 (size 3), the
+    /// cross product is bilinear: dy/da = b × (·), dy/db = (·) × a. Concretely,
+    /// dL/da = gradOutput × b (cross of gradOutput with b), and
+    /// dL/db = a × gradOutput.  Uses savedState[0] = dim (int).
+    /// </summary>
+    internal static void CrossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int dim = (int)savedState[0];
+        var a = inputs[0];
+        var b = inputs[1];
+        var dA = engine.TensorCross(gradOutput, b, dim);
+        var dB = engine.TensorCross(a, gradOutput, dim);
+        DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
+    }
+
+    /// <summary>
+    /// I0e / I1e backward: scaled modified Bessel functions.
+    /// I0e(x) = exp(-|x|) · I0(x); similarly for I1e.
+    /// d/dx I0e(x) = I1e(x) - sign(x) · I0e(x)
+    /// d/dx I1e(x) = I0e(x) - I1e(x)·(1/|x| + sign(x))  (for x ≠ 0)
+    /// We compute via d/dx I0e = I1e - sign(x)·I0e  (safe for x = 0 where I1e(0) = 0).
+    /// </summary>
+    internal static void I0eBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var x = inputs[0];
+        var i1e = engine.TensorI1e(x);
+        var sign = engine.TensorSign(x);
+        var signI0e = engine.TensorMultiply(sign, output);
+        var deriv = engine.TensorSubtract(i1e, signI0e);
+        var grad = engine.TensorMultiply(gradOutput, deriv);
+        DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+    }
+
+    /// <summary>
+    /// I1e backward using d/dx I1e(x) = I0e(x) - I1e(x)·sign(x) - I1e(x)/|x|.
+    /// For x = 0 the limit is finite (I0e(0) = 1, I1e(0) = 0) so we guard.
+    /// </summary>
+    internal static void I1eBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var x = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var deriv = new Tensor<T>(x._shape);
+        var xs = x.AsSpan();
+        var i1es = output.AsSpan();
+        var dst = deriv.AsWritableSpan();
+        // compute I0e on the side
+        var i0e = engine.TensorI0e(x).AsSpan();
+        for (int i = 0; i < xs.Length; i++)
+        {
+            double xi = System.Convert.ToDouble(xs[i], System.Globalization.CultureInfo.InvariantCulture);
+            double i0v = System.Convert.ToDouble(i0e[i], System.Globalization.CultureInfo.InvariantCulture);
+            double i1v = System.Convert.ToDouble(i1es[i], System.Globalization.CultureInfo.InvariantCulture);
+            double d;
+            if (xi == 0.0) d = 0.0; // limit at 0
+            else d = i0v - i1v * (System.Math.Sign(xi) + 1.0 / System.Math.Abs(xi));
+            dst[i] = ops.FromDouble(d);
+        }
+        var grad = engine.TensorMultiply(gradOutput, deriv);
+        DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+    }
 }
