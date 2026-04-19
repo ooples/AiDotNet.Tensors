@@ -6573,6 +6573,19 @@ public interface IEngine
     Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other);
 
     /// <summary>
+    /// Broadcast a set of tensors to a common shape (torch.broadcast_tensors).
+    /// Returns one output per input, each with the broadcast shape.
+    /// </summary>
+    Tensor<T>[] TensorBroadcastTensors<T>(Tensor<T>[] tensors);
+
+    /// <summary>
+    /// Unique *consecutive* values — only collapses runs of repeated values
+    /// (torch.unique_consecutive). Unlike Unique, does not change relative
+    /// order or remove non-adjacent repeats.
+    /// </summary>
+    Tensor<T> TensorUniqueConsecutive<T>(Tensor<T> input);
+
+    /// <summary>
     /// Build a block-diagonal matrix from 2-D matrices (torch.block_diag).
     /// Result shape = (Σ rows) × (Σ cols); off-diagonal blocks are zero.
     /// </summary>

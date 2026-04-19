@@ -851,6 +851,62 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorBroadcastTensors<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length == 0) return System.Array.Empty<Tensor<T>>();
+
+        // Compute the common broadcast shape: right-align, size-1 ↔ any,
+        // mismatch otherwise.
+        int maxRank = 0;
+        foreach (var t in tensors)
+        {
+            if (t == null) throw new ArgumentNullException(nameof(tensors));
+            if (t.Rank > maxRank) maxRank = t.Rank;
+        }
+        var broadcast = new int[maxRank];
+        for (int i = 0; i < maxRank; i++) broadcast[i] = 1;
+        foreach (var t in tensors)
+        {
+            int offset = maxRank - t.Rank;
+            for (int i = 0; i < t.Rank; i++)
+            {
+                int d = t._shape[i];
+                int target = broadcast[offset + i];
+                if (target == 1) broadcast[offset + i] = d;
+                else if (d != 1 && d != target)
+                    throw new ArgumentException(
+                        $"Cannot broadcast dim {d} against {target} at position {offset + i}");
+            }
+        }
+
+        // Broadcast every input to `broadcast`.
+        var result = new Tensor<T>[tensors.Length];
+        for (int k = 0; k < tensors.Length; k++)
+            result[k] = TensorBroadcastTo(tensors[k], broadcast);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorUniqueConsecutive<T>(Tensor<T> input)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        if (src.Length == 0) return new Tensor<T>(new T[0], new[] { 0 });
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var keep = new System.Collections.Generic.List<T>();
+        keep.Add(src[0]);
+        for (int i = 1; i < src.Length; i++)
+        {
+            if (!ops.Equals(src[i], src[i - 1])) keep.Add(src[i]);
+        }
+        var arr = keep.ToArray();
+        return new Tensor<T>(arr, new[] { arr.Length });
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices)
     {
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));

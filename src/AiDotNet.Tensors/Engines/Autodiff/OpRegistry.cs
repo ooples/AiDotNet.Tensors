@@ -104,7 +104,7 @@ internal static class OpRegistry
         // Parity-210 indexing family (forward only in v1)
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy",
         "TensorMaskedScatter", "TensorScatterReduce",
-        "TensorBroadcastTo", "TensorExpandAs",
+        "TensorBroadcastTo", "TensorExpandAs", "TensorBroadcastTensors",
         "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
 
@@ -145,7 +145,8 @@ internal static class OpRegistry
         "TensorGreaterOrEqual", "TensorLessOrEqual",
         "TensorIsClose", "TensorAllClose", "TensorIsIn", "TensorAminmax",
         "TensorKthvalue", "TensorMedian", "TensorNanMedian", "TensorMode",
-        "TensorUnique", "TensorSearchSorted", "TensorBucketize", "TensorHistogram",
+        "TensorUnique", "TensorUniqueConsecutive",
+        "TensorSearchSorted", "TensorBucketize", "TensorHistogram",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",
