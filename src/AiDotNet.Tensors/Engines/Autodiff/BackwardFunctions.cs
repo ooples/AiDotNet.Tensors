@@ -4243,8 +4243,12 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// IndexCopy backward: gradient at copied positions is zeroed on the
-    /// input (the original values are overwritten); rest passes through.
+    /// IndexCopy backward.  Forward is <c>result = input; result[idx] = source</c>.
+    ///   dL/d(input)  = gradOutput with zeroed rows at the copied indices
+    ///                  (those positions no longer depend on input).
+    ///   dL/d(source) = gradOutput gathered along axis at the indices
+    ///                  (each source row flowed verbatim into one output row).
+    /// savedState[0] = axis, savedState[1] = indices.
     /// </summary>
     internal static void IndexCopyBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4253,8 +4257,9 @@ internal static class BackwardFunctions<T>
         int axis = (int)savedState[0];
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
-        // Clone gradOutput; zero-out positions that got overwritten.
         var ops = MathHelper.GetNumericOperations<T>();
+
+        // dL/d(input): clone gradOutput, zero the overwritten positions.
         var grad = (Tensor<T>)gradOutput.Clone();
         var dst = grad.AsWritableSpan();
         int rank = input.Rank;
@@ -4268,12 +4273,31 @@ internal static class BackwardFunctions<T>
             for (int i = 0; i < idx.Length; i++)
             {
                 int target = idx[i];
+                if (target < 0 || target >= axisSize) continue;
                 for (int inner = 0; inner < innerSize; inner++)
-                {
                     dst[outer * axisSize * innerSize + target * innerSize + inner] = zero;
-                }
             }
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+
+        // dL/d(source): present only when the forward recorded RecordBinary.
+        if (inputs.Length < 2) return;
+        var source = inputs[1];
+        var srcGrad = new Tensor<T>(source._shape);
+        var sd = srcGrad.AsWritableSpan();
+        var go = gradOutput.AsSpan();
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idx.Length; i++)
+            {
+                int target = idx[i];
+                if (target < 0 || target >= axisSize) continue;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int goPos = outer * axisSize * innerSize + target * innerSize + inner;
+                    int sdPos = outer * idx.Length * innerSize + i * innerSize + inner;
+                    sd[sdPos] = go[goPos];
+                }
+            }
+        DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
     /// <summary>
@@ -4348,9 +4372,12 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// MaskedScatter backward: gradient passes through at non-masked positions
-    /// (original input survives); masked positions get zero on the input side
-    /// (they were overwritten by source).
+    /// MaskedScatter backward.  Forward is
+    ///   <c>result[i] = mask[i] ? source[prefixSum[i]] : input[i]</c>.
+    ///   dL/d(input)  = gradOutput with zeros at masked positions.
+    ///   dL/d(source) = flat gather of gradOutput at the masked positions
+    ///                  (in row-major order); size = popcount(mask).
+    /// savedState[0] = mask (Tensor&lt;Bit&gt;).
     /// </summary>
     internal static void MaskedScatterBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4358,13 +4385,34 @@ internal static class BackwardFunctions<T>
     {
         var mask = (Tensor<Bit>)savedState[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        var grad = (Tensor<T>)gradOutput.Clone();
-        var dst = grad.AsWritableSpan();
+
+        // dL/d(input): clone gradOutput, zero masked positions.
+        var inputGrad = (Tensor<T>)gradOutput.Clone();
+        var inputDst = inputGrad.AsWritableSpan();
         var maskSpan = mask.AsSpan();
+        var go = gradOutput.AsSpan();
         var zero = ops.Zero;
-        for (int i = 0; i < dst.Length; i++)
-            if ((bool)maskSpan[i]) dst[i] = zero;
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        int maskedCount = 0;
+        for (int i = 0; i < inputDst.Length; i++)
+        {
+            if ((bool)maskSpan[i]) { inputDst[i] = zero; maskedCount++; }
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+
+        // dL/d(source): flat gather at masked positions. Only propagate when
+        // the forward recorded the source as a second input.
+        if (inputs.Length < 2) return;
+        var source = inputs[1];
+        // Source is 1-D with length = number of mask-trues; entries are
+        // consumed in row-major order as the mask is scanned.
+        var srcGrad = new Tensor<T>(source._shape);
+        var sd = srcGrad.AsWritableSpan();
+        int cursor = 0;
+        for (int i = 0; i < maskSpan.Length && cursor < sd.Length; i++)
+        {
+            if ((bool)maskSpan[i]) sd[cursor++] = go[i];
+        }
+        DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
     /// <summary>

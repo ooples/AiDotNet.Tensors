@@ -2076,8 +2076,8 @@ public partial class CpuEngine
                 }
             }
         }
-        DifferentiableOps.RecordUnary(
-            "TensorIndexCopy", result, tensor,
+        DifferentiableOps.RecordBinary(
+            "TensorIndexCopy", result, tensor, source,
             BackwardFunctions<T>.IndexCopyBackward,
             savedState: new object[] { axis, indices });
         return result;
@@ -2432,8 +2432,8 @@ public partial class CpuEngine
                 dst[i] = srcData[sourceCursor++];
             }
         }
-        DifferentiableOps.RecordUnary(
-            "TensorMaskedScatter", result, tensor,
+        DifferentiableOps.RecordBinary(
+            "TensorMaskedScatter", result, tensor, source,
             BackwardFunctions<T>.MaskedScatterBackward,
             savedState: new object[] { mask });
         return result;
