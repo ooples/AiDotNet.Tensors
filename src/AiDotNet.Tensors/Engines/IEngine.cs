@@ -6360,6 +6360,12 @@ public interface IEngine
     /// <summary>1-D vector inner product Σ a[i]·b[i] (torch.linalg.vecdot).</summary>
     T TensorVecDot<T>(Tensor<T> a, Tensor<T> b);
 
+    /// <summary>
+    /// Vector cross product a × b along <paramref name="dim"/> (torch.cross /
+    /// torch.linalg.cross). The named dim must have size 3.
+    /// </summary>
+    Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1);
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 

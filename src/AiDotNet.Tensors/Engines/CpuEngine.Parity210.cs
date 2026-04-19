@@ -581,6 +581,47 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!a._shape.SequenceEqual(b._shape))
+            throw new ArgumentException("Cross: shapes must match");
+        int rank = a.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        if (a._shape[dim] != 3)
+            throw new ArgumentException($"Cross requires size 3 along dim {dim}; got {a._shape[dim]}");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        var dst = result.AsWritableSpan();
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= a._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= a._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                int b0 = outer * 3 * innerSize + 0 * innerSize + inner;
+                int b1 = outer * 3 * innerSize + 1 * innerSize + inner;
+                int b2 = outer * 3 * innerSize + 2 * innerSize + inner;
+                T ax = av[b0], ay = av[b1], az = av[b2];
+                T bx = bv[b0], by = bv[b1], bz = bv[b2];
+                // c = a × b = (ay·bz - az·by, az·bx - ax·bz, ax·by - ay·bx)
+                dst[b0] = ops.Subtract(ops.Multiply(ay, bz), ops.Multiply(az, by));
+                dst[b1] = ops.Subtract(ops.Multiply(az, bx), ops.Multiply(ax, bz));
+                dst[b2] = ops.Subtract(ops.Multiply(ax, by), ops.Multiply(ay, bx));
+            }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual T TensorVecDot<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
