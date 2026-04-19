@@ -851,6 +851,86 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices)
+    {
+        if (matrices == null) throw new ArgumentNullException(nameof(matrices));
+        if (matrices.Length == 0) throw new ArgumentException("BlockDiag requires at least one matrix");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int totalRows = 0, totalCols = 0;
+        foreach (var m in matrices)
+        {
+            if (m == null) throw new ArgumentNullException(nameof(matrices));
+            if (m.Rank != 2) throw new ArgumentException("BlockDiag requires 2-D matrices");
+            totalRows += m._shape[0];
+            totalCols += m._shape[1];
+        }
+
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { totalRows, totalCols });
+        var dst = result.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < dst.Length; i++) dst[i] = zero;
+
+        int rowOffset = 0, colOffset = 0;
+        foreach (var m in matrices)
+        {
+            var contig = m.IsContiguous ? m : m.Contiguous();
+            var src = contig.AsSpan();
+            int r = m._shape[0], c = m._shape[1];
+            for (int i = 0; i < r; i++)
+                for (int j = 0; j < c; j++)
+                    dst[(rowOffset + i) * totalCols + (colOffset + j)] = src[i * c + j];
+            rowOffset += r;
+            colOffset += c;
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorSliceScatter<T>(
+        Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        if (start < 0 || start + length > tensor._shape[dim])
+            throw new ArgumentOutOfRangeException(
+                $"slice[{dim}] start={start} length={length} out of range for axis size {tensor._shape[dim]}");
+        if (source._shape[dim] != length)
+            throw new ArgumentException(
+                $"source.shape[{dim}]={source._shape[dim]} must match length={length}");
+        for (int k = 0; k < rank; k++)
+        {
+            if (k != dim && source._shape[k] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
+        }
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var src = source.AsSpan();
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
+        int dstAxis = tensor._shape[dim];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < length; i++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int dstPos = outer * dstAxis * innerSize + (start + i) * innerSize + inner;
+                    int srcPos = outer * length * innerSize + i * innerSize + inner;
+                    dst[dstPos] = src[srcPos];
+                }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorIndexFill<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {

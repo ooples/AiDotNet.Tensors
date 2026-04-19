@@ -106,6 +106,7 @@ internal static class OpRegistry
         "TensorMaskedScatter", "TensorScatterReduce",
         "TensorBroadcastTo", "TensorExpandAs",
         "TensorTake", "TensorTakeAlongDim",
+        "TensorBlockDiag", "TensorSliceScatter",
 
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",

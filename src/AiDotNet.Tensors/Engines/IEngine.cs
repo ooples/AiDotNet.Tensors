@@ -6554,6 +6554,18 @@ public interface IEngine
     Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other);
 
     /// <summary>
+    /// Build a block-diagonal matrix from 2-D matrices (torch.block_diag).
+    /// Result shape = (Σ rows) × (Σ cols); off-diagonal blocks are zero.
+    /// </summary>
+    Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices);
+
+    /// <summary>
+    /// Overwrite a contiguous slice of <paramref name="tensor"/> along
+    /// <paramref name="dim"/> with <paramref name="source"/> (torch.slice_scatter).
+    /// </summary>
+    Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length);
+
+    /// <summary>
     /// Scatter elements from <paramref name="source"/> into
     /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
     /// <see cref="Bit.True"/>, consuming the source in row-major order
