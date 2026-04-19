@@ -56,6 +56,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _hyperbolicLibrary;
     private IntPtr _octonionLibrary;
     private IntPtr _spectralPerfLibrary;
+    private IntPtr _parity210Library;
 
     #region Properties
 
@@ -216,6 +217,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"Metal IoULoss pre-compilation warning: {ex.Message}");
+        }
+
+        // Parity-210 hot-path kernels — same function surface as CUDA/HIP.
+        try
+        {
+            _parity210Library = _shaderLibrary.CompileLibrary("Parity210",
+                MetalParity210Kernels.Source);
+        }
+        catch (Exception ex)
+        {
+            // Parity-210 library is optional; CPU fallback via CpuEngine inheritance stays intact.
+            System.Diagnostics.Debug.WriteLine($"Metal Parity-210 pre-compilation warning: {ex.Message}");
+            _parity210Library = IntPtr.Zero;
         }
     }
 
