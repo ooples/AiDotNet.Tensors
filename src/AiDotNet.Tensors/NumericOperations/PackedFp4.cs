@@ -18,11 +18,9 @@ namespace AiDotNet.Tensors.NumericOperations;
 /// </summary>
 public static class Fp4E2M1
 {
-    /// <summary>
-    /// Precomputed values of every FP4 E2M1 code, indexed by nibble.
-    /// Code 0 = +0 (positive zero), 8 = −0 (negative zero, collapsed).
-    /// </summary>
-    public static readonly float[] Table =
+    // Private backing array so callers can't mutate the FP4 code table
+    // at runtime and corrupt quantize/dequant process-wide.
+    private static readonly float[] _table =
     {
         0.0f,   // 0000: +0
         0.5f,   // 0001: +0.5
@@ -43,21 +41,36 @@ public static class Fp4E2M1
     };
 
     /// <summary>
+    /// Read-only view of the precomputed FP4 E2M1 code values, indexed
+    /// by nibble. Code 0 = +0 (positive zero), 8 = −0 (negative zero,
+    /// collapsed).
+    /// </summary>
+    public static ReadOnlySpan<float> Table => _table;
+
+    /// <summary>
     /// Snap <paramref name="value"/> to its nearest FP4 code [0, 15]
     /// with saturation — values beyond ±6 clamp to ±6 (no Inf
-    /// encoding in MXFP4 E2M1).
+    /// encoding in MXFP4 E2M1). Ties break toward the entry of smaller
+    /// magnitude.
     /// </summary>
     public static int ToIndex(float value)
     {
         if (float.IsNaN(value)) return 0; // no NaN encoding; collapse to +0
-        if (value >= Table[7])  return 7;  // +6 cap
-        if (value <= Table[15]) return 15; // -6 cap
+        if (value >= _table[7])  return 7;  // +6 cap
+        if (value <= _table[15]) return 15; // -6 cap
         int best = 0;
-        float bestErr = Math.Abs(value - Table[0]);
-        for (int i = 1; i < Table.Length; i++)
+        float bestErr = Math.Abs(value - _table[0]);
+        for (int i = 1; i < _table.Length; i++)
         {
-            float e = Math.Abs(value - Table[i]);
-            if (e < bestErr) { bestErr = e; best = i; }
+            float e = Math.Abs(value - _table[i]);
+            // Tie-break toward the lower-magnitude entry so ±0 collisions
+            // and midpoint values pick the "smaller" code deterministically.
+            if (e < bestErr ||
+                (e == bestErr && Math.Abs(_table[i]) < Math.Abs(_table[best])))
+            {
+                bestErr = e;
+                best = i;
+            }
         }
         return best;
     }
@@ -65,8 +78,8 @@ public static class Fp4E2M1
     /// <summary>Dequantize an FP4 code to float.</summary>
     public static float FromIndex(int index)
     {
-        if ((uint)index >= (uint)Table.Length)
+        if ((uint)index >= (uint)_table.Length)
             throw new ArgumentOutOfRangeException(nameof(index));
-        return Table[index];
+        return _table[index];
     }
 }

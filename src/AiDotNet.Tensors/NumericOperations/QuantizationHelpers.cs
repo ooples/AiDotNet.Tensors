@@ -326,6 +326,20 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int gs = scale.GroupSize;
+        if (gs <= 0)
+            throw new ArgumentException(
+                $"scale.GroupSize must be positive for int2 dequantization (got {gs}).",
+                nameof(scale));
+        int expectedSrc = (dst.Length + PackedInt2.ValuesPerByte - 1) / PackedInt2.ValuesPerByte;
+        if (src.Length < expectedSrc)
+            throw new ArgumentException(
+                $"src must hold at least {expectedSrc} packed bytes (got {src.Length}).",
+                nameof(src));
+        int groups = (dst.Length + gs - 1) / gs;
+        if (scale.Scales.Length < groups)
+            throw new ArgumentException(
+                $"scale.Scales length {scale.Scales.Length} insufficient for {groups} groups.",
+                nameof(scale));
         for (int i = 0; i < dst.Length; i++)
         {
             int byteIdx = i / PackedInt2.ValuesPerByte;
@@ -395,6 +409,20 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int gs = scale.GroupSize;
+        if (gs <= 0)
+            throw new ArgumentException(
+                $"scale.GroupSize must be positive for int3 dequantization (got {gs}).",
+                nameof(scale));
+        int expectedSrc = (dst.Length + PackedInt3Block.ValuesPerBlock - 1) / PackedInt3Block.ValuesPerBlock;
+        if (src.Length < expectedSrc)
+            throw new ArgumentException(
+                $"src must hold at least {expectedSrc} packed blocks (got {src.Length}).",
+                nameof(src));
+        int groups = (dst.Length + gs - 1) / gs;
+        if (scale.Scales.Length < groups)
+            throw new ArgumentException(
+                $"scale.Scales length {scale.Scales.Length} insufficient for {groups} groups.",
+                nameof(scale));
         for (int i = 0; i < dst.Length; i++)
         {
             int blockIdx = i / PackedInt3Block.ValuesPerBlock;
@@ -458,6 +486,20 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int gs = scale.GroupSize;
+        if (gs <= 0)
+            throw new ArgumentException(
+                $"scale.GroupSize must be positive for NF4 dequantization (got {gs}).",
+                nameof(scale));
+        int expectedSrc = (dst.Length + 1) / 2;
+        if (src.Length < expectedSrc)
+            throw new ArgumentException(
+                $"src must hold at least {expectedSrc} packed bytes (got {src.Length}).",
+                nameof(src));
+        int groups = (dst.Length + gs - 1) / gs;
+        if (scale.Scales.Length < groups)
+            throw new ArgumentException(
+                $"scale.Scales length {scale.Scales.Length} insufficient for {groups} groups.",
+                nameof(scale));
         for (int i = 0; i < dst.Length; i++)
         {
             int byteIdx = i >> 1;
@@ -522,6 +564,20 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int gs = scale.GroupSize;
+        if (gs <= 0)
+            throw new ArgumentException(
+                $"scale.GroupSize must be positive for FP4 dequantization (got {gs}).",
+                nameof(scale));
+        int expectedSrc = (dst.Length + 1) / 2;
+        if (src.Length < expectedSrc)
+            throw new ArgumentException(
+                $"src must hold at least {expectedSrc} packed bytes (got {src.Length}).",
+                nameof(src));
+        int groups = (dst.Length + gs - 1) / gs;
+        if (scale.Scales.Length < groups)
+            throw new ArgumentException(
+                $"scale.Scales length {scale.Scales.Length} insufficient for {groups} groups.",
+                nameof(scale));
         for (int i = 0; i < dst.Length; i++)
         {
             int byteIdx = i >> 1;
@@ -547,35 +603,50 @@ public static class QuantizationHelpers
     public static void FakeQuantizeInt4(
         ReadOnlySpan<float> src, Span<float> dst, int groupSize = 32)
     {
+        // The inner Dequantize only fills dst.Length elements, so a
+        // shorter dst silently truncates the QAT forward pass and hides
+        // caller bugs. Fail fast so mismatched buffers surface immediately.
+        if (dst.Length < src.Length)
+            throw new ArgumentException(
+                $"dst length {dst.Length} must be at least src length {src.Length} for fake-quant.",
+                nameof(dst));
         int packedLen = (src.Length + 1) / 2;
         Span<PackedInt4> tmp = packedLen <= 256
             ? stackalloc PackedInt4[packedLen]
             : new PackedInt4[packedLen];
         var scale = QuantizeInt4(src, tmp, groupSize);
-        DequantizeInt4(tmp, scale, dst);
+        DequantizeInt4(tmp, scale, dst.Slice(0, src.Length));
     }
 
     /// <summary>FP8-style fake-quantize for NF4.</summary>
     public static void FakeQuantizeNF4(
         ReadOnlySpan<float> src, Span<float> dst, int groupSize = 64)
     {
+        if (dst.Length < src.Length)
+            throw new ArgumentException(
+                $"dst length {dst.Length} must be at least src length {src.Length} for fake-quant.",
+                nameof(dst));
         int packedLen = (src.Length + 1) / 2;
         Span<PackedInt4> tmp = packedLen <= 256
             ? stackalloc PackedInt4[packedLen]
             : new PackedInt4[packedLen];
         var scale = QuantizeNF4(src, tmp, groupSize);
-        DequantizeNF4(tmp, scale, dst);
+        DequantizeNF4(tmp, scale, dst.Slice(0, src.Length));
     }
 
     /// <summary>Fake-quantize for Int1 (BitNet's sign-STE).</summary>
     public static void FakeQuantizeInt1(
         ReadOnlySpan<float> src, Span<float> dst, int groupSize = 0)
     {
+        if (dst.Length < src.Length)
+            throw new ArgumentException(
+                $"dst length {dst.Length} must be at least src length {src.Length} for fake-quant.",
+                nameof(dst));
         int packedLen = (src.Length + 7) / 8;
         Span<PackedInt1> tmp = packedLen <= 256
             ? stackalloc PackedInt1[packedLen]
             : new PackedInt1[packedLen];
         var scale = QuantizeInt1(src, tmp, groupSize);
-        DequantizeInt1(tmp, scale, dst);
+        DequantizeInt1(tmp, scale, dst.Slice(0, src.Length));
     }
 }

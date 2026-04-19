@@ -106,10 +106,10 @@ public class GgufReaderTests
             w.Write((ulong)tensors.Length);
             w.Write((ulong)metadata.Count);
 
-            foreach (var (k, v) in metadata)
+            foreach (var kv in metadata)
             {
-                WriteString(w, k);
-                WriteValue(w, v);
+                WriteString(w, kv.Key);
+                WriteValue(w, kv.Value);
             }
             foreach (var (name, type, dims) in tensors)
             {

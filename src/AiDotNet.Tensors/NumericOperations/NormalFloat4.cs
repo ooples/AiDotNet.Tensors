@@ -14,13 +14,9 @@ namespace AiDotNet.Tensors.NumericOperations;
 /// </summary>
 public static class NormalFloat4
 {
-    /// <summary>
-    /// The 16 quantile anchor values, sorted ascending. From Dettmers
-    /// et al. (2023), "QLoRA: Efficient Finetuning of Quantized LLMs".
-    /// These are the values a weight in [-1, +1] (after absmax scaling)
-    /// is snapped to on quantize and recovered from on dequantize.
-    /// </summary>
-    public static readonly float[] Table =
+    // Private backing array so callers can't mutate the NF4 anchors at
+    // runtime and silently corrupt every quantizer in the process.
+    private static readonly float[] _table =
     {
         -1.0f,
         -0.6961928f,
@@ -41,24 +37,44 @@ public static class NormalFloat4
     };
 
     /// <summary>
+    /// Read-only view of the 16 quantile anchor values, sorted ascending.
+    /// From Dettmers et al. (2023), "QLoRA: Efficient Finetuning of
+    /// Quantized LLMs". These are the values a weight in [-1, +1] (after
+    /// absmax scaling) is snapped to on quantize and recovered from on
+    /// dequantize.
+    /// </summary>
+    public static ReadOnlySpan<float> Table => _table;
+
+    /// <summary>
     /// Snap <paramref name="value"/> in [-1, 1] to its nearest table
-    /// index [0..15]. Nearest-neighbor with tie-breaking by rounding
-    /// toward zero in the table (arbitrary but deterministic).
+    /// index [0..15]. Nearest-neighbor with tie-breaking toward the
+    /// table entry of smaller magnitude (deterministic, and consistent
+    /// with the documented "toward zero" rule).
     /// </summary>
     public static int ToIndex(float value)
     {
         // Clamp — values beyond ±1 saturate to the endpoints.
-        if (value <= Table[0]) return 0;
-        if (value >= Table[15]) return 15;
+        if (value <= _table[0]) return 0;
+        if (value >= _table[15]) return 15;
         // Linear scan; binary search is a micro-optimization that saves
         // a few cycles per call. The dominant cost at quantize time is
         // the absmax scan, not the lookup.
         int best = 0;
-        float bestErr = Math.Abs(value - Table[0]);
-        for (int i = 1; i < Table.Length; i++)
+        float bestErr = Math.Abs(value - _table[0]);
+        for (int i = 1; i < _table.Length; i++)
         {
-            float e = Math.Abs(value - Table[i]);
-            if (e < bestErr) { bestErr = e; best = i; }
+            float e = Math.Abs(value - _table[i]);
+            // On exact midpoints the strict `<` would keep the first hit
+            // (whichever side was scanned first), which silently picks
+            // away-from-zero when scanning ascending from the negative
+            // endpoint. Break ties by preferring the smaller-magnitude
+            // anchor so the observable rule matches the doc.
+            if (e < bestErr ||
+                (e == bestErr && Math.Abs(_table[i]) < Math.Abs(_table[best])))
+            {
+                bestErr = e;
+                best = i;
+            }
         }
         return best;
     }
@@ -68,8 +84,8 @@ public static class NormalFloat4
     /// </summary>
     public static float FromIndex(int index)
     {
-        if ((uint)index >= (uint)Table.Length)
+        if ((uint)index >= (uint)_table.Length)
             throw new ArgumentOutOfRangeException(nameof(index));
-        return Table[index];
+        return _table[index];
     }
 }

@@ -106,7 +106,7 @@ public class ExtendedQuantizationTests
     [Fact]
     public void NF4_TableHasSixteenDistinctValues()
     {
-        var distinct = new HashSet<float>(NormalFloat4.Table);
+        var distinct = new HashSet<float>(NormalFloat4.Table.ToArray());
         Assert.Equal(16, distinct.Count);
     }
 

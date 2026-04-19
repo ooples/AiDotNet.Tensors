@@ -48,6 +48,13 @@ public static class SmoothQuant
                 $"Length mismatch: activation {activationAbsMax.Length} vs weight {weightAbsMax.Length}.");
         if (alpha < 0f || alpha > 1f)
             throw new ArgumentOutOfRangeException(nameof(alpha), "alpha must be in [0, 1].");
+        // eps is the numerical floor for both magnitudes and the
+        // denominator of a 1/eps clamp. Zero, negative, NaN, or Inf all
+        // poison the clamp range silently; reject at the boundary.
+        // Using IsNaN || IsInfinity (not IsFinite) for net471 compat.
+        if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
+            throw new ArgumentOutOfRangeException(
+                nameof(eps), "eps must be finite and > 0.");
 
         int c = activationAbsMax.Length;
         var s = new float[c];
@@ -76,11 +83,21 @@ public static class SmoothQuant
     public static void ApplyToWeights(
         Span<float> weights, int outC, int inC, ReadOnlySpan<float> smoothingFactor)
     {
+        if (outC < 0)
+            throw new ArgumentOutOfRangeException(nameof(outC), "must be non-negative.");
+        if (inC < 0)
+            throw new ArgumentOutOfRangeException(nameof(inC), "must be non-negative.");
         if (smoothingFactor.Length != inC)
             throw new ArgumentException(
                 $"smoothingFactor length {smoothingFactor.Length} must match inC {inC}.");
-        if (weights.Length < outC * inC)
-            throw new ArgumentException("weights too small.");
+        // int multiplication wraps silently on realistic LLM shapes
+        // (e.g. 50k × 50k overflows int32), which would let an
+        // undersized weights buffer slip past the length check. Do the
+        // product in long.
+        long required = (long)outC * inC;
+        if (weights.Length < required)
+            throw new ArgumentException(
+                $"weights length {weights.Length} < outC*inC = {required}.", nameof(weights));
         for (int i = 0; i < outC; i++)
         {
             int rowBase = i * inC;
@@ -97,11 +114,18 @@ public static class SmoothQuant
     public static void ApplyToActivations(
         Span<float> activations, int batch, int inC, ReadOnlySpan<float> smoothingFactor)
     {
+        if (batch < 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "must be non-negative.");
+        if (inC < 0)
+            throw new ArgumentOutOfRangeException(nameof(inC), "must be non-negative.");
         if (smoothingFactor.Length != inC)
             throw new ArgumentException(
                 $"smoothingFactor length {smoothingFactor.Length} must match inC {inC}.");
-        if (activations.Length < batch * inC)
-            throw new ArgumentException("activations too small.");
+        long required = (long)batch * inC;
+        if (activations.Length < required)
+            throw new ArgumentException(
+                $"activations length {activations.Length} < batch*inC = {required}.",
+                nameof(activations));
         for (int n = 0; n < batch; n++)
         {
             int rowBase = n * inC;
@@ -118,8 +142,14 @@ public static class SmoothQuant
     /// </summary>
     public static float[] PerColumnAbsMax(ReadOnlySpan<float> data, int rows, int cols)
     {
-        if (data.Length < rows * cols)
-            throw new ArgumentException("data too small.");
+        if (rows < 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "must be non-negative.");
+        if (cols < 0)
+            throw new ArgumentOutOfRangeException(nameof(cols), "must be non-negative.");
+        long required = (long)rows * cols;
+        if (data.Length < required)
+            throw new ArgumentException(
+                $"data length {data.Length} < rows*cols = {required}.", nameof(data));
         var result = new float[cols];
         for (int i = 0; i < rows; i++)
         {

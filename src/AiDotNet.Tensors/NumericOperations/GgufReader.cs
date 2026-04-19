@@ -137,6 +137,12 @@ public static class GgufReader
                 6 => br.ReadSingle(),
                 7 => br.ReadByte() != 0,
                 8 => ReadString(br),
+                // Type 9 = nested array. The spec is recursive — array
+                // elements may themselves be arrays of any valid type —
+                // so a container-level file that embeds e.g. a list of
+                // token-merge pairs reaches this branch. Omitting it
+                // would throw InvalidDataException on valid GGUF input.
+                9 => ReadArray(br),
                 10 => br.ReadUInt64(),
                 11 => br.ReadInt64(),
                 12 => br.ReadDouble(),

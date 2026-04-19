@@ -313,6 +313,11 @@ internal static class PackedMatMul
         if (groupSize <= 0)
             throw new ArgumentException("Per-group scales required.", nameof(aScale));
         int groupsPerRow = (k + groupSize - 1) / groupSize;
+        int expectedScales = m * groupsPerRow;
+        if (aScale.Scales.Length < expectedScales)
+            throw new ArgumentException(
+                $"aScale.Scales length {aScale.Scales.Length} < M × groupsPerRow = {expectedScales}.",
+                nameof(aScale));
 
         c.Clear();
         for (int i = 0; i < m; i++)
@@ -359,6 +364,11 @@ internal static class PackedMatMul
         if (groupSize <= 0)
             throw new ArgumentException("Per-group scales required.", nameof(aScale));
         int groupsPerRow = (k + groupSize - 1) / groupSize;
+        int expectedScales = m * groupsPerRow;
+        if (aScale.Scales.Length < expectedScales)
+            throw new ArgumentException(
+                $"aScale.Scales length {aScale.Scales.Length} < M × groupsPerRow = {expectedScales}.",
+                nameof(aScale));
 
         c.Clear();
         for (int i = 0; i < m; i++)
@@ -407,7 +417,7 @@ internal static class PackedMatMul
     private static void Fp4FamilyMatMul(
         ReadOnlySpan<PackedInt4> a, QuantizationScale aScale,
         ReadOnlySpan<float> b, Span<float> c,
-        int m, int k, int n, float[] table)
+        int m, int k, int n, ReadOnlySpan<float> table)
     {
         if (aScale is null) throw new ArgumentNullException(nameof(aScale));
         if ((k & 1) != 0)
@@ -421,6 +431,11 @@ internal static class PackedMatMul
         if (groupSize <= 0)
             throw new ArgumentException("Per-group scales required.", nameof(aScale));
         int groupsPerRow = (k + groupSize - 1) / groupSize;
+        int expectedScales = m * groupsPerRow;
+        if (aScale.Scales.Length < expectedScales)
+            throw new ArgumentException(
+                $"aScale.Scales length {aScale.Scales.Length} < M × groupsPerRow = {expectedScales}.",
+                nameof(aScale));
 
         c.Clear();
         for (int i = 0; i < m; i++)
