@@ -150,7 +150,8 @@ internal static class OpRegistry
         "TensorIsFinite", "TensorIsNan", "TensorIsInf",
         "TensorKthvalue", "TensorMedian", "TensorNanMedian", "TensorMode",
         "TensorUnique", "TensorUniqueConsecutive",
-        "TensorSearchSorted", "TensorBucketize", "TensorHistogram",
+        "TensorSearchSorted", "TensorBucketize",
+        "TensorHistogram", "TensorHistogramDD",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",

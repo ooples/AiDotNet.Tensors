@@ -1557,6 +1557,70 @@ public partial class CpuEngine
         => TensorSearchSorted(boundaries, input, right);
 
     /// <inheritdoc/>
+    public virtual Tensor<int> TensorHistogramDD<T>(
+        Tensor<T> samples, int[] bins, T[] mins, T[] maxs)
+    {
+        if (samples == null) throw new ArgumentNullException(nameof(samples));
+        if (bins == null) throw new ArgumentNullException(nameof(bins));
+        if (mins == null) throw new ArgumentNullException(nameof(mins));
+        if (maxs == null) throw new ArgumentNullException(nameof(maxs));
+        if (samples.Rank != 2)
+            throw new ArgumentException("HistogramDD expects samples of shape [N, D]");
+        int n = samples._shape[0];
+        int d = samples._shape[1];
+        if (bins.Length != d || mins.Length != d || maxs.Length != d)
+            throw new ArgumentException($"bins / mins / maxs must have length D={d}");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int k = 0; k < d; k++)
+        {
+            if (bins[k] < 1) throw new ArgumentOutOfRangeException(nameof(bins));
+            if (ops.GreaterThanOrEquals(mins[k], maxs[k]))
+                throw new ArgumentException($"bins[{k}]: mins must be < maxs");
+        }
+
+        if (!samples.IsContiguous) samples = samples.Contiguous();
+        var src = samples.AsSpan();
+
+        // Output shape is bins[0] × bins[1] × ... × bins[d-1].
+        var result = new Tensor<int>(bins);
+        var dst = result.AsWritableSpan();
+
+        // Precompute widths and row-major strides of the output.
+        var widths = new T[d];
+        for (int k = 0; k < d; k++)
+            widths[k] = ops.Divide(ops.Subtract(maxs[k], mins[k]), ops.FromDouble(bins[k]));
+        var strides = ComputeRowMajorStrides(bins);
+
+        // Walk samples; compute bin index per dim; drop out-of-range samples.
+        for (int i = 0; i < n; i++)
+        {
+            int binIdx = 0;
+            bool inRange = true;
+            for (int k = 0; k < d; k++)
+            {
+                var v = src[i * d + k];
+                if (ops.LessThan(v, mins[k]) || ops.GreaterThan(v, maxs[k]))
+                {
+                    inRange = false; break;
+                }
+                int kIdx;
+                if (ops.Equals(v, maxs[k])) kIdx = bins[k] - 1;
+                else
+                {
+                    var f = ops.Divide(ops.Subtract(v, mins[k]), widths[k]);
+                    kIdx = ops.ToInt32(ops.Floor(f));
+                    if (kIdx >= bins[k]) kIdx = bins[k] - 1;
+                    if (kIdx < 0) kIdx = 0;
+                }
+                binIdx += kIdx * strides[k];
+            }
+            if (inRange) dst[binIdx]++;
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));

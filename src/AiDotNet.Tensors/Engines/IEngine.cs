@@ -6582,6 +6582,13 @@ public interface IEngine
     Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max);
 
     /// <summary>
+    /// N-dimensional histogram (torch.histogramdd). Input samples have shape
+    /// [N, D]; bins, mins, maxs all have length D. Output shape = bins[0] ×
+    /// … × bins[D-1] of int counts.
+    /// </summary>
+    Tensor<int> TensorHistogramDD<T>(Tensor<T> samples, int[] bins, T[] mins, T[] maxs);
+
+    /// <summary>
     /// Median ignoring NaN values (torch.nanmedian). Returns NaN if every
     /// value is NaN. Lower-median convention on even counts.
     /// </summary>
