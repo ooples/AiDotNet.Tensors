@@ -4487,10 +4487,13 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// Inner backward: tensor inner product is sum along the last axis of
-    /// a * b broadcast-expanded. For rank-1 inputs, dL/da = dL/dy · b and
-    /// dL/db = dL/dy · a (dL/dy is a scalar). For higher ranks, broadcasting
-    /// multiplies across all but the last dim.
+    /// Inner product backward. For inputs with shapes
+    /// <c>a = [*A, K]</c> and <c>b = [*B, K]</c> the forward is
+    /// <c>y[*A, *B] = Σ_k a[*A, k] · b[*B, k]</c>, so:
+    ///   dL/da[*A, k] = Σ_{*B} gradOutput[*A, *B] · b[*B, k]
+    ///   dL/db[*B, k] = Σ_{*A} gradOutput[*A, *B] · a[*A, k]
+    /// Both are plain einsum contractions — we reuse TensorEinsum which has
+    /// its own path optimizer + autograd plumbing.
     /// </summary>
     internal static void InnerBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4498,12 +4501,8 @@ internal static class BackwardFunctions<T>
     {
         var a = inputs[0];
         var b = inputs[1];
-        // Both at least rank-1 with matching final dim. gradOutput has shape
-        // a.shape[:-1] + b.shape[:-1]. Broadcasting multiplication recovers
-        // full-rank gradients; we then sum along the correct axes.
-        //
-        // For the common scalar-output rank-1 case (vectors), gradOutput is a
-        // scalar s; dL/da = s · b; dL/db = s · a.
+
+        // Common scalar-output vector case: gradOutput is a scalar s.
         if (a.Rank == 1 && b.Rank == 1)
         {
             T s = gradOutput.AsSpan()[0];
@@ -4513,19 +4512,34 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
             return;
         }
-        // General case falls back to einsum: inner(a, b) = a...i, b...i -> ab...
-        // dL/da[...i] = Σ_b dL/dy[ab...] · b[b...i]; symmetric for b.
-        // Use einsum of the original semantics for the backward.
-        var aLabels = "a" + GetLabels(a.Rank - 1, 'c');
-        var bLabels = "b" + GetLabels(b.Rank - 1, 'k');
-        // Inner requires a.shape[-1] == b.shape[-1], so re-use same trailing label.
-        aLabels = aLabels.Substring(0, aLabels.Length - 1) + "z";
-        bLabels = bLabels.Substring(0, bLabels.Length - 1) + "z";
-        // NOTE: scaffolded — higher-rank Inner is rare; keep stub for now.
-        // Users that hit this will see a clear error vs. silent wrong grad.
-        throw new NotSupportedException(
-            "Inner backward for rank>1 tensors is not yet implemented; " +
-            "use Matmul or Einsum and take their gradients instead.");
+
+        // General case via einsum. Layout:
+        //   a labels: A_{0..rA-2} + "k"       (rA labels, last is contraction)
+        //   b labels: B_{0..rB-2} + "k"       (rB labels, last is contraction)
+        //   out labels: A_{0..rA-2} + B_{0..rB-2}
+        // So the three equations are:
+        //   forward:       A..k, B..k  ->  A..B..
+        //   grad-a:        A..B.., B..k  ->  A..k
+        //   grad-b:        A..B.., A..k  ->  B..k
+        // Labels are drawn from disjoint ranges so they never clash.
+        int rA = a.Rank, rB = b.Rank;
+        string aFree = GetLabels(rA - 1, 'a');   // a..f
+        string bFree = GetLabels(rB - 1, 'g');   // g..l
+        const string k = "z";
+        string aAll = aFree + k;
+        string bAll = bFree + k;
+        string outLbl = aFree + bFree;
+
+        // dL/da = einsum( "A..B..,B..k -> A..k", gradOutput, b )
+        var dAEq = $"{outLbl},{bAll}->{aAll}";
+        var dAGrad = engine.TensorEinsum(dAEq, gradOutput, b);
+
+        // dL/db = einsum( "A..B..,A..k -> B..k", gradOutput, a )
+        var dBEq = $"{outLbl},{aAll}->{bAll}";
+        var dBGrad = engine.TensorEinsum(dBEq, gradOutput, a);
+
+        DifferentiableOps.AccumulateGrad(grads, a, dAGrad, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, dBGrad, engine);
     }
 
     private static string GetLabels(int n, char start)
