@@ -2368,25 +2368,53 @@ public class CpuEngine : ITensorLevelEngine
         int matrixSizeB = k * n;
         int matrixSizeResult = m * n;
 
-        // Fast path: for float, do sequential BLAS calls (avoids Parallel.For overhead for small batches)
-        // For B <= 16, the Parallel.For thread pool overhead exceeds the parallelism benefit.
-        if (typeof(T) == typeof(float) && batchSize <= 16)
+        // Fast path: for float, choose the right parallelism axis based on
+        // batch size.
+        //
+        // batchSize == 1: call Sgemm directly — it has internal Parallel.For
+        //   across the m dimension, so a single large slice still utilises
+        //   all cores. Outer Parallel.For(0, 1) would run serial anyway.
+        //
+        // batchSize >= 2: outer Parallel.For over the batch with
+        //   SgemmSequential per slice. Outer parallelism hides SGEMM dispatch
+        //   overhead and each worker can saturate a core on one slice.
+        //   Using Sgemm here would NEST parallel loops (one Parallel.For per
+        //   worker), which contends for the shared thread pool.
+        //
+        // BatchMatMulRootCauseDiag validated these tiers: batch=12 BERT
+        // attention slices are 3× faster with outer Parallel.For +
+        // SgemmSequential vs MatrixMultiplyHelper sequential; batch=1 FFN
+        // weight broadcasts use Sgemm's internal parallelism at ~100 GFLOP/s.
+        if (typeof(T) == typeof(float))
         {
-            for (int batch = 0; batch < batchSize; batch++)
+            var aF = (float[])(object)aData;
+            var bF = (float[])(object)bData;
+            var rF = (float[])(object)rData;
+            if (batchSize == 1)
             {
-                int aOffset = batch * matrixSizeA;
-                int bOffset = batch * matrixSizeB;
-                int resultOffset = batch * matrixSizeResult;
-                if (!MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, k, n))
+                Simd.SimdGemm.Sgemm(
+                    aF.AsSpan(0, matrixSizeA),
+                    bF.AsSpan(0, matrixSizeB),
+                    rF.AsSpan(0, matrixSizeResult),
+                    m, k, n);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, batch =>
                 {
-                    // BLAS unavailable — fall through to parallel path
-                    goto parallelFallback;
-                }
+                    int aOffset = batch * matrixSizeA;
+                    int bOffset = batch * matrixSizeB;
+                    int resultOffset = batch * matrixSizeResult;
+                    Simd.SimdGemm.SgemmSequential(
+                        aF.AsSpan(aOffset, matrixSizeA),
+                        bF.AsSpan(bOffset, matrixSizeB),
+                        rF.AsSpan(resultOffset, matrixSizeResult),
+                        m, k, n);
+                });
             }
             goto batchDone;
         }
 
-        parallelFallback:
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
