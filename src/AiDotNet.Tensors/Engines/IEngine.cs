@@ -6594,6 +6594,14 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source);
 
+    /// <summary>
+    /// Full multi-axis scatter (torch.index_put). One 1-D index tensor per
+    /// tensor axis; all index tensors must have the same length; source
+    /// has that same length. With <paramref name="accumulate"/> = true,
+    /// duplicate-index writes sum (matching torch's index_put_(accumulate=True)).
+    /// </summary>
+    Tensor<T> TensorIndexPut<T>(Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false);
+
     /// <summary>Broadcast <paramref name="tensor"/> to the shape of <paramref name="other"/> (torch.expand_as).</summary>
     Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other);
 

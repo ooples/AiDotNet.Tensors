@@ -867,6 +867,58 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorIndexPut<T>(
+        Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (indices.Length != rank)
+            throw new ArgumentException(
+                $"IndexPut expects one index tensor per axis ({rank}); got {indices.Length}");
+
+        // Every index tensor must be 1-D and the same length. Source length
+        // must match the index length.
+        int n = indices[0]?.Length ?? 0;
+        for (int k = 0; k < rank; k++)
+        {
+            if (indices[k] == null) throw new ArgumentNullException(nameof(indices));
+            if (indices[k].Rank != 1)
+                throw new ArgumentException($"indices[{k}] must be 1-D");
+            if (indices[k].Length != n)
+                throw new ArgumentException($"indices[{k}].Length={indices[k].Length} must match indices[0].Length={n}");
+        }
+        if (source.Length != n)
+            throw new ArgumentException($"source length {source.Length} must match index length {n}");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var srcData = source.AsSpan();
+
+        // Contiguous row-major strides over tensor.Shape.
+        var strides = ComputeRowMajorStrides(tensor._shape);
+        for (int i = 0; i < n; i++)
+        {
+            int pos = 0;
+            for (int k = 0; k < rank; k++)
+            {
+                int idx = indices[k][i];
+                if (idx < 0 || idx >= tensor._shape[k])
+                    throw new IndexOutOfRangeException(
+                        $"indices[{k}][{i}]={idx} out of range for axis size {tensor._shape[k]}");
+                pos += idx * strides[k];
+            }
+            dst[pos] = accumulate ? ops.Add(dst[pos], srcData[i]) : srcData[i];
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorIndexCopy<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
