@@ -121,6 +121,22 @@ internal static class PackedMatMul
         if (c.Length < m * n)
             throw new ArgumentException("c is too small.", nameof(c));
 
+        // This kernel only supports per-tensor (Scales.Length == 1) or per-row/col
+        // (Scales.Length == m for a, n for b). Per-group (Scales.Length = m * groups)
+        // would need the inner loop to pick a scale per k-chunk, which isn't
+        // implemented here — silently indexing Scales[i] or Scales[j] with per-group
+        // metadata reads the wrong row/col and returns plausible-but-wrong numbers.
+        if (aScale.Scales.Length != 1 && aScale.Scales.Length != m)
+            throw new ArgumentException(
+                $"aScale.Scales length {aScale.Scales.Length} must be 1 (per-tensor) or {m} (per-row). " +
+                "Per-group scales are not supported by Int1MatMulXnor.",
+                nameof(aScale));
+        if (bScale.Scales.Length != 1 && bScale.Scales.Length != n)
+            throw new ArgumentException(
+                $"bScale.Scales length {bScale.Scales.Length} must be 1 (per-tensor) or {n} (per-col). " +
+                "Per-group scales are not supported by Int1MatMulXnor.",
+                nameof(bScale));
+
         c.Clear();
 
         for (int i = 0; i < m; i++)
@@ -165,6 +181,15 @@ internal static class PackedMatMul
             throw new ArgumentException("b too small for K × N.", nameof(b));
         if (packed.Length < n * kBytes)
             throw new ArgumentException("packed too small for N × K/8.", nameof(packed));
+        // This packer emits exactly one scale per column (absmean over all k rows).
+        // A non-zero groupSize smaller than k would imply multiple scales per column,
+        // which we don't compute — honouring the group count would return a
+        // QuantizationScale that lies about its shape and break downstream kernels.
+        if (groupSize != 0 && groupSize != k)
+            throw new ArgumentException(
+                $"groupSize must be 0 (per-column) or equal to k ({k}); got {groupSize}. " +
+                "Per-group packing along K is not implemented.",
+                nameof(groupSize));
 
         // Per-column scale (BitNet absmean).
         var scales = new float[n];

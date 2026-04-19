@@ -37,6 +37,16 @@ public sealed class QuantizationScale
     public QuantizationScale(float[] scales, int groupSize, int[]? zeroPoints = null)
     {
         Scales = scales ?? throw new ArgumentNullException(nameof(scales));
+        // Negative GroupSize is meaningless — dequantizers either divide by it
+        // or use it as an index base, both of which produce garbage. Fail at
+        // construction rather than deep inside a dequant loop where the
+        // symptom (OOB / DivideByZero) hides the cause (bad metadata). Zero
+        // is still valid — it signals "per-tensor / single scale".
+        if (groupSize < 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(groupSize),
+                $"groupSize must be non-negative (got {groupSize}). " +
+                "Use 0 for per-tensor scale, or a positive value for per-group scale.");
         GroupSize = groupSize;
         ZeroPoints = zeroPoints ?? Array.Empty<int>();
         if (ZeroPoints.Length != 0 && ZeroPoints.Length != scales.Length)
@@ -130,6 +140,16 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int groupSize = scale.GroupSize;
+        // Int4 dequant is strictly per-group — the `g = i / groupSize` index
+        // below divides by groupSize, so 0 throws DivideByZeroException
+        // deep in the loop. Reject at the boundary with a clear message
+        // instead. Callers that really mean per-tensor should build an
+        // appropriately sized Scales array; the shared QuantizationScale
+        // zero-signifies-per-tensor convention doesn't apply to the int4 path.
+        if (groupSize <= 0)
+            throw new ArgumentException(
+                $"scale.GroupSize must be positive for int4 dequantization (got {groupSize}).",
+                nameof(scale));
         int n = dst.Length;
         int expectedSrc = (n + 1) / 2;
         if (src.Length < expectedSrc)
@@ -214,7 +234,25 @@ public static class QuantizationHelpers
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int n = dst.Length;
+        // scale.GroupSize == 0 means "per-tensor" (single scale applied to
+        // every element); treat that as "one group of length n". Positive
+        // values are real groupings.
         int groupSize = scale.GroupSize == 0 ? n : scale.GroupSize;
+
+        // Validate src + scale.Scales lengths up front so a malformed caller
+        // gets a deterministic ArgumentException instead of an
+        // IndexOutOfRangeException from deep in the loop — matches the
+        // fail-fast contract of DequantizeInt4 and the quantize entry points.
+        int expectedSrc = (n + PackedInt1.ValuesPerByte - 1) / PackedInt1.ValuesPerByte;
+        if (src.Length < expectedSrc)
+            throw new ArgumentException(
+                $"src must hold at least {expectedSrc} packed bytes (got {src.Length}).",
+                nameof(src));
+        int groups = scale.GroupSize == 0 ? 1 : (n + groupSize - 1) / groupSize;
+        if (scale.Scales.Length < groups)
+            throw new ArgumentException(
+                $"scale.Scales length {scale.Scales.Length} insufficient for {groups} groups.",
+                nameof(scale));
 
         for (int i = 0; i < n; i++)
         {
