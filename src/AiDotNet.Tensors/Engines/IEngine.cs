@@ -6423,6 +6423,12 @@ public interface IEngine
     Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0);
 
     /// <summary>
+    /// Cosine similarity along <paramref name="dim"/> with an
+    /// epsilon-clamped denominator (torch.nn.functional.cosine_similarity).
+    /// </summary>
+    Tensor<T> TensorCosineSimilarity<T>(Tensor<T> x1, Tensor<T> x2, int dim = -1, double eps = 1e-8);
+
+    /// <summary>
     /// Cross pairwise distance: output[i, j] = ‖x1[i] − x2[j]‖_p
     /// (torch.cdist).
     /// </summary>

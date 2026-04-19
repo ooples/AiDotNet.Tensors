@@ -617,6 +617,68 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorCosineSimilarity<T>(
+        Tensor<T> x1, Tensor<T> x2, int dim = -1, double eps = 1e-8)
+    {
+        if (x1 == null) throw new ArgumentNullException(nameof(x1));
+        if (x2 == null) throw new ArgumentNullException(nameof(x2));
+        if (!x1._shape.SequenceEqual(x2._shape))
+            throw new ArgumentException("CosineSimilarity: shapes must match");
+
+        int rank = x1.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!x1.IsContiguous) x1 = x1.Contiguous();
+        if (!x2.IsContiguous) x2 = x2.Contiguous();
+        var a = x1.AsSpan();
+        var b = x2.AsSpan();
+
+        // Output shape drops dim.
+        var outShape = new int[rank - 1];
+        int w = 0;
+        for (int i = 0; i < rank; i++) if (i != dim) outShape[w++] = x1._shape[i];
+        var result = new Tensor<T>(outShape.Length == 0 ? new[] { 1 } : outShape);
+        // 0-rank result for e.g. 1-D input: treat specially — single scalar.
+        var dst = result.AsWritableSpan();
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= x1._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= x1._shape[k];
+        int axisLen = x1._shape[dim];
+        var epsV = ops.FromDouble(eps);
+
+        int resCursor = 0;
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                T dot = ops.Zero;
+                T na = ops.Zero;
+                T nb = ops.Zero;
+                for (int i = 0; i < axisLen; i++)
+                {
+                    int pos = outer * axisLen * innerSize + i * innerSize + inner;
+                    T av = a[pos];
+                    T bv = b[pos];
+                    dot = ops.Add(dot, ops.Multiply(av, bv));
+                    na = ops.Add(na, ops.Multiply(av, av));
+                    nb = ops.Add(nb, ops.Multiply(bv, bv));
+                }
+                var denom = ops.Multiply(
+                    MaxScalar(ops, ops.Sqrt(na), epsV),
+                    MaxScalar(ops, ops.Sqrt(nb), epsV));
+                dst[resCursor++] = ops.Divide(dot, denom);
+            }
+
+        // For 1-D inputs we produced a length-1 result; flatten to scalar.
+        if (rank == 1) return result.Reshape(new int[0]);
+        return result;
+    }
+
+    private static T MaxScalar<T>(Interfaces.INumericOperations<T> ops, T a, T b)
+        => ops.GreaterThan(a, b) ? a : b;
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
     {
         // Pairwise p-norm distance over the N rows of a 2-D [N, D] input.
