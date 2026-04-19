@@ -9015,6 +9015,42 @@ public class CpuEngine : ITensorLevelEngine
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
 
+        // Phase 2D BERT-attention fix: for float, bypass
+        // MatrixMultiplyHelper.TryGemm's per-slice validation + memory
+        // conversion overhead and call SimdGemm.SgemmSequential directly.
+        //
+        // BatchMatMulRootCauseDiag showed this saves ~40 µs per slice
+        // (×12 slices on BERT attention = ~480 µs total), taking the
+        // attn-scores [12,256,64]×[12,64,256] call from 920 µs → 441 µs
+        // and attn×V [12,256,256]×[12,256,64] from 588 µs → 474 µs.
+        // SgemmSequential (not Sgemm) is the right SGEMM variant here —
+        // we're already inside Parallel.For, so letting the inner SGEMM
+        // also spawn a Parallel.For would nest workers over the thread
+        // pool. In practice the nested case measured equivalent for
+        // BERT-scale slices (SGEMM's internal work threshold isn't hit),
+        // but SgemmSequential is the documented correct pattern.
+        if (typeof(T) == typeof(float))
+        {
+            var aF = (float[])(object)aData;
+            var bF = (float[])(object)bData;
+            var rF = (float[])(object)rData;
+
+            Parallel.For(0, batchSize, batch =>
+            {
+                int aOffset = batch * matrixSizeA;
+                int bOffset = batch * matrixSizeB;
+                int resultOffset = batch * matrixSizeResult;
+
+                Simd.SimdGemm.SgemmSequential(
+                    aF.AsSpan(aOffset, matrixSizeA),
+                    bF.AsSpan(bOffset, matrixSizeB),
+                    rF.AsSpan(resultOffset, matrixSizeResult),
+                    m, n, p);
+            });
+
+            return result;
+        }
+
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
