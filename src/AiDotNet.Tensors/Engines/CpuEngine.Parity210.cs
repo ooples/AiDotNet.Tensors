@@ -2389,6 +2389,72 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (bins < 1) throw new ArgumentOutOfRangeException(nameof(bins));
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+
+        // If min == max, auto-detect from input (matches torch.histc).
+        T loBound = min, hiBound = max;
+        if (ops.Equals(min, max))
+        {
+            if (src.Length == 0)
+            {
+                loBound = ops.Zero;
+                hiBound = ops.Zero;
+            }
+            else
+            {
+                loBound = src[0];
+                hiBound = src[0];
+                for (int i = 1; i < src.Length; i++)
+                {
+                    if (ops.LessThan(src[i], loBound)) loBound = src[i];
+                    if (ops.GreaterThan(src[i], hiBound)) hiBound = src[i];
+                }
+            }
+            // Degenerate-range guard: torch returns a histogram where all values
+            // go into the single bin when min == max and input is non-empty.
+            if (ops.Equals(loBound, hiBound))
+            {
+                var r = new Tensor<T>(new[] { bins });
+                var d = r.AsWritableSpan();
+                d[0] = ops.FromDouble(src.Length);
+                for (int b = 1; b < bins; b++) d[b] = ops.Zero;
+                return r;
+            }
+        }
+        else if (ops.GreaterThanOrEquals(loBound, hiBound))
+        {
+            throw new ArgumentException("Histc requires min < max when both are explicit");
+        }
+
+        var result = new Tensor<T>(new[] { bins });
+        var dst = result.AsWritableSpan();
+        var width = ops.Divide(ops.Subtract(hiBound, loBound), ops.FromDouble(bins));
+        for (int i = 0; i < src.Length; i++)
+        {
+            var v = src[i];
+            if (ops.LessThan(v, loBound) || ops.GreaterThan(v, hiBound)) continue;
+            int idx;
+            if (ops.Equals(v, hiBound)) idx = bins - 1;
+            else
+            {
+                var f = ops.Divide(ops.Subtract(v, loBound), width);
+                idx = ops.ToInt32(ops.Floor(f));
+                if (idx >= bins) idx = bins - 1;
+                if (idx < 0) idx = 0;
+            }
+            dst[idx] = ops.Add(dst[idx], ops.One);
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

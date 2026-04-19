@@ -6758,6 +6758,14 @@ public interface IEngine
     Tensor<Bit> TensorEqScalar<T>(Tensor<T> a, T scalar);
 
     /// <summary>
+    /// torch.histc — 1-D histogram returning float counts. When
+    /// <paramref name="min"/> == <paramref name="max"/> (both default zero),
+    /// the tensor's own min/max are used as bounds. Values outside
+    /// [min, max] are discarded.
+    /// </summary>
+    Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).
