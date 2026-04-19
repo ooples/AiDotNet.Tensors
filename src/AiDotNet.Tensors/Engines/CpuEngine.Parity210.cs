@@ -505,6 +505,10 @@ public partial class CpuEngine
                     int srcPos = outer * srcAxis * innerSize + target * innerSize + inner;
                     dst[idxPos] = src[srcPos];
                 }
+        DifferentiableOps.RecordUnary(
+            "TensorTakeAlongDim", result, tensor,
+            BackwardFunctions<T>.TakeAlongDimBackward,
+            savedState: new object[] { indices, dim });
         return result;
     }
 
@@ -1617,6 +1621,10 @@ public partial class CpuEngine
                 }
             }
         }
+        DifferentiableOps.RecordUnary(
+            "TensorIndexAdd", result, tensor,
+            BackwardFunctions<T>.IndexAddBackward,
+            savedState: new object[] { axis, indices });
         return result;
     }
 
@@ -1724,6 +1732,10 @@ public partial class CpuEngine
                 }
             }
         }
+        DifferentiableOps.RecordUnary(
+            "TensorIndexCopy", result, tensor,
+            BackwardFunctions<T>.IndexCopyBackward,
+            savedState: new object[] { axis, indices });
         return result;
     }
 
@@ -1904,6 +1916,10 @@ public partial class CpuEngine
                     dst[outerBase + target * innerSize + inner] = value;
             }
         }
+        DifferentiableOps.RecordUnary(
+            "TensorIndexFill", result, tensor,
+            BackwardFunctions<T>.IndexFillBackward,
+            savedState: new object[] { axis, indices });
         return result;
     }
 
@@ -2060,6 +2076,10 @@ public partial class CpuEngine
                 dst[i] = srcData[sourceCursor++];
             }
         }
+        DifferentiableOps.RecordUnary(
+            "TensorMaskedScatter", result, tensor,
+            BackwardFunctions<T>.MaskedScatterBackward,
+            savedState: new object[] { mask });
         return result;
     }
 

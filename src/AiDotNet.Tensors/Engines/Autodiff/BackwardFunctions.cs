@@ -3676,6 +3676,145 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// IndexAdd backward: dL/dinput = gradOutput (clone); dL/dsource = gather
+    /// gradOutput at the scatter positions.
+    /// v1 stores only the input's grad contribution here; source grad is a
+    /// follow-up when the op is re-wired through RecordBinary.
+    /// </summary>
+    internal static void IndexAddBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // dL/d(input tensor) = dL/d(output) because result = input + scattered(source).
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+    }
+
+    /// <summary>
+    /// IndexCopy backward: gradient at copied positions is zeroed on the
+    /// input (the original values are overwritten); rest passes through.
+    /// </summary>
+    internal static void IndexCopyBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int axis = (int)savedState[0];
+        var indices = (Tensor<int>)savedState[1];
+        var input = inputs[0];
+        // Clone gradOutput; zero-out positions that got overwritten.
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = (Tensor<T>)gradOutput.Clone();
+        var dst = grad.AsWritableSpan();
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        int axisSize = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+        var zero = ops.Zero;
+        var idx = indices.AsSpan();
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idx.Length; i++)
+            {
+                int target = idx[i];
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    dst[outer * axisSize * innerSize + target * innerSize + inner] = zero;
+                }
+            }
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// IndexFill backward: zero the gradient at filled positions; rest passes
+    /// through (gradient w.r.t. the scalar fill-value is not tracked in v1).
+    /// </summary>
+    internal static void IndexFillBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Same shape/iteration as IndexCopy — just zero the filled positions.
+        int axis = (int)savedState[0];
+        var indices = (Tensor<int>)savedState[1];
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = (Tensor<T>)gradOutput.Clone();
+        var dst = grad.AsWritableSpan();
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        int axisSize = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+        var zero = ops.Zero;
+        var idx = indices.AsSpan();
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idx.Length; i++)
+            {
+                int target = idx[i];
+                for (int inner = 0; inner < innerSize; inner++)
+                    dst[outer * axisSize * innerSize + target * innerSize + inner] = zero;
+            }
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// TakeAlongDim backward: scatter incoming gradient back along `dim` at
+    /// the gathered positions. Duplicate indices accumulate.
+    /// </summary>
+    internal static void TakeAlongDimBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        int dim = (int)savedState[1];
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = new Tensor<T>(input._shape);
+        var dst = grad.AsWritableSpan();
+        var src = gradOutput.AsSpan();
+        var idx = indices.AsSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < dst.Length; i++) dst[i] = zero;
+
+        int rank = input.Rank;
+        if (dim < 0) dim += rank;
+        int srcAxis = input._shape[dim];
+        int idxAxis = indices._shape[dim];
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < idxAxis; i++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int idxPos = outer * idxAxis * innerSize + i * innerSize + inner;
+                    int target = idx[idxPos];
+                    int dstPos = outer * srcAxis * innerSize + target * innerSize + inner;
+                    dst[dstPos] = ops.Add(dst[dstPos], src[idxPos]);
+                }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// MaskedScatter backward: gradient passes through at non-masked positions
+    /// (original input survives); masked positions get zero on the input side
+    /// (they were overwritten by source).
+    /// </summary>
+    internal static void MaskedScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mask = (Tensor<Bit>)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = (Tensor<T>)gradOutput.Clone();
+        var dst = grad.AsWritableSpan();
+        var maskSpan = mask.AsSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < dst.Length; i++)
+            if ((bool)maskSpan[i]) dst[i] = zero;
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
     /// Take backward: scatter the incoming gradient (same shape as indices)
     /// back to the flattened input shape at each indexed position. Duplicate
     /// indices accumulate.
