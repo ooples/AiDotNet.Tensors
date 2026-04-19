@@ -80,7 +80,7 @@ internal static class OpRegistry
         // Parity-210 movement / cumulative / clamp
         "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
         "TensorDot", "TensorVecDot", "TensorCross", "TensorMeshgrid",
-        "TensorMultiDot", "TensorTrace", "TensorDiagEmbed",
+        "TensorMultiDot", "TensorTrace", "TensorDiagEmbed", "TensorAddMM",
         "TensorFliplr", "TensorFlipud", "TensorRot90",
         "TensorSwapAxes", "TensorMoveDim",
         "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",

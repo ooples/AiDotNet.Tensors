@@ -504,6 +504,42 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorAddMM<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b)
+    {
+        // Default alpha=beta=1; the compiler can't express that cleanly for
+        // unconstrained generic T, so we route through the explicit overload.
+        var ops = MathHelper.GetNumericOperations<T>();
+        return TensorAddMM(input, a, b, ops.One, ops.One);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorAddMM<T>(
+        Tensor<T> input, Tensor<T> a, Tensor<T> b, T alpha, T beta)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a.Rank != 2 || b.Rank != 2)
+            throw new ArgumentException("AddMM requires 2-D matrices");
+        if (a._shape[1] != b._shape[0])
+            throw new ArgumentException("Inner dims must match");
+        int m = a._shape[0], n = b._shape[1];
+        if (input._shape[0] != m || input._shape[1] != n)
+            throw new ArgumentException(
+                $"input shape must be [{m}, {n}]; got [{input._shape[0]}, {input._shape[1]}]");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var matmul = TensorMatMul(a, b);
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, n });
+        var mmSrc = matmul.AsSpan();
+        var inSrc = (input.IsContiguous ? input : input.Contiguous()).AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < dst.Length; i++)
+            dst[i] = ops.Add(ops.Multiply(alpha, mmSrc[i]), ops.Multiply(beta, inSrc[i]));
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

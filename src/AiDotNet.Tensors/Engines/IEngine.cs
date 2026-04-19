@@ -6357,6 +6357,17 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB);
 
+    /// <summary>
+    /// Fused matmul + bias add with default α = β = 1: <c>A · B + input</c>
+    /// (torch.addmm).
+    /// </summary>
+    Tensor<T> TensorAddMM<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Fused matmul + bias add with explicit scalars: <c>α · (A · B) + β · input</c>.
+    /// </summary>
+    Tensor<T> TensorAddMM<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b, T alpha, T beta);
+
     /// <summary>1-D vector inner product Σ a[i]·b[i] (torch.linalg.vecdot).</summary>
     T TensorVecDot<T>(Tensor<T> a, Tensor<T> b);
 
