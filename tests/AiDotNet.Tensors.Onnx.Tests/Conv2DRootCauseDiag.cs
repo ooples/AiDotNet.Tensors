@@ -85,6 +85,14 @@ public class Conv2DRootCauseDiag
             _output.WriteLine($"  [2] OnnxImport → Plan.Execute:      {t2 * 1000:F1} µs  ({gflop / t2:F1} G·op/ms)  StepCount={stepCount}");
             _output.WriteLine($"      per-iter ms: {string.Join(", ", Array.ConvertAll(perIter, v => v.ToString("F1")))}");
 
+            // [2b] Use the plan's CAPTURED tensors directly (bypass the
+            // plan's closure/step machinery) and call engine.Conv2D.
+            // If this is fast, the overhead lives in the plan's Execute
+            // loop. If this is slow (matches [2]), the captured tensors
+            // themselves carry context that slows Conv2D.
+            double t2b = TimeWithCapturedTensors(cs);
+            _output.WriteLine($"  [2b] Plan's captured tensors direct:{t2b * 1000:F1} µs  ({gflop / t2b:F1} G·op/ms)");
+
             var steps = ProfilePerStepOf(cs);
             _output.WriteLine("      Per-step breakdown:");
             for (int i = 0; i < steps.Length; i++)
@@ -201,6 +209,44 @@ public class Conv2DRootCauseDiag
             totalTicks += (t1 - t0);
         }
         return totalTicks * tickToMs / Iters;
+    }
+
+    /// <summary>
+    /// Time engine.Conv2D using the tensors captured in the plan's step[0].Inputs.
+    /// If this is as fast as [1], the plan-execution loop itself adds overhead.
+    /// If this is as slow as [2], the captured-tensor references carry something
+    /// that slows Conv2D (layout flag, pinning state, shape metadata, etc.).
+    /// </summary>
+    private static double TimeWithCapturedTensors((int n, int c, int h, int w, int co, int kH, int kW, int stride, int pad, string label) cs)
+    {
+        var model = BuildSingleConvModel(cs);
+        var bytes = OnnxTestGraphBuilder.Serialize(model);
+        var engine = new CpuEngine();
+        using var stream = new MemoryStream(bytes);
+        var result = OnnxImporter.Import<float>(stream, engine);
+        Rand(0xC03, cs.n * cs.c * cs.h * cs.w).AsSpan().CopyTo(result.Inputs["X"].AsWritableSpan());
+        var plan = (CompiledInferencePlan<float>)result.Plan!;
+
+        // Access the plan's step[0] (Conv2D) input tensors directly via
+        // the InternalsVisibleTo hook. step[0].Inputs[0] = input, [1] = kernel.
+        var stepsField = typeof(CompiledInferencePlan<float>).GetField("_steps",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var steps = (CompiledStep<float>[])stepsField.GetValue(plan)!;
+        var capturedInput = steps[0].Inputs[0];
+        var capturedKernel = steps[0].Inputs[1];
+
+        // Sanity — shapes should match the test case.
+        Assert.Equal(cs.n, capturedInput._shape[0]);
+        Assert.Equal(cs.c, capturedInput._shape[1]);
+
+        for (int i = 0; i < Warmup; i++)
+            _ = engine.Conv2D(capturedInput, capturedKernel, new[] { cs.stride, cs.stride }, new[] { cs.pad, cs.pad }, new[] { 1, 1 });
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Iters; i++)
+            _ = engine.Conv2D(capturedInput, capturedKernel, new[] { cs.stride, cs.stride }, new[] { cs.pad, cs.pad }, new[] { 1, 1 });
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / Iters;
     }
 
     private static (string OpName, double AvgMs)[] ProfilePerStepOf((int n, int c, int h, int w, int co, int kH, int kW, int stride, int pad, string label) cs)
