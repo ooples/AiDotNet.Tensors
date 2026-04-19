@@ -3424,4 +3424,48 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
         }
     }
+
+    /// <summary>
+    /// Backward for the general einsum path. For an n-operand forward
+    ///     out = einsum("X_1,X_2,...,X_n -> Y", A_1, A_2, ..., A_n)
+    /// the gradient w.r.t. the i-th input is
+    ///     dL/dA_i = einsum("X_1,...,Y,...,X_n -> X_i",
+    ///                      A_1, ..., A_{i-1}, gradOutput, A_{i+1}, ..., A_n)
+    /// — the i-th operand slot swaps in `gradOutput` carrying Y's labels, and
+    /// the output labels become X_i's labels.
+    /// </summary>
+    /// <remarks>
+    /// v1 limitations (caller guarantees these at record-time):
+    ///   - 2+ operands.
+    ///   - No repeated labels within a single operand (no diagonals).
+    /// Caller skips the tape-record when these are violated so backward is
+    /// never invoked for unsupported cases.
+    /// </remarks>
+    internal static void EinsumBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var equationStr = (string)savedState[0];
+        var eq = Engines.Einsum.EinsumEquation.Parse(equationStr);
+
+        string outLabels = eq.Output.ToString();
+        var operandStrs = new string[eq.Operands.Count];
+        for (int i = 0; i < operandStrs.Length; i++) operandStrs[i] = eq.Operands[i].ToString();
+
+        var bwdInputs = new Tensor<T>[inputs.Length];
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            // Build the derived equation with operand i replaced by output labels.
+            var parts = new string[inputs.Length];
+            for (int j = 0; j < inputs.Length; j++)
+                parts[j] = (j == i) ? outLabels : operandStrs[j];
+            string bwdEq = string.Join(",", parts) + "->" + operandStrs[i];
+
+            for (int j = 0; j < inputs.Length; j++)
+                bwdInputs[j] = (j == i) ? gradOutput : inputs[j];
+
+            var gradI = engine.TensorEinsum(bwdEq, bwdInputs);
+            DifferentiableOps.AccumulateGrad(grads, inputs[i], gradI, engine);
+        }
+    }
 }

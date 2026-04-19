@@ -22181,7 +22181,37 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < tensors.Length; i++) shapes[i] = tensors[i].Shape.ToArray();
         var binding = Engines.Einsum.EinsumShapeBinding.Bind(equation, shapes);
         var path = Engines.Einsum.EinsumPathOptimizer.Greedy(binding);
-        return Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
+        var einsumResult = Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
+
+        // Record autograd for the general path. v1 supports 2+ operands with
+        // no within-operand diagonals; in other cases we leave the tape
+        // unrecorded (caller gets a runtime error on .Backward() — a clear
+        // signal that the op is not yet differentiable rather than silent
+        // wrong gradients).
+        if (DifferentiableOps.IsRecording<T>()
+            && tensors.Length >= 2
+            && !HasDiagonalOperand(equation))
+        {
+            DifferentiableOps.RecordIfActive(
+                "TensorEinsum",
+                einsumResult,
+                tensors,
+                Engines.Autodiff.BackwardFunctions<T>.EinsumBackward,
+                savedState: new object[] { subscripts });
+        }
+
+        return einsumResult;
+    }
+
+    private static bool HasDiagonalOperand(Engines.Einsum.EinsumEquation eq)
+    {
+        foreach (var op in eq.Operands)
+        {
+            var seen = new HashSet<char>();
+            foreach (var c in op.Labels)
+                if (!seen.Add(c)) return true;
+        }
+        return false;
     }
 
     /// <inheritdoc/>
