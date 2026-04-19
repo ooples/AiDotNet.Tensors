@@ -2389,6 +2389,77 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "size must be positive");
+        if (step <= 0) throw new ArgumentOutOfRangeException(nameof(step), "step must be positive");
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        int dimSize = tensor._shape[dim];
+        if (size > dimSize)
+            throw new ArgumentException(
+                $"Unfold size {size} exceeds dimension size {dimSize} along axis {dim}");
+
+        int nWindows = (dimSize - size) / step + 1;
+
+        // Output shape: tensor.Shape with shape[dim] replaced by nWindows and
+        // a new trailing axis of length 'size'.
+        var outShape = new int[rank + 1];
+        for (int i = 0; i < rank; i++) outShape[i] = tensor._shape[i];
+        outShape[dim] = nWindows;
+        outShape[rank] = size;
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+        var dst = result.AsWritableSpan();
+
+        int outerSize = 1;
+        for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1;
+        for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
+
+        // Source strides for the original tensor.
+        int srcDimStride = innerSize;                  // stride of `dim` in source
+        int srcOuterStride = dimSize * innerSize;      // stride of axes < dim
+
+        // Destination strides: out shape = outer × nWindows × inner × size
+        int dstSizeStride = 1;
+        int dstInnerStride = size;
+        int dstWindowStride = innerSize * size;
+        int dstOuterStride = nWindows * dstWindowStride;
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int srcOuterBase = outer * srcOuterStride;
+            int dstOuterBase = outer * dstOuterStride;
+            for (int w = 0; w < nWindows; w++)
+            {
+                int windowStart = w * step;
+                int dstWindowBase = dstOuterBase + w * dstWindowStride;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int dstInnerBase = dstWindowBase + inner * dstInnerStride;
+                    for (int s = 0; s < size; s++)
+                    {
+                        int srcPos = srcOuterBase
+                                   + (windowStart + s) * srcDimStride
+                                   + inner;
+                        dst[dstInnerBase + s * dstSizeStride] = src[srcPos];
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.RecordUnary(
+            "TensorUnfold", result, tensor, BackwardFunctions<T>.UnfoldParity210Backward,
+            savedState: new object[] { dim, size, step, (int[])tensor._shape.Clone() });
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
         // ζ(x, q) = Σ_{k=0}^∞ (k + q)^{-x}.

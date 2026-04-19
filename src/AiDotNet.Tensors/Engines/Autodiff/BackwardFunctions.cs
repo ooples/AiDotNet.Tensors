@@ -4551,6 +4551,69 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Sliding-window unfold backward.  grad has shape
+    /// <c>inputShape with dim = nWindows, plus trailing 'size' axis</c>;
+    /// we scatter-add each window's values back into their original
+    /// positions along the specified dim (overlapping windows accumulate).
+    /// savedState[0] = dim, [1] = size, [2] = step, [3] = original input shape.
+    /// </summary>
+    internal static void UnfoldParity210Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int dim = (int)savedState[0];
+        int size = (int)savedState[1];
+        int step = (int)savedState[2];
+        int[] inputShape = (int[])savedState[3];
+
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = new Tensor<T>(inputShape);
+        var gSrc = gradOutput.AsSpan();
+        var gDst = grad.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < gDst.Length; i++) gDst[i] = zero;
+
+        int rank = inputShape.Length;
+        int dimSize = inputShape[dim];
+        int nWindows = (dimSize - size) / step + 1;
+
+        int outerSize = 1;
+        for (int k = 0; k < dim; k++) outerSize *= inputShape[k];
+        int innerSize = 1;
+        for (int k = dim + 1; k < rank; k++) innerSize *= inputShape[k];
+
+        int srcDimStride = innerSize;
+        int srcOuterStride = dimSize * innerSize;
+        int gWindowStride = innerSize * size;
+        int gOuterStride = nWindows * gWindowStride;
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int dstOuterBase = outer * srcOuterStride;
+            int gOuterBase = outer * gOuterStride;
+            for (int w = 0; w < nWindows; w++)
+            {
+                int windowStart = w * step;
+                int gWindowBase = gOuterBase + w * gWindowStride;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int gInnerBase = gWindowBase + inner * size;
+                    for (int s = 0; s < size; s++)
+                    {
+                        int dstPos = dstOuterBase
+                                   + (windowStart + s) * srcDimStride
+                                   + inner;
+                        gDst[dstPos] = ops.Add(gDst[dstPos], gSrc[gInnerBase + s]);
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
     /// Hurwitz zeta backward.  ∂ζ(x, q)/∂q = -x · ζ(x+1, q).  The ∂/∂x
     /// branch requires a derivative w.r.t. the zeta function's first
     /// argument which doesn't have a closed form; PyTorch marks it

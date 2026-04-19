@@ -6717,6 +6717,15 @@ public interface IEngine
     Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q);
 
     /// <summary>
+    /// Sliding-window unfold (<c>torch.Tensor.unfold</c>). Slides a window
+    /// of length <paramref name="size"/> along <paramref name="dim"/> with
+    /// stride <paramref name="step"/>, replacing <c>shape[dim]</c> with
+    /// <c>(shape[dim] - size) / step + 1</c> and appending a new trailing
+    /// axis of length <paramref name="size"/>.
+    /// </summary>
+    Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).
