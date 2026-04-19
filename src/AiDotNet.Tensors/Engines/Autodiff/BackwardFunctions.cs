@@ -3676,6 +3676,34 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Take backward: scatter the incoming gradient (same shape as indices)
+    /// back to the flattened input shape at each indexed position. Duplicate
+    /// indices accumulate.
+    /// </summary>
+    internal static void TakeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        var inputShape = (int[])savedState[1];
+
+        var grad = new Tensor<T>(inputShape);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var dst = grad.AsWritableSpan();
+        var src = gradOutput.AsSpan();
+        var idx = indices.AsSpan();
+        // dst starts at zero (tensor default); accumulate into indexed slots.
+        var zero = numOps.Zero;
+        for (int i = 0; i < dst.Length; i++) dst[i] = zero;
+        for (int i = 0; i < idx.Length; i++)
+        {
+            int pos = idx[i];
+            dst[pos] = numOps.Add(dst[pos], src[i]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
     /// MaskedSelect backward: scatter the incoming 1-D gradient back to the
     /// original tensor shape at mask-true positions; zero elsewhere.
     /// </summary>

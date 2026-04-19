@@ -457,6 +457,11 @@ public partial class CpuEngine
                     $"indices[{i}]={pos} out of range for flattened tensor length {total}");
             dst[i] = src[pos];
         }
+
+        DifferentiableOps.RecordUnary(
+            "TensorTake", result, tensor,
+            BackwardFunctions<T>.TakeBackward,
+            savedState: new object[] { indices, tensor._shape });
         return result;
     }
 
