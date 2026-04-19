@@ -581,6 +581,59 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
+    {
+        if (tensors == null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length == 0) return System.Array.Empty<Tensor<T>>();
+        foreach (var t in tensors)
+        {
+            if (t == null) throw new ArgumentNullException(nameof(tensors));
+            if (t.Rank != 1) throw new ArgumentException("Meshgrid requires 1-D inputs");
+        }
+        if (indexing != "ij" && indexing != "xy")
+            throw new ArgumentException("indexing must be 'ij' or 'xy'");
+
+        int d = tensors.Length;
+        // Output shape by indexing rule:
+        //   ij: (len(t0), len(t1), ..., len(t{d-1}))
+        //   xy: applies only when d >= 2 — first two axes are swapped vs ij.
+        var outShape = new int[d];
+        for (int i = 0; i < d; i++) outShape[i] = tensors[i]._shape[0];
+        if (indexing == "xy" && d >= 2)
+        {
+            (outShape[0], outShape[1]) = (outShape[1], outShape[0]);
+        }
+
+        var results = new Tensor<T>[d];
+        var strides = ComputeRowMajorStrides(outShape);
+        int total = 1; foreach (var s in outShape) total *= s;
+
+        for (int k = 0; k < d; k++)
+        {
+            // Figure out which axis in the output corresponds to tensor k.
+            int axisK = k;
+            if (indexing == "xy" && d >= 2)
+            {
+                if (k == 0) axisK = 1;
+                else if (k == 1) axisK = 0;
+            }
+
+            results[k] = AutoTensorCache.RentOrAllocate<T>(outShape);
+            var dst = results[k].AsWritableSpan();
+            var src = (tensors[k].IsContiguous ? tensors[k] : tensors[k].Contiguous()).AsSpan();
+
+            // For each linear index in the output, pick the coordinate along
+            // axisK and use src[that coord].
+            for (int linear = 0; linear < total; linear++)
+            {
+                int coord = (linear / strides[axisK]) % outShape[axisK];
+                dst[linear] = src[coord];
+            }
+        }
+        return results;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

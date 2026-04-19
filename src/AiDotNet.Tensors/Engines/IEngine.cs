@@ -6366,6 +6366,13 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1);
 
+    /// <summary>
+    /// Build coordinate grids from 1-D input tensors (torch.meshgrid).
+    /// <paramref name="indexing"/> is "ij" (default, matrix-style) or "xy"
+    /// (Cartesian, swaps the first two output axes).
+    /// </summary>
+    Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij");
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 
