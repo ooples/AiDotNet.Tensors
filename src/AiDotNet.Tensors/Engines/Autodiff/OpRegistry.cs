@@ -96,7 +96,8 @@ internal static class OpRegistry
         // Parity-210 special math (forward only in v1)
         "TensorErfc", "TensorXlogy", "TensorXlog1py",
         "TensorLgamma", "TensorDigamma",
-        "TensorErfinv", "TensorI0", "TensorI1",
+        "TensorErfinv", "TensorI0", "TensorI1", "TensorI0e", "TensorI1e",
+        "TensorFrexp",
 
         // Parity-210 sort / order stats (non-differentiable category below
         // also lists the scalar-returning ones; the tensor-returning ones

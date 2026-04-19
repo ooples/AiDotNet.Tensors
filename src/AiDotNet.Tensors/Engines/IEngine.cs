@@ -6511,6 +6511,19 @@ public interface IEngine
     /// <summary>Modified Bessel function of the first kind, order 1 (torch.special.i1).</summary>
     Tensor<T> TensorI1<T>(Tensor<T> tensor);
 
+    /// <summary>Exponentially-scaled I₀: e^(-|x|) · I₀(x) (torch.special.i0e). Safe for large x.</summary>
+    Tensor<T> TensorI0e<T>(Tensor<T> tensor);
+
+    /// <summary>Exponentially-scaled I₁: e^(-|x|) · I₁(x) (torch.special.i1e).</summary>
+    Tensor<T> TensorI1e<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Decompose floating-point values into mantissa ∈ [0.5, 1) and integer
+    /// exponent such that x = mantissa · 2^exp (torch.frexp). Zero maps to
+    /// (0, 0).
+    /// </summary>
+    (Tensor<T> Mantissa, Tensor<int> Exponent) TensorFrexp<T>(Tensor<T> tensor);
+
     /// <summary>
     /// Sort along an axis; returns both the sorted values and the permutation
     /// indices (torch.sort). Ascending by default, descending when

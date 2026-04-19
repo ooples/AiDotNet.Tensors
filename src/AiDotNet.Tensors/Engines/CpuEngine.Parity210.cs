@@ -1794,6 +1794,78 @@ public partial class CpuEngine
         }, "TensorI1");
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorI0e<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            // I₀ with exponential scaling: e^(-|x|) · I₀(x). Safe for large x
+            // where I₀ overflows.
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            double absX = System.Math.Abs(xd);
+            double halfX = xd / 2.0;
+            double halfSq = halfX * halfX;
+            double term = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 25; k++)
+            {
+                term *= halfSq / (k * k);   // I₀ has (k!)² denominator ⇒ k·k per step
+                sum += term;
+                if (term < 1e-16 * sum) break;
+            }
+            return ops.FromDouble(System.Math.Exp(-absX) * sum);
+        }, "TensorI0e");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorI1e<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            double absX = System.Math.Abs(xd);
+            double halfX = xd / 2.0;
+            double halfSq = halfX * halfX;
+            double term = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 25; k++)
+            {
+                term *= halfSq / (k * (k + 1));
+                sum += term;
+                if (term < 1e-16 * sum) break;
+            }
+            return ops.FromDouble(System.Math.Exp(-absX) * halfX * sum);
+        }, "TensorI1e");
+
+    /// <inheritdoc/>
+    public virtual (Tensor<T> Mantissa, Tensor<int> Exponent) TensorFrexp<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var mant = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+        var exp = new Tensor<int>(tensor._shape);
+        var mdst = mant.AsWritableSpan();
+        var edst = exp.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++)
+        {
+            double xd = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
+            if (xd == 0.0)
+            {
+                mdst[i] = ops.Zero;
+                edst[i] = 0;
+                continue;
+            }
+            int e = (int)System.Math.Floor(System.Math.Log(System.Math.Abs(xd), 2.0)) + 1;
+            double m = xd * System.Math.Pow(2.0, -e);
+            // Normalise into [0.5, 1) — adjust by one step if floating error
+            // pushes us to the edge.
+            while (System.Math.Abs(m) >= 1.0) { m *= 0.5; e++; }
+            while (System.Math.Abs(m) < 0.5) { m *= 2.0; e--; }
+            mdst[i] = ops.FromDouble(m);
+            edst[i] = e;
+        }
+        return (mant, exp);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
         => ElementwiseUnary(tensor, x => {
             // Asymptotic series with recurrence shift. Good enough for fp32;
