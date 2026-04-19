@@ -291,6 +291,81 @@ public partial class CpuEngine
         return tensor.Reshape(new[] { 1, tensor._shape[0], tensor._shape[1] });
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorHStack<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
+        // torch.hstack: concat along axis 0 for 1-D, axis 1 for higher ranks.
+        int axis = tensors[0].Rank == 1 ? 0 : 1;
+        return TensorConcatenate(tensors, axis);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorVStack<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
+        // torch.vstack: promote 1-D to 2-D rows and concat along axis 0.
+        var promoted = new Tensor<T>[tensors.Length];
+        for (int i = 0; i < tensors.Length; i++)
+            promoted[i] = tensors[i].Rank == 1
+                ? tensors[i].Reshape(new[] { 1, tensors[i]._shape[0] })
+                : tensors[i];
+        return TensorConcatenate(promoted, 0);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDStack<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
+        // torch.dstack: concat along axis 2 after promoting each tensor to at-least-3D.
+        var promoted = new Tensor<T>[tensors.Length];
+        for (int i = 0; i < tensors.Length; i++)
+            promoted[i] = TensorAtLeast3D(tensors[i]);
+        return TensorConcatenate(promoted, 2);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorColumnStack<T>(Tensor<T>[] tensors)
+    {
+        if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
+        // torch.column_stack: 1-D tensors become columns of a 2-D matrix;
+        // ≥2-D tensors concat along axis 1.
+        var promoted = new Tensor<T>[tensors.Length];
+        for (int i = 0; i < tensors.Length; i++)
+            promoted[i] = tensors[i].Rank == 1
+                ? tensors[i].Reshape(new[] { tensors[i]._shape[0], 1 })
+                : tensors[i];
+        return TensorConcatenate(promoted, 1);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorRowStack<T>(Tensor<T>[] tensors)
+        => TensorVStack(tensors);  // torch.row_stack is an alias for vstack.
+
+    /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorHSplit<T>(Tensor<T> tensor, int sections)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        int axis = tensor.Rank == 1 ? 0 : 1;
+        return TensorSplit(tensor, sections, axis);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorVSplit<T>(Tensor<T> tensor, int sections)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 2) throw new ArgumentException("VSplit requires rank >= 2");
+        return TensorSplit(tensor, sections, 0);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorDSplit<T>(Tensor<T> tensor, int sections)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 3) throw new ArgumentException("DSplit requires rank >= 3");
+        return TensorSplit(tensor, sections, 2);
+    }
+
     // ==================================================================
     // Cumulative ops
     // ==================================================================

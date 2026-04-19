@@ -6356,6 +6356,30 @@ public interface IEngine
     /// <summary>Promote to rank ≥3 (torch.atleast_3d).</summary>
     Tensor<T> TensorAtLeast3D<T>(Tensor<T> tensor);
 
+    /// <summary>Horizontal stack (torch.hstack): concat along axis 0 for 1D, axis 1 for ≥2D.</summary>
+    Tensor<T> TensorHStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Vertical stack (torch.vstack): 1D tensors become rows; then concat along axis 0.</summary>
+    Tensor<T> TensorVStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Depth stack (torch.dstack): promotes to ≥3D and concats along axis 2.</summary>
+    Tensor<T> TensorDStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Column stack (torch.column_stack): 1D tensors become columns; ≥2D concat along axis 1.</summary>
+    Tensor<T> TensorColumnStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Row stack (torch.row_stack), alias for vstack.</summary>
+    Tensor<T> TensorRowStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Horizontal split (torch.hsplit).</summary>
+    Tensor<T>[] TensorHSplit<T>(Tensor<T> tensor, int sections);
+
+    /// <summary>Vertical split (torch.vsplit).</summary>
+    Tensor<T>[] TensorVSplit<T>(Tensor<T> tensor, int sections);
+
+    /// <summary>Depth split (torch.dsplit).</summary>
+    Tensor<T>[] TensorDSplit<T>(Tensor<T> tensor, int sections);
+
     /// <summary>Cumulative product along <paramref name="axis"/> (torch.cumprod).</summary>
     Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis);
 

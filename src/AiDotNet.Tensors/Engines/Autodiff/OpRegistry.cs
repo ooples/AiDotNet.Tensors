@@ -82,6 +82,9 @@ internal static class OpRegistry
         "TensorFliplr", "TensorFlipud", "TensorRot90",
         "TensorSwapAxes", "TensorMoveDim",
         "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",
+        "TensorHStack", "TensorVStack", "TensorDStack",
+        "TensorColumnStack", "TensorRowStack",
+        "TensorHSplit", "TensorVSplit", "TensorDSplit",
         "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
         "TensorClampMin", "TensorClampMax",
 
