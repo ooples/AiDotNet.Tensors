@@ -71,6 +71,15 @@ public sealed class FlashAttentionConfig
     /// this null.</summary>
     public double? DropoutRate { get; set; }
 
+    /// <summary>
+    /// When true, dispatch through the block-tiled online-softmax
+    /// <see cref="FlashAttention2"/> kernel (forward + backward) instead
+    /// of materialising the full score matrix. O(seqLen) intermediate
+    /// memory — required for long-context (seq ≥ 4k). Today gated to
+    /// <c>T == float</c>; falls back to the standard path for other T.
+    /// </summary>
+    public bool UseFlashAttention2 { get; set; }
+
     /// <summary>Default configuration — every field at its spec default.</summary>
     public static FlashAttentionConfig Default => new();
 }
@@ -191,6 +200,33 @@ public static class FusedAttention<T>
             throw new ArgumentException(
                 $"queryOffset={queryOffset} + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]}.",
                 nameof(config));
+
+        // FlashAttention-2 block-tiled dispatch: O(seqLen) memory, uses
+        // online softmax so long-context inference (seq ≥ 4k) stays
+        // tractable. Gated to T=float today (the kernel is float-only in
+        // the paper; bf16 / fp16 Tensor-Core variants follow).
+        if (config.UseFlashAttention2 && typeof(T) == typeof(float))
+        {
+            var qf = (Tensor<float>)(object)query;
+            var kf = (Tensor<float>)(object)key;
+            var vf = (Tensor<float>)(object)value;
+            var biasF = attentionBias is null ? null : (Tensor<float>)(object)attentionBias;
+            int bsQ = config.BlockSizeQ ?? 64;
+            int bsKV = config.BlockSizeKV ?? 64;
+            var (fOut, _lse) = FlashAttention2.Forward(
+                qf, kf, vf, bsQ, bsKV, config.Scale, config.IsCausal, queryOffset, biasF);
+            var outT = (Tensor<T>)(object)fOut;
+            if (was3D) outT = DemoteToThreeD(engine, outT);
+            // The block-tiled kernel deliberately never materialises the
+            // full weights matrix; if the caller needed weights they must
+            // use the standard bias path.
+            if (config.ReturnAttentionWeights)
+                throw new ArgumentException(
+                    "UseFlashAttention2 = true does not support ReturnAttentionWeights " +
+                    "(the block-tiled kernel never materialises the [B,H,Sq,Sk] matrix).",
+                    nameof(config));
+            return (outT, null);
+        }
 
         // Causal no-bias → synthesize the offset-aware -inf upper-triangle
         // bias and route through the bias path. Honours queryOffset so the

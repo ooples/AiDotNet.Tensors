@@ -119,9 +119,30 @@ internal static class SimdGemm
         int n)
     {
         c.Clear();
+        // Autotune dispatch: if the cache has a winning variant for this
+        // (KernelId, shape) combination, honour it. Today the catalog
+        // covers "sequential" vs "parallel" — falling back to the default
+        // UseParallelGemm toggle when no cached choice is present.
+        bool allowParallel = ResolveParallelFromAutotune(m, n, k);
         // Iter 39: signal "we just cleared C" so the small-matmul fast path
         // can use store-only kernels (saves 12 loads + 12 adds per micro-tile).
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: true);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: allowParallel, clearedOutput: true);
+    }
+
+    /// <summary>
+    /// Consult <see cref="Helpers.Autotune.AutotuneCache"/> for a cached
+    /// winner of the SGEMM dispatch choice at this shape. Returns the
+    /// default <see cref="UseParallelGemm"/> when there's no hit.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ResolveParallelFromAutotune(int m, int n, int k)
+    {
+        var choice = Helpers.Autotune.AutotuneCache.Lookup(
+            Helpers.Autotune.BuiltInCatalog.SGEMM,
+            new Helpers.Autotune.ShapeProfile(m, n, k));
+        if (choice is null) return UseParallelGemm;
+        // Variant strings come from BuiltInCatalog.SgemmVariants.
+        return choice.Variant == "parallel";
     }
 
     /// <summary>
