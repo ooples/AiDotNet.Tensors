@@ -6387,6 +6387,47 @@ public interface IEngine
     Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y);
 
     /// <summary>
+    /// Sort along an axis; returns both the sorted values and the permutation
+    /// indices (torch.sort). Ascending by default, descending when
+    /// <paramref name="descending"/> is true.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
+
+    /// <summary>
+    /// Returns the <paramref name="k"/>-th smallest value of the flattened
+    /// tensor with its flat index. <paramref name="k"/> is 1-based
+    /// (torch.kthvalue convention).
+    /// </summary>
+    (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k);
+
+    /// <summary>
+    /// Median of the flattened tensor (torch.median). For even length returns
+    /// the lower median, matching PyTorch.
+    /// </summary>
+    T TensorMedian<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Unique values of the flattened tensor. When <paramref name="sorted"/>
+    /// is true (default), the result is ascending; otherwise the input order
+    /// is preserved (first occurrence).
+    /// </summary>
+    Tensor<T> TensorUnique<T>(Tensor<T> input, bool sorted = true);
+
+    /// <summary>
+    /// Branchless binary search. For each value in <paramref name="values"/>,
+    /// returns the insertion index into the sorted 1-D <paramref name="sortedSequence"/>
+    /// (torch.searchsorted).
+    /// </summary>
+    Tensor<int> TensorSearchSorted<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right = false);
+
+    /// <summary>
+    /// Counts values falling into <paramref name="bins"/> equal-width bins on
+    /// <c>[min, max]</c>. Values outside the range are dropped. Mirrors
+    /// <c>torch.histc</c>.
+    /// </summary>
+    Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

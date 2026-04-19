@@ -89,6 +89,11 @@ internal static class OpRegistry
         // Parity-210 special math (forward only in v1)
         "TensorErfc", "TensorXlogy", "TensorXlog1py",
 
+        // Parity-210 sort / order stats (non-differentiable category below
+        // also lists the scalar-returning ones; the tensor-returning ones
+        // sit here as stubs with no backward).
+        "TensorSort",
+
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
         "ComplexMagnitudeSquared",
@@ -125,6 +130,8 @@ internal static class OpRegistry
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
         "TensorIsClose", "TensorAllClose", "TensorIsIn", "TensorAminmax",
+        "TensorKthvalue", "TensorMedian", "TensorUnique",
+        "TensorSearchSorted", "TensorHistogram",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",

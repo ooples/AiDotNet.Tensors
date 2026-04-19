@@ -393,6 +393,178 @@ public partial class CpuEngine
     }
 
     // ==================================================================
+    // Sort / order statistics
+    // ==================================================================
+
+    /// <inheritdoc/>
+    public virtual (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(
+        Tensor<T> input, int axis = -1, bool descending = false)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        int rank = input.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var valuesOut = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        var indicesOut = new Tensor<int>(input._shape);
+
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        var valDst = valuesOut.AsWritableSpan();
+        var idxDst = indicesOut.AsWritableSpan();
+
+        int axisSize = input._shape[axis];
+        int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        var buffer = new (T value, int index)[axisSize];
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                int baseIdx = outer * axisSize * innerSize + inner;
+                for (int a = 0; a < axisSize; a++)
+                    buffer[a] = (src[baseIdx + a * innerSize], a);
+
+                Array.Sort(buffer, descending
+                    ? (x, y) => numOps.Compare(y.value, x.value)
+                    : (Comparison<(T value, int index)>)((x, y) => numOps.Compare(x.value, y.value)));
+
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int pos = baseIdx + a * innerSize;
+                    valDst[pos] = buffer[a].value;
+                    idxDst[pos] = buffer[a].index;
+                }
+            }
+        return (valuesOut, indicesOut);
+    }
+
+    /// <inheritdoc/>
+    public virtual (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (k < 1 || k > input.Length) throw new ArgumentOutOfRangeException(nameof(k));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        var pairs = new (T value, int index)[src.Length];
+        for (int i = 0; i < src.Length; i++) pairs[i] = (src[i], i);
+        Array.Sort(pairs, (x, y) => numOps.Compare(x.value, y.value));
+        return pairs[k - 1];
+    }
+
+    /// <inheritdoc/>
+    public virtual T TensorMedian<T>(Tensor<T> input)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
+        // PyTorch returns the lower median for even-length; keep the same behaviour.
+        int k = (input.Length + 1) / 2;
+        var (value, _) = TensorKthvalue(input, k);
+        return value;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorUnique<T>(Tensor<T> input, bool sorted = true)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+
+        // HashSet<T> preserves first-insertion order in .NET; we sort afterwards if requested.
+        var seen = new System.Collections.Generic.HashSet<T>();
+        var order = new System.Collections.Generic.List<T>();
+        for (int i = 0; i < src.Length; i++)
+        {
+            if (seen.Add(src[i])) order.Add(src[i]);
+        }
+
+        if (sorted)
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            order.Sort((a, b) => numOps.Compare(a, b));
+        }
+
+        var outArr = order.ToArray();
+        return new Tensor<T>(outArr, new[] { outArr.Length });
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<int> TensorSearchSorted<T>(
+        Tensor<T> sortedSequence, Tensor<T> values, bool right = false)
+    {
+        if (sortedSequence == null) throw new ArgumentNullException(nameof(sortedSequence));
+        if (values == null) throw new ArgumentNullException(nameof(values));
+        if (sortedSequence.Rank != 1)
+            throw new ArgumentException("SearchSorted expects a 1-D sorted sequence");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!sortedSequence.IsContiguous) sortedSequence = sortedSequence.Contiguous();
+        if (!values.IsContiguous) values = values.Contiguous();
+        var seq = sortedSequence.AsSpan();
+        var vs = values.AsSpan();
+        var result = new Tensor<int>(values._shape);
+        var dst = result.AsWritableSpan();
+
+        for (int i = 0; i < vs.Length; i++)
+        {
+            // Branchless-ready binary search; returns insertion index.
+            int lo = 0, hi = seq.Length;
+            var v = vs[i];
+            while (lo < hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                // right=false → lower bound: split at seq[mid] >= v (v <= seq[mid]).
+                // right=true  → upper bound: split at seq[mid] >  v (v <  seq[mid]).
+                bool beforeMid = right
+                    ? numOps.LessThan(v, seq[mid])
+                    : numOps.LessThanOrEquals(v, seq[mid]);
+                if (beforeMid) hi = mid; else lo = mid + 1;
+            }
+            dst[i] = lo;
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (bins < 1) throw new ArgumentOutOfRangeException(nameof(bins));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (numOps.GreaterThanOrEquals(min, max))
+            throw new ArgumentException("Histogram requires min < max");
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var result = new Tensor<int>(new[] { bins });
+        var dst = result.AsWritableSpan();
+        var src = input.AsSpan();
+
+        var width = numOps.Divide(numOps.Subtract(max, min), numOps.FromDouble(bins));
+        for (int i = 0; i < src.Length; i++)
+        {
+            var v = src[i];
+            if (numOps.LessThan(v, min) || numOps.GreaterThan(v, max)) continue;
+            // Bin index: floor((v - min) / width). Clamp the last-bin edge so
+            // the upper boundary maps into the final bin.
+            int idx;
+            if (numOps.Equals(v, max)) idx = bins - 1;
+            else
+            {
+                var f = numOps.Divide(numOps.Subtract(v, min), width);
+                idx = numOps.ToInt32(numOps.Floor(f));
+                if (idx >= bins) idx = bins - 1;
+                if (idx < 0) idx = 0;
+            }
+            dst[idx]++;
+        }
+        return result;
+    }
+
+    // ==================================================================
     // Element-wise binary math
     // ==================================================================
 
