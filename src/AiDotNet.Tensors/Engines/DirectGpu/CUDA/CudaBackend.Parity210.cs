@@ -132,7 +132,37 @@ public sealed partial class CudaBackend : IParity210Backend
 
     public unsafe void Parity210CumSum(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
-        => LaunchCumulativeLine("parity210_cumsum_axis", input, output, outerSize, axisSize, innerSize);
+    {
+        // Block-level Hillis-Steele scan for axes up to 1024 — each line gets
+        // one thread block with 2*blockDim.x floats of shared memory for
+        // ping-pong buffers. Longer axes fall through to the per-line serial
+        // kernel (multi-block carry scheme is a follow-up).
+        if (axisSize > 0 && axisSize <= 1024)
+        {
+            LaunchBlockScanCumSum(input, output, outerSize, axisSize, innerSize);
+            return;
+        }
+        LaunchCumulativeLine("parity210_cumsum_axis", input, output, outerSize, axisSize, innerSize);
+    }
+
+    private unsafe void LaunchBlockScanCumSum(
+        IGpuBuffer input, IGpuBuffer output,
+        int outerSize, int axisSize, int innerSize)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cumsum_block_hillis_steele");
+        using var _ = PushContext();
+        // Pick next power of two ≥ axisSize, capped at 1024 per block.
+        uint block = 1;
+        while (block < (uint)axisSize && block < 1024) block <<= 1;
+        uint grid = (uint)(outerSize * innerSize);
+        uint sharedBytes = block * 2 * sizeof(float);
+        IntPtr inPtr = input.Handle; IntPtr outPtr = output.Handle;
+        int o = outerSize, a = axisSize, i = innerSize;
+        void** args = stackalloc void*[5];
+        args[0] = &inPtr; args[1] = &outPtr;
+        args[2] = &o; args[3] = &a; args[4] = &i;
+        LaunchKernelWithSharedMem(kernel, grid, block, sharedBytes, args);
+    }
 
     public unsafe void Parity210CumProd(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)

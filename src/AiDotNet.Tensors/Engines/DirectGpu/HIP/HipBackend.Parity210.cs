@@ -99,7 +99,32 @@ public sealed partial class HipBackend : IParity210Backend
 
     public unsafe void Parity210CumSum(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
-        => LaunchCumulativeLineP210("parity210_cumsum_axis", input, output, outerSize, axisSize, innerSize);
+    {
+        if (axisSize > 0 && axisSize <= 1024)
+        {
+            LaunchBlockScanCumSumHip(input, output, outerSize, axisSize, innerSize);
+            return;
+        }
+        LaunchCumulativeLineP210("parity210_cumsum_axis", input, output, outerSize, axisSize, innerSize);
+    }
+
+    private unsafe void LaunchBlockScanCumSumHip(
+        IGpuBuffer input, IGpuBuffer output,
+        int outerSize, int axisSize, int innerSize)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cumsum_block_hillis_steele");
+        uint block = 1;
+        while (block < (uint)axisSize && block < 1024) block <<= 1;
+        uint grid = (uint)(outerSize * innerSize);
+        uint sharedBytes = block * 2 * sizeof(float);
+        IntPtr inPtr = input.Handle; IntPtr outPtr = output.Handle;
+        int o = outerSize, a = axisSize, i = innerSize;
+        void** args = stackalloc void*[5];
+        args[0] = &inPtr; args[1] = &outPtr;
+        args[2] = &o; args[3] = &a; args[4] = &i;
+        LaunchKernel(kernel, grid, block, args, sharedBytes);
+        Synchronize();
+    }
 
     public unsafe void Parity210CumProd(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)

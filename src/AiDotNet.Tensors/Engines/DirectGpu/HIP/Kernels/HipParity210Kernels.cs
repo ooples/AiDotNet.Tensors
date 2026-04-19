@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
             "parity210_diag_embed",
             "parity210_cumsum_axis","parity210_cumprod_axis","parity210_cummax_axis",
             "parity210_cummin_axis","parity210_logcumsumexp_axis",
+            "parity210_cumsum_block_hillis_steele",
             "parity210_take_linear","parity210_take_along_dim","parity210_index_add",
             "parity210_index_copy","parity210_index_fill","parity210_masked_scatter",
             "parity210_hypot","parity210_copysign","parity210_fmod","parity210_remainder",
@@ -132,6 +133,41 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_diag_embed(
 // ==========================================================================
 // CUMULATIVE
 // ==========================================================================
+
+// Block-level Hillis-Steele scan for axes ≤ 1024. See the CUDA counterpart
+// for algorithmic detail; HIP's shared-memory + sync semantics match CUDA
+// line-for-line.
+extern ""C"" __global__ void parity210_cumsum_block_hillis_steele(
+    const float* input, float* output,
+    int outerSize, int axisSize, int innerSize)
+{
+    HIP_DYNAMIC_SHARED(float, smem);
+    int line = blockIdx.x;
+    int inner = line % innerSize;
+    int outer = line / innerSize;
+    if (outer >= outerSize) return;
+    int base_ = outer * axisSize * innerSize + inner;
+
+    int tid = threadIdx.x;
+    float* s0 = smem;
+    float* s1 = smem + blockDim.x;
+
+    s0[tid] = (tid < axisSize) ? input[base_ + tid * innerSize] : 0.0f;
+    __syncthreads();
+
+    int limit = axisSize;
+    for (int offset = 1; offset < limit; offset *= 2) {
+        if (tid < limit) {
+            s1[tid] = (tid >= offset) ? s0[tid] + s0[tid - offset] : s0[tid];
+        }
+        __syncthreads();
+        float* tmp = s0; s0 = s1; s1 = tmp;
+    }
+
+    if (tid < axisSize) {
+        output[base_ + tid * innerSize] = s0[tid];
+    }
+}
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_cumsum_axis(
     const float* input, float* output,

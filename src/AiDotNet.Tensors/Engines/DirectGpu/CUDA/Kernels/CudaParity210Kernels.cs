@@ -26,6 +26,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             // Cumulative
             "parity210_cumsum_axis","parity210_cumprod_axis","parity210_cummax_axis",
             "parity210_cummin_axis","parity210_logcumsumexp_axis",
+            "parity210_cumsum_block_hillis_steele",
             // Indexing
             "parity210_take_linear","parity210_take_along_dim","parity210_index_add",
             "parity210_index_copy","parity210_index_fill","parity210_masked_scatter",
@@ -162,9 +163,54 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_diag_embed(
 // CUMULATIVE (sequential along axis — one thread per (outer, inner) line)
 // ==========================================================================
 
+// Block-level Hillis-Steele prefix sum for axes up to 1024 elements.
+// One block per (outer * inner) line; each thread handles one axis position.
+// Shared memory holds 2 * blockDim.x floats for ping-pong scan.
+//
+// O(log n) depth, O(n log n) work — simpler than Blelloch and faster in
+// practice up to ~1024 elements (Blelloch's extra sync overhead dominates
+// for these sizes; beyond 1024 the tree-based approach wins and we fall
+// through to a multi-block carry scheme via the per-line serial kernel).
+extern ""C"" __global__ void parity210_cumsum_block_hillis_steele(
+    const float* __restrict__ input, float* __restrict__ output,
+    int outerSize, int axisSize, int innerSize)
+{
+    extern __shared__ float smem[];
+    int line = blockIdx.x;             // one block per outer*inner line
+    int inner = line % innerSize;
+    int outer = line / innerSize;
+    if (outer >= outerSize) return;
+    int base_ = outer * axisSize * innerSize + inner;
+
+    int tid = threadIdx.x;
+    float* s0 = smem;
+    float* s1 = smem + blockDim.x;
+
+    // Load into s0 (thread tid owns position tid along axis).
+    s0[tid] = (tid < axisSize) ? input[base_ + tid * innerSize] : 0.0f;
+    __syncthreads();
+
+    // Hillis-Steele scan: each step reads from the prior buffer and writes
+    // to the other, then swaps.
+    int limit = axisSize;
+    for (int offset = 1; offset < limit; offset *= 2) {
+        if (tid < limit) {
+            s1[tid] = (tid >= offset) ? s0[tid] + s0[tid - offset] : s0[tid];
+        }
+        __syncthreads();
+        // Swap s0 <-> s1 for next iteration.
+        float* tmp = s0; s0 = s1; s1 = tmp;
+    }
+
+    if (tid < axisSize) {
+        output[base_ + tid * innerSize] = s0[tid];
+    }
+}
+
 // Each thread owns one 1-D line of length axisSize and does a serial scan.
-// axisSize is typically 64-2048 which fits in registers; for very long axes
-// a block-level Blelloch scan would be faster — follow-up.
+// Fallback path for axisSize > 1024 (above the single-block Hillis-Steele
+// cutoff); also used for cumprod / cummax / cummin / logcumsumexp which
+// don't yet have a block-scan specialization.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_cumsum_axis(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int axisSize, int innerSize)
