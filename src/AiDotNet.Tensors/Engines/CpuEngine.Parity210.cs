@@ -2389,6 +2389,84 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int sections, int dim = 0)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (sections <= 0) throw new ArgumentOutOfRangeException(nameof(sections));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+
+        int dimSize = tensor._shape[dim];
+        // PyTorch rule: first (dimSize % sections) chunks have ceil(dimSize/sections),
+        // remaining chunks have floor(dimSize/sections).
+        int baseSize = dimSize / sections;
+        int extra = dimSize % sections;
+
+        var indices = new int[sections - 1];
+        int cursor = 0;
+        for (int i = 0; i < sections - 1; i++)
+        {
+            cursor += baseSize + (i < extra ? 1 : 0);
+            indices[i] = cursor;
+        }
+        return TensorTensorSplit(tensor, indices, dim);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        int dimSize = tensor._shape[dim];
+
+        var result = new Tensor<T>[indices.Length + 1];
+        int prev = 0;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            int cur = System.Math.Min(System.Math.Max(indices[i], prev), dimSize);
+            result[i] = SliceAlongAxis(tensor, dim, prev, cur);
+            prev = cur;
+        }
+        result[indices.Length] = SliceAlongAxis(tensor, dim, prev, dimSize);
+        return result;
+    }
+
+    /// <summary>
+    /// Slice along <paramref name="dim"/> from start (inclusive) to end (exclusive).
+    /// Produces a contiguous tensor; empty-slice (end <= start) returns an
+    /// empty tensor with the sliced dim zero.
+    /// </summary>
+    private static Tensor<T> SliceAlongAxis<T>(Tensor<T> tensor, int dim, int start, int end)
+    {
+        int rank = tensor.Rank;
+        int len = System.Math.Max(0, end - start);
+        var outShape = new int[rank];
+        for (int k = 0; k < rank; k++) outShape[k] = tensor._shape[k];
+        outShape[dim] = len;
+
+        if (len == 0) return new Tensor<T>(outShape);
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
+        var src = tensor.AsSpan();
+        var result = new Tensor<T>(outShape);
+        var dst = result.AsWritableSpan();
+        int outer = 1; for (int k = 0; k < dim; k++) outer *= tensor._shape[k];
+        int inner = 1; for (int k = dim + 1; k < rank; k++) inner *= tensor._shape[k];
+        int srcStride = tensor._shape[dim] * inner;
+        int dstStride = len * inner;
+        for (int o = 0; o < outer; o++)
+            for (int i = 0; i < len; i++)
+                for (int n = 0; n < inner; n++)
+                    dst[o * dstStride + i * inner + n] =
+                        src[o * srcStride + (start + i) * inner + n];
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

@@ -6726,6 +6726,21 @@ public interface IEngine
     Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step);
 
     /// <summary>
+    /// torch.tensor_split(sections) equivalent. Splits <paramref name="tensor"/>
+    /// into exactly <paramref name="sections"/> chunks along <paramref name="dim"/>.
+    /// If the dim doesn't divide evenly, the first <c>dimSize % sections</c>
+    /// chunks get one extra element (matches NumPy / PyTorch semantics).
+    /// </summary>
+    Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int sections, int dim = 0);
+
+    /// <summary>
+    /// torch.tensor_split(indices_or_sections=[...]) equivalent. Splits at
+    /// the given indices along <paramref name="dim"/>; indices outside
+    /// <c>[0, dimSize]</c> produce empty chunks, matching PyTorch.
+    /// </summary>
+    Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).
