@@ -802,6 +802,9 @@ public partial class CpuEngine
                         dst[row * outCols + col] = ops.Multiply(aij, bSrc[k * q + l]);
                     }
             }
+        DifferentiableOps.RecordBinary(
+            "TensorKron", result, a, b,
+            BackwardFunctions<T>.KronBackward);
         return result;
     }
 

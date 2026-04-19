@@ -3676,6 +3676,85 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Trace backward: dL/dX = I · dL/dscalar — fill a zero matrix of the
+    /// input shape with dL/dscalar on the main diagonal.
+    /// </summary>
+    internal static void TraceBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var grad = new Tensor<T>(input._shape);
+        var dst = grad.AsWritableSpan();
+        // gradOutput is a scalar tensor.
+        T scalar = gradOutput.AsSpan()[0];
+        int rows = input._shape[0];
+        int cols = input._shape[1];
+        int n = System.Math.Min(rows, cols);
+        for (int i = 0; i < n; i++) dst[i * cols + i] = scalar;
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
+    /// Kron backward. y = kron(A, B) where y[ip+k, jq+l] = A[i,j] · B[k,l].
+    /// So dL/dA[i,j] = Σ_{k,l} dL/dy[ip+k, jq+l] · B[k,l]
+    ///    dL/dB[k,l] = Σ_{i,j} dL/dy[ip+k, jq+l] · A[i,j]
+    /// </summary>
+    internal static void KronBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var a = inputs[0];
+        var b = inputs[1];
+        var ops = MathHelper.GetNumericOperations<T>();
+        int m = a._shape[0], n = a._shape[1];
+        int p = b._shape[0], q = b._shape[1];
+
+        var aSrc = a.AsSpan();
+        var bSrc = b.AsSpan();
+        var dySrc = gradOutput.AsSpan();
+        int outCols = n * q;
+
+        // dA[i, j] = Σ_{k, l} dY[ip+k, jq+l] · B[k, l]
+        var dA = new Tensor<T>(a._shape);
+        var dAd = dA.AsWritableSpan();
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                T acc = ops.Zero;
+                for (int k = 0; k < p; k++)
+                    for (int l = 0; l < q; l++)
+                    {
+                        int row = i * p + k;
+                        int col = j * q + l;
+                        acc = ops.Add(acc, ops.Multiply(dySrc[row * outCols + col], bSrc[k * q + l]));
+                    }
+                dAd[i * n + j] = acc;
+            }
+
+        // dB[k, l] = Σ_{i, j} dY[ip+k, jq+l] · A[i, j]
+        var dB = new Tensor<T>(b._shape);
+        var dBd = dB.AsWritableSpan();
+        for (int k = 0; k < p; k++)
+            for (int l = 0; l < q; l++)
+            {
+                T acc = ops.Zero;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        int row = i * p + k;
+                        int col = j * q + l;
+                        acc = ops.Add(acc, ops.Multiply(dySrc[row * outCols + col], aSrc[i * n + j]));
+                    }
+                dBd[k * q + l] = acc;
+            }
+
+        DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
+    }
+
+    /// <summary>
     /// IndexAdd backward: dL/dinput = gradOutput (clone); dL/dsource = gather
     /// gradOutput at the scatter positions.
     /// v1 stores only the input's grad contribution here; source grad is a
