@@ -487,6 +487,17 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ci = indices;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorTake", tensor, (int[])indices._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorTake(ct, ci); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TakeBackward, new object[] { ci, (int[])ct._shape.Clone() });
+            }
+        }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var src = tensor.AsSpan();
         var idx = indices.AsSpan();
@@ -519,6 +530,18 @@ public partial class CpuEngine
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
         if (indices.Rank != rank)
             throw new ArgumentException("indices must have the same rank as tensor");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ci = indices; var cd = dim;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorTakeAlongDim", tensor, (int[])indices._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorTakeAlongDim(ct, ci, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TakeAlongDimBackward, new object[] { ci, cd });
+            }
+        }
         for (int k = 0; k < rank; k++)
         {
             if (k != dim && indices._shape[k] != tensor._shape[k])
