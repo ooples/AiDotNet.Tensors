@@ -4111,50 +4111,81 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // General-rank Kronecker backward.  Forward:
+        //   y[i0*b0+j0, ..., iN*bN+jN] = a[i0,..,iN] * b[j0,..,jN]
+        //
+        //   dA[i0,..,iN] = Σ_{j0,..,jN} dY[i0*b0+j0, ..., iN*bN+jN] * B[j0,..,jN]
+        //   dB[j0,..,jN] = Σ_{i0,..,iN} dY[i0*b0+j0, ..., iN*bN+jN] * A[i0,..,iN]
         var a = inputs[0];
         var b = inputs[1];
         var ops = MathHelper.GetNumericOperations<T>();
-        int m = a._shape[0], n = a._shape[1];
-        int p = b._shape[0], q = b._shape[1];
+
+        int rankA = a.Rank;
+        int rankB = b.Rank;
+        int rank = System.Math.Max(rankA, rankB);
+
+        // Right-align shapes by padding leading 1s (match the forward's
+        // shape-promotion convention).
+        var aShape = new int[rank];
+        var bShape = new int[rank];
+        for (int k = 0; k < rank; k++)
+        {
+            aShape[k] = (k >= rank - rankA) ? a._shape[k - (rank - rankA)] : 1;
+            bShape[k] = (k >= rank - rankB) ? b._shape[k - (rank - rankB)] : 1;
+        }
+
+        // Output shape per axis: outShape[k] = aShape[k] * bShape[k].
+        var outShape = new int[rank];
+        int outTotal = 1;
+        int aTotal = 1, bTotal = 1;
+        for (int k = 0; k < rank; k++)
+        {
+            outShape[k] = aShape[k] * bShape[k];
+            outTotal *= outShape[k];
+            aTotal *= aShape[k];
+            bTotal *= bShape[k];
+        }
+
+        // Row-major strides for a, b, output.
+        var aStrides = new int[rank];
+        var bStrides = new int[rank];
+        var outStrides = new int[rank];
+        aStrides[rank - 1] = 1; bStrides[rank - 1] = 1; outStrides[rank - 1] = 1;
+        for (int k = rank - 2; k >= 0; k--)
+        {
+            aStrides[k] = aStrides[k + 1] * aShape[k + 1];
+            bStrides[k] = bStrides[k + 1] * bShape[k + 1];
+            outStrides[k] = outStrides[k + 1] * outShape[k + 1];
+        }
 
         var aSrc = a.AsSpan();
         var bSrc = b.AsSpan();
         var dySrc = gradOutput.AsSpan();
-        int outCols = n * q;
 
-        // dA[i, j] = Σ_{k, l} dY[ip+k, jq+l] · B[k, l]
         var dA = new Tensor<T>(a._shape);
         var dAd = dA.AsWritableSpan();
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j < n; j++)
-            {
-                T acc = ops.Zero;
-                for (int k = 0; k < p; k++)
-                    for (int l = 0; l < q; l++)
-                    {
-                        int row = i * p + k;
-                        int col = j * q + l;
-                        acc = ops.Add(acc, ops.Multiply(dySrc[row * outCols + col], bSrc[k * q + l]));
-                    }
-                dAd[i * n + j] = acc;
-            }
-
-        // dB[k, l] = Σ_{i, j} dY[ip+k, jq+l] · A[i, j]
         var dB = new Tensor<T>(b._shape);
         var dBd = dB.AsWritableSpan();
-        for (int k = 0; k < p; k++)
-            for (int l = 0; l < q; l++)
+
+        // Accumulate by walking every output position once — O(outTotal).
+        var idx = new int[rank];
+        for (int o = 0; o < outTotal; o++)
+        {
+            int rem = o;
+            int aFlat = 0, bFlat = 0;
+            for (int k = 0; k < rank; k++)
             {
-                T acc = ops.Zero;
-                for (int i = 0; i < m; i++)
-                    for (int j = 0; j < n; j++)
-                    {
-                        int row = i * p + k;
-                        int col = j * q + l;
-                        acc = ops.Add(acc, ops.Multiply(dySrc[row * outCols + col], aSrc[i * n + j]));
-                    }
-                dBd[k * q + l] = acc;
+                idx[k] = rem / outStrides[k];
+                rem -= idx[k] * outStrides[k];
+                int iAx = idx[k] / bShape[k];
+                int jAx = idx[k] % bShape[k];
+                aFlat += iAx * aStrides[k];
+                bFlat += jAx * bStrides[k];
             }
+            var dy = dySrc[o];
+            dAd[aFlat] = ops.Add(dAd[aFlat], ops.Multiply(dy, bSrc[bFlat]));
+            dBd[bFlat] = ops.Add(dBd[bFlat], ops.Multiply(dy, aSrc[aFlat]));
+        }
 
         DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
         DifferentiableOps.AccumulateGrad(grads, b, dB, engine);

@@ -24,13 +24,13 @@ public class Parity210KronInnerTests
     }
 
     [Fact]
-    public void Kron_Rank1_PromotesTo_RowVector()
+    public void Kron_Rank1_ProducesFlatOuterProduct()
     {
         var a = T(new[] { 1f, 2f }, 2);
         var b = T(new[] { 3f, 4f }, 2);
         var r = E.TensorKron(a, b);
-        // Both promoted to (1,2); result shape (1, 4).
-        Assert.Equal(new[] { 1, 4 }, r.Shape.ToArray());
+        // General form (torch.kron): 1-D inputs stay 1-D; shape [a.len * b.len].
+        Assert.Equal(new[] { 4 }, r.Shape.ToArray());
         Assert.Equal(new[] { 3f, 4f, 6f, 8f }, r.AsSpan().ToArray());
     }
 

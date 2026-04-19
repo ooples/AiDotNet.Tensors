@@ -854,40 +854,84 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
     {
-        // Kronecker product. For 2-D inputs A ∈ ℝ^{m×n} and B ∈ ℝ^{p×q},
-        // output is ∈ ℝ^{mp × nq} with block structure A[i,j] · B.
-        // Generalised here: treat both inputs as 2-D or promote rank-1 to
-        // (1, len). Higher ranks left for a follow-up.
+        // Kronecker product torch.kron — generalises to arbitrary rank.
+        //
+        //   output[i0*b0 + j0, i1*b1 + j1, ..., iN*bN + jN]
+        //     = a[i0, i1, ..., iN] * b[j0, j1, ..., jN]
+        //
+        // Implementation: right-align shapes by padding the shorter-rank input
+        // with leading ones, then iterate the cartesian product of (a index,
+        // b index) pairs and write each into the flat output position derived
+        // from i*b_dim + j along each axis.
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (a.Rank == 1) a = a.Reshape(new[] { 1, a._shape[0] });
-        if (b.Rank == 1) b = b.Reshape(new[] { 1, b._shape[0] });
-        if (a.Rank != 2 || b.Rank != 2)
-            throw new ArgumentException("Kron supports 1-D or 2-D inputs");
+
+        int rankA = a.Rank;
+        int rankB = b.Rank;
+        int rank = System.Math.Max(rankA, rankB);
+
+        // Pad the smaller-rank input with leading 1s.
+        var aShape = new int[rank];
+        var bShape = new int[rank];
+        for (int k = 0; k < rank; k++)
+        {
+            aShape[k] = (k >= rank - rankA) ? a._shape[k - (rank - rankA)] : 1;
+            bShape[k] = (k >= rank - rankB) ? b._shape[k - (rank - rankB)] : 1;
+        }
+
+        var outShape = new int[rank];
+        int outTotal = 1;
+        for (int k = 0; k < rank; k++)
+        {
+            outShape[k] = aShape[k] * bShape[k];
+            outTotal *= outShape[k];
+        }
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        int m = a._shape[0], n = a._shape[1];
-        int p = b._shape[0], q = b._shape[1];
 
-        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m * p, n * q });
+        var result = AutoTensorCache.RentOrAllocate<T>(outShape);
         var dst = result.AsWritableSpan();
         var aSrc = a.AsSpan();
         var bSrc = b.AsSpan();
-        int outCols = n * q;
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j < n; j++)
+
+        // Row-major strides for a (reshaped), b (reshaped), and output.
+        var aStrides = new int[rank];
+        var bStrides = new int[rank];
+        var outStrides = new int[rank];
+        aStrides[rank - 1] = 1; bStrides[rank - 1] = 1; outStrides[rank - 1] = 1;
+        for (int k = rank - 2; k >= 0; k--)
+        {
+            aStrides[k] = aStrides[k + 1] * aShape[k + 1];
+            bStrides[k] = bStrides[k + 1] * bShape[k + 1];
+            outStrides[k] = outStrides[k + 1] * outShape[k + 1];
+        }
+
+        // Walk every output element: for position idx, decompose into
+        // (i, j) per axis via idx / outStrides[k], then map back to
+        // aIdx and bIdx.
+        var idx = new int[rank];
+        for (int o = 0; o < outTotal; o++)
+        {
+            // Decompose flat o into per-axis indices.
+            int rem = o;
+            for (int k = 0; k < rank; k++)
             {
-                T aij = aSrc[i * n + j];
-                for (int k = 0; k < p; k++)
-                    for (int l = 0; l < q; l++)
-                    {
-                        int row = i * p + k;
-                        int col = j * q + l;
-                        dst[row * outCols + col] = ops.Multiply(aij, bSrc[k * q + l]);
-                    }
+                idx[k] = rem / outStrides[k];
+                rem -= idx[k] * outStrides[k];
             }
+            int aFlat = 0, bFlat = 0;
+            for (int k = 0; k < rank; k++)
+            {
+                int i = idx[k] / bShape[k];   // a's index along axis k
+                int j = idx[k] % bShape[k];   // b's index along axis k
+                aFlat += i * aStrides[k];
+                bFlat += j * bStrides[k];
+            }
+            dst[o] = ops.Multiply(aSrc[aFlat], bSrc[bFlat]);
+        }
+
         DifferentiableOps.RecordBinary(
             "TensorKron", result, a, b,
             BackwardFunctions<T>.KronBackward);
@@ -1732,12 +1776,14 @@ public partial class CpuEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        // For now, require exact-shape bounds (no broadcasting). A broadcasting
-        // variant can layer on top via BroadcastTensors.
-        if (min is not null && !min._shape.SequenceEqual(tensor._shape))
-            throw new ArgumentException("min shape must match tensor shape (broadcasting TBD)");
-        if (max is not null && !max._shape.SequenceEqual(tensor._shape))
-            throw new ArgumentException("max shape must match tensor shape (broadcasting TBD)");
+
+        // Broadcast min / max against the tensor shape using NumPy / PyTorch
+        // rules: right-align, dims of 1 or missing broadcast freely.
+        // ValidateAndComputeBroadcastStride returns null when the shape is
+        // exactly compatible (no broadcasting needed) or a stride vector in
+        // the tensor's row-major order when broadcasting is active.
+        int[]? minStrides = ValidateAndComputeClampBroadcastStrides(tensor._shape, min?._shape);
+        int[]? maxStrides = ValidateAndComputeClampBroadcastStrides(tensor._shape, max?._shape);
 
         var src = tensor.AsSpan();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -1745,12 +1791,29 @@ public partial class CpuEngine
         var minSpan = min is null ? default : (min.IsContiguous ? min : min.Contiguous()).AsSpan();
         var maxSpan = max is null ? default : (max.IsContiguous ? max : max.Contiguous()).AsSpan();
 
+        int rank = tensor.Rank;
+        var idx = new int[rank];
         for (int i = 0; i < src.Length; i++)
         {
             var v = src[i];
-            if (min is not null && ops.LessThan(v, minSpan[i])) v = minSpan[i];
-            if (max is not null && ops.GreaterThan(v, maxSpan[i])) v = maxSpan[i];
+            if (min is not null)
+            {
+                int mIdx = minStrides == null ? i : BroadcastLookup(idx, minStrides);
+                if (ops.LessThan(v, minSpan[mIdx])) v = minSpan[mIdx];
+            }
+            if (max is not null)
+            {
+                int xIdx = maxStrides == null ? i : BroadcastLookup(idx, maxStrides);
+                if (ops.GreaterThan(v, maxSpan[xIdx])) v = maxSpan[xIdx];
+            }
             dst[i] = v;
+            // Advance row-major index.
+            for (int k = rank - 1; k >= 0; k--)
+            {
+                idx[k]++;
+                if (idx[k] < tensor._shape[k]) break;
+                idx[k] = 0;
+            }
         }
         return result;
     }
@@ -3874,6 +3937,51 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         // Not actually used — cumulative fns handle the first element specially.
         return ops.Zero;
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="bounds"/> can broadcast against
+    /// <paramref name="target"/> (NumPy / PyTorch semantics) and returns the
+    /// per-axis stride vector (in <paramref name="target"/>'s row-major
+    /// order) to convert a target index to a bounds flat index. Returns null
+    /// when the shapes match exactly (linear index works verbatim).
+    /// Throws when they can't broadcast.
+    /// </summary>
+    private static int[]? ValidateAndComputeClampBroadcastStrides(int[] target, int[]? bounds)
+    {
+        if (bounds == null) return null;
+        if (target.SequenceEqual(bounds)) return null;
+
+        int tr = target.Length, br = bounds.Length;
+        if (br > tr)
+            throw new ArgumentException(
+                $"clamp bounds shape [{string.Join(",", bounds)}] has higher rank than tensor [{string.Join(",", target)}]");
+
+        // Right-align shapes: walk from the trailing axis back.  Each axis
+        // must be 1 or equal to the target axis size.
+        var strides = new int[tr];
+        int bStride = 1;
+        for (int k = tr - 1; k >= 0; k--)
+        {
+            int boundsAxis = k - (tr - br);        // index into bounds, or -1 if padded
+            int boundsDim = boundsAxis >= 0 ? bounds[boundsAxis] : 1;
+            if (boundsDim != 1 && boundsDim != target[k])
+                throw new ArgumentException(
+                    $"clamp bounds shape [{string.Join(",", bounds)}] not broadcastable against tensor [{string.Join(",", target)}]");
+            // Stride is 0 when broadcasting (dim size 1 in bounds), else the
+            // physical stride of that axis in the bounds' contiguous layout.
+            strides[k] = boundsDim == 1 ? 0 : bStride;
+            if (boundsDim != 1) bStride *= boundsDim;
+        }
+        return strides;
+    }
+
+    /// <summary>Flat-index lookup into a broadcast-strided bounds tensor.</summary>
+    private static int BroadcastLookup(int[] idx, int[] strides)
+    {
+        int pos = 0;
+        for (int k = 0; k < idx.Length; k++) pos += idx[k] * strides[k];
+        return pos;
     }
 
     private static Tensor<T> ElementwiseUnary<T>(
