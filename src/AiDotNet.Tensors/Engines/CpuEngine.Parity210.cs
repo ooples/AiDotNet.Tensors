@@ -973,6 +973,67 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual T TensorNanMedian<T>(Tensor<T> input)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        // Filter NaNs; take lower-median of the remaining values.
+        var kept = new System.Collections.Generic.List<T>(src.Length);
+        for (int i = 0; i < src.Length; i++)
+            if (!ops.IsNaN(src[i])) kept.Add(src[i]);
+        if (kept.Count == 0) return ops.FromDouble(double.NaN);
+        kept.Sort((a, b) => ops.Compare(a, b));
+        int k = (kept.Count + 1) / 2;
+        return kept[k - 1];
+    }
+
+    /// <inheritdoc/>
+    public virtual (T Value, int Count) TensorMode<T>(Tensor<T> input)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Length == 0) throw new ArgumentException("Mode requires a non-empty tensor");
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        // Count occurrences; return the most frequent. Ties broken by smallest
+        // value. Using a list of (value, count) pairs with linear search
+        // avoids the Dictionary<T, …> notnull constraint on generic T — Mode
+        // is typically called on small tensors so the O(N·U) cost (U = unique
+        // values) is acceptable.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var counts = new System.Collections.Generic.List<(T value, int count)>();
+        for (int i = 0; i < src.Length; i++)
+        {
+            int found = -1;
+            for (int j = 0; j < counts.Count; j++)
+            {
+                if (numOps.Equals(counts[j].value, src[i])) { found = j; break; }
+            }
+            if (found < 0) counts.Add((src[i], 1));
+            else counts[found] = (counts[found].value, counts[found].count + 1);
+        }
+
+        T bestValue = numOps.Zero;  // guaranteed overwritten below (input is non-empty)
+        int bestCount = -1;
+        foreach (var kv in counts)
+        {
+            if (bestCount < 0
+                || kv.count > bestCount
+                || (kv.count == bestCount && numOps.LessThan(kv.value, bestValue)))
+            {
+                bestValue = kv.value;
+                bestCount = kv.count;
+            }
+        }
+        return (bestValue, bestCount);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<int> TensorBucketize<T>(Tensor<T> input, Tensor<T> boundaries, bool right = false)
+        => TensorSearchSorted(boundaries, input, right);
+
+    /// <inheritdoc/>
     public virtual Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));

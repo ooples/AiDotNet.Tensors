@@ -6509,6 +6509,27 @@ public interface IEngine
     Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max);
 
     /// <summary>
+    /// Median ignoring NaN values (torch.nanmedian). Returns NaN if every
+    /// value is NaN. Lower-median convention on even counts.
+    /// </summary>
+    T TensorNanMedian<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Most frequent value in the flattened tensor with its occurrence count
+    /// (torch.mode — flattened here; per-axis variant can come later). Ties
+    /// broken by smallest-value-wins.
+    /// </summary>
+    (T Value, int Count) TensorMode<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Bucketize values into the bins defined by a sorted 1-D
+    /// <paramref name="boundaries"/> tensor (torch.bucketize). Equivalent to
+    /// searchsorted with swapped argument order; kept as its own API for
+    /// familiarity.
+    /// </summary>
+    Tensor<int> TensorBucketize<T>(Tensor<T> input, Tensor<T> boundaries, bool right = false);
+
+    /// <summary>
     /// Add values from <paramref name="source"/> into <paramref name="tensor"/>
     /// at positions specified by <paramref name="indices"/> along
     /// <paramref name="axis"/> (torch.index_add). Duplicate indices accumulate.
