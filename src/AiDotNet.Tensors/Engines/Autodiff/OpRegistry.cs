@@ -94,6 +94,7 @@ internal static class OpRegistry
         // Parity-210 element-wise binary (forward only in v1; backward TBD)
         "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",
         "TensorFloatPower", "TensorLdexp", "TensorNextAfter",
+        "TensorLogAddExp", "TensorLogAddExp2",
 
         // Parity-210 special math (forward only in v1)
         "TensorErfc", "TensorXlogy", "TensorXlog1py",

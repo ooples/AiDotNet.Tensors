@@ -6540,6 +6540,15 @@ public interface IEngine
     Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>
+    /// Numerically-stable <c>log(exp(a) + exp(b))</c> (torch.logaddexp). Uses the
+    /// max-shift trick so no overflow for large inputs.
+    /// </summary>
+    Tensor<T> TensorLogAddExp<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Same as LogAddExp but in base-2 (torch.logaddexp2).</summary>
+    Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
     /// Element-wise <c>x · 2^exp</c> (torch.ldexp). <paramref name="exp"/> must
     /// be integer and broadcast to the same shape as <paramref name="x"/>.
     /// </summary>

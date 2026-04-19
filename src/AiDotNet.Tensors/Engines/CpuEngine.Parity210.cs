@@ -2126,6 +2126,35 @@ public partial class CpuEngine
             MathHelper.GetNumericOperations<T>().Power(ax, bx), "TensorFloatPower");
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorLogAddExp<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (av, bv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            // Numerically stable: max + log(1 + exp(-|a-b|)).
+            var larger = ops.GreaterThan(av, bv) ? av : bv;
+            var smaller = ops.GreaterThan(av, bv) ? bv : av;
+            var diff = ops.Subtract(smaller, larger);  // ≤ 0
+            // log(1 + exp(diff)) — use log1p for accuracy.
+            var expDiff = ops.Exp(diff);
+            return ops.Add(larger, ops.Log(ops.Add(ops.One, expDiff)));
+        }, "TensorLogAddExp");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (av, bv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            // log2(2^a + 2^b) = log2(2^(max) · (1 + 2^(min-max))) = max + log2(1 + 2^(min-max))
+            var larger = ops.GreaterThan(av, bv) ? av : bv;
+            var smaller = ops.GreaterThan(av, bv) ? bv : av;
+            var diff = ops.Subtract(smaller, larger);
+            // 2^diff = exp(diff · ln 2)
+            var ln2 = ops.FromDouble(System.Math.Log(2.0));
+            var pow2 = ops.Exp(ops.Multiply(diff, ln2));
+            // log2(1 + pow2) = log(1 + pow2) / ln 2
+            var log1p = ops.Log(ops.Add(ops.One, pow2));
+            return ops.Add(larger, ops.Divide(log1p, ln2));
+        }, "TensorLogAddExp2");
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
     {
         if (x == null) throw new ArgumentNullException(nameof(x));
