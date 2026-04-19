@@ -1217,6 +1217,29 @@ public partial class CpuEngine
                     BackwardFunctions<T>.CumMaxBackward, new object[] { ca });
             }
         }
+        // Fp32 contiguous inner-most axis fast path: SIMD-assisted running max.
+        if (typeof(T) == typeof(float))
+        {
+            int r = tensor.Rank;
+            int ax = axis < 0 ? axis + r : axis;
+            if (ax == r - 1 && tensor.IsContiguous)
+            {
+                var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+                var src = (float[])(object)tensor.GetDataArray();
+                var dst = (float[])(object)result.GetDataArray();
+                int axisLen = tensor._shape[ax];
+                int outer = tensor.Length / axisLen;
+                for (int o = 0; o < outer; o++)
+                {
+                    Simd.ScanKernels.RunningMaxFloat(
+                        new ReadOnlySpan<float>(src, o * axisLen, axisLen),
+                        new Span<float>(dst, o * axisLen, axisLen));
+                }
+                DifferentiableOps.RecordUnary("TensorCumMax", result, tensor,
+                    BackwardFunctions<T>.CumMaxBackward, new object[] { axis });
+                return result;
+            }
+        }
         return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: true),
             (a, b) => {
@@ -1238,6 +1261,28 @@ public partial class CpuEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorCumMin", tensor, (int[])tensor._shape.Clone(),
                     (eng, output) => { var r = eng.TensorCumMin(ct, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.CumMinBackward, new object[] { ca });
+            }
+        }
+        if (typeof(T) == typeof(float))
+        {
+            int r = tensor.Rank;
+            int ax = axis < 0 ? axis + r : axis;
+            if (ax == r - 1 && tensor.IsContiguous)
+            {
+                var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+                var src = (float[])(object)tensor.GetDataArray();
+                var dst = (float[])(object)result.GetDataArray();
+                int axisLen = tensor._shape[ax];
+                int outer = tensor.Length / axisLen;
+                for (int o = 0; o < outer; o++)
+                {
+                    Simd.ScanKernels.RunningMinFloat(
+                        new ReadOnlySpan<float>(src, o * axisLen, axisLen),
+                        new Span<float>(dst, o * axisLen, axisLen));
+                }
+                DifferentiableOps.RecordUnary("TensorCumMin", result, tensor,
+                    BackwardFunctions<T>.CumMinBackward, new object[] { axis });
+                return result;
             }
         }
         return CumulativeAlongAxis(tensor, axis,
