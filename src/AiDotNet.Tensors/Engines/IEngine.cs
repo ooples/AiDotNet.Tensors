@@ -6430,6 +6430,18 @@ public interface IEngine
     /// <summary>Element-wise ±∞ test (torch.isinf).</summary>
     Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor);
 
+    /// <summary>Element-wise logical AND on bit-packed masks (torch.logical_and).</summary>
+    Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical OR on bit-packed masks (torch.logical_or).</summary>
+    Tensor<Bit> TensorLogicalOr(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical XOR on bit-packed masks (torch.logical_xor).</summary>
+    Tensor<Bit> TensorLogicalXor(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical NOT on a bit-packed mask (torch.logical_not).</summary>
+    Tensor<Bit> TensorLogicalNot(Tensor<Bit> a);
+
     /// <summary>Element-wise <c>max(x, min)</c> (torch.clamp_min).</summary>
     Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min);
 

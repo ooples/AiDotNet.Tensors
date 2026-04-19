@@ -693,6 +693,45 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b)
+        => BitBinary(a, b, (av, bv) => (bool)av && (bool)bv);
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorLogicalOr(Tensor<Bit> a, Tensor<Bit> b)
+        => BitBinary(a, b, (av, bv) => (bool)av || (bool)bv);
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorLogicalXor(Tensor<Bit> a, Tensor<Bit> b)
+        => BitBinary(a, b, (av, bv) => (bool)av ^ (bool)bv);
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorLogicalNot(Tensor<Bit> a)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!a.IsContiguous) a = a.Contiguous();
+        var src = a.AsSpan();
+        var dst = new Bit[src.Length];
+        for (int i = 0; i < src.Length; i++) dst[i] = (bool)src[i] ? Bit.False : Bit.True;
+        return new Tensor<Bit>(dst, a._shape);
+    }
+
+    private static Tensor<Bit> BitBinary(
+        Tensor<Bit> a, Tensor<Bit> b, Func<Bit, Bit, bool> f)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!a._shape.SequenceEqual(b._shape))
+            throw new ArgumentException("logical op: shape mismatch");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        var dst = new Bit[av.Length];
+        for (int i = 0; i < av.Length; i++) dst[i] = f(av[i], bv[i]) ? Bit.True : Bit.False;
+        return new Tensor<Bit>(dst, a._shape);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false)
     {
         if (elements == null) throw new ArgumentNullException(nameof(elements));
