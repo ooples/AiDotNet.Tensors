@@ -170,6 +170,127 @@ public partial class CpuEngine
         return result;
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorFliplr<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 2) throw new ArgumentException("Fliplr requires a tensor with at least 2 dimensions");
+        // Flip along the last axis ("left/right" in matrix-convention).
+        return TensorFlip(tensor, new[] { tensor.Rank - 1 });
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorFlipud<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 1) throw new ArgumentException("Flipud requires a tensor with at least 1 dimension");
+        // Flip along the first axis ("up/down").
+        return TensorFlip(tensor, new[] { 0 });
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorRot90<T>(Tensor<T> tensor, int k = 1, int[]? axes = null)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        axes ??= new[] { 0, 1 };
+        if (axes.Length != 2) throw new ArgumentException("Rot90 requires exactly 2 axes");
+        if (axes[0] == axes[1]) throw new ArgumentException("Rot90 axes must be different");
+
+        // k mod 4; if k<0, adjust to positive rotation count.
+        int steps = ((k % 4) + 4) % 4;
+        if (steps == 0) return (Tensor<T>)tensor.Clone();
+
+        // Canonical rotation: k=1 ≡ transpose(axes) then flip(axes[0]);
+        //                    k=2 ≡ flip(axes[0]) then flip(axes[1]);
+        //                    k=3 ≡ flip(axes[0]) then transpose(axes).
+        var result = tensor;
+        int a0 = axes[0], a1 = axes[1];
+        if (a0 < 0) a0 += tensor.Rank;
+        if (a1 < 0) a1 += tensor.Rank;
+
+        for (int s = 0; s < steps; s++)
+        {
+            // One 90° rotation = swap the two axes + flip the (new) axes[1].
+            var perm = new int[result.Rank];
+            for (int i = 0; i < result.Rank; i++) perm[i] = i;
+            perm[a0] = a1;
+            perm[a1] = a0;
+            result = result.Transpose(perm);
+            result = TensorFlip(result, new[] { a0 });
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorSwapAxes<T>(Tensor<T> tensor, int axis1, int axis2)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        int rank = tensor.Rank;
+        if (axis1 < 0) axis1 += rank;
+        if (axis2 < 0) axis2 += rank;
+        if (axis1 < 0 || axis1 >= rank) throw new ArgumentOutOfRangeException(nameof(axis1));
+        if (axis2 < 0 || axis2 >= rank) throw new ArgumentOutOfRangeException(nameof(axis2));
+        var perm = new int[rank];
+        for (int i = 0; i < rank; i++) perm[i] = i;
+        perm[axis1] = axis2;
+        perm[axis2] = axis1;
+        return tensor.Transpose(perm);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorMoveDim<T>(Tensor<T> tensor, int source, int destination)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        int rank = tensor.Rank;
+        if (source < 0) source += rank;
+        if (destination < 0) destination += rank;
+        if (source < 0 || source >= rank) throw new ArgumentOutOfRangeException(nameof(source));
+        if (destination < 0 || destination >= rank) throw new ArgumentOutOfRangeException(nameof(destination));
+
+        // Build permutation that "pulls out" source and inserts at destination.
+        var perm = new int[rank];
+        int w = 0;
+        for (int i = 0; i < rank; i++)
+        {
+            if (w == destination) { perm[w++] = source; }
+            if (i != source)
+            {
+                if (w == destination) { perm[w++] = source; }
+                perm[w++] = i;
+            }
+        }
+        if (w < rank) perm[w++] = source;
+        return tensor.Transpose(perm);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorAtLeast1D<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        return tensor.Rank >= 1 ? tensor : tensor.Reshape(new[] { 1 });
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank >= 2) return tensor;
+        if (tensor.Rank == 0) return tensor.Reshape(new[] { 1, 1 });
+        // Rank 1: make it a row vector [1, N].
+        return tensor.Reshape(new[] { 1, tensor._shape[0] });
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorAtLeast3D<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank >= 3) return tensor;
+        if (tensor.Rank == 0) return tensor.Reshape(new[] { 1, 1, 1 });
+        if (tensor.Rank == 1) return tensor.Reshape(new[] { 1, tensor._shape[0], 1 });
+        // Rank 2: insert leading 1.
+        return tensor.Reshape(new[] { 1, tensor._shape[0], tensor._shape[1] });
+    }
+
     // ==================================================================
     // Cumulative ops
     // ==================================================================

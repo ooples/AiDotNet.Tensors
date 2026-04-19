@@ -6326,6 +6326,36 @@ public interface IEngine
     /// <summary>Repeats each element along <paramref name="dim"/> <paramref name="repeats"/> times (torch.repeat_interleave).</summary>
     Tensor<T> TensorRepeatInterleave<T>(Tensor<T> tensor, int repeats, int dim);
 
+    /// <summary>Flip along the last axis (torch.fliplr).</summary>
+    Tensor<T> TensorFliplr<T>(Tensor<T> tensor);
+
+    /// <summary>Flip along the first axis (torch.flipud).</summary>
+    Tensor<T> TensorFlipud<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Rotate 90° in the plane spanned by two axes (torch.rot90).
+    /// <paramref name="k"/> counts 90° turns (can be negative).
+    /// </summary>
+    Tensor<T> TensorRot90<T>(Tensor<T> tensor, int k = 1, int[]? axes = null);
+
+    /// <summary>Swap two dimensions (torch.swapaxes / numpy.swapaxes).</summary>
+    Tensor<T> TensorSwapAxes<T>(Tensor<T> tensor, int axis1, int axis2);
+
+    /// <summary>
+    /// Move a single dimension from <paramref name="source"/> to
+    /// <paramref name="destination"/> (torch.movedim).
+    /// </summary>
+    Tensor<T> TensorMoveDim<T>(Tensor<T> tensor, int source, int destination);
+
+    /// <summary>Promote to rank ≥1 (torch.atleast_1d).</summary>
+    Tensor<T> TensorAtLeast1D<T>(Tensor<T> tensor);
+
+    /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
+    Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
+
+    /// <summary>Promote to rank ≥3 (torch.atleast_3d).</summary>
+    Tensor<T> TensorAtLeast3D<T>(Tensor<T> tensor);
+
     /// <summary>Cumulative product along <paramref name="axis"/> (torch.cumprod).</summary>
     Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis);
 

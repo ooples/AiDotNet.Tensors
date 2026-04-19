@@ -79,6 +79,9 @@ internal static class OpRegistry
 
         // Parity-210 movement / cumulative / clamp
         "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
+        "TensorFliplr", "TensorFlipud", "TensorRot90",
+        "TensorSwapAxes", "TensorMoveDim",
+        "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",
         "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
         "TensorClampMin", "TensorClampMax",
 
