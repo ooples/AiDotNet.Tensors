@@ -617,6 +617,84 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Kronecker product. For 2-D inputs A ∈ ℝ^{m×n} and B ∈ ℝ^{p×q},
+        // output is ∈ ℝ^{mp × nq} with block structure A[i,j] · B.
+        // Generalised here: treat both inputs as 2-D or promote rank-1 to
+        // (1, len). Higher ranks left for a follow-up.
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a.Rank == 1) a = a.Reshape(new[] { 1, a._shape[0] });
+        if (b.Rank == 1) b = b.Reshape(new[] { 1, b._shape[0] });
+        if (a.Rank != 2 || b.Rank != 2)
+            throw new ArgumentException("Kron supports 1-D or 2-D inputs");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        int m = a._shape[0], n = a._shape[1];
+        int p = b._shape[0], q = b._shape[1];
+
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m * p, n * q });
+        var dst = result.AsWritableSpan();
+        var aSrc = a.AsSpan();
+        var bSrc = b.AsSpan();
+        int outCols = n * q;
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                T aij = aSrc[i * n + j];
+                for (int k = 0; k < p; k++)
+                    for (int l = 0; l < q; l++)
+                    {
+                        int row = i * p + k;
+                        int col = j * q + l;
+                        dst[row * outCols + col] = ops.Multiply(aij, bSrc[k * q + l]);
+                    }
+            }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Inner product over the last axis (torch.inner). Output shape is
+        // a.shape[:-1] + b.shape[:-1]; contracts matching last-axis sizes.
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a._shape[a.Rank - 1] != b._shape[b.Rank - 1])
+            throw new ArgumentException(
+                $"Inner: last-axis sizes must match ({a._shape[a.Rank - 1]} vs {b._shape[b.Rank - 1]})");
+
+        // Build einsum equation where a's last-dim label and b's last-dim
+        // label are equal (contracted). Use two disjoint label alphabets for
+        // a's and b's free dims.
+        char cursor = 'a';
+        var aLabels = new char[a.Rank];
+        var bLabels = new char[b.Rank];
+        var outLabels = new System.Text.StringBuilder();
+        for (int i = 0; i < a.Rank - 1; i++)
+        {
+            aLabels[i] = cursor;
+            outLabels.Append(cursor);
+            cursor++;
+        }
+        char contract = cursor++;
+        aLabels[a.Rank - 1] = contract;
+        for (int i = 0; i < b.Rank - 1; i++)
+        {
+            bLabels[i] = cursor;
+            outLabels.Append(cursor);
+            cursor++;
+        }
+        bLabels[b.Rank - 1] = contract;
+
+        string eq = $"{new string(aLabels)},{new string(bLabels)}->{outLabels}";
+        return TensorEinsum(eq, a, b);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));

@@ -6402,6 +6402,19 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors);
 
+    /// <summary>
+    /// Kronecker product of 2-D matrices (torch.kron). Result shape is
+    /// <c>(m·p) × (n·q)</c> for inputs <c>A ∈ ℝ^{m×n}, B ∈ ℝ^{p×q}</c>.
+    /// Rank-1 inputs are promoted to <c>(1, len)</c>.
+    /// </summary>
+    Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Inner product contracting the last axis of both operands (torch.inner).
+    /// Output shape is <c>a.shape[:-1] + b.shape[:-1]</c>.
+    /// </summary>
+    Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b);
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 
