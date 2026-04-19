@@ -80,6 +80,7 @@ internal static class OpRegistry
         // Parity-210 movement / cumulative / clamp
         "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
         "TensorDot", "TensorVecDot", "TensorCross", "TensorMeshgrid",
+        "TensorMultiDot",
         "TensorFliplr", "TensorFlipud", "TensorRot90",
         "TensorSwapAxes", "TensorMoveDim",
         "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",
@@ -154,7 +155,7 @@ internal static class OpRegistry
         "TensorKthvalue", "TensorMedian", "TensorNanMedian", "TensorMode",
         "TensorUnique", "TensorUniqueConsecutive",
         "TensorSearchSorted", "TensorBucketize",
-        "TensorHistogram", "TensorHistogramDD",
+        "TensorHistogram", "TensorHistogramDD", "TensorBinCount",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",

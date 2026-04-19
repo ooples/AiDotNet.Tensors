@@ -1873,6 +1873,58 @@ public partial class CpuEngine
         => TensorSearchSorted(boundaries, input, right);
 
     /// <inheritdoc/>
+    public virtual Tensor<int> TensorBinCount(Tensor<int> input, int? minLength = null)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 1) throw new ArgumentException("BinCount requires a 1-D int tensor");
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+
+        // Find max; reject negatives (torch.bincount rejects them too).
+        int maxV = minLength ?? 0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            if (src[i] < 0)
+                throw new ArgumentException($"BinCount requires non-negative ints; got {src[i]}");
+            if (src[i] >= maxV) maxV = src[i] + 1;
+        }
+        if (maxV == 0) return new Tensor<int>(new[] { 0 });
+
+        var result = new Tensor<int>(new[] { maxV });
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[src[i]]++;
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices)
+    {
+        if (matrices == null) throw new ArgumentNullException(nameof(matrices));
+        if (matrices.Length == 0) throw new ArgumentException("MultiDot requires at least one matrix");
+        if (matrices.Length == 1) return matrices[0];
+
+        // Build einsum equation: "ab,bc,cd,...->a?" — one distinct char per
+        // contraction axis. The greedy path optimizer inside TensorEinsum
+        // picks an efficient contraction order automatically.
+        var labels = new System.Collections.Generic.List<string>(matrices.Length);
+        char cursor = 'a';
+        string prev = new string(cursor++, 1) + new string(cursor++, 1);
+        labels.Add(prev);
+        for (int i = 1; i < matrices.Length; i++)
+        {
+            // The right-side label of prev becomes the left-side label of this.
+            char left = prev[1];
+            char right = cursor++;
+            string cur = new string(new[] { left, right });
+            labels.Add(cur);
+            prev = cur;
+        }
+        string outLabels = new string(new[] { labels[0][0], prev[1] });
+        string eq = string.Join(",", labels) + "->" + outLabels;
+        return TensorEinsum(eq, matrices);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<int> TensorHistogramDD<T>(
         Tensor<T> samples, int[] bins, T[] mins, T[] maxs)
     {

@@ -6646,6 +6646,20 @@ public interface IEngine
     Tensor<int> TensorHistogramDD<T>(Tensor<T> samples, int[] bins, T[] mins, T[] maxs);
 
     /// <summary>
+    /// Count occurrences of each non-negative integer value (torch.bincount).
+    /// Output length = max(max(input) + 1, minLength).
+    /// </summary>
+    Tensor<int> TensorBinCount(Tensor<int> input, int? minLength = null);
+
+    /// <summary>
+    /// Chain of matrix multiplications. Builds an einsum expression and
+    /// dispatches to TensorEinsum, inheriting the greedy path optimiser —
+    /// so a chain like (A · B · C · D) picks an efficient contraction order
+    /// (torch.linalg.multi_dot).
+    /// </summary>
+    Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices);
+
+    /// <summary>
     /// Median ignoring NaN values (torch.nanmedian). Returns NaN if every
     /// value is NaN. Lower-median convention on even counts.
     /// </summary>
