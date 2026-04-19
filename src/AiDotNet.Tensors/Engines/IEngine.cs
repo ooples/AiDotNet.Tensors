@@ -6522,6 +6522,26 @@ public interface IEngine
     /// <summary>Element-wise ±∞ test (torch.isinf).</summary>
     Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// Sub-byte packed Gather over a byte-buffered packed tensor
+    /// (int1 / int2 / int4 / NF4 / FP4 — storage rides inside
+    /// <see cref="Tensor{Byte}"/>). Gathers rows directly in the packed
+    /// domain — no dequantisation needed. PyTorch forces dequant → gather →
+    /// requant for the same workload. The gather axis must not be the
+    /// last axis when <paramref name="valuesPerByte"/> &gt; 1 (crosses the
+    /// packing boundary).
+    /// </summary>
+    /// <param name="valuesPerByte">1 (plain byte), 2 (int4/NF4/FP4), 4 (int2), 8 (int1/BitNet).</param>
+    Tensor<byte> TensorGatherPacked(
+        Tensor<byte> packed, Tensor<int> indices, int axis, int valuesPerByte);
+
+    /// <summary>
+    /// Sub-byte packed Scatter — inverse of <see cref="TensorGatherPacked"/>.
+    /// </summary>
+    Tensor<byte> TensorScatterPacked(
+        Tensor<byte> packed, Tensor<int> indices, Tensor<byte> source, int axis, int valuesPerByte);
+
+
     /// <summary>Element-wise logical AND on bit-packed masks (torch.logical_and).</summary>
     Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b);
 
