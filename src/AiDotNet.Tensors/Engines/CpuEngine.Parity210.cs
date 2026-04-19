@@ -2965,53 +2965,89 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
     {
-        // v1: only n=0 (digamma) and n=1 (trigamma). Higher orders are a
-        // follow-up — they need the Hurwitz zeta function for full accuracy.
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n), "Polygamma order must be >= 0");
         if (n == 0) return TensorDigamma(tensor);
-        if (n != 1)
-            throw new System.NotImplementedException(
-                $"Polygamma for n={n} is not yet implemented (n=0 digamma and n=1 trigamma only; refs #210 follow-up).");
 
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            // Trigamma via recurrence-up for small x, then asymptotic series.
-            // ψ'(x) = ψ'(x+1) + 1/x². Shift until x ≥ 6 so the tail series
-            // converges rapidly:
-            //   ψ'(x) ≈ 1/x + 1/(2x²) + Σ B_{2k} / x^(2k+1), k ≥ 1
-            //         = 1/x + 1/(2x²) + 1/(6x³) - 1/(30x⁵) + 1/(42x⁷) − …
-            double shift = 0.0;
-            while (xd < 6.0)
-            {
-                shift += 1.0 / (xd * xd);
-                xd += 1.0;
-            }
-            double inv = 1.0 / xd;
-            double inv2 = inv * inv;
-            double series = inv + 0.5 * inv2
-                + inv2 * inv * (1.0 / 6.0
-                  - inv2 * (1.0 / 30.0
-                    - inv2 * (1.0 / 42.0)));
-            return ops.FromDouble(shift + series);
+            return ops.FromDouble(PolygammaScalar(n, xd));
         }, "TensorPolygamma");
-        // d/dx polygamma(n, x) = polygamma(n+1, x). We only support n∈{0,1}
-        // so the derivative is polygamma(n+1, x) which is n=1 or n=2. Since
-        // n=2 isn't implemented, we only record backward when n=0 so the
-        // chain via DigammaBackward (TensorDigamma already handled) works.
-        // For n=1 we stash savedState but PolygammaBackward will throw when
-        // it tries polygamma(2) — acceptable since forward disallows n>1.
-        if (n == 0)
-        {
-            // TensorDigamma already records DigammaBackward so this branch
-            // doesn't need a separate recording.
-        }
-        else
-        {
-            DifferentiableOps.RecordUnary(
-                "TensorPolygamma", result, tensor, BackwardFunctions<T>.PolygammaBackward,
-                savedState: new object[] { n });
-        }
+
+        DifferentiableOps.RecordUnary(
+            "TensorPolygamma", result, tensor, BackwardFunctions<T>.PolygammaBackward,
+            savedState: new object[] { n });
         return result;
+    }
+
+    /// <summary>
+    /// Scalar polygamma for arbitrary order n ≥ 1. Uses shift-up recurrence to
+    /// push the argument into the stable asymptotic regime, then sums the
+    /// general asymptotic series in terms of Bernoulli numbers:
+    /// <para>
+    ///   ψ^(n)(x) = (-1)^(n+1) · [ (n-1)!/x^n + n!/(2 x^(n+1))
+    ///                             + Σ_{k≥1} B_{2k} · (2k+n-1)!/(2k)! / x^(2k+n) ]
+    /// </para>
+    /// </summary>
+    private static double PolygammaScalar(int n, double x)
+    {
+        // For non-positive integer arguments polygamma has poles at x = 0, -1, -2, ...
+        if (x <= 0.0 && x == System.Math.Floor(x))
+            return double.PositiveInfinity;
+
+        // Reflection for x < 0.5 to put x in the forward-recurrence-friendly region.
+        // PyTorch uses the same split; the reflection uses higher-order cotangent
+        // derivatives, which cost more than a handful of recurrence steps, so we
+        // prefer to just recurrence-up for x < shift threshold.
+        double recurrence = 0.0;
+        double xd = x;
+        int signN = (n & 1) == 1 ? 1 : -1;  // (-1)^(n+1)
+
+        // Shift up until xd ≥ 10 so the asymptotic tail converges in ≤ 8 terms.
+        while (xd < 10.0)
+        {
+            // ψ^(n)(x) = ψ^(n)(x+1) + (-1)^n · n! / x^(n+1)
+            // Accumulate -(-1)^n · n! / x^(n+1) in `recurrence` so that
+            // result = recurrence + asymptotic(xd_shifted).
+            recurrence += signN * System.Math.Exp(FactorialLogD(n) - (n + 1) * System.Math.Log(xd));
+            xd += 1.0;
+        }
+
+        // Asymptotic:  ψ^(n)(xd) = (-1)^(n+1) · [ (n-1)!/xd^n + n!/(2·xd^(n+1)) + Σ ... ]
+        double lnX = System.Math.Log(xd);
+        double leading = System.Math.Exp(FactorialLogD(n - 1) - n * lnX);
+        double half    = 0.5 * System.Math.Exp(FactorialLogD(n) - (n + 1) * lnX);
+        double asympt = leading + half;
+
+        // B_{2k} (Bernoulli), k = 1..8 — sufficient for xd ≥ 10, n ≤ ~20.
+        // B_2 = 1/6, B_4 = -1/30, B_6 = 1/42, B_8 = -1/30, B_10 = 5/66,
+        // B_12 = -691/2730, B_14 = 7/6, B_16 = -3617/510.
+        double[] b2k = { 1.0/6.0, -1.0/30.0, 1.0/42.0, -1.0/30.0,
+                         5.0/66.0, -691.0/2730.0, 7.0/6.0, -3617.0/510.0 };
+        double invX2 = 1.0 / (xd * xd);
+        double xPow = 1.0 / System.Math.Pow(xd, n);  // xd^-n
+        for (int k = 1; k <= 8; k++)
+        {
+            // term = B_{2k} · (2k+n-1)! / (2k)! · xd^-(2k+n)
+            xPow *= invX2;  // xd^-(n+2k)
+            double logTerm = FactorialLogD(2 * k + n - 1) - FactorialLogD(2 * k);
+            double term = b2k[k - 1] * System.Math.Exp(logTerm) * xPow;
+            asympt += term;
+            if (System.Math.Abs(term) < 1e-16 * System.Math.Abs(asympt)) break;
+        }
+
+        return recurrence + signN * asympt;
+    }
+
+    /// <summary>Natural log of k! via lgamma(k+1). Safe for k up to 170.</summary>
+    private static double FactorialLogD(int k)
+    {
+        if (k <= 1) return 0.0;
+        // Direct log-sum for small k; Stirling for larger. Use MathHelper.Gamma
+        // would overflow for k > 170 so we take logs all the way through.
+        double s = 0.0;
+        for (int i = 2; i <= k; i++) s += System.Math.Log(i);
+        return s;
     }
 
     /// <inheritdoc/>
