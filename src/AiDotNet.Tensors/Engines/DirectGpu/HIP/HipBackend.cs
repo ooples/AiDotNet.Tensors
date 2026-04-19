@@ -82,6 +82,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _fusedLinearModule;
     private IntPtr _iouModule;
     private IntPtr _complexModule;
+    private IntPtr _parity210Module;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -526,6 +527,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
+
+            // Parity-210 hot-path kernels. Same surface as CUDA's parity210_* set.
+            try
+            {
+                CompileKernelModule(Kernels.HipParity210Kernels.GetSource(), "parity210",
+                    ref _parity210Module, Kernels.HipParity210Kernels.GetKernelNames());
+            }
+            catch
+            {
+                _parity210Module = IntPtr.Zero;
+            }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
