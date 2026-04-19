@@ -503,6 +503,101 @@ public partial class CpuEngine
         return result;
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (axesA == null) throw new ArgumentNullException(nameof(axesA));
+        if (axesB == null) throw new ArgumentNullException(nameof(axesB));
+        if (axesA.Length != axesB.Length)
+            throw new ArgumentException("axesA and axesB must have the same length");
+
+        // Build einsum labels for the two operands. Use distinct chars for
+        // each dim, but match labels between a and b on the contraction axes.
+        int aRank = a.Rank;
+        int bRank = b.Rank;
+        if (axesA.Length > aRank || axesB.Length > bRank)
+            throw new ArgumentException("axes exceed operand rank");
+
+        var aLabels = new char[aRank];
+        var bLabels = new char[bRank];
+
+        // Normalise negative axes and check for duplicates.
+        var contractedA = new int[axesA.Length];
+        var contractedB = new int[axesB.Length];
+        for (int i = 0; i < axesA.Length; i++)
+        {
+            int ax = axesA[i] < 0 ? axesA[i] + aRank : axesA[i];
+            if (ax < 0 || ax >= aRank) throw new ArgumentOutOfRangeException(nameof(axesA));
+            contractedA[i] = ax;
+            int bx = axesB[i] < 0 ? axesB[i] + bRank : axesB[i];
+            if (bx < 0 || bx >= bRank) throw new ArgumentOutOfRangeException(nameof(axesB));
+            contractedB[i] = bx;
+        }
+
+        // Assign a contraction label (lowercase starting at 'a') for each
+        // contracted dim; use uppercase starting at 'A' for free dims.
+        char contractCursor = 'a';
+        char freeCursor = 'A';
+        var freeA = new System.Collections.Generic.List<char>();
+        var freeB = new System.Collections.Generic.List<char>();
+
+        // Map contracted a-axis to its label, same label goes to matching b-axis.
+        var aIsContracted = new bool[aRank];
+        var bIsContracted = new bool[bRank];
+        for (int i = 0; i < contractedA.Length; i++)
+        {
+            char label = contractCursor++;
+            aLabels[contractedA[i]] = label;
+            bLabels[contractedB[i]] = label;
+            aIsContracted[contractedA[i]] = true;
+            bIsContracted[contractedB[i]] = true;
+        }
+        for (int i = 0; i < aRank; i++)
+        {
+            if (!aIsContracted[i])
+            {
+                char label = freeCursor++;
+                aLabels[i] = label;
+                freeA.Add(label);
+            }
+        }
+        for (int i = 0; i < bRank; i++)
+        {
+            if (!bIsContracted[i])
+            {
+                char label = freeCursor++;
+                bLabels[i] = label;
+                freeB.Add(label);
+            }
+        }
+
+        string aStr = new string(aLabels);
+        string bStr = new string(bLabels);
+        string outStr = new string(freeA.Concat(freeB).ToArray());
+        string eq = $"{aStr},{bStr}->{outStr}";
+        return TensorEinsum(eq, a, b);
+    }
+
+    /// <inheritdoc/>
+    public virtual T TensorVecDot<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a.Rank != 1 || b.Rank != 1) throw new ArgumentException("VecDot requires 1-D tensors");
+        if (a.Length != b.Length) throw new ArgumentException("vectors must have the same length");
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        T acc = ops.Zero;
+        for (int i = 0; i < av.Length; i++)
+            acc = ops.Add(acc, ops.Multiply(av[i], bv[i]));
+        return acc;
+    }
+
     // ==================================================================
     // Cumulative ops
     // ==================================================================

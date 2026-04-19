@@ -6350,6 +6350,16 @@ public interface IEngine
     /// <summary>Promote to rank ≥1 (torch.atleast_1d).</summary>
     Tensor<T> TensorAtLeast1D<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// General tensor contraction along arbitrary axes (torch.tensordot).
+    /// Internally builds an einsum equation and dispatches to TensorEinsum,
+    /// so it inherits the greedy path optimizer and fast-path routing.
+    /// </summary>
+    Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB);
+
+    /// <summary>1-D vector inner product Σ a[i]·b[i] (torch.linalg.vecdot).</summary>
+    T TensorVecDot<T>(Tensor<T> a, Tensor<T> b);
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 
