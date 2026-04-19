@@ -9272,6 +9272,16 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // Per-kernel pre-transposed array cache for the small-N Conv fast path.
+    // ConditionalWeakTable holds entries weakly by the kernel float[] reference
+    // — they survive exactly as long as the kernel does. For inference on a
+    // fixed ONNX model every Conv layer's kernel is stable, so the first call
+    // populates the cache and every subsequent call reuses the transposed
+    // buffer for ~0 µs. Multi-threaded callers are handled inside
+    // ConditionalWeakTable.GetValue which is documented thread-safe.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], float[]>
+        _kernelTransposeCache = new();
+
     /// <summary>
     /// im2col + SGEMM float conv. Unfolds the input tensor into a matrix
     /// where each row is one receptive field's flattened patch, then runs a
@@ -9365,17 +9375,19 @@ public class CpuEngine : ITensorLevelEngine
                 {
                     // col stored [K, N] → colT [N, K]
                     var colT = System.Buffers.ArrayPool<float>.Shared.Rent(N * K);
-                    // kernel stored [M, K] → kernelT [K, M]
-                    var kernelT = System.Buffers.ArrayPool<float>.Shared.Rent(K * outC);
                     // output computed as [N, M], then transposed to [M, N]
                     var outT = System.Buffers.ArrayPool<float>.Shared.Rent(N * outC);
+                    // Kernel pre-transpose cache: for a given input kernel
+                    // float[] reference, keep a pre-transposed [K, M] copy.
+                    // This is the "fast-forward transform" — moves the 2.4 MB
+                    // kernel transpose (~1 ms even parallelised) out of the
+                    // hot path. Kernel arrays are stable across Conv2D calls
+                    // for the same model, so the cache hits for every call
+                    // after the first. ConditionalWeakTable uses reference
+                    // equality and collects entries when the kernel is GC'd.
+                    float[] kernelT = GetOrBuildTransposedKernel(kernel, outC, K);
                     try
                     {
-                        // Kernel is the LARGE buffer (2.4 MB on stage4) —
-                        // parallelise its transpose across cores (Parallel.For
-                        // on outer col-block iter). Col + outT are smaller and
-                        // stay sequential.
-                        TransposeFloatParallel(kernel, 0, kernelT, 0, outC, K);
                         TransposeFloatSerial(col, 0, colT, 0, K, N);
 
                         int outOffInArray = outOff;
@@ -9390,8 +9402,9 @@ public class CpuEngine : ITensorLevelEngine
                     finally
                     {
                         System.Buffers.ArrayPool<float>.Shared.Return(outT);
-                        System.Buffers.ArrayPool<float>.Shared.Return(kernelT);
                         System.Buffers.ArrayPool<float>.Shared.Return(colT);
+                        // NOTE: kernelT is NOT returned to ArrayPool — it's
+                        // owned by the cache and lives as long as the kernel.
                     }
                 }
                 else
@@ -9424,6 +9437,24 @@ public class CpuEngine : ITensorLevelEngine
         /// cache-line-aligned. Uses <c>Unsafe.Add</c> on raw refs to skip
         /// per-element Span bounds checks.
         /// </summary>
+        // Persistent cache of pre-transposed kernel arrays for the small-N
+        // fast path. Keyed by the caller's kernel float[] reference via
+        // ConditionalWeakTable — the cache entry stays alive exactly as
+        // long as the kernel itself, so folding inference on a fixed
+        // model gets amortised kernel-transpose cost of zero after the
+        // first call per Conv layer, and transient kernels (training
+        // loops, ad-hoc computations) drop from the cache when the
+        // kernel array is GC'd.
+        static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
+        {
+            return _kernelTransposeCache.GetValue(kernel, k =>
+            {
+                var kernelT = new float[cols * rows];
+                TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
+                return kernelT;
+            });
+        }
+
         /// <summary>
         /// Serial blocked transpose on raw arrays. Takes arrays + offsets
         /// so callers can work with ArrayPool-rented buffers without span
