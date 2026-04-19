@@ -6362,6 +6362,30 @@ public interface IEngine
     /// </summary>
     (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor);
 
+    /// <summary>Element-wise sqrt(a² + b²) without under/overflow (torch.hypot).</summary>
+    Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Copies the sign of <paramref name="b"/> onto the magnitude of <paramref name="a"/> (torch.copysign).</summary>
+    Tensor<T> TensorCopysign<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>IEEE truncation-toward-zero remainder; result has the sign of <paramref name="a"/> (torch.fmod).</summary>
+    Tensor<T> TensorFmod<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Python-style modulo; result has the sign of <paramref name="b"/> (torch.remainder).</summary>
+    Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Element-wise power computed in floating point (torch.float_power).</summary>
+    Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Complementary error function 1 − erf(x) (torch.special.erfc).</summary>
+    Tensor<T> TensorErfc<T>(Tensor<T> tensor);
+
+    /// <summary>x · log(y), with 0·log(y) = 0 by convention (torch.special.xlogy).</summary>
+    Tensor<T> TensorXlogy<T>(Tensor<T> x, Tensor<T> y);
+
+    /// <summary>x · log(1 + y), with 0·log(…) = 0 by convention (torch.special.xlog1py).</summary>
+    Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y);
+
     /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>

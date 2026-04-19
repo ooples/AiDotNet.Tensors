@@ -393,6 +393,81 @@ public partial class CpuEngine
     }
 
     // ==================================================================
+    // Element-wise binary math
+    // ==================================================================
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (ax, bx) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            return ops.Sqrt(ops.Add(ops.Multiply(ax, ax), ops.Multiply(bx, bx)));
+        }, "TensorHypot");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorCopysign<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (ax, bx) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            var sign = ops.SignOrZero(bx);
+            var mag = ops.Abs(ax);
+            // Treat sign==0 (zero b) as positive, matching IEEE copysign on +0.
+            return ops.LessThan(sign, ops.Zero) ? ops.Negate(mag) : mag;
+        }, "TensorCopysign");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorFmod<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (ax, bx) => {
+            // IEEE: result has same sign as dividend (a).
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (ops.Equals(bx, ops.Zero)) return ops.Zero;
+            var q = TruncateTowardZero(ops.Divide(ax, bx));
+            return ops.Subtract(ax, ops.Multiply(q, bx));
+        }, "TensorFmod");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (ax, bx) => {
+            // Python-style: result has same sign as divisor (b).
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (ops.Equals(bx, ops.Zero)) return ops.Zero;
+            var q = ops.Floor(ops.Divide(ax, bx));
+            return ops.Subtract(ax, ops.Multiply(q, bx));
+        }, "TensorRemainder");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b)
+        => ElementwiseBinary(a, b, (ax, bx) =>
+            MathHelper.GetNumericOperations<T>().Power(ax, bx), "TensorFloatPower");
+
+    // ==================================================================
+    // Special math
+    // ==================================================================
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorErfc<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            return ops.Subtract(ops.One, MathHelper.Erf(x));
+        }, "TensorErfc");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorXlogy<T>(Tensor<T> x, Tensor<T> y)
+        => ElementwiseBinary(x, y, (xv, yv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            // x * log(y) with the convention 0 * log(0) = 0.
+            return ops.Equals(xv, ops.Zero) ? ops.Zero : ops.Multiply(xv, ops.Log(yv));
+        }, "TensorXlogy");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y)
+        => ElementwiseBinary(x, y, (xv, yv) => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            // x * log(1 + y) with 0 * log(...) = 0.
+            return ops.Equals(xv, ops.Zero)
+                ? ops.Zero
+                : ops.Multiply(xv, ops.Log(ops.Add(ops.One, yv)));
+        }, "TensorXlog1py");
+
+    // ==================================================================
     // Helpers
     // ==================================================================
 
@@ -460,5 +535,42 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         // Not actually used — cumulative fns handle the first element specially.
         return ops.Zero;
+    }
+
+    private static Tensor<T> ElementwiseUnary<T>(
+        Tensor<T> tensor, Func<T, T> f, string opName)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = f(src[i]);
+        return result;
+    }
+
+    private static Tensor<T> ElementwiseBinary<T>(
+        Tensor<T> a, Tensor<T> b, Func<T, T, T> f, string opName)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!a._shape.SequenceEqual(b._shape))
+            throw new ArgumentException(
+                $"{opName}: shape mismatch [{string.Join(", ", a._shape)}] vs [{string.Join(", ", b._shape)}]");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < av.Length; i++) dst[i] = f(av[i], bv[i]);
+        return result;
+    }
+
+    private static T TruncateTowardZero<T>(T value)
+    {
+        // Truncate toward zero: floor for positive, ceil for negative.
+        var ops = MathHelper.GetNumericOperations<T>();
+        return ops.LessThan(value, ops.Zero) ? ops.Ceiling(value) : ops.Floor(value);
     }
 }

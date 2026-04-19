@@ -82,6 +82,13 @@ internal static class OpRegistry
         "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
         "TensorClampMin", "TensorClampMax",
 
+        // Parity-210 element-wise binary (forward only in v1; backward TBD)
+        "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",
+        "TensorFloatPower",
+
+        // Parity-210 special math (forward only in v1)
+        "TensorErfc", "TensorXlogy", "TensorXlog1py",
+
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
         "ComplexMagnitudeSquared",
