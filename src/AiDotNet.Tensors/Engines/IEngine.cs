@@ -6421,6 +6421,15 @@ public interface IEngine
     /// <summary>Element-wise test for set membership (torch.isin).</summary>
     Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false);
 
+    /// <summary>Element-wise test for finite values — neither NaN nor ±∞ (torch.isfinite).</summary>
+    Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise NaN test (torch.isnan).</summary>
+    Tensor<Bit> TensorIsNan<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise ±∞ test (torch.isinf).</summary>
+    Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor);
+
     /// <summary>Element-wise <c>max(x, min)</c> (torch.clamp_min).</summary>
     Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min);
 

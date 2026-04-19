@@ -643,6 +643,56 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = new Bit[src.Length];
+        for (int i = 0; i < src.Length; i++)
+        {
+            bool finite = !ops.IsNaN(src[i]);
+            // Also check for ±∞ via round-trip to double (when T is fp).
+            if (finite)
+            {
+                double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
+                finite = !double.IsInfinity(d);
+            }
+            result[i] = finite ? Bit.True : Bit.False;
+        }
+        return new Tensor<Bit>(result, tensor._shape);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorIsNan<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = new Bit[src.Length];
+        for (int i = 0; i < src.Length; i++)
+            result[i] = ops.IsNaN(src[i]) ? Bit.True : Bit.False;
+        return new Tensor<Bit>(result, tensor._shape);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        var result = new Bit[src.Length];
+        for (int i = 0; i < src.Length; i++)
+        {
+            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
+            result[i] = double.IsInfinity(d) ? Bit.True : Bit.False;
+        }
+        return new Tensor<Bit>(result, tensor._shape);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false)
     {
         if (elements == null) throw new ArgumentNullException(nameof(elements));
