@@ -1401,6 +1401,109 @@ public partial class CpuEngine
         => ElementwiseBinary(a, b, (ax, bx) =>
             MathHelper.GetNumericOperations<T>().Power(ax, bx), "TensorFloatPower");
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (exp == null) throw new ArgumentNullException(nameof(exp));
+        if (!x._shape.SequenceEqual(exp._shape))
+            throw new ArgumentException("Ldexp requires matching shapes");
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!exp.IsContiguous) exp = exp.Contiguous();
+        var src = x.AsSpan();
+        var e = exp.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++)
+        {
+            // x * 2^e. Compute via Power(2.0, e) then multiply.
+            double scale = System.Math.Pow(2.0, e[i]);
+            dst[i] = ops.Multiply(src[i], ops.FromDouble(scale));
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Bit-level next-after. We dispatch on typeof(T) so fp32 stays in fp32
+        // (avoids the trap where "next after 1.0 toward 2.0" in fp64 rounds
+        // straight back to 1.0f when cast through T=float).
+        return ElementwiseBinary(a, b, (av, bv) => NextAfterDispatch(av, bv), "TensorNextAfter");
+    }
+
+    private static T NextAfterDispatch<T>(T av, T bv)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (typeof(T) == typeof(float))
+        {
+            // Convert.ToSingle handles the generic-to-numeric path via
+            // IConvertible without tripping nullable-reference warnings.
+            float af = System.Convert.ToSingle(av);
+            float bf = System.Convert.ToSingle(bv);
+            return ops.FromDouble(NextAfterFloat(af, bf));
+        }
+        if (typeof(T) == typeof(double))
+        {
+            double ad = System.Convert.ToDouble(av);
+            double bd = System.Convert.ToDouble(bv);
+            return ops.FromDouble(NextAfterDouble(ad, bd));
+        }
+        // Integer / decimal / complex: no meaningful ulp; return b.
+        return bv;
+    }
+
+    private static float NextAfterFloat(float a, float b)
+    {
+        if (a == b) return b;
+        if (float.IsNaN(a) || float.IsNaN(b)) return float.NaN;
+        // Reinterpret as int32 via unsafe cast (net471-compatible without
+        // BitConverter.SingleToInt32Bits).
+        unsafe
+        {
+            int bits = *(int*)&a;
+            bits += (a < b) ? (a >= 0 ? 1 : -1) : (a >= 0 ? -1 : 1);
+            return *(float*)&bits;
+        }
+    }
+
+    private static double NextAfterDouble(double a, double b)
+    {
+        if (a == b) return b;
+        if (double.IsNaN(a) || double.IsNaN(b)) return double.NaN;
+        long bits = System.BitConverter.DoubleToInt64Bits(a);
+        bits += (a < b) ? (a >= 0 ? 1 : -1) : (a >= 0 ? -1 : 1);
+        return System.BitConverter.Int64BitsToDouble(bits);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
+    {
+        // Flat-indexed scatter. Inverse of Take: tensor[indices.flatten()] = source.
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (indices.Length != source.Length)
+            throw new ArgumentException("indices and source must have the same element count");
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var idx = indices.AsSpan();
+        var src = source.AsSpan();
+        int total = dst.Length;
+        for (int i = 0; i < idx.Length; i++)
+        {
+            int pos = idx[i];
+            if (pos < 0 || pos >= total)
+                throw new IndexOutOfRangeException(
+                    $"indices[{i}]={pos} out of range for flattened length {total}");
+            dst[pos] = src[i];
+        }
+        return result;
+    }
+
     // ==================================================================
     // Special math
     // ==================================================================

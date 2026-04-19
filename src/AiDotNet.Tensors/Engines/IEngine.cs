@@ -6448,6 +6448,25 @@ public interface IEngine
     /// <summary>Element-wise power computed in floating point (torch.float_power).</summary>
     Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b);
 
+    /// <summary>
+    /// Element-wise <c>x · 2^exp</c> (torch.ldexp). <paramref name="exp"/> must
+    /// be integer and broadcast to the same shape as <paramref name="x"/>.
+    /// </summary>
+    Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp);
+
+    /// <summary>
+    /// Element-wise next representable floating-point value after
+    /// <paramref name="a"/> toward <paramref name="b"/> (torch.nextafter).
+    /// </summary>
+    Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Flat-indexed scatter (torch.put). Writes <paramref name="source"/>[i]
+    /// into <paramref name="tensor"/> at flat position <paramref name="indices"/>[i].
+    /// The inverse of <see cref="TensorTake{T}"/>.
+    /// </summary>
+    Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source);
+
     /// <summary>Complementary error function 1 − erf(x) (torch.special.erfc).</summary>
     Tensor<T> TensorErfc<T>(Tensor<T> tensor);
 

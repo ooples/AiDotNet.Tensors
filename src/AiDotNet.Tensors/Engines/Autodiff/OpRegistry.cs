@@ -90,7 +90,7 @@ internal static class OpRegistry
 
         // Parity-210 element-wise binary (forward only in v1; backward TBD)
         "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",
-        "TensorFloatPower",
+        "TensorFloatPower", "TensorLdexp", "TensorNextAfter",
 
         // Parity-210 special math (forward only in v1)
         "TensorErfc", "TensorXlogy", "TensorXlog1py",
@@ -105,7 +105,7 @@ internal static class OpRegistry
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy",
         "TensorMaskedScatter", "TensorScatterReduce",
         "TensorBroadcastTo", "TensorExpandAs",
-        "TensorTake", "TensorTakeAlongDim",
+        "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
 
         // Complex
