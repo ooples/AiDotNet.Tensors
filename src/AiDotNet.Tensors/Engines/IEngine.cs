@@ -6703,6 +6703,13 @@ public interface IEngine
     (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
+    /// Returns the indices that would sort the tensor along the given axis
+    /// (torch.argsort). Ascending by default, descending when
+    /// <paramref name="descending"/> is true.
+    /// </summary>
+    Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).

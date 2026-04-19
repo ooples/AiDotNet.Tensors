@@ -2380,6 +2380,15 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false)
+    {
+        // Argsort is just Sort discarding the values tensor. We share the
+        // same kernel path so any future SIMD Sort lands here too.
+        var (_, indices) = TensorSort(input, axis, descending);
+        return indices;
+    }
+
+    /// <inheritdoc/>
     public virtual (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
