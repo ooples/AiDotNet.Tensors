@@ -22,7 +22,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// - Third dimension: color channels (red, green, blue)
 /// </para>
 /// </remarks>
-public class Tensor<T> : TensorBase<T>, IEnumerable<T>
+public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 {
     /// <summary>
     /// Accumulated gradient from backward passes. Null until first backward, then
