@@ -6,7 +6,7 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend
+public sealed partial class MetalBackend : IParity210Backend
 {
     private const string Parity210LibName = "Parity210";
 

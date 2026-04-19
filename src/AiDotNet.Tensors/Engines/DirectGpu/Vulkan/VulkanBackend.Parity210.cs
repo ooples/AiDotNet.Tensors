@@ -5,7 +5,7 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend
+public sealed unsafe partial class VulkanBackend : IParity210Backend
 {
     // Push-constant layouts — sizeof in bytes. GLSL struct alignment rules
     // round each uint/int/float to 4 bytes.

@@ -5,7 +5,7 @@
 #if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    public sealed partial class OpenClBackend
+    public sealed partial class OpenClBackend : IParity210Backend
     {
         private const int Parity210LocalSize = 256;
 

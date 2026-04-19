@@ -14,7 +14,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IParity210Backend
 {
     // -----------------------------------------------------------------------
     // Helpers

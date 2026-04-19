@@ -5,7 +5,7 @@
 // (hipModuleLaunchKernel vs cuLaunchKernel) differs.
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend
+public sealed partial class HipBackend : IParity210Backend
 {
     private IntPtr ResolveParity210Kernel(string name)
     {
