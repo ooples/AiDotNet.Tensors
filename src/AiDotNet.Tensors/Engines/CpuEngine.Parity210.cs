@@ -693,6 +693,94 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0)
+        => TriangularFill(tensor, diagonal, keepUpper: true);
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorTril<T>(Tensor<T> tensor, int diagonal = 0)
+        => TriangularFill(tensor, diagonal, keepUpper: false);
+
+    private Tensor<T> TriangularFill<T>(Tensor<T> tensor, int diagonal, bool keepUpper)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Rank < 2) throw new ArgumentException("Triu/Tril requires rank >= 2");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
+        int rank = tensor.Rank;
+        int rows = tensor._shape[rank - 2];
+        int cols = tensor._shape[rank - 1];
+        int batchSize = 1; for (int k = 0; k < rank - 2; k++) batchSize *= tensor._shape[k];
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var zero = ops.Zero;
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int baseIdx = b * rows * cols;
+            for (int i = 0; i < rows; i++)
+                for (int j = 0; j < cols; j++)
+                {
+                    // keep cell iff:
+                    //   Triu: j - i >= diagonal
+                    //   Tril: j - i <= diagonal
+                    int offset = j - i;
+                    bool keep = keepUpper ? offset >= diagonal : offset <= diagonal;
+                    if (!keep) dst[baseIdx + i * cols + j] = zero;
+                }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<int> TensorNonzero<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        int rank = tensor.Rank;
+        var strides = ComputeRowMajorStrides(tensor._shape);
+
+        // First pass: count.
+        int n = 0;
+        for (int i = 0; i < src.Length; i++) if (!ops.Equals(src[i], ops.Zero)) n++;
+
+        // Second pass: coordinates.
+        var result = new Tensor<int>(new[] { n, rank });
+        var dst = result.AsWritableSpan();
+        int row = 0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            if (!ops.Equals(src[i], ops.Zero))
+            {
+                int rem = i;
+                for (int k = 0; k < rank; k++)
+                {
+                    dst[row * rank + k] = rem / strides[k];
+                    rem %= strides[k];
+                }
+                row++;
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual int TensorCountNonzero<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var src = tensor.AsSpan();
+        int n = 0;
+        for (int i = 0; i < src.Length; i++) if (!ops.Equals(src[i], ops.Zero)) n++;
+        return n;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b)
         => BitBinary(a, b, (av, bv) => (bool)av && (bool)bv);
 

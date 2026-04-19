@@ -6442,6 +6442,28 @@ public interface IEngine
     /// <summary>Element-wise logical NOT on a bit-packed mask (torch.logical_not).</summary>
     Tensor<Bit> TensorLogicalNot(Tensor<Bit> a);
 
+    /// <summary>
+    /// Upper-triangular fill: keep elements where (col − row) ≥ <paramref name="diagonal"/>;
+    /// zero everything else. Works on the last two dims; batch-preserving
+    /// (torch.triu).
+    /// </summary>
+    Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0);
+
+    /// <summary>
+    /// Lower-triangular fill: keep elements where (col − row) ≤ <paramref name="diagonal"/>;
+    /// zero everything else (torch.tril).
+    /// </summary>
+    Tensor<T> TensorTril<T>(Tensor<T> tensor, int diagonal = 0);
+
+    /// <summary>
+    /// Return coordinates of nonzero elements as a [N, rank] int tensor
+    /// (torch.nonzero). Ordered row-major over the input.
+    /// </summary>
+    Tensor<int> TensorNonzero<T>(Tensor<T> tensor);
+
+    /// <summary>Count nonzero elements in the flattened tensor (torch.count_nonzero).</summary>
+    int TensorCountNonzero<T>(Tensor<T> tensor);
+
     /// <summary>Element-wise <c>max(x, min)</c> (torch.clamp_min).</summary>
     Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min);
 
