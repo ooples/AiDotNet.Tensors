@@ -617,6 +617,84 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
+    {
+        // Pairwise p-norm distance over the N rows of a 2-D [N, D] input.
+        // Output shape: 1-D of length N·(N-1)/2, ordered (0,1),(0,2),...,
+        // matching torch.pdist.
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 2) throw new ArgumentException("PDist requires rank-2 input");
+        int n = input._shape[0];
+        int d = input._shape[1];
+        if (n == 0) return new Tensor<T>(new[] { 0 });
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        int pairs = n * (n - 1) / 2;
+        var result = new Tensor<T>(new[] { pairs });
+        var dst = result.AsWritableSpan();
+        int cursor = 0;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+            {
+                dst[cursor++] = PNorm(ops, src, i * d, j * d, d, p);
+            }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
+    {
+        // Cross pairwise p-norm: output[i, j] = ‖x1[i] − x2[j]‖_p.
+        if (x1 == null) throw new ArgumentNullException(nameof(x1));
+        if (x2 == null) throw new ArgumentNullException(nameof(x2));
+        if (x1.Rank != 2 || x2.Rank != 2)
+            throw new ArgumentException("CDist requires rank-2 inputs");
+        if (x1._shape[1] != x2._shape[1])
+            throw new ArgumentException("CDist: feature dim must match");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!x1.IsContiguous) x1 = x1.Contiguous();
+        if (!x2.IsContiguous) x2 = x2.Contiguous();
+        var a = x1.AsSpan();
+        var b = x2.AsSpan();
+        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+
+        var result = new Tensor<T>(new[] { m, n });
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
+        return result;
+    }
+
+    private static T PNorm<T>(Interfaces.INumericOperations<T> ops, System.ReadOnlySpan<T> s,
+        int offA, int offB, int d, double p)
+    {
+        // ‖a − b‖_p with inputs pulled from the same span (pdist case).
+        double acc = 0;
+        for (int k = 0; k < d; k++)
+        {
+            double diff = System.Convert.ToDouble(s[offA + k]) - System.Convert.ToDouble(s[offB + k]);
+            acc += System.Math.Pow(System.Math.Abs(diff), p);
+        }
+        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+    }
+
+    private static T PNormCross<T>(Interfaces.INumericOperations<T> ops,
+        System.ReadOnlySpan<T> a, int offA, System.ReadOnlySpan<T> b, int offB, int d, double p)
+    {
+        double acc = 0;
+        for (int k = 0; k < d; k++)
+        {
+            double diff = System.Convert.ToDouble(a[offA + k]) - System.Convert.ToDouble(b[offB + k]);
+            acc += System.Math.Pow(System.Math.Abs(diff), p);
+        }
+        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
     {
         // Kronecker product. For 2-D inputs A ∈ ℝ^{m×n} and B ∈ ℝ^{p×q},

@@ -6415,6 +6415,19 @@ public interface IEngine
     /// </summary>
     Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b);
 
+    /// <summary>
+    /// Pairwise p-norm distances over the N rows of a [N, D] matrix
+    /// (torch.pdist). Output is a 1-D tensor of length N·(N−1)/2 ordered
+    /// (0,1), (0,2), …, (N−2, N−1).
+    /// </summary>
+    Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0);
+
+    /// <summary>
+    /// Cross pairwise distance: output[i, j] = ‖x1[i] − x2[j]‖_p
+    /// (torch.cdist).
+    /// </summary>
+    Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0);
+
     /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
     Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
 
