@@ -2389,6 +2389,58 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!a._shape.SequenceEqual(b._shape)) return false;
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        for (int i = 0; i < av.Length; i++)
+        {
+            // NaN != NaN per PyTorch semantics; Equals returns false for NaN.
+            if (!ops.Equals(av[i], bv[i])) return false;
+        }
+        return true;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorEq<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!a._shape.SequenceEqual(b._shape))
+            throw new ArgumentException("Eq: tensors must have the same shape (broadcast TBD)");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var av = a.AsSpan();
+        var bv = b.AsSpan();
+        var result = new Tensor<Bit>(a._shape);
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < av.Length; i++)
+            dst[i] = ops.Equals(av[i], bv[i]) ? Bit.True : Bit.False;
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<Bit> TensorEqScalar<T>(Tensor<T> a, T scalar)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!a.IsContiguous) a = a.Contiguous();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var av = a.AsSpan();
+        var result = new Tensor<Bit>(a._shape);
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < av.Length; i++)
+            dst[i] = ops.Equals(av[i], scalar) ? Bit.True : Bit.False;
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int sections, int dim = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

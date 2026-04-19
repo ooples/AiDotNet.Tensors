@@ -6741,6 +6741,23 @@ public interface IEngine
     Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0);
 
     /// <summary>
+    /// torch.equal — returns true iff both tensors have the same shape and
+    /// every element compares equal. NaN is treated as not-equal (matches
+    /// PyTorch).
+    /// </summary>
+    bool TensorEqual<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// torch.eq — elementwise equality, returning a <see cref="Bit"/> tensor.
+    /// </summary>
+    Tensor<Bit> TensorEq<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// torch.eq with a scalar right-hand side.
+    /// </summary>
+    Tensor<Bit> TensorEqScalar<T>(Tensor<T> a, T scalar);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).
