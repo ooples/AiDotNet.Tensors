@@ -6766,6 +6766,23 @@ public interface IEngine
     Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max);
 
     /// <summary>
+    /// torch.unique with return_inverse / return_counts. Returns the unique
+    /// values along with optional inverse-map (assigning each input element
+    /// to its unique bucket) and occurrence-count tensors. Inverse and
+    /// counts default to null when the caller doesn't ask for them.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueWithInfo<T>(
+        Tensor<T> input, bool sorted = true, bool returnInverse = false, bool returnCounts = false);
+
+    /// <summary>
+    /// torch.unique_consecutive with return_inverse / return_counts.
+    /// Collapses runs of equal adjacent values, optionally returning an
+    /// inverse-map into the collapsed sequence and per-run counts.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueConsecutiveWithInfo<T>(
+        Tensor<T> input, bool returnInverse = false, bool returnCounts = false);
+
+    /// <summary>
     /// Returns the <paramref name="k"/>-th smallest value of the flattened
     /// tensor with its flat index. <paramref name="k"/> is 1-based
     /// (torch.kthvalue convention).

@@ -2389,6 +2389,125 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueWithInfo<T>(
+        Tensor<T> input, bool sorted = true, bool returnInverse = false, bool returnCounts = false)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        // Collect distinct values preserving first-seen order, track bucket index per element.
+        // We can't use Dictionary<T, int> because T lacks a `notnull` constraint;
+        // linear scan over the growing list is O(n·k) but fine for typical unique counts.
+        var list = new System.Collections.Generic.List<T>();
+        var bucketIdx = new int[src.Length];
+        var counts = new System.Collections.Generic.List<int>();
+        for (int i = 0; i < src.Length; i++)
+        {
+            int b = -1;
+            for (int j = 0; j < list.Count; j++)
+            {
+                if (ops.Equals(list[j], src[i])) { b = j; break; }
+            }
+            if (b < 0)
+            {
+                b = list.Count;
+                list.Add(src[i]);
+                counts.Add(0);
+            }
+            bucketIdx[i] = b;
+            counts[b] = counts[b] + 1;
+        }
+
+        int n = list.Count;
+        Tensor<T> values;
+        int[] remap = null!;
+        if (sorted)
+        {
+            // Sort unique values and build a remap from old bucket index -> new sorted position.
+            var pairs = new (T value, int oldIdx)[n];
+            for (int i = 0; i < n; i++) pairs[i] = (list[i], i);
+            Array.Sort(pairs, (a, b) => ops.Compare(a.value, b.value));
+            var sortedArr = new T[n];
+            remap = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                sortedArr[i] = pairs[i].value;
+                remap[pairs[i].oldIdx] = i;
+            }
+            values = new Tensor<T>(sortedArr, new[] { n });
+        }
+        else
+        {
+            values = new Tensor<T>(list.ToArray(), new[] { n });
+        }
+
+        Tensor<int>? inverse = null;
+        if (returnInverse)
+        {
+            var invArr = new int[src.Length];
+            for (int i = 0; i < src.Length; i++)
+                invArr[i] = sorted ? remap[bucketIdx[i]] : bucketIdx[i];
+            inverse = new Tensor<int>(invArr, (int[])input._shape.Clone());
+        }
+
+        Tensor<int>? countsOut = null;
+        if (returnCounts)
+        {
+            var countsArr = new int[n];
+            if (sorted)
+                for (int i = 0; i < n; i++) countsArr[remap[i]] = counts[i];
+            else
+                for (int i = 0; i < n; i++) countsArr[i] = counts[i];
+            countsOut = new Tensor<int>(countsArr, new[] { n });
+        }
+
+        return (values, inverse, countsOut);
+    }
+
+    /// <inheritdoc/>
+    public virtual (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueConsecutiveWithInfo<T>(
+        Tensor<T> input, bool returnInverse = false, bool returnCounts = false)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var src = input.AsSpan();
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        var values = new System.Collections.Generic.List<T>();
+        var counts = new System.Collections.Generic.List<int>();
+        var inv = returnInverse ? new int[src.Length] : null;
+
+        if (src.Length > 0)
+        {
+            T last = src[0];
+            values.Add(last);
+            counts.Add(1);
+            if (inv != null) inv[0] = 0;
+            for (int i = 1; i < src.Length; i++)
+            {
+                if (!ops.Equals(src[i], last))
+                {
+                    last = src[i];
+                    values.Add(last);
+                    counts.Add(1);
+                }
+                else
+                {
+                    counts[counts.Count - 1] = counts[counts.Count - 1] + 1;
+                }
+                if (inv != null) inv[i] = values.Count - 1;
+            }
+        }
+
+        var valuesOut = new Tensor<T>(values.ToArray(), new[] { values.Count });
+        Tensor<int>? inverseOut = inv != null ? new Tensor<int>(inv, (int[])input._shape.Clone()) : null;
+        Tensor<int>? countsOut = returnCounts ? new Tensor<int>(counts.ToArray(), new[] { counts.Count }) : null;
+        return (valuesOut, inverseOut, countsOut);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
