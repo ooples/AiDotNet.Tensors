@@ -86,7 +86,8 @@ internal static class OpRegistry
         "TensorColumnStack", "TensorRowStack",
         "TensorHSplit", "TensorVSplit", "TensorDSplit",
         "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
-        "TensorClampMin", "TensorClampMax",
+        "TensorClampMin", "TensorClampMax", "TensorClampTensor",
+        "TensorSelectScatter",
 
         // Parity-210 element-wise binary (forward only in v1; backward TBD)
         "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",

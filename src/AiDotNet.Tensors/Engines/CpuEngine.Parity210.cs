@@ -709,6 +709,85 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorClampTensor<T>(Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (min is null && max is null)
+            throw new ArgumentException("At least one of min / max must be supplied");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // For now, require exact-shape bounds (no broadcasting). A broadcasting
+        // variant can layer on top via BroadcastTensors.
+        if (min is not null && !min._shape.SequenceEqual(tensor._shape))
+            throw new ArgumentException("min shape must match tensor shape (broadcasting TBD)");
+        if (max is not null && !max._shape.SequenceEqual(tensor._shape))
+            throw new ArgumentException("max shape must match tensor shape (broadcasting TBD)");
+
+        var src = tensor.AsSpan();
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+        var dst = result.AsWritableSpan();
+        var minSpan = min is null ? default : (min.IsContiguous ? min : min.Contiguous()).AsSpan();
+        var maxSpan = max is null ? default : (max.IsContiguous ? max : max.Contiguous()).AsSpan();
+
+        for (int i = 0; i < src.Length; i++)
+        {
+            var v = src[i];
+            if (min is not null && ops.LessThan(v, minSpan[i])) v = minSpan[i];
+            if (max is not null && ops.GreaterThan(v, maxSpan[i])) v = maxSpan[i];
+            dst[i] = v;
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorSelectScatter<T>(
+        Tensor<T> tensor, Tensor<T> source, int dim, int index)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+        int axisSize = tensor._shape[dim];
+        if (index < 0) index += axisSize;
+        if (index < 0 || index >= axisSize) throw new ArgumentOutOfRangeException(nameof(index));
+
+        // Source should have rank = tensor.rank - 1, matching tensor shape with
+        // dim dropped.
+        if (source.Rank != rank - 1)
+            throw new ArgumentException($"source rank {source.Rank} must be tensor rank - 1 ({rank - 1})");
+        int srcDim = 0;
+        for (int k = 0; k < rank; k++)
+        {
+            if (k == dim) continue;
+            if (source._shape[srcDim] != tensor._shape[k])
+                throw new ArgumentException(
+                    $"source.shape[{srcDim}]={source._shape[srcDim]} must match tensor.shape[{k}]={tensor._shape[k]}");
+            srcDim++;
+        }
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var result = (Tensor<T>)tensor.Clone();
+        var dst = result.AsWritableSpan();
+        var src = source.AsSpan();
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                int dstPos = outer * axisSize * innerSize + index * innerSize + inner;
+                int srcPos = outer * innerSize + inner;
+                dst[dstPos] = src[srcPos];
+            }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

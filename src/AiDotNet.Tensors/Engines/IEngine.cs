@@ -6433,6 +6433,19 @@ public interface IEngine
     /// </summary>
     (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// Element-wise <c>clamp</c> with tensor-valued bounds (torch.clamp with
+    /// tensor min/max). Either bound may be <c>null</c>. Current v1 requires
+    /// exact-shape bounds; a broadcasting overload is a follow-up.
+    /// </summary>
+    Tensor<T> TensorClampTensor<T>(Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max);
+
+    /// <summary>
+    /// Write a (rank-1 smaller) slice into <paramref name="tensor"/> at a
+    /// single axis position (torch.select_scatter).
+    /// </summary>
+    Tensor<T> TensorSelectScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int index);
+
     /// <summary>Element-wise sqrt(a² + b²) without under/overflow (torch.hypot).</summary>
     Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b);
 
