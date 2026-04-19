@@ -12,6 +12,28 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 public partial class Tensor<T>
 {
     /// <summary>
+    /// Memory layout of this tensor's elements. Defaults to
+    /// <see cref="MemoryFormat.Contiguous"/> (NCHW). Ops that detect
+    /// <see cref="MemoryFormat.ChannelsLast"/> route through layout-
+    /// preserving kernels so gather / scatter / pool / norm don't
+    /// degrade to the slow generic stride walker the way PyTorch's
+    /// CPU path does for non-contiguous channels-last tensors.
+    /// </summary>
+    public MemoryFormat MemoryFormat { get; set; } = MemoryFormat.Contiguous;
+
+    /// <summary>
+    /// Copies the <see cref="MemoryFormat"/> of <paramref name="source"/>
+    /// onto this tensor. Used by movement / indexing ops whose output
+    /// retains the input's channels-last / channels-first layout.
+    /// </summary>
+    public Tensor<T> PreserveLayoutFrom(Tensor<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        MemoryFormat = source.MemoryFormat;
+        return this;
+    }
+
+    /// <summary>
     /// Boolean-mask indexing: returns the 1-D tensor of elements where
     /// <paramref name="mask"/> is true.  Shape of <paramref name="mask"/>
     /// must match the tensor's shape exactly.  Equivalent to
