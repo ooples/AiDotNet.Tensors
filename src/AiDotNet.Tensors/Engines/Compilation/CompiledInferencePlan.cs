@@ -24,14 +24,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private readonly Tensor<T> _finalOutput;
     private readonly IEngine _engine;
     private readonly int[] _compiledInputShape;
-    // Reference to the tensor the plan was traced against — distinct from
-    // _compiledInputShape which is just a shape vector. After a ThenAsync
-    // rebind this tensor's storage is aliased to the upstream plan's final
-    // output, so downstream steps read data written by the upstream steps
-    // without a boundary copy. Also serialized so a deserialized plan can
-    // be re-stitched or re-bound. Null only for the degenerate empty-plan
-    // case (zero steps).
-    private readonly Tensor<T>? _compiledInputTensor;
+    // Tensors the plan was traced against — the array is the primary storage
+    // so SetInputs generalizes cleanly to multi-input graphs. Today Compile()
+    // captures exactly one entry (steps[0].Inputs[0]); discovering all leaf
+    // inputs of a LazyTensorScope for true multi-input plans is a future
+    // Compile() refactor. After a ThenAsync rebind, the first entry's storage
+    // is aliased to the upstream plan's final output so downstream steps read
+    // data written by the upstream steps without a boundary copy. First entry
+    // is also serialized so a deserialized plan can be re-stitched or re-bound.
+    // Array is never null but may be empty (degenerate empty-plan case).
+    private readonly Tensor<T>[] _compiledInputTensors;
     private readonly List<GCHandle> _pinnedHandles = new();
 
     // Source plans that were stitched to form this plan — empty for plans
@@ -80,12 +82,18 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     internal Tensor<T> FinalOutputBuffer => _finalOutput;
 
     /// <summary>
-    /// The captured-at-trace-time input tensor of this plan. Internal for the
-    /// same reason as <see cref="FinalOutputBuffer"/>: stitching needs to
-    /// rebind the downstream plan's storage to point at the upstream plan's
-    /// output. Null for empty plans (no steps to consume an input).
+    /// The captured-at-trace-time input tensor of this plan (first entry of
+    /// <c>_compiledInputTensors</c>). Internal for the same reason as
+    /// <see cref="FinalOutputBuffer"/>: stitching needs to rebind the
+    /// downstream plan's storage to point at the upstream plan's output.
+    /// Null for empty plans (no steps to consume an input). Multi-input
+    /// plans — when Compile() eventually supports them — expose additional
+    /// captured tensors through <see cref="SetInputs"/>; stitching remains
+    /// a single-input operation since rebinding "the" input is ambiguous
+    /// for N>1.
     /// </summary>
-    internal Tensor<T>? CompiledInputTensor => _compiledInputTensor;
+    internal Tensor<T>? CompiledInputTensor =>
+        _compiledInputTensors.Length > 0 ? _compiledInputTensors[0] : null;
 
     private CompiledInferencePlan(
         CompiledStep<T>[] steps,
@@ -100,7 +108,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         _finalOutput = finalOutput;
         _engine = engine;
         _compiledInputShape = inputShape;
-        _compiledInputTensor = compiledInputTensor;
+        // Compile() / CreateFromDeserialized currently capture one input,
+        // so the array has length 0 or 1 in practice. Storing it as an array
+        // lets SetInputs generalize cleanly when multi-input Compile lands.
+        _compiledInputTensors = compiledInputTensor is null
+            ? Array.Empty<Tensor<T>>()
+            : new[] { compiledInputTensor };
         _sourcePlans = sourcePlans ?? Array.Empty<CompiledInferencePlan<T>>();
         if (handles is not null)
             _pinnedHandles.AddRange(handles);
@@ -124,7 +137,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
         cancellationToken.ThrowIfCancellationRequested();
 
-        InferencePlanWriter.Write(stream, _steps, _finalOutput, _compiledInputShape, _compiledInputTensor);
+        // Current on-disk format captures a single input tensor. When
+        // Compile() starts producing multi-input plans, bump the format
+        // version and extend the writer to emit every entry.
+        var firstInput = _compiledInputTensors.Length > 0 ? _compiledInputTensors[0] : null;
+        InferencePlanWriter.Write(stream, _steps, _finalOutput, _compiledInputShape, firstInput);
         return Task.CompletedTask;
     }
 
@@ -249,9 +266,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (nextPlan._steps.Length == 0)
             throw new ArgumentException(
                 "Cannot stitch into an empty plan (no steps to consume the upstream output).", nameof(next));
-        if (nextPlan._compiledInputTensor is null)
+        // Stitching is a single-input operation; multi-input downstream plans
+        // would need to pick which input to rebind and that's ambiguous. Today
+        // Compile() only produces 1-input plans so the first clause always
+        // holds, but the explicit length check keeps the contract honest when
+        // multi-input Compile lands later.
+        if (nextPlan._compiledInputTensors.Length == 0)
             throw new ArgumentException(
                 "Next plan has no captured input tensor — it cannot be stitched onto.", nameof(next));
+        if (nextPlan._compiledInputTensors.Length > 1)
+            throw new NotSupportedException(
+                "ThenAsync stitching is only supported for single-input plans. " +
+                $"Next plan has {nextPlan._compiledInputTensors.Length} captured inputs.");
+        var nextPlanInput = nextPlan._compiledInputTensors[0];
 
         // Reject fan-out reuse from a DIFFERENT upstream. Stitching rebinds
         // nextPlan's input storage to this plan's output; calling Then again
@@ -275,7 +302,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // criterion #3. Compare _shape arrays element-wise so the error
         // message can name the mismatching dim.
         var thisOut  = _finalOutput._shape;
-        var nextIn   = nextPlan._compiledInputTensor._shape;
+        var nextIn   = nextPlanInput._shape;
         if (thisOut.Length != nextIn.Length || !ShapesEqual(thisOut, nextIn))
             throw new ArgumentException(
                 $"Cannot stitch: this plan's output shape [{string.Join(", ", thisOut)}] " +
@@ -290,7 +317,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // validates shape/contiguity/offset-zero and throws descriptively
         // if the invariants don't hold (pre-filtered above, so in practice
         // this is a belt-and-suspenders check).
-        nextPlan._compiledInputTensor.RebindStorageFrom(_finalOutput);
+        nextPlanInput.RebindStorageFrom(_finalOutput);
         nextPlan._lastStitchUpstream = _finalOutput;
 
         // Splice: [thisSteps..., nextSteps...]. No boundary step — the
@@ -365,7 +392,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             finalOutput: nextPlan._finalOutput,
             engine: _engine,
             inputShape: (int[])_compiledInputShape.Clone(),
-            compiledInputTensor: _compiledInputTensor,
+            compiledInputTensor: _compiledInputTensors.Length > 0 ? _compiledInputTensors[0] : null,
             handles: null,
             sourcePlans: stitchedSources);
     }
@@ -414,6 +441,76 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             steps[i].Execute(engine, steps[i].OutputBuffer);
         }
         return _finalOutput;
+    }
+
+    /// <inheritdoc/>
+    public void ExecuteInto(Tensor<T> output)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+
+        // Validate shape up front so we throw before any step runs. Same
+        // shape guards RebindStorageFrom would raise, but surfaced here so
+        // the exception trace points at the user's call site.
+        ValidateShapesMatch(_finalOutput, output, nameof(output));
+
+        // Run the plan into its internal buffer, then copy the final tensor's
+        // data into the caller's buffer. Copy (not rebind) because many
+        // specialized kernel paths capture array references at compile time
+        // via GetDataArray() closure — a post-compile storage rebind would
+        // not reach those closures, leaving the caller's buffer untouched.
+        // The extra copy is one memcpy of the output-tensor size per call;
+        // under CUDA graph capture it's recorded as a device memcpy node and
+        // replays correctly every iteration.
+        Execute();
+        _finalOutput.AsSpan().CopyTo(output.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void SetInputs(Tensor<T>[] inputs)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        // The uniform length-match check below handles every case: zero-input
+        // plans accept SetInputs(Array.Empty<Tensor<T>>()) as a no-op, N-input
+        // plans require exactly N, and the error names the expected count.
+        // No special case for empty plans — callers get one consistent
+        // contract across 0-, 1-, and future N-input graphs.
+        if (inputs.Length != _compiledInputTensors.Length)
+            throw new ArgumentException(
+                $"This plan was compiled with {_compiledInputTensors.Length} captured input(s); " +
+                $"got {inputs.Length}.",
+                nameof(inputs));
+
+        // Copy (not rebind): the specialized kernels capture each input's
+        // array reference at compile time (see
+        // CompiledTrainingPlan.TryBuildSpecializedForward), so a storage
+        // rebind after compile is invisible to them. Copying refreshes the
+        // captured buffer in-place — the kernels read the new data next
+        // Execute and stay graph-capture-safe.
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var src = inputs[i] ?? throw new ArgumentException(
+                $"inputs[{i}] is null.", nameof(inputs));
+            ValidateShapesMatch(_compiledInputTensors[i], src, $"inputs[{i}]");
+            src.AsSpan().CopyTo(_compiledInputTensors[i].AsWritableSpan());
+        }
+    }
+
+    private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
+    {
+        if (expected._shape.Length != actual._shape.Length)
+            throw new ArgumentException(
+                $"{paramName} rank {actual._shape.Length} != plan rank {expected._shape.Length}.",
+                paramName);
+        for (int i = 0; i < expected._shape.Length; i++)
+        {
+            if (expected._shape[i] != actual._shape[i])
+                throw new ArgumentException(
+                    $"{paramName} shape [{string.Join(", ", actual._shape)}] " +
+                    $"!= plan shape [{string.Join(", ", expected._shape)}].",
+                    paramName);
+        }
     }
 
     public void Dispose()

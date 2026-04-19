@@ -19,6 +19,91 @@ public interface ICompiledPlan<T> : IDisposable
     /// <summary>Executes the compiled plan and returns the output tensor.</summary>
     Tensor<T> Execute();
 
+    /// <summary>
+    /// Executes the compiled plan with the final output written into
+    /// <paramref name="output"/>. Runs every step, then memcpy's the plan's
+    /// internal final-output buffer into <paramref name="output"/>'s
+    /// storage — one fixed memcpy per call, no per-call allocation of the
+    /// output tensor. This is the primitive that makes
+    /// <see cref="ICompiledPlan{T}"/> safely composable with CUDA Graph
+    /// capture: the captured graph records both the step kernels and the
+    /// final memcpy node; each Replay writes into
+    /// <paramref name="output"/>'s backing pointer the same way.
+    /// </summary>
+    /// <param name="output">A caller-owned tensor whose shape equals this plan's
+    /// final output shape. Must be contiguous with zero storage offset.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="output"/> is null.</exception>
+    /// <exception cref="ArgumentException">Shape of <paramref name="output"/>
+    /// does not match this plan's final output shape.</exception>
+    /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Usage pattern — CUDA graph capture:</b> the caller owns the output
+    /// buffer, so allocate it with a shape you already know (the graph's
+    /// output shape is fixed at trace time). If you don't have the shape
+    /// in hand, call <see cref="Execute"/> once first — its returned tensor
+    /// carries the final shape and you can allocate a matching buffer from
+    /// it for subsequent <c>ExecuteInto</c> calls.
+    /// <code>
+    /// var plan = cache.GetOrCompileInference(shape, trace);
+    /// // Derive the output shape from one warm-up Execute, or pass a
+    /// // caller-known shape directly.
+    /// var first = plan.Execute();
+    /// var outputBuf = engine.AllocateTensor&lt;float&gt;(first.Shape.ToArray());
+    /// // A second warm-up run outside capture (stream-sync hygiene)
+    /// plan.ExecuteInto(outputBuf);
+    /// using var scope = new CudaGraphScope(backend, streamHandle);
+    /// scope.BeginCapture();
+    /// plan.ExecuteInto(outputBuf);
+    /// scope.EndCapture();
+    /// foreach (var batch in batches)
+    /// {
+    ///     plan.SetInputs(new[] { inputBuf.CopyFrom(batch) });
+    ///     scope.Replay();                      // zero dispatch, zero alloc
+    ///     outputBuf.CopyTo(results);
+    /// }
+    /// </code>
+    /// </para>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE (issue #199):</b> same rationale as
+    /// <see cref="ThenAsync"/> / <see cref="SaveAsync"/> — adding a member to
+    /// a public interface is breaking for external implementers, no DIM
+    /// polyfill on net471. Built-in <c>CompiledInferencePlan&lt;T&gt;</c> is
+    /// updated in the same PR.
+    /// </para>
+    /// </remarks>
+    void ExecuteInto(Tensor<T> output);
+
+    /// <summary>
+    /// Copies the caller's input data into this plan's captured input
+    /// buffers. After this call subsequent <see cref="Execute"/> /
+    /// <see cref="ExecuteInto"/> read the updated data — one fixed memcpy
+    /// per call, no per-call allocation of the captured input tensor.
+    /// Implementation uses copy rather than storage rebind so the specialized
+    /// kernel paths (which capture array references at compile time) pick
+    /// up the new data correctly. Under CUDA Graph capture the copy is
+    /// recorded as a device memcpy node and replays deterministically.
+    /// </summary>
+    /// <param name="inputs">Array of input tensors in graph-input order. For
+    /// a single-input plan (the common inference case), pass
+    /// <c>new[] { myInput }</c>. Each input must have the same rank, shape,
+    /// and contiguity as the corresponding captured input.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="inputs"/> is
+    /// null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="inputs"/> length
+    /// doesn't match the plan's captured-input count, or any input's shape
+    /// doesn't match the captured input. A zero-input plan accepts
+    /// <c>Array.Empty&lt;Tensor&lt;T&gt;&gt;()</c> as a no-op — the length
+    /// check still applies, so any other length throws.</exception>
+    /// <exception cref="ObjectDisposedException">This plan has been disposed.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE (issue #199):</b> see
+    /// <see cref="ExecuteInto"/>.
+    /// </para>
+    /// </remarks>
+    void SetInputs(Tensor<T>[] inputs);
+
     /// <summary>Checks whether this plan is valid for the given input shape.</summary>
     bool IsValid(int[] inputShape);
 
@@ -145,6 +230,34 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// Returns the loss tensor.
     /// </summary>
     Tensor<T> Step();
+
+    /// <summary>
+    /// CUDA-Graph-capture-safe counterpart to <see cref="Step"/>: runs forward +
+    /// backward, writes the final loss into <paramref name="lossOutput"/>, and
+    /// leaves gradients in <see cref="Gradients"/>. No per-call allocation of the
+    /// loss tensor — the captured graph records a memcpy node that lands in
+    /// <paramref name="lossOutput"/>'s backing memory on every replay.
+    /// </summary>
+    /// <param name="lossOutput">Caller-owned tensor whose shape equals the
+    /// plan's loss-tensor shape.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="lossOutput"/> is null.</exception>
+    /// <exception cref="ArgumentException">Shape mismatch against the plan's loss output.</exception>
+    /// <exception cref="ObjectDisposedException">Plan has been disposed.</exception>
+    void StepInto(Tensor<T> lossOutput);
+
+    /// <summary>
+    /// Copies caller input data into this plan's captured input buffer(s).
+    /// Same semantics as <see cref="ICompiledPlan{T}.SetInputs"/> — one
+    /// memcpy per call, kernels see the new data next <see cref="Step"/>.
+    /// Enables CUDA Graph capture of training loops where the input buffer
+    /// is refilled between replays.
+    /// </summary>
+    /// <param name="inputs">Inputs in captured order.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="inputs"/> is null.</exception>
+    /// <exception cref="ArgumentException">Length doesn't match the plan's
+    /// captured-input count or any input's shape doesn't match.</exception>
+    /// <exception cref="ObjectDisposedException">Plan has been disposed.</exception>
+    void SetInputs(Tensor<T>[] inputs);
 
     /// <summary>
     /// Gradient tensors for each parameter, in the same order as the parameters
