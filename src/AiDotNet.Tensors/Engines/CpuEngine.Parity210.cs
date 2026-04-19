@@ -1600,6 +1600,69 @@ public partial class CpuEngine
         }, "TensorLgamma");
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorErfinv<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double y = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            if (y >= 1.0) return ops.FromDouble(double.PositiveInfinity);
+            if (y <= -1.0) return ops.FromDouble(double.NegativeInfinity);
+            // Seed: Winitzki's approximation, good to ~5 digits.
+            double ln = System.Math.Log(1.0 - y * y);
+            double a = 0.147;
+            double t = 2.0 / (System.Math.PI * a) + ln / 2.0;
+            double xs = System.Math.Sign(y) * System.Math.Sqrt(System.Math.Sqrt(t * t - ln / a) - t);
+            // Refine with 2 Newton steps: f(x) = erf(x) - y, f'(x) = 2/√π · e^(-x²).
+            // Using MathHelper.Erf (Abramowitz-Stegun, 6-digit) — .NET doesn't
+            // expose Math.Erf until very recent versions.
+            for (int it = 0; it < 2; it++)
+            {
+                double e = MathHelper.Erf(xs);
+                double df = 2.0 / System.Math.Sqrt(System.Math.PI) * System.Math.Exp(-xs * xs);
+                xs -= (e - y) / df;
+            }
+            return ops.FromDouble(xs);
+        }, "TensorErfinv");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorI0<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            // Series: I₀(x) = Σ_{k=0}^∞ (x/2)^(2k) / (k!)².
+            // 25 terms cover |x| up to ~15 with fp64 precision.
+            double halfX = xd / 2.0;
+            double halfSq = halfX * halfX;
+            double term = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 25; k++)
+            {
+                term *= halfSq / (k * k);
+                sum += term;
+                if (term < 1e-16) break;
+            }
+            return ops.FromDouble(sum);
+        }, "TensorI0");
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorI1<T>(Tensor<T> tensor)
+        => ElementwiseUnary(tensor, x => {
+            var ops = MathHelper.GetNumericOperations<T>();
+            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
+            // Series: I₁(x) = (x/2) · Σ_{k=0}^∞ (x/2)^(2k) / (k! · (k+1)!).
+            double halfX = xd / 2.0;
+            double halfSq = halfX * halfX;
+            double term = 1.0;   // k=0: 1 / (0! · 1!) = 1
+            double sum = 1.0;
+            for (int k = 1; k < 25; k++)
+            {
+                term *= halfSq / (k * (k + 1));
+                sum += term;
+                if (term < 1e-16) break;
+            }
+            return ops.FromDouble(halfX * sum);
+        }, "TensorI1");
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
         => ElementwiseUnary(tensor, x => {
             // Asymptotic series with recurrence shift. Good enough for fp32;

@@ -6487,6 +6487,18 @@ public interface IEngine
     Tensor<T> TensorDigamma<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Inverse error function (torch.special.erfinv). Winitzki seed +
+    /// 2 Newton iterations — ~7-digit accuracy.
+    /// </summary>
+    Tensor<T> TensorErfinv<T>(Tensor<T> tensor);
+
+    /// <summary>Modified Bessel function of the first kind, order 0 (torch.special.i0).</summary>
+    Tensor<T> TensorI0<T>(Tensor<T> tensor);
+
+    /// <summary>Modified Bessel function of the first kind, order 1 (torch.special.i1).</summary>
+    Tensor<T> TensorI1<T>(Tensor<T> tensor);
+
+    /// <summary>
     /// Sort along an axis; returns both the sorted values and the permutation
     /// indices (torch.sort). Ascending by default, descending when
     /// <paramref name="descending"/> is true.
