@@ -22194,7 +22194,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var shapes = new int[tensors.Length][];
         for (int i = 0; i < tensors.Length; i++) shapes[i] = tensors[i].Shape.ToArray();
         var binding = Engines.Einsum.EinsumShapeBinding.Bind(equation, shapes);
-        var path = Engines.Einsum.EinsumPathOptimizer.Greedy(binding);
+        var path = Engines.Einsum.EinsumPathOptimizer.Optimize(binding);
         var einsumResult = Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
 
         // Record autograd for the general path. v1 supports 2+ operands with

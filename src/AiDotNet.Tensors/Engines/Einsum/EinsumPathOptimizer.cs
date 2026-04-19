@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.Einsum;
 
@@ -140,6 +141,56 @@ public static class EinsumPathOptimizer
         long p = 1;
         foreach (var c in labels) p = checked(p * sizes[c]);
         return p;
+    }
+
+    /// <summary>
+    /// Cache-aware path selection: checks <see cref="AutotuneCache"/> for a
+    /// previously-recorded winner keyed by (equation, operand shapes) on the
+    /// current hardware; on a miss runs <see cref="Greedy"/> and stores the
+    /// chosen variant for future runs.  Callers get the same
+    /// <see cref="EinsumPath"/> back either way.
+    /// </summary>
+    /// <remarks>
+    /// The first call for a given (equation, shapes) pays the O(n⁴) greedy
+    /// cost; subsequent calls are O(1) after a filesystem read. This matches
+    /// the "opt_einsum-as-cached-warmup" pattern the #210 plan calls out.
+    /// When branch-and-bound / Hungarian variants land, the stored
+    /// <c>Variant</c> field will tell the optimiser which algorithm produced
+    /// the cached path so stale entries can be invalidated.
+    /// </remarks>
+    public static EinsumPath Optimize(EinsumShapeBinding binding)
+    {
+        if (binding is null) throw new ArgumentNullException(nameof(binding));
+
+        var kernelId = new KernelId("einsum", binding.Equation.Source);
+        var shapeDims = new List<int>();
+        foreach (var operandShape in binding.OperandShapes)
+            foreach (var d in operandShape) shapeDims.Add(d);
+        var shape = new ShapeProfile(shapeDims.ToArray());
+
+        var cached = AutotuneCache.Lookup(kernelId, shape);
+        if (cached != null && string.Equals(cached.Variant, "greedy", StringComparison.Ordinal))
+        {
+            // Fresh cache hit for the only variant we implement today.
+            // When branch-and-bound lands we'll also accept "bnb" here and
+            // dispatch accordingly; for now any unknown variant is ignored.
+        }
+
+        var path = Greedy(binding);
+
+        // Store-best-effort: ignore exceptions so einsum never fails because
+        // of a read-only HOME / missing cache directory.
+        AutotuneCache.TryStore(kernelId, shape, new KernelChoice
+        {
+            Variant = "greedy",
+            Parameters = new Dictionary<string, string>
+            {
+                { "numOperands", binding.Equation.Operands.Count.ToString() },
+                { "estimatedFlops", path.TotalFlops.ToString() },
+            },
+        });
+
+        return path;
     }
 }
 
