@@ -113,13 +113,30 @@ public sealed class AutocastScope : IDisposable
     /// Registers <paramref name="fp32"/> as the FP32 master copy for
     /// <paramref name="name"/>, casts it to FP16 compute copy, and caches
     /// both. Subsequent calls with the same name return the cached FP16
-    /// copy without re-casting.
+    /// copy without re-casting — unless the FP32 tensor reference has
+    /// changed (e.g. weight update during training replaces the master
+    /// tensor), in which case the stale FP16 cache entry is dropped and
+    /// the new FP32 is freshly re-cast.
     /// </summary>
     public LinearAlgebra.Tensor<Half> RegisterAndCastToFP16(string name, LinearAlgebra.Tensor<float> fp32)
     {
         if (string.IsNullOrEmpty(name)) throw new ArgumentException("Name required.", nameof(name));
         if (fp32 is null) throw new ArgumentNullException(nameof(fp32));
         if (_disposed) throw new ObjectDisposedException(nameof(AutocastScope));
+
+        // Invalidate the FP16 cache entry when the caller swaps in a
+        // different FP32 tensor for the same name. Without this check,
+        // training loops that rebuild weight tensors (rather than mutating
+        // in place) would keep receiving stale FP16 copies of the previous
+        // weights. Reference-equality is the right trigger — content
+        // mutations on the same instance are invisible to this cache by
+        // design; callers who mutate tensor contents in place must call
+        // InvalidateFP16Cache(name) explicitly.
+        if (_fp32Cache.TryGetValue(name, out var existingFp32) &&
+            !ReferenceEquals(existingFp32, fp32))
+        {
+            _fp16Cache.Remove(name);
+        }
 
         _fp32Cache[name] = fp32;
         if (_fp16Cache.TryGetValue(name, out var existing)) return existing;

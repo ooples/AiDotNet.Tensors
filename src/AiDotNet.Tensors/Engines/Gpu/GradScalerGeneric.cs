@@ -151,22 +151,31 @@ public sealed class GradScaler<T>
 
     /// <summary>Single-tensor unscale + overflow check in one call. Returns
     /// true when the step should proceed (no overflow observed), false
-    /// when the caller should skip the optimizer step.</summary>
+    /// when the caller should skip the optimizer step.
+    /// <para>Two-pass implementation: the first pass scans for overflow
+    /// without mutating <paramref name="grads"/>. If any unscaled value
+    /// would be Inf/NaN, the tensor is left untouched and <c>false</c> is
+    /// returned — callers that discard the tensor after skipping don't
+    /// care, but callers that reuse it get a consistent state rather than
+    /// a half-unscaled mess from the previous aborted attempt.</para></summary>
     public bool UnscaleGradientsAndCheck(Tensor<T> grads)
     {
         if (grads is null) throw new ArgumentNullException(nameof(grads));
         var invScale = _numOps.FromDouble(1.0 / _scale);
         var data = grads.GetDataArray();
+        // Pass 1: scan — no writes. If we find an overflow, bail before
+        // mutating so the tensor stays fully scaled (consistent state).
         for (int i = 0; i < data.Length; i++)
         {
-            T v = _numOps.Multiply(data[i], invScale);
-            data[i] = v;
-            if (HasOverflow(v))
+            if (HasOverflow(_numOps.Multiply(data[i], invScale)))
             {
                 _foundInfOrNan = true;
                 return false;
             }
         }
+        // Pass 2: clean scan complete — write the unscaled values back.
+        for (int i = 0; i < data.Length; i++)
+            data[i] = _numOps.Multiply(data[i], invScale);
         _foundInfOrNan = false;
         return true;
     }
