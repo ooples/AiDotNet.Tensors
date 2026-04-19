@@ -9305,21 +9305,151 @@ public class CpuEngine : ITensorLevelEngine
                 int outOff = b * outC * N;
                 var outSpan = output.AsSpan(outOff, outC * N);
                 outSpan.Clear();
-                // Sgemm (vs SgemmSequential) lets SimdGemm spawn its own
-                // Parallel.For when the workload crosses ParallelWorkThreshold.
-                // For batch=1 inference the outer per-image loop has no
-                // parallelism to offer, so the SGEMM-internal one is the
-                // only source of multi-core throughput.
-                AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
-                    kernel.AsSpan(0, outC * K),
-                    col.AsSpan(0, K * N),
-                    outSpan,
-                    outC, K, N);
+
+                // Phase 2C small-N fast path: when N (output patches)
+                // is small and M (outC) is large, SimdGemm's standard
+                // blocked kernel underperforms (stage4 1×512×7×7 3×3
+                // conv = SGEMM[M=512, K=4608, N=49] hits only 18 GFLOPS
+                // vs 100+ on balanced shapes). Diagnostic data from
+                // Conv2DKernelSplitDiag showed the SAME FLOPs with
+                // M↔N swapped runs at 116 GFLOPS — 6.4× faster.
+                //
+                // Fix: when the gate fires, explicitly transpose col and
+                // kernel into the fast-shape layout, run SGEMM on
+                // [N, K] × [K, M] → [N, M], then transpose back to
+                // [M, N]. Rent transposed buffers from ArrayPool so we
+                // don't churn the GC.
+                //
+                // Gate tuning: fires when N ≤ 128 AND M ≥ 128. Empirically
+                // stage4 (N=49, M=512) hits the gate; stages 1-3 all have
+                // N > 128 so they skip it (their direct SGEMM is fast).
+                // The 1×1 ResNet bottleneck and BERT shapes all have
+                // either N > 128 or M < 128, so they also skip.
+                if (N <= 128 && outC >= 128)
+                {
+                    // col stored [K, N] → colT [N, K]
+                    var colT = System.Buffers.ArrayPool<float>.Shared.Rent(N * K);
+                    // kernel stored [M, K] → kernelT [K, M]
+                    var kernelT = System.Buffers.ArrayPool<float>.Shared.Rent(K * outC);
+                    // output computed as [N, M], then transposed to [M, N]
+                    var outT = System.Buffers.ArrayPool<float>.Shared.Rent(N * outC);
+                    try
+                    {
+                        // Kernel is the LARGE buffer (2.4 MB on stage4) —
+                        // parallelise its transpose across cores (Parallel.For
+                        // on outer col-block iter). Col + outT are smaller and
+                        // stay sequential.
+                        TransposeFloatParallel(kernel, 0, kernelT, 0, outC, K);
+                        TransposeFloatSerial(col, 0, colT, 0, K, N);
+
+                        int outOffInArray = outOff;
+                        AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
+                            colT.AsSpan(0, N * K),
+                            kernelT.AsSpan(0, K * outC),
+                            outT.AsSpan(0, N * outC),
+                            N, K, outC);
+
+                        TransposeFloatSerial(outT, 0, output, outOffInArray, N, outC);
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<float>.Shared.Return(outT);
+                        System.Buffers.ArrayPool<float>.Shared.Return(kernelT);
+                        System.Buffers.ArrayPool<float>.Shared.Return(colT);
+                    }
+                }
+                else
+                {
+                    // Sgemm (vs SgemmSequential) lets SimdGemm spawn its own
+                    // Parallel.For when the workload crosses ParallelWorkThreshold.
+                    // For batch=1 inference the outer per-image loop has no
+                    // parallelism to offer, so the SGEMM-internal one is the
+                    // only source of multi-core throughput.
+                    AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
+                        kernel.AsSpan(0, outC * K),
+                        col.AsSpan(0, K * N),
+                        outSpan,
+                        outC, K, N);
+                }
             }
             finally
             {
                 System.Buffers.ArrayPool<float>.Shared.Return(col);
             }
+        }
+
+        /// <summary>
+        /// Blocked row/col transpose for the small-N SGEMM fast path above.
+        /// src is [rows, cols] row-major; dst is [cols, rows] row-major.
+        /// Uses a 32×32 blocked traversal with the INNER loop over <c>r</c>
+        /// so dst writes within a block are contiguous (stride 1 in <c>r</c>
+        /// maps to stride 1 in <c>dst[c*rows + r]</c>). This is the
+        /// "transpose by contiguous writes" layout — SIMD-friendly and
+        /// cache-line-aligned. Uses <c>Unsafe.Add</c> on raw refs to skip
+        /// per-element Span bounds checks.
+        /// </summary>
+        /// <summary>
+        /// Serial blocked transpose on raw arrays. Takes arrays + offsets
+        /// so callers can work with ArrayPool-rented buffers without span
+        /// juggling. Inner loop order: outer c (block-contiguous dst rows),
+        /// inner r (stride-1 dst writes). Uses <c>Unsafe.Add</c> on array
+        /// refs to elide bounds checks.
+        /// </summary>
+        static void TransposeFloatSerial(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
+        {
+            const int BLK = 32;
+            ref float srcRef = ref src[srcOff];
+            ref float dstRef = ref dst[dstOff];
+            for (int cb = 0; cb < cols; cb += BLK)
+            {
+                int cEnd = Math.Min(cb + BLK, cols);
+                for (int rb = 0; rb < rows; rb += BLK)
+                {
+                    int rEnd = Math.Min(rb + BLK, rows);
+                    for (int c = cb; c < cEnd; c++)
+                    {
+                        int dstRowBase = c * rows;
+                        for (int r = rb; r < rEnd; r++)
+                        {
+                            System.Runtime.CompilerServices.Unsafe.Add(ref dstRef, dstRowBase + r) =
+                                System.Runtime.CompilerServices.Unsafe.Add(ref srcRef, r * cols + c);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Parallel variant that distributes the outer col-block iteration
+        /// across cores. For the ResNet stage4 kernel (2.4 MB, 144 col
+        /// blocks) → ~9 blocks per core on a 16-core box ≈ 36 KB working
+        /// set per core (fits in L1). Uses raw array refs to bypass
+        /// per-element Span bounds checks inside the parallel closure.
+        /// </summary>
+        static void TransposeFloatParallel(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
+        {
+            const int BLK = 32;
+            int numColBlocks = (cols + BLK - 1) / BLK;
+            System.Threading.Tasks.Parallel.For(0, numColBlocks, colBlockIdx =>
+            {
+                int cb = colBlockIdx * BLK;
+                int cEnd = Math.Min(cb + BLK, cols);
+                ref float srcRef = ref src[srcOff];
+                ref float dstRef = ref dst[dstOff];
+                for (int rb = 0; rb < rows; rb += BLK)
+                {
+                    int rEnd = Math.Min(rb + BLK, rows);
+                    for (int c = cb; c < cEnd; c++)
+                    {
+                        int dstRowBase = c * rows;
+                        for (int r = rb; r < rEnd; r++)
+                        {
+                            System.Runtime.CompilerServices.Unsafe.Add(ref dstRef, dstRowBase + r) =
+                                System.Runtime.CompilerServices.Unsafe.Add(ref srcRef, r * cols + c);
+                        }
+                    }
+                }
+            });
         }
 
         if (parallelBatch)
