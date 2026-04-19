@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -44,72 +46,114 @@ internal static class NchwcBatchNorm
         int spatial = H * W;
         int hwC = spatial * CBlock;
 
-        // Pre-combine: scale[c] = gamma[c] / sqrt(var[c] + eps); bias[c] = beta[c] - scale[c] * mean[c].
-        // Pack scale/bias into [cg, 8] so lane loads are contiguous.
-        var packedScale = new float[C];
-        var packedBias = new float[C];
-        for (int c = 0; c < C; c++)
+        // Rent everything from ArrayPool. Old code allocated packedScale/Bias
+        // fresh plus input.ToArray() plus new float[output.Length] plus a
+        // fresh float[CBlock=8] INSIDE the SIMD hot loop (spatial × 8 allocs
+        // per channel group, dominant cost on BN-heavy models).
+        var packedScale = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        var packedBias  = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        try
         {
-            double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
-            packedScale[c] = (float)s;
-            packedBias[c] = beta[c] - (float)(s * mean[c]);
+            for (int c = 0; c < C; c++)
+            {
+                double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
+                packedScale[c] = (float)s;
+                packedBias[c] = beta[c] - (float)(s * mean[c]);
+            }
+
+            var inArr  = System.Buffers.ArrayPool<float>.Shared.Rent(input.Length);
+            var outArr = System.Buffers.ArrayPool<float>.Shared.Rent(output.Length);
+            try
+            {
+                input.CopyTo(inArr.AsSpan(0, input.Length));
+
+#if NET5_0_OR_GREATER
+                bool useSimd = Avx.IsSupported && Fma.IsSupported;
+#endif
+                long totalOps = (long)N * cg * spatial;
+                if (totalOps >= 64 * 1024)
+                {
+                    Parallel.For(0, N * cg, task =>
+                        ProcessChannelGroup(inArr, outArr, task, cg, spatial, hwC, packedScale, packedBias
+#if NET5_0_OR_GREATER
+                            , useSimd
+#endif
+                        ));
+                }
+                else
+                {
+                    for (int task = 0; task < N * cg; task++)
+                        ProcessChannelGroup(inArr, outArr, task, cg, spatial, hwC, packedScale, packedBias
+#if NET5_0_OR_GREATER
+                            , useSimd
+#endif
+                        );
+                }
+
+                outArr.AsSpan(0, output.Length).CopyTo(output);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(outArr);
+                System.Buffers.ArrayPool<float>.Shared.Return(inArr);
+            }
         }
-
-#if NET5_0_OR_GREATER
-        bool useSimd = Avx.IsSupported && Fma.IsSupported;
-#endif
-        var inArr = input.ToArray();
-        var outArr = new float[output.Length];
-
-        Parallel.For(0, N * cg, task =>
+        finally
         {
-            int n = task / cg;
-            int ocg = task % cg;
-            int groupBase = (n * cg + ocg) * hwC;
-            int scaleBase = ocg * CBlock;
+            System.Buffers.ArrayPool<float>.Shared.Return(packedBias);
+            System.Buffers.ArrayPool<float>.Shared.Return(packedScale);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ProcessChannelGroup(
+        float[] inArr, float[] outArr,
+        int task, int cg, int spatial, int hwC,
+        float[] packedScale, float[] packedBias
+#if NET5_0_OR_GREATER
+        , bool useSimd
+#endif
+    )
+    {
+        int n = task / cg;
+        int ocg = task % cg;
+        int groupBase = (n * cg + ocg) * hwC;
+        int scaleBase = ocg * CBlock;
 
 #if NET5_0_OR_GREATER
-            if (useSimd)
-            {
-                var vScale = Vector256.Create(
-                    packedScale[scaleBase + 0], packedScale[scaleBase + 1],
-                    packedScale[scaleBase + 2], packedScale[scaleBase + 3],
-                    packedScale[scaleBase + 4], packedScale[scaleBase + 5],
-                    packedScale[scaleBase + 6], packedScale[scaleBase + 7]);
-                var vBias = Vector256.Create(
-                    packedBias[scaleBase + 0], packedBias[scaleBase + 1],
-                    packedBias[scaleBase + 2], packedBias[scaleBase + 3],
-                    packedBias[scaleBase + 4], packedBias[scaleBase + 5],
-                    packedBias[scaleBase + 6], packedBias[scaleBase + 7]);
+        if (useSimd)
+        {
+            // Vector load the scale/bias packed lanes — one 32-byte load each.
+            var vScale = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref packedScale[scaleBase]));
+            var vBias = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref packedBias[scaleBase]));
 
-                for (int sp = 0; sp < spatial; sp++)
-                {
-                    int idx = groupBase + sp * CBlock;
-                    var vIn = Vector256.Create(
-                        inArr[idx + 0], inArr[idx + 1], inArr[idx + 2], inArr[idx + 3],
-                        inArr[idx + 4], inArr[idx + 5], inArr[idx + 6], inArr[idx + 7]);
-                    var vOut = Fma.MultiplyAdd(vIn, vScale, vBias);
-                    var store = new float[CBlock];
-                    vOut.CopyTo(store);
-                    for (int i = 0; i < CBlock; i++) outArr[idx + i] = store[i];
-                }
+            for (int sp = 0; sp < spatial; sp++)
+            {
+                int idx = groupBase + sp * CBlock;
+                // One 32-byte load + FMA + 32-byte store per 8 output
+                // elements. No scalar unpack, no fresh float[8] alloc.
+                var vIn = Unsafe.ReadUnaligned<Vector256<float>>(
+                    ref Unsafe.As<float, byte>(ref inArr[idx]));
+                var vOut = Fma.MultiplyAdd(vIn, vScale, vBias);
+                Unsafe.WriteUnaligned(
+                    ref Unsafe.As<float, byte>(ref outArr[idx]), vOut);
             }
-            else
+        }
+        else
 #endif
+        {
+            for (int sp = 0; sp < spatial; sp++)
             {
-                for (int sp = 0; sp < spatial; sp++)
+                int idx = groupBase + sp * CBlock;
+                for (int cb = 0; cb < CBlock; cb++)
                 {
-                    int idx = groupBase + sp * CBlock;
-                    for (int cb = 0; cb < CBlock; cb++)
-                    {
-                        outArr[idx + cb] =
-                            inArr[idx + cb] * packedScale[scaleBase + cb] + packedBias[scaleBase + cb];
-                    }
+                    outArr[idx + cb] =
+                        inArr[idx + cb] * packedScale[scaleBase + cb] + packedBias[scaleBase + cb];
                 }
             }
-        });
-
-        outArr.AsSpan().CopyTo(output);
+        }
     }
 
     /// <summary>
@@ -127,57 +171,124 @@ internal static class NchwcBatchNorm
         int N, int C, int H, int W)
     {
         int spatial = H * W;
-        var packedScale = new float[C];
-        var packedBias = new float[C];
-        for (int c = 0; c < C; c++)
+        // Rent pre-combined scale/bias from ArrayPool — old code allocated
+        // these fresh every call. Small (C floats), but 53 BN calls per
+        // ResNet inference adds up to ~53 × 2 × C × sizeof(float) allocs.
+        var packedScale = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        var packedBias  = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        try
         {
-            double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
-            packedScale[c] = (float)s;
-            packedBias[c] = beta[c] - (float)(s * mean[c]);
-        }
-
-#if NET5_0_OR_GREATER
-        bool useSimd = Avx.IsSupported && Fma.IsSupported;
-#endif
-        var inArr = input.ToArray();
-        var outArr = new float[output.Length];
-
-        Parallel.For(0, N * C, task =>
-        {
-            int n = task / C;
-            int c = task % C;
-            int chanBase = (n * C + c) * spatial;
-            float s = packedScale[c];
-            float b = packedBias[c];
-
-#if NET5_0_OR_GREATER
-            if (useSimd && spatial >= 8)
+            for (int c = 0; c < C; c++)
             {
-                var vS = Vector256.Create(s);
-                var vB = Vector256.Create(b);
-                int i = 0;
-                for (; i + 8 <= spatial; i += 8)
+                double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
+                packedScale[c] = (float)s;
+                packedBias[c] = beta[c] - (float)(s * mean[c]);
+            }
+
+            // Old code did input.ToArray() + new float[output.Length] + a
+            // fresh `new float[8]` allocation INSIDE the SIMD loop (6 K+
+            // allocations per 50 K-element call, dominating the op cost).
+            // Rent input + output arrays from ArrayPool instead. Input copy
+            // is unavoidable when the caller passes a ReadOnlySpan (can't
+            // project back to an array without MemoryMarshal API that's
+            // Span-API-gated), but it's a single bulk CopyTo not 6 K small
+            // allocations.
+            var inArr  = System.Buffers.ArrayPool<float>.Shared.Rent(input.Length);
+            var outArr = System.Buffers.ArrayPool<float>.Shared.Rent(output.Length);
+            try
+            {
+                input.CopyTo(inArr.AsSpan(0, input.Length));
+
+#if NET5_0_OR_GREATER
+                bool useSimd = Avx.IsSupported && Fma.IsSupported;
+#endif
+                long totalOps = (long)N * C * spatial;
+                if (totalOps >= 64 * 1024)
                 {
-                    int idx = chanBase + i;
-                    var vIn = Vector256.Create(
-                        inArr[idx + 0], inArr[idx + 1], inArr[idx + 2], inArr[idx + 3],
-                        inArr[idx + 4], inArr[idx + 5], inArr[idx + 6], inArr[idx + 7]);
-                    var vOut = Fma.MultiplyAdd(vIn, vS, vB);
-                    var store = new float[8];
-                    vOut.CopyTo(store);
-                    for (int k = 0; k < 8; k++) outArr[idx + k] = store[k];
-                }
-                for (; i < spatial; i++)
-                    outArr[chanBase + i] = inArr[chanBase + i] * s + b;
-            }
-            else
+                    Parallel.For(0, N * C, task =>
+                        ProcessChannel(inArr, outArr, task, C, spatial, packedScale, packedBias
+#if NET5_0_OR_GREATER
+                            , useSimd
 #endif
-            {
-                for (int i = 0; i < spatial; i++)
-                    outArr[chanBase + i] = inArr[chanBase + i] * s + b;
-            }
-        });
+                        ));
+                }
+                else
+                {
+                    for (int task = 0; task < N * C; task++)
+                        ProcessChannel(inArr, outArr, task, C, spatial, packedScale, packedBias
+#if NET5_0_OR_GREATER
+                            , useSimd
+#endif
+                        );
+                }
 
-        outArr.AsSpan().CopyTo(output);
+                outArr.AsSpan(0, output.Length).CopyTo(output);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(outArr);
+                System.Buffers.ArrayPool<float>.Shared.Return(inArr);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(packedBias);
+            System.Buffers.ArrayPool<float>.Shared.Return(packedScale);
+        }
+    }
+
+    /// <summary>
+    /// Per-channel FMA kernel extracted so the Parallel.For lambda can call
+    /// a named static method (clearer than capturing refs into closures,
+    /// which the compiler rejects with CS8175 anyway). Uses
+    /// <c>Unsafe.ReadUnaligned</c>/<c>WriteUnaligned</c> for the SIMD
+    /// load/store — one 32-byte op each, versus the old code's
+    /// <c>Vector256.Create(scalar, scalar, ..., scalar)</c> from 8 array
+    /// reads + <c>CopyTo(new float[8])</c> + 8 array writes per vector
+    /// (which also allocated a fresh float[8] every iteration — the
+    /// dominant cost of the old kernel on BN-heavy models).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ProcessChannel(
+        float[] inArr, float[] outArr,
+        int task, int C, int spatial,
+        float[] packedScale, float[] packedBias
+#if NET5_0_OR_GREATER
+        , bool useSimd
+#endif
+    )
+    {
+        int n = task / C;
+        int c = task % C;
+        int chanBase = (n * C + c) * spatial;
+        float s = packedScale[c];
+        float b = packedBias[c];
+
+#if NET5_0_OR_GREATER
+        if (useSimd && spatial >= 8)
+        {
+            var vS = Vector256.Create(s);
+            var vB = Vector256.Create(b);
+            int i = 0;
+            for (; i + 8 <= spatial; i += 8)
+            {
+                int idx = chanBase + i;
+                // One 32-byte vector load — no scalar unpack.
+                var vIn = Unsafe.ReadUnaligned<Vector256<float>>(
+                    ref Unsafe.As<float, byte>(ref inArr[idx]));
+                var vOut = Fma.MultiplyAdd(vIn, vS, vB);
+                // One 32-byte vector store — no fresh float[8] alloc.
+                Unsafe.WriteUnaligned(
+                    ref Unsafe.As<float, byte>(ref outArr[idx]), vOut);
+            }
+            for (; i < spatial; i++)
+                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
+        }
+        else
+#endif
+        {
+            for (int i = 0; i < spatial; i++)
+                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
+        }
     }
 }
