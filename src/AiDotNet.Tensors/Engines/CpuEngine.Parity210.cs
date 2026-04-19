@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -45,6 +46,20 @@ public partial class CpuEngine
         if (axes == null) throw new ArgumentNullException(nameof(axes));
         if (shifts.Length != axes.Length)
             throw new ArgumentException("shifts and axes must have the same length");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                var cs = (int[])shifts.Clone();
+                var ca = (int[])axes.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorRoll", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorRoll(ct, cs, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.RollBackward, new object[] { cs, ca });
+            }
+        }
 
         int rank = tensor.Rank;
         var shape = tensor._shape;
@@ -105,6 +120,19 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (axes == null) throw new ArgumentNullException(nameof(axes));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                var ca = (int[])axes.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorFlip", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorFlip(ct, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.FlipBackward, new object[] { ca });
+            }
+        }
+
         int rank = tensor.Rank;
         foreach (var a in axes) if (a < 0 || a >= rank)
             throw new ArgumentOutOfRangeException(nameof(axes), $"axis {a} out of range");
@@ -150,6 +178,22 @@ public partial class CpuEngine
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "repeats must be >= 1");
         int rank = tensor.Rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                var cr = repeats;
+                var cd = dim;
+                var graphShape = (int[])tensor._shape.Clone();
+                graphShape[dim] = tensor._shape[dim] * repeats;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatInterleave", tensor, graphShape,
+                    (eng, output) => { var r = eng.TensorRepeatInterleave(ct, cr, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.RepeatInterleaveBackward, new object[] { cr, cd });
+            }
+        }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var inShape = tensor._shape;
@@ -1063,29 +1107,68 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis)
-        => CumulativeAlongAxis(tensor, axis, MathHelper.GetNumericOperations<T>().One,
+    {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = axis;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorCumProd", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorCumProd(ct, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CumProdBackward, new object[] { ca });
+            }
+        }
+        return CumulativeAlongAxis(tensor, axis, MathHelper.GetNumericOperations<T>().One,
             (a, b) => MathHelper.GetNumericOperations<T>().Multiply(a, b),
             "TensorCumProd", BackwardFunctions<T>.CumProdBackward);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCumMax<T>(Tensor<T> tensor, int axis)
-        => CumulativeAlongAxis(tensor, axis,
+    {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = axis;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorCumMax", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorCumMax(ct, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CumMaxBackward, new object[] { ca });
+            }
+        }
+        return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: true),
             (a, b) => {
                 var ops = MathHelper.GetNumericOperations<T>();
                 return ops.GreaterThan(a, b) ? a : b;
             },
             "TensorCumMax", BackwardFunctions<T>.CumMaxBackward);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCumMin<T>(Tensor<T> tensor, int axis)
-        => CumulativeAlongAxis(tensor, axis,
+    {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = axis;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorCumMin", tensor, (int[])tensor._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorCumMin(ct, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CumMinBackward, new object[] { ca });
+            }
+        }
+        return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: false),
             (a, b) => {
                 var ops = MathHelper.GetNumericOperations<T>();
                 return ops.LessThan(a, b) ? a : b;
             },
             "TensorCumMin", BackwardFunctions<T>.CumMinBackward);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogCumSumExp<T>(Tensor<T> tensor, int axis)
