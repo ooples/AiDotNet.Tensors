@@ -6317,6 +6317,51 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask);
 
+    /// <summary>Rolls elements along the given axes with wrap-around (torch.roll).</summary>
+    Tensor<T> TensorRoll<T>(Tensor<T> tensor, int[] shifts, int[] axes);
+
+    /// <summary>Reverses the tensor along the given axes (torch.flip).</summary>
+    Tensor<T> TensorFlip<T>(Tensor<T> tensor, int[] axes);
+
+    /// <summary>Repeats each element along <paramref name="dim"/> <paramref name="repeats"/> times (torch.repeat_interleave).</summary>
+    Tensor<T> TensorRepeatInterleave<T>(Tensor<T> tensor, int repeats, int dim);
+
+    /// <summary>Cumulative product along <paramref name="axis"/> (torch.cumprod).</summary>
+    Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative max along <paramref name="axis"/> (torch.cummax — values only here).</summary>
+    Tensor<T> TensorCumMax<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative min along <paramref name="axis"/> (torch.cummin — values only here).</summary>
+    Tensor<T> TensorCumMin<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative log-sum-exp along <paramref name="axis"/> (torch.logcumsumexp).</summary>
+    Tensor<T> TensorLogCumSumExp<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>
+    /// Element-wise closeness check: |a − b| ≤ atol + rtol · |b|, with optional
+    /// NaN-equal semantics. Returns a bit-packed mask to save memory.
+    /// </summary>
+    Tensor<Bit> TensorIsClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false);
+
+    /// <summary>True if every element is close (torch.allclose).</summary>
+    bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false);
+
+    /// <summary>Element-wise test for set membership (torch.isin).</summary>
+    Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false);
+
+    /// <summary>Element-wise <c>max(x, min)</c> (torch.clamp_min).</summary>
+    Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min);
+
+    /// <summary>Element-wise <c>min(x, max)</c> (torch.clamp_max).</summary>
+    Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max);
+
+    /// <summary>
+    /// Single-pass element-wise min + max (torch.aminmax). Faster than calling
+    /// ReduceMin and ReduceMax separately because it visits memory once.
+    /// </summary>
+    (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor);
+
     /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>

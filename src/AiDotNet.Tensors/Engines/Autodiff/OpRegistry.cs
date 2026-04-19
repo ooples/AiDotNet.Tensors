@@ -77,6 +77,11 @@ internal static class OpRegistry
         "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
         "TensorIndexSelect", "TensorMaskedFill", "TensorMaskedSelect",
 
+        // Parity-210 movement / cumulative / clamp
+        "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
+        "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
+        "TensorClampMin", "TensorClampMax",
+
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
         "ComplexMagnitudeSquared",
@@ -112,6 +117,7 @@ internal static class OpRegistry
         // Comparison (return bool-like tensors, not differentiable)
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
+        "TensorIsClose", "TensorAllClose", "TensorIsIn", "TensorAminmax",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",

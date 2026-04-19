@@ -3426,6 +3426,144 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Roll backward: shifts the incoming gradient by the negated shifts.
+    /// Roll is a permutation, so its transpose is itself-with-negated-shifts.
+    /// </summary>
+    internal static void RollBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var shifts = (int[])savedState[0];
+        var axes = (int[])savedState[1];
+        var negShifts = new int[shifts.Length];
+        for (int i = 0; i < shifts.Length; i++) negShifts[i] = -shifts[i];
+        var grad = engine.TensorRoll(gradOutput, negShifts, axes);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Flip backward: flip is an involution, so the transpose is itself.
+    /// </summary>
+    internal static void FlipBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var axes = (int[])savedState[0];
+        var grad = engine.TensorFlip(gradOutput, axes);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// RepeatInterleave backward: sum-reduce along the repeated axis in
+    /// stride-<c>repeats</c> chunks so every source position gets the sum
+    /// of its <c>repeats</c> downstream copies.
+    /// </summary>
+    internal static void RepeatInterleaveBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int repeats = (int)savedState[0];
+        int dim = (int)savedState[1];
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+
+        int rank = input.Rank;
+        int axisLen = input._shape[dim];
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= input._shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= input._shape[k];
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var src = gradOutput.AsSpan();
+        var dst = grad.AsWritableSpan();
+
+        int outerStrideSrc = axisLen * repeats * innerSize;
+        int outerStrideDst = axisLen * innerSize;
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < axisLen; i++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    T sum = ops.Zero;
+                    int dstPos = outer * outerStrideDst + i * innerSize + inner;
+                    int srcBase = outer * outerStrideSrc + i * repeats * innerSize + inner;
+                    for (int r = 0; r < repeats; r++)
+                        sum = ops.Add(sum, src[srcBase + r * innerSize]);
+                    dst[dstPos] = sum;
+                }
+
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>CumProd backward (not yet supported in v1).</summary>
+    internal static void CumProdBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Deferred: backward requires careful treatment of zeros in the input.
+        // Call site catches NotImplementedException and surfaces a clear error.
+        throw new NotImplementedException("CumProd backward is not yet implemented (refs #210 follow-up).");
+    }
+
+    /// <summary>CumMax backward: gradient flows to argmax of the running max.</summary>
+    internal static void CumMaxBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        throw new NotImplementedException("CumMax backward is not yet implemented (refs #210 follow-up).");
+    }
+
+    /// <summary>CumMin backward: symmetric to CumMax.</summary>
+    internal static void CumMinBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        throw new NotImplementedException("CumMin backward is not yet implemented (refs #210 follow-up).");
+    }
+
+    /// <summary>LogCumSumExp backward.</summary>
+    internal static void LogCumSumExpBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        throw new NotImplementedException("LogCumSumExp backward is not yet implemented (refs #210 follow-up).");
+    }
+
+    /// <summary>ClampMin backward: gradient passes only where x &gt;= min.</summary>
+    internal static void ClampMinBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var min = (T)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var gsrc = gradOutput.AsSpan();
+        var dst = grad.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < src.Length; i++)
+            dst[i] = ops.GreaterThanOrEquals(src[i], min) ? gsrc[i] : zero;
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>ClampMax backward: gradient passes only where x &lt;= max.</summary>
+    internal static void ClampMaxBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var max = (T)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var input = inputs[0];
+        var grad = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var gsrc = gradOutput.AsSpan();
+        var dst = grad.AsWritableSpan();
+        var zero = ops.Zero;
+        for (int i = 0; i < src.Length; i++)
+            dst[i] = ops.LessThanOrEquals(src[i], max) ? gsrc[i] : zero;
+        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+    }
+
+    /// <summary>
     /// MaskedSelect backward: scatter the incoming 1-D gradient back to the
     /// original tensor shape at mask-true positions; zero elsewhere.
     /// </summary>
