@@ -126,11 +126,13 @@ public sealed class GradScaler<T>
 
     /// <summary>Vector-of-Vector overload: unscale flat gradient arrays that
     /// don't wear tensor shape. Common in custom optimizers that store
-    /// gradients as <see cref="Vector{T}"/> per parameter.</summary>
-    public void Unscale(Vector<T>[] gradients, IEngine engine)
+    /// gradients as <see cref="Vector{T}"/> per parameter. Unlike the
+    /// <see cref="Tensor{T}"/> overload, this path does its scaling via
+    /// <see cref="INumericOperations{T}"/> directly — no engine needed,
+    /// so we don't thread one through.</summary>
+    public void Unscale(Vector<T>[] gradients)
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
-        if (engine is null) throw new ArgumentNullException(nameof(engine));
         var invScale = _numOps.FromDouble(1.0 / _scale);
         _foundInfOrNan = false;
         for (int i = 0; i < gradients.Length; i++)

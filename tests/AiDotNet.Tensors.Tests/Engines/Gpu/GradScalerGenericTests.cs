@@ -198,10 +198,12 @@ public class GradScalerGenericTests
     [Fact]
     public void Unscale_Vector_Works()
     {
-        var engine = new CpuEngine();
+        // Vector overload does all arithmetic through INumericOperations<T>
+        // directly; no engine needed, so the signature takes only the
+        // gradients array.
         var scaler = new GradScaler<float>(initialScale: 2.0);
         var gradients = new[] { new Vector<float>(new float[] { 4f, 8f, 2f }) };
-        scaler.Unscale(gradients, engine);
+        scaler.Unscale(gradients);
         Assert.Equal(2f, gradients[0][0], 3);
         Assert.Equal(4f, gradients[0][1], 3);
         Assert.Equal(1f, gradients[0][2], 3);

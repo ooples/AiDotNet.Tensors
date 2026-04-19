@@ -22,7 +22,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// var scaledLoss = scaler.ScaleLoss(loss, engine); // Multiply loss by scale factor
 /// tape.Backward(scaledLoss);
 ///
-/// scaler.Unscale(gradients, engine);               // Divide gradients by scale factor
+/// scaler.Unscale(gradients);                       // Divide gradients by scale factor
 /// if (scaler.ShouldStep())                         // Check for inf/nan
 ///     optimizer.Step(parameters, gradients);     // Only step if gradients are valid
 /// scaler.Update();                              // Adjust scale factor for next iteration
