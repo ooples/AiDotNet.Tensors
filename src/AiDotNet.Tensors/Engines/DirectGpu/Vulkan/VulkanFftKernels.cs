@@ -14,8 +14,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 ";
 
+        // Two-binding layout (input RO, output RW) to fit GlslUnaryOp's pipeline.
+        // The first phase copies input → output; all subsequent work is in-place
+        // on `output` (which makes the actual FFT in-place semantics of the
+        // algorithm work out with zero extra allocations).
         public static string Fft => Header + @"
-layout(set = 0, binding = 0) buffer Buf { float x[]; };
+layout(set = 0, binding = 0) readonly buffer InBuf { float src[]; };
+layout(set = 0, binding = 1) buffer OutBuf { float x[]; };
 layout(push_constant) uniform P { int batchCount; int n; int inverse; };
 
 void main() {
@@ -24,6 +29,10 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint blockSize = gl_WorkGroupSize.x;
     uint bOff = b * uint(2 * n);
+
+    // Copy input → output so subsequent in-place processing works cleanly.
+    for (uint i = tid; i < uint(2 * n); i += blockSize) x[bOff + i] = src[bOff + i];
+    barrier();
 
     // Bit reversal permutation.
     int bits = 0;
