@@ -1,3 +1,4 @@
+#if NET5_0_OR_GREATER
 using System;
 using System.Runtime.Intrinsics;
 using AiDotNet.Tensors.Engines.Simd;
@@ -10,6 +11,10 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// expected ~1e-4 relative error band vs MathF.Exp across the typical
 /// softmax input range. Lower precision than FastExp256 (1e-6) but fine
 /// for softmax because the normalisation rescales per-element error.
+///
+/// <para>Guarded with NET5_0_OR_GREATER because the kernel (and its
+/// <see cref="Vector256{T}"/> inputs) only compile on NET5+. On net471
+/// the tests don't apply.</para>
 /// </summary>
 public class FastExp256ForSoftmaxTests
 {
@@ -91,3 +96,4 @@ public class FastExp256ForSoftmaxTests
         Assert.True(maxRelErr < 0.01, $"max relative error vs scalar reference = {maxRelErr:F6}");
     }
 }
+#endif

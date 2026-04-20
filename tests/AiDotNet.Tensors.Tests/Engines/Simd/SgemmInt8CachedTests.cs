@@ -1,3 +1,4 @@
+#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.Simd;
 using Xunit;
@@ -8,6 +9,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// Correctness for SimdGemm.SgemmWithInt8CachedB (Path D weight-only int8).
 /// Verifies the int8 path matches the float path within the expected
 /// quantization SNR band (35-40 dB on typical transformer-shape inputs).
+///
+/// <para>Guarded with NET5_0_OR_GREATER because the kernel only compiles
+/// on NET5+ (requires <c>System.Runtime.Intrinsics</c>).</para>
 /// </summary>
 public class SgemmInt8CachedTests
 {
@@ -71,3 +75,4 @@ public class SgemmInt8CachedTests
             Assert.Equal(c1[i], c1Again[i]);
     }
 }
+#endif
