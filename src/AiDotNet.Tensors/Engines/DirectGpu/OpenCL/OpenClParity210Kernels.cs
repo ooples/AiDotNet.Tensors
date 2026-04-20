@@ -210,14 +210,22 @@ __kernel void parity210_logcumsumexp_axis(
 // INDEXING
 // ============================================================================
 
+// PyTorch-style negative index normalization: [-n, n-1] -> [0, n-1].
+// Returns -1 for out-of-range so callers can write 0 / skip.
+inline int p210_pmod(int a, int m) {
+    if (m <= 0) return -1;
+    if (a < 0) a += m;
+    return (a >= 0 && a < m) ? a : -1;
+}
+
 __kernel void parity210_take_linear(
     __global const float* input, __global const int* indices,
     __global float* output, const int outSize, const int inputLinearLen)
 {
     int gid = get_global_id(0);
     if (gid >= outSize) return;
-    int pos = indices[gid];
-    output[gid] = (pos >= 0 && pos < inputLinearLen) ? input[pos] : 0.0f;
+    int pos = p210_pmod(indices[gid], inputLinearLen);
+    output[gid] = (pos >= 0) ? input[pos] : 0.0f;
 }
 
 __kernel void parity210_take_along_dim(
@@ -232,9 +240,10 @@ __kernel void parity210_take_along_dim(
     int tmp = gid / innerSize;
     int i = tmp % idxAxis;
     int outer = tmp / idxAxis;
-    int target = indices[gid];
+    int target = p210_pmod(indices[gid], srcAxis);
+    if (target < 0) { output[gid] = 0.0f; return; }
     int srcIdx = (outer * srcAxis + target) * innerSize + inner;
-    output[gid] = (target >= 0 && target < srcAxis) ? input[srcIdx] : 0.0f;
+    output[gid] = input[srcIdx];
 }
 
 // OpenCL 2.0 atomic_fetch_add on float via cl_khr_int32_base_atomics +
@@ -260,8 +269,8 @@ __kernel void parity210_index_add(
     int tmp = gid / innerSize;
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
-    int target = indices[i];
-    if (target < 0 || target >= dstAxis) return;
+    int target = p210_pmod(indices[i], dstAxis);
+    if (target < 0) return;
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     p210_atomic_add(&output[dstPos], source[srcPos]);
@@ -279,8 +288,8 @@ __kernel void parity210_index_copy(
     int tmp = gid / innerSize;
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
-    int target = indices[i];
-    if (target < 0 || target >= dstAxis) return;
+    int target = p210_pmod(indices[i], dstAxis);
+    if (target < 0) return;
     output[(outer * dstAxis + target) * innerSize + inner] =
         source[(outer * idxLen + i) * innerSize + inner];
 }
@@ -297,8 +306,8 @@ __kernel void parity210_index_fill(
     int tmp = gid / innerSize;
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
-    int target = indices[i];
-    if (target < 0 || target >= dstAxis) return;
+    int target = p210_pmod(indices[i], dstAxis);
+    if (target < 0) return;
     output[(outer * dstAxis + target) * innerSize + inner] = fillValue;
 }
 
@@ -340,8 +349,8 @@ __kernel void parity210_fmod(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    float bv = b[gid];
-    out[gid] = (bv == 0.0f) ? 0.0f : fmod(a[gid], bv);
+    // torch.fmod(x, 0) = NaN for fp; IEEE-compliant fmod does this.
+    out[gid] = fmod(a[gid], b[gid]);
 }
 
 __kernel void parity210_remainder(
@@ -351,7 +360,7 @@ __kernel void parity210_remainder(
     int gid = get_global_id(0);
     if (gid >= size) return;
     float av = a[gid], bv = b[gid];
-    if (bv == 0.0f) { out[gid] = 0.0f; return; }
+    if (bv == 0.0f) { out[gid] = NAN; return; }
     float q = floor(av / bv);
     out[gid] = av - q * bv;
 }
@@ -372,6 +381,8 @@ __kernel void parity210_log_add_exp(
     int gid = get_global_id(0);
     if (gid >= size) return;
     float av = a[gid], bv = b[gid];
+    // Equal infinities: inf-inf=NaN would poison result; short-circuit to +/-inf.
+    if (av == bv && isinf(av)) { out[gid] = av; return; }
     float m = fmax(av, bv);
     float s = fmin(av, bv);
     out[gid] = m + log(1.0f + exp(s - m));
@@ -384,6 +395,7 @@ __kernel void parity210_log_add_exp2(
     int gid = get_global_id(0);
     if (gid >= size) return;
     float av = a[gid], bv = b[gid];
+    if (av == bv && isinf(av)) { out[gid] = av; return; }
     float m = fmax(av, bv);
     float s = fmin(av, bv);
     float inv_ln2 = 1.4426950408889634f;
@@ -428,8 +440,10 @@ __kernel void parity210_erfinv(
     int gid = get_global_id(0);
     if (gid >= size) return;
     float y = input[gid];
-    if (y >= 1.0f) { output[gid] = INFINITY; return; }
-    if (y <= -1.0f) { output[gid] = -INFINITY; return; }
+    // Domain: [-1, 1]. Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
+    if (y == 1.0f) { output[gid] = INFINITY; return; }
+    if (y == -1.0f) { output[gid] = -INFINITY; return; }
+    if (!(y > -1.0f && y < 1.0f)) { output[gid] = NAN; return; }
     float ln = log(1.0f - y * y);
     float a = 0.147f;
     const float pi = 3.14159265358979f;
@@ -458,6 +472,15 @@ __kernel void parity210_digamma(
     if (gid >= size) return;
     float x = input[gid];
     float result = 0.0f;
+    const float pi = 3.14159265358979f;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0f) {
+        if (x == floor(x)) { output[gid] = NAN; return; }
+        float sp = sin(pi * x);
+        result = -pi * cos(pi * x) / sp;
+        x = 1.0f - x;
+    }
     // Bounded for-loop — x += 1 on -INFINITY stays at -INFINITY.
     for (int step = 0; step < 64 && x < 6.0f; ++step) { result -= 1.0f / x; x += 1.0f; }
     float inv = 1.0f / x;

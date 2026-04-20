@@ -392,8 +392,8 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_fmod(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float bv = b[idx];
-    out[idx] = (bv == 0.0f) ? 0.0f : fmodf(a[idx], bv);
+    // torch.fmod(x, 0) returns NaN for fp; fmodf already does so under IEEE 754.
+    out[idx] = fmodf(a[idx], b[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_remainder(
@@ -402,7 +402,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_remainder(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float av = a[idx], bv = b[idx];
-    if (bv == 0.0f) { out[idx] = 0.0f; return; }
+    if (bv == 0.0f) { out[idx] = nanf(""""); return; }
     float q = floorf(av / bv);
     out[idx] = av - q * bv;
 }
@@ -415,12 +415,14 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_float_power(
     out[idx] = powf(a[idx], b[idx]);
 }
 
+// Short-circuit equal infinities to avoid inf-inf = NaN on `s - m`.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_log_add_exp(
     const float* a, const float* b, float* out, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float av = a[idx], bv = b[idx];
+    if (av == bv && isinf(av)) { out[idx] = av; return; }
     float m = fmaxf(av, bv);
     float s = fminf(av, bv);
     out[idx] = m + log1pf(expf(s - m));
@@ -432,6 +434,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_log_add_exp2(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float av = a[idx], bv = b[idx];
+    if (av == bv && isinf(av)) { out[idx] = av; return; }
     float m = fmaxf(av, bv);
     float s = fminf(av, bv);
     out[idx] = m + log2f(1.0f + exp2f(s - m));
@@ -502,6 +505,15 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_digamma(
     if (idx >= size) return;
     float x = input[idx];
     float result = 0.0f;
+    const float pi = 3.14159265358979323846f;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0f) {
+        if (x == floorf(x)) { output[idx] = nanf(""""); return; }
+        float sp = sinf(pi * x);
+        result = -pi * cosf(pi * x) / sp;
+        x = 1.0f - x;
+    }
     // Bounded for-loop — x += 1.0f never advances -INFINITY, so an
     // unbounded while would hang the kernel.
     for (int step = 0; step < 64 && x < 6.0f; ++step) { result -= 1.0f / x; x += 1.0f; }

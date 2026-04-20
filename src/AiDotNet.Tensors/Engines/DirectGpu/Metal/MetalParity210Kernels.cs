@@ -266,6 +266,8 @@ kernel void parity210_take_linear(
 {
     if ((int)gid >= outSize) return;
     int pos = indices[gid];
+    // PyTorch-style negative index normalization.
+    if (pos < 0) pos += inputLinearLen;
     output[gid] = (pos >= 0 && pos < inputLinearLen) ? input[pos] : 0.0f;
 }
 
@@ -286,8 +288,10 @@ kernel void parity210_take_along_dim(
     int i = tmp % idxAxis;
     int outer = tmp / idxAxis;
     int target = indices[gid];
+    if (target < 0) target += srcAxis;
+    if (target < 0 || target >= srcAxis) { output[gid] = 0.0f; return; }
     int srcIdx = (outer * srcAxis + target) * innerSize + inner;
-    output[gid] = (target >= 0 && target < srcAxis) ? input[srcIdx] : 0.0f;
+    output[gid] = input[srcIdx];
 }
 
 kernel void parity210_index_add(
@@ -307,6 +311,7 @@ kernel void parity210_index_add(
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
     int target = indices[i];
+    if (target < 0) target += dstAxis;
     if (target < 0 || target >= dstAxis) return;
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
@@ -330,6 +335,7 @@ kernel void parity210_index_copy(
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
     int target = indices[i];
+    if (target < 0) target += dstAxis;
     if (target < 0 || target >= dstAxis) return;
     output[(outer * dstAxis + target) * innerSize + inner] =
         source[(outer * idxLen + i) * innerSize + inner];
@@ -352,6 +358,7 @@ kernel void parity210_index_fill(
     int i = tmp % idxLen;
     int outer = tmp / idxLen;
     int target = indices[i];
+    if (target < 0) target += dstAxis;
     if (target < 0 || target >= dstAxis) return;
     output[(outer * dstAxis + target) * innerSize + inner] = fillValue;
 }
@@ -396,8 +403,8 @@ kernel void parity210_fmod(
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
-    float bv = b[gid];
-    out[gid] = (bv == 0.0f) ? 0.0f : fmod(a[gid], bv);
+    // torch.fmod(x, 0) = NaN for fp; Metal's fmod follows IEEE.
+    out[gid] = fmod(a[gid], b[gid]);
 }
 
 kernel void parity210_remainder(
@@ -407,7 +414,7 @@ kernel void parity210_remainder(
 {
     if ((int)gid >= size) return;
     float av = a[gid], bv = b[gid];
-    if (bv == 0.0f) { out[gid] = 0.0f; return; }
+    if (bv == 0.0f) { out[gid] = NAN; return; }
     float q = floor(av / bv);
     out[gid] = av - q * bv;
 }
@@ -428,6 +435,8 @@ kernel void parity210_log_add_exp(
 {
     if ((int)gid >= size) return;
     float av = a[gid], bv = b[gid];
+    // Short-circuit equal infinities so inf-inf = NaN doesn't contaminate.
+    if (av == bv && isinf(av)) { out[gid] = av; return; }
     float m = max(av, bv);
     float s = min(av, bv);
     out[gid] = m + log1p(exp(s - m));
@@ -440,6 +449,7 @@ kernel void parity210_log_add_exp2(
 {
     if ((int)gid >= size) return;
     float av = a[gid], bv = b[gid];
+    if (av == bv && isinf(av)) { out[gid] = av; return; }
     float m = max(av, bv);
     float s = min(av, bv);
     out[gid] = m + log2(1.0f + exp2(s - m));
@@ -483,8 +493,10 @@ kernel void parity210_erfinv(
 {
     if ((int)gid >= size) return;
     float y = input[gid];
-    if (y >= 1.0f) { output[gid] = INFINITY; return; }
-    if (y <= -1.0f) { output[gid] = -INFINITY; return; }
+    // Domain: [-1, 1]. Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
+    if (y == 1.0f) { output[gid] = INFINITY; return; }
+    if (y == -1.0f) { output[gid] = -INFINITY; return; }
+    if (!(y > -1.0f && y < 1.0f)) { output[gid] = NAN; return; }
     float ln = log(1.0f - y * y);
     float a = 0.147f;
     float t = 2.0f / (PARITY210_PI * a) + ln * 0.5f;
@@ -512,6 +524,14 @@ kernel void parity210_digamma(
     if ((int)gid >= size) return;
     float x = input[gid];
     float result = 0.0f;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0f) {
+        if (x == floor(x)) { output[gid] = NAN; return; }
+        float sp = sin(PARITY210_PI * x);
+        result = -PARITY210_PI * cos(PARITY210_PI * x) / sp;
+        x = 1.0f - x;
+    }
     // Bounded for-loop — x += 1 on -INFINITY stays at -INFINITY.
     for (int step = 0; step < 64 && x < 6.0f; ++step) { result -= 1.0f / x; x += 1.0f; }
     float inv = 1.0f / x;

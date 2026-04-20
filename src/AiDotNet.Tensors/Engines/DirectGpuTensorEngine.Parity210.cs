@@ -718,6 +718,12 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorNanToNum<T>(
         Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null)
     {
+        // The GPU kernel operates on fp32; anything wider (e.g. double) would
+        // lose replacement-scalar precision on downcast. Send those to the
+        // CpuEngine reference path instead of silently clipping.
+        if (typeof(T) != typeof(float))
+            return base.TensorNanToNum(tensor, nan, posinf, neginf);
+
         if (TryGetBackend(out var backend) && backend is IParity210Backend p210)
         {
             try

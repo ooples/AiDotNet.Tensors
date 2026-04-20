@@ -377,7 +377,8 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let bv = b[gid];
-    if (bv == 0.0) { o[gid] = 0.0; return; }
+    // torch.fmod(x, 0) = NaN for fp; WGSL has no NAN literal so 0.0/0.0.
+    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
     let av = a[gid];
     let q = trunc(av / bv);
     o[gid] = av - q * bv;
@@ -394,7 +395,7 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let av = a[gid]; let bv = b[gid];
-    if (bv == 0.0) { o[gid] = 0.0; return; }
+    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
     let q = floor(av / bv);
     o[gid] = av - q * bv;
 }
@@ -423,6 +424,9 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let av = a[gid]; let bv = b[gid];
+    // Equal infinities short-circuit: inf-inf=NaN would poison the max/min formula.
+    // WGSL has no isinf(); abs > f32::MAX flags +/-inf.
+    if (av == bv && abs(av) > 3.4028234e38) { o[gid] = av; return; }
     let m = max(av, bv);
     let s = min(av, bv);
     o[gid] = m + log(1.0 + exp(s - m));
@@ -439,6 +443,7 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let av = a[gid]; let bv = b[gid];
+    if (av == bv && abs(av) > 3.4028234e38) { o[gid] = av; return; }
     let m = max(av, bv);
     let s = min(av, bv);
     o[gid] = m + log2(1.0 + exp2(s - m));
@@ -534,6 +539,15 @@ struct P { size: i32 };
     if (gid >= p.size) { return; }
     var x = a[gid];
     var result : f32 = 0.0;
+    let pi : f32 = 3.14159265358979;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0) {
+        if (x == floor(x)) { o[gid] = 0.0 / 0.0; return; }
+        let sp = sin(pi * x);
+        result = -pi * cos(pi * x) / sp;
+        x = 1.0 - x;
+    }
     for (var k : i32 = 0; k < 64; k = k + 1) {
         if (x >= 6.0) { break; }
         result = result - 1.0 / x;

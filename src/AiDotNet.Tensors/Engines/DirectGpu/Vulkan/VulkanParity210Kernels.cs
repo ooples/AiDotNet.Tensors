@@ -337,7 +337,8 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float bv = b[gid];
-    if (bv == 0.0) { o[gid] = 0.0; return; }
+    // torch.fmod(x, 0) = NaN for fp. GLSL has no NAN literal; 0.0/0.0 gives NaN.
+    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
     float av = a[gid];
     float q = trunc(av / bv);
     o[gid] = av - q * bv;
@@ -349,7 +350,7 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float av = a[gid]; float bv = b[gid];
-    if (bv == 0.0) { o[gid] = 0.0; return; }
+    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
     float q = floor(av / bv);
     o[gid] = av - q * bv;
 }";
@@ -368,6 +369,8 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float av = a[gid]; float bv = b[gid];
+    // Equal infinities short-circuit: inf - inf = NaN would poison the result.
+    if (av == bv && isinf(av)) { o[gid] = av; return; }
     float m = max(av, bv);
     float s = min(av, bv);
     o[gid] = m + log(1.0 + exp(s - m));
@@ -379,6 +382,7 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float av = a[gid]; float bv = b[gid];
+    if (av == bv && isinf(av)) { o[gid] = av; return; }
     float m = max(av, bv);
     float s = min(av, bv);
     o[gid] = m + log2(1.0 + exp2(s - m));
@@ -533,6 +537,15 @@ void main() {
     if (gid >= size) return;
     float x = a[gid];
     float result = 0.0;
+    const float pi = 3.14159265358979;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0) {
+        if (x == floor(x)) { o[gid] = 0.0 / 0.0; return; }
+        float sp = sin(pi * x);
+        result = -pi * cos(pi * x) / sp;
+        x = 1.0 - x;
+    }
     for (int k = 0; k < 64 && x < 6.0; ++k) { result -= 1.0 / x; x += 1.0; }
     float inv = 1.0 / x;
     float inv2 = inv * inv;

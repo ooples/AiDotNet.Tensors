@@ -467,11 +467,13 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_fmod(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float bv = b[idx];
-    out[idx] = (bv == 0.0f) ? 0.0f : fmodf(a[idx], bv);
+    // torch.fmod(x, 0) returns NaN for floating types. fmodf(x, 0) is
+    // already NaN under IEEE 754 so no branch is needed.
+    out[idx] = fmodf(a[idx], b[idx]);
 }
 
 // torch.remainder: floor-based mod (result has the same sign as divisor).
+// Returns NaN when the divisor is zero to match PyTorch.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_remainder(
     const float* __restrict__ a, const float* __restrict__ b,
     float* __restrict__ out, int size)
@@ -480,7 +482,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_remainder(
     if (idx >= size) return;
     float av = a[idx];
     float bv = b[idx];
-    if (bv == 0.0f) { out[idx] = 0.0f; return; }
+    if (bv == 0.0f) { out[idx] = nanf(""""); return; }
     float q = floorf(av / bv);
     out[idx] = av - q * bv;
 }
@@ -494,7 +496,9 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_float_power(
     out[idx] = powf(a[idx], b[idx]);
 }
 
-// log(exp(a)+exp(b)) — stable.
+// log(exp(a)+exp(b)) — stable.  When both inputs are equal infinities,
+// `s - m` evaluates to inf - inf = NaN, so short-circuit to the shared
+// infinity value to match PyTorch.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_log_add_exp(
     const float* __restrict__ a, const float* __restrict__ b,
     float* __restrict__ out, int size)
@@ -502,6 +506,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_log_add_exp(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float av = a[idx], bv = b[idx];
+    if (av == bv && isinf(av)) { out[idx] = av; return; }
     float m = fmaxf(av, bv);
     float s = fminf(av, bv);
     out[idx] = m + log1pf(expf(s - m));
@@ -514,6 +519,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_log_add_exp2(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float av = a[idx], bv = b[idx];
+    if (av == bv && isinf(av)) { out[idx] = av; return; }
     float m = fmaxf(av, bv);
     float s = fminf(av, bv);
     // log2(2^m + 2^s) = m + log2(1 + 2^(s-m))
@@ -593,6 +599,15 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_digamma(
     if (idx >= size) return;
     float x = input[idx];
     float result = 0.0f;
+    const float pi = 3.14159265358979323846f;
+    // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
+    // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
+    if (x <= 0.0f) {
+        if (x == floorf(x)) { output[idx] = nanf(""""); return; }
+        float sp = sinf(pi * x);
+        result = -pi * cosf(pi * x) / sp;
+        x = 1.0f - x;
+    }
     // psi(x) = psi(x+1) - 1/x, shift until x >= 6.  Bounded for-loop —
     // x += 1.0f never advances -INFINITY, so an unbounded while would hang.
     for (int step = 0; step < 64 && x < 6.0f; ++step) {
