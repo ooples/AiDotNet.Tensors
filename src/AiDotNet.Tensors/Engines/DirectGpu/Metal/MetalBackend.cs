@@ -58,6 +58,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _spectralPerfLibrary;
     private IntPtr _parity210Library;
     private IntPtr _linalgLibrary;
+    private IntPtr _fftLibrary;
 
     #region Properties
 
@@ -243,6 +244,20 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal Linalg pre-compilation warning: {ex.Message}");
             _linalgLibrary = IntPtr.Zero;
+        }
+
+        // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
+        // FFT library). Optional in the same sense as Parity-210: if the
+        // library fails to compile, IFftBackend.LaunchFft throws and the
+        // Fft module falls back to CPU.
+        try
+        {
+            _fftLibrary = _shaderLibrary.CompileLibrary("Fft212", MetalFftKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal FFT pre-compilation warning: {ex.Message}");
+            _fftLibrary = IntPtr.Zero;
         }
     }
 
