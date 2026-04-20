@@ -71,6 +71,17 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     public bool IsAvailable => _initialized && !_disposed;
 
     /// <summary>
+    /// Gets whether runtime GLSL→SPIR-V compilation is available on this
+    /// host. Returns <c>false</c> when libshaderc cannot be loaded — which
+    /// leaves every GLSL-compiled kernel (octonion linear, Poincaré
+    /// distance, Möbius add, …) unable to execute. Tests targeting those
+    /// kernels should skip when this is <c>false</c> instead of silently
+    /// observing zero-filled output buffers (GlslQuadOp / GlslBinaryOp
+    /// take no-op fallbacks when the pipeline can't be created).
+    /// </summary>
+    public bool IsGlslCompilerAvailable => _initialized && _glslCompiler is not null && _glslCompiler.IsAvailable;
+
+    /// <summary>
     /// Gets the backend name.
     /// </summary>
     public string BackendName => "Vulkan";

@@ -113,7 +113,11 @@ internal static class OpRegistry
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
-        "TensorBroadcastTo", "TensorExpandAs", "TensorBroadcastTensors",
+        // TensorBroadcastTo belongs to the Delegator set below (composed
+        // from Reshape / TensorBroadcastAdd which record themselves) —
+        // listing it here too tripped the duplicate-check in
+        // TapeCompletenessTests.OpRegistry_HasNoDuplicates.
+        "TensorExpandAs", "TensorBroadcastTensors",
         "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
 
