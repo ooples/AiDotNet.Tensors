@@ -29251,6 +29251,115 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through bilinear upsample. Mirrors the kernel of
+    /// <see cref="TensorUpsampleBilinear{T}"/> but writes into a pre-
+    /// allocated output. Used by segmentation decoders (DeepLab, SegFormer,
+    /// U-Net++) and detection FPN heads. Hoists per-row interpolation
+    /// factors out of the inner loops, parallelises over batch-channel,
+    /// and adds a float fast path that avoids NumOps boxing.
+    /// </summary>
+    public void TensorUpsampleBilinearInto<T>(Tensor<T> output, Tensor<T> input, int[] outputSize)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException("UpsampleBilinearInto requires rank-4 NCHW input.");
+
+        int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
+        int outH = outputSize[0], outW = outputSize[1];
+
+        // Per-row precomputation (factors are independent of batch/channel).
+        // Cuts ~4 div + 2 floor + 4 fma per output pixel down to 4 mul + 2 fma.
+        var h0Arr = new int[outH];
+        var h1Arr = new int[outH];
+        var fhArr = new double[outH];
+        for (int oh = 0; oh < outH; oh++)
+        {
+            double srcH = (oh + 0.5) * h / outH - 0.5;
+            int h0 = Math.Max(0, (int)Math.Floor(srcH));
+            h0Arr[oh] = h0;
+            h1Arr[oh] = Math.Min(h - 1, h0 + 1);
+            fhArr[oh] = srcH - h0;
+        }
+        var w0Arr = new int[outW];
+        var w1Arr = new int[outW];
+        var fwArr = new double[outW];
+        for (int ow = 0; ow < outW; ow++)
+        {
+            double srcW = (ow + 0.5) * w / outW - 0.5;
+            int w0 = Math.Max(0, (int)Math.Floor(srcW));
+            w0Arr[ow] = w0;
+            w1Arr[ow] = Math.Min(w - 1, w0 + 1);
+            fwArr[ow] = srcW - w0;
+        }
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int total = n * c;
+            int hh = h, ww = w, oH = outH, oW = outW;
+            // Prefer width/height-major hoisting: per-pixel factor needs 1-fh,
+            // fh, 1-fw, fw — hoist the 1-fh products outside the ow loop.
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * hh * ww;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                    float fh = (float)fhArr[oh];
+                    float omfh = 1f - fh;
+                    int rowH0 = inBase + h0 * ww;
+                    int rowH1 = inBase + h1 * ww;
+                    int rowOut = outBase + oh * oW;
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                        float fw = (float)fwArr[ow];
+                        float omfw = 1f - fw;
+                        float v = omfh * omfw * inArr[rowH0 + w0]
+                                + omfh * fw   * inArr[rowH0 + w1]
+                                + fh   * omfw * inArr[rowH1 + w0]
+                                + fh   * fw   * inArr[rowH1 + w1];
+                        outArr[rowOut + ow] = v;
+                    }
+                }
+            };
+            if (total > 4) Parallel.For(0, total, kernel);
+            else for (int bc = 0; bc < total; bc++) kernel(bc);
+            return;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var inData = input.GetFlattenedData();
+        var outData = output.GetDataArray();
+        int totalBC = n * c;
+        Parallel.For(0, totalBC, bc =>
+        {
+            int inBase = bc * h * w;
+            int outBase = bc * outH * outW;
+            for (int oh = 0; oh < outH; oh++)
+            {
+                int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                double fh = fhArr[oh];
+                int rowH0 = inBase + h0 * w;
+                int rowH1 = inBase + h1 * w;
+                int rowOut = outBase + oh * outW;
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                    double fw = fwArr[ow];
+                    double val = (1 - fh) * (1 - fw) * numOps.ToDouble(inData[rowH0 + w0])
+                               + (1 - fh) * fw       * numOps.ToDouble(inData[rowH0 + w1])
+                               + fh       * (1 - fw) * numOps.ToDouble(inData[rowH1 + w0])
+                               + fh       * fw       * numOps.ToDouble(inData[rowH1 + w1]);
+                    outData[rowOut + ow] = numOps.FromDouble(val);
+                }
+            }
+        });
+    }
+
     /// <summary>Upsample using bilinear interpolation (4D: NCHW).</summary>
     public virtual Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
@@ -29266,37 +29375,19 @@ public class CpuEngine : ITensorLevelEngine
                 int capH = input._shape[2], capW = input._shape[3];
                 var outShape = new[] { input._shape[0], input._shape[1], outputSize[0], outputSize[1] };
                 return scope.RecordUnary(LazyNodeType.Custom, "UpsampleBilinear", input, outShape,
-                    (eng, output) => { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
+                        else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
         int outH = outputSize[0], outW = outputSize[1];
         var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
-        var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
-
-        for (int batch = 0; batch < n; batch++)
-            for (int ch = 0; ch < c; ch++)
-                for (int oh = 0; oh < outH; oh++)
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        double srcH = (oh + 0.5) * h / outH - 0.5;
-                        double srcW = (ow + 0.5) * w / outW - 0.5;
-                        int h0 = Math.Max(0, (int)Math.Floor(srcH));
-                        int w0 = Math.Max(0, (int)Math.Floor(srcW));
-                        int h1 = Math.Min(h - 1, h0 + 1);
-                        int w1 = Math.Min(w - 1, w0 + 1);
-                        double fh = srcH - h0, fw = srcW - w0;
-                        int baseIdx = (batch * c + ch) * h * w;
-                        double val = (1 - fh) * (1 - fw) * numOps.ToDouble(inData[baseIdx + h0 * w + w0])
-                                   + (1 - fh) * fw * numOps.ToDouble(inData[baseIdx + h0 * w + w1])
-                                   + fh * (1 - fw) * numOps.ToDouble(inData[baseIdx + h1 * w + w0])
-                                   + fh * fw * numOps.ToDouble(inData[baseIdx + h1 * w + w1]);
-                        outData[(batch * c + ch) * outH * outW + oh * outW + ow] = numOps.FromDouble(val);
-                    }
+        TensorUpsampleBilinearInto(result, input, outputSize);
         DifferentiableOps.RecordUnary("UpsampleBilinear", result, input, BackwardFunctions<T>.UpsampleBilinearBackward,
             savedState: new object[] { new[] { h, w } });
         AutoTracer.RecordOp("UpsampleBilinear", result, eng => result);
