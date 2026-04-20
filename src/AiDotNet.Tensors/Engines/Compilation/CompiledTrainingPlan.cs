@@ -485,7 +485,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return eng =>
             {
                 if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                    SimdGemm.Sgemm(cA, cB, cOut, M, K, N);
+                    // Path A pre-pack cache — B (weight) is constant across
+                    // inference calls, so SgemmWithCachedB amortises PackB
+                    // cost. Falls through to standard Sgemm for non-cache-
+                    // eligible shapes (n > Nc=4096).
+                    SimdGemm.SgemmWithCachedB(cA.AsSpan(0, M * K), cB, cOut.AsSpan(0, M * N), M, K, N);
             };
         }
 
