@@ -21003,13 +21003,90 @@ public class CpuEngine : ITensorLevelEngine
         return (realNorm, imagNorm);
     }
 
+    /// <summary>
+    /// Write-through 4D-NCHW crop. Mirrors <see cref="Crop{T}"/> but writes
+    /// into the supplied output buffer with row-contiguous BlockCopy/Array
+    /// .Copy. Used by detection postprocessing and ROI-based pipelines.
+    /// </summary>
+    public void CropInto<T>(Tensor<T> output, Tensor<T> input, int top, int left, int height, int width)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length != 4)
+            throw new ArgumentException("CropInto expects 4D tensor [batch, channels, height, width]");
+
+        int batch = shape[0];
+        int channels = shape[1];
+        int inputHeight = shape[2];
+        int inputWidth = shape[3];
+
+        if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
+            throw new ArgumentException("Crop region is out of bounds");
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int totalBC = batch * channels;
+            int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
+            int t = top, l = left;
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * iH * iW + t * iW + l;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    Buffer.BlockCopy(inArr, (inBase + oh * iW) * sizeof(float),
+                                     outArr, (outBase + oh * oW) * sizeof(float),
+                                     oW * sizeof(float));
+                }
+            };
+            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
+            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, bc =>
+        {
+            int inBase = bc * inputHeight * inputWidth + top * inputWidth + left;
+            int outBase = bc * height * width;
+            for (int oh = 0; oh < height; oh++)
+            {
+                Array.Copy(inputData, inBase + oh * inputWidth,
+                           outputData, outBase + oh * width, width);
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_top = top; var c_left = left; var c_height = height; var c_width = width; return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, input._shape, (eng, output) => { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CropBackward); } }
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var c_input = input;
+                int c_top = top, c_left = left, c_height = height, c_width = width;
+                // FIX: previous code passed input._shape, leaving the output buffer
+                // sized for the un-cropped input — only the leading bytes were
+                // overwritten, downstream ops saw stale data after the crop.
+                var outShape = new[] { shape[0], shape[1], height, width };
+                return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, outShape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
+                        else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
+                    BackwardFunctions<T>.CropBackward, new object[] { c_top, c_left });
+            }
+        }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Crop", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
@@ -21020,28 +21097,8 @@ public class CpuEngine : ITensorLevelEngine
         if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
             throw new ArgumentException("Crop region is out of bounds");
 
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batch * channels * height * width];
-
-        Parallel.For(0, batch * channels, bc =>
-        {
-            int b = bc / channels;
-            int c = bc % channels;
-
-            for (int oh = 0; oh < height; oh++)
-            {
-                int ih = top + oh;
-                for (int ow = 0; ow < width; ow++)
-                {
-                    int iw = left + ow;
-                    int inputIdx = ((b * channels + c) * inputHeight + ih) * inputWidth + iw;
-                    int outputIdx = ((b * channels + c) * height + oh) * width + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        });
-
-        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width]);
+        CropInto(cropResult, input, top, left, height, width);
         DifferentiableOps.RecordUnary("Crop", cropResult, input, BackwardFunctions<T>.CropBackward, new object[] { top, left });
         { var ci = input; var ct = top; var cl = left; var ch = height; var cw = width; AutoTracer.RecordOp("Crop", cropResult, eng => eng.Crop(ci, ct, cl, ch, cw)); }
         return cropResult;
