@@ -39,6 +39,22 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// Per-backend hard cap on Eigh's matrix dimension. Each backend's
+    /// shader statically provisions its Ash/Vsh workgroup arrays, and
+    /// exceeding those bounds silently reads/writes past the workgroup
+    /// memory region. Keep this table in sync with the kernel sources.
+    /// </summary>
+    private static int BackendEighMaxN(IDirectGpuBackend backend)
+    {
+#if NET7_0_OR_GREATER
+        if (backend is AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend)
+            return 32; // WebGpuLinalgKernels.Eigh: Ash[1024] = 32×32.
+#endif
+        // CUDA/HIP/Metal/OpenCL/Vulkan all provision 64×64.
+        return 64;
+    }
+
+    /// <summary>
     /// GPU-accelerated Cholesky. Returns null on unsupported backends or
     /// oversized matrices so callers fall back to the CPU path.
     /// </summary>
@@ -230,8 +246,10 @@ public partial class DirectGpuTensorEngine
         int n = input.Shape[rank - 1];
         if (input.Shape[rank - 2] != n) return (null, null);
         if (n == 0) return (null, null); // Empty matrix — fall back to CPU.
-        // Eigh's shared-memory budget is tighter (2·n² floats).
-        if (n > 64) return (null, null);
+        // Per-backend cap: WebGPU's shader ships with 32×32 workgroup arrays,
+        // everyone else provisions 64×64. Above the backend's cap we fall
+        // back to the CPU Jacobi path instead of overrunning workgroup memory.
+        if (n > BackendEighMaxN(backend)) return (null, null);
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
