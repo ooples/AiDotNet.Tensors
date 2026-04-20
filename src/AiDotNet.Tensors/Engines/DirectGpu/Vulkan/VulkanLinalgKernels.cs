@@ -140,15 +140,16 @@ void main() {
         // via in-place reflector application). Vulkan spec requires all control
         // flow to be well-defined so we use an iteration cap.
         // ═══════════════════════════════════════════════════════════════════
+        // Modified Gram–Schmidt. See CudaLinalgKernels for the algorithm derivation;
+        // this mirrors it in GLSL compute. Writes Q and R directly — no in-place
+        // working buffer needed, so both the ""tall-rows stale"" and ""Q column-only""
+        // bugs of the earlier Householder kernel are structurally eliminated.
         public static string QrReduced => Header + @"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) buffer Q { float q[]; };
 layout(set = 0, binding = 2) buffer R { float r[]; };
 layout(push_constant) uniform P { int batchCount; int m; int n; };
-shared float sNorm;
-shared float sAlpha;
-shared float sBeta;
-shared float sV0;
+shared float sScalar;
 shared float partials[256];
 
 void main() {
@@ -162,68 +163,72 @@ void main() {
     uint qOff = b * uint(m * k);
     uint rOff = b * uint(k * n);
 
-    for (uint idx = tid; idx < uint(m * n); idx += blockSize) {
-        int i = int(idx) / n;
-        if (i < k) r[rOff + idx] = a[aOff + idx];
-    }
-    barrier();
-    for (uint idx = tid; idx < uint(m * k); idx += blockSize) {
-        int i = int(idx) / k, j = int(idx) % k;
-        q[qOff + i * k + j] = (i == j) ? 1.0 : 0.0;
-    }
+    // Zero R.
+    for (uint idx = tid; idx < uint(k * n); idx += blockSize) r[rOff + idx] = 0.0;
     barrier();
 
+    // Stage 1: MGS on columns 0..k-1.
     for (int j = 0; j < k; ++j) {
-        float partial = 0.0;
-        for (int i = j + int(tid); i < m; i += int(blockSize)) {
-            float v = (i < k) ? r[rOff + i * n + j] : a[aOff + i * n + j];
-            partial += v * v;
+        for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] = a[aOff + i * uint(n) + uint(j)];
+        barrier();
+
+        for (int p = 0; p < j; ++p) {
+            float partial = 0.0;
+            for (uint i = tid; i < uint(m); i += blockSize)
+                partial += q[qOff + i * uint(k) + uint(p)] * q[qOff + i * uint(k) + uint(j)];
+            partials[tid] = partial;
+            barrier();
+            for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
+                if (tid < s) partials[tid] += partials[tid + s];
+                barrier();
+            }
+            if (tid == 0u) { sScalar = partials[0]; r[rOff + uint(p * n + j)] = sScalar; }
+            barrier();
+            float rp = sScalar;
+            for (uint i = tid; i < uint(m); i += blockSize)
+                q[qOff + i * uint(k) + uint(j)] -= rp * q[qOff + i * uint(k) + uint(p)];
+            barrier();
         }
-        partials[tid] = partial;
+
+        float partialN = 0.0;
+        for (uint i = tid; i < uint(m); i += blockSize) {
+            float vi = q[qOff + i * uint(k) + uint(j)];
+            partialN += vi * vi;
+        }
+        partials[tid] = partialN;
         barrier();
         for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
             if (tid < s) partials[tid] += partials[tid + s];
             barrier();
         }
-        if (tid == 0u) sNorm = sqrt(partials[0]);
+        if (tid == 0u) { sScalar = sqrt(partials[0]); r[rOff + uint(j * n + j)] = sScalar; }
         barrier();
-        if (sNorm == 0.0) continue;
 
-        if (tid == 0u) {
-            float x0 = (j < k) ? r[rOff + j * n + j] : a[aOff + j * n + j];
-            sAlpha = (x0 >= 0.0) ? -sNorm : sNorm;
-            sV0 = x0 - sAlpha;
-            float vNorm2 = sV0 * sV0 + (sNorm * sNorm - x0 * x0);
-            sBeta = (vNorm2 > 0.0) ? (2.0 / vNorm2) : 0.0;
-        }
-        barrier();
-        if (sBeta == 0.0) continue;
-
-        for (int c = j + int(tid); c < n; c += int(blockSize)) {
-            float dot = sV0 * ((j < k) ? r[rOff + j * n + c] : a[aOff + j * n + c]);
-            for (int i = 1; i + j < m; ++i) {
-                float v_i = (j + i < k) ? r[rOff + (j + i) * n + j] : a[aOff + (j + i) * n + j];
-                float a_ic = (j + i < k) ? r[rOff + (j + i) * n + c] : a[aOff + (j + i) * n + c];
-                dot += v_i * a_ic;
-            }
-            float s = sBeta * dot;
-            if (j < k) r[rOff + j * n + c] -= s * sV0;
-            for (int i = 1; i + j < m; ++i) {
-                float v_i = (j + i < k) ? r[rOff + (j + i) * n + j] : a[aOff + (j + i) * n + j];
-                if (j + i < k) r[rOff + (j + i) * n + c] -= s * v_i;
-            }
-        }
-        barrier();
-        for (int ri = int(tid); ri < m; ri += int(blockSize)) {
-            float dot = sV0 * q[qOff + ri * k + j];
-            float s = sBeta * dot;
-            q[qOff + ri * k + j] -= s * sV0;
+        float norm = sScalar;
+        if (norm > 1e-30) {
+            float invNorm = 1.0 / norm;
+            for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] *= invNorm;
+        } else {
+            for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] = 0.0;
         }
         barrier();
     }
-    for (uint idx = tid; idx < uint(k * n); idx += blockSize) {
-        int i = int(idx) / n, j = int(idx) % n;
-        if (i > j && i < k) r[rOff + idx] = 0.0;
+
+    // Stage 2: fill R[:, c] for c >= k via Qᵀ · A[:, c].
+    for (int c = k; c < n; ++c) {
+        for (int p = 0; p < k; ++p) {
+            float partial = 0.0;
+            for (uint i = tid; i < uint(m); i += blockSize)
+                partial += q[qOff + i * uint(k) + uint(p)] * a[aOff + i * uint(n) + uint(c)];
+            partials[tid] = partial;
+            barrier();
+            for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
+                if (tid < s) partials[tid] += partials[tid + s];
+                barrier();
+            }
+            if (tid == 0u) r[rOff + uint(p * n + c)] = partials[0];
+            barrier();
+        }
     }
 }";
 

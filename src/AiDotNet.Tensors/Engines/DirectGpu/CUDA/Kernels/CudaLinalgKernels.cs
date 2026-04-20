@@ -183,8 +183,27 @@ extern ""C"" __global__ void parity211_lu_factor(
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// QR FACTORIZATION (Householder, reduced). One block per batch.
+// QR FACTORIZATION (Modified Gram–Schmidt, reduced). One block per batch.
 // Q is (m × k), R is (k × n), where k = min(m, n).
+//
+// Why MGS (not Householder)? The reflector variant needs an m×n working
+// buffer to keep the trailing rows in sync after each reflector; MGS
+// writes Q and R directly from the columns of A, with no hidden state.
+// Stability is sufficient for the well-conditioned cases ML cares about
+// (the managed CPU path still runs Householder for ill-conditioned
+// inputs — this is the GPU fast-path only).
+//
+// Algorithm:
+//   Stage 1 (columns 0..k-1):
+//     v ← A[:, j]
+//     for p = 0..j-1:
+//         R[p,j] ← ⟨Q[:, p], v⟩
+//         v      ← v − R[p,j] · Q[:, p]
+//     R[j,j] ← ‖v‖
+//     Q[:, j] ← v / R[j,j]
+//     R[i,j] ← 0 for i>j  (upper triangular)
+//   Stage 2 (columns k..n-1, only when n > k):
+//     R[p,c] ← ⟨Q[:, p], A[:, c]⟩  for p = 0..k-1
 // ═════════════════════════════════════════════════════════════════════════
 extern ""C"" __global__ void parity211_qr_reduced(
     const float* __restrict__ A,
@@ -201,124 +220,84 @@ extern ""C"" __global__ void parity211_qr_reduced(
     float* Qb = Q + b * m * k;
     float* Rb = R + b * k * n;
 
-    // Work matrix A' — copy of A in shared memory isn't viable for large n;
-    // instead use R directly as scratch for the Householder pass on the
-    // reflected matrix, and accumulate Q in parallel with the same work matrix
-    // by stashing reflector betas + v₀-offsets in a per-batch temporary region.
-    // For simplicity and correctness v1: do the full algorithm on a device
-    // buffer region overlapped with R (we overwrite R cells we know we'll
-    // repopulate). This keeps the kernel self-contained without extra buffers.
-
-    // Step 1: copy A into a temporary device scratch (reuse R for the first
-    // min(m, k)*n region; the remainder of A[k..m, :] sits with its own data
-    // still in Ab and is re-read on Householder application).
-    // Simpler: overwrite Q's m*k region with A's transposed projection? No —
-    // use a local double-pass.
-    //
-    // Cleanest portable approach: two buffers of shared memory are impractical
-    // for large m/n, so we do the work in-place by staging A into R's memory
-    // one column at a time and applying reflectors to Q within the loop.
-
-    // Copy upper k rows of A into R so R serves as the working matrix.
-    for (int idx = tid; idx < m * n; idx += blockDim.x) {
-        int i = idx / n, j = idx % n;
-        if (i < k) Rb[i * n + j] = Ab[idx];  // R buffer holds rows 0..k-1
-    }
+    // Zero R up front — the strict lower triangle stays zero, and stage-2
+    // off-diagonal cells above row k are written below.
+    for (int idx = tid; idx < k * n; idx += blockDim.x) Rb[idx] = 0.0f;
     __syncthreads();
 
-    // Q starts as identity (m × k). When k < m, the trailing rows of Q are zero.
-    for (int idx = tid; idx < m * k; idx += blockDim.x) {
-        int i = idx / k, j = idx % k;
-        Qb[i * k + j] = (i == j) ? 1.0f : 0.0f;
-    }
-    __syncthreads();
+    // Block-wide reduction scratch.
+    __shared__ float partials[1024];
+    __shared__ float sScalar;
 
-    // For each column j of the original matrix, compute the Householder
-    // reflector from the sub-diagonal of column j (rows j..m-1 of Ab)
-    // and apply it to the trailing submatrix of A and to Q.
-    __shared__ float sNorm;
-    __shared__ float sAlpha;
-    __shared__ float sBeta;
-    __shared__ float sV0;  // v[0] (after normalization)
-
+    // Stage 1: MGS on the first k columns.
     for (int j = 0; j < k; ++j) {
-        // Compute ||x||² where x is Ab[j..m-1, j] — but we need the *current*
-        // state (after prior reflectors applied), which lives partly in Rb
-        // and partly in the trailing A region. To keep this simple, we reload
-        // x from Ab only for the first reflector, and subsequent reflectors
-        // apply updated values stored via a second scratch path.
-        // (v1 simplification: do a direct from-Ab pass. Correctness holds for
-        // k ≤ 4 well-conditioned cases; full batched GPU QR across all
-        // positions is a natural follow-up that overlaps with MatMul.)
-        float partial = 0.0f;
-        for (int i = j + tid; i < m; i += blockDim.x) {
-            float v = (i < k) ? Rb[i * n + j] : Ab[i * n + j];
-            partial += v * v;
+        // Load column j of A into Q[:, j] as the starting v vector.
+        for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] = Ab[i * n + j];
+        __syncthreads();
+
+        // Orthogonalize v against each earlier Q column.
+        for (int p = 0; p < j; ++p) {
+            // dot = ⟨Q[:, p], v⟩ via block-wide reduction.
+            float partial = 0.0f;
+            for (int i = tid; i < m; i += blockDim.x)
+                partial += Qb[i * k + p] * Qb[i * k + j];
+            partials[tid] = partial;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) partials[tid] += partials[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) { sScalar = partials[0]; Rb[p * n + j] = sScalar; }
+            __syncthreads();
+            // v ← v − dot · Q[:, p].
+            float rp = sScalar;
+            for (int i = tid; i < m; i += blockDim.x)
+                Qb[i * k + j] -= rp * Qb[i * k + p];
+            __syncthreads();
         }
-        // Block-reduce partial to sNorm.
-        __shared__ float partials[1024];
-        partials[tid] = partial;
+
+        // R[j, j] = ‖v‖.
+        float partialN = 0.0f;
+        for (int i = tid; i < m; i += blockDim.x) {
+            float vi = Qb[i * k + j];
+            partialN += vi * vi;
+        }
+        partials[tid] = partialN;
         __syncthreads();
         for (int s = blockDim.x / 2; s > 0; s >>= 1) {
             if (tid < s) partials[tid] += partials[tid + s];
             __syncthreads();
         }
-        if (tid == 0) sNorm = sqrtf(partials[0]);
+        if (tid == 0) { sScalar = sqrtf(partials[0]); Rb[j * n + j] = sScalar; }
         __syncthreads();
 
-        if (sNorm == 0.0f) continue;
-
-        if (tid == 0) {
-            float x0 = (j < k) ? Rb[j * n + j] : Ab[j * n + j];
-            sAlpha = (x0 >= 0.0f) ? -sNorm : sNorm;
-            sV0 = x0 - sAlpha;
-            // β = 2 / (||v||²); ||v||² = v₀² + Σ_{i>j} x[i]²
-            // and Σ_{i>j} x[i]² = ||x||² - x₀²
-            float vNorm2 = sV0 * sV0 + (sNorm * sNorm - x0 * x0);
-            sBeta = (vNorm2 > 0.0f) ? (2.0f / vNorm2) : 0.0f;
-        }
-        __syncthreads();
-
-        if (sBeta == 0.0f) continue;
-
-        // Apply reflector to trailing submatrix of the working matrix Rb.
-        // v[0] = sV0, v[i > 0] = Rb[(j+i)*n + j] (for i in rows beyond j).
-        for (int c = j + tid; c < n; c += blockDim.x) {
-            // dot = Σ_i v[i] * A[j+i, c]
-            float dot = sV0 * ((j < k) ? Rb[j * n + c] : Ab[j * n + c]);
-            for (int i = 1; i + j < m; ++i) {
-                float v_i = (j + i < k) ? Rb[(j + i) * n + j] : Ab[(j + i) * n + j];
-                float a_ic = (j + i < k) ? Rb[(j + i) * n + c] : Ab[(j + i) * n + c];
-                dot += v_i * a_ic;
-            }
-            float s = sBeta * dot;
-            // Update row j, c
-            if (j < k) Rb[j * n + c] -= s * sV0;
-            for (int i = 1; i + j < m; ++i) {
-                float v_i = (j + i < k) ? Rb[(j + i) * n + j] : Ab[(j + i) * n + j];
-                if (j + i < k) Rb[(j + i) * n + c] -= s * v_i;
-            }
-        }
-        __syncthreads();
-
-        // Apply reflector to Q from the right: Q ← Q · (I − β v vᵀ).
-        // For each row r of Q, update Q[r, :] by reflecting over v.
-        for (int r = tid; r < m; r += blockDim.x) {
-            float dot = sV0 * Qb[r * k + j];
-            for (int i = 1; i + j < k; ++i) dot += Qb[r * k + (j + i)] * 0.0f;
-            float s = sBeta * dot;
-            Qb[r * k + j] -= s * sV0;
-            // Column updates for i > 0 are zero-contributions here since Q's
-            // reflector columns beyond j are still identity at this step.
+        // Q[:, j] = v / R[j, j]. If the column is rank-deficient (norm ≈ 0),
+        // leave Q[:, j] zero — the consumer can detect via R[j, j].
+        float norm = sScalar;
+        if (norm > 1e-30f) {
+            float invNorm = 1.0f / norm;
+            for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] *= invNorm;
+        } else {
+            for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] = 0.0f;
         }
         __syncthreads();
     }
 
-    // R is the upper k rows of the reflected matrix; zero out the strict lower
-    // triangle for a clean output.
-    for (int idx = tid; idx < k * n; idx += blockDim.x) {
-        int i = idx / n, j = idx % n;
-        if (i > j && i < k) Rb[i * n + j] = 0.0f;
+    // Stage 2: fill R[:, c] for c in [k, n) via Qᵀ · A[:, c].
+    for (int c = k; c < n; ++c) {
+        for (int p = 0; p < k; ++p) {
+            float partial = 0.0f;
+            for (int i = tid; i < m; i += blockDim.x)
+                partial += Qb[i * k + p] * Ab[i * n + c];
+            partials[tid] = partial;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) partials[tid] += partials[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) Rb[p * n + c] = partials[0];
+            __syncthreads();
+        }
     }
 }
 

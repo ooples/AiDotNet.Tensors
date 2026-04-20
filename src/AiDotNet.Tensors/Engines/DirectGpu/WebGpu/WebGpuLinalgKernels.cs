@@ -167,6 +167,11 @@ var<workgroup> pivRow : i32;
         // ═══════════════════════════════════════════════════════════════════
         // QR REDUCED
         // ═══════════════════════════════════════════════════════════════════
+        // Modified Gram–Schmidt. See CudaLinalgKernels for the algorithm; this is
+        // the WGSL port. Writes Q and R directly from A's columns — there is no
+        // ""trailing-rows"" in-place working buffer and no per-column Q accumulation
+        // subtlety, so the earlier Householder correctness gaps are structurally
+        // gone.
         public static string QrReduced => @"
 @group(0) @binding(0) var<storage, read> A : array<f32>;
 @group(0) @binding(1) var<storage, read_write> Q : array<f32>;
@@ -174,10 +179,7 @@ var<workgroup> pivRow : i32;
 struct P { batchCount: i32, m: i32, n: i32 };
 @group(0) @binding(3) var<uniform> p : P;
 
-var<workgroup> sNorm : f32;
-var<workgroup> sAlpha : f32;
-var<workgroup> sBeta : f32;
-var<workgroup> sV0 : f32;
+var<workgroup> sScalar : f32;
 var<workgroup> partials : array<f32, 256>;
 
 @compute @workgroup_size(256) fn main(
@@ -194,91 +196,116 @@ var<workgroup> partials : array<f32, 256>;
     let qOff = b * m * k;
     let rOff = b * k * n;
 
-    var idx0 : i32 = tid;
+    // Zero R.
+    var zi : i32 = tid;
     loop {
-        if (idx0 >= m * n) { break; }
-        let i = idx0 / n;
-        if (i < k) { R[rOff + idx0] = A[aOff + idx0]; }
-        idx0 = idx0 + bs;
-    }
-    workgroupBarrier();
-    var idx1 : i32 = tid;
-    loop {
-        if (idx1 >= m * k) { break; }
-        let i = idx1 / k;
-        let j = idx1 % k;
-        Q[qOff + i * k + j] = select(0.0, 1.0, i == j);
-        idx1 = idx1 + bs;
+        if (zi >= k * n) { break; }
+        R[rOff + zi] = 0.0;
+        zi = zi + bs;
     }
     workgroupBarrier();
 
+    // Stage 1: MGS on columns 0..k-1.
     for (var j : i32 = 0; j < k; j = j + 1) {
-        var partial : f32 = 0.0;
-        var ii : i32 = j + tid;
+        var ii : i32 = tid;
         loop {
             if (ii >= m) { break; }
-            let v : f32 = select(A[aOff + ii * n + j], R[rOff + ii * n + j], ii < k);
-            partial = partial + v * v;
+            Q[qOff + ii * k + j] = A[aOff + ii * n + j];
             ii = ii + bs;
         }
-        partials[tid] = partial;
         workgroupBarrier();
-        var s : i32 = bs / 2;
-        loop {
-            if (s <= 0) { break; }
-            if (tid < s) { partials[tid] = partials[tid] + partials[tid + s]; }
+
+        for (var pp : i32 = 0; pp < j; pp = pp + 1) {
+            var partial : f32 = 0.0;
+            var i2 : i32 = tid;
+            loop {
+                if (i2 >= m) { break; }
+                partial = partial + Q[qOff + i2 * k + pp] * Q[qOff + i2 * k + j];
+                i2 = i2 + bs;
+            }
+            partials[tid] = partial;
             workgroupBarrier();
-            s = s / 2;
-        }
-        if (tid == 0) { sNorm = sqrt(partials[0]); }
-        workgroupBarrier();
-        if (sNorm == 0.0) { continue; }
-
-        if (tid == 0) {
-            let x0 : f32 = select(A[aOff + j * n + j], R[rOff + j * n + j], j < k);
-            sAlpha = select(sNorm, -sNorm, x0 >= 0.0);
-            sV0 = x0 - sAlpha;
-            let vNorm2 : f32 = sV0 * sV0 + (sNorm * sNorm - x0 * x0);
-            sBeta = select(0.0, 2.0 / vNorm2, vNorm2 > 0.0);
-        }
-        workgroupBarrier();
-        if (sBeta == 0.0) { continue; }
-
-        var c : i32 = j + tid;
-        loop {
-            if (c >= n) { break; }
-            var dotp : f32 = sV0 * select(A[aOff + j * n + c], R[rOff + j * n + c], j < k);
-            for (var i : i32 = 1; i + j < m; i = i + 1) {
-                let v_i : f32 = select(A[aOff + (j + i) * n + j], R[rOff + (j + i) * n + j], j + i < k);
-                let a_ic : f32 = select(A[aOff + (j + i) * n + c], R[rOff + (j + i) * n + c], j + i < k);
-                dotp = dotp + v_i * a_ic;
+            var s : i32 = bs / 2;
+            loop {
+                if (s <= 0) { break; }
+                if (tid < s) { partials[tid] = partials[tid] + partials[tid + s]; }
+                workgroupBarrier();
+                s = s / 2;
             }
-            let ss : f32 = sBeta * dotp;
-            if (j < k) { R[rOff + j * n + c] = R[rOff + j * n + c] - ss * sV0; }
-            for (var i : i32 = 1; i + j < m; i = i + 1) {
-                let v_i : f32 = select(A[aOff + (j + i) * n + j], R[rOff + (j + i) * n + j], j + i < k);
-                if (j + i < k) { R[rOff + (j + i) * n + c] = R[rOff + (j + i) * n + c] - ss * v_i; }
+            if (tid == 0) { sScalar = partials[0]; R[rOff + pp * n + j] = sScalar; }
+            workgroupBarrier();
+            let rp = sScalar;
+            var i3 : i32 = tid;
+            loop {
+                if (i3 >= m) { break; }
+                Q[qOff + i3 * k + j] = Q[qOff + i3 * k + j] - rp * Q[qOff + i3 * k + pp];
+                i3 = i3 + bs;
             }
-            c = c + bs;
+            workgroupBarrier();
         }
-        workgroupBarrier();
-        var ri : i32 = tid;
+
+        var partialN : f32 = 0.0;
+        var i4 : i32 = tid;
         loop {
-            if (ri >= m) { break; }
-            let dotp : f32 = sV0 * Q[qOff + ri * k + j];
-            let ss : f32 = sBeta * dotp;
-            Q[qOff + ri * k + j] = Q[qOff + ri * k + j] - ss * sV0;
-            ri = ri + bs;
+            if (i4 >= m) { break; }
+            let vi = Q[qOff + i4 * k + j];
+            partialN = partialN + vi * vi;
+            i4 = i4 + bs;
+        }
+        partials[tid] = partialN;
+        workgroupBarrier();
+        var s2 : i32 = bs / 2;
+        loop {
+            if (s2 <= 0) { break; }
+            if (tid < s2) { partials[tid] = partials[tid] + partials[tid + s2]; }
+            workgroupBarrier();
+            s2 = s2 / 2;
+        }
+        if (tid == 0) { sScalar = sqrt(partials[0]); R[rOff + j * n + j] = sScalar; }
+        workgroupBarrier();
+
+        let norm = sScalar;
+        if (norm > 1e-30) {
+            let invNorm = 1.0 / norm;
+            var i5 : i32 = tid;
+            loop {
+                if (i5 >= m) { break; }
+                Q[qOff + i5 * k + j] = Q[qOff + i5 * k + j] * invNorm;
+                i5 = i5 + bs;
+            }
+        } else {
+            var i5b : i32 = tid;
+            loop {
+                if (i5b >= m) { break; }
+                Q[qOff + i5b * k + j] = 0.0;
+                i5b = i5b + bs;
+            }
         }
         workgroupBarrier();
     }
-    var idx3 : i32 = tid;
-    loop {
-        if (idx3 >= k * n) { break; }
-        let i = idx3 / n;
-        let j = idx3 % n;
-        if (i > j && i < k) { R[rOff + idx3] = 0.0; }
-        idx3 = idx3 + bs;
+
+    // Stage 2: fill R[:, c] for c >= k via Qᵀ · A[:, c].
+    for (var c : i32 = k; c < n; c = c + 1) {
+        for (var pp : i32 = 0; pp < k; pp = pp + 1) {
+            var partial : f32 = 0.0;
+            var i6 : i32 = tid;
+            loop {
+                if (i6 >= m) { break; }
+                partial = partial + Q[qOff + i6 * k + pp] * A[aOff + i6 * n + c];
+                i6 = i6 + bs;
+            }
+            partials[tid] = partial;
+            workgroupBarrier();
+            var s3 : i32 = bs / 2;
+            loop {
+                if (s3 <= 0) { break; }
+                if (tid < s3) { partials[tid] = partials[tid] + partials[tid + s3]; }
+                workgroupBarrier();
+                s3 = s3 / 2;
+            }
+            if (tid == 0) { R[rOff + pp * n + c] = partials[0]; }
+            workgroupBarrier();
+        }
     }
 }
 ";
