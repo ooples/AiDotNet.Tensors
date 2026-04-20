@@ -24670,6 +24670,30 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // ND float fast path: for rank-3+ input with rank-2 weight (BERT
+        // FFN pattern), TensorMatMul collapses to a big 2D GEMM via Path A's
+        // cached-B. Then bias + activation can share the SIMD epilogue with
+        // the 2D path above — no need to fall through to the TensorBroadcast-
+        // Add + ApplyFusedActivationInPlace pair of separate memory passes.
+        if (typeof(T) == typeof(float) && input.Rank >= 3 && weights.Rank == 2
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU
+                || activation == FusedActivationType.GELU))
+        {
+            var matMulResult = TensorMatMul(input, weights);
+            if (bias != null || activation != FusedActivationType.None)
+            {
+                var outArr = (float[])(object)matMulResult.GetDataArray();
+                var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                // matMulResult shape: [..batchDims.., M_rows, N]
+                // Collapse batch dims to treat as a single [M_total, N] for the epilogue.
+                int N = matMulResult._shape[matMulResult._shape.Length - 1];
+                int Mtotal = matMulResult.Length / N;
+                CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, Mtotal, N, activation);
+            }
+            return matMulResult;
+        }
+
         // Fallback: sequential operations for other types or higher-rank tensors
         var fallbackResult = TensorMatMul(input, weights);
 
