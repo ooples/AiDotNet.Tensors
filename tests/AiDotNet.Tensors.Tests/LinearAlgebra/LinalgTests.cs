@@ -442,4 +442,295 @@ public class LinalgTests
         Assert.True(Math.Abs(r0) < 1e-6);
         Assert.True(Math.Abs(r1) < 1e-6);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 4D BATCHED TESTS — issue #211 acceptance criterion
+    // "Batched variants tested up to 4D input (batch, batch, M, N)"
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static Tensor<double> Make4DBatchSpd(int b1, int b2, int n, int seed)
+    {
+        var t = new Tensor<double>(new[] { b1, b2, n, n });
+        var d = t.GetDataArray();
+        var rng = new Random(seed);
+        for (int i1 = 0; i1 < b1; i1++)
+            for (int i2 = 0; i2 < b2; i2++)
+            {
+                int off = (i1 * b2 + i2) * n * n;
+                // Generate M, then A = M·Mᵀ + n·I is SPD.
+                var M = new double[n * n];
+                for (int i = 0; i < n * n; i++) M[i] = rng.NextDouble() - 0.5;
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double s = i == j ? n : 0;
+                        for (int k = 0; k < n; k++) s += M[i * n + k] * M[j * n + k];
+                        d[off + i * n + j] = s;
+                    }
+            }
+        return t;
+    }
+
+    [Fact]
+    public void Cholesky_4DBatched_FactorsEachSpdMatrixCorrectly()
+    {
+        // (2, 3, 4, 4) batch → 6 SPD matrices, each 4×4.
+        var A = Make4DBatchSpd(2, 3, 4, seed: 101);
+        var L = Linalg.Cholesky(A);
+        Assert.Equal(new[] { 2, 3, 4, 4 }, L.Shape.ToArray());
+
+        // Verify each batch slice: L·Lᵀ ≈ A slice.
+        var Ld = L.GetDataArray();
+        var Ad = A.GetDataArray();
+        for (int b = 0; b < 6; b++)
+        {
+            int off = b * 16;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                {
+                    double llt = 0;
+                    for (int k = 0; k < 4; k++)
+                        llt += Ld[off + i * 4 + k] * Ld[off + j * 4 + k];
+                    Assert.True(Math.Abs(llt - Ad[off + i * 4 + j]) < 1e-6,
+                        $"batch {b} [{i},{j}]: L·Lᵀ={llt}, A={Ad[off + i * 4 + j]}");
+                }
+        }
+    }
+
+    [Fact]
+    public void Lu_4DBatched_SatisfiesPaEqualsLu()
+    {
+        // 4D batch LU — verify P·A = L·U for each slice.
+        var A = new Tensor<double>(new[] { 2, 2, 3, 3 });
+        var d = A.GetDataArray();
+        var rng = new Random(5);
+        for (int i = 0; i < d.Length; i++) d[i] = rng.NextDouble();
+
+        var (P, L, U) = Linalg.LU(A);
+        Assert.Equal(new[] { 2, 2, 3, 3 }, P.Shape.ToArray());
+        Assert.Equal(new[] { 2, 2, 3, 3 }, L.Shape.ToArray());
+        Assert.Equal(new[] { 2, 2, 3, 3 }, U.Shape.ToArray());
+
+        var Pd = P.GetDataArray();
+        var Ld = L.GetDataArray();
+        var Ud = U.GetDataArray();
+        var Ad = A.GetDataArray();
+        for (int b = 0; b < 4; b++)
+        {
+            int off = b * 9;
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                {
+                    // (P·A)[i,j] = Σₖ P[i,k] · A[k,j]
+                    double pa = 0;
+                    for (int k = 0; k < 3; k++) pa += Pd[off + i * 3 + k] * Ad[off + k * 3 + j];
+                    // (L·U)[i,j] = Σₖ L[i,k] · U[k,j]
+                    double lu = 0;
+                    for (int k = 0; k < 3; k++) lu += Ld[off + i * 3 + k] * Ud[off + k * 3 + j];
+                    Assert.True(Math.Abs(pa - lu) < 1e-8,
+                        $"batch {b} [{i},{j}]: PA={pa}, LU={lu}");
+                }
+        }
+    }
+
+    [Fact]
+    public void Eigh_4DBatched_ReturnsSortedEigenvalues()
+    {
+        var A = Make4DBatchSpd(2, 2, 3, seed: 77);
+        var (w, V) = Linalg.Eigh(A);
+        Assert.Equal(new[] { 2, 2, 3 }, w.Shape.ToArray());
+        Assert.Equal(new[] { 2, 2, 3, 3 }, V.Shape.ToArray());
+
+        // Each batch's eigenvalues are ascending and positive (SPD).
+        var wd = w.GetDataArray();
+        for (int b = 0; b < 4; b++)
+        {
+            int off = b * 3;
+            for (int i = 1; i < 3; i++)
+                Assert.True(wd[off + i] >= wd[off + i - 1] - 1e-10,
+                    $"batch {b}: eigenvalues not sorted: {wd[off + i - 1]} then {wd[off + i]}");
+            for (int i = 0; i < 3; i++)
+                Assert.True(wd[off + i] > 0, $"batch {b} eigvalue {i} = {wd[off + i]} not positive.");
+        }
+    }
+
+    [Fact]
+    public void Det_4DBatched_PerSliceDetMatchesManualComputation()
+    {
+        var A = Make4DBatchSpd(2, 2, 3, seed: 33);
+        var det = Linalg.Det(A);
+        Assert.Equal(new[] { 2, 2 }, det.Shape.ToArray());
+
+        var dd = det.GetDataArray();
+        var Ad = A.GetDataArray();
+        for (int b = 0; b < 4; b++)
+        {
+            int off = b * 9;
+            // Compute 3x3 det via cofactor expansion.
+            double expected = Ad[off + 0] * (Ad[off + 4] * Ad[off + 8] - Ad[off + 5] * Ad[off + 7])
+                            - Ad[off + 1] * (Ad[off + 3] * Ad[off + 8] - Ad[off + 5] * Ad[off + 6])
+                            + Ad[off + 2] * (Ad[off + 3] * Ad[off + 7] - Ad[off + 4] * Ad[off + 6]);
+            Assert.True(Math.Abs(dd[b] - expected) < 1e-6,
+                $"batch {b}: det={dd[b]}, expected={expected}");
+        }
+    }
+
+    [Fact]
+    public void Solve_4DBatched_PerSliceSolvesCorrectly()
+    {
+        var A = Make4DBatchSpd(2, 2, 3, seed: 41);
+        var b = new Tensor<double>(new[] { 2, 2, 3 });
+        var bd = b.GetDataArray();
+        var rng = new Random(42);
+        for (int i = 0; i < bd.Length; i++) bd[i] = rng.NextDouble();
+
+        var x = Linalg.Solve(A, b);
+        Assert.Equal(new[] { 2, 2, 3 }, x.Shape.ToArray());
+
+        // Verify A·x = b for each batch.
+        var Ad = A.GetDataArray();
+        var xd = x.GetDataArray();
+        for (int batch = 0; batch < 4; batch++)
+        {
+            int matOff = batch * 9;
+            int vecOff = batch * 3;
+            for (int i = 0; i < 3; i++)
+            {
+                double ax = 0;
+                for (int j = 0; j < 3; j++) ax += Ad[matOff + i * 3 + j] * xd[vecOff + j];
+                Assert.True(Math.Abs(ax - bd[vecOff + i]) < 1e-6,
+                    $"batch {batch} row {i}: A·x={ax}, b={bd[vecOff + i]}");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STRUCTURED-MATRIX ROUTING (moat #7)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void Solve_RoutesSpdThroughCholesky_AndMatchesLuResult()
+    {
+        // Both paths should produce the same x within FP tolerance.
+        var A = FromRows(new double[,] { { 4, 1 }, { 1, 3 } }); // SPD
+        var b = new Tensor<double>(new[] { 2 });
+        b.GetDataArray()[0] = 1; b.GetDataArray()[1] = 2;
+
+        var xViaStructured = Linalg.Solve(A, b); // Auto-routes via Cholesky.
+        var (xViaLu, _) = Linalg.SolveEx(A, b);
+        for (int i = 0; i < 2; i++)
+            Assert.True(Math.Abs(xViaStructured.GetDataArray()[i] - xViaLu.GetDataArray()[i]) < 1e-10,
+                $"Cholesky / LU Solve results diverge at [{i}]");
+    }
+
+    [Fact]
+    public void Solve_RoutesTriangularThroughTriangSolve_AndMatchesExplicit()
+    {
+        var A = FromRows(new double[,] { { 2, 1 }, { 0, 3 } }); // upper triangular
+        var b = new Tensor<double>(new[] { 2 });
+        b.GetDataArray()[0] = 5; b.GetDataArray()[1] = 9;
+
+        var xAuto = Linalg.Solve(A, b);
+        var xExplicit = Linalg.SolveTriangular(A, b, upper: true);
+        for (int i = 0; i < 2; i++)
+            Assert.True(Math.Abs(xAuto.GetDataArray()[i] - xExplicit.GetDataArray()[i]) < 1e-10);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MIXED-PRECISION (moat #4)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void SolveMixed_MatchesSolve_WithinTolerance()
+    {
+        var A = Make4DBatchSpd(1, 1, 4, seed: 7).Reshape(new[] { 4, 4 });
+        var b = new Tensor<double>(new[] { 4 });
+        var bd = b.GetDataArray();
+        var rng = new Random(9);
+        for (int i = 0; i < 4; i++) bd[i] = rng.NextDouble();
+
+        var xDirect = Linalg.Solve(A, b);
+        var xMixed = LinalgMixedPrecision.SolveMixed(A, b);
+        // Iterative refinement should recover fp64-equivalent accuracy on
+        // well-conditioned SPD inputs.
+        for (int i = 0; i < 4; i++)
+        {
+            double diff = Math.Abs(xDirect.GetDataArray()[i] - xMixed.GetDataArray()[i]);
+            Assert.True(diff < 1e-8, $"mixed-precision diverges at [{i}]: diff={diff}");
+        }
+    }
+
+    [Fact]
+    public void CholeskyMixed_RoundTripsCorrectly()
+    {
+        var A = FromRows(new double[,] { { 4, 2 }, { 2, 5 } });
+        var L = LinalgMixedPrecision.CholeskyMixed(A);
+        // Reconstruct L·Lᵀ ≈ A (FP32 casting introduces ~1e-6 error on small values).
+        var Ld = L.GetDataArray();
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+            {
+                double llt = 0;
+                for (int k = 0; k < 2; k++) llt += Ld[i * 2 + k] * Ld[j * 2 + k];
+                Assert.True(Math.Abs(llt - A.GetDataArray()[i * 2 + j]) < 1e-4);
+            }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CROSS on NON-LAST DIMENSION (batched gap fix)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void Cross_DimNotLast_UsesStrideBasedWalk()
+    {
+        // Shape (3, 2): axis 0 is the size-3 dim. [[1,0],[0,1],[0,0]] × [[0,1],[1,0],[0,0]]
+        // Per-column cross:
+        //   col 0: [1,0,0] × [0,1,0] = [0,0,1]
+        //   col 1: [0,1,0] × [1,0,0] = [0,0,-1]
+        var a = new Tensor<double>(new[] { 3, 2 });
+        var b = new Tensor<double>(new[] { 3, 2 });
+        var ad = a.GetDataArray();
+        var bd = b.GetDataArray();
+        ad[0] = 1; ad[1] = 0;
+        ad[2] = 0; ad[3] = 1;
+        ad[4] = 0; ad[5] = 0;
+        bd[0] = 0; bd[1] = 1;
+        bd[2] = 1; bd[3] = 0;
+        bd[4] = 0; bd[5] = 0;
+
+        var c = Linalg.Cross(a, b, dim: 0);
+        var cd = c.GetDataArray();
+        // Expected: col 0 → [0, 0, 1]; col 1 → [0, 0, -1]
+        Assert.Equal(0.0, cd[0], 10); // [0, col 0]
+        Assert.Equal(0.0, cd[1], 10); // [0, col 1]
+        Assert.Equal(0.0, cd[2], 10); // [1, col 0]
+        Assert.Equal(0.0, cd[3], 10); // [1, col 1]
+        Assert.Equal(1.0, cd[4], 10); // [2, col 0]
+        Assert.Equal(-1.0, cd[5], 10); // [2, col 1]
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HOUSEHOLDER PRODUCT BATCHED (gap fix)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void HouseholderProduct_Batched_ProducesBatchedOrthogonalMatrices()
+    {
+        // Trivial case: tau = 0 for all reflectors means Q = I for each batch.
+        var refl = new Tensor<double>(new[] { 2, 3, 2 }); // 2 batches, each 3×2
+        var tau = new Tensor<double>(new[] { 2, 2 });    // 2 batches, each k=2
+
+        var Q = Linalg.HouseholderProduct(refl, tau);
+        Assert.Equal(new[] { 2, 3, 3 }, Q.Shape.ToArray());
+
+        // Each batch's Q should be identity (tau=0 → no reflection).
+        var qd = Q.GetDataArray();
+        for (int b = 0; b < 2; b++)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                {
+                    double expected = i == j ? 1.0 : 0.0;
+                    Assert.Equal(expected, qd[b * 9 + i * 3 + j], 10);
+                }
+    }
 }

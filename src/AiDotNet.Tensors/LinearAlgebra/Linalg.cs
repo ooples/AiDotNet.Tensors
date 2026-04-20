@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra.Decompositions;
 using AiDotNet.Tensors.LinearAlgebra.Solvers;
 
@@ -135,7 +136,11 @@ public static class Linalg
     /// <summary>Solve the general linear system <c>A·X = B</c>.</summary>
     public static Tensor<T> Solve<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinearSolvers.Solve(a, b);
+    {
+        var result = LinearSolvers.Solve(a, b);
+        DifferentiableOps.RecordBinary("Linalg.Solve", result, a, b, LinalgBackward.SolveBackward<T>());
+        return result;
+    }
 
     /// <summary>Solve, returning the solution and an <c>info</c> flag per batch element.</summary>
     public static (Tensor<T> Solution, Tensor<int> Info) SolveEx<T>(Tensor<T> a, Tensor<T> b)
@@ -160,7 +165,11 @@ public static class Linalg
     /// <summary>Matrix inverse.</summary>
     public static Tensor<T> Inv<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgInverses.Inv(input);
+    {
+        var result = LinalgInverses.Inv(input);
+        DifferentiableOps.RecordUnary("Linalg.Inv", result, input, LinalgBackward.InvBackward<T>());
+        return result;
+    }
 
     /// <summary>Inverse with <c>info</c> per batch element (no throw on singular).</summary>
     public static (Tensor<T> Inverse, Tensor<int> Info) InvEx<T>(Tensor<T> input)
@@ -179,12 +188,21 @@ public static class Linalg
     /// <summary>Determinant.</summary>
     public static Tensor<T> Det<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgScalars.Det(input);
+    {
+        var result = LinalgScalars.Det(input);
+        DifferentiableOps.RecordUnary("Linalg.Det", result, input, LinalgBackward.DetBackward<T>());
+        return result;
+    }
 
     /// <summary>(sign, log|det|) decomposition — avoids overflow for ill-conditioned matrices.</summary>
     public static (Tensor<T> Sign, Tensor<T> LogAbsDet) SlogDet<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgScalars.SlogDet(input);
+    {
+        var (sign, logAbs) = LinalgScalars.SlogDet(input);
+        // Record backward on the log-abs branch (sign has zero gradient).
+        DifferentiableOps.RecordUnary("Linalg.SlogDet", logAbs, input, LinalgBackward.SlogDetBackward<T>());
+        return (sign, logAbs);
+    }
 
     /// <summary>Matrix rank via SVD.</summary>
     public static Tensor<int> MatrixRank<T>(Tensor<T> input, double? atol = null, double? rtol = null, bool hermitian = false)
@@ -222,7 +240,12 @@ public static class Linalg
     /// <summary>A^n for integer n (including negative via Inv).</summary>
     public static Tensor<T> MatrixPower<T>(Tensor<T> input, int n)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgStructural.MatrixPower(input, n);
+    {
+        var result = LinalgStructural.MatrixPower(input, n);
+        DifferentiableOps.RecordUnary("Linalg.MatrixPower", result, input,
+            LinalgBackward.MatrixPowerBackward<T>(), savedState: new object[] { n });
+        return result;
+    }
 
     /// <summary>Matrix exponential via Padé scaling-and-squaring.</summary>
     public static Tensor<T> MatrixExp<T>(Tensor<T> input)

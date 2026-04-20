@@ -169,37 +169,41 @@ internal static class LinalgStructural
         if (b is null) throw new ArgumentNullException(nameof(b));
         int rank = a.Rank;
         int d = dim < 0 ? dim + rank : dim;
+        if (d < 0 || d >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
         if (a.Shape[d] != 3 || b.Shape[d] != 3) throw new ArgumentException("Cross needs size-3 axis.");
 
+        // Supports arbitrary dim via stride-based walk — no permute required.
+        // Inner/outer split: positions with index < d form the "outer" batch,
+        // positions > d form the "inner" stride; the 3 components at axis d
+        // are combined per (outer, inner) slot.
         var result = new Tensor<T>((int[])a._shape.Clone());
         var aD = a.GetDataArray();
         var bD = b.GetDataArray();
         var rD = result.GetDataArray();
 
-        // Iterate all positions; for each fixed set of non-dim coords, compute 3-cross.
-        int total = 1;
-        for (int i = 0; i < rank; i++) total *= a._shape[i];
+        int outer = 1;
+        int inner = 1;
+        for (int i = 0; i < d; i++) outer *= a._shape[i];
+        for (int i = d + 1; i < rank; i++) inner *= a._shape[i];
 
-        for (int i = 0; i < total; i += a._shape[d])
+        for (int o = 0; o < outer; o++)
         {
-            // Check alignment on axis d.
-            // For contiguous row-major, stride along d equals product of later dims.
-            // Simpler: iterate via strides.
-        }
+            for (int s = 0; s < inner; s++)
+            {
+                int off0 = o * 3 * inner + 0 * inner + s;
+                int off1 = o * 3 * inner + 1 * inner + s;
+                int off2 = o * 3 * inner + 2 * inner + s;
 
-        // Fallback simple implementation: contiguous with dim as last axis.
-        if (d != rank - 1)
-            throw new NotSupportedException("Cross currently supports dim as the last axis; use Permute to reorder first.");
-
-        int groups = total / 3;
-        for (int g = 0; g < groups; g++)
-        {
-            int off = g * 3;
-            double ax = ToDouble(aD[off]), ay = ToDouble(aD[off + 1]), az = ToDouble(aD[off + 2]);
-            double bx = ToDouble(bD[off]), by = ToDouble(bD[off + 1]), bz = ToDouble(bD[off + 2]);
-            rD[off] = FromDouble<T>(ay * bz - az * by);
-            rD[off + 1] = FromDouble<T>(az * bx - ax * bz);
-            rD[off + 2] = FromDouble<T>(ax * by - ay * bx);
+                double ax = ToDouble(aD[off0]);
+                double ay = ToDouble(aD[off1]);
+                double az = ToDouble(aD[off2]);
+                double bx = ToDouble(bD[off0]);
+                double by = ToDouble(bD[off1]);
+                double bz = ToDouble(bD[off2]);
+                rD[off0] = FromDouble<T>(ay * bz - az * by);
+                rD[off1] = FromDouble<T>(az * bx - ax * bz);
+                rD[off2] = FromDouble<T>(ax * by - ay * bx);
+            }
         }
         return result;
     }
@@ -232,39 +236,51 @@ internal static class LinalgStructural
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         // Apply k Householder reflectors (columns of `reflectors`) in order to build Q.
+        // Supports batched input of shape (..., M, K); tau has shape (..., K).
         if (reflectors is null) throw new ArgumentNullException(nameof(reflectors));
         if (tau is null) throw new ArgumentNullException(nameof(tau));
-        if (reflectors.Rank != 2) throw new ArgumentException("HouseholderProduct currently only supports non-batched input.");
+        if (reflectors.Rank < 2) throw new ArgumentException("HouseholderProduct needs at least 2D input.");
 
-        int m = reflectors.Shape[0];
-        int k = reflectors.Shape[1];
-        var q = new double[m * m];
-        for (int i = 0; i < m; i++) q[i * m + i] = 1.0;
+        int rank = reflectors.Rank;
+        int m = reflectors.Shape[rank - 2];
+        int k = reflectors.Shape[rank - 1];
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch *= reflectors._shape[i];
+
+        var outShape = (int[])reflectors._shape.Clone();
+        outShape[rank - 1] = m;
+        var result = new Tensor<T>(outShape);
 
         var refD = reflectors.GetDataArray();
         var tauD = tau.GetDataArray();
+        var rD = result.GetDataArray();
 
-        for (int j = k - 1; j >= 0; j--)
+        for (int b = 0; b < batch; b++)
         {
-            double beta = ToDouble(tauD[j]);
-            if (beta == 0) continue;
-            int colLen = m - j;
-            var v = new double[colLen];
-            v[0] = 1.0;
-            for (int i = 1; i < colLen; i++) v[i] = ToDouble(refD[(j + i) * k + j]);
+            var q = new double[m * m];
+            for (int i = 0; i < m; i++) q[i * m + i] = 1.0;
 
-            for (int c = 0; c < m; c++)
+            for (int j = k - 1; j >= 0; j--)
             {
-                double dot = 0;
-                for (int i = 0; i < colLen; i++) dot += v[i] * q[(j + i) * m + c];
-                double scale = beta * dot;
-                for (int i = 0; i < colLen; i++) q[(j + i) * m + c] -= scale * v[i];
+                double beta = ToDouble(tauD[b * k + j]);
+                if (beta == 0) continue;
+                int colLen = m - j;
+                var v = new double[colLen];
+                v[0] = 1.0;
+                for (int i = 1; i < colLen; i++) v[i] = ToDouble(refD[b * m * k + (j + i) * k + j]);
+
+                for (int c = 0; c < m; c++)
+                {
+                    double dot = 0;
+                    for (int i = 0; i < colLen; i++) dot += v[i] * q[(j + i) * m + c];
+                    double scale = beta * dot;
+                    for (int i = 0; i < colLen; i++) q[(j + i) * m + c] -= scale * v[i];
+                }
             }
+
+            for (int i = 0; i < m * m; i++) rD[b * m * m + i] = FromDouble<T>(q[i]);
         }
 
-        var result = new Tensor<T>(new[] { m, m });
-        var rD = result.GetDataArray();
-        for (int i = 0; i < m * m; i++) rD[i] = FromDouble<T>(q[i]);
         return result;
     }
 

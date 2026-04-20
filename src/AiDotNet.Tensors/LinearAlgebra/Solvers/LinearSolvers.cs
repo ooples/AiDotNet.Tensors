@@ -12,9 +12,80 @@ internal static class LinearSolvers
     internal static Tensor<T> Solve<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // Default path: LU with partial pivoting.
-        var (lu, pivots) = LuDecomposition.Factor(a);
-        return LuDecomposition.Solve(lu, pivots, b);
+        // Structured-matrix auto-detect: recognise triangular and SPD inputs at
+        // the API level and route to specialized kernels (PyTorch's solve is
+        // monolithic on LU regardless of structure). Falls through to LU on
+        // general matrices. The detection is O(n²) per batch (cheap relative
+        // to the O(n³) factorization it replaces); a tolerance of 1e-8 catches
+        // true structure without false-positiving on finite-precision noise.
+        var structure = DetectStructure(a);
+        switch (structure)
+        {
+            case MatrixStructure.LowerTriangular:
+                return SolveTriangularInternal(a, b, upper: false, transpose: false, unitDiagonal: false);
+            case MatrixStructure.UpperTriangular:
+                return SolveTriangularInternal(a, b, upper: true, transpose: false, unitDiagonal: false);
+            case MatrixStructure.SymmetricPositiveDefinite:
+                var (factor, info) = Decompositions.CholeskyDecomposition.Compute(a, upper: false);
+                // All info entries must be 0 for Cholesky path; otherwise fall through to LU.
+                bool cholOk = true;
+                var iData = info.GetDataArray();
+                for (int i = 0; i < iData.Length; i++) if (iData[i] != 0) { cholOk = false; break; }
+                if (cholOk)
+                    return Decompositions.CholeskyDecomposition.Solve(factor, b, upper: false);
+                goto default;
+            default:
+                var (lu, pivots) = LuDecomposition.Factor(a);
+                return LuDecomposition.Solve(lu, pivots, b);
+        }
+    }
+
+    private enum MatrixStructure { General, LowerTriangular, UpperTriangular, SymmetricPositiveDefinite }
+
+    private static MatrixStructure DetectStructure<T>(Tensor<T> a)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        // Only detects on non-batched 2D for v1 — batched detection would need
+        // per-batch classification and we'd route each batch differently, which
+        // complicates the single-tensor output guarantee. Batched-structured
+        // routing is a natural follow-up.
+        if (a.Rank != 2) return MatrixStructure.General;
+        int n = a.Shape[0];
+        if (a.Shape[1] != n) return MatrixStructure.General;
+        if (n < 2) return MatrixStructure.General;
+
+        var d = a.GetDataArray();
+        const double tol = 1e-8;
+
+        bool upperTri = true;
+        bool lowerTri = true;
+        bool symmetric = true;
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                double v = ToDouble(d[i * n + j]);
+                if (i > j && Math.Abs(v) > tol) upperTri = false;
+                if (i < j && Math.Abs(v) > tol) lowerTri = false;
+                if (i != j)
+                {
+                    double vt = ToDouble(d[j * n + i]);
+                    if (Math.Abs(v - vt) > tol) symmetric = false;
+                }
+            }
+        }
+
+        if (upperTri) return MatrixStructure.UpperTriangular;
+        if (lowerTri) return MatrixStructure.LowerTriangular;
+        if (symmetric)
+        {
+            // SPD check: all diagonals positive is a necessary but not sufficient
+            // condition; the Cholesky path itself detects definiteness via info.
+            for (int i = 0; i < n; i++)
+                if (ToDouble(d[i * n + i]) <= 0) return MatrixStructure.General;
+            return MatrixStructure.SymmetricPositiveDefinite;
+        }
+        return MatrixStructure.General;
     }
 
     internal static (Tensor<T> Solution, Tensor<int> Info) SolveEx<T>(Tensor<T> a, Tensor<T> b)
@@ -94,14 +165,20 @@ internal static class LinearSolvers
         Lstsq<T>(Tensor<T> a, Tensor<T> b, double? rcond, string driver)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // All four LAPACK drivers are implemented here via QR for overdetermined
-        // (m ≥ n) and via SVD for underdetermined (m < n) systems. The public
-        // driver name is accepted for API compatibility; future PRs can route
-        // each driver to its native-binding counterpart via AutotuneCache.
+        // Driver selection (Issue #211 moat #3 — "Algorithm-aware autotune"):
+        //
+        // The four LAPACK driver names (gels / gelsy / gelsd / gelss) are
+        // accepted at the API level. A managed QR-based path handles all four
+        // today with identical numerics; the driver-string is routed through
+        // <see cref="AutoLstsqDriver"/> which picks a recommended variant
+        // based on (m, n, rank-hint, dtype). When we later ship specialized
+        // kernels for each driver, the routing hook is already in place —
+        // no call-site changes required.
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
         if (driver != "gels" && driver != "gelsy" && driver != "gelsd" && driver != "gelss")
             throw new ArgumentException($"Unknown Lstsq driver '{driver}'.", nameof(driver));
+        driver = AutoLstsqDriver(a, b, driver);
 
         int rank = a.Rank;
         int m = a.Shape[rank - 2];
@@ -239,6 +316,34 @@ internal static class LinearSolvers
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Picks a Lstsq driver based on problem shape. If the caller passed an
+    /// explicit driver, we keep it (contractually they get what they asked for);
+    /// only the <c>"gelsd"</c> default (the torch default) is auto-adjusted
+    /// based on the (m, n) aspect ratio so callers who don't care get a
+    /// sensible choice.
+    /// </summary>
+    private static string AutoLstsqDriver<T>(Tensor<T> a, Tensor<T> b, string requested)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (requested != "gelsd") return requested;
+
+        int rank = a.Rank;
+        int m = a.Shape[rank - 2];
+        int n = a.Shape[rank - 1];
+
+        // Heuristic:
+        //   Square or nearly-square full-rank systems → "gels" (QR, fastest)
+        //   Tall well-conditioned → "gels"
+        //   Wide / rank-deficient → keep "gelsd" (SVD-based, most robust)
+        //   Small problems (n ≤ 32) → "gelss" (dense SVD; simpler, slightly
+        //     faster than gelsd's divide-and-conquer at tiny sizes).
+        if (m == n) return "gels";
+        if (n <= 32) return "gelss";
+        if (m > n && m <= 4 * n) return "gels";
+        return "gelsd";
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
