@@ -27744,6 +27744,134 @@ public class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
     }
 
+    /// <summary>
+    /// Write-through AdaptiveAvgPool2D: same dispatch as
+    /// <see cref="AdaptiveAvgPool2D{T}(Tensor{T}, int, int)"/> but writes into
+    /// the provided output tensor. Used by ResNet's classifier head where the
+    /// final spatial map (typically [N, 2048, 7, 7]) collapses to [N, 2048,
+    /// 1, 1] before the FC layer; a 1×1 adaptive pool is just global average
+    /// pooling, which has an NCHWc8 SIMD path. Saves the intermediate
+    /// alloc+CopyTo per inference.
+    /// </summary>
+    public void AdaptiveAvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int outputHeight, int outputWidth)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int inHeight = input._shape[2];
+        int inWidth = input._shape[3];
+
+        // ResNet/ImageNet hot path: 1×1 adaptive pool == global avg pool.
+        // GlobalAvgPool2D has NCHWc8 SIMD; reuse it instead of the generic
+        // bin loop. Result is [N, C, 1, 1] — exactly our output shape.
+        if (outputHeight == 1 && outputWidth == 1)
+        {
+            if (typeof(T) == typeof(float)
+                && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+                && channels % Simd.NchwcPool.CBlock == 0)
+            {
+                var srcF = (Tensor<float>)(object)input;
+                var dstF = (Tensor<float>)(object)output;
+                Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.AsSpan(), dstF.AsWritableSpan(),
+                    batch, channels, inHeight, inWidth);
+                dstF.Layout = LinearAlgebra.TensorLayout.Nchw;
+                return;
+            }
+
+            if (typeof(T) == typeof(float)
+                && input.GetDataArray() is float[] inArrG
+                && output.GetDataArray() is float[] outArrG)
+            {
+                int totalChannelsG = batch * channels;
+                int spatialG = inHeight * inWidth;
+                float invG = 1f / spatialG;
+                Action<int> kernelG = bc =>
+                {
+                    int off = bc * spatialG;
+                    float sum = 0f;
+                    for (int s = 0; s < spatialG; s++) sum += inArrG[off + s];
+                    outArrG[bc] = sum * invG;
+                };
+                if (totalChannelsG > 32) Parallel.For(0, totalChannelsG, kernelG);
+                else for (int bc = 0; bc < totalChannelsG; bc++) kernelG(bc);
+                return;
+            }
+        }
+
+        // Float fast path — generic adaptive bin pool, no NumOps boxing.
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
+            int totalChannels = batch * channels;
+            Action<int> kernel = bc =>
+            {
+                int inputBaseOffset = bc * iH * iW;
+                int outputBaseOffset = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int startH = (int)Math.Floor((double)oh * iH / oH);
+                    int endH = (int)Math.Ceiling((double)(oh + 1) * iH / oH);
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int startW = (int)Math.Floor((double)ow * iW / oW);
+                        int endW = (int)Math.Ceiling((double)(ow + 1) * iW / oW);
+                        float sum = 0f;
+                        int count = 0;
+                        for (int ih = startH; ih < endH; ih++)
+                        {
+                            int rowOff = inputBaseOffset + ih * iW;
+                            for (int iw = startW; iw < endW; iw++)
+                            {
+                                sum += inArr[rowOff + iw];
+                                count++;
+                            }
+                        }
+                        outArr[outputBaseOffset + oh * oW + ow] = sum / count;
+                    }
+                }
+            };
+            if (totalChannels > 16) Parallel.For(0, totalChannels, kernel);
+            else for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return;
+        }
+
+        // Generic fallback.
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int inputBaseOffset = idx * inHeight * inWidth;
+            int outputBaseOffset = idx * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                int startH = (int)Math.Floor((double)oh * inHeight / outputHeight);
+                int endH = (int)Math.Ceiling((double)(oh + 1) * inHeight / outputHeight);
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    int startW = (int)Math.Floor((double)ow * inWidth / outputWidth);
+                    int endW = (int)Math.Ceiling((double)(ow + 1) * inWidth / outputWidth);
+                    double sum = 0;
+                    int count = 0;
+                    for (int ih = startH; ih < endH; ih++)
+                    {
+                        for (int iw = startW; iw < endW; iw++)
+                        {
+                            sum += numOps.ToDouble(inputData[inputBaseOffset + ih * inWidth + iw]);
+                            count++;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = numOps.FromDouble(sum / count);
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
@@ -27760,7 +27888,11 @@ public class CpuEngine : ITensorLevelEngine
                 int capOutH = outputHeight, capOutW = outputWidth;
                 var outShape = new[] { input._shape[0], input._shape[1], outputHeight, outputWidth };
                 return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveAvgPool2D", input, outShape,
-                    (eng, output) => { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
+                        else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
             }
         }
