@@ -21088,6 +21088,81 @@ public class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
+    /// <summary>
+    /// Write-through 2D-spatial pad. Mirrors <see cref="Pad{T}"/> but writes
+    /// into the supplied output. The eager path was per-element fill + per-
+    /// element copy (O(NHW) memory bandwidth twice). This implementation
+    /// uses Array.Clear for zero-pad and Buffer.MemoryCopy per row, cutting
+    /// the inner copy from 4 ops/element to a single memcpy. Hot whenever
+    /// an ONNX model uses an explicit Pad op before Conv (asymmetric pads,
+    /// non-zero pad value, or padding modes Conv2D doesn't support natively).
+    /// </summary>
+    public void PadInto<T>(Tensor<T> output, Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var shape = input._shape;
+        if (shape.Length < 2) throw new ArgumentException("PadInto expects at least 2D tensor");
+
+        int rank = shape.Length;
+        int height = shape[rank - 2];
+        int width = shape[rank - 1];
+        int newHeight = height + padTop + padBottom;
+        int newWidth = width + padLeft + padRight;
+        int batchSize = 1;
+        for (int i = 0; i < rank - 2; i++) batchSize *= shape[i];
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            float padF = padValue is float fv ? fv : 0f;
+            // Fast fill: Array.Clear if zero pad, scalar fill otherwise.
+            if (padF == 0f)
+            {
+                Array.Clear(outArr, 0, outArr.Length);
+            }
+            else
+            {
+                outArr.AsSpan().Fill(padF);
+            }
+            int h = height, w = width, nH = newHeight, nW = newWidth;
+            int pt = padTop, pl = padLeft;
+            Action<int> kernel = b =>
+            {
+                int inBase = b * h * w;
+                int outBase = b * nH * nW + pt * nW + pl;
+                for (int ih = 0; ih < h; ih++)
+                {
+                    Buffer.BlockCopy(inArr, (inBase + ih * w) * sizeof(float),
+                                     outArr, (outBase + ih * nW) * sizeof(float),
+                                     w * sizeof(float));
+                }
+            };
+            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
+            else for (int b = 0; b < batchSize; b++) kernel(b);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        // Single fill of the whole output with padValue (Span<T>.Fill is
+        // available across all target frameworks via System.Memory).
+        outputData.AsSpan().Fill(padValue);
+        Parallel.For(0, batchSize, b =>
+        {
+            int inBase = b * height * width;
+            int outBase = b * newHeight * newWidth + padTop * newWidth + padLeft;
+            // Per-row contiguous copy.
+            for (int ih = 0; ih < height; ih++)
+            {
+                Array.Copy(inputData, inBase + ih * width,
+                           outputData, outBase + ih * newWidth, width);
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
@@ -21109,7 +21184,11 @@ public class CpuEngine : ITensorLevelEngine
                 outShape[capRank - 2] += padTop + padBottom;
                 outShape[capRank - 1] += padLeft + padRight;
                 return scope.RecordUnary(LazyNodeType.Custom, "Pad", input, outShape,
-                    (eng, output) => { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
+                        else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
             }
         }
@@ -21121,36 +21200,12 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height + padTop + padBottom;
         int newWidth = width + padLeft + padRight;
 
-        int batchSize = 1;
-        for (int i = 0; i < rank - 2; i++)
-            batchSize *= shape[i];
-
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batchSize * newHeight * newWidth];
-
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = padValue;
-
-        Parallel.For(0, batchSize, b =>
-        {
-            for (int ih = 0; ih < height; ih++)
-            {
-                int oh = ih + padTop;
-                for (int iw = 0; iw < width; iw++)
-                {
-                    int ow = iw + padLeft;
-                    int inputIdx = b * height * width + ih * width + iw;
-                    int outputIdx = b * newHeight * newWidth + oh * newWidth + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        });
-
         var newShape = (int[])shape.Clone();
         newShape[rank - 2] = newHeight;
         newShape[rank - 1] = newWidth;
 
-        var padResult = TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        var padResult = TensorAllocator.Rent<T>(newShape);
+        PadInto(padResult, input, padTop, padBottom, padLeft, padRight, padValue);
         DifferentiableOps.RecordUnary("Pad", padResult, input, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
         { var ci = input; var cpt = padTop; var cpb = padBottom; var cpl = padLeft; var cpr = padRight; var cpv = padValue; AutoTracer.RecordOp("Pad", padResult, eng => eng.Pad(ci, cpt, cpb, cpl, cpr, cpv)); }
         return padResult;
