@@ -139,8 +139,12 @@ public static class CpuFusedOperations
             return;
         }
 
-        // BLAS unavailable: use SIMD tiled GEMM fallback
-        Engines.Simd.SimdGemm.Sgemm(A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
+        // BLAS unavailable: Path A's SgemmWithCachedB pre-packs B (the weight)
+        // once and amortises over every forward call. Falls through to the
+        // standard Sgemm inside SgemmWithCachedB for shapes where caching
+        // isn't applicable (n > Nc=4096 or AVX-512 eligible).
+        SimdGemm.SgemmWithCachedB(
+            A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
         ApplyBiasActivationInPlace(output, bias, M, N, activation);
     }
 
