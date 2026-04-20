@@ -12,9 +12,15 @@ namespace AiDotNet.Tensors.Onnx.Tests;
 internal static class OnnxTestGraphBuilder
 {
     /// <summary>
+    /// <summary>
     /// Builds a single-node ONNX model: <c>Op(inputs...) -&gt; output</c>.
-    /// Inputs declared as graph inputs, output as graph output, no
-    /// initializers. Caller supplies input tensors at execute time.
+    /// Inputs declared as graph inputs, output as graph output. Optional
+    /// <paramref name="initializers"/> become const weights bound by name
+    /// and added as additional node inputs after the user-declared
+    /// <paramref name="inputs"/>. When <paramref name="domain"/> is supplied
+    /// the node carries it AND the emitted ModelProto declares a matching
+    /// <c>OperatorSetIdProto</c> for that domain (ONNX validation rejects
+    /// models with non-default node domains that aren't in opset_import).
     /// </summary>
     internal static ModelProto SingleOp(
         string opType,

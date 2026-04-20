@@ -105,9 +105,14 @@ internal static class NchwcPool
 
     /// <summary>
     /// AvgPool on NCHWc8 <c>[N, cg, H, W, 8]</c> → <c>[N, cg, oH, oW, 8]</c>.
-    /// Divisor is the full kernel area (matches ONNX default
-    /// <c>count_include_pad=0</c> only for interior cells; a proper
-    /// count-excluding-pad mode would require per-output area tracking).
+    /// Divisor honours <paramref name="countIncludePad"/>:
+    /// <list type="bullet">
+    ///   <item><c>true</c> — divisor is the full kernel area <c>kH*kW</c>
+    ///     (ONNX <c>count_include_pad = 1</c>).</item>
+    ///   <item><c>false</c> — divisor is the number of in-bounds source
+    ///     cells contributing to the output, so pad cells don't dilute the
+    ///     average (ONNX default <c>count_include_pad = 0</c>).</item>
+    /// </list>
     /// </summary>
     public static void AvgPoolNchwc8(
         float[] input, float[] output,
