@@ -2516,10 +2516,19 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Fallback: SimdKernels with parallel chunking for large arrays
-                // Use PersistentParallelExecutor for near-zero dispatch overhead
-                // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
-                int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                // Fallback: SimdKernels with parallel chunking for large arrays.
+                // Bandwidth-bound threshold: one core hits ~4 GB/s on a bulk
+                // add of non-L2-resident data, DRAM delivers 50+ GB/s across
+                // channels. AddRootCauseDiag measured 3.25× speedup moving
+                // from 1 → 4 chunks at length=196608 (BERT residual add).
+                // Old threshold length/500_000 required a 3 MB add before
+                // splitting — far past the point where parallelism helps.
+                // Target ~64 KB per chunk (fits in L1) with a cap at the
+                // thread-pool size.
+                const int kElemsPerChunk = 16 * 1024; // 64 KB at float32
+                int addChunks = Math.Min(
+                    CpuParallelSettings.MaxDegreeOfParallelism,
+                    Math.Max(1, length / kElemsPerChunk));
                 if (addChunks >= 2)
                 {
                     int chunkSize = (length + addChunks - 1) / addChunks;
