@@ -180,7 +180,54 @@ public class StableOpPerfHarness
                                     "M=256,K=768,N=3072 (FFN up pattern)",
                                     m:256, k:768, n:3072, occurs:12));
 
+        // BERT actually uses GELU not ReLU — same FFN up shape as above
+        // but with the GELU activation that hits the new SIMD GELU pass.
+        list.Add(MatMulAddActivationChain("BERT-like", "MatMul+Add+GELU",
+                                          "M=256,K=768,N=3072 (FFN up GELU)",
+                                          m:256, k:768, n:3072, activation:"Gelu", occurs:12));
+
         return list.ToArray();
+    }
+
+    private static Case MatMulAddActivationChain(string model, string op, string shape,
+        int m, int k, int n, string activation, int occurs)
+    {
+        var A = RandArr(0xC01, m * k);
+        var W = RandArr(0xC02, k * n);
+        var bias = RandArr(0xC03, n);
+
+        var graph = new GraphProto { Name = "matmul_add_act" };
+        graph.Input.Add(OnnxTestGraphBuilder.MakeValueInfo("A", new[] { m, k }, FLOAT));
+        graph.Initializer.Add(OnnxTestGraphBuilder.MakeInitializer("W", new[] { k, n }, W));
+        graph.Initializer.Add(OnnxTestGraphBuilder.MakeInitializer("B", new[] { n }, bias));
+        graph.Output.Add(OnnxTestGraphBuilder.MakeValueInfo("Y", new[] { m, n }, FLOAT));
+
+        var mm = new NodeProto { OpType = "MatMul" };
+        mm.Input.Add("A"); mm.Input.Add("W"); mm.Output.Add("MM");
+        var add = new NodeProto { OpType = "Add" };
+        add.Input.Add("MM"); add.Input.Add("B"); add.Output.Add("MMB");
+        var act = new NodeProto { OpType = activation };
+        act.Input.Add("MMB"); act.Output.Add("Y");
+        // For Gelu, set approximate='tanh' — the tanh form routes through
+        // engine.GELU's SIMD path. Without this attribute (approximate='none'),
+        // the importer decomposes Gelu into 8+ erf-based scalar ops which is
+        // orders of magnitude slower. Most BERT/GPT exporters emit
+        // approximate='tanh' anyway for the same reason.
+        if (activation == "Gelu")
+            act.Attribute.Add(new AttributeProto {
+                Name = "approximate",
+                Type = AttributeProto.Types.AttributeType.String,
+                S = Google.Protobuf.ByteString.CopyFromUtf8("tanh"),
+            });
+        graph.Node.Add(mm); graph.Node.Add(add); graph.Node.Add(act);
+
+        var modelProto = OnnxTestGraphBuilder.WrapModel(graph);
+        // Gelu is opset-20 — bump our opset so ORT recognises it.
+        modelProto.OpsetImport.Clear();
+        modelProto.OpsetImport.Add(new OperatorSetIdProto { Version = 20 });
+        byte[] bytes = OnnxTestGraphBuilder.Serialize(modelProto);
+        return BuildCase(model, op, shape, occurs, bytes,
+            new[] { ("A", new[] { m, k }, A) });
     }
 
     // ─── Path B target: fused MatMul + Add(bias) + Activation chain ────────

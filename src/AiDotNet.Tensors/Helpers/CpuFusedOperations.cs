@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -155,24 +156,54 @@ public static class CpuFusedOperations
         if (!hasBias && !hasActivation) return;
 
 #if NET5_0_OR_GREATER
-        // Path B: SIMD-vectorised bias + Relu epilogue. The prior scalar
+        // Path B: SIMD-vectorised bias + activation epilogue. The prior scalar
         // loop with per-element delegate dispatch took ~8 ms on BERT FFN
         // up output [256, 3072] (786 KB, memory-bound budget is ~200 µs).
-        // This kernel hits SIMD bandwidth with 8-float-wide ops + parallel
-        // across M rows for large outputs.
-        if (Avx.IsSupported && (activation == FusedActivationType.None
-            || activation == FusedActivationType.ReLU)
-            && (M * N) >= 4096)
+        //
+        // None / ReLU: fused single-pass kernel writes bias + activation in
+        //   one SIMD loop per row.
+        // GELU: bias add via the SIMD path, then SimdKernels.GELUUnsafe in
+        //   a second pass — already vectorised + 4×-unrolled. Two passes
+        //   double the memory traffic (~300 µs vs 150 µs for a true fused
+        //   kernel) but still 25× faster than the scalar baseline.
+        if (Avx.IsSupported && (M * N) >= 4096 &&
+            (activation == FusedActivationType.None
+             || activation == FusedActivationType.ReLU
+             || activation == FusedActivationType.GELU))
         {
+            bool simdRelu = activation == FusedActivationType.ReLU;
             int parallelThreshold = 16 * 1024;  // 16K elems → parallelise
-            if (M * N >= parallelThreshold && M >= 4)
+
+            if (hasBias)
             {
-                Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, bias, i, N, activation == FusedActivationType.ReLU));
+                if (M * N >= parallelThreshold && M >= 4)
+                {
+                    Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, bias, i, N, simdRelu));
+                }
+                else
+                {
+                    for (int i = 0; i < M; i++)
+                        ApplyBiasReluRowSimd(output, bias, i, N, simdRelu);
+                }
             }
-            else
+            else if (simdRelu)
             {
-                for (int i = 0; i < M; i++)
-                    ApplyBiasReluRowSimd(output, bias, i, N, activation == FusedActivationType.ReLU);
+                // Pure ReLU, no bias
+                if (M * N >= parallelThreshold && M >= 4)
+                    Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, null, i, N, true));
+                else
+                    for (int i = 0; i < M; i++)
+                        ApplyBiasReluRowSimd(output, null, i, N, true);
+            }
+
+            // GELU: second pass via the existing SIMD kernel.
+            if (activation == FusedActivationType.GELU)
+            {
+                unsafe
+                {
+                    fixed (float* pOut = output)
+                        SimdKernels.GELUUnsafe(pOut, pOut, M * N);
+                }
             }
             return;
         }
