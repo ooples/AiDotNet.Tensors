@@ -15758,7 +15758,14 @@ public class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(savedScope);
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "GroupNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.GroupNormInto(output, ci, cn, cg, cb, ce, out _, out _);
+                        }
+                        else { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.GroupNormBackward, new object[] { mean, variance, numGroups, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
