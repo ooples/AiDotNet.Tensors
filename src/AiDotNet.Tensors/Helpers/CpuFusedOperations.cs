@@ -260,7 +260,46 @@ public static class CpuFusedOperations
         fixed (float* pBias = bias)
         {
             int j = 0;
-            // GELU constants
+
+#if NET8_0_OR_GREATER
+            // AVX-512 path: 16 floats per lane with Vector512. Uses the
+            // AVX-512 Padé sigmoid variant for the tanh-via-sigmoid
+            // reformulation. ~2× throughput vs the Vector256 path on
+            // Zen 5 / Intel Ice Lake+ / Sapphire Rapids.
+            if (CpuFeatures.HasAVX512F && N >= 16)
+            {
+                var vSqrt2OverPi512 = Vector512.Create(0.7978845608028654f);
+                var vCoeff512       = Vector512.Create(0.044715f);
+                var vHalf512        = Vector512.Create(0.5f);
+                var vOne512         = Vector512.Create(1.0f);
+                var vTwo512         = Vector512.Create(2.0f);
+                int simdLen512 = N & ~15;
+                for (; j < simdLen512; j += 16)
+                {
+                    var biased = Avx512F.Add(Avx512F.LoadVector512(pOut + j), Avx512F.LoadVector512(pBias + j));
+                    var biasedSq = Avx512F.Multiply(biased, biased);
+                    var biasedCu = Avx512F.Multiply(biasedSq, biased);
+                    var inner    = Avx512F.FusedMultiplyAdd(vCoeff512, biasedCu, biased);
+                    var tanhArg  = Avx512F.Multiply(vSqrt2OverPi512, inner);
+                    var sigArg   = Avx512F.Multiply(vTwo512, tanhArg);
+                    var sig      = PadeSigmoid.Sigmoid16(sigArg);
+                    var tanh     = Avx512F.Subtract(Avx512F.Multiply(vTwo512, sig), vOne512);
+                    var onePlusTanh = Avx512F.Add(vOne512, tanh);
+                    var result   = Avx512F.Multiply(vHalf512, Avx512F.Multiply(biased, onePlusTanh));
+                    Avx512F.Store(pOut + j, result);
+                }
+                for (; j < N; j++)
+                {
+                    float b = pOut[j] + pBias[j];
+                    float inner = 0.7978845608028654f * (b + 0.044715f * b * b * b);
+                    float tanh = MathF.Tanh(inner);
+                    pOut[j] = 0.5f * b * (1.0f + tanh);
+                }
+                return;
+            }
+#endif
+
+            // GELU constants (AVX2 8-wide)
             var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
             var vCoeff       = Vector256.Create(0.044715f);
             var vHalf        = Vector256.Create(0.5f);
