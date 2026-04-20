@@ -16,7 +16,7 @@ using System;
 using AiDotNet.Tensors.LinearAlgebra.Fft;
 using Xunit;
 
-namespace AiDotNet.Tensors.Tests.LinearAlgebra.Fft;
+namespace AiDotNet.Tensors.Tests.LinearAlgebra.FftTests;
 
 public class FftKernelsInvariantsTests
 {
