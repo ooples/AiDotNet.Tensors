@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed class OpenClBackend : IAsyncGpuBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend
     {
         /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
@@ -553,6 +553,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _programs.Add(complexProgram);
                 foreach (var name in ComplexKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, complexProgram, name);
+
+                // Compile Parity-210 kernels (hot-path subset of #210 op surface).
+                // Optional — on drivers that reject any op the whole module we
+                // swallow the exception and fall back to the CpuEngine path.
+                try
+                {
+                    var parity210Program = CompileOrLoadCached(OpenClParity210Kernels.GetSource(), optimizationFlags, "Parity-210 kernels");
+                    _programs.Add(parity210Program);
+                    foreach (var name in OpenClParity210Kernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, parity210Program, name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Parity-210 compilation failed: {ex.Message}");
+                }
             }
             catch (Exception ex)
             {

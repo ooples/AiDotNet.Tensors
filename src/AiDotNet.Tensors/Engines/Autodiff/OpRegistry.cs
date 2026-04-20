@@ -75,7 +75,67 @@ internal static class OpRegistry
 
         // Scatter/Gather
         "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
-        "TensorIndexSelect", "TensorMaskedFill",
+        "TensorIndexSelect", "TensorMaskedFill", "TensorMaskedSelect",
+
+        // Parity-210 movement / cumulative / clamp
+        "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
+        "TensorDot", "TensorVecDot", "TensorCross", "TensorMeshgrid",
+        "TensorMultiDot", "TensorTrace", "TensorDiagEmbed", "TensorAddMM",
+        "TensorCartesianProd", "TensorKron", "TensorInner",
+        "TensorPDist", "TensorCDist", "TensorCosineSimilarity",
+        "TensorFliplr", "TensorFlipud", "TensorRot90",
+        "TensorSwapAxes", "TensorMoveDim",
+        "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",
+        "TensorHStack", "TensorVStack", "TensorDStack",
+        "TensorColumnStack", "TensorRowStack",
+        "TensorHSplit", "TensorVSplit", "TensorDSplit",
+        "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
+        "TensorClampMin", "TensorClampMax", "TensorClampTensor",
+        "TensorSelectScatter",
+
+        // Parity-210 element-wise binary (forward only in v1; backward TBD)
+        "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",
+        "TensorFloatPower", "TensorLdexp", "TensorNextAfter",
+        "TensorLogAddExp", "TensorLogAddExp2",
+
+        // Parity-210 special math (forward only in v1)
+        "TensorErfc", "TensorXlogy", "TensorXlog1py",
+        "TensorLgamma", "TensorDigamma",
+        "TensorErfinv", "TensorI0", "TensorI1", "TensorI0e", "TensorI1e",
+        "TensorFrexp", "TensorPolygamma",
+
+        // Parity-210 sort / order stats (non-differentiable category below
+        // also lists the scalar-returning ones; the tensor-returning ones
+        // sit here as stubs with no backward).
+        "TensorSort",
+
+        // Parity-210 indexing family (forward only in v1)
+        "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
+        "TensorGatherPacked", "TensorScatterPacked",
+        "TensorMaskedScatter", "TensorScatterReduce",
+        "TensorBroadcastTo", "TensorExpandAs", "TensorBroadcastTensors",
+        "TensorTake", "TensorTakeAlongDim", "TensorPut",
+        "TensorBlockDiag", "TensorSliceScatter",
+
+        // Parity-210 ops with autograd added in 2026-04
+        "TensorTriu", "TensorTril",
+        "TensorNanToNum",
+        "TensorZeta", "TensorUnfold", "TensorPolygamma",
+        "TensorFliplr", "TensorFlipud", "TensorRot90",
+        "TensorSwapAxes", "TensorMoveDim",
+        "TensorAtLeast1D", "TensorAtLeast2D", "TensorAtLeast3D",
+        "TensorHStack", "TensorVStack", "TensorDStack",
+        "TensorColumnStack", "TensorRowStack",
+        "TensorCross", "TensorDiagEmbed",
+        "TensorRoll", "TensorFlip", "TensorRepeatInterleave",
+        "TensorCumProd", "TensorCumMax", "TensorCumMin", "TensorLogCumSumExp",
+        "TensorHypot", "TensorCopysign", "TensorFmod", "TensorRemainder",
+        "TensorFloatPower", "TensorLogAddExp", "TensorLogAddExp2",
+        "TensorXlogy", "TensorXlog1py", "TensorLdexp",
+        "TensorErfc", "TensorErfinv", "TensorLgamma", "TensorDigamma",
+        "TensorI0", "TensorI1", "TensorI0e", "TensorI1e",
+        "TensorKron", "TensorInner", "TensorAddMM", "TensorDot",
+        "TensorCosineSimilarity", "TensorPDist", "TensorCDist",
 
         // Complex
         "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
@@ -112,6 +172,17 @@ internal static class OpRegistry
         // Comparison (return bool-like tensors, not differentiable)
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
+        "TensorIsClose", "TensorAllClose", "TensorIsIn", "TensorAminmax",
+        "TensorIsFinite", "TensorIsNan", "TensorIsInf",
+        "TensorEqual", "TensorEq", "TensorEqScalar",
+        "TensorLogicalAnd", "TensorLogicalOr", "TensorLogicalXor", "TensorLogicalNot",
+        "TensorNonzero", "TensorCountNonzero",
+        "TensorKthvalue", "TensorMedian", "TensorNanMedian", "TensorMode",
+        "TensorUnique", "TensorUniqueConsecutive",
+        "TensorUniqueWithInfo", "TensorUniqueConsecutiveWithInfo",
+        "TensorSearchSorted", "TensorBucketize",
+        "TensorHistogram", "TensorHistogramDD", "TensorBinCount", "TensorHistc",
+        "TensorArgsort",
 
         // Constructors / initializers
         "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",
@@ -133,6 +204,10 @@ internal static class OpRegistry
 
         // Discrete selection
         "TensorTopK", "TensorScatter",
+        // Shape-splitting — each split output is a differentiable slice, but
+        // the multi-tensor return type is currently treated as
+        // non-differentiable at the tape level.
+        "TensorTensorSplit",
 
         // Grid/geometry (non-learnable)
         "AffineGrid",

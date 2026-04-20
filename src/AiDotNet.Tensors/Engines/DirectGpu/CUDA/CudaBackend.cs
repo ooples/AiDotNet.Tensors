@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed class CudaBackend : IAsyncGpuBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend
 {
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
@@ -56,6 +56,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
+    private IntPtr _parity210Module;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
@@ -694,6 +695,22 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
         CompileKernelModule(device, Kernels.CudaComplexKernels.GetSource(), "complex_kernels", Kernels.CudaComplexKernels.GetKernelNames());
+
+        // Parity-210: 40 hot-path kernels (movement / cumulative / indexing /
+        // element-wise special / pairwise) covering the #210 op surface.
+        // Optional — if NVRTC rejects something on an older toolkit we fall
+        // back to the CPU reference via CpuEngine inheritance.
+        try
+        {
+            _parity210Module = CompileKernelModule(device,
+                Kernels.CudaParity210Kernels.GetSource(),
+                "parity210_kernels",
+                Kernels.CudaParity210Kernels.GetKernelNames());
+        }
+        catch
+        {
+            _parity210Module = IntPtr.Zero;
+        }
     }
 
     private static string GetNvrtcLog(IntPtr program)
@@ -10929,6 +10946,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
+        }
+
+        if (_parity210Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_parity210Module);
+            _parity210Module = IntPtr.Zero;
         }
 
         if (_fftModule != IntPtr.Zero)

@@ -39,7 +39,7 @@ namespace AiDotNet.Tensors.Engines;
 /// - You're using custom numeric types
 /// </para>
 /// </remarks>
-public class CpuEngine : ITensorLevelEngine
+public partial class CpuEngine : ITensorLevelEngine
 {
     /// <inheritdoc/>
     public string Name => "CPU Engine";
@@ -21748,7 +21748,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
+    public virtual Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -21781,16 +21781,30 @@ public class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
-        // Float fast path for 1D (common case)
+        // Float fast path for 1D (common case). Uses the SIMD Sklansky
+        // prefix-sum from Simd.ScanKernels when AVX2 is available, 8x the
+        // scalar throughput on bandwidth-limited 1-D cumsum.
         if (typeof(T) == typeof(float) && tensor.Rank == 1)
         {
             var src = (float[])(object)tensor.GetDataArray();
             var dst = (float[])(object)result.GetDataArray();
-            float cum = 0f;
-            for (int i = 0; i < src.Length; i++)
+            Simd.ScanKernels.PrefixSumFloat(src, dst);
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            return result;
+        }
+
+        // Fp32 contiguous inner-most axis: run the SIMD scan per line.
+        if (typeof(T) == typeof(float) && innerSize == 1)
+        {
+            var src = (float[])(object)tensor.GetDataArray();
+            var dst = (float[])(object)result.GetDataArray();
+            for (int outer = 0; outer < outerSize; outer++)
             {
-                cum += src[i];
-                dst[i] = cum;
+                int start = outer * axisSize;
+                Simd.ScanKernels.PrefixSumFloat(
+                    new ReadOnlySpan<float>(src, start, axisSize),
+                    new Span<float>(dst, start, axisSize));
             }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
             AutoTracer.RecordOp("TensorCumSum", result, eng => result);
@@ -22127,42 +22141,34 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Parse einsum notation
-        var parts = subscripts.Replace(" ", "").Split(new[] { "->" }, StringSplitOptions.None);
-        if (parts.Length != 2)
-            throw new ArgumentException("Einsum subscripts must contain '->'");
-
-        var inputSubscripts = parts[0].Split(new[] { ',' }, StringSplitOptions.None);
-        var outputSubscripts = parts[1];
-
-        if (inputSubscripts.Length != tensors.Length)
-            throw new ArgumentException($"Expected {inputSubscripts.Length} tensors but got {tensors.Length}");
-
-        // Handle common cases directly for efficiency
+        // Fast-paths for common patterns that already have tuned kernels.
+        // Strip whitespace only for pattern-matching; the generic parser
+        // handles whitespace itself.
+        var normalized = subscripts.Replace(" ", "");
         if (tensors.Length == 2)
         {
             // Batched matrix multiplication: bij,bjk->bik
-            if (subscripts == "bij,bjk->bik")
+            if (normalized == "bij,bjk->bik")
             {
                 return BatchMatMul(tensors[0], tensors[1]);
             }
             // Matrix multiplication: ij,jk->ik
-            if (subscripts == "ij,jk->ik")
+            if (normalized == "ij,jk->ik")
             {
                 return TensorMatMul(tensors[0], tensors[1]);
             }
             // Batched outer product: bi,bj->bij
-            if (subscripts == "bi,bj->bij")
+            if (normalized == "bi,bj->bij")
             {
                 return TensorBatchOuterProduct(tensors[0], tensors[1]);
             }
             // Outer product: i,j->ij
-            if (subscripts == "i,j->ij")
+            if (normalized == "i,j->ij")
             {
                 return TensorOuterProduct(tensors[0], tensors[1]);
             }
             // Batched dot: bi,bi->b
-            if (subscripts == "bi,bi->b")
+            if (normalized == "bi,bi->b")
             {
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];
@@ -22180,8 +22186,45 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // General einsum implementation is complex - throw for unsupported patterns
-        throw new NotImplementedException($"Einsum pattern '{subscripts}' not implemented. Use specific tensor operations instead.");
+        // General path: parse -> bind shapes -> choose contraction order ->
+        // execute. The hardcoded fast-paths above still win on speed since
+        // they route to our tuned GEMM/BatchMatMul kernels; the generic path
+        // is the correctness floor for every other equation.
+        var equation = Engines.Einsum.EinsumEquation.Parse(subscripts);
+        var shapes = new int[tensors.Length][];
+        for (int i = 0; i < tensors.Length; i++) shapes[i] = tensors[i].Shape.ToArray();
+        var binding = Engines.Einsum.EinsumShapeBinding.Bind(equation, shapes);
+        var path = Engines.Einsum.EinsumPathOptimizer.Optimize(binding);
+        var einsumResult = Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
+
+        // Record autograd for every operand count (including 1-operand
+        // transpose / reduction einsums).  The only case we leave unrecorded
+        // is a within-operand diagonal (e.g. "ii->i") — the backward for
+        // those reduces an entire axis to a single element, which is
+        // gather-into-diagonal, not a standard einsum contraction.
+        if (DifferentiableOps.IsRecording<T>()
+            && !HasDiagonalOperand(equation))
+        {
+            DifferentiableOps.RecordIfActive(
+                "TensorEinsum",
+                einsumResult,
+                tensors,
+                Engines.Autodiff.BackwardFunctions<T>.EinsumBackward,
+                savedState: new object[] { subscripts });
+        }
+
+        return einsumResult;
+    }
+
+    private static bool HasDiagonalOperand(Engines.Einsum.EinsumEquation eq)
+    {
+        foreach (var op in eq.Operands)
+        {
+            var seen = new HashSet<char>();
+            foreach (var c in op.Labels)
+                if (!seen.Add(c)) return true;
+        }
+        return false;
     }
 
     /// <inheritdoc/>
@@ -23602,6 +23645,44 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         { var ct = tensor; var cm = mask; var cv = value; AutoTracer.RecordOp("MaskedFill", result, eng => eng.TensorMaskedFill(ct, cm, cv)); }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor._shape.SequenceEqual(mask._shape))
+            throw new ArgumentException(
+                $"MaskedSelect requires mask shape [{string.Join(", ", mask._shape)}] " +
+                $"to match tensor shape [{string.Join(", ", tensor._shape)}].");
+
+        // Preserve the original tensor/mask for autograd binding so gradients
+        // flow back to the caller's input, not to transient contiguous copies.
+        var inputTensor = tensor;
+        var computeTensor = tensor.IsContiguous ? tensor : tensor.Contiguous();
+        var computeMask = mask.IsContiguous ? mask : mask.Contiguous();
+
+        var src = computeTensor.AsSpan();
+        var maskSpan = computeMask.AsSpan();
+        // First pass: count true entries.
+        int n = 0;
+        for (int i = 0; i < maskSpan.Length; i++) if ((bool)maskSpan[i]) n++;
+
+        var result = new Tensor<T>(new[] { n });
+        var dest = result.AsWritableSpan();
+        // Second pass: copy selected elements in order.
+        int w = 0;
+        for (int i = 0; i < maskSpan.Length; i++)
+        {
+            if ((bool)maskSpan[i]) dest[w++] = src[i];
+        }
+
+        DifferentiableOps.RecordUnary(
+            "TensorMaskedSelect", result, inputTensor,
+            BackwardFunctions<T>.MaskedSelectBackward,
+            savedState: new object[] { computeMask, (int[])inputTensor._shape.Clone() });
         return result;
     }
 
