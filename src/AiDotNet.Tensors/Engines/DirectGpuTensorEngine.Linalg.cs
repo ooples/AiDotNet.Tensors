@@ -122,44 +122,21 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    /// <summary>GPU-accelerated reduced QR.</summary>
+    /// <summary>
+    /// GPU-accelerated reduced QR. Currently disabled pending a correct
+    /// Householder implementation — the v1 kernels in every backend have
+    /// two correctness gaps: (1) for tall matrices (m &gt; k) the trailing
+    /// rows never receive the reflector updates because writes gate on
+    /// <c>j+i &lt; k</c>, and (2) the <c>Q</c> accumulation only updates
+    /// column <c>j</c>, multiplying the remaining <c>v[i&gt;0]</c>
+    /// contributions by zero instead of the Householder entries. Route
+    /// everything to the managed CPU QR until the kernels get a full
+    /// m×n work buffer + correct <c>Q</c> column walk.
+    /// </summary>
     internal (Tensor<float>? Q, Tensor<float>? R) TryGpuQrReduced(Tensor<float> input)
     {
-        if (!TryGetBackend(out var backend)) return (null, null);
-        if (backend is not ILinalgBackend lin) return (null, null);
-        if (!BackendLinalgReady(backend)) return (null, null);
-
-        int rank = input.Rank;
-        if (rank < 2) return (null, null);
-        int m = input.Shape[rank - 2];
-        int n = input.Shape[rank - 1];
-        if (Math.Max(m, n) > GpuLinalgMaxN) return (null, null);
-        int k = Math.Min(m, n);
-
-        int batch = 1;
-        for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
-
-        // qBuf/rBuf lifetime transfers into the activation cache on success.
-        using var inBuf = GetOrAllocateBuffer(backend, input);
-        var qBuf = AllocateOutputBuffer(backend, batch * m * k);
-        var rBuf = AllocateOutputBuffer(backend, batch * k * n);
-        try
-        {
-            lin.LinalgQrReduced(inBuf.Buffer, qBuf.Buffer, rBuf.Buffer, batch, m, n);
-            var qArr = FinishGpuOp<float>(backend, qBuf, batch * m * k);
-            var rArr = FinishGpuOp<float>(backend, rBuf, batch * k * n);
-            var qShape = (int[])input._shape.Clone();
-            qShape[rank - 1] = k;
-            var rShape = (int[])input._shape.Clone();
-            rShape[rank - 2] = k;
-            return (new Tensor<float>(qArr, qShape), new Tensor<float>(rArr, rShape));
-        }
-        catch
-        {
-            qBuf.Dispose();
-            rBuf.Dispose();
-            return (null, null);
-        }
+        _ = input;
+        return (null, null);
     }
 
     // NOTE on buffer lifetimes in this file: each "output" buffer passed to

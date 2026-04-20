@@ -112,13 +112,34 @@ public static class Linalg
         // GPU fast-path: when the active engine is DirectGpuTensorEngine + the
         // backend advertises ILinalgBackend, route through the native kernel.
         // Managed CPU reference is the fallback for unsupported types/sizes.
+        Tensor<T> factor;
+        Tensor<int> info;
         if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
         {
             var (gFactor, gInfo) = gpu.TryGpuCholesky((Tensor<float>)(object)input, upper);
             if (gFactor is not null && gInfo is not null)
-                return ((Tensor<T>)(object)gFactor, gInfo);
+            {
+                factor = (Tensor<T>)(object)gFactor;
+                info = gInfo;
+            }
+            else
+            {
+                (factor, info) = CholeskyDecomposition.Compute(input, upper);
+            }
         }
-        return CholeskyDecomposition.Compute(input, upper);
+        else
+        {
+            (factor, info) = CholeskyDecomposition.Compute(input, upper);
+        }
+
+        // Record autodiff: CholeskyBackward reads savedState[0] for the 'upper'
+        // flag (see LinalgBackward.CholeskyBackward for the Stan/Murray 2016
+        // rule). Only the factor tensor participates in downstream gradients;
+        // `info` is an integer diagnostic and stays out of the graph.
+        DifferentiableOps.RecordUnary(
+            "Linalg.Cholesky", factor, input, LinalgBackward.CholeskyBackward<T>(),
+            savedState: new object[] { upper });
+        return (factor, info);
     }
 
     /// <summary>LU decomposition. Returns P, L, U such that <c>PA = LU</c> (partial pivoting).</summary>
@@ -265,17 +286,58 @@ public static class Linalg
     /// <summary>Generic norm — dispatches on rank: 1D → vector norm; 2D → matrix norm.</summary>
     public static Tensor<T> Norm<T>(Tensor<T> input, object ord = null!, int[] dim = null!, bool keepDim = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgNorms.Norm(input, ord, dim, keepDim);
+    {
+        var result = LinalgNorms.Norm(input, ord, dim, keepDim);
+        // Autodiff recording: only register the closed-form backward when the
+        // norm matches a differentiable form we have a backward for. L2 vector
+        // norm and Frobenius matrix norm share the a/||a|| rule; other orders
+        // (L1, L∞, nuclear, p-norms) require dedicated backwards that aren't
+        // wired yet, so we skip recording rather than record a wrong gradient.
+        if (IsL2OrFroNorm(ord, input.Rank))
+            DifferentiableOps.RecordUnary("Linalg.Norm", result, input, LinalgBackward.VectorNormL2Backward<T>());
+        return result;
+    }
 
     /// <summary>Vector norm along specified dimension(s).</summary>
     public static Tensor<T> VectorNorm<T>(Tensor<T> input, double ord = 2.0, int[] dim = null!, bool keepDim = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgNorms.VectorNorm(input, ord, dim, keepDim);
+    {
+        var result = LinalgNorms.VectorNorm(input, ord, dim, keepDim);
+        if (ord == 2.0)
+            DifferentiableOps.RecordUnary("Linalg.VectorNorm", result, input, LinalgBackward.VectorNormL2Backward<T>());
+        return result;
+    }
 
     /// <summary>Matrix norm. <paramref name="ord"/> ∈ {1, 2, ∞, -1, -2, -∞, "fro", "nuc"}.</summary>
     public static Tensor<T> MatrixNorm<T>(Tensor<T> input, object ord = null!, int[] dim = null!, bool keepDim = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinalgNorms.MatrixNorm(input, ord, dim, keepDim);
+    {
+        var result = LinalgNorms.MatrixNorm(input, ord, dim, keepDim);
+        // Only the Frobenius norm has a wired closed-form backward. Default
+        // `ord == null` is Frobenius per the LinalgNorms.MatrixNorm contract.
+        if (ord is null || (ord is string s && s == "fro"))
+            DifferentiableOps.RecordUnary("Linalg.MatrixNorm", result, input, LinalgBackward.FroNormBackward<T>());
+        return result;
+    }
+
+    private static bool IsL2OrFroNorm(object? ord, int rank)
+    {
+        // Vector L2 when input is 1D and ord == 2 (or default null == 2).
+        if (rank == 1)
+        {
+            if (ord is null) return true;
+            if (ord is double d) return d == 2.0;
+            if (ord is int i) return i == 2;
+            return false;
+        }
+        // Matrix Frobenius when input is 2D and ord == "fro" (or default null).
+        if (rank == 2)
+        {
+            if (ord is null) return true;
+            if (ord is string s) return s == "fro";
+        }
+        return false;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // STRUCTURAL

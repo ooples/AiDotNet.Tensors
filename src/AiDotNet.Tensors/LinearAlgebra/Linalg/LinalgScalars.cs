@@ -51,9 +51,14 @@ internal static class LinalgScalars
     internal static (Tensor<T> Sign, Tensor<T> LogAbsDet) SlogDet<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        var (lu, pivots) = LuDecomposition.Factor(input);
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank < 2) throw new ArgumentException("SlogDet needs a 2D+ tensor.", nameof(input));
         int rank = input.Rank;
         int n = input.Shape[rank - 1];
+        if (input.Shape[rank - 2] != n)
+            throw new ArgumentException("SlogDet needs a square matrix.", nameof(input));
+
+        var (lu, pivots) = LuDecomposition.Factor(input);
 
         var outShape = rank > 2 ? TakePrefix(input._shape, rank - 2) : new[] { 1 };
         var sign = new Tensor<T>(outShape);

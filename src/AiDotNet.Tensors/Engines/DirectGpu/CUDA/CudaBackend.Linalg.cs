@@ -80,11 +80,21 @@ public sealed partial class CudaBackend : ILinalgBackend
         int batchCount, int n)
     {
         if (batchCount <= 0 || n <= 0) return;
+        // The kernel allocates 2·n·n floats of dynamic shared memory (Ash +
+        // Vsh scratch). CUDA caps dynamic shared memory per block at 48 KB
+        // by default, which bounds n at ⌊√(48 KB / 2 / 4 B)⌋ ≈ 77. We clamp
+        // conservatively to n ≤ 64 so the budget stays safely inside every
+        // compute capability. DirectGpuTensorEngine already gates larger
+        // values to CPU, but enforce again here so direct callers surface a
+        // clear error instead of a silent shared-memory overflow.
+        if (n > 64)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"CUDA Eigh kernel supports n ≤ 64 (got n = {n}); route to CPU " +
+                "via DirectGpuTensorEngine.TryGpuEigh for larger sizes.");
         var kernel = ResolveLinalgKernel("parity211_eigh");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle; IntPtr wPtr = eigenvalues.Handle; IntPtr vPtr = eigenvectors.Handle;
         int b = batchCount, nn = n;
-        // Eigh needs 2·n·n floats of shared memory (working A + V).
         uint sharedBytes = (uint)(2 * n * n * sizeof(float));
         void** args = stackalloc void*[5];
         args[0] = &inPtr; args[1] = &wPtr; args[2] = &vPtr;
