@@ -916,15 +916,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long threshold = timestamps[removeCount - 1];
 
         // Remove entries at or below threshold, collect for disposal outside lock.
-        // Skip entries with pending deferred downloads — their GPU buffers must stay alive
-        // until the download is materialized (otherwise CPU arrays would remain empty).
+        // Skip entries whose GPU buffer still has a pending deferred materializer —
+        // otherwise the later TryMaterialize call reads a freed OpenCL buffer and
+        // crashes with CL_INVALID_MEM_OBJECT (issue #226).
+        //
+        // Check the unified DeferredArrayMaterializer registry, not just the engine-local
+        // _deferredDownloads map: DeferTensorResult registers a materializer with the
+        // global registry but not _deferredDownloads, so the old containsKey check
+        // missed those entries and let eviction dispose their buffers prematurely.
         int removed = 0;
         for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
             if (entries[i].Value.Timestamp <= threshold)
             {
-                // Don't evict entries that have deferred downloads pending
-                if (_deferredDownloads.ContainsKey(entries[i].Key))
+                // Don't evict entries that have deferred materializers pending.
+                // IsPending is the single source of truth for "CPU code still needs
+                // to download this buffer"; _deferredDownloads is a subset.
+                if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                     continue;
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
@@ -1084,7 +1092,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (_deferredDownloads.TryRemove(arr, out var entry))
             {
-                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                float[] floatData;
+                try
+                {
+                    floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // See DeferTensorResult for rationale on the wrap.
+                    throw new InvalidOperationException(
+                        "Deferred GPU download failed because the underlying buffer was " +
+                        "released before materialization. This typically indicates an " +
+                        "activation-cache eviction raced with a pending materializer " +
+                        "(issue #226). See DirectGpuTensorEngine.FinishGpuOp / " +
+                        "EvictOldestActivationsUnsafe.", ex);
+                }
                 var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
                 Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
             }
@@ -1121,12 +1143,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU
         var vector = tensor.DataVector;
+
+        // Also track in _deferredDownloads so MaterializeAllDeferred at scope end flushes
+        // this tensor (it iterates _deferredDownloads). Eviction still uses the unified
+        // DeferredArrayMaterializer.IsPending guard — keeping this map in sync is belt
+        // and suspenders against anyone later walking _deferredDownloads directly.
+        // Issue #226: missing this entry let MaterializeAllDeferred skip GPU-resident
+        // tensors, and the eviction guard in turn released their buffers.
+        _deferredDownloads.TryAdd(vector, new DeferredDownloadEntry(outputBuffer, backend, elementCount));
+
         Helpers.DeferredArrayMaterializer.Register(vector, obj =>
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
+            // Drop the _deferredDownloads entry eagerly so it doesn't pin the buffer
+            // after the data is on CPU. The actual download routes through tensor._gpuBuffer
+            // (the tensor itself may still reference the buffer for a subsequent GPU op).
+            _deferredDownloads.TryRemove(vec, out _);
+
             if (tensor._gpuBuffer is not null && tensor._gpuBackend is not null)
             {
-                float[] floatData = tensor._gpuBackend.DownloadBuffer(tensor._gpuBuffer);
+                float[] floatData;
+                try
+                {
+                    floatData = tensor._gpuBackend.DownloadBuffer(tensor._gpuBuffer);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Surface a clearer error — historically this manifested as a raw
+                    // "Failed to read OpenCL buffer: -38" with no context on why the
+                    // buffer was invalid. The lifetime fix in this engine covers the
+                    // known case; this wrap guards against any future regression.
+                    throw new InvalidOperationException(
+                        "Deferred GPU download failed because the underlying buffer was " +
+                        "released before materialization. This typically indicates an " +
+                        "activation-cache eviction raced with a pending materializer " +
+                        "(issue #226). See DirectGpuTensorEngine.DeferTensorResult / " +
+                        "EvictOldestActivationsUnsafe.", ex);
+                }
                 var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
                 var arr = vec.GetBackingArrayUnsafe();
                 if (arr is not null)
