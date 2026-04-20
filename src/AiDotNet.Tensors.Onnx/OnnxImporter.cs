@@ -133,7 +133,27 @@ public static class OnnxImporter
         //    layers. Only fires when the input to Div is a regular tensor
         //    (not a constant) and the output of the final Mul has no other
         //    consumers, so rewrite is semantically equivalent.
-        var rewrittenNodes = GeluPatternRewriter.Rewrite(graph.Node);
+        // Build a scalar-initializer lookup so the GELU rewriter can verify
+        // the √2 / 1.0 / 0.5 constants before collapsing the subgraph — a
+        // structurally-identical but numerically-different chain would
+        // otherwise silently turn unrelated math into Gelu.
+        var scalarInitByName = new Dictionary<string, double>(StringComparer.Ordinal);
+        for (int i = 0; i < graph.Initializer.Count; i++)
+        {
+            var init = graph.Initializer[i];
+            // Only scalar-shaped initializers (Dims.Count == 0 or total length == 1).
+            long total = 1;
+            for (int d = 0; d < init.Dims.Count; d++) total *= init.Dims[d];
+            if (total != 1) continue;
+            if (init.FloatData.Count > 0) scalarInitByName[init.Name] = init.FloatData[0];
+            else if (init.DoubleData.Count > 0) scalarInitByName[init.Name] = init.DoubleData[0];
+            else if (!init.RawData.IsEmpty && init.DataType == 1 && init.RawData.Length >= 4)
+                scalarInitByName[init.Name] = BitConverter.ToSingle(init.RawData.ToArray(), 0);
+            else if (!init.RawData.IsEmpty && init.DataType == 11 && init.RawData.Length >= 8)
+                scalarInitByName[init.Name] = BitConverter.ToDouble(init.RawData.ToArray(), 0);
+        }
+        var rewrittenNodes = GeluPatternRewriter.Rewrite(graph.Node,
+            name => scalarInitByName.TryGetValue(name, out var v) ? v : (double?)null);
 
         // ── Topologically sort nodes ──────────────────────────────────────
         var sortedNodes = TopologicalSort(graph, tensorsByName.Keys, rewrittenNodes);

@@ -2009,13 +2009,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedLayout = targetLayout;
                 var capturedCBlock = cBlock;
                 var capturedShape = (int[])tensor._shape.Clone();
-                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchwc(captured, capturedLayout);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                         output.Layout = capturedLayout;
                     });
+                // Mirror the layout on the placeholder at RECORD time. A later
+                // layout-sensitive op in the same scope (e.g. ReorderToNchw
+                // below) inspects Layout during recording and would otherwise
+                // observe the default Nchw — short-circuiting a required reorder.
+                lazy.Layout = capturedLayout;
+                return lazy;
             }
         }
 
@@ -2073,13 +2079,18 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 var capturedShape = (int[])tensor._shape.Clone();
-                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchw(captured);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                         output.Layout = LinearAlgebra.TensorLayout.Nchw;
                     });
+                // Propagate Layout at record time (see matching comment in
+                // ReorderToNchwc above) so downstream layout-sensitive ops
+                // within the same scope see Nchw and don't short-circuit.
+                lazy.Layout = LinearAlgebra.TensorLayout.Nchw;
+                return lazy;
             }
         }
 
@@ -2168,12 +2179,27 @@ public partial class CpuEngine : ITensorLevelEngine
                     meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
                     result.AsWritableSpan(), N, C, H, W);
             }
-            else
+            else if (x.Layout == LinearAlgebra.TensorLayout.Nchw)
             {
                 Simd.NchwcBatchNorm.RunNchw(
                     xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
                     meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
                     result.AsWritableSpan(), N, C, H, W);
+            }
+            else
+            {
+                // Any other packed layout (e.g. Nchwc16 that didn't hit the
+                // Nchwc8 branch above) isn't safe to interpret as plain NCHW
+                // — RunNchw would index into the buffer with the wrong stride
+                // and produce garbage. Unpack to plain NCHW first, then run
+                // the generic NCHW kernel, and mark the result as Nchw.
+                var unpackedT = new Tensor<float>(new[] { N, C, H, W }) { Layout = LinearAlgebra.TensorLayout.Nchw };
+                Simd.NchwcReorder.ToNchw(xf.AsSpan(), unpackedT.AsWritableSpan(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                Simd.NchwcBatchNorm.RunNchw(
+                    unpackedT.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+                result.Layout = LinearAlgebra.TensorLayout.Nchw;
             }
             return (Tensor<T>)(object)result;
         }
@@ -9308,6 +9334,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // BLAS path. This closes ~95% of the ResNet-50 gap vs ORT.
         if (typeof(T) == typeof(float))
         {
+            // Packed layouts (Nchwc8 / Nchwc16) that fell through to this
+            // fallback must be unpacked first — Conv2DIm2colGemm reads the
+            // buffer assuming plain NCHW row-major indexing, so reading a
+            // packed buffer would silently produce wrong outputs.
+            if (input.Layout == LinearAlgebra.TensorLayout.Nchwc8 ||
+                input.Layout == LinearAlgebra.TensorLayout.Nchwc16)
+            {
+                int cBlock = input.Layout == LinearAlgebra.TensorLayout.Nchwc16 ? 16 : 8;
+                if (inChannels % cBlock != 0)
+                    throw new NotSupportedException(
+                        $"Conv2D fallback: packed {input.Layout} input with inChannels={inChannels} " +
+                        $"not divisible by cBlock={cBlock} cannot be unpacked safely.");
+                var unpackedData = new float[batch * inChannels * height * width];
+                Simd.NchwcReorder.ToNchw(
+                    ((float[])(object)inputData).AsSpan(), unpackedData.AsSpan(),
+                    batch, inChannels, height, width, cBlock);
+                inputData = (T[])(object)unpackedData;
+            }
             Conv2DIm2colGemm(
                 (float[])(object)inputData,
                 (float[])(object)kernelData,

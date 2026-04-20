@@ -841,9 +841,14 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
-        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
-            return ToArray();
-        return _storage.GetDataArray();
+        // Always route through ToArray() on the common path so lazy / GPU-
+        // resident tensors get materialized before returning CPU memory.
+        // The non-realizing optimization lives in GetLiveBackingArrayOrNull()
+        // for callers that deliberately opt out of materialization.
+        // Returning _storage.GetDataArray() on the contiguous path without
+        // realizing produced the BERT-SQuAD × 100 bug where subsequent
+        // executes returned the first execute's output verbatim.
+        return ToArray();
     }
 
     /// <summary>

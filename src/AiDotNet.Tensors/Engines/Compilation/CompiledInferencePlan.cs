@@ -553,8 +553,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         // Warm up — run the full plan N times so JIT / CPU cache / branch
         // predictor / allocator state matches steady-state conditions.
+        // Guard stitched sources before EACH warmup iteration (same contract
+        // as the measurement loop below): profiling a stitched plan whose
+        // source was disposed during warmup used to crash reading freed
+        // GCHandles instead of throwing the clean ObjectDisposedException.
         for (int w = 0; w < warmup; w++)
         {
+            for (int s = 0; s < _sourcePlans.Length; s++)
+            {
+                if (_sourcePlans[s]._disposed)
+                    throw new ObjectDisposedException(
+                        nameof(CompiledInferencePlan<T>),
+                        $"Stitched plan's source at index {s} has been disposed during warmup.");
+            }
             for (int i = 0; i < steps.Length; i++)
                 steps[i].Execute(engine, steps[i].OutputBuffer);
         }
