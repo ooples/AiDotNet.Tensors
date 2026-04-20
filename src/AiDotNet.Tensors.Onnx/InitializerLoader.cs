@@ -204,7 +204,17 @@ internal static class InitializerLoader
                 else
                 {
                     ValidateTypedFieldCount(proto, proto.Int32Data.Count, n, nameof(proto.Int32Data));
-                    for (int i = 0; i < n; i++) asLong[i] = proto.Int32Data[i];
+                    for (int i = 0; i < n; i++)
+                    {
+                        int v = proto.Int32Data[i];
+                        // ONNX stores INT8 in Int32Data slots — validate the
+                        // declared range instead of silently narrowing.
+                        if (v < sbyte.MinValue || v > sbyte.MaxValue)
+                            throw new InvalidDataException(
+                                $"ONNX initializer '{proto.Name}' INT8 value {v} at index {i} " +
+                                $"is outside the [{sbyte.MinValue}, {sbyte.MaxValue}] range.");
+                        asLong[i] = (sbyte)v;
+                    }
                 }
                 break;
             case UINT8:
@@ -217,7 +227,17 @@ internal static class InitializerLoader
                 else
                 {
                     ValidateTypedFieldCount(proto, proto.Int32Data.Count, n, nameof(proto.Int32Data));
-                    for (int i = 0; i < n; i++) asLong[i] = (uint)proto.Int32Data[i];
+                    for (int i = 0; i < n; i++)
+                    {
+                        int v = proto.Int32Data[i];
+                        // ONNX stores UINT8 in Int32Data slots — negatives and
+                        // values > 255 would silently wrap on the (uint) cast.
+                        if (v < byte.MinValue || v > byte.MaxValue)
+                            throw new InvalidDataException(
+                                $"ONNX initializer '{proto.Name}' UINT8 value {v} at index {i} " +
+                                $"is outside the [{byte.MinValue}, {byte.MaxValue}] range.");
+                        asLong[i] = (byte)v;
+                    }
                 }
                 break;
             default:

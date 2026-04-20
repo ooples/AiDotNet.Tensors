@@ -14,12 +14,22 @@ public static class GatherDebug
     private static readonly List<string> _messages = new();
     private static readonly object _lock = new();
     private static int _stepCounter;
+    // Backed by a volatile int so writes on the test thread are immediately
+    // visible to engine worker threads that read Enabled in their hot path.
+    // Plain bool would be legal under the .NET memory model on x86 but the
+    // JIT is free to hoist a non-volatile read out of a tight loop.
+    private static volatile int _enabled;
 
     /// <summary>
     /// Master switch. Default off so production paths pay nothing; tests
-    /// flip this on around the diagnostic region.
+    /// flip this on around the diagnostic region. Reads/writes go through
+    /// a volatile int so multi-threaded visibility is guaranteed.
     /// </summary>
-    public static bool Enabled { get; set; }
+    public static bool Enabled
+    {
+        get => _enabled != 0;
+        set => _enabled = value ? 1 : 0;
+    }
 
     /// <summary>Thread-safe incrementing step counter.</summary>
     public static int StepCounter

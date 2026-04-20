@@ -128,10 +128,25 @@ internal static class TensorManipOperators
             {
                 if (raw[i] == 0)
                 {
-                    // allowzero=0 (default): copy the corresponding input dim
-                    // (requires a corresponding axis exists in input). With
-                    // allowzero=1 the 0 is a literal dimension.
-                    result[i] = allowZero ? 0 : (i < inputShape.Length ? inputShape[i] : 0);
+                    if (allowZero)
+                    {
+                        // allowzero=1 — literal zero dimension.
+                        result[i] = 0;
+                    }
+                    else
+                    {
+                        // allowzero=0 (default): copy the corresponding input
+                        // dim. Per ONNX spec, a copy-dim is only valid when
+                        // the source axis actually exists; silently collapsing
+                        // to a literal 0 built an invalid plan without flagging
+                        // the malformed graph.
+                        if (i >= inputShape.Length)
+                            throw new InvalidDataException(
+                                $"Reshape copy-dim at axis {i} has no corresponding input axis " +
+                                $"(input rank {inputShape.Length}). Set allowzero=1 if a literal zero " +
+                                "dimension was intended.");
+                        result[i] = inputShape[i];
+                    }
                     known *= result[i];
                 }
                 else if (raw[i] == -1)

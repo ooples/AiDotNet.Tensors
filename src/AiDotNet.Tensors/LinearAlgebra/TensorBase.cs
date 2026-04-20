@@ -869,6 +869,14 @@ public abstract class TensorBase<T> : IDisposable
     {
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
             return null;
+        // GPU-resident tensors keep the authoritative data on-device; the
+        // CPU backing array may hold stale/placeholder bytes that haven't
+        // been copied back. Pinning that into a specialization would read
+        // the wrong values at replay. Force these callers onto the AsSpan
+        // path, which goes through EnsureMaterialized and copies GPU→CPU
+        // before the caller touches the buffer.
+        if (_device != TensorDevice.CPU)
+            return null;
         return _storage.GetDataArray();
     }
 
@@ -883,6 +891,12 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance(_shape);
+        // Packed layouts (Nchwc8/Nchwc16) reinterpret the flat buffer via a
+        // different stride pattern; a contiguous element-for-element copy
+        // that leaves Layout at the default Nchw would send later ops down
+        // the wrong dispatch branch. Propagate the source layout so the
+        // copy stays semantically identical.
+        result.Layout = Layout;
         if (Length == 0) return result;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
@@ -907,6 +921,10 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
+        // Transform walks flat index i in source order. A packed source
+        // with the default Nchw layout on the result would mislabel the
+        // output; propagate so downstream dispatch stays correct.
+        result.Layout = Layout;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
             var src = _data.AsSpan();
@@ -928,6 +946,7 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
+        result.Layout = Layout;
         var indices = new int[Rank];
         for (int i = 0; i < Length; i++)
         {
