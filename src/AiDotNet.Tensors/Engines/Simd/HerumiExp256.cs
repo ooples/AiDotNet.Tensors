@@ -33,8 +33,12 @@ internal static class HerumiExp256
     private const float ClampMax = 88.7228f;
 
     // 256-entry lookup table: Table[k] = 2^(k/256) for k=0..255
-    // 1024 bytes — fits comfortably in L1 cache
-    private static readonly float[] Table = GenerateTable();
+    // 1024 bytes — fits comfortably in L1 cache. Exposed as _table
+    // (internal) so callers that pin the table across their own unrolled
+    // SIMD loops (e.g. SoftmaxRowSmall's 32-wide inner loop) can do so
+    // without going through ExpArray's fixed block.
+    internal static readonly float[] _table = GenerateTable();
+    private static readonly float[] Table = _table;
 
     private static float[] GenerateTable()
     {

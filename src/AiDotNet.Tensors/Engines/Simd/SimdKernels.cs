@@ -6305,6 +6305,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                 if (input[i] > maxVal) maxVal = input[i];
 
             // Pass 2: Fused exp + store + sum (SIMD 4x unrolled)
+            // CPU-adaptive exp kernel — two paths:
+            //   HasFastGather (Intel + AMD Zen 4+): HerumiExp256 table exp
+            //     (~2× faster than polynomial — 256-entry table in L1,
+            //     single gather per vector, 2nd-order polynomial remainder).
+            //   No fast-gather (AMD Zen 1-3): FastExp256ForSoftmax (4-term
+            //     Horner polynomial) — avoids the slow vpgatherdd on
+            //     these CPUs.
+            // Both produce float32-ULP-accurate results suitable for
+            // softmax's subsequent normalisation.
             float sumExp = 0f;
             i = 0;
 #if NET5_0_OR_GREATER
@@ -6316,25 +6325,46 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vsum2 = Vector256<float>.Zero;
                 var vsum3 = Vector256<float>.Zero;
                 int simdLen = length & ~31;
-                // Use FastExp256ForSoftmax (4-term Horner) instead of
-                // FastExp256 (6-term Estrin). Lower precision (1e-4 vs 1e-6)
-                // is fine because softmax normalises to sum=1, masking the
-                // per-element exp error in the rescaling. ~30% kernel
-                // speedup measured on AMD Zen 2.
-                for (; i < simdLen; i += 32)
+                if (CpuFeatures.HasFastGather)
                 {
-                    var e0 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast));
-                    var e1 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast));
-                    var e2 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast));
-                    var e3 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast));
-                    Avx.Store(output + i, e0);
-                    Avx.Store(output + i + 8, e1);
-                    Avx.Store(output + i + 16, e2);
-                    Avx.Store(output + i + 24, e3);
-                    vsum0 = Avx.Add(vsum0, e0);
-                    vsum1 = Avx.Add(vsum1, e1);
-                    vsum2 = Avx.Add(vsum2, e2);
-                    vsum3 = Avx.Add(vsum3, e3);
+                    // Pin the 256-entry exp table once per call — the gather
+                    // ops inside the 32-wide loop use this pointer.
+                    fixed (float* tablePtr = HerumiExp256._table)
+                    {
+                        for (; i < simdLen; i += 32)
+                        {
+                            var e0 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast), tablePtr);
+                            var e1 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast), tablePtr);
+                            var e2 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast), tablePtr);
+                            var e3 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast), tablePtr);
+                            Avx.Store(output + i, e0);
+                            Avx.Store(output + i + 8, e1);
+                            Avx.Store(output + i + 16, e2);
+                            Avx.Store(output + i + 24, e3);
+                            vsum0 = Avx.Add(vsum0, e0);
+                            vsum1 = Avx.Add(vsum1, e1);
+                            vsum2 = Avx.Add(vsum2, e2);
+                            vsum3 = Avx.Add(vsum3, e3);
+                        }
+                    }
+                }
+                else
+                {
+                    for (; i < simdLen; i += 32)
+                    {
+                        var e0 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast));
+                        var e1 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast));
+                        var e2 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast));
+                        var e3 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast));
+                        Avx.Store(output + i, e0);
+                        Avx.Store(output + i + 8, e1);
+                        Avx.Store(output + i + 16, e2);
+                        Avx.Store(output + i + 24, e3);
+                        vsum0 = Avx.Add(vsum0, e0);
+                        vsum1 = Avx.Add(vsum1, e1);
+                        vsum2 = Avx.Add(vsum2, e2);
+                        vsum3 = Avx.Add(vsum3, e3);
+                    }
                 }
                 vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
                 sumExp = HorizontalSum(vsum0);
