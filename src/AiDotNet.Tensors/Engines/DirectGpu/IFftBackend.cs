@@ -13,9 +13,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
     ///
     /// Contract:
     /// <list type="bullet">
-    ///   <item>Input/output buffers: interleaved <c>re/im</c> doubles packed
-    ///     into <see cref="IGpuBuffer"/> slots, <c>2·batchCount·n</c> total
-    ///     elements each. Input and output may be the same buffer (in-place).</item>
+    ///   <item>Input/output buffers: interleaved <c>re/im</c> <b>float32</b>
+    ///     elements packed into <see cref="IGpuBuffer"/>, <c>2·batchCount·n</c>
+    ///     total elements. All GPU shaders operate on f32; callers with f64
+    ///     inputs must downcast before dispatch. The buffer is modified
+    ///     in place.</item>
     ///   <item><paramref name="n"/> must be a power of two (scalar kernels
     ///     only ship radix-2). Callers that need non-pow-2 must route through
     ///     the CPU Bluestein path.</item>
@@ -30,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         /// Launch a batched length-<paramref name="n"/> FFT across
         /// <paramref name="batchCount"/> independent signals, in place.
         /// </summary>
-        /// <param name="buffer">Interleaved re/im doubles, <c>2·batchCount·n</c> elements. Modified in place.</param>
+        /// <param name="buffer">Interleaved re/im float32 elements, <c>2·batchCount·n</c> total. Modified in place.</param>
         /// <param name="batchCount">Number of independent signals.</param>
         /// <param name="n">Transform length (power of two).</param>
         /// <param name="inverse">True for IFFT (conjugated twiddles + 1/n scale), false for forward FFT.</param>

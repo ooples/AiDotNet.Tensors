@@ -198,7 +198,12 @@ public static class Stft
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (nFft <= 0) throw new ArgumentException("nFft must be positive.", nameof(nFft));
         int hop = hopLength ?? (nFft / 4);
+        if (hop <= 0) throw new ArgumentException("hopLength must be positive.", nameof(hopLength));
         int win = winLength ?? nFft;
+        if (win <= 0 || win > nFft) throw new ArgumentException("winLength must be in (0, nFft].", nameof(winLength));
+        if (window is not null && (window.Rank != 1 || window.Shape[0] != win))
+            throw new ArgumentException($"window must be 1D with length {win}.", nameof(window));
+
         var ops = MathHelper.GetNumericOperations<T>();
 
         var winPadded = new double[nFft];

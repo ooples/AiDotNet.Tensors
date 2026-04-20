@@ -20,6 +20,8 @@ public sealed partial class WebGpuBackend
             throw new ArgumentException(
                 $"WebGPU LaunchFft requires n to be a power of two (got n = {n}).",
                 nameof(n));
+        if (buffer is not WebGpuBuffer)
+            throw new ArgumentException("Buffer must be WebGpuBuffer.", nameof(buffer));
 
         var pipelineId = await GetOrCreatePipelineAsync(
             FftModuleKey + ":Fft", WebGpuFftKernels.Fft, "main");

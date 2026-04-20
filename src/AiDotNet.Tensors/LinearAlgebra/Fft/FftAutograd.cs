@@ -162,11 +162,11 @@ internal static class FftAutograd
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         if (!DifferentiableOps.AnyTapeActive()) return;
-        // Resolve nullable axes to a concrete array: default is the trailing
-        // `axesCount` axes of the output tensor.
+        // Snapshot caller-owned s/axes arrays so a later caller mutation
+        // doesn't change the backward pass parameters.
         int outRank = output.Rank;
-        int[] savedAxes = axes ?? DefaultTrailingAxes(outRank, axesCount);
-        int[] savedS = s ?? new int[] { };
+        int[] savedAxes = axes is null ? DefaultTrailingAxes(outRank, axesCount) : (int[])axes.Clone();
+        int[] savedS = s is null ? new int[] { } : (int[])s.Clone();
         string name = inverse ? "Fft.IFftN" : "Fft.FftN";
         DifferentiableOps.RecordUnary(name, output, input, static (gradOut, inputs, _, saved, engine, grads) =>
         {
@@ -187,8 +187,8 @@ internal static class FftAutograd
     {
         if (!DifferentiableOps.AnyTapeActive()) return;
         int outRank = output.Rank;
-        int[] savedAxes = axes ?? DefaultTrailingAxes(outRank, axesCount);
-        int[] savedS = s ?? new int[] { };
+        int[] savedAxes = axes is null ? DefaultTrailingAxes(outRank, axesCount) : (int[])axes.Clone();
+        int[] savedS = s is null ? new int[] { } : (int[])s.Clone();
         string name = inverse ? "Fft.IRFftN" : "Fft.RFftN";
         DifferentiableOps.RecordUnary(name, output, input, static (gradOut, inputs, _, saved, engine, grads) =>
         {
@@ -225,6 +225,54 @@ internal static class FftAutograd
     //   ⇒ dL/dX = conj(doubleInterior(RFft(gradOut, n, norm)))
     // IHFft(x) = conj(RFft(x, n, dualNorm(norm)))
     //   ⇒ dL/dx = IRFft(halveInterior(conj(gradOut)), n, norm)
+
+    // N-D Hermitian variants — derivation extends the 1D rule axis-wise.
+    //   HFftN(X) = IRFftN(conj(X), s, axes, dualNorm)
+    //     ⇒ dL/dX = conj(doubleInterior(RFftN(gradOut, s, axes, norm)))
+    //   IHFftN(x) = conj(RFftN(x, s, axes, dualNorm))
+    //     ⇒ dL/dx = IRFftN(halveInterior(conj(gradOut)), s, axes, norm)
+
+    internal static void RecordHFftN<T>(Tensor<T> output, Tensor<T> input, int[]? s, int[]? axes, int axesCount, FftNorm norm, int lastAxisSize)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        int inRank = input.Rank;
+        int[] savedAxes = axes is null ? DefaultTrailingAxes(inRank, axesCount) : (int[])axes.Clone();
+        int[] savedS = s is null ? new int[] { } : (int[])s.Clone();
+        DifferentiableOps.RecordUnary("Fft.HFftN", output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int[] ss = (int[])saved[0];
+            int[] axs = (int[])saved[1];
+            var savedNorm = (FftNorm)saved[2];
+            int lastSize = (int)saved[3];
+            int[]? sArg = ss.Length == 0 ? null : ss;
+            var rfft = Fft.RFftN(gradOut, sArg, axs, savedNorm);
+            var doubled = DoubleInteriorLastAxis(rfft, lastSize);
+            var gx = ConjugateLastAxis(doubled);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { savedS, savedAxes, norm, lastAxisSize });
+    }
+
+    internal static void RecordIHFftN<T>(Tensor<T> output, Tensor<T> input, int[]? s, int[]? axes, int axesCount, FftNorm norm, int lastAxisSize)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        int inRank = input.Rank;
+        int[] savedAxes = axes is null ? DefaultTrailingAxes(inRank, axesCount) : (int[])axes.Clone();
+        int[] savedS = s is null ? new int[] { } : (int[])s.Clone();
+        DifferentiableOps.RecordUnary("Fft.IHFftN", output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int[] ss = (int[])saved[0];
+            int[] axs = (int[])saved[1];
+            var savedNorm = (FftNorm)saved[2];
+            int lastSize = (int)saved[3];
+            int[]? sArg = ss.Length == 0 ? null : ss;
+            var conj = ConjugateLastAxis(gradOut);
+            var halved = HalveInteriorLastAxis(conj, lastSize);
+            var gx = Fft.IRFftN(halved, sArg, axs, savedNorm);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { savedS, savedAxes, norm, lastAxisSize });
+    }
 
     internal static void RecordHFft<T>(Tensor<T> output, Tensor<T> input, int n, FftNorm norm)
         where T : unmanaged, IEquatable<T>, IComparable<T>

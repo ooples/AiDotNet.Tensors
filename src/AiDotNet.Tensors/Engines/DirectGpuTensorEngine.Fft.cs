@@ -40,7 +40,12 @@ public partial class DirectGpuTensorEngine
             // a buffer that may be cached).
             var outBuf = AllocateOutputBuffer(backend, interleaved.Length);
 
-            // Pre-handoff phase: outBuf still owned by us.
+            // Pre-handoff phase: outBuf still owned by us. Narrow the catch
+            // to the exceptions GPU dispatch is expected to throw when a
+            // kernel isn't supported on this hardware (InvalidOperation for
+            // library-not-compiled, NotSupported for out-of-contract shapes,
+            // ArgumentOutOfRange for dimension guards). Other exceptions are
+            // real bugs and should propagate.
             float[] outArr;
             try
             {
@@ -49,21 +54,17 @@ public partial class DirectGpuTensorEngine
                 outArr = FinishGpuOp<float>(backend, outBuf, interleaved.Length);
                 // outBuf ownership now in the activation cache — do NOT Dispose below.
             }
-            catch
+            catch (Exception ex) when (
+                ex is InvalidOperationException
+                   or NotSupportedException
+                   or ArgumentException)
             {
                 outBuf.Dispose();
                 return null;
             }
 
-            // Post-handoff phase: outBuf is cache-owned, don't touch.
-            try
-            {
-                return new Tensor<float>(outArr, (int[])interleaved._shape.Clone());
-            }
-            catch
-            {
-                return null;
-            }
+            // Post-handoff phase: outBuf is cache-owned, don't touch it.
+            return new Tensor<float>(outArr, (int[])interleaved._shape.Clone());
         }
 
         // Path B: split real/imag engine.FFT (CUDA / HIP / OpenCL — existing

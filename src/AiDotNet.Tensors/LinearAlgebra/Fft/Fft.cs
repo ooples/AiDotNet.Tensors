@@ -253,22 +253,44 @@ public static class Fft
     /// <summary>2D Hermitian FFT along the last two axes.</summary>
     public static Tensor<T> HFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => HermitianTransformND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+    {
+        int lastSize = s is null ? 2 * (input.Shape[input.Rank - 1] / 2 - 1) : s[s.Length - 1];
+        var result = HermitianTransformND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+        FftAutograd.RecordHFftN(result, input, s, axes: null, axesCount: 2, norm, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>2D inverse Hermitian FFT along the last two axes.</summary>
     public static Tensor<T> IHFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => HermitianTransformND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+    {
+        int lastSize = s is null ? input.Shape[input.Rank - 1] : s[s.Length - 1];
+        var result = HermitianTransformND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+        FftAutograd.RecordIHFftN(result, input, s, axes: null, axesCount: 2, norm, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>N-D Hermitian FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> HFftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => HermitianTransformND(input, s, axes, norm, inverse: false, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        int lastSize = s is null ? 2 * (input.Shape[input.Rank - 1] / 2 - 1) : s[s.Length - 1];
+        var result = HermitianTransformND(input, s, axes, norm, inverse: false, axesCount: ac);
+        FftAutograd.RecordHFftN(result, input, s, axes, axesCount: ac, norm, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>N-D inverse Hermitian FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> IHFftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => HermitianTransformND(input, s, axes, norm, inverse: true, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        int lastSize = s is null ? input.Shape[input.Rank - 1] : s[s.Length - 1];
+        var result = HermitianTransformND(input, s, axes, norm, inverse: true, axesCount: ac);
+        FftAutograd.RecordIHFftN(result, input, s, axes, axesCount: ac, norm, lastAxisSize: lastSize);
+        return result;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // FREQUENCY / SHIFT HELPERS
@@ -315,14 +337,23 @@ public static class Fft
     /// center. Applied along the specified <paramref name="axes"/> (default:
     /// all axes). Inverse is <see cref="IFftShift"/>.
     /// </summary>
-    public static Tensor<T> FftShift<T>(Tensor<T> input, int[]? axes = null)
+    /// <param name="lastAxisIsComplex">
+    /// When <c>true</c> (default) the tensor's last axis is treated as
+    /// interleaved complex pairs (physical length <c>2N</c>, logical length
+    /// <c>N</c>) — the shift is computed over <c>N</c> complex units and
+    /// applied in two-double strides so odd <c>N</c> doesn't split a
+    /// real/imaginary pair. Pass <c>false</c> for real-valued tensors (e.g.
+    /// the output of <see cref="FftFreq{T}"/>) where the last axis is not
+    /// interleaved complex.
+    /// </param>
+    public static Tensor<T> FftShift<T>(Tensor<T> input, int[]? axes = null, bool lastAxisIsComplex = true)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => Shift(input, axes, inverse: false);
+        => Shift(input, axes, inverse: false, lastAxisIsComplex);
 
     /// <summary>Inverse of <see cref="FftShift"/>.</summary>
-    public static Tensor<T> IFftShift<T>(Tensor<T> input, int[]? axes = null)
+    public static Tensor<T> IFftShift<T>(Tensor<T> input, int[]? axes = null, bool lastAxisIsComplex = true)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => Shift(input, axes, inverse: true);
+        => Shift(input, axes, inverse: true, lastAxisIsComplex);
 
     // ═══════════════════════════════════════════════════════════════════════
     // INTERNAL PLUMBING
@@ -678,7 +709,7 @@ public static class Fft
         return (resolvedAxes, sizes);
     }
 
-    private static Tensor<T> Shift<T>(Tensor<T> input, int[]? axes, bool inverse)
+    private static Tensor<T> Shift<T>(Tensor<T> input, int[]? axes, bool inverse, bool lastAxisIsComplex)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -690,10 +721,23 @@ public static class Fft
         var cur = input;
         foreach (int a in ax)
         {
-            int dim = cur.Shape[a];
-            // fftshift: shift by dim/2 (floor); ifftshift: shift by dim - dim/2.
-            int shift = inverse ? dim - dim / 2 : dim / 2;
-            cur = Roll(cur, a, shift);
+            int physicalDim = cur.Shape[a];
+            // When shifting the complex-interleaved last axis, the logical
+            // unit is a (re, im) pair (physical length 2N, logical length N).
+            // Rotate by a whole number of PAIRS so odd N doesn't split a pair.
+            bool isComplexAxis = lastAxisIsComplex && a == rank - 1;
+            if (isComplexAxis)
+            {
+                int n = physicalDim / 2;
+                int shiftPairs = inverse ? n - n / 2 : n / 2;
+                cur = Roll(cur, a, shiftPairs * 2);
+            }
+            else
+            {
+                // fftshift: shift by dim/2 (floor); ifftshift: shift by dim - dim/2.
+                int shift = inverse ? physicalDim - physicalDim / 2 : physicalDim / 2;
+                cur = Roll(cur, a, shift);
+            }
         }
         return cur;
     }

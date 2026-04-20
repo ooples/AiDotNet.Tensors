@@ -1,6 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// Validates the plan cache memoizes Bluestein chirps / B-spectra and returns
-// bit-identical results under cold and hot calls.
+// FftPlanCache contract tests: the cache memoizes Bluestein plans per
+// (n, inverse) key and returns bit-identical results across cold/warm calls.
+// Test strategy: probe GetOrCreateBluestein directly rather than counting
+// entries (which is race-prone with concurrent FFT tests in the same process).
 
 using System;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -11,51 +13,49 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra.FftTests;
 
 public class FftPlanCacheTests
 {
-    // The cache is process-global and may be populated by other concurrent
-    // tests. We use delta assertions around our own calls only: calling the
-    // same op twice must NOT change the count (by more than concurrent peers
-    // would in the same window); calling a NEW, prime-sized Bluestein must
-    // either keep the count steady (other test raced ahead) or add exactly 1.
-    // We pick primes unlikely to collide and assert the "did not decrease"
-    // invariant plus the "repeats don't add" invariant which is deterministic
-    // regardless of concurrent activity.
+    // Repeated lookups with the same key return the SAME plan instance.
+    // This asserts reuse directly instead of depending on a global counter
+    // that concurrent tests can perturb.
     [Fact]
-    public void BluesteinPlan_RepeatedCallsDontAddNewPlans()
+    public void GetOrCreateBluestein_ReturnsSameInstanceForSameKey()
     {
-        // Primes 83 and 89 — not used in any other test.
-        var x = new Tensor<double>(new[] { 2 * 83 });
-        for (int i = 0; i < x.Length; i++) x[i] = i;
-        _ = Fft.Fft1(x);
-        int afterFirst = FftPlanCache.Count;
+        var a = FftPlanCache.GetOrCreateBluestein(83, inverse: false);
+        var b = FftPlanCache.GetOrCreateBluestein(83, inverse: false);
+        Assert.Same(a, b);
 
-        // Same size + direction: call many times, count must stay at afterFirst
-        // (other concurrent tests may inflate Count, but not reduce it; we
-        // check the invariant "our own repeat call doesn't add anything NEW"
-        // by re-observing Count and confirming it didn't jump by exactly our
-        // contribution).
-        _ = Fft.Fft1(x);
-        _ = Fft.Fft1(x);
-        Assert.True(FftPlanCache.Count >= afterFirst,
-            $"cache count shrank from {afterFirst} to {FftPlanCache.Count}");
+        // Different direction → different plan.
+        var c = FftPlanCache.GetOrCreateBluestein(83, inverse: true);
+        Assert.NotSame(a, c);
 
-        // New prime size → count must strictly increase.
-        var x2 = new Tensor<double>(new[] { 2 * 89 });
-        for (int i = 0; i < x2.Length; i++) x2[i] = i;
-        int before = FftPlanCache.Count;
-        _ = Fft.Fft1(x2);
-        Assert.True(FftPlanCache.Count > before,
-            $"cache count did not increase after new Bluestein size: {before} → {FftPlanCache.Count}");
+        // Different size → different plan.
+        var d = FftPlanCache.GetOrCreateBluestein(89, inverse: false);
+        Assert.NotSame(a, d);
+    }
+
+    [Fact]
+    public void GetOrCreateBluestein_ParametersAreCorrect()
+    {
+        var plan = FftPlanCache.GetOrCreateBluestein(7, inverse: false);
+        Assert.Equal(7, plan.N);
+        Assert.False(plan.Inverse);
+        Assert.Equal(7, plan.ChirpRe.Length);
+        Assert.Equal(7, plan.ChirpIm.Length);
+        // M must be a power of 2 ≥ 2N−1 = 13 → 16.
+        Assert.Equal(16, plan.M);
+        Assert.Equal(16, plan.BSpectrumRe.Length);
     }
 
     [Fact]
     public void BluesteinPlan_BitIdenticalWarmColdResults()
     {
+        // Independent of global cache state: two identical inputs must produce
+        // byte-identical outputs whether the plan was freshly constructed or
+        // retrieved from cache.
         var x = new Tensor<double>(new[] { 2 * 13 }); // n=13 complex → Bluestein
         var d = x.GetDataArray();
         var rng = new Random(42);
         for (int i = 0; i < d.Length; i++) d[i] = rng.NextDouble();
 
-        FftPlanCache.Clear();
         var cold = Fft.Fft1(x);
         var warm = Fft.Fft1(x);
         var coldD = cold.GetDataArray();

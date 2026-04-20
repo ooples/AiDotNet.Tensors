@@ -166,7 +166,11 @@ public static class Windows
         if (periodic && center.HasValue)
             throw new ArgumentException("Exponential window requires periodic=false when center is specified.");
         var result = new Tensor<T>(new[] { length });
-        double c = center ?? (periodic ? length - 1 : length - 1) / 2.0;
+        // Default center for both periodic and symmetric variants is (M−1)/2
+        // where M is the length basis. The two code paths had been split
+        // by a redundant ternary (both branches computed length-1); we
+        // unify them here without changing behavior.
+        double c = center ?? (length - 1) / 2.0;
         var data = result.GetDataArray();
         for (int i = 0; i < length; i++)
         {

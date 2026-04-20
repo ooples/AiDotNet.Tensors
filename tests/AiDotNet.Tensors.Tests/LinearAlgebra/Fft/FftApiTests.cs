@@ -71,11 +71,12 @@ public class FftApiTests
     [InlineData(9)] // odd length
     public void FftShift_IFftShift_Identity(int n)
     {
+        // Real-tensor semantics: treat the last axis as regular (not complex-interleaved).
         var x = new Tensor<double>(new[] { n });
         var data = x.GetDataArray();
         for (int i = 0; i < n; i++) data[i] = i;
-        var shifted = Fft.FftShift(x);
-        var back = Fft.IFftShift(shifted);
+        var shifted = Fft.FftShift(x, lastAxisIsComplex: false);
+        var back = Fft.IFftShift(shifted, lastAxisIsComplex: false);
         var backData = back.GetDataArray();
         for (int i = 0; i < n; i++)
             Assert.Equal(i, backData[i], precision: 10);
@@ -88,11 +89,39 @@ public class FftApiTests
         var x = new Tensor<double>(new[] { 8 });
         var d = x.GetDataArray();
         for (int i = 0; i < 8; i++) d[i] = i; // [0,1,2,3,4,5,6,7]
-        var s = Fft.FftShift(x);
+        var s = Fft.FftShift(x, lastAxisIsComplex: false);
         var sd = s.GetDataArray();
         // After fftshift: [4,5,6,7,0,1,2,3] — zero-freq index (0) lands at position 4.
         double[] expected = { 4, 5, 6, 7, 0, 1, 2, 3 };
         for (int i = 0; i < 8; i++) Assert.Equal(expected[i], sd[i], precision: 10);
+    }
+
+    // ── fftshift preserves re/im pairing for odd-N complex (Critical fix) ───
+    [Fact]
+    public void FftShift_Complex_OddN_PreservesReImPairing()
+    {
+        // 5 complex bins → 10 doubles interleaved re/im. After fftshift with
+        // lastAxisIsComplex=true, the result should be a pair-rotation (every
+        // pair stays intact), NOT a 5-double rotation that splits pairs.
+        int n = 5;
+        var x = new Tensor<double>(new[] { 2 * n });
+        var d = x.GetDataArray();
+        // Re_k = k, Im_k = 100 + k so we can spot any re/im split.
+        for (int k = 0; k < n; k++) { d[2 * k] = k; d[2 * k + 1] = 100 + k; }
+
+        var s = Fft.FftShift(x); // default lastAxisIsComplex = true
+        var sd = s.GetDataArray();
+
+        // For n=5 complex, fftshift rotates by n/2 = 2 complex pairs → [2,3,4,0,1].
+        for (int k = 0; k < n; k++)
+        {
+            int sourceK = (k + (n - n / 2)) % n; // inverse of n/2 rotation
+            // Re at position k came from logical index (k - 2 mod 5)
+            double expectedRe = (k + n - n / 2) % n;
+            double expectedIm = 100 + (k + n - n / 2) % n;
+            Assert.Equal(expectedRe, sd[2 * k], precision: 10);
+            Assert.Equal(expectedIm, sd[2 * k + 1], precision: 10);
+        }
     }
 
     // ── fftfreq conventions match numpy ──────────────────────────────────────

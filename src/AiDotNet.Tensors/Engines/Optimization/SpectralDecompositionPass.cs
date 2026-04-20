@@ -22,7 +22,11 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
 {
     public string Name => "SpectralDecomposition";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableSpectralDecomposition;
+    // The pass runs if EITHER spectral SVD decomposition OR FFT-conv rewrite
+    // is enabled — they're independent features sharing the same pass file.
+    public bool IsEnabled =>
+        TensorCodecOptions.Current.EnableSpectralDecomposition
+     || TensorCodecOptions.Current.EnableFftConv;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
@@ -31,12 +35,14 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         var result = new CompiledStep<T>[steps.Length];
         bool anyOptimized = false;
 
+        bool svdEnabled = TensorCodecOptions.Current.EnableSpectralDecomposition;
         bool fftConvEnabled = TensorCodecOptions.Current.EnableFftConv;
         int fftKernelThreshold = TensorCodecOptions.Current.FftConvKernelThreshold;
 
         for (int i = 0; i < steps.Length; i++)
         {
-            if (steps[i].OpType == OpType.TensorMatMul
+            if (svdEnabled
+                && steps[i].OpType == OpType.TensorMatMul
                 && steps[i].Inputs.Length == 2
                 && steps[i].Inputs[0].Rank == 2
                 && steps[i].Inputs[1].Rank == 2)
