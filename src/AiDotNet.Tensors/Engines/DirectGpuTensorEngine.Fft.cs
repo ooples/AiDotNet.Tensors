@@ -39,20 +39,29 @@ public partial class DirectGpuTensorEngine
             // still contain its original data — GetOrAllocateBuffer returns
             // a buffer that may be cached).
             var outBuf = AllocateOutputBuffer(backend, interleaved.Length);
+
+            // Pre-handoff phase: outBuf still owned by us.
+            float[] outArr;
             try
             {
-                // Copy input → output by letting the kernel do the initial copy
-                // on Vulkan (2-binding shader), or by calling an explicit copy
-                // for Metal. The safe-for-all-backends approach is to upload
-                // the input directly into outBuf first, then dispatch in place.
                 backend.CopyBuffer(buf.Buffer, outBuf.Buffer, interleaved.Length);
                 fftBackend.LaunchFft(outBuf.Buffer, batch, n, inverse);
-                var outArr = FinishGpuOp<float>(backend, outBuf, interleaved.Length);
-                return new Tensor<float>(outArr, (int[])interleaved._shape.Clone());
+                outArr = FinishGpuOp<float>(backend, outBuf, interleaved.Length);
+                // outBuf ownership now in the activation cache — do NOT Dispose below.
             }
             catch
             {
                 outBuf.Dispose();
+                return null;
+            }
+
+            // Post-handoff phase: outBuf is cache-owned, don't touch.
+            try
+            {
+                return new Tensor<float>(outArr, (int[])interleaved._shape.Clone());
+            }
+            catch
+            {
                 return null;
             }
         }

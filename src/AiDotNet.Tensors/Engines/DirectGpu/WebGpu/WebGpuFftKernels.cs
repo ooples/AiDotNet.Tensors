@@ -48,6 +48,7 @@ struct P { batchCount : i32, n : i32, inverse : i32 };
         }
         i = i + bs;
     }
+    storageBarrier();
     workgroupBarrier();
 
     let sign = select(-1.0, 1.0, p.inverse != 0);
@@ -79,7 +80,8 @@ struct P { batchCount : i32, n : i32, inverse : i32 };
             buf[bOff + 2 * o + 1] = eIm - tIm2;
             bf = bf + bs;
         }
-        workgroupBarrier();
+        storageBarrier();
+    workgroupBarrier();
         size = size << 1;
     }
 

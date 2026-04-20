@@ -22,9 +22,10 @@ public sealed unsafe partial class VulkanBackend : IFftBackend
         uint[] pc = { (uint)batchCount, (uint)n, (uint)(inverse ? 1 : 0) };
         // One workgroup per batch slice; workgroup size 256 handles up to
         // n = 512 butterflies per slice with one butterfly per thread.
-        GlslUnaryOp(
+        // Single-SSBO in-place dispatch — no buffer aliasing concerns.
+        GlslInPlaceOp(
             VulkanFftKernels.Fft,
-            buffer, buffer, // same buffer in both slots — algorithm is in-place
+            buffer,
             dispatchSize: batchCount * 256,
             pushConstants: pc,
             pushConstantSize: sizeof(uint) * 3u);

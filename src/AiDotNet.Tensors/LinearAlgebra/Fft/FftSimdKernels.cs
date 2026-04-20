@@ -1,23 +1,18 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// AVX2 / AVX-512 radix-2 butterfly stages for the iterative Cooley-Tukey FFT.
+// Vectorized radix-2 butterfly stages for the iterative Cooley-Tukey FFT,
+// specialized per SIMD width. Each stage handles N/2 butterflies; we batch
+// the inner `k` loop into SIMD groups of (vector-width / sizeof(double))
+// butterflies at a time, pre-computing lane-0..V-1 twiddles and advancing
+// `w` by V steps per iteration via a single complex multiply.
 //
-// The scalar radix-2 in FftKernels.IterativeRadix2 iterates butterflies with:
-//     w  ← 1
-//     for k in 0..half:
-//         t = w * odd;  even ± t
-//         w *= wStep
+// Lane widths (doubles per vector):
+//     Vector512  →  8 butterflies per iter (true AVX-512, NET 8+)
+//     Vector256  →  4 butterflies per iter (AVX / AVX2)
+//     Vector128  →  2 butterflies per iter (SSE2 baseline)
 //
-// For each SIMD-wide slab of butterflies we vectorize the inner k-loop by
-// pre-computing the twiddles w[0..vlen-1] and advancing w by vlen steps per
-// iteration. A length-N stage has N/2 butterflies; with AVX2 we process 2
-// complex (= 4 doubles) per vector, with AVX-512 we process 4 complex (= 8
-// doubles). When "halfSize" is smaller than the vector lane count we fall
-// back to scalar for that stage.
-//
-// Supported lanes:
-//     AVX2:    2 complex (ymm registers, 4 doubles)
-//     AVX-512: 4 complex (zmm registers, 8 doubles)
-//     fallback: scalar (already in FftKernels.IterativeRadix2)
+// The dispatcher TryRadix2Stage picks the widest applicable path based on
+// `half = stageSize / 2` (vector width must not exceed `half`) and the
+// runtime's ISA probes. Stages with half < 2 fall through to scalar.
 
 #if NET7_0_OR_GREATER
 using System;
@@ -29,111 +24,106 @@ namespace AiDotNet.Tensors.LinearAlgebra.Fft;
 
 internal static class FftSimdKernels
 {
+#if NET8_0_OR_GREATER
     internal static bool Avx512Supported => Avx512F.IsSupported;
+#else
+    internal static bool Avx512Supported => false;
+#endif
     internal static bool Avx2Supported => Avx2.IsSupported;
+    internal static bool Sse2Supported => Sse2.IsSupported;
 
+#if NET8_0_OR_GREATER
     /// <summary>
-    /// Run one iterative radix-2 stage of size <paramref name="stageSize"/>
-    /// using AVX-512 lanes (4 complex per vector). The buffer is interleaved
-    /// complex (re/im doubles); stage loops over <c>n / stageSize</c>
-    /// butterfly groups, each of <c>half = stageSize / 2</c> butterflies.
-    /// Requires <paramref name="half"/> &gt;= 4.
+    /// AVX-512 radix-2 stage: 8 complex butterflies per vectorized inner
+    /// iteration (Vector512 of doubles). Requires <c>half ≥ 8</c>.
     /// </summary>
-    internal static unsafe void Radix2StageAvx512(
+    internal static unsafe void Radix2StageVector512(
         double* buf, int n, int stageSize, bool inverse)
     {
         int half = stageSize >> 1;
         double sign = inverse ? 1.0 : -1.0;
         double theta = sign * 2.0 * Math.PI / stageSize;
 
-        // Pre-compute the first 4 twiddle factors (for lanes 0..3) and the
-        // step-by-4 twiddle so we can advance w by 4 lanes per iteration.
-        var wReLane = Vector256.Create(
-            Math.Cos(0 * theta),
-            Math.Cos(1 * theta),
-            Math.Cos(2 * theta),
-            Math.Cos(3 * theta));
-        var wImLane = Vector256.Create(
-            Math.Sin(0 * theta),
-            Math.Sin(1 * theta),
-            Math.Sin(2 * theta),
-            Math.Sin(3 * theta));
+        // Lane twiddles for k = 0..7 and the step-by-8 advance factor.
+        var wRe = Vector512.Create(
+            Math.Cos(0 * theta), Math.Cos(1 * theta), Math.Cos(2 * theta), Math.Cos(3 * theta),
+            Math.Cos(4 * theta), Math.Cos(5 * theta), Math.Cos(6 * theta), Math.Cos(7 * theta));
+        var wIm = Vector512.Create(
+            Math.Sin(0 * theta), Math.Sin(1 * theta), Math.Sin(2 * theta), Math.Sin(3 * theta),
+            Math.Sin(4 * theta), Math.Sin(5 * theta), Math.Sin(6 * theta), Math.Sin(7 * theta));
+        var step8Re = Vector512.Create(Math.Cos(8.0 * theta));
+        var step8Im = Vector512.Create(Math.Sin(8.0 * theta));
 
-        double theta4 = 4.0 * theta;
-        double step4Re = Math.Cos(theta4);
-        double step4Im = Math.Sin(theta4);
-        var step4ReV = Vector256.Create(step4Re);
-        var step4ImV = Vector256.Create(step4Im);
+        // Stack scratch for deinterleave/interleave and twiddle tail
+        // (hoisted out of every loop to satisfy CA2014).
+        double* evenReArr = stackalloc double[8];
+        double* evenImArr = stackalloc double[8];
+        double* oddReArr = stackalloc double[8];
+        double* oddImArr = stackalloc double[8];
+        double* resEvenRe = stackalloc double[8];
+        double* resEvenIm = stackalloc double[8];
+        double* resOddRe = stackalloc double[8];
+        double* resOddIm = stackalloc double[8];
+        double* wReTail = stackalloc double[8];
+        double* wImTail = stackalloc double[8];
 
         for (int start = 0; start < n; start += stageSize)
         {
-            var wRe = wReLane;
-            var wIm = wImLane;
+            var curWRe = wRe;
+            var curWIm = wIm;
             int k = 0;
-
-            // Vectorize 4 butterflies at a time while we have room.
-            for (; k + 4 <= half; k += 4)
+            for (; k + 8 <= half; k += 8)
             {
                 int evenBase = 2 * (start + k);
                 int oddBase = 2 * (start + k + half);
 
-                // Gather even / odd lanes into ymm registers. Loads are
-                // interleaved re/im so re = [buf[2i], buf[2(i+1)], ...] and
-                // im = [buf[2i+1], ...]. Use shuffle to deinterleave.
-                var evenReIm0 = Vector128.Create(buf[evenBase + 0], buf[evenBase + 1]);
-                var evenReIm1 = Vector128.Create(buf[evenBase + 2], buf[evenBase + 3]);
-                var evenReIm2 = Vector128.Create(buf[evenBase + 4], buf[evenBase + 5]);
-                var evenReIm3 = Vector128.Create(buf[evenBase + 6], buf[evenBase + 7]);
-                var oddReIm0 = Vector128.Create(buf[oddBase + 0], buf[oddBase + 1]);
-                var oddReIm1 = Vector128.Create(buf[oddBase + 2], buf[oddBase + 3]);
-                var oddReIm2 = Vector128.Create(buf[oddBase + 4], buf[oddBase + 5]);
-                var oddReIm3 = Vector128.Create(buf[oddBase + 6], buf[oddBase + 7]);
-
-                // Deinterleave into real/imag vectors.
-                var evenRe = Vector256.Create(
-                    evenReIm0.GetElement(0), evenReIm1.GetElement(0),
-                    evenReIm2.GetElement(0), evenReIm3.GetElement(0));
-                var evenIm = Vector256.Create(
-                    evenReIm0.GetElement(1), evenReIm1.GetElement(1),
-                    evenReIm2.GetElement(1), evenReIm3.GetElement(1));
-                var oddRe = Vector256.Create(
-                    oddReIm0.GetElement(0), oddReIm1.GetElement(0),
-                    oddReIm2.GetElement(0), oddReIm3.GetElement(0));
-                var oddIm = Vector256.Create(
-                    oddReIm0.GetElement(1), oddReIm1.GetElement(1),
-                    oddReIm2.GetElement(1), oddReIm3.GetElement(1));
+                for (int lane = 0; lane < 8; lane++)
+                {
+                    evenReArr[lane] = buf[evenBase + 2 * lane];
+                    evenImArr[lane] = buf[evenBase + 2 * lane + 1];
+                    oddReArr[lane] = buf[oddBase + 2 * lane];
+                    oddImArr[lane] = buf[oddBase + 2 * lane + 1];
+                }
+                var evenRe = Vector512.Load(evenReArr);
+                var evenIm = Vector512.Load(evenImArr);
+                var oddRe = Vector512.Load(oddReArr);
+                var oddIm = Vector512.Load(oddImArr);
 
                 // t = w * odd
-                var tRe = Avx.Subtract(Avx.Multiply(wRe, oddRe), Avx.Multiply(wIm, oddIm));
-                var tIm = Avx.Add(Avx.Multiply(wRe, oddIm), Avx.Multiply(wIm, oddRe));
+                var tRe = Avx512F.Subtract(Avx512F.Multiply(curWRe, oddRe), Avx512F.Multiply(curWIm, oddIm));
+                var tIm = Avx512F.Add(Avx512F.Multiply(curWRe, oddIm), Avx512F.Multiply(curWIm, oddRe));
 
-                // even ← even + t ; odd ← even - t
-                var newEvenRe = Avx.Add(evenRe, tRe);
-                var newEvenIm = Avx.Add(evenIm, tIm);
-                var newOddRe = Avx.Subtract(evenRe, tRe);
-                var newOddIm = Avx.Subtract(evenIm, tIm);
+                var newEvenRe = Avx512F.Add(evenRe, tRe);
+                var newEvenIm = Avx512F.Add(evenIm, tIm);
+                var newOddRe = Avx512F.Subtract(evenRe, tRe);
+                var newOddIm = Avx512F.Subtract(evenIm, tIm);
 
-                // Re-interleave and store back.
-                for (int lane = 0; lane < 4; lane++)
+                newEvenRe.Store(resEvenRe);
+                newEvenIm.Store(resEvenIm);
+                newOddRe.Store(resOddRe);
+                newOddIm.Store(resOddIm);
+                for (int lane = 0; lane < 8; lane++)
                 {
-                    buf[evenBase + 2 * lane] = newEvenRe.GetElement(lane);
-                    buf[evenBase + 2 * lane + 1] = newEvenIm.GetElement(lane);
-                    buf[oddBase + 2 * lane] = newOddRe.GetElement(lane);
-                    buf[oddBase + 2 * lane + 1] = newOddIm.GetElement(lane);
+                    buf[evenBase + 2 * lane] = resEvenRe[lane];
+                    buf[evenBase + 2 * lane + 1] = resEvenIm[lane];
+                    buf[oddBase + 2 * lane] = resOddRe[lane];
+                    buf[oddBase + 2 * lane + 1] = resOddIm[lane];
                 }
 
-                // Advance w by 4 steps:  w ← w * step⁴
-                var newWRe = Avx.Subtract(Avx.Multiply(wRe, step4ReV), Avx.Multiply(wIm, step4ImV));
-                var newWIm = Avx.Add(Avx.Multiply(wRe, step4ImV), Avx.Multiply(wIm, step4ReV));
-                wRe = newWRe;
-                wIm = newWIm;
+                // w ← w * step⁸
+                var nwRe = Avx512F.Subtract(Avx512F.Multiply(curWRe, step8Re), Avx512F.Multiply(curWIm, step8Im));
+                var nwIm = Avx512F.Add(Avx512F.Multiply(curWRe, step8Im), Avx512F.Multiply(curWIm, step8Re));
+                curWRe = nwRe;
+                curWIm = nwIm;
             }
 
             // Scalar tail.
-            double wReScalar = wRe.GetElement(0);
-            double wImScalar = wIm.GetElement(0);
-            double wStepReScalar = Math.Cos(theta);
-            double wStepImScalar = Math.Sin(theta);
+            curWRe.Store(wReTail);
+            curWIm.Store(wImTail);
+            double wReScalar = wReTail[0];
+            double wImScalar = wImTail[0];
+            double wStepRe = Math.Cos(theta);
+            double wStepIm = Math.Sin(theta);
             for (; k < half; k++)
             {
                 int eIdx = 2 * (start + k);
@@ -146,8 +136,94 @@ internal static class FftSimdKernels
                 buf[eIdx + 1] = eIm + tIm;
                 buf[oIdx] = eRe - tRe;
                 buf[oIdx + 1] = eIm - tIm;
-                double nwRe = wReScalar * wStepReScalar - wImScalar * wStepImScalar;
-                double nwIm = wReScalar * wStepImScalar + wImScalar * wStepReScalar;
+                double nwRe2 = wReScalar * wStepRe - wImScalar * wStepIm;
+                double nwIm2 = wReScalar * wStepIm + wImScalar * wStepRe;
+                wReScalar = nwRe2;
+                wImScalar = nwIm2;
+            }
+        }
+    }
+#endif
+
+    /// <summary>
+    /// AVX/AVX2 radix-2 stage: 4 complex butterflies per vectorized inner
+    /// iteration (Vector256 of doubles). Requires <c>half ≥ 4</c>.
+    /// </summary>
+    internal static unsafe void Radix2StageVector256(
+        double* buf, int n, int stageSize, bool inverse)
+    {
+        int half = stageSize >> 1;
+        double sign = inverse ? 1.0 : -1.0;
+        double theta = sign * 2.0 * Math.PI / stageSize;
+
+        var wReInit = Vector256.Create(
+            Math.Cos(0 * theta), Math.Cos(1 * theta),
+            Math.Cos(2 * theta), Math.Cos(3 * theta));
+        var wImInit = Vector256.Create(
+            Math.Sin(0 * theta), Math.Sin(1 * theta),
+            Math.Sin(2 * theta), Math.Sin(3 * theta));
+        var step4Re = Vector256.Create(Math.Cos(4.0 * theta));
+        var step4Im = Vector256.Create(Math.Sin(4.0 * theta));
+
+        for (int start = 0; start < n; start += stageSize)
+        {
+            var wRe = wReInit;
+            var wIm = wImInit;
+            int k = 0;
+            for (; k + 4 <= half; k += 4)
+            {
+                int evenBase = 2 * (start + k);
+                int oddBase = 2 * (start + k + half);
+
+                var evenRe = Vector256.Create(
+                    buf[evenBase + 0], buf[evenBase + 2], buf[evenBase + 4], buf[evenBase + 6]);
+                var evenIm = Vector256.Create(
+                    buf[evenBase + 1], buf[evenBase + 3], buf[evenBase + 5], buf[evenBase + 7]);
+                var oddRe = Vector256.Create(
+                    buf[oddBase + 0], buf[oddBase + 2], buf[oddBase + 4], buf[oddBase + 6]);
+                var oddIm = Vector256.Create(
+                    buf[oddBase + 1], buf[oddBase + 3], buf[oddBase + 5], buf[oddBase + 7]);
+
+                var tRe = Avx.Subtract(Avx.Multiply(wRe, oddRe), Avx.Multiply(wIm, oddIm));
+                var tIm = Avx.Add(Avx.Multiply(wRe, oddIm), Avx.Multiply(wIm, oddRe));
+
+                var newEvenRe = Avx.Add(evenRe, tRe);
+                var newEvenIm = Avx.Add(evenIm, tIm);
+                var newOddRe = Avx.Subtract(evenRe, tRe);
+                var newOddIm = Avx.Subtract(evenIm, tIm);
+
+                for (int lane = 0; lane < 4; lane++)
+                {
+                    buf[evenBase + 2 * lane] = newEvenRe.GetElement(lane);
+                    buf[evenBase + 2 * lane + 1] = newEvenIm.GetElement(lane);
+                    buf[oddBase + 2 * lane] = newOddRe.GetElement(lane);
+                    buf[oddBase + 2 * lane + 1] = newOddIm.GetElement(lane);
+                }
+
+                var newWRe = Avx.Subtract(Avx.Multiply(wRe, step4Re), Avx.Multiply(wIm, step4Im));
+                var newWIm = Avx.Add(Avx.Multiply(wRe, step4Im), Avx.Multiply(wIm, step4Re));
+                wRe = newWRe;
+                wIm = newWIm;
+            }
+
+            double wReScalar = wRe.GetElement(0);
+            double wImScalar = wIm.GetElement(0);
+            double wStepReal = Math.Cos(theta);
+            double wStepImag = Math.Sin(theta);
+            for (; k < half; k++)
+            {
+                int eIdx = 2 * (start + k);
+                int oIdx = 2 * (start + k + half);
+                double eRe = buf[eIdx], eIm = buf[eIdx + 1];
+                double oRe = buf[oIdx], oIm = buf[oIdx + 1];
+                double tRe = wReScalar * oRe - wImScalar * oIm;
+                double tIm = wReScalar * oIm + wImScalar * oRe;
+                buf[eIdx] = eRe + tRe;
+                buf[eIdx + 1] = eIm + tIm;
+                buf[oIdx] = eRe - tRe;
+                buf[oIdx + 1] = eIm - tIm;
+                double nwRe = wReScalar * wStepReal - wImScalar * wStepImag;
+                double nwIm = wReScalar * wStepImag + wImScalar * wStepReal;
                 wReScalar = nwRe;
                 wImScalar = nwIm;
             }
@@ -155,27 +231,25 @@ internal static class FftSimdKernels
     }
 
     /// <summary>
-    /// AVX2 version: 2 complex butterflies per vector (Vector128 of doubles).
-    /// Requires <paramref name="half"/> &gt;= 2.
+    /// SSE2 radix-2 stage: 2 complex butterflies per vectorized inner
+    /// iteration (Vector128 of doubles). Requires <c>half ≥ 2</c>.
     /// </summary>
-    internal static unsafe void Radix2StageAvx2(
+    internal static unsafe void Radix2StageVector128(
         double* buf, int n, int stageSize, bool inverse)
     {
         int half = stageSize >> 1;
         double sign = inverse ? 1.0 : -1.0;
         double theta = sign * 2.0 * Math.PI / stageSize;
 
-        // Pre-compute twiddles for lanes 0..1 and the step-by-2 advance.
-        var wReLane = Vector128.Create(Math.Cos(0 * theta), Math.Cos(1 * theta));
-        var wImLane = Vector128.Create(Math.Sin(0 * theta), Math.Sin(1 * theta));
-        double theta2 = 2.0 * theta;
-        var step2Re = Vector128.Create(Math.Cos(theta2));
-        var step2Im = Vector128.Create(Math.Sin(theta2));
+        var wReInit = Vector128.Create(Math.Cos(0 * theta), Math.Cos(1 * theta));
+        var wImInit = Vector128.Create(Math.Sin(0 * theta), Math.Sin(1 * theta));
+        var step2Re = Vector128.Create(Math.Cos(2.0 * theta));
+        var step2Im = Vector128.Create(Math.Sin(2.0 * theta));
 
         for (int start = 0; start < n; start += stageSize)
         {
-            var wRe = wReLane;
-            var wIm = wImLane;
+            var wRe = wReInit;
+            var wIm = wImInit;
             int k = 0;
             for (; k + 2 <= half; k += 2)
             {
@@ -204,18 +278,16 @@ internal static class FftSimdKernels
                 buf[oddBase + 2] = newOddRe.GetElement(1);
                 buf[oddBase + 3] = newOddIm.GetElement(1);
 
-                // Advance w by 2 steps.
                 var newWRe = Sse2.Subtract(Sse2.Multiply(wRe, step2Re), Sse2.Multiply(wIm, step2Im));
                 var newWIm = Sse2.Add(Sse2.Multiply(wRe, step2Im), Sse2.Multiply(wIm, step2Re));
                 wRe = newWRe;
                 wIm = newWIm;
             }
 
-            // Scalar tail.
             double wReScalar = wRe.GetElement(0);
             double wImScalar = wIm.GetElement(0);
-            double wStepReScalar = Math.Cos(theta);
-            double wStepImScalar = Math.Sin(theta);
+            double wStepReal = Math.Cos(theta);
+            double wStepImag = Math.Sin(theta);
             for (; k < half; k++)
             {
                 int eIdx = 2 * (start + k);
@@ -228,8 +300,8 @@ internal static class FftSimdKernels
                 buf[eIdx + 1] = eIm + tIm;
                 buf[oIdx] = eRe - tRe;
                 buf[oIdx + 1] = eIm - tIm;
-                double nwRe = wReScalar * wStepReScalar - wImScalar * wStepImScalar;
-                double nwIm = wReScalar * wStepImScalar + wImScalar * wStepReScalar;
+                double nwRe = wReScalar * wStepReal - wImScalar * wStepImag;
+                double nwIm = wReScalar * wStepImag + wImScalar * wStepReal;
                 wReScalar = nwRe;
                 wImScalar = nwIm;
             }
@@ -237,23 +309,30 @@ internal static class FftSimdKernels
     }
 
     /// <summary>
-    /// Dispatch a single radix-2 stage to the best available SIMD path.
-    /// Returns <c>true</c> if a SIMD path ran, <c>false</c> if the caller
-    /// must fall back to scalar (because neither path was applicable).
+    /// Dispatch a single radix-2 stage to the widest SIMD path whose lane
+    /// count fits into <c>half = stageSize/2</c>. Returns <c>true</c> if
+    /// a SIMD path ran; <c>false</c> means the caller must run scalar.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe bool TryRadix2Stage(
         double* buf, int n, int stageSize, bool inverse)
     {
         int half = stageSize >> 1;
-        if (Avx512F.IsSupported && half >= 4)
+#if NET8_0_OR_GREATER
+        if (Avx512F.IsSupported && half >= 8)
         {
-            Radix2StageAvx512(buf, n, stageSize, inverse);
+            Radix2StageVector512(buf, n, stageSize, inverse);
             return true;
         }
-        if (Avx2.IsSupported && half >= 2)
+#endif
+        if (Avx.IsSupported && half >= 4)
         {
-            Radix2StageAvx2(buf, n, stageSize, inverse);
+            Radix2StageVector256(buf, n, stageSize, inverse);
+            return true;
+        }
+        if (Sse2.IsSupported && half >= 2)
+        {
+            Radix2StageVector128(buf, n, stageSize, inverse);
             return true;
         }
         return false;
