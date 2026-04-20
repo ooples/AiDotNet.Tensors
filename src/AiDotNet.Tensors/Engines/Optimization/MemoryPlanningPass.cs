@@ -34,6 +34,19 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
     {
         if (steps.Length < 4) return null; // Not worth the overhead for tiny plans
 
+        // Phase 0: Identify which tensors were produced by a step in this
+        // plan. Only those are safe to donate to the dead pool — graph
+        // inputs and initializer weights must persist across repeat
+        // executions of the plan. Adding them to the pool was the root
+        // of the ONNX MNIST re-execute failure: on execute #1 the pool
+        // rebound a later step's output to (say) Conv weight W's storage,
+        // step N's Execute then clobbered W, and execute #2 fed the model
+        // weights that were really leftover activation data.
+        var producedHere = new HashSet<Tensor<T>>(
+            steps.Length, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < steps.Length; i++)
+            producedHere.Add(steps[i].OutputBuffer);
+
         // Phase 1: Compute tensor lifetimes
         // Map each tensor (by reference identity) to its last-use step index.
         // Must use reference-equality semantics — two distinct tensors may have
@@ -96,6 +109,11 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
             for (int j = 0; j < step.Inputs.Length; j++)
             {
                 var inp = step.Inputs[j];
+                // Graph inputs and initializer weights aren't produced by
+                // any step in the plan — they must stay intact across
+                // repeat Execute() calls. Only intermediate activations
+                // are pool-eligible.
+                if (!producedHere.Contains(inp)) continue;
                 if (lastUse.TryGetValue(inp, out int lu) && lu == i)
                 {
                     // This input's lifetime just ended — add to dead pool
