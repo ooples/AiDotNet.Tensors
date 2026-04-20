@@ -20500,13 +20500,129 @@ public class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
+    /// <summary>
+    /// Write-through PixelShuffle (sub-pixel upscaling). Used by super-
+    /// resolution heads (ESPCN, EDSR, SRResNet) and YOLO neck/head blocks.
+    /// Inverts the loop nest from output-major (with div/mod per inner pixel)
+    /// to input-major so the inner ow loop becomes linear indexing.
+    /// </summary>
+    public void PixelShuffleInto<T>(Tensor<T> output, Tensor<T> input, int upscaleFactor)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length != 4)
+            throw new ArgumentException("PixelShuffleInto expects 4D tensor [batch, channels, height, width]");
+
+        int batch = shape[0];
+        int channels = shape[1];
+        int height = shape[2];
+        int width = shape[3];
+        int r = upscaleFactor;
+        if (channels % (r * r) != 0)
+            throw new ArgumentException($"Number of channels ({channels}) must be divisible by r^2 ({r * r})");
+
+        int newChannels = channels / (r * r);
+        int newHeight = height * r;
+        int newWidth = width * r;
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int totalBOC = batch * newChannels;
+            int hh = height, ww = width, oH = newHeight, oW = newWidth, rr = r, ch = channels;
+            Action<int> kernel = boc =>
+            {
+                int b = boc / newChannels;
+                int oc = boc % newChannels;
+                int ocBase = oc * rr * rr;
+                int outBcBase = boc * oH * oW;
+                int inBatchBase = b * ch * hh * ww;
+                for (int subH = 0; subH < rr; subH++)
+                {
+                    for (int subW = 0; subW < rr; subW++)
+                    {
+                        int ic = ocBase + subH * rr + subW;
+                        int inChanBase = inBatchBase + ic * hh * ww;
+                        for (int ih = 0; ih < hh; ih++)
+                        {
+                            int oh = ih * rr + subH;
+                            int rowOut = outBcBase + oh * oW + subW;
+                            int rowIn = inChanBase + ih * ww;
+                            // Stride-rr write into the output row.
+                            for (int iw = 0; iw < ww; iw++)
+                            {
+                                outArr[rowOut + iw * rr] = inArr[rowIn + iw];
+                            }
+                        }
+                    }
+                }
+            };
+            if (totalBOC > 4) Parallel.For(0, totalBOC, kernel);
+            else for (int boc = 0; boc < totalBOC; boc++) kernel(boc);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * newChannels, boc =>
+        {
+            int b = boc / newChannels;
+            int oc = boc % newChannels;
+            int ocBase = oc * r * r;
+            int outBcBase = boc * newHeight * newWidth;
+            int inBatchBase = b * channels * height * width;
+            for (int subH = 0; subH < r; subH++)
+            {
+                for (int subW = 0; subW < r; subW++)
+                {
+                    int ic = ocBase + subH * r + subW;
+                    int inChanBase = inBatchBase + ic * height * width;
+                    for (int ih = 0; ih < height; ih++)
+                    {
+                        int oh = ih * r + subH;
+                        int rowOut = outBcBase + oh * newWidth + subW;
+                        int rowIn = inChanBase + ih * width;
+                        for (int iw = 0; iw < width; iw++)
+                        {
+                            outputData[rowOut + iw * r] = inputData[rowIn + iw];
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_upscaleFactor = upscaleFactor; return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, input._shape, (eng, output) => { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PixelShuffleBackward); } }
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var c_input = input;
+                int c_upscaleFactor = upscaleFactor;
+                int rr = upscaleFactor;
+                if (shape[1] % (rr * rr) != 0)
+                    throw new ArgumentException($"Number of channels ({shape[1]}) must be divisible by r^2 ({rr * rr})");
+                // FIX: previous code passed input._shape, leaving the output buffer
+                // sized for the pre-shuffle layout — element count matched but the
+                // shape metadata was wrong for downstream shape-aware ops.
+                var outShape = new[] { shape[0], shape[1] / (rr * rr), shape[2] * rr, shape[3] * rr };
+                return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, outShape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
+                        else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
+                    BackwardFunctions<T>.PixelShuffleBackward, new object[] { c_upscaleFactor });
+            }
+        }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("PixelShuffle", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
@@ -20522,32 +20638,8 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batch * newChannels * newHeight * newWidth];
-
-        Parallel.For(0, batch, b =>
-        {
-            for (int oc = 0; oc < newChannels; oc++)
-            {
-                for (int oh = 0; oh < newHeight; oh++)
-                {
-                    for (int ow = 0; ow < newWidth; ow++)
-                    {
-                        int ih = oh / r;
-                        int iw = ow / r;
-                        int subH = oh % r;
-                        int subW = ow % r;
-                        int ic = oc * r * r + subH * r + subW;
-
-                        int inputIdx = ((b * channels + ic) * height + ih) * width + iw;
-                        int outputIdx = ((b * newChannels + oc) * newHeight + oh) * newWidth + ow;
-                        outputData[outputIdx] = inputData[inputIdx];
-                    }
-                }
-            }
-        });
-
-        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth]);
+        PixelShuffleInto(psResult, input, upscaleFactor);
         DifferentiableOps.RecordUnary("PixelShuffle", psResult, input, BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
         { var ci = input; var cu = upscaleFactor; AutoTracer.RecordOp("PixelShuffle", psResult, eng => eng.PixelShuffle(ci, cu)); }
         return psResult;
