@@ -15,7 +15,12 @@ internal static class PlanFormatConstants
     /// files with a higher version (forward-incompat) and files with version 0
     /// (corruption). Files with the same version are guaranteed readable.
     /// </summary>
-    internal const ushort CurrentFormatVersion = 1;
+    /// <remarks>
+    /// Version 2 added an explicit final-output tensor ID (written after the
+    /// op sequence, before the footer) so view-ending forwards serialize
+    /// correctly — see issue #228.
+    /// </remarks>
+    internal const ushort CurrentFormatVersion = 2;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

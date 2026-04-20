@@ -100,7 +100,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             AiDotNetEngine.SetDeterministicMode(false);
@@ -109,7 +109,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             // The two plans must be distinct instances — the cache is keyed on
@@ -146,7 +146,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             var second = cache.GetOrCompileInference(
@@ -154,7 +154,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             Assert.Same(first, second);
@@ -402,7 +402,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             // Second compile: same thread, but now with a local override to false.
@@ -412,7 +412,7 @@ public class DeterministicByDefaultTests
                 () =>
                 {
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 });
 
             Assert.NotSame(planInherited, planOverridden);

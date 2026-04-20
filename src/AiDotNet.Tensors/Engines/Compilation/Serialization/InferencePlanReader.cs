@@ -125,8 +125,23 @@ internal static class InferencePlanReader
             steps[i] = ReadStep(reader, tensorTable, engine, bodyStream);
         }
 
+        // ── Final output identity (format v2+) ──────────────────────────
+        Tensor<T> finalOutput;
+        if (formatVersion >= 2)
+        {
+            int finalOutputId = reader.ReadInt32();
+            if (finalOutputId >= 0 && finalOutputId < tensorTable.Length)
+                finalOutput = tensorTable[finalOutputId];
+            else
+                finalOutput = stepCount > 0 ? steps[stepCount - 1].OutputBuffer : new Tensor<T>(new[] { 0 });
+        }
+        else
+        {
+            // v1 used the last-step heuristic implicitly.
+            finalOutput = stepCount > 0 ? steps[stepCount - 1].OutputBuffer : new Tensor<T>(new[] { 0 });
+        }
+
         // ── Construct plan ──────────────────────────────────────────────
-        var finalOutput = stepCount > 0 ? steps[stepCount - 1].OutputBuffer : new Tensor<T>(new[] { 0 });
         return CompiledInferencePlan<T>.CreateFromDeserialized(
             steps, finalOutput, engine, inputShape, compiledInputTensor);
     }
