@@ -1061,18 +1061,42 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                unsafe
+                // LayerNorm per batch element. Previously serial — that
+                // capped BERT LayerNorm at ~900 µs on [1,256,768] despite
+                // the underlying kernel running in ~120 µs when dispatched
+                // in parallel. Threshold: parallelise if total work ≥50K
+                // elements (matches CpuEngine.LayerNorm's own gate).
+                int totalElems = batchSize * normSize;
+                if (totalElems >= 50_000)
                 {
-                    // LayerNorm per batch element
-                    float* pIn = (float*)inH.AddrOfPinnedObject();
-                    float* pOut = (float*)outH.AddrOfPinnedObject();
-                    float* pG = (float*)gammaH.AddrOfPinnedObject();
-                    float* pB = (float*)betaH.AddrOfPinnedObject();
-                    for (int b = 0; b < batchSize; b++)
+                    System.Threading.Tasks.Parallel.For(0, batchSize, b =>
                     {
-                        Simd.FusedKernels.LayerNormUnsafe(
-                            pIn + b * normSize, pG, pB,
-                            pOut + b * normSize, normSize, capturedEps);
+                        unsafe
+                        {
+                            float* pIn = (float*)inH.AddrOfPinnedObject();
+                            float* pOut = (float*)outH.AddrOfPinnedObject();
+                            float* pG = (float*)gammaH.AddrOfPinnedObject();
+                            float* pB = (float*)betaH.AddrOfPinnedObject();
+                            Simd.FusedKernels.LayerNormUnsafe(
+                                pIn + b * normSize, pG, pB,
+                                pOut + b * normSize, normSize, capturedEps);
+                        }
+                    });
+                }
+                else
+                {
+                    unsafe
+                    {
+                        float* pIn = (float*)inH.AddrOfPinnedObject();
+                        float* pOut = (float*)outH.AddrOfPinnedObject();
+                        float* pG = (float*)gammaH.AddrOfPinnedObject();
+                        float* pB = (float*)betaH.AddrOfPinnedObject();
+                        for (int b = 0; b < batchSize; b++)
+                        {
+                            Simd.FusedKernels.LayerNormUnsafe(
+                                pIn + b * normSize, pG, pB,
+                                pOut + b * normSize, normSize, capturedEps);
+                        }
                     }
                 }
             };

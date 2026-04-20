@@ -15184,10 +15184,13 @@ public class CpuEngine : ITensorLevelEngine
     /// <para>Skips mean/variance allocation — inference doesn't need them.
     /// Scratch is rented from ArrayPool.</para>
     /// </summary>
+    internal static long _lnFloatIntoCalls;
+
     internal void LayerNormFloatInto(
         Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         double epsilon, Tensor<float> output)
     {
+        System.Threading.Interlocked.Increment(ref _lnFloatIntoCalls);
         int normalizedDims = gamma._shape.Length;
         int inputRank = input._shape.Length;
         int batchSize = 1;

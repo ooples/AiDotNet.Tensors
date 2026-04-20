@@ -130,6 +130,7 @@ public class StableOpPerfHarness
         }
         _output.WriteLine($"TOTAL\t\t\t\t\t\t\t\t\t{sumAggOurs:F1}");
         _output.WriteLine($"Aggregate ours/ort = {sumAggOurs / System.Math.Max(sumAggOrt, 0.001):F2}x");
+        _output.WriteLine($"LayerNormFloatInto calls: {AiDotNet.Tensors.Engines.CpuEngine._lnFloatIntoCalls}");
     }
 
     private static (double Median, double Min, double P95, double IQR) Summarise(double[,] samples, int caseIdx)
