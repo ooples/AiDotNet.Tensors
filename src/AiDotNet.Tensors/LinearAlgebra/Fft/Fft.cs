@@ -75,6 +75,9 @@ public static class Fft
     }
 
     // GPU fast-path precondition checks. Returns true if it dispatched.
+    // Delegates the backend-specific ladder (IFftBackend → engine.FFT split
+    // real/imag → CPU) to DirectGpuTensorEngine.TryBackendFft so every
+    // Fft module call site benefits from new backends transparently.
     private static bool TryGpuFft1<T>(Tensor<T> input, int? nRequested, FftNorm norm, bool inverse, out Tensor<T>? result)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
@@ -87,48 +90,12 @@ public static class Fft
         int last = input.Shape[input.Rank - 1];
         if (last % 2 != 0) return false;
         int n = last / 2;
-        if (!FftKernels.IsPowerOfTwo(n)) return false; // custom GPU kernel is pow2-only
+        if (!FftKernels.IsPowerOfTwo(n)) return false;
         if (n < 2) return false;
 
-        // Split interleaved input into separate real/imag tensors, dispatch via
-        // the engine's FFT(real, imag, ...) entrypoint (which routes to custom
-        // CUDA/HIP/OpenCL kernels on a GPU backend), then re-interleave.
-        int batch = input.Length / last;
-        var realShape = (int[])input._shape.Clone();
-        realShape[realShape.Length - 1] = n;
-        var realIn = new Tensor<float>(realShape);
-        var imagIn = new Tensor<float>(realShape);
-        var inD = (float[])(object)input.GetDataArray();
-        var reD = realIn.GetDataArray();
-        var imD = imagIn.GetDataArray();
-        for (int b = 0; b < batch; b++)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                reD[b * n + i] = inD[b * last + 2 * i];
-                imD[b * n + i] = inD[b * last + 2 * i + 1];
-            }
-        }
-        gpu.FFT(realIn, imagIn, out Tensor<float> reOut, out Tensor<float> imOut);
-        if (inverse)
-        {
-            // gpu.FFT is forward-only; manually call IFFT if available.
-            gpu.IFFT(realIn, imagIn, out reOut, out imOut);
-        }
-        var outShape = (int[])input._shape.Clone();
-        var output = new Tensor<T>(outShape);
-        var oD = (float[])(object)output.GetDataArray();
-        var outReD = reOut.GetDataArray();
-        var outImD = imOut.GetDataArray();
-        for (int b = 0; b < batch; b++)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                oD[b * last + 2 * i] = outReD[b * n + i];
-                oD[b * last + 2 * i + 1] = outImD[b * n + i];
-            }
-        }
-        result = output;
+        var output = gpu.TryBackendFft((Tensor<float>)(object)input, inverse);
+        if (output is null) return false;
+        result = (Tensor<T>)(object)output;
         return true;
     }
 
