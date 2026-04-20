@@ -512,7 +512,8 @@ kernel void parity210_digamma(
     if ((int)gid >= size) return;
     float x = input[gid];
     float result = 0.0f;
-    while (x < 6.0f) { result -= 1.0f / x; x += 1.0f; }
+    // Bounded for-loop — x += 1 on -INFINITY stays at -INFINITY.
+    for (int step = 0; step < 64 && x < 6.0f; ++step) { result -= 1.0f / x; x += 1.0f; }
     float inv = 1.0f / x;
     float inv2 = inv * inv;
     result += log(x) - 0.5f * inv

@@ -342,8 +342,12 @@ struct P { size: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    let av = a[gid]; let bv = b[gid];
-    o[gid] = sqrt(av*av + bv*bv);
+    // Numerically stable hypot.
+    let ax = abs(a[gid]); let bx = abs(b[gid]);
+    let hi = max(ax, bx); let lo = min(ax, bx);
+    if (hi == 0.0) { o[gid] = 0.0; return; }
+    let r = lo / hi;
+    o[gid] = hi * sqrt(1.0 + r * r);
 }
 ";
 
@@ -356,8 +360,10 @@ struct P { size: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    let mag = abs(a[gid]);
-    if (b[gid] < 0.0) { o[gid] = -mag; } else { o[gid] = mag; }
+    // Sign-bit transplant so copysign(1.0, -0.0) returns -1.0 (IEEE).
+    let magBits = bitcast<u32>(abs(a[gid])) & 0x7FFFFFFFu;
+    let signBit = bitcast<u32>(b[gid]) & 0x80000000u;
+    o[gid] = bitcast<f32>(magBits | signBit);
 }
 ";
 
@@ -488,8 +494,10 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let y = a[gid];
-    if (y >= 1.0) { o[gid] = 3.402823e+38; return; }
-    if (y <= -1.0) { o[gid] = -3.402823e+38; return; }
+    // Signed infinities at the boundary — matches CUDA/HIP/Metal so downstream
+    // isinf() checks stay honest.  WGSL has no INF literal so we use 1.0/0.0.
+    if (y >= 1.0) { o[gid] = 1.0 / 0.0; return; }
+    if (y <= -1.0) { o[gid] = -1.0 / 0.0; return; }
     let ln = log(1.0 - y * y);
     let ac = 0.147;
     let pi : f32 = 3.14159265358979;

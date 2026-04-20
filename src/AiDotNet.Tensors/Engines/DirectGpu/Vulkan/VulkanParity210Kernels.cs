@@ -308,8 +308,13 @@ layout(push_constant) uniform P { int size; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
-    float av = a[gid]; float bv = b[gid];
-    o[gid] = sqrt(av*av + bv*bv);
+    // Numerically stable hypot: max * sqrt(1 + (min/max)^2), avoiding
+    // overflow on large |av|, |bv| and underflow on tiny inputs.
+    float ax = abs(a[gid]); float bx = abs(b[gid]);
+    float hi = max(ax, bx); float lo = min(ax, bx);
+    if (hi == 0.0) { o[gid] = 0.0; return; }
+    float r = lo / hi;
+    o[gid] = hi * sqrt(1.0 + r * r);
 }";
 
     public static string Copysign => Header + ThreeBuf + @"
@@ -317,8 +322,13 @@ layout(push_constant) uniform P { int size; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
+    // Sign-bit based copysign so copysign(1.0, -0.0) = -1.0.
+    // GLSL has no direct sign-bit accessor, so reinterpret as int and
+    // transplant the high bit.
     float mag = abs(a[gid]);
-    o[gid] = (b[gid] < 0.0) ? -mag : mag;
+    uint bBits = floatBitsToUint(b[gid]);
+    uint outBits = (floatBitsToUint(mag) & 0x7FFFFFFFu) | (bBits & 0x80000000u);
+    o[gid] = uintBitsToFloat(outBits);
 }";
 
     public static string Fmod => Header + ThreeBuf + @"
@@ -458,8 +468,11 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float y = a[gid];
-    if (y >= 1.0) { o[gid] = 1.0e38; return; }
-    if (y <= -1.0) { o[gid] = -1.0e38; return; }
+    // Return signed infinities at the boundary so downstream isinf()
+    // checks stay honest — GLSL has no literal INF but 1.0/0.0 produces
+    // +Inf on any spec-compliant implementation.
+    if (y >= 1.0) { o[gid] = 1.0 / 0.0; return; }
+    if (y <= -1.0) { o[gid] = -1.0 / 0.0; return; }
     float ln = log(1.0 - y * y);
     float aC = 0.147;
     float t = 2.0 / (3.14159265358979 * aC) + ln * 0.5;
@@ -473,12 +486,11 @@ void main() {
 }";
 
     // lgamma via Lanczos approximation (single-precision, 8-term).
+    // GLSL 4.50 forbids recursion, so the reflection branch calls a
+    // positive-only helper rather than `p210_lgamma` itself.
     private const string LgammaHelper = @"
-float p210_lgamma(float x) {
-    // Reflection for x < 0.5
-    if (x < 0.5) {
-        return log(3.14159265358979 / abs(sin(3.14159265358979 * x))) - p210_lgamma(1.0 - x);
-    }
+float p210_lgamma_positive(float x) {
+    // Valid for x >= 0.5.
     float g = 7.0;
     float t = x - 1.0;
     float hi = t + g + 0.5;
@@ -494,6 +506,15 @@ float p210_lgamma(float x) {
     lc[7] = 1.5056327351493116e-7;
     for (int i = 0; i < 8; ++i) sum += lc[i] / (t + float(i + 1));
     return 0.5 * log(2.0 * 3.14159265358979) + (t + 0.5) * log(hi) - hi + log(sum);
+}
+
+float p210_lgamma(float x) {
+    // Reflection for x < 0.5 — uses the positive-only helper instead of
+    // recursing into itself (forbidden by GLSL 4.50).
+    if (x < 0.5) {
+        return log(3.14159265358979 / abs(sin(3.14159265358979 * x))) - p210_lgamma_positive(1.0 - x);
+    }
+    return p210_lgamma_positive(x);
 }
 ";
 

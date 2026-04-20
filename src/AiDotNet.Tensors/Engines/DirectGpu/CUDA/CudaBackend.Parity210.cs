@@ -54,6 +54,9 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize, int shift)
     {
+        // Empty-shape guard — avoids cuLaunchKernel with grid=0 which some
+        // driver versions reject with CUDA_ERROR_INVALID_VALUE.
+        if (outerSize <= 0 || axisSize <= 0 || innerSize <= 0) return;
         var kernel = ResolveParity210Kernel("parity210_roll_1d");
         using var _ = PushContext();
         int total = outerSize * axisSize * innerSize;
@@ -70,6 +73,7 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
+        if (outerSize <= 0 || axisSize <= 0 || innerSize <= 0) return;
         var kernel = ResolveParity210Kernel("parity210_flip_axis");
         using var _ = PushContext();
         int total = outerSize * axisSize * innerSize;
@@ -98,6 +102,7 @@ public sealed partial class CudaBackend : IParity210Backend
         string name, IGpuBuffer input, IGpuBuffer output,
         int batchSize, int rows, int cols, int diagonal)
     {
+        if (batchSize <= 0 || rows <= 0 || cols <= 0) return;
         var kernel = ResolveParity210Kernel(name);
         using var _ = PushContext();
         int total = batchSize * rows * cols;
@@ -114,6 +119,7 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer output,
         int batchSize, int diagLen, int matSize, int offset)
     {
+        if (batchSize <= 0 || matSize <= 0) return;
         var kernel = ResolveParity210Kernel("parity210_diag_embed");
         using var _ = PushContext();
         int total = batchSize * matSize * matSize;

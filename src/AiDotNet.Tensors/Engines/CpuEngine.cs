@@ -22197,13 +22197,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var path = Engines.Einsum.EinsumPathOptimizer.Optimize(binding);
         var einsumResult = Engines.Einsum.EinsumExecutor.Execute(binding, path, tensors);
 
-        // Record autograd for the general path. v1 supports 2+ operands with
-        // no within-operand diagonals; in other cases we leave the tape
-        // unrecorded (caller gets a runtime error on .Backward() — a clear
-        // signal that the op is not yet differentiable rather than silent
-        // wrong gradients).
+        // Record autograd for every operand count (including 1-operand
+        // transpose / reduction einsums).  The only case we leave unrecorded
+        // is a within-operand diagonal (e.g. "ii->i") — the backward for
+        // those reduces an entire axis to a single element, which is
+        // gather-into-diagonal, not a standard einsum contraction.
         if (DifferentiableOps.IsRecording<T>()
-            && tensors.Length >= 2
             && !HasDiagonalOperand(equation))
         {
             DifferentiableOps.RecordIfActive(
@@ -23659,10 +23658,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"MaskedSelect requires mask shape [{string.Join(", ", mask._shape)}] " +
                 $"to match tensor shape [{string.Join(", ", tensor._shape)}].");
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Preserve the original tensor/mask for autograd binding so gradients
+        // flow back to the caller's input, not to transient contiguous copies.
+        var inputTensor = tensor;
+        var computeTensor = tensor.IsContiguous ? tensor : tensor.Contiguous();
+        var computeMask = mask.IsContiguous ? mask : mask.Contiguous();
 
-        var src = tensor.AsSpan();
-        var maskSpan = mask.AsSpan();
+        var src = computeTensor.AsSpan();
+        var maskSpan = computeMask.AsSpan();
         // First pass: count true entries.
         int n = 0;
         for (int i = 0; i < maskSpan.Length; i++) if ((bool)maskSpan[i]) n++;
@@ -23677,9 +23680,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary(
-            "TensorMaskedSelect", result, tensor,
+            "TensorMaskedSelect", result, inputTensor,
             BackwardFunctions<T>.MaskedSelectBackward,
-            savedState: new object[] { mask, tensor._shape });
+            savedState: new object[] { computeMask, (int[])inputTensor._shape.Clone() });
         return result;
     }
 

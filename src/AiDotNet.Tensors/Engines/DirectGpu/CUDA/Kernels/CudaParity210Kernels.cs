@@ -593,12 +593,13 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_digamma(
     if (idx >= size) return;
     float x = input[idx];
     float result = 0.0f;
-    // ψ(x) = ψ(x+1) - 1/x, shift until x >= 6
-    while (x < 6.0f) {
+    // psi(x) = psi(x+1) - 1/x, shift until x >= 6.  Bounded for-loop —
+    // x += 1.0f never advances -INFINITY, so an unbounded while would hang.
+    for (int step = 0; step < 64 && x < 6.0f; ++step) {
         result -= 1.0f / x;
         x += 1.0f;
     }
-    // Asymptotic: ψ(x) ≈ ln(x) - 1/(2x) - sum B_{2k} / (2k·x^{2k})
+    // Asymptotic: psi(x) ~ ln(x) - 1/(2x) - sum B_{2k} / (2k * x^{2k})
     float inv = 1.0f / x;
     float inv2 = inv * inv;
     result += logf(x) - 0.5f * inv

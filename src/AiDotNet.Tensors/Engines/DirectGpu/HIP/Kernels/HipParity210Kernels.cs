@@ -502,7 +502,9 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_digamma(
     if (idx >= size) return;
     float x = input[idx];
     float result = 0.0f;
-    while (x < 6.0f) { result -= 1.0f / x; x += 1.0f; }
+    // Bounded for-loop — x += 1.0f never advances -INFINITY, so an
+    // unbounded while would hang the kernel.
+    for (int step = 0; step < 64 && x < 6.0f; ++step) { result -= 1.0f / x; x += 1.0f; }
     float inv = 1.0f / x;
     float inv2 = inv * inv;
     result += logf(x) - 0.5f * inv

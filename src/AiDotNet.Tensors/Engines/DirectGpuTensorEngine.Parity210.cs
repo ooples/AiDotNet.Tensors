@@ -334,6 +334,13 @@ public partial class DirectGpuTensorEngine
             {
                 int rank = tensor.Rank;
                 if (axis < 0) axis += rank;
+                // Validate the normalised axis BEFORE indexing _shape so an
+                // out-of-range axis (e.g. -rank-1 which normalises to -1)
+                // falls through to the CPU reference path — which throws the
+                // canonical ArgumentOutOfRangeException — instead of picking
+                // up a wrong axis silently.
+                if (axis < 0 || axis >= rank)
+                    return base.TensorCumSum(tensor, axis);
                 int outer = 1; for (int i = 0; i < axis; i++) outer *= tensor._shape[i];
                 int axisSize = tensor._shape[axis];
                 int inner = 1; for (int i = axis + 1; i < rank; i++) inner *= tensor._shape[i];
