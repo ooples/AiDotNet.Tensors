@@ -174,13 +174,51 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
             isDepthwise ? "FusedDepthwiseConvBn" : "FusedConvBnReLU",
             (eng, output) =>
             {
+                // Path C write-through for the Conv+BN(+Activation) fused
+                // step. Previously allocated a fresh result tensor via
+                // Conv2D / FusedConv2D, then CopyTo'd into the plan's
+                // pre-allocated output — ~100 µs of redundant memory
+                // traffic per ResNet Conv.
+                if (!isDepthwise && eng is CpuEngine cpuEngNonDw)
+                {
+                    // Conv2DInto writes directly to output; then fused
+                    // bias + activation in a single SIMD NCHW pass.
+                    cpuEngNonDw.Conv2DInto(output, capturedInput, capturedFusedWeights,
+                        capturedStrides, capturedPaddings, capturedDilations);
+                    if (output.Rank == 4)
+                    {
+                        int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
+                        var outArr = (float[])(object)output.GetDataArray();
+                        var biasArr = (float[])(object)((Tensor<T>)(object)capturedFusedBias).GetDataArray();
+                        if (capturedActivation == FusedActivationType.None
+                            || capturedActivation == FusedActivationType.ReLU)
+                        {
+                            CpuFusedOperations.ApplyBiasActivationNCHWInPlace(
+                                outArr, biasArr, N, C, H, W, capturedActivation);
+                            return;
+                        }
+                        // Other activations: bias via SIMD, activation via the
+                        // generic in-place helper (ApplyFusedActivationInPlace
+                        // isn't NCHW-aware, so we invoke it on the full tensor).
+                        CpuFusedOperations.ApplyBiasActivationNCHWInPlace(
+                            outArr, biasArr, N, C, H, W, FusedActivationType.None);
+                        // Non-Relu activation: flat 2D epilogue over the
+                        // bias-added output (bias already applied; just
+                        // activation needed). Using ApplyBiasActivationInPlace
+                        // with null bias gives us SIMD Relu/GELU or scalar
+                        // fallback for other activations.
+                        CpuFusedOperations.ApplyBiasActivationInPlace(
+                            outArr, null, N * C, H * W, capturedActivation);
+                        return;
+                    }
+                }
+
+                // Fallback for depthwise / non-CpuEngine / non-rank-4.
                 Tensor<T> result;
                 if (isDepthwise)
                 {
-                    // DepthwiseConv2D with fused BN weights (no FusedConv2D for depthwise)
                     result = eng.DepthwiseConv2D(capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings);
-                    // Add fused bias manually
                     result = eng.TensorBroadcastAdd(result, capturedFusedBias);
                 }
                 else if (capturedActivation != FusedActivationType.None)
@@ -192,7 +230,6 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 {
                     result = eng.Conv2D(capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings, capturedDilations);
-                    // Add the fused BN bias (Conv2D alone doesn't include bias)
                     result = eng.TensorBroadcastAdd(result, capturedFusedBias);
                 }
 
