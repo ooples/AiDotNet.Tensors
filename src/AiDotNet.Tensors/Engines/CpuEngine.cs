@@ -8861,19 +8861,21 @@ public class CpuEngine : ITensorLevelEngine
         var bArr = b.GetDataArray();
         var oArr = output.GetDataArray();
 
-        // 2D × 2D
+        // 2D × 2D — route through cached-B path (Path A: pre-pack weights)
         if (a.Rank == 2 && b.Rank == 2)
         {
             int m = a._shape[0], k = a._shape[1], n = b._shape[1];
-            Simd.SimdGemm.Sgemm(
+            Simd.SimdGemm.SgemmWithCachedB(
                 new System.ReadOnlySpan<float>(aArr, 0, m * k),
-                new System.ReadOnlySpan<float>(bArr, 0, k * n),
+                bArr,
                 new System.Span<float>(oArr, 0, m * n),
                 m, k, n);
             return;
         }
 
         // ND × 2D: collapse batch dims into m (mirrors TensorMatMulBatched fast path)
+        // Also routes through cached-B — B is the constant weight across all
+        // batch items and across all forward calls.
         if (b.Rank == 2)
         {
             int aRank = a.Rank;
@@ -8882,10 +8884,9 @@ public class CpuEngine : ITensorLevelEngine
             int n = b._shape[1];
             int batchSize = 1;
             for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
-            // One big GEMM: [batchSize*m, k] × [k, n] = [batchSize*m, n]
-            Simd.SimdGemm.Sgemm(
+            Simd.SimdGemm.SgemmWithCachedB(
                 new System.ReadOnlySpan<float>(aArr, 0, batchSize * m * k),
-                new System.ReadOnlySpan<float>(bArr, 0, k * n),
+                bArr,
                 new System.Span<float>(oArr, 0, batchSize * m * n),
                 batchSize * m, k, n);
             return;

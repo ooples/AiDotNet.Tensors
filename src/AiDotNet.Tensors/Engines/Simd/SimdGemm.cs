@@ -76,6 +76,285 @@ internal static class SimdGemm
     // Intended for benchmark A/B iteration, not production config.
     internal static bool UseParallelGemm = true;
 
+#if NET5_0_OR_GREATER
+    // ─── Path A: pre-packed B cache ────────────────────────────────────────
+    //
+    // ONNX inference calls MatMul with the SAME B (initializer weights) on
+    // every forward pass. PackB re-packs B's panels identically every call.
+    // SgemmRootCauseDiag measured PackB as 18-20% of Sgemm wall time on
+    // BERT FFN shapes — effectively free performance if we cache it.
+    //
+    // The cache keys on the B float[] object identity via
+    // ConditionalWeakTable, so GC still collects when the weight tensor
+    // is released. Cache entry holds per-(pcIter, csIdx) packed buffers
+    // matching the layout SgemmTiledParallel2D would produce, with a
+    // metadata snapshot so shape/threading changes trigger re-pack.
+
+    internal sealed class PrePackedB
+    {
+        internal int K;
+        internal int N;
+        internal int Kc;
+        internal int Mc;                   // for row-block count consistency
+        internal int NumColSubBlocks;
+        internal int ColSubSize;
+        // Per (pcIter, csIdx), the packed buffer.
+        // Flat index: pcIter * NumColSubBlocks + csIdx.
+        internal float[][] PackedSubs = System.Array.Empty<float[]>();
+        internal int NumPcIters;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
+
+    /// <summary>
+    /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
+    /// full set of per-(pcIter, csIdx) packed buffers. Called on cache miss.
+    /// </summary>
+    private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
+    {
+        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int numPcIters = (k + Kc - 1) / Kc;
+
+        // Mirror SgemmTiledParallel2D's numColSubs adaptive choice at jc=0
+        int nc0 = System.Math.Min(Nc, n);
+        int desiredColSubs = System.Math.Max(1, maxThreads / numRowBlocks);
+        int maxColSubs = System.Math.Max(1, nc0 / (Nr * 4));
+        int numColSubBlocks = System.Math.Min(desiredColSubs, maxColSubs);
+        int colSubSize = (nc0 / numColSubBlocks / Nr) * Nr;
+        if (colSubSize < Nr)
+        {
+            colSubSize = nc0;
+            numColSubBlocks = 1;
+        }
+
+        int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
+        int lastColSubWidth = nc0 - (numColSubBlocks - 1) * colSubSize;
+        int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
+        int packedBSizePerSub = Kc * System.Math.Max(colSubRounded, lastColSubRounded);
+
+        var packedSubs = new float[numPcIters * numColSubBlocks][];
+        var bSpan = new System.ReadOnlySpan<float>(b);
+        for (int pcIter = 0; pcIter < numPcIters; pcIter++)
+        {
+            int pc = pcIter * Kc;
+            int kc = System.Math.Min(Kc, k - pc);
+            for (int cs = 0; cs < numColSubBlocks; cs++)
+            {
+                int jStart = cs * colSubSize;
+                int subNc = (cs == numColSubBlocks - 1) ? (nc0 - jStart) : colSubSize;
+                var buf = new float[packedBSizePerSub];
+                PackB(bSpan, buf, n, pc, kc, jStart, subNc);
+                packedSubs[pcIter * numColSubBlocks + cs] = buf;
+            }
+        }
+
+        return new PrePackedB
+        {
+            K = k, N = n, Kc = Kc, Mc = Mc,
+            NumColSubBlocks = numColSubBlocks,
+            ColSubSize = colSubSize,
+            PackedSubs = packedSubs,
+            NumPcIters = numPcIters,
+        };
+    }
+
+    /// <summary>
+    /// Compute C = A·B using a cached pre-packed B keyed on the B array's
+    /// object identity. On cache miss, pre-packs B and stores. On hit,
+    /// skips the PackB work entirely (18-20% of Sgemm time saved on BERT
+    /// FFN shapes).
+    ///
+    /// <para>Requirements for cache hit: same B array identity AND same
+    /// (k, n) shape AND same (m) row-block count as the cached build.
+    /// Jc is assumed to be 0 and nc = n (single jc-pass) — which holds
+    /// for all shapes where n ≤ Nc = 4096, including every BERT MatMul.
+    /// Falls through to standard Sgemm for shapes outside this band.</para>
+    /// </summary>
+    public static void SgemmWithCachedB(
+        System.ReadOnlySpan<float> a,
+        float[] b,
+        System.Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+
+        // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
+        // times and our single-jc assumption breaks. Also skip if AVX-512 path is
+        // eligible (the specialised kernel's layout differs).
+        if (n > Nc || Avx512Sgemm.CanUse)
+        {
+            SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
+                allowParallel: true, clearedOutput: true);
+            return;
+        }
+
+        _prePackedBCache.TryGetValue(b, out var existing);
+        int expectedMc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        PrePackedB cached;
+        if (existing is null
+            || existing.K != k || existing.N != n
+            || existing.Mc != expectedMc)
+        {
+            if (existing is not null) _prePackedBCache.Remove(b);
+            cached = BuildPrePackedB(b, k, n, m);
+            _prePackedBCache.Add(b, cached);
+        }
+        else
+        {
+            cached = existing;
+        }
+
+        SgemmTiledWithCached(a, cached, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Tiled SGEMM using a pre-packed B. Mirrors SgemmTiled's jc/pc outer
+    /// loop but reuses <see cref="PrePackedB.PackedSubs"/> instead of
+    /// packing each call. Only PackA runs per-call (A is the activations,
+    /// which vary).
+    /// </summary>
+    private static unsafe void SgemmTiledWithCached(
+        System.ReadOnlySpan<float> a,
+        PrePackedB cached,
+        System.Span<float> c,
+        int m, int k, int n)
+    {
+        int Mc = cached.Mc;
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        bool canParallelize = UseParallelGemm
+            && maxThreads > 1
+            && numRowBlocks >= 1
+            && (long)m * k * n >= ParallelWorkThreshold;
+
+        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
+        int packedASizePerRow = mcRounded * Kc;
+        float[] packedABuf = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
+        if (canParallelize)
+        {
+            for (int r = 0; r < numRowBlocks; r++)
+                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        }
+
+        try
+        {
+            int jc = 0;
+            int nc = System.Math.Min(Nc, n);
+
+            for (int pcIter = 0; pcIter < cached.NumPcIters; pcIter++)
+            {
+                int pc = pcIter * Kc;
+                int kc = System.Math.Min(Kc, k - pc);
+
+                int subsBase = pcIter * cached.NumColSubBlocks;
+
+                if (canParallelize && cached.NumColSubBlocks >= 2)
+                {
+                    // 2D parallel: row blocks × col subs
+                    int localNumRowBlocks = numRowBlocks;
+                    int localMc = Mc;
+                    int localM = m;
+                    int localK = k;
+                    int localN = n;
+                    int localPc = pc;
+                    int localKc = kc;
+                    int localColSubSize = cached.ColSubSize;
+                    int localNumColSubs = cached.NumColSubBlocks;
+                    int localNc = nc;
+                    var localPackedABufs = packedABufs!;
+                    var localCachedSubs = cached.PackedSubs;
+                    int localSubsBase = subsBase;
+
+                    fixed (float* aPtr0 = a)
+                    fixed (float* cPtr0 = c)
+                    {
+                        float* localAPtr = aPtr0;
+                        int localALen = a.Length;
+                        float* localCPtr = cPtr0;
+                        int localCLen = c.Length;
+
+                        // Phase 1: pack A only (B already cached)
+                        Helpers.CpuParallelSettings.LightweightParallel(localNumRowBlocks, taskId =>
+                        {
+                            int r = taskId;
+                            int ic = r * localMc;
+                            int mcLocal = System.Math.Min(localMc, localM - ic);
+                            if (mcLocal > 0)
+                            {
+                                var aSpan = new System.ReadOnlySpan<float>(localAPtr, localALen);
+                                PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
+                            }
+                        });
+
+                        // Phase 2: compute
+                        int totalTiles = localNumRowBlocks * localNumColSubs;
+                        Helpers.CpuParallelSettings.LightweightParallel(totalTiles, tileId =>
+                        {
+                            int r = tileId / localNumColSubs;
+                            int cs = tileId % localNumColSubs;
+                            int ic = r * localMc;
+                            int mcLocal = System.Math.Min(localMc, localM - ic);
+                            int jStart = cs * localColSubSize;
+                            int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
+                            if (mcLocal > 0 && subNc > 0)
+                            {
+                                var cSpan = new System.Span<float>(localCPtr, localCLen);
+                                MacroKernel(
+                                    localPackedABufs[r], localCachedSubs[localSubsBase + cs],
+                                    cSpan, mcLocal, subNc, localKc, localN,
+                                    ic, jc + jStart);
+                            }
+                        });
+                    }
+                }
+                else
+                {
+                    // Sequential fallback
+                    PackA(a, packedABuf, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
+                    for (int ic = 0; ic < m; ic += Mc)
+                    {
+                        int mc = System.Math.Min(Mc, m - ic);
+                        if (ic > 0)
+                            PackA(a, packedABuf, k, false, ic, mc, pc, kc);
+
+                        for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
+                        {
+                            int jStart = cs * cached.ColSubSize;
+                            int subNc = (cs == cached.NumColSubBlocks - 1) ? (nc - jStart) : cached.ColSubSize;
+                            if (subNc > 0)
+                                MacroKernel(
+                                    packedABuf, cached.PackedSubs[subsBase + cs],
+                                    c, mc, subNc, kc, n,
+                                    ic, jc + jStart);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
+            if (packedABufs is not null)
+            {
+                for (int r = 0; r < numRowBlocks; r++)
+                    System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
+            }
+        }
+    }
+
+#else
+    // net471 fallback: no cache, just call the uncached path.
+    public static void SgemmWithCachedB(
+        System.ReadOnlySpan<float> a, float[] b, System.Span<float> c,
+        int m, int k, int n)
+    {
+        Sgemm(a, b.AsSpan(), c, m, k, n);
+    }
+#endif
+
     // Minimum problem size (m*n*k, count as flops/2) to enable parallel dispatch.
     // Iter 2 (2026-04-11): raised 4M → 20M after measuring that 256² (16.8M) regressed
     // with parallel on a 16-core Ryzen 9 3950X — thread-pool dispatch overhead scales
