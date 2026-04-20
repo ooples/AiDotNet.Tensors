@@ -7982,7 +7982,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Swish, "Swish", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.Swish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => eng.SwishInto(output, captured),
                     BackwardFunctions<T>.SwishBackward);
             }
         }
@@ -8770,7 +8770,27 @@ public class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMul", a, b, outShape,
-                    (eng, output) => { var eager = eng.TensorMatMul(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: write-through. BERT has 72 MatMul calls per
+                    // layer, each allocating + copying its output (786 KB
+                    // to 9 MB depending on shape). Eliminating the CopyTo
+                    // saves ~12 ms of aggregate redundant memory traffic
+                    // per BERT inference. TensorMatMulInto dispatches the
+                    // 2D/ND×2D/ND×ND cases to write-through kernels.
+                    (eng, output) =>
+                    {
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.TensorMatMulFloatInto(
+                                (Tensor<float>)(object)capturedA,
+                                (Tensor<float>)(object)capturedB,
+                                (Tensor<float>)(object)output);
+                        }
+                        else
+                        {
+                            var eager = eng.TensorMatMul(capturedA, capturedB);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
                     BackwardFunctions<T>.MatMulBackward);
             }
         }
@@ -8816,6 +8836,97 @@ public class CpuEngine : ITensorLevelEngine
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMatMul", result, eng => eng.TensorMatMul(ca, cb)); }
 
         return result;
+    }
+
+    /// <summary>
+    /// Write-through TensorMatMul for float: writes directly into the provided
+    /// <paramref name="output"/> tensor, skipping the intermediate allocation
+    /// + <c>CopyTo</c> that the public <see cref="TensorMatMul{T}"/> routes
+    /// through when called from a compiled plan step. Used by the Path C
+    /// plan-step lambda (captured in GraphMode-active LazyGraph recording).
+    ///
+    /// <para>Dispatch mirrors <see cref="TensorMatMul{T}"/>:</para>
+    /// <list type="bullet">
+    ///   <item>2D×2D: SGEMM directly into output (uses MatMulInto semantics)</item>
+    ///   <item>ND×2D: collapse to 2D GEMM [batch*m, k]×[k,n], single SGEMM</item>
+    ///   <item>ND×ND (same rank): parallel loop over batches, Sgemm/SgemmSequential</item>
+    /// </list>
+    /// </summary>
+    internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
+    {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var oArr = output.GetDataArray();
+
+        // 2D × 2D
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+            Simd.SimdGemm.Sgemm(
+                new System.ReadOnlySpan<float>(aArr, 0, m * k),
+                new System.ReadOnlySpan<float>(bArr, 0, k * n),
+                new System.Span<float>(oArr, 0, m * n),
+                m, k, n);
+            return;
+        }
+
+        // ND × 2D: collapse batch dims into m (mirrors TensorMatMulBatched fast path)
+        if (b.Rank == 2)
+        {
+            int aRank = a.Rank;
+            int m = a._shape[aRank - 2];
+            int k = a._shape[aRank - 1];
+            int n = b._shape[1];
+            int batchSize = 1;
+            for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
+            // One big GEMM: [batchSize*m, k] × [k, n] = [batchSize*m, n]
+            Simd.SimdGemm.Sgemm(
+                new System.ReadOnlySpan<float>(aArr, 0, batchSize * m * k),
+                new System.ReadOnlySpan<float>(bArr, 0, k * n),
+                new System.Span<float>(oArr, 0, batchSize * m * n),
+                batchSize * m, k, n);
+            return;
+        }
+
+        // ND × ND (same rank): parallel per-batch SGEMM (mirrors
+        // TensorMatMulFullBatched's float fast path + BatchMatMul's
+        // batchSize-aware dispatch: batch=1 → Sgemm, batch≥2 → Parallel+Sequential)
+        if (a.Rank == b.Rank)
+        {
+            int rank = a.Rank;
+            int m = a._shape[rank - 2];
+            int k = a._shape[rank - 1];
+            int n = b._shape[rank - 1];
+            int batchSize = 1;
+            for (int i = 0; i < rank - 2; i++) batchSize *= a._shape[i];
+            int sliceA = m * k, sliceB = k * n, sliceC = m * n;
+            if (batchSize == 1)
+            {
+                Simd.SimdGemm.Sgemm(
+                    new System.ReadOnlySpan<float>(aArr, 0, sliceA),
+                    new System.ReadOnlySpan<float>(bArr, 0, sliceB),
+                    new System.Span<float>(oArr, 0, sliceC),
+                    m, k, n);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, batch =>
+                {
+                    Simd.SimdGemm.SgemmSequential(
+                        new System.ReadOnlySpan<float>(aArr, batch * sliceA, sliceA),
+                        new System.ReadOnlySpan<float>(bArr, batch * sliceB, sliceB),
+                        new System.Span<float>(oArr, batch * sliceC, sliceC),
+                        m, k, n);
+                });
+            }
+            return;
+        }
+
+        throw new ArgumentException(
+            $"TensorMatMulFloatInto: unsupported rank combination {a.Rank} and {b.Rank}");
     }
 
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
@@ -13159,7 +13270,10 @@ public class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Softmax, "Softmax", input, input._shape,
-                    (eng, output) => { var eager = eng.Softmax(captured, capturedAxis); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: write-through via SoftmaxInto when possible.
+                    // Skips the alloc-copy round-trip through Softmax's
+                    // public API (~100 µs saved on BERT [1,12,256,256]).
+                    (eng, output) => eng.SoftmaxInto(output, captured, capturedAxis),
                     BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             }
         }
@@ -14897,7 +15011,30 @@ public class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(savedScope);
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: plan-step write-through. When the engine is
+                    // CpuEngine and T is float, call LayerNormFloatInto which
+                    // writes directly into the plan's pre-allocated output.
+                    // This skips the intermediate tensor allocation + the
+                    // 786 KB CopyTo that the generic path below would incur
+                    // for BERT's [1,256,768] LayerNorm (~130 µs saved per
+                    // call × 24 calls per BERT layer).
+                    (eng, output) =>
+                    {
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.LayerNormFloatInto(
+                                (Tensor<float>)(object)ci,
+                                (Tensor<float>)(object)cg,
+                                (Tensor<float>)(object)cb,
+                                ce,
+                                (Tensor<float>)(object)output);
+                        }
+                        else
+                        {
+                            var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _);
+                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -15032,6 +15169,50 @@ public class CpuEngine : ITensorLevelEngine
             BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
         AutoTracer.RecordOp("LayerNorm", lnResultG, eng => lnResultG);
         return lnResultG;
+    }
+
+    /// <summary>
+    /// Write-through LayerNorm for float inference: writes directly into the
+    /// provided <paramref name="output"/> tensor instead of allocating a new
+    /// one. Used by compiled plan steps so the plan-step lambda doesn't have
+    /// to call the public <see cref="LayerNorm{T}"/> (which allocates an
+    /// intermediate tensor) then <c>CopyTo</c> into the pre-allocated plan
+    /// buffer. For BERT LayerNorm [1,256,768] this saves ~130 µs per call
+    /// (50 µs allocation + 80 µs 786 KB CopyTo at 10 GB/s).
+    ///
+    /// <para>Skips mean/variance allocation — inference doesn't need them.
+    /// Scratch is rented from ArrayPool.</para>
+    /// </summary>
+    internal void LayerNormFloatInto(
+        Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
+        double epsilon, Tensor<float> output)
+    {
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
+        int batchSize = 1;
+        for (int i = 0; i < inputRank - normalizedDims; i++)
+            batchSize *= input._shape[i];
+        if (batchSize == 0) batchSize = 1;
+        int featureSize = gamma.Length;
+
+        var fInput  = input .GetDataArray();
+        var fGamma  = gamma .GetDataArray();
+        var fBeta   = beta  .GetDataArray();
+        var fOutput = output.GetDataArray();
+        float fEps = (float)epsilon;
+
+        var fMean = System.Buffers.ArrayPool<float>.Shared.Rent(batchSize);
+        var fVar  = System.Buffers.ArrayPool<float>.Shared.Rent(batchSize);
+        try
+        {
+            ProcessBatchesSimd(fInput, fGamma, fBeta, fOutput, fMean, fVar,
+                batchSize, featureSize, fEps);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(fVar);
+            System.Buffers.ArrayPool<float>.Shared.Return(fMean);
+        }
     }
 
     /// <summary>

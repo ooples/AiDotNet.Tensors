@@ -83,6 +83,9 @@ public class LayerNormRootCauseDiag
         double t3 = TimeCpuEngineLayerNorm(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [7] CpuEngine.LayerNorm (full public API):      {t3:F1} µs/call");
 
+        double t8 = TimeCpuEngineLayerNormInto(input, gamma, beta, batch, feat);
+        _output.WriteLine($"  [8] CpuEngine.LayerNormFloatInto (write-thru):  {t8:F1} µs/call");
+
         _output.WriteLine("");
         _output.WriteLine($"  Parallel.For overhead (scalar {t1:F0} → {t2:F0}): saves {t1 - t2:F0} µs");
         _output.WriteLine($"  SIMD gain at serial (scalar {t1:F0} → SIMD {t1s:F0}): saves {t1 - t1s:F0} µs");
@@ -356,6 +359,31 @@ public class LayerNormRootCauseDiag
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < Iters; i++)
             _ = engine.LayerNorm(xT, gT, bT, 1e-5, out _, out _);
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
+    }
+
+    // Write-through variant — simulates the ONNX plan-step path where the
+    // output buffer is pre-allocated by the plan and we skip the allocation
+    // + CopyTo overhead of the public API.
+    private static double TimeCpuEngineLayerNormInto(
+        float[] input, float[] gamma, float[] beta, int batch, int fs)
+    {
+        var engine = new CpuEngine();
+        var xT = new Tensor<float>(new[] { 1, batch, fs });
+        var gT = new Tensor<float>(new[] { fs });
+        var bT = new Tensor<float>(new[] { fs });
+        var outT = new Tensor<float>(new[] { 1, batch, fs });  // pre-allocated output
+        input.AsSpan().CopyTo(xT.AsWritableSpan());
+        gamma.AsSpan().CopyTo(gT.AsWritableSpan());
+        beta .AsSpan().CopyTo(bT.AsWritableSpan());
+
+        for (int i = 0; i < Warmup; i++)
+            engine.LayerNormFloatInto(xT, gT, bT, 1e-5, outT);
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Iters; i++)
+            engine.LayerNormFloatInto(xT, gT, bT, 1e-5, outT);
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
     }
