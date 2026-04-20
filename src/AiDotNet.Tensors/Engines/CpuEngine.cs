@@ -9385,8 +9385,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // im2col builds B as [K, N] per-image so GEMM produces [outC, N].
         // We allocate one col buffer per image and reuse via a thread-local
         // pool to avoid per-batch allocations hot-path.
-        // For small K*N totals we do the whole batch sequentially; for large
-        // we parallelize across batch.
+        //
+        // Parallel-batch policy: we ONLY parallelize across the batch axis
+        // for small per-image GEMMs. When the per-image GEMM is large enough
+        // (>= 50M FLOPs per image), the inner SgemmBlocked already
+        // parallelizes across K and saturates cores — adding an outer
+        // Parallel.For would double-dip and waste threads. For small
+        // per-image work, the inner GEMM can't usefully parallelize, so
+        // batch-level parallelism is how we get thread-scaling.
         long perImageCost = (long)outC * K * N;
         bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
 

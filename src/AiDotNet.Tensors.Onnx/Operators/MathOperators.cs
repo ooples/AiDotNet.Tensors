@@ -62,6 +62,18 @@ internal static class MathOperators
         public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
         {
             var shapeT = ctx.GetTensor(node.Input[0]);
+            // ConstantOfShape's output shape is defined by the input tensor's
+            // *contents*. If the input is a graph-input placeholder its trace-
+            // time contents are just whatever memory the placeholder was
+            // allocated with — materializing that would bake stale shape values
+            // into the plan. Fail fast with a clear error until a lazy-shape
+            // path is wired.
+            if (shapeT.LazySource is null && ctx.IsPlaceholderInput(node.Input[0]))
+                throw new NotSupportedException(
+                    $"ConstantOfShape input '{node.Input[0]}' is a runtime placeholder; " +
+                    "only constant-initializer or compile-time-known shape inputs are " +
+                    "supported in this importer.");
+
             var shapeSpan = shapeT.AsSpan();
             var shape = new int[shapeSpan.Length];
             for (int i = 0; i < shapeSpan.Length; i++) shape[i] = Convert.ToInt32(shapeSpan[i]!);
@@ -426,13 +438,12 @@ internal static class MathOperators
         }
 
         private static bool IsDynamicInput(OnnxTranslationContext<T> ctx, string name) =>
-            // We don't have the dynamicTensorNames set inside the translator,
-            // but LazySource is a good enough proxy — graph-input placeholders
-            // have no LazySource BUT they haven't been filled yet at trace
-            // time. Using scope!=null as a trigger for the lazy path is
-            // sufficient for import-time correctness: the LazyNode's closure
-            // runs at Execute time and reads whatever's in the tensor then.
-            false;
+            // Graph-input placeholders are allocated at import time but their
+            // contents are written by the caller before each Execute. Routing
+            // them down the eager OneHot path would freeze trace-time zeros
+            // (or whatever the placeholder happens to contain at import) into
+            // the compiled plan.
+            ctx.IsPlaceholderInput(name);
 
         private static void Scatter(
             ReadOnlySpan<T> indexSpan, int[] indicesShape,

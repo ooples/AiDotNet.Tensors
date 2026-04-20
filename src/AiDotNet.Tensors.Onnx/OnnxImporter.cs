@@ -142,7 +142,7 @@ public static class OnnxImporter
         var registry = OnnxOpTranslatorRegistry<T>.BuildDefault();
         // Let callers add/override translators via the options hook so they
         // can plug in custom-op handlers without forking the importer.
-        options.ConfigureRegistry?.Invoke(registry);
+        options.ApplyConfigureRegistry(registry);
         var unsupported = new List<string>();
 
         // First pass: catalog unsupported operators. If any, we return early
@@ -206,7 +206,12 @@ public static class OnnxImporter
                 var o = model.OpsetImport[i];
                 if (string.IsNullOrEmpty(o.Domain)) { defaultOpset = o.Version; break; }
             }
-            var ctx = new OnnxTranslationContext<T>(engine, tensorsByName, options, defaultOpset);
+            // Track graph-input placeholder names so translators can distinguish
+            // runtime-filled inputs from constant initializers (ops whose
+            // semantics depend on runtime content — OneHot indices,
+            // ConstantOfShape shape — need the lazy path).
+            var placeholderInputs = new HashSet<string>(inputTensors.Keys, StringComparer.Ordinal);
+            var ctx = new OnnxTranslationContext<T>(engine, tensorsByName, options, defaultOpset, placeholderInputs);
             for (int i = 0; i < sortedNodes.Count; i++)
             {
                 var node = sortedNodes[i];

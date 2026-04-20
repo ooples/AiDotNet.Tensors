@@ -66,9 +66,21 @@ internal static class TensorManipOperators
                 ctx.PutTensor(node.Output[0], ctx.Engine.TensorMultiply(sign, floored));
                 return;
             }
-            // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16) and BOOL: pass
-            // through. For bool, downstream ops typically consume 0/1 floats
-            // via our Not / Where translators.
+            if (to == 9)
+            {
+                // BOOL: normalize to 0/1. Forwarding the raw tensor preserved
+                // magnitudes (-3, 2, etc.), which broke downstream consumers
+                // that expected boolean {0, 1} — a subsequent Cast(…, INT) or
+                // arithmetic Where/Not would silently use the wrong values.
+                // Emit (x != 0) → 1 else 0 via sign-of-abs:
+                //   |x| > 0 ⇒ sign(|x|) == 1 ; |x| == 0 ⇒ sign == 0.
+                var absX = ctx.Engine.TensorAbs(x);
+                var normalized = ctx.Engine.TensorSign(absX);
+                ctx.PutTensor(node.Output[0], normalized);
+                return;
+            }
+            // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16): pass through
+            // since our plan represents every tensor as the same T.
             ctx.PutTensor(node.Output[0], x);
         }
     }

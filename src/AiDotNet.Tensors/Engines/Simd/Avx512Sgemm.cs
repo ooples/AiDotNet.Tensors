@@ -79,23 +79,29 @@ internal static class Avx512Sgemm
         float* cPtr, int ldc,
         int k)
     {
-        // Load 16 accumulator registers from C (C += A*B semantics).
-        var acc00 = Vector512.Load(cPtr + 0  * ldc);
-        var acc01 = Vector512.Load(cPtr + 1  * ldc);
-        var acc02 = Vector512.Load(cPtr + 2  * ldc);
-        var acc03 = Vector512.Load(cPtr + 3  * ldc);
-        var acc04 = Vector512.Load(cPtr + 4  * ldc);
-        var acc05 = Vector512.Load(cPtr + 5  * ldc);
-        var acc06 = Vector512.Load(cPtr + 6  * ldc);
-        var acc07 = Vector512.Load(cPtr + 7  * ldc);
-        var acc08 = Vector512.Load(cPtr + 8  * ldc);
-        var acc09 = Vector512.Load(cPtr + 9  * ldc);
-        var acc10 = Vector512.Load(cPtr + 10 * ldc);
-        var acc11 = Vector512.Load(cPtr + 11 * ldc);
-        var acc12 = Vector512.Load(cPtr + 12 * ldc);
-        var acc13 = Vector512.Load(cPtr + 13 * ldc);
-        var acc14 = Vector512.Load(cPtr + 14 * ldc);
-        var acc15 = Vector512.Load(cPtr + 15 * ldc);
+        // Accumulators start from zero to match the SgemmBlocked dispatch
+        // contract (clearedOutput: true → C = A*B, not C += A*B). Reading
+        // from C was a latent bug: while C IS zero when the caller honours
+        // the contract, any stale content (incomplete clear, future call
+        // path that passes clearedOutput: false) would silently produce
+        // C_new = C_stale + A*B. Zero-start removes that coupling and saves
+        // 16 unnecessary loads per tile.
+        var acc00 = Vector512<float>.Zero;
+        var acc01 = Vector512<float>.Zero;
+        var acc02 = Vector512<float>.Zero;
+        var acc03 = Vector512<float>.Zero;
+        var acc04 = Vector512<float>.Zero;
+        var acc05 = Vector512<float>.Zero;
+        var acc06 = Vector512<float>.Zero;
+        var acc07 = Vector512<float>.Zero;
+        var acc08 = Vector512<float>.Zero;
+        var acc09 = Vector512<float>.Zero;
+        var acc10 = Vector512<float>.Zero;
+        var acc11 = Vector512<float>.Zero;
+        var acc12 = Vector512<float>.Zero;
+        var acc13 = Vector512<float>.Zero;
+        var acc14 = Vector512<float>.Zero;
+        var acc15 = Vector512<float>.Zero;
 
         for (int kk = 0; kk < k; kk++)
         {
