@@ -22,7 +22,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// - Third dimension: color channels (red, green, blue)
 /// </para>
 /// </remarks>
-public class Tensor<T> : TensorBase<T>, IEnumerable<T>
+public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 {
     /// <summary>
     /// Accumulated gradient from backward passes. Null until first backward, then
@@ -159,37 +159,136 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
-        // Materialize: copy data from strided layout to contiguous row-major
         var result = new Tensor<T>(_shape);
-        var srcData = _data.GetDataArray();
-        var dstData = result._data.AsWritableSpan();
+        var dstSpan = result._data.AsWritableSpan();
 
         if (IsContiguous)
         {
             // Contiguous with offset — simple bulk copy
-            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstData);
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstSpan);
+            return result;
         }
-        else
-        {
-            // Non-contiguous — use cached row-major strides to decompose flat index
-            var rowMajorStrides = RowMajorStrides;
 
-            for (int i = 0; i < Length; i++)
+        // Non-contiguous materialization — "odometer" stride walk.
+        // Previous implementation decomposed each flat destination index via
+        // N divisions per element, which dominated DiT forward wall clock
+        // whenever a permuted/sliced tensor reached a Contiguous() call (the
+        // SelfAttention output → DenseLayer.Forward path hits this). The
+        // odometer replaces N divisions with at most one per-axis increment:
+        // each step rolls the counter like a car odometer, and srcIdx tracks
+        // the current strided source offset incrementally — no divisions at
+        // all on the hot path.
+        var srcSpan = _data.AsSpan();
+        int rank = Rank;
+        int length = Length;
+        if (rank == 0 || length == 0) return result;
+
+        Span<int> counter = stackalloc int[rank];
+        int srcIdx = _storageOffset;
+        for (int flat = 0; flat < length; flat++)
+        {
+            dstSpan[flat] = srcSpan[srcIdx];
+
+            // Increment counter with rightmost-axis carry, and update srcIdx
+            // incrementally using the stride deltas so no mul/div is required
+            // except on a wrap.
+            for (int d = rank - 1; d >= 0; d--)
             {
-                int srcIdx = _storageOffset;
-                int remaining = i;
-                for (int d = 0; d < Rank; d++)
-                {
-                    int dimIndex = remaining / rowMajorStrides[d];
-                    remaining -= dimIndex * rowMajorStrides[d];
-                    srcIdx += dimIndex * _strides[d];
-                }
-                dstData[i] = srcData[srcIdx];
+                counter[d]++;
+                srcIdx += _strides[d];
+                if (counter[d] < _shape[d]) break;
+                counter[d] = 0;
+                srcIdx -= _strides[d] * _shape[d];
             }
         }
 
         return result;
     }
+
+    /// <summary>
+    /// Copies the tensor's logical contents, in row-major order, into
+    /// <paramref name="destination"/>. Handles both contiguous and strided
+    /// (e.g., post-<see cref="Transpose()"/> / post-permute) layouts without
+    /// allocating an intermediate contiguous tensor.
+    /// </summary>
+    /// <param name="destination">Destination span. Must have length at least
+    /// <see cref="TensorBase{T}.Length"/>.</param>
+    /// <exception cref="ArgumentException"><paramref name="destination"/> is shorter than
+    /// <see cref="TensorBase{T}.Length"/>.</exception>
+    /// <exception cref="NotSupportedException">This tensor is a <see cref="SparseTensor{T}"/>.</exception>
+    /// <remarks>
+    /// <para>
+    /// Use this instead of <c>Contiguous().AsSpan().CopyTo(dst)</c> when the
+    /// goal is to spill a logical tensor into a flat buffer. The
+    /// materialize-then-copy idiom allocates a second full-size tensor and
+    /// does two passes over the data; <c>CopyTo</c> does one pass straight
+    /// into the destination. For a strided [3,32,32] permuted-to-HWC tensor
+    /// this roughly halves both allocation count and per-element work.
+    /// </para>
+    /// <para>
+    /// Bulk path: when this tensor is contiguous (with or without a storage
+    /// offset), the copy reduces to a single <see cref="Span{T}"/>-level
+    /// <c>CopyTo</c>, which on modern runtimes lowers to <c>memmove</c>.
+    /// Strided path: uses cached row-major strides to decompose the flat
+    /// destination index into per-axis indices, matching
+    /// <see cref="Contiguous"/>'s fallback arithmetic so behavior is
+    /// identical.
+    /// </para>
+    /// <para>
+    /// The destination need not match this tensor's shape rank; only length
+    /// matters. Writes exactly <see cref="TensorBase{T}.Length"/> elements
+    /// starting at <c>destination[0]</c>; any trailing elements of a larger
+    /// destination are left untouched.
+    /// </para>
+    /// </remarks>
+    public void CopyTo(Span<T> destination)
+    {
+        ThrowIfSparse();
+        if (destination.Length < Length)
+        {
+            throw new ArgumentException(
+                $"Destination span is too small: need {Length} elements, got {destination.Length}.",
+                nameof(destination));
+        }
+
+        if (IsContiguous)
+        {
+            // Fast path for contiguous tensors (with or without storage
+            // offset) — a single Span<T>.CopyTo delegates to Buffer.Memmove.
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(destination);
+            return;
+        }
+
+        // Strided fallback. Identical decomposition to Contiguous() so the
+        // two methods stay behaviorally consistent — any future
+        // optimization that applies to one should be applied to the other.
+        var srcData = _data.GetDataArray();
+        var rowMajorStrides = RowMajorStrides;
+        int rank = Rank;
+        int len = Length;
+        int offset = _storageOffset;
+
+        for (int i = 0; i < len; i++)
+        {
+            int srcIdx = offset;
+            int remaining = i;
+            for (int d = 0; d < rank; d++)
+            {
+                int dimIndex = remaining / rowMajorStrides[d];
+                remaining -= dimIndex * rowMajorStrides[d];
+                srcIdx += dimIndex * _strides[d];
+            }
+            destination[i] = srcData[srcIdx];
+        }
+    }
+
+    /// <summary>
+    /// Overload of <see cref="CopyTo(Span{T})"/> that accepts a
+    /// <see cref="Memory{T}"/> destination.
+    /// </summary>
+    /// <param name="destination">Destination memory. Must have length at least
+    /// <see cref="TensorBase{T}.Length"/>.</param>
+    public void CopyTo(Memory<T> destination) => CopyTo(destination.Span);
 
     /// <summary>
     /// Inserts a size-1 dimension at the specified axis. O(1) view — no data copy.
@@ -261,7 +360,18 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+
+        // Record the view under GraphMode so the compiler sees the caller's
+        // final tensor when a forward ends in Squeeze (issue #228).
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -293,7 +403,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+
+        // Record the view under GraphMode — see Squeeze(int) for rationale.
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -1444,6 +1564,19 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 savedState: new object[] { originalShape });
         }
 
+        // Record the view in the active lazy graph so a forward lambda ending
+        // in Reshape (or routing through Reshape in a host-side branch) hands
+        // CompiledInferencePlan.Compile a tensor with a LazySource — issue #228.
+        // The view shares storage with `this`, so the recorded node's execute
+        // step is a no-op: writes to the producer buffer are live-visible
+        // through the view at replay time.
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Reshape", this, result);
+        }
+
         return result;
     }
 
@@ -1906,6 +2039,92 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         return broadcastShape;
+    }
+
+    /// <summary>
+    /// Linear-span broadcast elementwise op. Replaces the previous
+    /// <c>foreach (var index in result.GetIndices())</c> indexer-per-element
+    /// loops that dominated broadcast wall clock at orders-of-magnitude slower
+    /// than the engine fast path.
+    /// <para>
+    /// Walks <paramref name="result"/>'s span linearly and computes each
+    /// operand's source offset from pre-computed broadcast strides — a stride
+    /// of 0 on a broadcast axis means the operand is read from the same offset
+    /// for every value of that axis. No per-element index array allocation, no
+    /// indexer dispatch. Still scalar-per-element at the innermost level since
+    /// the broadcast layout is general; when the pattern is "trailing-repeat"
+    /// the engine's TensorBroadcast* fast path handles it via SIMD span ops
+    /// before this is reached.
+    /// </para>
+    /// </summary>
+    private static void BroadcastElementwise(
+        Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, Func<T, T, T> op)
+    {
+        int maxRank = broadcastShape.Length;
+        int aRank = a.Rank;
+        int bRank = b.Rank;
+        int aOff = maxRank - aRank;
+        int bOff = maxRank - bRank;
+
+        // Materialize both operands as zero-offset contiguous buffers so we
+        // can index by flat offset. A contiguous VIEW can still have a
+        // non-zero _storageOffset (e.g. a slice of a larger tensor with row-
+        // major layout); reading _data.AsSpan() from index 0 would then
+        // return garbage from before the view's start. Force offset==0 via
+        // Contiguous() in that case, and slice the resulting span by
+        // (offset, logical length) to also handle ArrayPool-backed buffers
+        // that over-allocate past Length.
+        var aContig = (a.IsContiguous && a._storageOffset == 0) ? a : a.Contiguous();
+        var bContig = (b.IsContiguous && b._storageOffset == 0) ? b : b.Contiguous();
+        var aSpan = aContig._data.AsSpan().Slice(aContig._storageOffset, aContig.Length);
+        var bSpan = bContig._data.AsSpan().Slice(bContig._storageOffset, bContig.Length);
+        var rSpan = result._data.AsWritableSpan();
+
+        // Broadcast stride per axis: operand's row-major stride if its dim
+        // matches the broadcast dim, or 0 if the dim is 1 (broadcast axis).
+        // Preceding-axes (the extra leading 1s we implicitly added) have
+        // stride 0 as well.
+        Span<int> aBroadStride = stackalloc int[maxRank];
+        Span<int> bBroadStride = stackalloc int[maxRank];
+        int aRowStride = 1;
+        for (int i = aRank - 1; i >= 0; i--)
+        {
+            aBroadStride[aOff + i] = a._shape[i] == 1 ? 0 : aRowStride;
+            aRowStride *= a._shape[i];
+        }
+        for (int i = 0; i < aOff; i++) aBroadStride[i] = 0;
+        int bRowStride = 1;
+        for (int i = bRank - 1; i >= 0; i--)
+        {
+            bBroadStride[bOff + i] = b._shape[i] == 1 ? 0 : bRowStride;
+            bRowStride *= b._shape[i];
+        }
+        for (int i = 0; i < bOff; i++) bBroadStride[i] = 0;
+
+        // Walk the result tensor in row-major order. For each output offset,
+        // compute the two operand offsets from multi-dim coordinate derived
+        // from the running flat offset via the broadcast shape.
+        Span<int> coord = stackalloc int[maxRank];
+        int total = result.Length;
+        for (int flat = 0; flat < total; flat++)
+        {
+            // Derive multi-dim coord from flat index (row-major).
+            int remaining = flat;
+            for (int d = maxRank - 1; d >= 0; d--)
+            {
+                coord[d] = remaining % broadcastShape[d];
+                remaining /= broadcastShape[d];
+            }
+
+            int aIdx = 0, bIdx = 0;
+            for (int d = 0; d < maxRank; d++)
+            {
+                aIdx += coord[d] * aBroadStride[d];
+                bIdx += coord[d] * bBroadStride[d];
+            }
+
+            rSpan[flat] = op(aSpan[aIdx], bSpan[bIdx]);
+        }
     }
 
     /// <summary>
@@ -2892,45 +3111,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform addition
-            result[index] = _numOps.Add(this[thisIndices], other[otherIndices]);
-        }
-
+        // Span-based stride broadcast — replaces the previous
+        // foreach (var index in result.GetIndices()) + indexer-per-element
+        // loop that dominated broadcast wall clock at >1ms per 1K elements.
+        // This path materializes both operands contiguously and walks the
+        // result span linearly, computing each source offset from stride
+        // arithmetic (stride = 0 on broadcast dims). Use the span elementwise
+        // Add from numOps when the two operand spans align exactly — otherwise
+        // fall through to scalar per-element, but still avoiding the allocating
+        // GetIndices iterator.
+        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Add);
         return result;
     }
 
@@ -2957,49 +3147,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return Subtract(other);
         }
 
-        // Get broadcast shape
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform subtraction
-            result[index] = _numOps.Subtract(this[thisIndices], other[otherIndices]);
-        }
-
+        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Subtract);
         return result;
     }
 
@@ -3032,49 +3182,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return fastResult;
         }
 
-        // Get broadcast shape
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform multiplication
-            result[index] = _numOps.Multiply(this[thisIndices], other[otherIndices]);
-        }
-
+        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Multiply);
         return result;
     }
 

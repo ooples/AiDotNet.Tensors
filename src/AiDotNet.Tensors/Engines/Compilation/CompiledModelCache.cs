@@ -28,12 +28,19 @@ public sealed class CompiledModelCache<T> : IDisposable
 
     /// <summary>
     /// Gets a cached inference plan for the given input shape, or compiles a new one.
-    /// The forward action is traced once on cache miss and compiled into an optimized plan.
+    /// The forward function is traced once on cache miss and compiled into an optimized plan.
     /// </summary>
     /// <param name="inputShape">Shape of the input tensor (used as cache key).</param>
-    /// <param name="forward">The forward pass to trace. Called once during compilation.</param>
+    /// <param name="forward">
+    /// The forward pass to trace. Must return the tensor the caller intends as
+    /// the model's output. The returned tensor is what <c>plan.Execute()</c>
+    /// will yield on every replay — the compile step uses it as the explicit
+    /// final output, so a forward ending in a pure-view op
+    /// (<c>Reshape</c> on contiguous data, <c>Squeeze</c>, ...) or with
+    /// host-side control flow behaves correctly (issue #228).
+    /// </param>
     /// <returns>The compiled inference plan.</returns>
-    public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Action forward)
+    public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Func<Tensor<T>> forward)
     {
         long key = ComputeShapeKey(inputShape);
         if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(inputShape))
@@ -46,11 +53,11 @@ public sealed class CompiledModelCache<T> : IDisposable
                 return cached;
 
             // Trace the forward pass under GraphMode and compile.
-            // The forward action is called once to trace the graph — on subsequent calls
+            // The forward function is called once to trace the graph — on subsequent calls
             // the caller must invoke plan.Execute() with current data in the input tensors.
             using var scope = GraphMode.Enable();
-            forward();
-            var plan = scope.CompileInference<T>();
+            var explicitOutput = forward();
+            var plan = scope.CompileInference<T>(explicitOutput);
 
             // Dispose old plan if shape changed
             if (_inferencePlans.TryGetValue(key, out var old))
@@ -63,14 +70,18 @@ public sealed class CompiledModelCache<T> : IDisposable
 
     /// <summary>
     /// Gets a cached inference plan, rebinding the input tensor on cache hit.
-    /// On cache miss, the forward action is traced and the input tensor is captured.
+    /// On cache miss, the forward function is traced and the input tensor is captured.
     /// On cache hit, the new input's data is copied into the plan's captured input
     /// tensor so the compiled plan sees the current batch.
     /// </summary>
     /// <param name="input">The input tensor. Its data is copied into the plan on cache hit.</param>
-    /// <param name="forward">The forward pass to trace (called once on cache miss).</param>
+    /// <param name="forward">
+    /// The forward pass to trace (called once on cache miss). Must return the
+    /// tensor the caller intends as the model's output — see the other
+    /// overload for details on issue #228.
+    /// </param>
     /// <returns>The compiled inference plan.</returns>
-    public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Action forward)
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Func<Tensor<T>> forward)
     {
         long key = ComputeShapeKey(input._shape);
         if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(input._shape))
@@ -95,8 +106,8 @@ public sealed class CompiledModelCache<T> : IDisposable
             }
 
             using var scope = GraphMode.Enable();
-            forward();
-            var plan = scope.CompileInference<T>();
+            var explicitOutput = forward();
+            var plan = scope.CompileInference<T>(explicitOutput);
 
             if (_inferencePlans.TryGetValue(key, out var old))
                 old.Dispose();
@@ -112,11 +123,16 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// The forward + loss computation is traced once and compiled with backward pass.
     /// </summary>
     /// <param name="inputShape">Shape of the input tensor (used as cache key).</param>
-    /// <param name="forwardAndLoss">The forward + loss computation to trace.</param>
+    /// <param name="forwardAndLoss">
+    /// The forward + loss computation to trace. Must return the loss tensor
+    /// that backward will be seeded with — the plan uses it as the explicit
+    /// loss output, so a loss computation ending in a view op (<c>Reshape</c>
+    /// to scalarize, <c>Squeeze</c>) behaves correctly (issue #228).
+    /// </param>
     /// <param name="parameters">Trainable parameters for gradient computation.</param>
     /// <returns>The compiled training plan.</returns>
     public ICompiledTrainingPlan<T> GetOrCompileTraining(
-        int[] inputShape, Action forwardAndLoss, Tensor<T>[] parameters)
+        int[] inputShape, Func<Tensor<T>> forwardAndLoss, Tensor<T>[] parameters)
     {
         long key = ComputeShapeKey(inputShape);
         if (_trainingPlans.TryGetValue(key, out var cached))
@@ -130,8 +146,8 @@ public sealed class CompiledModelCache<T> : IDisposable
 
             // Trace forward + loss under GraphMode and compile with backward
             using var scope = GraphMode.Enable();
-            forwardAndLoss();
-            var plan = scope.CompileTraining(parameters);
+            var explicitLoss = forwardAndLoss();
+            var plan = scope.CompileTraining(parameters, explicitLoss);
 
             // Dispose old plan if exists
             if (_trainingPlans.TryGetValue(key, out var old))
@@ -173,7 +189,7 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// <param name="forward">Forward pass to trace on cache miss.</param>
     /// <param name="symbolicShape">Symbolic shape with dynamic dimensions marked.</param>
     /// <returns>Compiled inference plan.</returns>
-    public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Action forward, SymbolicShape symbolicShape)
+    public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Func<Tensor<T>> forward, SymbolicShape symbolicShape)
     {
         // Use symbolic key (ignores dynamic dims like batch size)
         long key = symbolicShape.ComputeKey();
@@ -188,8 +204,8 @@ public sealed class CompiledModelCache<T> : IDisposable
 
             // Compile with the current concrete shape
             using var scope = GraphMode.Enable();
-            forward();
-            var plan = scope.CompileInference<T>();
+            var explicitOutput = forward();
+            var plan = scope.CompileInference<T>(explicitOutput);
 
             if (_inferencePlans.TryGetValue(key, out var old))
                 old.Dispose();

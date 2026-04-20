@@ -1421,6 +1421,12 @@ public sealed class CuDnnConvolution : IDisposable
 {
     private readonly CuDnnContext _context;
     private readonly bool _ownsContext;
+    // Workspace is shared across all Forward/Backward calls on this instance
+    // and is resized in-place when a larger size is needed. Serialize the
+    // "ensure-workspace + launch-kernel" critical section so a concurrent
+    // call can't reallocate the device buffer while another call still has
+    // the pointer in flight inside cudnnConvolutionForward.
+    private readonly object _workspaceLock = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
     private bool _disposed;
@@ -1518,29 +1524,36 @@ public sealed class CuDnnConvolution : IDisposable
             _context.CopyToDevice(gpuInput, input);
             _context.CopyToDevice(gpuFilter, filter);
 
-            // Allocate workspace if needed
-            IntPtr workspace = IntPtr.Zero;
-            if (workspaceSize > 0)
+            // Serialize workspace acquisition and the forward launch —
+            // same rationale as the GPU-pointer Forward overload below.
+            // Without this, a concurrent Forward call on the same
+            // CuDnnConvolution instance can realloc the workspace mid-
+            // kernel and invalidate our workspace pointer.
+            lock (_workspaceLock)
             {
-                EnsureWorkspace(workspaceSize);
-                workspace = _workspace;
+                IntPtr workspace = IntPtr.Zero;
+                if (workspaceSize > 0)
+                {
+                    EnsureWorkspaceUnlocked(workspaceSize);
+                    workspace = _workspace;
+                }
+
+                // Execute convolution
+                float alpha = 1.0f;
+                float beta = 0.0f;
+
+                status = CuDnnNative.cudnnConvolutionForward(
+                    _context.Handle,
+                    ref alpha,
+                    inputDesc.Handle, gpuInput.DevicePtr,
+                    filterDesc.Handle, gpuFilter.DevicePtr,
+                    convDesc.Handle,
+                    algo,
+                    workspace, workspaceSize,
+                    ref beta,
+                    outputDesc.Handle, gpuOutput.DevicePtr);
+                CuDnnContext.CheckStatus(status, "ConvolutionForward");
             }
-
-            // Execute convolution
-            float alpha = 1.0f;
-            float beta = 0.0f;
-
-            status = CuDnnNative.cudnnConvolutionForward(
-                _context.Handle,
-                ref alpha,
-                inputDesc.Handle, gpuInput.DevicePtr,
-                filterDesc.Handle, gpuFilter.DevicePtr,
-                convDesc.Handle,
-                algo,
-                workspace, workspaceSize,
-                ref beta,
-                outputDesc.Handle, gpuOutput.DevicePtr);
-            CuDnnContext.CheckStatus(status, "ConvolutionForward");
 
             // Copy result back
             var output = new float[outputSize];
@@ -1554,7 +1567,111 @@ public sealed class CuDnnConvolution : IDisposable
         }
     }
 
-    private void EnsureWorkspace(ulong requiredSize)
+    /// <summary>
+    /// GPU-pointer variant of <see cref="Conv2DForward(float[], float[], int, int, int, int, int, int, int, int, int, int, int)"/>:
+    /// accepts device pointers + output pointer directly, so no host
+    /// round-trip. This is the hot path for
+    /// <see cref="Engines.DirectGpu.CUDA.CudaBackend.Conv2D"/> when the
+    /// cuDNN auto-dispatch is enabled (issue #201). Caller owns the
+    /// device memory and sizing — we only set descriptors, pick an
+    /// algorithm, and launch.
+    /// </summary>
+    /// <param name="inputDevPtr">Device pointer to NCHW input [n, c, h, w] floats.</param>
+    /// <param name="filterDevPtr">Device pointer to NCHW filter [k, c, fh, fw] floats.</param>
+    /// <param name="outputDevPtr">Device pointer to NCHW output [n, k, oh, ow] floats — caller allocates.</param>
+    /// <param name="outputHeight">Expected output height; used to sanity-check against cuDNN's shape calc.</param>
+    /// <param name="outputWidth">Expected output width.</param>
+    public void Conv2DForwardGpu(
+        IntPtr inputDevPtr, IntPtr filterDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        int k, int filterH, int filterW,
+        int outputHeight, int outputWidth,
+        int padH = 0, int padW = 0,
+        int strideH = 1, int strideW = 1,
+        int dilationH = 1, int dilationW = 1)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
+
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var filterDesc = new CuDnnFilterDescriptor();
+        using var convDesc = new CuDnnConvolutionDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+
+        inputDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        filterDesc.Set4D(CuDnnNative.CudnnDataType.Float, k, c, filterH, filterW);
+        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+
+        // Verify output shape agrees with cuDNN's internal shape calc.
+        // Mismatch would mean the caller pre-allocated the wrong-size
+        // buffer and the kernel would corrupt adjacent memory.
+        int cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW;
+        var status = CuDnnNative.cudnnGetConvolution2dForwardOutputDim(
+            convDesc.Handle, inputDesc.Handle, filterDesc.Handle,
+            out cudnnOutN, out cudnnOutC, out cudnnOutH, out cudnnOutW);
+        CuDnnContext.CheckStatus(status, "GetConvolution2dForwardOutputDim");
+        if (cudnnOutH != outputHeight || cudnnOutW != outputWidth)
+            throw new InvalidOperationException(
+                $"cuDNN output shape {cudnnOutN}x{cudnnOutC}x{cudnnOutH}x{cudnnOutW} " +
+                $"disagrees with caller's expected {n}x{k}x{outputHeight}x{outputWidth}.");
+
+        outputDesc.Set4D(CuDnnNative.CudnnDataType.Float, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+
+        // Algorithm selection — use ImplicitPrecompGemm as a stable default;
+        // fall back to Gemm if workspace query fails on this size. A future
+        // autotune hook picks the per-shape winner via
+        // cudnnGetConvolutionForwardAlgorithm_v7, caches it in
+        // AutotuneCache, and reuses. Tracked separately; this hot path
+        // is correct today with the default algorithm.
+        var algo = CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+        ulong workspaceSize;
+        status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
+            _context.Handle, inputDesc.Handle, filterDesc.Handle,
+            convDesc.Handle, outputDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success)
+        {
+            algo = CuDnnNative.CudnnConvolutionFwdAlgo.Gemm;
+            status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
+                _context.Handle, inputDesc.Handle, filterDesc.Handle,
+                convDesc.Handle, outputDesc.Handle, algo, out workspaceSize);
+            CuDnnContext.CheckStatus(status, "GetConvolutionForwardWorkspaceSize");
+        }
+
+        // Serialize workspace acquisition and the forward launch so a
+        // concurrent call can't reallocate _workspace while this call is
+        // still using the pointer inside cuDNN. Future follow-up: per-call
+        // workspace pool if contention on the shared buffer becomes a real
+        // hot-path bottleneck.
+        lock (_workspaceLock)
+        {
+            IntPtr workspace = IntPtr.Zero;
+            if (workspaceSize > 0)
+            {
+                EnsureWorkspaceUnlocked(workspaceSize);
+                workspace = _workspace;
+            }
+
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            status = CuDnnNative.cudnnConvolutionForward(
+                _context.Handle,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                filterDesc.Handle, filterDevPtr,
+                convDesc.Handle,
+                algo,
+                workspace, workspaceSize,
+                ref beta,
+                outputDesc.Handle, outputDevPtr);
+            CuDnnContext.CheckStatus(status, "ConvolutionForward");
+        }
+    }
+
+    /// <summary>
+    /// Grows the workspace if needed. Caller MUST hold <see cref="_workspaceLock"/>;
+    /// that invariant is how we serialize resize-vs-in-flight-kernel across
+    /// concurrent convolution calls.
+    /// </summary>
+    private void EnsureWorkspaceUnlocked(ulong requiredSize)
     {
         if (_workspaceSize >= requiredSize) return;
 
@@ -1822,6 +1939,112 @@ public sealed class CuDnnBatchNorm : IDisposable
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// GPU-pointer variant of <see cref="ForwardInference"/>. No host
+    /// round-trip — all tensors are already resident on the device and
+    /// the caller owns output allocation. Called from
+    /// <c>CudaBackend.BatchNorm</c> when the cuDNN dispatch is enabled.
+    /// </summary>
+    public void ForwardInferenceGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        IntPtr scaleDevPtr, IntPtr biasDevPtr,
+        IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alpha = 1f, beta = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationForwardInference(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alpha, ref beta,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, outputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr, biasDevPtr,
+            runningMeanDevPtr, runningVarDevPtr,
+            epsilon);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationForwardInferenceGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer training-mode BatchNorm. Writes saved mean / inv-var
+    /// for the backward pass and updates running stats in place.
+    /// </summary>
+    public void ForwardTrainingGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        IntPtr scaleDevPtr, IntPtr biasDevPtr,
+        IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
+        IntPtr saveMeanDevPtr, IntPtr saveInvVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alpha = 1f, beta = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationForwardTraining(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alpha, ref beta,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, outputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr, biasDevPtr,
+            momentum,
+            runningMeanDevPtr, runningVarDevPtr,
+            epsilon,
+            saveMeanDevPtr, saveInvVarDevPtr);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationForwardTrainingGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer BatchNorm backward. Produces dX / dScale / dBias
+    /// given dY and the saved forward stats.
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr inputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
+        IntPtr scaleDevPtr, IntPtr gradScaleDevPtr, IntPtr gradBiasDevPtr,
+        IntPtr savedMeanDevPtr, IntPtr savedInvVarDevPtr,
+        int n, int c, int h, int w, double epsilon = 1e-5)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
+        using var xDesc = new CuDnnTensorDescriptor();
+        using var bnDesc = new CuDnnTensorDescriptor();
+
+        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
+            bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
+        CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
+
+        float alphaD = 1f, betaD = 0f, alphaP = 1f, betaP = 0f;
+        var status = CuDnnNative.cudnnBatchNormalizationBackward(
+            _context.Handle,
+            CuDnnNative.CudnnBatchNormMode.Spatial,
+            ref alphaD, ref betaD, ref alphaP, ref betaP,
+            xDesc.Handle, inputDevPtr,
+            xDesc.Handle, gradOutputDevPtr,
+            xDesc.Handle, gradInputDevPtr,
+            bnDesc.Handle,
+            scaleDevPtr,
+            gradScaleDevPtr, gradBiasDevPtr,
+            epsilon,
+            savedMeanDevPtr, savedInvVarDevPtr);
+        CuDnnContext.CheckStatus(status, "BatchNormalizationBackwardGpu");
     }
 
     public void Dispose()

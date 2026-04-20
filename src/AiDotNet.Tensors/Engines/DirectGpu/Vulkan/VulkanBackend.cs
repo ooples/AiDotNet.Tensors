@@ -236,6 +236,32 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <summary>
+    /// Executes a GLSL compute pipeline with exactly one storage buffer
+    /// (in-place op). Used by kernels that read AND write the same memory —
+    /// allocating a two-binding pipeline with the same buffer aliased would
+    /// trip the Vulkan "aliased readonly/writable buffer" validation.
+    /// </summary>
+    private void GlslInPlaceOp(string glslSource, IGpuBuffer buffer, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
+        EnsureInitialized();
+        if (dispatchSize <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 1, pushConstantSize);
+        if (pipeline is null)
+        {
+            // No CPU fallback for in-place ops: the caller should handle this
+            // by catching and routing to a managed path.
+            throw new System.InvalidOperationException("Vulkan in-place pipeline creation failed.");
+        }
+        var vb = AsVulkan(buffer);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vb.Storage);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
+        }
+    }
+
+    /// <summary>
     /// Executes a GLSL compute pipeline with 2 buffers and explicit push constant values.
     /// </summary>
     private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int dispatchSize, uint[] pushConstants, uint pushConstantSize)

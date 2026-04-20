@@ -87,7 +87,7 @@ public class SymbolicShapeMultiShapeBenchmark
                 {
                     compiled++;
                     var output = _engine.TensorMatMul(input, _weights[0]);
-                    _ = _engine.ReduceSum(output, null);
+                    return _engine.ReduceSum(output, null);
                 },
                 SymbolicShape.BatchAndSeqDynamic(new[] { b, s, FeatureDim }));
         }
@@ -113,7 +113,7 @@ public class SymbolicShapeMultiShapeBenchmark
                 {
                     compiled++;
                     var output = _engine.TensorMatMul(input, _weights[0]);
-                    _ = _engine.ReduceSum(output, null);
+                    return _engine.ReduceSum(output, null);
                 });
         }
         return compiled; // Will be 16.

@@ -82,6 +82,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _fusedLinearModule;
     private IntPtr _iouModule;
     private IntPtr _complexModule;
+    private IntPtr _parity210Module;
+    private IntPtr _linalgModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -526,6 +528,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
+
+            // Parity-210 hot-path kernels. Same surface as CUDA's parity210_* set.
+            try
+            {
+                CompileKernelModule(Kernels.HipParity210Kernels.GetSource(), "parity210",
+                    ref _parity210Module, Kernels.HipParity210Kernels.GetKernelNames());
+            }
+            catch
+            {
+                _parity210Module = IntPtr.Zero;
+            }
+
+            // Linalg decomposition kernels (#211 moat #2).
+            try
+            {
+                CompileKernelModule(Kernels.HipLinalgKernels.GetSource(), "linalg",
+                    ref _linalgModule, Kernels.HipLinalgKernels.GetKernelNames());
+            }
+            catch
+            {
+                _linalgModule = IntPtr.Zero;
+            }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
@@ -10117,6 +10141,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         {
             HipNativeBindings.hipModuleUnload(_snnModule);
             _snnModule = IntPtr.Zero;
+        }
+
+        if (_linalgModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
         }
 
         // Unload all additional kernel modules
