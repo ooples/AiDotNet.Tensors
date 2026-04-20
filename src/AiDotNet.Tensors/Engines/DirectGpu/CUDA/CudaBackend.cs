@@ -57,6 +57,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
+    private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
@@ -710,6 +711,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _parity210Module = IntPtr.Zero;
+        }
+
+        // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:
+        // NVRTC failures fall through to the CPU reference via ILinalgBackend
+        // not being advertised by this backend.
+        try
+        {
+            _linalgModule = CompileKernelModule(device,
+                Kernels.CudaLinalgKernels.GetSource(),
+                "linalg_kernels",
+                Kernels.CudaLinalgKernels.GetKernelNames());
+        }
+        catch
+        {
+            _linalgModule = IntPtr.Zero;
         }
     }
 
@@ -11048,6 +11064,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_sparseModule);
             _sparseModule = IntPtr.Zero;
+        }
+
+        if (_linalgModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
         }
 
         if (_cudaContext != IntPtr.Zero)

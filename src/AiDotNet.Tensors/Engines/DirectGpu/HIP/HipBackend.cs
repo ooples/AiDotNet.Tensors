@@ -83,6 +83,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _iouModule;
     private IntPtr _complexModule;
     private IntPtr _parity210Module;
+    private IntPtr _linalgModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -537,6 +538,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _parity210Module = IntPtr.Zero;
+            }
+
+            // Linalg decomposition kernels (#211 moat #2).
+            try
+            {
+                CompileKernelModule(Kernels.HipLinalgKernels.GetSource(), "linalg",
+                    ref _linalgModule, Kernels.HipLinalgKernels.GetKernelNames());
+            }
+            catch
+            {
+                _linalgModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
@@ -10129,6 +10141,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         {
             HipNativeBindings.hipModuleUnload(_snnModule);
             _snnModule = IntPtr.Zero;
+        }
+
+        if (_linalgModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
         }
 
         // Unload all additional kernel modules
