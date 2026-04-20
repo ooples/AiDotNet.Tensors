@@ -158,8 +158,12 @@ __kernel void parity210_cummax_axis(
     int inner = gid % innerSize;
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = -INFINITY;
-    for (int k = 0; k < axisSize; ++k) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so a leading NaN propagates (NaN > -INF is
+    // false, which would otherwise silently shadow it with the sentinel).
+    float acc = input[base_];
+    output[base_] = acc;
+    for (int k = 1; k < axisSize; ++k) {
         float v = input[base_ + k * innerSize];
         if (v > acc) acc = v;
         output[base_ + k * innerSize] = acc;
@@ -176,8 +180,12 @@ __kernel void parity210_cummin_axis(
     int inner = gid % innerSize;
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = INFINITY;
-    for (int k = 0; k < axisSize; ++k) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so a leading NaN propagates (NaN < +INF is
+    // false, which would otherwise silently shadow it with the sentinel).
+    float acc = input[base_];
+    output[base_] = acc;
+    for (int k = 1; k < axisSize; ++k) {
         float v = input[base_ + k * innerSize];
         if (v < acc) acc = v;
         output[base_ + k * innerSize] = acc;

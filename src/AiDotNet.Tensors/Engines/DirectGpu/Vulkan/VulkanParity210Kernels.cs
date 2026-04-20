@@ -155,8 +155,12 @@ void main() {
     int inner = gid % innerSize;
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = -1.0e38;
-    for (int k = 0; k < axisSize; ++k) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so leading -Inf stays -Inf and leading NaN
+    // propagates; the finite sentinel -1.0e38 would shadow both.
+    float acc = a[base_];
+    o[base_] = acc;
+    for (int k = 1; k < axisSize; ++k) {
         float v = a[base_ + k * innerSize];
         if (v > acc) acc = v;
         o[base_ + k * innerSize] = acc;
@@ -172,8 +176,12 @@ void main() {
     int inner = gid % innerSize;
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = 1.0e38;
-    for (int k = 0; k < axisSize; ++k) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so leading +Inf stays +Inf and leading NaN
+    // propagates; the finite sentinel 1.0e38 would shadow both.
+    float acc = a[base_];
+    o[base_] = acc;
+    for (int k = 1; k < axisSize; ++k) {
         float v = a[base_ + k * innerSize];
         if (v < acc) acc = v;
         o[base_ + k * innerSize] = acc;
@@ -318,6 +326,10 @@ void main() {
     // Numerically stable hypot: max * sqrt(1 + (min/max)^2), avoiding
     // overflow on large |av|, |bv| and underflow on tiny inputs.
     float ax = abs(a[gid]); float bx = abs(b[gid]);
+    // IEEE: hypot(inf, y) = +inf (even y = NaN); hypot(NaN, finite) = NaN.
+    // lo/hi becomes inf/inf = NaN for (inf, inf) without this short-circuit.
+    if (isinf(ax) || isinf(bx)) { o[gid] = 1.0 / 0.0; return; }
+    if (isnan(ax) || isnan(bx)) { o[gid] = 0.0 / 0.0; return; }
     float hi = max(ax, bx); float lo = min(ax, bx);
     if (hi == 0.0) { o[gid] = 0.0; return; }
     float r = lo / hi;
@@ -367,7 +379,23 @@ layout(push_constant) uniform P { int size; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
-    o[gid] = pow(a[gid], b[gid]);
+    float x = a[gid]; float y = b[gid];
+    // GLSL pow(x, y) is undefined for x < 0 (even for integer y), so route
+    // negative-base integer exponents through |x|^y with a sign flip.
+    if (x < 0.0) {
+        float rounded = floor(y + 0.5);
+        if (abs(y - rounded) < 1e-6) {
+            float mag = pow(-x, y);
+            // Even exponents keep sign positive; odd exponents negate.
+            float sign = (mod(rounded, 2.0) == 0.0) ? 1.0 : -1.0;
+            o[gid] = sign * mag;
+            return;
+        }
+        // Non-integer exponent on negative base -> NaN (matches pytorch).
+        o[gid] = 0.0 / 0.0;
+        return;
+    }
+    o[gid] = pow(x, y);
 }";
 
     public static string LogAddExp => Header + ThreeBuf + @"
@@ -483,11 +511,11 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float y = a[gid];
-    // Return signed infinities at the boundary so downstream isinf()
-    // checks stay honest — GLSL has no literal INF but 1.0/0.0 produces
-    // +Inf on any spec-compliant implementation.
-    if (y >= 1.0) { o[gid] = 1.0 / 0.0; return; }
-    if (y <= -1.0) { o[gid] = -1.0 / 0.0; return; }
+    // Domain: [-1, 1].  Exact +/-1 -> +/-infinity (via 1.0/0.0); anything
+    // strictly outside the domain is NaN (via 0.0/0.0).
+    if (y == 1.0) { o[gid] = 1.0 / 0.0; return; }
+    if (y == -1.0) { o[gid] = -1.0 / 0.0; return; }
+    if (y > 1.0 || y < -1.0) { o[gid] = 0.0 / 0.0; return; }
     float ln = log(1.0 - y * y);
     float aC = 0.147;
     float t = 2.0 / (3.14159265358979 * aC) + ln * 0.5;

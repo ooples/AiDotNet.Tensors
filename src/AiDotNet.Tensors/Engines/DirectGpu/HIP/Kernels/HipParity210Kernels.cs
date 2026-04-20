@@ -216,8 +216,12 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_cummax_axis(
     int inner = idx % innerSize;
     int outer = idx / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = -INFINITY;
-    for (int a = 0; a < axisSize; ++a) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so a leading NaN propagates (NaN > -INF is
+    // false, which would otherwise silently shadow it with the sentinel).
+    float acc = input[base_];
+    output[base_] = acc;
+    for (int a = 1; a < axisSize; ++a) {
         float v = input[base_ + a * innerSize];
         if (v > acc) acc = v;
         output[base_ + a * innerSize] = acc;
@@ -235,8 +239,12 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_cummin_axis(
     int inner = idx % innerSize;
     int outer = idx / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float acc = INFINITY;
-    for (int a = 0; a < axisSize; ++a) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so a leading NaN propagates (NaN < +INF is
+    // false, which would otherwise silently shadow it with the sentinel).
+    float acc = input[base_];
+    output[base_] = acc;
+    for (int a = 1; a < axisSize; ++a) {
         float v = input[base_ + a * innerSize];
         if (v < acc) acc = v;
         output[base_ + a * innerSize] = acc;

@@ -435,12 +435,19 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer lo, IGpuBuffer hi, IGpuBuffer output,
         int size, bool hasLo, bool hasHi)
     {
+        // Fail loudly if the flags disagree with the buffers — silent reuse
+        // of input.Handle on hasLo=true/lo=null produces wrong clamp bounds.
+        if (hasLo && lo is null)
+            throw new ArgumentNullException(nameof(lo), "hasLo=true requires a non-null lower-bound buffer.");
+        if (hasHi && hi is null)
+            throw new ArgumentNullException(nameof(hi), "hasHi=true requires a non-null upper-bound buffer.");
+
         var kernel = ResolveParity210Kernel("parity210_clamp_min_max");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inPtr = input.Handle;
-        IntPtr loPtr = lo?.Handle ?? input.Handle;   // unused branch handled in kernel via hasLo flag
-        IntPtr hiPtr = hi?.Handle ?? input.Handle;
+        IntPtr loPtr = hasLo ? lo.Handle : input.Handle;
+        IntPtr hiPtr = hasHi ? hi.Handle : input.Handle;
         IntPtr outPtr = output.Handle;
         int n = size, hl = hasLo ? 1 : 0, hh = hasHi ? 1 : 0;
         void** args = stackalloc void*[7];

@@ -463,17 +463,22 @@ public sealed partial class MetalBackend : IParity210Backend
         ThrowIfDisposed();
         if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer oBuf)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        // Fail loudly if the flags disagree with the buffers — silent reuse
+        // of inBuf on hasLo=true/lo=null produces wrong clamp bounds.
+        if (hasLo && lo is null)
+            throw new ArgumentNullException(nameof(lo), "hasLo=true requires a non-null lower-bound buffer.");
+        if (hasHi && hi is null)
+            throw new ArgumentNullException(nameof(hi), "hasHi=true requires a non-null upper-bound buffer.");
 
         var pipeline = GetParity210Pipeline("parity210_clamp_min_max");
         var (tgr, tpg) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(inBuf, 0);
-        // lo / hi may be null when hasLo / hasHi are false — reuse the input
-        // buffer in that slot so the kernel has valid pointers even though
-        // the has* flag tells it to skip those reads.
-        var loBuf = (lo as MetalGpuBuffer) ?? inBuf;
-        var hiBuf = (hi as MetalGpuBuffer) ?? inBuf;
+        // When hasLo / hasHi are false we still need a valid pointer in the
+        // slot, so reuse the input buffer — the kernel skips the read.
+        var loBuf = hasLo ? (MetalGpuBuffer)lo : inBuf;
+        var hiBuf = hasHi ? (MetalGpuBuffer)hi : inBuf;
         encoder.SetBuffer(loBuf, 1);
         encoder.SetBuffer(hiBuf, 2);
         encoder.SetBuffer(oBuf, 3);

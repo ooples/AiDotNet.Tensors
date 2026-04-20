@@ -235,8 +235,34 @@ struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
 
     public static string CumSumAxis => CumulativeScan("cumsum", "0.0", "acc = acc + v;", "acc");
     public static string CumProdAxis => CumulativeScan("cumprod", "1.0", "acc = acc * v;", "acc");
-    public static string CumMaxAxis => CumulativeScan("cummax", "-3.402823e+38", "if (v > acc) { acc = v; }", "acc");
-    public static string CumMinAxis => CumulativeScan("cummin", "3.402823e+38", "if (v < acc) { acc = v; }", "acc");
+    // cummax / cummin cannot use the finite-sentinel template: -f32::MAX /
+    // +f32::MAX would shadow a leading +/-Inf and suppress leading NaN.
+    // Bootstrap from input[0] so every ieee value propagates correctly.
+    public static string CumMaxAxis => CumulativeScanFromFirst("cummax", "if (v > acc) { acc = v; }");
+    public static string CumMinAxis => CumulativeScanFromFirst("cummin", "if (v < acc) { acc = v; }");
+
+    private static string CumulativeScanFromFirst(string opName, string update) => @"
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read_write> o : array<f32>;
+struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
+@group(0) @binding(2) var<uniform> p : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    let total = p.outerSize * p.innerSize;
+    if (gid >= total) { return; }
+    let inner = gid % p.innerSize;
+    let outer = gid / p.innerSize;
+    let base_ = outer * p.axisSize * p.innerSize + inner;
+    if (p.axisSize <= 0) { return; }
+    var acc : f32 = a[base_];
+    o[base_] = acc;
+    for (var k : i32 = 1; k < p.axisSize; k = k + 1) {
+        let v = a[base_ + k * p.innerSize];
+        " + update + @"
+        o[base_ + k * p.innerSize] = acc;
+    }
+}
+";
 
     public static string LogCumSumExpAxis => @"
 @group(0) @binding(0) var<storage, read> a : array<f32>;
@@ -427,7 +453,23 @@ struct P { size: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    o[gid] = pow(a[gid], b[gid]);
+    let x = a[gid]; let y = b[gid];
+    // WGSL pow(x, y) is undefined for x < 0 (same as GLSL), so route
+    // negative-base integer exponents through |x|^y with a sign flip.
+    if (x < 0.0) {
+        let rounded = floor(y + 0.5);
+        if (abs(y - rounded) < 1e-6) {
+            let mag = pow(-x, y);
+            // Even exponents keep sign positive; odd exponents negate.
+            let sign_ = select(-1.0, 1.0, (rounded - 2.0 * floor(rounded * 0.5)) == 0.0);
+            o[gid] = sign_ * mag;
+            return;
+        }
+        // Non-integer exponent on negative base -> NaN (matches pytorch).
+        o[gid] = 0.0 / 0.0;
+        return;
+    }
+    o[gid] = pow(x, y);
 }
 ";
 
