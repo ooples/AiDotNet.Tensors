@@ -311,6 +311,42 @@ public static class CpuFusedOperations
         fixed (float* pBias = bias)  // null-safe: becomes null ptr when bias is null
         {
             int j = 0;
+
+#if NET8_0_OR_GREATER
+            // AVX-512 path: 16-wide Vector512, still 32-float unroll per
+            // iter (2× Vector512) so register pressure stays balanced vs
+            // the AVX2 4×Vector256 form. ~2× throughput on Zen 5 / Ice Lake+.
+            if (CpuFeatures.HasAVX512F && bias is not null)
+            {
+                var vZero512 = Vector512<float>.Zero;
+                int simdLen512 = N & ~31;
+                for (; j < simdLen512; j += 32)
+                {
+                    var v0 = Avx512F.Add(Avx512F.LoadVector512(pOut + j),      Avx512F.LoadVector512(pBias + j));
+                    var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), Avx512F.LoadVector512(pBias + j + 16));
+                    if (applyRelu)
+                    {
+                        v0 = Avx512F.Max(v0, vZero512);
+                        v1 = Avx512F.Max(v1, vZero512);
+                    }
+                    Avx512F.Store(pOut + j,      v0);
+                    Avx512F.Store(pOut + j + 16, v1);
+                }
+                for (; j + 16 <= N; j += 16)
+                {
+                    var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), Avx512F.LoadVector512(pBias + j));
+                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    Avx512F.Store(pOut + j, v);
+                }
+                for (; j < N; j++)
+                {
+                    float val = pOut[j] + pBias[j];
+                    pOut[j] = applyRelu && val < 0f ? 0f : val;
+                }
+                return;
+            }
+#endif
+
             var vZero = Vector256<float>.Zero;
 
             if (bias is not null)
