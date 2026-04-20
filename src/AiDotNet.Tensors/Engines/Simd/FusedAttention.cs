@@ -294,6 +294,13 @@ internal static class FusedAttention
         int batchHeads, int seqQ, int seqK, int headDim,
         float scale, bool isCausal = false)
     {
+        // Note: previous implementation Array.Copy'd each batch slice into
+        // fresh scratch buffers — 5× the actual data movement for no reason.
+        // FlashAttentionForward operates on float[] but only reads/writes
+        // the first (stride)-many elements, so we can use ArraySegment-like
+        // offset semantics by... actually, the simplest fix is to compute
+        // offsets and call a new Forward overload that accepts pointers
+        // directly. Done inline here to keep the change minimal.
         int qStride = seqQ * headDim;
         int kStride = seqK * headDim;
 
@@ -301,20 +308,64 @@ internal static class FusedAttention
         {
             int qOffset = bh * qStride;
             int kOffset = bh * kStride;
-
-            var qSlice = new float[qStride];
-            var kSlice = new float[kStride];
-            var vSlice = new float[kStride];
-            var oSlice = new float[qStride];
-
-            Array.Copy(q, qOffset, qSlice, 0, qStride);
-            Array.Copy(k, kOffset, kSlice, 0, kStride);
-            Array.Copy(v, kOffset, vSlice, 0, kStride);
-
-            FlashAttentionForward(qSlice, kSlice, vSlice, oSlice,
-                seqQ, seqK, headDim, scale, isCausal);
-
-            Array.Copy(oSlice, 0, output, qOffset, qStride);
+            unsafe
+            {
+                fixed (float* pQ = q, pK = k, pV = v, pO = output)
+                {
+                    FlashAttentionForwardPtr(
+                        pQ + qOffset, pK + kOffset, pV + kOffset, pO + qOffset,
+                        seqQ, seqK, headDim, scale, isCausal);
+                }
+            }
         });
+    }
+
+    /// <summary>
+    /// Pointer-based FlashAttentionForward for per-batch-head dispatch.
+    /// Same algorithm as the array-based form but skips the array
+    /// allocations for scratch buffers (uses thread-local).
+    /// </summary>
+    internal static unsafe void FlashAttentionForwardPtr(
+        float* pQ, float* pK, float* pV, float* pO,
+        int seqQ, int seqK, int headDim,
+        float scale, bool isCausal = false)
+    {
+        int br = Math.Min(DefaultBr, seqQ);
+        int bc = Math.Min(DefaultBc, seqK);
+
+        var rowMax = _tlRowMax;
+        if (rowMax is null || rowMax.Length < br) _tlRowMax = rowMax = new float[br];
+        var rowSum = _tlRowSum;
+        if (rowSum is null || rowSum.Length < br) _tlRowSum = rowSum = new float[br];
+        var localScores = _tlScores;
+        if (localScores is null || localScores.Length < br * bc) _tlScores = localScores = new float[br * bc];
+
+        // Clear output for this batch-head
+        for (int i = 0; i < seqQ * headDim; i++) pO[i] = 0f;
+
+        fixed (float* pScores = localScores, pRowMax = rowMax, pRowSum = rowSum)
+        {
+            for (int qi = 0; qi < seqQ; qi += br)
+            {
+                int actualBr = Math.Min(br, seqQ - qi);
+                for (int r = 0; r < actualBr; r++)
+                {
+                    pRowMax[r] = float.NegativeInfinity;
+                    pRowSum[r] = 0f;
+                }
+
+                for (int kj = 0; kj < seqK; kj += bc)
+                {
+                    int actualBc = Math.Min(bc, seqK - kj);
+                    ComputeScoreTileSimd(pQ, pK, pScores, qi, kj, actualBr, actualBc, headDim, scale);
+                    if (isCausal)
+                        ApplyCausalMask(pScores, qi, kj, actualBr, actualBc);
+                    OnlineSoftmaxAndAccumulate(
+                        pScores, pV, pO, pRowMax, pRowSum,
+                        qi, kj, actualBr, actualBc, headDim);
+                }
+                NormalizeOutput(pO, pRowSum, qi, actualBr, headDim);
+            }
+        }
     }
 }

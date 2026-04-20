@@ -140,7 +140,62 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
             return true;
         }
 
-        // For higher-rank tensors, fall back to dispatch fusion (sequential execution)
+        // 3D / 4D attention: real FlashAttention kernel via
+        // FusedAttention.BatchedFlashAttention. BERT attention has Q/K/V
+        // shaped [batch, heads, seqQ, headDim] = [1, 12, 256, 64]. We
+        // collapse (batch, heads) into a single batch-heads dim, then
+        // dispatch per-head in parallel. Skips materialising the full
+        // [batch, heads, seqQ, seqK] attention matrix (3 MB per head in
+        // BERT = 36 MB of DRAM traffic per forward pass).
+        //
+        // Gate conditions: rank 3 or 4 tensors with matching inner dims.
+        // rank-4 input [batch, heads, seq, d]: collapse to [batch*heads,
+        //   seq, d].
+        // rank-3 input [batch_heads, seq, d]: pass through directly.
+        if (queryTensor.Rank >= 3 && keyTensor.Rank == queryTensor.Rank
+            && valueTensor.Rank == queryTensor.Rank
+            && queryTensor.Rank <= 4)
+        {
+            int rank = queryTensor.Rank;
+            int seqQ = queryTensor._shape[rank - 2];
+            int headDim = queryTensor._shape[rank - 1];
+            int seqK = keyTensor._shape[rank - 2];
+            int batchHeads = 1;
+            for (int i = 0; i < rank - 2; i++) batchHeads *= queryTensor._shape[i];
+            float scale = 1f / MathF.Sqrt(headDim);
+
+            // Sanity: K and V must share seqK and headDim with the
+            // expected attention layout. The QK step output is the
+            // attention-weights tensor whose last two dims are [seqQ, seqK].
+            if (keyTensor._shape[rank - 1] != headDim) return false;
+            if (valueTensor._shape[rank - 2] != seqK) return false;
+            if (valueTensor._shape[rank - 1] != headDim) return false;
+
+            var capturedQ = queryTensor;
+            var capturedK = keyTensor;
+            var capturedV = valueTensor;
+
+            fused = new CompiledStep<T>(
+                "FlashAttention",
+                (eng, output) =>
+                {
+                    var qArr = (float[])(object)capturedQ.GetDataArray();
+                    var kArr = (float[])(object)capturedK.GetDataArray();
+                    var vArr = (float[])(object)capturedV.GetDataArray();
+                    var oArr = (float[])(object)output.GetDataArray();
+
+                    FusedAttention.BatchedFlashAttention(
+                        qArr, kArr, vArr, oArr,
+                        batchHeads, seqQ, seqK, headDim, scale);
+                },
+                finalOutput,
+                new[] { queryTensor, keyTensor, valueTensor },
+                null, null);
+
+            return true;
+        }
+
+        // Last-resort fallback: dispatch fusion (sequential execution)
         var capturedSteps = new CompiledStep<T>[consumed];
         Array.Copy(steps, index, capturedSteps, 0, consumed);
 
