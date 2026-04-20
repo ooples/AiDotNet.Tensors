@@ -1,0 +1,224 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// Self-contained, allocation-lean FFT kernels:
+//   - IterativeRadix2 — Cooley-Tukey in-place for n = 2^k
+//   - Bluestein      — chirp-z for arbitrary n via a length-M ≥ 2n-1 power-of-2 FFT
+//   - ApplyScale     — per-FftNorm pre/post scaling
+//
+// Layout convention: interleaved real/imag pairs in `double[2 * n]`. Stride-free,
+// cache-friendly, zero generic overhead. Upper tiers (Tensor-level, per-dtype)
+// convert to/from this double layout once per call.
+//
+// Supply-chain note: no external FFT library is called. Twiddles are materialized
+// from sin/cos; Bluestein chirps from the same. This is the entire numerical
+// FFT surface for the library.
+
+using System;
+
+namespace AiDotNet.Tensors.LinearAlgebra.Fft;
+
+internal static class FftKernels
+{
+    /// <summary>
+    /// In-place 1D FFT (arbitrary length). <paramref name="buf"/> is interleaved
+    /// real/imag with <c>buf.Length == 2 * n</c>. On return, <paramref name="buf"/>
+    /// holds the transformed spectrum; the chosen <see cref="FftNorm"/> scaling is applied.
+    /// </summary>
+    /// <param name="buf">Interleaved complex buffer, modified in place.</param>
+    /// <param name="n">Logical transform length (<c>buf.Length / 2</c>).</param>
+    /// <param name="inverse">True for IFFT (conjugate twiddles), false for FFT.</param>
+    /// <param name="norm">Normalization convention; see <see cref="FftNorm"/>.</param>
+    internal static void Transform1D(Span<double> buf, int n, bool inverse, FftNorm norm)
+    {
+        if (n <= 0) return;
+        if (buf.Length < 2 * n) throw new ArgumentException("buf must hold at least 2*n doubles.", nameof(buf));
+        if (n == 1)
+        {
+            ApplyScale(buf, n, inverse, norm);
+            return;
+        }
+        if (IsPowerOfTwo(n))
+        {
+            IterativeRadix2(buf, n, inverse);
+        }
+        else
+        {
+            Bluestein(buf, n, inverse);
+        }
+        ApplyScale(buf, n, inverse, norm);
+    }
+
+    // ── Cooley-Tukey radix-2, iterative, in place ───────────────────────────
+    // Standard decimation-in-time formulation: bit-reverse permute, then
+    // log₂ n stages of butterflies with twiddle factors W_N^k = e^{−2πi k / N}
+    // (conjugated for inverse). No recursion, no per-stage allocation.
+    private static void IterativeRadix2(Span<double> buf, int n, bool inverse)
+    {
+        BitReverseShuffle(buf, n);
+        double sign = inverse ? 1.0 : -1.0;
+        for (int size = 2; size <= n; size <<= 1)
+        {
+            int half = size >> 1;
+            double theta = sign * 2.0 * Math.PI / size;
+            double wStepReal = Math.Cos(theta);
+            double wStepImag = Math.Sin(theta);
+            for (int start = 0; start < n; start += size)
+            {
+                double wReal = 1.0, wImag = 0.0;
+                for (int k = 0; k < half; k++)
+                {
+                    int eIdx = 2 * (start + k);
+                    int oIdx = 2 * (start + k + half);
+                    double eRe = buf[eIdx], eIm = buf[eIdx + 1];
+                    double oRe = buf[oIdx], oIm = buf[oIdx + 1];
+                    // t = w * odd
+                    double tRe = wReal * oRe - wImag * oIm;
+                    double tIm = wReal * oIm + wImag * oRe;
+                    buf[eIdx] = eRe + tRe;
+                    buf[eIdx + 1] = eIm + tIm;
+                    buf[oIdx] = eRe - tRe;
+                    buf[oIdx + 1] = eIm - tIm;
+                    // Advance twiddle: w *= wStep.
+                    double nwRe = wReal * wStepReal - wImag * wStepImag;
+                    double nwIm = wReal * wStepImag + wImag * wStepReal;
+                    wReal = nwRe;
+                    wImag = nwIm;
+                }
+            }
+        }
+    }
+
+    // ── Bluestein chirp-z for arbitrary n ──────────────────────────────────
+    // Identity: n*k = (n² + k² − (k−n)²) / 2, so the DFT
+    //   X[k] = Σ x[n] · e^{−iπk²/N} · e^{iπ(k−n)²/N} · e^{−iπn²/N}
+    //        = e^{−iπk²/N} · (a ⊛ b)[k]   with
+    //   a[n] = x[n] · e^{−iπn²/N},    b[n] = e^{iπn²/N}
+    // where ⊛ is aperiodic convolution. Compute the convolution with a length
+    // M ≥ 2N − 1 power-of-2 radix-2 FFT; "wrap" b into the negative-index half
+    // of the length-M buffer so the circular convolution mod M realizes the
+    // desired aperiodic convolution for indices 0..N−1.
+    //
+    // For the inverse transform we conjugate: a[n] = x[n] · e^{+iπn²/N} etc.
+    private static void Bluestein(Span<double> buf, int n, bool inverse)
+    {
+        int m = 1;
+        while (m < 2 * n - 1) m <<= 1;
+
+        double sign = inverse ? -1.0 : 1.0; // a uses e^{-iπn²/N * sign}, b uses e^{+iπn²/N * sign}
+
+        // Precompute chirp c[n] = e^{−sign · iπn²/N} (used in both a construction and final multiply).
+        double[] cRe = new double[n];
+        double[] cIm = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            // Use (i²) mod (2N) trick to avoid precision loss on large i.
+            long sq = ((long)i * i) % (2L * n);
+            double phase = -sign * Math.PI * sq / n;
+            cRe[i] = Math.Cos(phase);
+            cIm[i] = Math.Sin(phase);
+        }
+
+        // a[i] = x[i] * c[i]  for i in [0, n), zero-padded to M.
+        Span<double> a = new double[2 * m];
+        for (int i = 0; i < n; i++)
+        {
+            double xRe = buf[2 * i];
+            double xIm = buf[2 * i + 1];
+            a[2 * i] = xRe * cRe[i] - xIm * cIm[i];
+            a[2 * i + 1] = xRe * cIm[i] + xIm * cRe[i];
+        }
+
+        // b[i] = conj(c[i]) for i in [0, n); b[M-i] = b[i] for i in [1, n); zeros elsewhere.
+        Span<double> b = new double[2 * m];
+        b[0] = cRe[0];
+        b[1] = -cIm[0];
+        for (int i = 1; i < n; i++)
+        {
+            double bRe = cRe[i];
+            double bIm = -cIm[i];
+            b[2 * i] = bRe;
+            b[2 * i + 1] = bIm;
+            b[2 * (m - i)] = bRe;
+            b[2 * (m - i) + 1] = bIm;
+        }
+
+        // Convolve via length-M radix-2 FFT: A = FFT(a), B = FFT(b),
+        // C = IFFT(A.*B). Both FFT/IFFT routed through IterativeRadix2 with
+        // normalization folded in by dividing by M after the inverse.
+        IterativeRadix2(a, m, inverse: false);
+        IterativeRadix2(b, m, inverse: false);
+        for (int i = 0; i < m; i++)
+        {
+            double aRe = a[2 * i];
+            double aIm = a[2 * i + 1];
+            double bRe = b[2 * i];
+            double bIm = b[2 * i + 1];
+            a[2 * i] = aRe * bRe - aIm * bIm;
+            a[2 * i + 1] = aRe * bIm + aIm * bRe;
+        }
+        IterativeRadix2(a, m, inverse: true);
+        double invM = 1.0 / m;
+        for (int i = 0; i < 2 * m; i++) a[i] *= invM;
+
+        // Final chirp multiply: X[k] = c[k] · (a ⊛ b)[k].
+        for (int k = 0; k < n; k++)
+        {
+            double rRe = a[2 * k];
+            double rIm = a[2 * k + 1];
+            buf[2 * k] = rRe * cRe[k] - rIm * cIm[k];
+            buf[2 * k + 1] = rRe * cIm[k] + rIm * cRe[k];
+        }
+    }
+
+    /// <summary>
+    /// In-place bit-reversal permutation for a length-n buffer (n must be a
+    /// power of two). Pairs of interleaved complex elements are swapped
+    /// according to the reversed binary representation of their index.
+    /// </summary>
+    internal static void BitReverseShuffle(Span<double> buf, int n)
+    {
+        int j = 0;
+        for (int i = 1; i < n; i++)
+        {
+            int bit = n >> 1;
+            while ((j & bit) != 0)
+            {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j ^= bit;
+            if (i < j)
+            {
+                int ii = 2 * i;
+                int jj = 2 * j;
+                (buf[ii], buf[jj]) = (buf[jj], buf[ii]);
+                (buf[ii + 1], buf[jj + 1]) = (buf[jj + 1], buf[ii + 1]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Apply the <see cref="FftNorm"/> scale factor to an in-place transform
+    /// result. <paramref name="inverse"/> selects which side of the norm
+    /// receives the extra factor.
+    /// </summary>
+    internal static void ApplyScale(Span<double> buf, int n, bool inverse, FftNorm norm)
+    {
+        double scale = ScaleFor(n, inverse, norm);
+        if (scale == 1.0) return;
+        for (int i = 0; i < 2 * n; i++) buf[i] *= scale;
+    }
+
+    /// <summary>
+    /// Returns the scalar applied to a length-<paramref name="n"/> transform
+    /// under the requested normalization convention.
+    /// </summary>
+    internal static double ScaleFor(int n, bool inverse, FftNorm norm) => norm switch
+    {
+        FftNorm.Backward => inverse ? 1.0 / n : 1.0,
+        FftNorm.Forward => inverse ? 1.0 : 1.0 / n,
+        FftNorm.Ortho => 1.0 / Math.Sqrt(n),
+        _ => throw new ArgumentOutOfRangeException(nameof(norm), norm, "Unknown FftNorm."),
+    };
+
+    internal static bool IsPowerOfTwo(int n) => n > 0 && (n & (n - 1)) == 0;
+}
