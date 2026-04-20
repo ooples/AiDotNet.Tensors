@@ -360,7 +360,18 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+
+        // Record the view under GraphMode so the compiler sees the caller's
+        // final tensor when a forward ends in Squeeze (issue #228).
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -392,7 +403,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+
+        // Record the view under GraphMode — see Squeeze(int) for rationale.
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -1541,6 +1562,19 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward,
                 result, this,
                 savedState: new object[] { originalShape });
+        }
+
+        // Record the view in the active lazy graph so a forward lambda ending
+        // in Reshape (or routing through Reshape in a host-side branch) hands
+        // CompiledInferencePlan.Compile a tensor with a LazySource — issue #228.
+        // The view shares storage with `this`, so the recorded node's execute
+        // step is a no-op: writes to the producer buffer are live-visible
+        // through the view at replay time.
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                Engines.Compilation.LazyNodeType.Reshape, "Reshape", this, result);
         }
 
         return result;

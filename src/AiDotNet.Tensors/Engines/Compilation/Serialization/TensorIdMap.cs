@@ -48,6 +48,9 @@ internal sealed class TensorIdMap<T>
             "be registered via GetOrAdd before serialization begins.");
     }
 
+    /// <summary>Returns <c>true</c> if the tensor is registered.</summary>
+    internal bool Contains(Tensor<T> tensor) => _map.ContainsKey(tensor);
+
     /// <summary>
     /// Reference-equality comparer for Tensor&lt;T&gt;. Uses
     /// <see cref="RuntimeHelpers.GetHashCode(object)"/> for identity hash.

@@ -63,6 +63,15 @@ internal static class InferencePlanWriter
             WriteStep(writer, steps[i], tensorMap);
         }
 
+        // ── Final output identity (format v2+) ──────────────────────────
+        // Writes the tensor ID of the plan's final output so the reader
+        // returns the caller's actual output tensor, not the last step's
+        // buffer — matters when optimization passes reorder steps or when
+        // the forward ended in a pure-view op (issue #228). -1 means
+        // "fall back to last-step heuristic" (empty plans).
+        int finalOutputId = tensorMap.Contains(finalOutput) ? tensorMap.GetId(finalOutput) : -1;
+        writer.Write(finalOutputId);
+
         // ── Footer (checksum) ───────────────────────────────────────────
         writer.Flush();
         int bodyLength = (int)body.Length;

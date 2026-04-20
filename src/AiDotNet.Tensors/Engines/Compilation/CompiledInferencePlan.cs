@@ -529,7 +529,18 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// Compiles a lazy tensor scope into an inference plan.
     /// Runs optimization passes, pre-allocates all buffers, and builds step array.
     /// </summary>
-    internal static CompiledInferencePlan<T> Compile(LazyTensorScope scope, IEngine engine)
+    /// <param name="scope">The traced lazy graph.</param>
+    /// <param name="engine">Execution engine.</param>
+    /// <param name="explicitOutput">
+    /// The tensor the caller's forward lambda returned, or <c>null</c> to
+    /// fall back to the last-optimized-step heuristic. Passing the caller's
+    /// actual output tensor is what fixes issue #228: a forward that ends in
+    /// a pure-view op (<c>Reshape</c> on contiguous data, <c>Squeeze</c>, ...)
+    /// or has host-side control flow that conditionally appends such a view
+    /// no longer leaks the wrong tensor through <c>Execute()</c>.
+    /// </param>
+    internal static CompiledInferencePlan<T> Compile(
+        LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput)
     {
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
@@ -641,8 +652,27 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         foreach (var step in optimizedSteps)
             step.OutputBuffer.LazySource = null;
 
-        // Use the last optimized step's output (may differ from original after fusion/spectral passes)
-        var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
+        // Prefer the caller's returned tensor (#228). When the forward ends in
+        // a pure-view op, explicitOutput shares storage with one of the step
+        // output buffers — writes to the producer buffer flow through the view
+        // at Execute() time. When the forward returns a regular lazy-node
+        // output, explicitOutput is that node's output buffer itself.
+        //
+        // Legacy no-explicit-output path still uses the last-step heuristic so
+        // internal callers (AutoTracer, tests constructing scopes directly)
+        // keep working unchanged.
+        Tensor<T> finalOutput;
+        if (explicitOutput is not null)
+        {
+            explicitOutput.LazySource = null;
+            finalOutput = explicitOutput;
+        }
+        else
+        {
+            finalOutput = optimizedSteps.Length > 0
+                ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer
+                : new Tensor<T>(new int[] { 0 });
+        }
         return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles);
     }
 

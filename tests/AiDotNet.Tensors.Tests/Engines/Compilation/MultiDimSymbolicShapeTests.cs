@@ -160,11 +160,11 @@ public class MultiDimSymbolicShapeTests
             // serving loop would build fresh tensors per request.
             var input = Tensor<float>.CreateRandom(new[] { batch, seq, dim });
             var weight = Tensor<float>.CreateRandom(new[] { dim, dim });
-            Action forward = () =>
+            Func<Tensor<float>> forward = () =>
             {
                 forwardInvocations++;
                 var output = engine.TensorMatMul(input, weight);
-                _ = engine.ReduceSum(output, null);
+                return engine.ReduceSum(output, null);
             };
             cache.GetOrCompileInference(
                 input._shape,
@@ -210,7 +210,7 @@ public class MultiDimSymbolicShapeTests
                 {
                     forwardInvocations++;
                     var output = engine.TensorMatMul(input, weight);
-                    _ = engine.ReduceSum(output, null);
+                    return engine.ReduceSum(output, null);
                 },
                 SymbolicShape.BatchAndSeqDynamic(new[] { 1, 128, dim }));
         }

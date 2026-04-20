@@ -366,7 +366,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal Tensor<T>? SerializedInputTensor => _compiledInputTensor;
 
     internal static CompiledTrainingPlan<T> Compile(
-        LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters)
+        LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
     {
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
@@ -500,9 +500,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
-        var lossOutput = forwardSteps.Count > 0
-            ? forwardSteps[forwardSteps.Count - 1].OutputBuffer
-            : new Tensor<T>(new int[] { 1 });
+        // Prefer the caller's returned loss tensor. The last-step heuristic
+        // picks the wrong tensor whenever the forward+loss lambda ends in a
+        // pure-view op (e.g. scalarize-via-Reshape) — same issue as
+        // inference #228.
+        Tensor<T> lossOutput;
+        if (explicitLoss is not null)
+        {
+            explicitLoss.LazySource = null;
+            lossOutput = explicitLoss;
+        }
+        else
+        {
+            lossOutput = forwardSteps.Count > 0
+                ? forwardSteps[forwardSteps.Count - 1].OutputBuffer
+                : new Tensor<T>(new int[] { 1 });
+        }
         var lossGradSeed = TensorAllocator.RentUninitialized<T>(lossOutput._shape);
         lossGradSeed.AsWritableSpan().Fill(numOps.One);
 

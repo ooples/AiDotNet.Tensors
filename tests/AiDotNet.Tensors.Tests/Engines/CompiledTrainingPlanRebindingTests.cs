@@ -72,7 +72,7 @@ public class CompiledTrainingPlanRebindingTests
             () =>
             {
                 var output = engine.TensorMatMul(input, weight);
-                engine.ReduceSum(output, null);
+                return engine.ReduceSum(output, null);
             },
             new[] { weight });
 
@@ -94,7 +94,7 @@ public class CompiledTrainingPlanRebindingTests
             () =>
             {
                 var output = engine.TensorMatMul(input, weight);
-                engine.ReduceSum(output, null);
+                return engine.ReduceSum(output, null);
             },
             new[] { weight });
 
@@ -127,7 +127,7 @@ public class CompiledTrainingPlanRebindingTests
                 var pred = engine.FusedLinear(h, w2, b2, FusedActivationType.None);
                 var diff = engine.TensorSubtract(pred, target);
                 var sq = engine.TensorMultiply(diff, diff);
-                engine.ReduceSum(sq, null);
+                return engine.ReduceSum(sq, null);
             },
             new[] { w1, b1, w2, b2 });
 
@@ -163,7 +163,7 @@ public class CompiledTrainingPlanRebindingTests
             () =>
             {
                 var h = engine.FusedLinear(input, weight, bias, FusedActivationType.ReLU);
-                engine.ReduceSum(h, null);
+                return engine.ReduceSum(h, null);
             },
             new[] { weight, bias });
 
