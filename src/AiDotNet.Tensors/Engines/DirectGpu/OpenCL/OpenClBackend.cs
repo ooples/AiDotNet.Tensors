@@ -568,6 +568,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     System.Diagnostics.Debug.WriteLine($"OpenCL Parity-210 compilation failed: {ex.Message}");
                 }
+
+                // Linalg decomposition kernels (#211 moat #2).
+                try
+                {
+                    var linalgProgram = CompileOrLoadCached(OpenClLinalgKernels.GetSource(), optimizationFlags, "Linalg kernels");
+                    _programs.Add(linalgProgram);
+                    foreach (var name in OpenClLinalgKernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, linalgProgram, name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Linalg compilation failed: {ex.Message}");
+                }
             }
             catch (Exception ex)
             {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra.Decompositions;
 using AiDotNet.Tensors.LinearAlgebra.Solvers;
@@ -47,7 +48,16 @@ public static class Linalg
     /// <returns>Tuple (eigenvalues <c>(..., N)</c>, eigenvectors <c>(..., N, N)</c>).</returns>
     public static (Tensor<T> Eigenvalues, Tensor<T> Eigenvectors) Eigh<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => EighDecomposition.Compute(input, upper);
+    {
+        // GPU fast-path (fp32, n ≤ 64 — shared-memory bound).
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (gW, gV) = gpu.TryGpuEigh((Tensor<float>)(object)input);
+            if (gW is not null && gV is not null)
+                return ((Tensor<T>)(object)gW, (Tensor<T>)(object)gV);
+        }
+        return EighDecomposition.Compute(input, upper);
+    }
 
     /// <summary>Eigenvalues only of a symmetric/Hermitian matrix.</summary>
     public static Tensor<T> Eigvalsh<T>(Tensor<T> input, bool upper = false)
@@ -71,19 +81,41 @@ public static class Linalg
     /// <summary>QR factorization. Supports <paramref name="mode"/> = "reduced" | "complete" | "r".</summary>
     public static (Tensor<T> Q, Tensor<T> R) QR<T>(Tensor<T> input, string mode = "reduced")
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => QrDecomposition.Compute(input, mode);
+    {
+        // GPU fast-path is reduced-mode only (the kernel doesn't implement
+        // "complete" padding or "r"-only suppression). Complete/r fall through
+        // to the managed implementation.
+        if (mode == "reduced" && typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (gQ, gR) = gpu.TryGpuQrReduced((Tensor<float>)(object)input);
+            if (gQ is not null && gR is not null)
+                return ((Tensor<T>)(object)gQ, (Tensor<T>)(object)gR);
+        }
+        return QrDecomposition.Compute(input, mode);
+    }
 
     /// <summary>Cholesky factorization of a symmetric positive-definite matrix.</summary>
     /// <param name="input">Batched SPD matrix of shape <c>(..., N, N)</c>.</param>
     /// <param name="upper">When true, return the upper triangular factor; otherwise lower.</param>
     public static Tensor<T> Cholesky<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => CholeskyDecomposition.Compute(input, upper).Factor;
+        => CholeskyEx(input, upper).Factor;
 
     /// <summary>Cholesky factorization returning both the factor and an <c>info</c> flag.</summary>
     public static (Tensor<T> Factor, Tensor<int> Info) CholeskyEx<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => CholeskyDecomposition.Compute(input, upper);
+    {
+        // GPU fast-path: when the active engine is DirectGpuTensorEngine + the
+        // backend advertises ILinalgBackend, route through the native kernel.
+        // Managed CPU reference is the fallback for unsupported types/sizes.
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (gFactor, gInfo) = gpu.TryGpuCholesky((Tensor<float>)(object)input, upper);
+            if (gFactor is not null && gInfo is not null)
+                return ((Tensor<T>)(object)gFactor, gInfo);
+        }
+        return CholeskyDecomposition.Compute(input, upper);
+    }
 
     /// <summary>LU decomposition. Returns P, L, U such that <c>PA = LU</c> (partial pivoting).</summary>
     public static (Tensor<T> P, Tensor<T> L, Tensor<T> U) LU<T>(Tensor<T> input)
@@ -93,7 +125,15 @@ public static class Linalg
     /// <summary>LU factorization returning the packed factor and pivots (<c>getrf</c> form).</summary>
     public static (Tensor<T> LU, Tensor<int> Pivots) LuFactor<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LuDecomposition.Factor(input);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (gLu, gPivots) = gpu.TryGpuLuFactor((Tensor<float>)(object)input);
+            if (gLu is not null && gPivots is not null)
+                return ((Tensor<T>)(object)gLu, gPivots);
+        }
+        return LuDecomposition.Factor(input);
+    }
 
     /// <summary>Solve <c>AX = B</c> given a precomputed LU factorization.</summary>
     public static Tensor<T> LuSolve<T>(Tensor<T> lu, Tensor<int> pivots, Tensor<T> b)
