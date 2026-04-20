@@ -77,6 +77,14 @@ public class SgemmRootCauseDiag
             _output.WriteLine($"  [4] PackB only, 16× parallel (memory-bound):    {tPackBParallel * 1000:F1} µs  ({(double)cs.k * cs.n * 4 / tPackBParallel / 1e6:F0} MB/s)");
             _output.WriteLine($"     PackB fraction of parallel Sgemm: {tPackBParallel / tParallel * 100:F1}%");
 
+            // Path A vs Path D: cached float B vs cached int8 B
+            double tCachedFloat = TimeSgemmCachedFloat(cs.m, cs.k, cs.n);
+            _output.WriteLine($"  [5] SgemmWithCachedB (Path A, float):           {tCachedFloat * 1000:F1} µs  ({flops / tCachedFloat / 1e6:F0} GFLOP/s)");
+
+            double tCachedInt8 = TimeSgemmCachedInt8(cs.m, cs.k, cs.n);
+            _output.WriteLine($"  [6] SgemmWithInt8CachedB (Path D, int8 weight): {tCachedInt8 * 1000:F1} µs  ({flops / tCachedInt8 / 1e6:F0} GFLOP/s)");
+            _output.WriteLine($"     Path D vs Path A: {tCachedFloat / tCachedInt8:F2}× ({(tCachedFloat - tCachedInt8) * 1000:+F1;-F1} µs)");
+
             _output.WriteLine("");
         }
     }
@@ -135,6 +143,30 @@ public class SgemmRootCauseDiag
         for (int it = 0; it < Iters; it++)
             System.Threading.Tasks.Parallel.For(0, cores, i =>
                 SimdGemm.SgemmSequential(bufs[i].a, bufs[i].b, bufs[i].c, m, k, n));
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / Iters;
+    }
+
+    private static double TimeSgemmCachedFloat(int m, int k, int n)
+    {
+        var a = Rand(0xE05, m * k);
+        var b = Rand(0xE06, k * n);
+        var c = new float[m * n];
+        for (int i = 0; i < Warmup; i++) SimdGemm.SgemmWithCachedB(a, b, c, m, k, n);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Iters; i++) SimdGemm.SgemmWithCachedB(a, b, c, m, k, n);
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / Iters;
+    }
+
+    private static double TimeSgemmCachedInt8(int m, int k, int n)
+    {
+        var a = Rand(0xE07, m * k);
+        var b = Rand(0xE08, k * n);
+        var c = new float[m * n];
+        for (int i = 0; i < Warmup; i++) SimdGemm.SgemmWithInt8CachedB(a, b, c, m, k, n);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Iters; i++) SimdGemm.SgemmWithInt8CachedB(a, b, c, m, k, n);
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds / Iters;
     }
