@@ -7948,7 +7948,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Mish", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.MishInto(output, captured);
+                        else { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MishBackward);
             }
         }
@@ -8074,7 +8078,11 @@ public class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 double capturedAlpha = alpha;
                 return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.ELUInto(output, captured, capturedAlpha);
+                        else { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
             }
         }
@@ -20677,7 +20685,11 @@ public class CpuEngine : ITensorLevelEngine
                 foreach (var t in tensors) totalAxis += t._shape[capturedAxis];
                 outShape[capturedAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concat", captured, outShape,
-                    (eng, output) => { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.ConcatInto(output, captured, capturedAxis);
+                        else { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
         }
