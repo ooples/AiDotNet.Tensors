@@ -4179,7 +4179,11 @@ public class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.MultiplyScalar, "TensorMultiplyScalar", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
+                        else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
             }
         }
@@ -4482,7 +4486,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
+                        else { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.LogBackward);
             }
         }
@@ -4528,7 +4536,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorExpInto(output, captured);
+                        else { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ExpBackward);
             }
         }
@@ -4592,7 +4604,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSqrtInto(output, captured);
+                        else { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.SqrtBackward);
             }
         }
@@ -4637,7 +4653,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorAbsInto(output, captured);
+                        else { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AbsBackward);
             }
         }
@@ -4935,7 +4955,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSinInto(output, captured);
+                        else { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.SinBackward);
             }
         }
@@ -4985,7 +5009,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorCosInto(output, captured);
+                        else { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.CosBackward);
             }
         }
