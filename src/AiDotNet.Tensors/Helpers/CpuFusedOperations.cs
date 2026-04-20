@@ -152,6 +152,148 @@ public static class CpuFusedOperations
     /// Applies bias addition and activation function in-place over the GEMM output.
     /// Single O(MN) pass — cheap compared to the O(MNK) GEMM.
     /// </summary>
+    /// <summary>
+    /// Channel-wise bias + activation for a NCHW Conv2D output. Bias is [C]
+    /// — scalar per channel. Output is [N, C, H, W]. Broadcast: each
+    /// output[n, c, :, :] gets bias[c] added then activation applied.
+    /// Parallelises across (N × C) "planes"; each worker processes HW
+    /// elements with a scalar bias broadcast via Vector256.Create + SIMD add.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static void ApplyBiasActivationNCHWInPlace(
+        float[] output, float[]? bias,
+        int N, int C, int H, int W, FusedActivationType activation)
+    {
+        bool hasBias = bias != null;
+        bool hasActivation = activation != FusedActivationType.None;
+        if (!hasBias && !hasActivation) return;
+
+        int hw = H * W;
+        int totalPlanes = N * C;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && hw >= 8 &&
+            (activation == FusedActivationType.None
+             || activation == FusedActivationType.ReLU))
+        {
+            if (totalPlanes >= 4)
+            {
+                Parallel.For(0, totalPlanes, p =>
+                    ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
+            }
+            else
+            {
+                for (int p = 0; p < totalPlanes; p++)
+                    ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU);
+            }
+            return;
+        }
+#endif
+
+        Func<float, float>? activationFn = hasActivation ? GetFloatActivation(activation) : null;
+        for (int n = 0; n < N; n++)
+        {
+            for (int c = 0; c < C; c++)
+            {
+                float b = hasBias ? bias![c] : 0f;
+                int offset = (n * C + c) * hw;
+                for (int i = 0; i < hw; i++)
+                {
+                    float val = output[offset + i];
+                    if (hasBias) val += b;
+                    if (activationFn != null) val = activationFn(val);
+                    output[offset + i] = val;
+                }
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD per-(n, c) plane kernel: scalar bias[c] broadcast to vector,
+    /// added to each HW position, optional ReLU, in-place store. 32-float
+    /// unroll for load-store throughput. Used by ApplyBiasActivationNCHWInPlace.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ApplyNchwPlaneSimd(
+        float[] output, float[]? bias, int planeIdx, int C, int hw, bool applyRelu)
+    {
+        int c = planeIdx % C;
+        float b = bias is not null ? bias[c] : 0f;
+        int offset = planeIdx * hw;
+        fixed (float* pOut = &output[offset])
+        {
+            int j = 0;
+            var vZero = Vector256<float>.Zero;
+            var vBias = Vector256.Create(b);
+
+#if NET8_0_OR_GREATER
+            if (CpuFeatures.HasAVX512F)
+            {
+                var vZero512 = Vector512<float>.Zero;
+                var vBias512 = Vector512.Create(b);
+                int simdLen512 = hw & ~31;
+                for (; j < simdLen512; j += 32)
+                {
+                    var v0 = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), vBias512);
+                    if (applyRelu)
+                    {
+                        v0 = Avx512F.Max(v0, vZero512);
+                        v1 = Avx512F.Max(v1, vZero512);
+                    }
+                    Avx512F.Store(pOut + j, v0);
+                    Avx512F.Store(pOut + j + 16, v1);
+                }
+                for (; j + 16 <= hw; j += 16)
+                {
+                    var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    Avx512F.Store(pOut + j, v);
+                }
+                for (; j < hw; j++)
+                {
+                    float val = pOut[j] + b;
+                    pOut[j] = applyRelu && val < 0f ? 0f : val;
+                }
+                return;
+            }
+#endif
+
+            int simdLen = hw & ~31;
+            for (; j < simdLen; j += 32)
+            {
+                var v0 = Avx.Add(Avx.LoadVector256(pOut + j),      vBias);
+                var v1 = Avx.Add(Avx.LoadVector256(pOut + j + 8),  vBias);
+                var v2 = Avx.Add(Avx.LoadVector256(pOut + j + 16), vBias);
+                var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), vBias);
+                if (applyRelu)
+                {
+                    v0 = Avx.Max(v0, vZero);
+                    v1 = Avx.Max(v1, vZero);
+                    v2 = Avx.Max(v2, vZero);
+                    v3 = Avx.Max(v3, vZero);
+                }
+                Avx.Store(pOut + j,      v0);
+                Avx.Store(pOut + j + 8,  v1);
+                Avx.Store(pOut + j + 16, v2);
+                Avx.Store(pOut + j + 24, v3);
+            }
+            for (; j + 8 <= hw; j += 8)
+            {
+                var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
+                if (applyRelu) v = Avx.Max(v, vZero);
+                Avx.Store(pOut + j, v);
+            }
+            for (; j < hw; j++)
+            {
+                float val = pOut[j] + b;
+                pOut[j] = applyRelu && val < 0f ? 0f : val;
+            }
+        }
+    }
+#endif
+
     [MethodImpl(Hot)]
     internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
     {

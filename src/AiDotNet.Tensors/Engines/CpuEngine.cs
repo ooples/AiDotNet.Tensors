@@ -24951,13 +24951,27 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
-        // CPU implementation: sequential operations
         // Step 1: Conv2D
         var result = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
 
-        // Step 2: Add bias if provided. Right-align broadcast: a rank-1
-        // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
-        // with the NCHW result's channel axis, not the innermost (W) dim.
+        // Step 2+3: float fast path — fuse bias + activation into a single
+        // SIMD pass over Conv2D's output. Saves one full memory round-trip
+        // vs the prior 2-pass form (TensorBroadcastAdd + ApplyFusedActivationInPlace).
+        // For a ResNet stage3 Conv output [1, 256, 14, 14] = 200 KB, that's
+        // ~40 µs saved per call × tens of Convs per inference = meaningful.
+        if (typeof(T) == typeof(float) && result.Rank == 4
+            && (bias is null || (bias.Rank == 1 && bias._shape[0] == result._shape[1]))
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU))
+        {
+            int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
+            var outArr = (float[])(object)result.GetDataArray();
+            var biasArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+            CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
+            return result;
+        }
+
+        // Generic fallback (non-float, non-NCHW, or unsupported activation).
         if (bias != null)
         {
             var biasView = bias;
@@ -24967,10 +24981,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             result = TensorBroadcastAdd(result, biasView);
         }
-
-        // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)
         ApplyFusedActivationInPlace(result, activation);
-
         return result;
     }
 
