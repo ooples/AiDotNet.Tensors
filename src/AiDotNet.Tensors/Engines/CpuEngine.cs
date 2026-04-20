@@ -6624,7 +6624,11 @@ public class CpuEngine : ITensorLevelEngine
                 var capturedKernel = kernel;
                 int s = stride, p = padding, d = dilation;
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
-                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             }
         }
@@ -9298,8 +9302,32 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through Conv2D (int[] overload): runs the same dispatch as the
+    /// public <see cref="Conv2D{T}(Tensor{T}, Tensor{T}, int[], int[], int[])"/>
+    /// but writes directly into a pre-allocated <paramref name="output"/>
+    /// tensor instead of renting a fresh one. Used by compiled plan steps to
+    /// skip the intermediate allocation + CopyTo that would otherwise burn
+    /// ~50 µs per call on ResNet conv shapes.
+    /// </summary>
+    public void Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        Conv2DIntoImpl(input, kernel, stride, padding, dilation, output);
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    {
+        return Conv2DIntoImpl<T>(input, kernel, stride, padding, dilation, preAllocatedOutput: null);
+    }
+
+    /// <summary>
+    /// Shared implementation. When <paramref name="preAllocatedOutput"/> is
+    /// null, allocates a fresh result via TensorAllocator.Rent. Otherwise
+    /// writes into the provided tensor (path used by Conv2DInto).
+    /// </summary>
+    private Tensor<T> Conv2DIntoImpl<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation, Tensor<T>? preAllocatedOutput)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -9337,8 +9365,10 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check kernel size, stride, padding, and dilation parameters.");
 
-        // Lazy graph mode: record and return placeholder
-        if (GraphMode.IsActive)
+        // Lazy graph mode: record and return placeholder. Only when invoked
+        // as the allocating Conv2D — write-through Conv2DInto skips this
+        // because it already has the output to write into.
+        if (preAllocatedOutput is null && GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -9350,12 +9380,21 @@ public class CpuEngine : ITensorLevelEngine
                 var capturedPad = padding;
                 var capturedDil = dilation;
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
-                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // Path C write-through for Conv2D via the int[] overload.
+                        // Routes through Conv2DInto(int[]) so the dispatch stays
+                        // on the fast int[] NCHWc / im2col+Sgemm path without
+                        // allocating an intermediate tensor.
+                        if (eng is CpuEngine cpuEng)
+                            cpuEng.Conv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil);
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
             }
         }
 
-        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        var result = preAllocatedOutput ?? TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();

@@ -1214,27 +1214,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (savedState != null && savedState.Length == 3
                 && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
             {
-                // Capture locals so the closure holds onto its own refs
-                // without walking savedState every Execute.
+                // Path C write-through: use Conv2DInto (int[]) directly so we
+                // skip the intermediate-tensor allocation + CopyTo. Routes
+                // through the same int[] dispatch as Conv2D but shortcuts
+                // the Rent with the plan's pre-allocated output buffer.
+                // Saves ~50 µs per ResNet Conv.
                 var capStride = stride;
                 var capPadding = padding;
                 var capDilation = dilation;
                 return eng =>
                 {
-                    var result = eng.Conv2D(inp, kernel, capStride, capPadding, capDilation);
-                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                    if (eng is CpuEngine cpuEng)
+                        cpuEng.Conv2DInto(o, inp, kernel, capStride, capPadding, capDilation);
+                    else
+                    {
+                        var result = eng.Conv2D(inp, kernel, capStride, capPadding, capDilation);
+                        result.AsSpan().CopyTo(o.AsWritableSpan());
+                    }
                 };
             }
-            // Default stride/padding/dilation when savedState is absent —
-            // the int[] overload requires arrays, so hoist constant arrays
-            // out of the closure.
+            // Default stride/padding/dilation when savedState is absent.
             var defStride = new[] { 1, 1 };
             var defPadding = new[] { 0, 0 };
             var defDilation = new[] { 1, 1 };
             return eng =>
             {
-                var result = eng.Conv2D(inp, kernel, defStride, defPadding, defDilation);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
+                if (eng is CpuEngine cpuEng)
+                    cpuEng.Conv2DInto(o, inp, kernel, defStride, defPadding, defDilation);
+                else
+                {
+                    var result = eng.Conv2D(inp, kernel, defStride, defPadding, defDilation);
+                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                }
             };
         }
 
