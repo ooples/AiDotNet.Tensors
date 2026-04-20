@@ -63,6 +63,13 @@ public class BertSingleMixedMask
         };
         TensorCodecOptions.SetCurrent(opts);
 
+        // Guarantee we restore the thread-local options even when an assertion
+        // or exception fires before the explicit SetCurrent(null) below. Without
+        // this finally, a failed assertion in this test would leave every
+        // optimization pass disabled for the rest of the test-class / fixture
+        // lifetime on this worker thread.
+        try
+        {
         var (result, session) = ImportBoth(path);
         int totalMismatches = 0;
         float maxDiff = 0f;
@@ -97,10 +104,14 @@ public class BertSingleMixedMask
         }
 
         _output.WriteLine($"5 samples, different inputs, same plan instance: {totalMismatches} diverge, max {maxDiff}");
-        TensorCodecOptions.SetCurrent(null);
         Assert.True(totalMismatches == 0,
             $"Multi-execute-different-inputs (no-opt): {totalMismatches} elements diverged. State bleed.");
         session.Dispose();
+        }
+        finally
+        {
+            TensorCodecOptions.SetCurrent(null);
+        }
     }
 
     [SkippableFact]
@@ -305,8 +316,17 @@ public class BertSingleMixedMask
         var outs = new Dictionary<string, float[]>();
         foreach (var r in ortResults)
         {
-            try { outs[r.Name] = r.AsTensor<float>().ToArray(); continue; } catch { }
-            try { outs[r.Name] = r.AsTensor<long>().ToArray().Select(x => (float)x).ToArray(); continue; } catch { }
+            // Fail explicitly if ORT returns a dtype we don't know how to
+            // convert — previously the blanket catch let the parity test go
+            // green with missing outputs.
+            bool converted = false;
+            try { outs[r.Name] = r.AsTensor<float>().ToArray(); converted = true; } catch { }
+            if (!converted)
+            {
+                try { outs[r.Name] = r.AsTensor<long>().ToArray().Select(x => (float)x).ToArray(); converted = true; } catch { }
+            }
+            Assert.True(converted,
+                $"ORT output '{r.Name}' has an unsupported element type; extend RunOrt's conversion list.");
         }
         return outs;
     }
@@ -317,9 +337,11 @@ public class BertSingleMixedMask
         float maxDiff = 0f;
         foreach (var kv in ortByName)
         {
-            if (!result.Outputs.TryGetValue(kv.Key, out var ours)) continue;
-            var oursSpan = ours.AsSpan();
-            if (oursSpan.Length != kv.Value.Length) continue;
+            Assert.True(result.Outputs.TryGetValue(kv.Key, out var ours),
+                $"AiDotNet plan did not produce output '{kv.Key}' that ORT did.");
+            var oursSpan = ours!.AsSpan();
+            Assert.True(oursSpan.Length == kv.Value.Length,
+                $"Output '{kv.Key}' length mismatch: AiDotNet {oursSpan.Length}, ORT {kv.Value.Length}.");
             int mismatches = 0;
             for (int i = 0; i < kv.Value.Length; i++)
             {
@@ -331,6 +353,8 @@ public class BertSingleMixedMask
             totalMismatches += mismatches;
         }
         _output.WriteLine($"Single s=0 vs ORT: {totalMismatches} diverge, max diff {maxDiff}");
+        Assert.True(totalMismatches == 0,
+            $"BERT SingleMixedMask: {totalMismatches} output elements diverged beyond 1e-4 rel tol. Max: {maxDiff}.");
     }
 
     private static void FillFloat(LinearAlgebra.Tensor<float> placeholder, long[] source)

@@ -47,6 +47,11 @@ public class VitImportTest
         foreach (var op in result.UnsupportedOperators) _output.WriteLine($"  - {op}");
         if (result.Plan is not null)
             _output.WriteLine($"Plan step count: {result.Plan.StepCount}");
+        // Import-success contract for this acceptance gate: no unsupported
+        // operators AND a non-null executable plan. Without these assertions
+        // the test would silently pass on importer regressions.
+        Assert.Empty(result.UnsupportedOperators);
+        Assert.NotNull(result.Plan);
     }
 
     [SkippableFact]
@@ -100,9 +105,11 @@ public class VitImportTest
         float maxDiff = 0f;
         foreach (var kv in ortByName)
         {
-            if (!result.Outputs.TryGetValue(kv.Key, out var ours)) continue;
-            var oursSpan = ours.AsSpan();
-            if (oursSpan.Length != kv.Value.Length) continue;
+            Assert.True(result.Outputs.TryGetValue(kv.Key, out var ours),
+                $"AiDotNet plan did not produce output '{kv.Key}' that ORT did.");
+            var oursSpan = ours!.AsSpan();
+            Assert.True(oursSpan.Length == kv.Value.Length,
+                $"Output '{kv.Key}' length mismatch: AiDotNet {oursSpan.Length}, ORT {kv.Value.Length}.");
             for (int i = 0; i < kv.Value.Length; i++)
             {
                 float d = Math.Abs(kv.Value[i] - oursSpan[i]);

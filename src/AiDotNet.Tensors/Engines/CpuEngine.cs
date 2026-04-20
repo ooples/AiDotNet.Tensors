@@ -6251,7 +6251,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)result;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.MaxPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding);
             return result;
@@ -6398,7 +6398,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)result;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.AvgPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding,
                 countIncludePad: false);
@@ -28158,7 +28158,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)input;
             var flat = new Tensor<float>(new[] { batch, channels });
-            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.AsSpan(), flat.AsWritableSpan(),
+            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.GetDataArray(), flat.GetDataArray(),
                 batch, channels, height, width);
             var reshaped = flat.Reshape(new[] { batch, channels, 1, 1 });
             reshaped.Layout = LinearAlgebra.TensorLayout.Nchw;
