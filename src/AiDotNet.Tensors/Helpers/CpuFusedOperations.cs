@@ -3,6 +3,10 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -150,6 +154,30 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
+#if NET5_0_OR_GREATER
+        // Path B: SIMD-vectorised bias + Relu epilogue. The prior scalar
+        // loop with per-element delegate dispatch took ~8 ms on BERT FFN
+        // up output [256, 3072] (786 KB, memory-bound budget is ~200 µs).
+        // This kernel hits SIMD bandwidth with 8-float-wide ops + parallel
+        // across M rows for large outputs.
+        if (Avx.IsSupported && (activation == FusedActivationType.None
+            || activation == FusedActivationType.ReLU)
+            && (M * N) >= 4096)
+        {
+            int parallelThreshold = 16 * 1024;  // 16K elems → parallelise
+            if (M * N >= parallelThreshold && M >= 4)
+            {
+                Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, bias, i, N, activation == FusedActivationType.ReLU));
+            }
+            else
+            {
+                for (int i = 0; i < M; i++)
+                    ApplyBiasReluRowSimd(output, bias, i, N, activation == FusedActivationType.ReLU);
+            }
+            return;
+        }
+#endif
+
         // Hoist the delegate lookup outside the hot loop to avoid per-element dictionary access
         Func<float, float>? activationFn = hasActivation ? GetFloatActivation(activation) : null;
 
@@ -165,6 +193,74 @@ public static class CpuFusedOperations
             }
         }
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD row kernel: output[row, :] = output[row, :] + bias; optionally ReLU.
+    /// 32-float unroll (4× Vector256) for load-store throughput. Memory-bound
+    /// on most CPUs — the compute is trivial relative to the read+write bandwidth.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ApplyBiasReluRowSimd(float[] output, float[]? bias, int row, int N, bool applyRelu)
+    {
+        int rowOff = row * N;
+        fixed (float* pOut = &output[rowOff])
+        fixed (float* pBias = bias)  // null-safe: becomes null ptr when bias is null
+        {
+            int j = 0;
+            var vZero = Vector256<float>.Zero;
+
+            if (bias is not null)
+            {
+                int simdLen = N & ~31;
+                for (; j < simdLen; j += 32)
+                {
+                    var v0 = Avx.Add(Avx.LoadVector256(pOut + j),      Avx.LoadVector256(pBias + j));
+                    var v1 = Avx.Add(Avx.LoadVector256(pOut + j + 8),  Avx.LoadVector256(pBias + j + 8));
+                    var v2 = Avx.Add(Avx.LoadVector256(pOut + j + 16), Avx.LoadVector256(pBias + j + 16));
+                    var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), Avx.LoadVector256(pBias + j + 24));
+                    if (applyRelu)
+                    {
+                        v0 = Avx.Max(v0, vZero);
+                        v1 = Avx.Max(v1, vZero);
+                        v2 = Avx.Max(v2, vZero);
+                        v3 = Avx.Max(v3, vZero);
+                    }
+                    Avx.Store(pOut + j,      v0);
+                    Avx.Store(pOut + j + 8,  v1);
+                    Avx.Store(pOut + j + 16, v2);
+                    Avx.Store(pOut + j + 24, v3);
+                }
+                for (; j + 8 <= N; j += 8)
+                {
+                    var v = Avx.Add(Avx.LoadVector256(pOut + j), Avx.LoadVector256(pBias + j));
+                    if (applyRelu) v = Avx.Max(v, vZero);
+                    Avx.Store(pOut + j, v);
+                }
+                for (; j < N; j++)
+                {
+                    float val = pOut[j] + pBias[j];
+                    pOut[j] = applyRelu && val < 0f ? 0f : val;
+                }
+            }
+            else  // Relu only
+            {
+                int simdLen = N & ~31;
+                for (; j < simdLen; j += 32)
+                {
+                    Avx.Store(pOut + j,      Avx.Max(Avx.LoadVector256(pOut + j),      vZero));
+                    Avx.Store(pOut + j + 8,  Avx.Max(Avx.LoadVector256(pOut + j + 8),  vZero));
+                    Avx.Store(pOut + j + 16, Avx.Max(Avx.LoadVector256(pOut + j + 16), vZero));
+                    Avx.Store(pOut + j + 24, Avx.Max(Avx.LoadVector256(pOut + j + 24), vZero));
+                }
+                for (; j + 8 <= N; j += 8)
+                    Avx.Store(pOut + j, Avx.Max(Avx.LoadVector256(pOut + j), vZero));
+                for (; j < N; j++)
+                    if (pOut[j] < 0f) pOut[j] = 0f;
+            }
+        }
+    }
+#endif
 
     #endregion
 

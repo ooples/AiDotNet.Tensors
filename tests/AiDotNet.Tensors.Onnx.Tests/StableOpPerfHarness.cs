@@ -168,7 +168,46 @@ public class StableOpPerfHarness
         list.Add(AddBin("BERT", "Add", "[1,256,768] + [1,256,768]",
                          dims:new[]{1,256,768}, occurs:24));
 
+        // MatMul + Add(bias) + Activation chains — the Path B target.
+        // These mirror BERT FFN's (linear1 → GELU) and (linear2 → residual-add)
+        // but at smaller shapes so the harness runs in ~30s. We use the same
+        // shape as PerformanceComparison.MatMulAddRelu_Chain_BeatsOrEqualsOrt
+        // for continuity.
+        list.Add(MatMulAddReluChain("BERT-like", "MatMul+Add+Relu",
+                                    "M=64,K=256,N=256 (small FFN pattern)",
+                                    m:64, k:256, n:256, occurs:12));
+        list.Add(MatMulAddReluChain("BERT-like", "MatMul+Add+Relu",
+                                    "M=256,K=768,N=3072 (FFN up pattern)",
+                                    m:256, k:768, n:3072, occurs:12));
+
         return list.ToArray();
+    }
+
+    // ─── Path B target: fused MatMul + Add(bias) + Activation chain ────────
+    private static Case MatMulAddReluChain(string model, string op, string shape,
+        int m, int k, int n, int occurs)
+    {
+        var A = RandArr(0xB01, m * k);
+        var W = RandArr(0xB02, k * n);
+        var bias = RandArr(0xB03, n);
+
+        var graph = new GraphProto { Name = "matmul_add_relu" };
+        graph.Input.Add(OnnxTestGraphBuilder.MakeValueInfo("A", new[] { m, k }, FLOAT));
+        graph.Initializer.Add(OnnxTestGraphBuilder.MakeInitializer("W", new[] { k, n }, W));
+        graph.Initializer.Add(OnnxTestGraphBuilder.MakeInitializer("B", new[] { n }, bias));
+        graph.Output.Add(OnnxTestGraphBuilder.MakeValueInfo("Y", new[] { m, n }, FLOAT));
+
+        var mm = new NodeProto { OpType = "MatMul" };
+        mm.Input.Add("A"); mm.Input.Add("W"); mm.Output.Add("MM");
+        var add = new NodeProto { OpType = "Add" };
+        add.Input.Add("MM"); add.Input.Add("B"); add.Output.Add("MMB");
+        var relu = new NodeProto { OpType = "Relu" };
+        relu.Input.Add("MMB"); relu.Output.Add("Y");
+        graph.Node.Add(mm); graph.Node.Add(add); graph.Node.Add(relu);
+
+        byte[] bytes = OnnxTestGraphBuilder.Serialize(OnnxTestGraphBuilder.WrapModel(graph));
+        return BuildCase(model, op, shape, occurs, bytes,
+            new[] { ("A", new[] { m, k }, A) });
     }
 
     // ─── case factories ────────────────────────────────────────────────────

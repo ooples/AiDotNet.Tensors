@@ -24595,7 +24595,13 @@ public class CpuEngine : ITensorLevelEngine
                     // Tier 3: Any BLAS with validation
                     else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                     {
-                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                        // Path B step 1: route through Path A's cached-B
+                        // SGEMM. For inference with stable weight arrays,
+                        // this amortises PackB across every forward call.
+                        // Falls through to standard Sgemm when the shape
+                        // exceeds Nc (single-jc-pass assumption).
+                        Simd.SimdGemm.SgemmWithCachedB(
+                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     }
                 }
 
