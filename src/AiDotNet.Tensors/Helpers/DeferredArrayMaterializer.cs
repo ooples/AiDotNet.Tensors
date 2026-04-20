@@ -1,4 +1,7 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Linq;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -80,25 +83,37 @@ internal static class DeferredArrayMaterializer
         // Snapshot keys so we can safely mutate the dictionary from each callback
         // (Register's semantics are "remove on fire" via TryRemove).
         var keys = _pendingMaterializations.Keys.ToArray();
+        List<Exception>? failures = null;
         foreach (var key in keys)
         {
             if (!_pendingMaterializations.TryRemove(key, out var callback))
                 continue;
 
-            if (swallowErrors)
+            try { callback(key); }
+            catch (InvalidOperationException) when (swallowErrors)
             {
-                try { callback(key); }
-                catch (InvalidOperationException)
-                {
-                    // GPU buffer may be torn down; the entry was already removed
-                    // above, so any subsequent call falls through the normal data
-                    // path rather than re-running a broken callback.
-                }
+                // GPU buffer may be torn down; the entry was already removed
+                // above, so any subsequent call falls through the normal data
+                // path rather than re-running a broken callback.
             }
-            else
+            catch (Exception ex)
             {
-                callback(key);
+                // Drain-all semantics: a single failing callback must not pin
+                // the remaining entries. Collect the exceptions and surface
+                // them after the loop finishes so the registry ends in a
+                // clean "no pending" state regardless of how many entries
+                // raised.
+                (failures ??= new List<Exception>()).Add(ex);
             }
+        }
+
+        if (failures is not null)
+        {
+            throw failures.Count == 1
+                ? failures[0]
+                : new AggregateException(
+                    "One or more deferred GPU-to-CPU materialization callbacks failed.",
+                    failures);
         }
     }
 }
