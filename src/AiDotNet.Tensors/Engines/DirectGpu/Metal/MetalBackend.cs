@@ -57,6 +57,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _octonionLibrary;
     private IntPtr _spectralPerfLibrary;
     private IntPtr _parity210Library;
+    private IntPtr _linalgLibrary;
     private IntPtr _fftLibrary;
 
     #region Properties
@@ -231,6 +232,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend
             // Parity-210 library is optional; CPU fallback via CpuEngine inheritance stays intact.
             System.Diagnostics.Debug.WriteLine($"Metal Parity-210 pre-compilation warning: {ex.Message}");
             _parity210Library = IntPtr.Zero;
+        }
+
+        // Linalg decomposition kernels (#211 moat #2).
+        try
+        {
+            _linalgLibrary = _shaderLibrary.CompileLibrary("Linalg",
+                MetalLinalgKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Linalg pre-compilation warning: {ex.Message}");
+            _linalgLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
