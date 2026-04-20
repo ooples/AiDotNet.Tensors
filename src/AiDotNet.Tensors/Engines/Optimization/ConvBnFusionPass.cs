@@ -213,6 +213,27 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                     }
                 }
 
+                // Depthwise path (MobileNet / EfficientNet): Path C write-
+                // through via DepthwiseConv2DInto + NCHW bias+activation.
+                if (isDepthwise && eng is CpuEngine cpuEngDw && output.Rank == 4)
+                {
+                    cpuEngDw.DepthwiseConv2DInto(output, capturedInput, capturedFusedWeights,
+                        capturedStrides, capturedPaddings);
+                    int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
+                    var outArr = (float[])(object)output.GetDataArray();
+                    var biasArr = (float[])(object)((Tensor<T>)(object)capturedFusedBias).GetDataArray();
+                    var act = capturedActivation == FusedActivationType.None
+                        || capturedActivation == FusedActivationType.ReLU
+                        ? capturedActivation
+                        : FusedActivationType.None;
+                    CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, act);
+                    if (act == FusedActivationType.None && capturedActivation != FusedActivationType.None)
+                    {
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outArr, null, N * C, H * W, capturedActivation);
+                    }
+                    return;
+                }
+
                 // Fallback for depthwise / non-CpuEngine / non-rank-4.
                 Tensor<T> result;
                 if (isDepthwise)
