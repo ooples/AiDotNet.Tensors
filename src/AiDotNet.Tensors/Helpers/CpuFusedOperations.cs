@@ -172,7 +172,23 @@ public static class CpuFusedOperations
              || activation == FusedActivationType.GELU))
         {
             bool simdRelu = activation == FusedActivationType.ReLU;
+            bool simdGelu = activation == FusedActivationType.GELU;
             int parallelThreshold = 16 * 1024;  // 16K elems → parallelise
+
+            if (simdGelu && hasBias)
+            {
+                // Truly fused bias+GELU path — one SIMD pass over output
+                // adds bias and applies GELU. Saves the ~786 KB memory
+                // round-trip the two-pass form needed (load+bias+store,
+                // then load+gelu+store). For BERT FFN up this cuts
+                // ~200 µs per call; 12 calls per BERT = ~2.4 ms.
+                if (M * N >= parallelThreshold && M >= 4)
+                    Parallel.For(0, M, i => ApplyBiasGeluRowSimd(output, bias!, i, N));
+                else
+                    for (int i = 0; i < M; i++)
+                        ApplyBiasGeluRowSimd(output, bias!, i, N);
+                return;
+            }
 
             if (hasBias)
             {
@@ -196,8 +212,8 @@ public static class CpuFusedOperations
                         ApplyBiasReluRowSimd(output, null, i, N, true);
             }
 
-            // GELU: second pass via the existing SIMD kernel.
-            if (activation == FusedActivationType.GELU)
+            // GELU without bias: still needs the separate GELU pass.
+            if (simdGelu && !hasBias)
             {
                 unsafe
                 {
@@ -226,6 +242,58 @@ public static class CpuFusedOperations
     }
 
 #if NET5_0_OR_GREATER
+    /// <summary>
+    /// Fused bias + GELU(tanh approximation) row kernel — single SIMD pass
+    /// over output. GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715·x³))).
+    /// Inputs: output row (post-MatMul), bias row, N columns. Output is
+    /// written back in-place with bias added and GELU applied.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ApplyBiasGeluRowSimd(float[] output, float[] bias, int row, int N)
+    {
+        int rowOff = row * N;
+        fixed (float* pOut = &output[rowOff])
+        fixed (float* pBias = bias)
+        {
+            int j = 0;
+            // GELU constants
+            var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+            var vCoeff       = Vector256.Create(0.044715f);
+            var vHalf        = Vector256.Create(0.5f);
+            var vOne         = Vector256.Create(1.0f);
+            var vTwo         = Vector256.Create(2.0f);
+
+            int simdLen = N & ~7;
+            for (; j < simdLen; j += 8)
+            {
+                // Fused: biased = output[j..j+8] + bias[j..j+8]
+                var biased = Avx.Add(Avx.LoadVector256(pOut + j), Avx.LoadVector256(pBias + j));
+
+                // GELU(biased) = 0.5 * biased * (1 + tanh(sqrt(2/pi) * (biased + 0.044715 * biased^3)))
+                //             = 0.5 * biased * (1 + (2*sigmoid(2z) - 1))
+                //             = biased * sigmoid(2z), where z = sqrt(2/pi) * (biased + 0.044715*biased³)
+                var biasedSq = Avx.Multiply(biased, biased);
+                var biasedCu = Avx.Multiply(biasedSq, biased);
+                var inner    = Fma.MultiplyAdd(vCoeff, biasedCu, biased);
+                var tanhArg  = Avx.Multiply(vSqrt2OverPi, inner);
+                // tanh via 2*sigmoid(2x) - 1
+                var sigArg   = Avx.Multiply(vTwo, tanhArg);
+                var sig      = SimdKernels.FastSigmoid256(sigArg);
+                var tanh     = Avx.Subtract(Avx.Multiply(vTwo, sig), vOne);
+                var onePlusTanh = Avx.Add(vOne, tanh);
+                var result   = Avx.Multiply(vHalf, Avx.Multiply(biased, onePlusTanh));
+                Avx.Store(pOut + j, result);
+            }
+            for (; j < N; j++)
+            {
+                float b = pOut[j] + pBias[j];
+                float inner = 0.7978845608028654f * (b + 0.044715f * b * b * b);
+                float tanh = MathF.Tanh(inner);
+                pOut[j] = 0.5f * b * (1.0f + tanh);
+            }
+        }
+    }
+
     /// <summary>
     /// SIMD row kernel: output[row, :] = output[row, :] + bias; optionally ReLU.
     /// 32-float unroll (4× Vector256) for load-store throughput. Memory-bound
