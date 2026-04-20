@@ -147,6 +147,9 @@ public sealed partial class WebGpuBackend
         IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
+        // Empty-axis guard — a shape like [2, 0, 3] has a zero-length scan
+        // per line; dispatching would walk past zero-length buffers.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
         int total = outerSize * innerSize;
         var pipelineId = await GetOrCreatePipelineAsync(
             Parity210ModuleKey + ":" + tag, source, "main");

@@ -21748,7 +21748,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
+    public virtual Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 

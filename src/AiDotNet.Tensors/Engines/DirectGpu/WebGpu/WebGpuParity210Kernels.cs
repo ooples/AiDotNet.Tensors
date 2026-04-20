@@ -245,9 +245,12 @@ struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
     let inner = gid % p.innerSize;
     let outer = gid / p.innerSize;
     let base_ = outer * p.axisSize * p.innerSize + inner;
-    var m : f32 = -3.402823e+38;
-    var s : f32 = 0.0;
-    for (var k : i32 = 0; k < p.axisSize; k = k + 1) {
+    if (p.axisSize <= 0) { return; }
+    // Bootstrap from the first element so a leading -Inf doesn't yield NaN.
+    var m : f32 = a[base_];
+    var s : f32 = 1.0;
+    o[base_] = m;
+    for (var k : i32 = 1; k < p.axisSize; k = k + 1) {
         let x = a[base_ + k * p.innerSize];
         if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
         else { s = s + exp(x - m); }
@@ -562,7 +565,8 @@ struct P { size: i32 };
 }
 ";
 
-    public static string I0e => Helpers + @"
+    // Overflow-safe I0e — see CUDA/Metal counterparts for commentary.
+    public static string I0e => @"
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read_write> o : array<f32>;
 struct P { size: i32 };
@@ -571,11 +575,25 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let x = a[gid];
-    o[gid] = exp(-abs(x)) * p210_i0(x);
+    let ax = abs(x);
+    var ans : f32;
+    if (ax < 3.75) {
+        var y = x / 3.75; y = y * y;
+        ans = 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492
+                + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))));
+        ans = exp(-ax) * ans;
+    } else {
+        let y = 3.75 / ax;
+        ans = 0.39894228 + y * (0.01328592 + y * (0.00225319
+                + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706
+                + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))));
+        ans = ans / sqrt(ax);
+    }
+    o[gid] = ans;
 }
 ";
 
-    public static string I1e => Helpers + @"
+    public static string I1e => @"
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read_write> o : array<f32>;
 struct P { size: i32 };
@@ -584,7 +602,21 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let x = a[gid];
-    o[gid] = exp(-abs(x)) * p210_i1(x);
+    let ax = abs(x);
+    var ans : f32;
+    if (ax < 3.75) {
+        var y = x / 3.75; y = y * y;
+        ans = ax * (0.5 + y * (0.87890594 + y * (0.51498869 + y * (0.15084934
+                + y * (0.02658733 + y * (0.00301532 + y * 0.00032411))))));
+        ans = exp(-ax) * ans;
+    } else {
+        let y = 3.75 / ax;
+        ans = 0.39894228 + y * (-0.03988024 + y * (-0.00362018
+                + y * (0.00163801 + y * (-0.01031555 + y * (0.02282967
+                + y * (-0.02895312 + y * (0.01787654 + y * -0.00420059)))))));
+        ans = ans / sqrt(ax);
+    }
+    if (x < 0.0) { o[gid] = -ans; } else { o[gid] = ans; }
 }
 ";
 

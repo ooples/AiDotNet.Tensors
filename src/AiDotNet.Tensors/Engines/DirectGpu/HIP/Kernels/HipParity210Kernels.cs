@@ -254,9 +254,14 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_logcumsumexp_axis(
     int inner = idx % innerSize;
     int outer = idx / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float m = -INFINITY;
-    float s = 0.0f;
-    for (int a = 0; a < axisSize; ++a) {
+    if (axisSize <= 0) return;
+    // Bootstrap from the first element instead of -INFINITY. The original
+    // seeding would compute exp(-INF - -INF) = exp(NaN) on the first
+    // iteration when input[0] is -INFINITY, propagating NaN down the scan.
+    float m = input[base_];
+    float s = 1.0f;
+    output[base_] = m;
+    for (int a = 1; a < axisSize; ++a) {
         float x = input[base_ + a * innerSize];
         if (x > m) { s = s * expf(m - x) + 1.0f; m = x; }
         else { s += expf(x - m); }
@@ -555,13 +560,28 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_i1(
     output[idx] = parity210_dev_i1(input[idx]);
 }
 
+// Overflow-safe form — see the CUDA counterpart for full commentary.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_i0e(
     const float* input, float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = expf(-fabsf(x)) * parity210_dev_i0(x);
+    float ax = fabsf(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
+                + y * (0.2659732f + y * (0.0360768f + y * 0.0045813f)))));
+        ans = expf(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (0.01328592f + y * (0.00225319f
+                + y * (-0.00157565f + y * (0.00916281f + y * (-0.02057706f
+                + y * (0.02635537f + y * (-0.01647633f + y * 0.00392377f)))))));
+        ans = ans / sqrtf(ax);
+    }
+    output[idx] = ans;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_i1e(
@@ -570,7 +590,21 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_i1e(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = expf(-fabsf(x)) * parity210_dev_i1(x);
+    float ax = fabsf(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = ax * (0.5f + y * (0.87890594f + y * (0.51498869f + y * (0.15084934f
+                + y * (0.02658733f + y * (0.00301532f + y * 0.00032411f))))));
+        ans = expf(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (-0.03988024f + y * (-0.00362018f
+                + y * (0.00163801f + y * (-0.01031555f + y * (0.02282967f
+                + y * (-0.02895312f + y * (0.01787654f + y * -0.00420059f)))))));
+        ans = ans / sqrtf(ax);
+    }
+    output[idx] = (x < 0.0f) ? -ans : ans;
 }
 
 // ==========================================================================

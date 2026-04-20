@@ -133,11 +133,14 @@ public sealed partial class CudaBackend : IParity210Backend
     public unsafe void Parity210CumSum(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
+        // Empty-axis shape (e.g. [outer, 0, inner]) has zero-length output;
+        // skip launching before probing axisSize against the 1024 threshold.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
         // Block-level Hillis-Steele scan for axes up to 1024 — each line gets
         // one thread block with 2*blockDim.x floats of shared memory for
         // ping-pong buffers. Longer axes fall through to the per-line serial
         // kernel (multi-block carry scheme is a follow-up).
-        if (axisSize > 0 && axisSize <= 1024)
+        if (axisSize <= 1024)
         {
             LaunchBlockScanCumSum(input, output, outerSize, axisSize, innerSize);
             return;
@@ -184,6 +187,9 @@ public sealed partial class CudaBackend : IParity210Backend
         string name, IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
+        // Empty-axis guard: for shapes like [outer, 0, inner] the output is
+        // also empty — launching a kernel would read from zero-length buffers.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
         var kernel = ResolveParity210Kernel(name);
         using var _ = PushContext();
         int total = outerSize * innerSize;       // one thread per line

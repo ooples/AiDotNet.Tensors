@@ -151,6 +151,8 @@ public sealed partial class MetalBackend : IParity210Backend
         int outerSize, int axisSize, int innerSize)
     {
         ThrowIfDisposed();
+        // Empty-axis guard — matches CUDA / HIP / OpenCL.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
         RequireMetalPair(input, output, out var inBuf, out var outBuf);
         int total = outerSize * innerSize;
         var pipeline = GetParity210Pipeline(name);

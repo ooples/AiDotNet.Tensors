@@ -189,9 +189,12 @@ void main() {
     int inner = gid % innerSize;
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float m = -1.0e38;
-    float s = 0.0;
-    for (int k = 0; k < axisSize; ++k) {
+    if (axisSize <= 0) return;
+    // Bootstrap from the first element so a leading -Inf doesn't produce NaN.
+    float m = a[base_];
+    float s = 1.0;
+    o[base_] = m;
+    for (int k = 1; k < axisSize; ++k) {
         float x = a[base_ + k * innerSize];
         if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
         else { s += exp(x - m); }
@@ -535,22 +538,51 @@ void main() {
     o[gid] = p210_i1(a[gid]);
 }";
 
-    public static string I0e => Header + I0I1Helpers + TwoBuf + @"
+    // Overflow-safe form — see the CUDA/Metal counterparts for full commentary.
+    public static string I0e => Header + TwoBuf + @"
 layout(push_constant) uniform P { int size; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float x = a[gid];
-    o[gid] = exp(-abs(x)) * p210_i0(x);
+    float ax = abs(x);
+    float ans;
+    if (ax < 3.75) {
+        float y = (x / 3.75); y = y * y;
+        ans = 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492
+                + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))));
+        ans = exp(-ax) * ans;
+    } else {
+        float y = 3.75 / ax;
+        ans = 0.39894228 + y * (0.01328592 + y * (0.00225319
+                + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706
+                + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))));
+        ans = ans / sqrt(ax);
+    }
+    o[gid] = ans;
 }";
 
-    public static string I1e => Header + I0I1Helpers + TwoBuf + @"
+    public static string I1e => Header + TwoBuf + @"
 layout(push_constant) uniform P { int size; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
     float x = a[gid];
-    o[gid] = exp(-abs(x)) * p210_i1(x);
+    float ax = abs(x);
+    float ans;
+    if (ax < 3.75) {
+        float y = (x / 3.75); y = y * y;
+        ans = ax * (0.5 + y * (0.87890594 + y * (0.51498869 + y * (0.15084934
+                + y * (0.02658733 + y * (0.00301532 + y * 0.00032411))))));
+        ans = exp(-ax) * ans;
+    } else {
+        float y = 3.75 / ax;
+        ans = 0.39894228 + y * (-0.03988024 + y * (-0.00362018
+                + y * (0.00163801 + y * (-0.01031555 + y * (0.02282967
+                + y * (-0.02895312 + y * (0.01787654 + y * -0.00420059)))))));
+        ans = ans / sqrt(ax);
+    }
+    o[gid] = (x < 0.0) ? -ans : ans;
 }";
 
     // =====================================================================

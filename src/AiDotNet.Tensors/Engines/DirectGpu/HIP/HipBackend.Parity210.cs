@@ -100,7 +100,9 @@ public sealed partial class HipBackend : IParity210Backend
     public unsafe void Parity210CumSum(IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
-        if (axisSize > 0 && axisSize <= 1024)
+        // Empty-axis shape — no work, no kernel launch.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
+        if (axisSize <= 1024)
         {
             LaunchBlockScanCumSumHip(input, output, outerSize, axisSize, innerSize);
             return;
@@ -146,6 +148,8 @@ public sealed partial class HipBackend : IParity210Backend
         string name, IGpuBuffer input, IGpuBuffer output,
         int outerSize, int axisSize, int innerSize)
     {
+        // Empty-axis guard — mirrors the CUDA fast path.
+        if (axisSize <= 0 || outerSize <= 0 || innerSize <= 0) return;
         var kernel = ResolveParity210Kernel(name);
         int total = outerSize * innerSize;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

@@ -239,9 +239,12 @@ kernel void parity210_logcumsumexp_axis(
     int inner = (int)gid % innerSize;
     int outer = (int)gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float m = -INFINITY;
-    float s = 0.0f;
-    for (int a = 0; a < axisSize; ++a) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so initial -INFINITY doesn't produce NaN.
+    float m = input[base_];
+    float s = 1.0f;
+    output[base_] = m;
+    for (int a = 1; a < axisSize; ++a) {
         float x = input[base_ + a * innerSize];
         if (x > m) { s = s * exp(m - x) + 1.0f; m = x; }
         else { s += exp(x - m); }
@@ -567,13 +570,33 @@ kernel void parity210_i1(
     output[gid] = p210_i1(input[gid]);
 }
 
+// i0e / i1e compute their own scaled polynomials directly so the
+// intermediate `exp(ax) * exp(-ax)` never overflows for large |x|.
+// For |x| < 3.75 the series is already bounded; for |x| >= 3.75 the
+// exp(ax) factor the helpers would produce cancels with exp(-|x|), so
+// we fold the cancellation in and evaluate (1/sqrt(|x|)) * ans directly.
 kernel void parity210_i0e(
     device const float* input [[buffer(0)]], device float* output [[buffer(1)]],
     constant int& size [[buffer(2)]], uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
     float x = input[gid];
-    output[gid] = exp(-fabs(x)) * p210_i0(x);
+    float ax = fabs(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
+                + y * (0.2659732f + y * (0.0360768f + y * 0.0045813f)))));
+        ans = exp(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (0.01328592f + y * (0.00225319f
+                + y * (-0.00157565f + y * (0.00916281f + y * (-0.02057706f
+                + y * (0.02635537f + y * (-0.01647633f + y * 0.00392377f)))))));
+        // Large-|x| form already absorbs the exp(-ax) cancellation.
+        ans = ans / sqrt(ax);
+    }
+    output[gid] = ans;
 }
 
 kernel void parity210_i1e(
@@ -582,7 +605,21 @@ kernel void parity210_i1e(
 {
     if ((int)gid >= size) return;
     float x = input[gid];
-    output[gid] = exp(-fabs(x)) * p210_i1(x);
+    float ax = fabs(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = ax * (0.5f + y * (0.87890594f + y * (0.51498869f + y * (0.15084934f
+                + y * (0.02658733f + y * (0.00301532f + y * 0.00032411f))))));
+        ans = exp(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (-0.03988024f + y * (-0.00362018f
+                + y * (0.00163801f + y * (-0.01031555f + y * (0.02282967f
+                + y * (-0.02895312f + y * (0.01787654f + y * -0.00420059f)))))));
+        ans = ans / sqrt(ax);
+    }
+    output[gid] = (x < 0.0f) ? -ans : ans;
 }
 
 // ==========================================================================

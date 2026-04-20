@@ -297,9 +297,15 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_logcumsumexp_axis(
     int inner = idx % innerSize;
     int outer = idx / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
-    float m = -INFINITY;      // running max
-    float s = 0.0f;           // running sum of exp(x - m)
-    for (int a = 0; a < axisSize; ++a) {
+    if (axisSize <= 0) return;
+    // Bootstrap from input[0] so an initial -INFINITY doesn't force
+    // exp(-INF - -INF) = exp(NaN). The scanning invariant
+    //   output[i] = m_i + log(s_i)
+    // is satisfied at i=0 with m = x0, s = 1 (i.e. output[0] = x0).
+    float m = input[base_];
+    float s = 1.0f;
+    output[base_] = m;
+    for (int a = 1; a < axisSize; ++a) {
         float x = input[base_ + a * innerSize];
         if (x > m) {
             // Rebase to new max: s' = s * exp(m - x) + 1
@@ -651,14 +657,34 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_i1(
     output[idx] = parity210_dev_i1(input[idx]);
 }
 
-// I0e / I1e: scaled by exp(-|x|) for overflow-safe large-x behaviour.
+// I0e / I1e: scaled by exp(-|x|).  The naive form `expf(-fabsf(x)) *
+// parity210_dev_i0(x)` overflows before the cancellation can happen
+// because the large-|x| branch of parity210_dev_i0 multiplies by
+// exp(|x|) / sqrt(|x|). Inline the polynomial here and fold in
+// exp(-|x|) analytically: for |x| < 3.75 the series is small enough
+// to multiply by exp(-|x|); for |x| >= 3.75 the exp factors cancel
+// to 1/sqrt(|x|), so we drop them entirely.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_i0e(
     const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = expf(-fabsf(x)) * parity210_dev_i0(x);
+    float ax = fabsf(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
+                + y * (0.2659732f + y * (0.0360768f + y * 0.0045813f)))));
+        ans = expf(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (0.01328592f + y * (0.00225319f
+                + y * (-0.00157565f + y * (0.00916281f + y * (-0.02057706f
+                + y * (0.02635537f + y * (-0.01647633f + y * 0.00392377f)))))));
+        ans = ans / sqrtf(ax);
+    }
+    output[idx] = ans;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_i1e(
@@ -667,7 +693,21 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_i1e(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = expf(-fabsf(x)) * parity210_dev_i1(x);
+    float ax = fabsf(x);
+    float ans;
+    if (ax < 3.75f) {
+        float y = (x / 3.75f); y = y * y;
+        ans = ax * (0.5f + y * (0.87890594f + y * (0.51498869f + y * (0.15084934f
+                + y * (0.02658733f + y * (0.00301532f + y * 0.00032411f))))));
+        ans = expf(-ax) * ans;
+    } else {
+        float y = 3.75f / ax;
+        ans = 0.39894228f + y * (-0.03988024f + y * (-0.00362018f
+                + y * (0.00163801f + y * (-0.01031555f + y * (0.02282967f
+                + y * (-0.02895312f + y * (0.01787654f + y * -0.00420059f)))))));
+        ans = ans / sqrtf(ax);
+    }
+    output[idx] = (x < 0.0f) ? -ans : ans;
 }
 
 // ==========================================================================

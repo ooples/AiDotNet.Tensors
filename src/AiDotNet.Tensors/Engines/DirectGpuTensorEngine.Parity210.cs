@@ -326,7 +326,7 @@ public partial class DirectGpuTensorEngine
     // Cumulative  (CumSum: one thread per (outer, inner) line)
     // =======================================================================
 
-    public new Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
+    public override Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         try
         {
@@ -343,7 +343,10 @@ public partial class DirectGpuTensorEngine
                 {
                     p210.Parity210CumSum(inBuf.Buffer, outBuf.Buffer, outer, axisSize, inner);
                     var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                    return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    Autodiff.DifferentiableOps.RecordUnary("TensorCumSum", r, tensor,
+                        Autodiff.BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+                    return r;
                 }
                 catch
                 {

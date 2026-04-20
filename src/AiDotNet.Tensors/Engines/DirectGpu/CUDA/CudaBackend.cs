@@ -10948,6 +10948,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             _activationModule = IntPtr.Zero;
         }
 
+        if (_parity210Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_parity210Module);
+            _parity210Module = IntPtr.Zero;
+        }
+
         if (_fftModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_fftModule);
