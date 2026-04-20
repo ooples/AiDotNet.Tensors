@@ -11066,6 +11066,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             _sparseModule = IntPtr.Zero;
         }
 
+        if (_linalgModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
+        }
+
         if (_cudaContext != IntPtr.Zero)
         {
             CuBlasNative.cuCtxDestroy(_cudaContext);

@@ -25,6 +25,8 @@ internal static class LinalgInverses
         if (input.Rank < 2) throw new ArgumentException("InvEx needs a square matrix.", nameof(input));
         int rank = input.Rank;
         int n = input.Shape[rank - 1];
+        if (input.Shape[rank - 2] != n)
+            throw new ArgumentException("InvEx needs a square matrix.", nameof(input));
         var eye = Eye<T>(input._shape, n);
         return LinearSolvers.SolveEx(input, eye);
     }

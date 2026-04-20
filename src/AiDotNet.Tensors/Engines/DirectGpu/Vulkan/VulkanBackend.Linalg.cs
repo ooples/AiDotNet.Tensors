@@ -43,6 +43,15 @@ public sealed unsafe partial class VulkanBackend : ILinalgBackend
         int batchCount, int n)
     {
         if (batchCount <= 0 || n <= 0) return;
+        // VulkanLinalgKernels.Eigh declares `shared float Ash[64*64]; shared
+        // float Vsh[64*64];` — anything beyond 64 would index out of bounds.
+        // The engine-level dispatcher already caps at 64, but enforce again
+        // here so a misuse surfaces as an explicit exception rather than an
+        // undefined-behavior kernel launch.
+        if (n > 64)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"Vulkan Eigh kernel supports n ≤ 64 (got n = {n}). " +
+                "Route to CPU via DirectGpuTensorEngine.TryGpuEigh for larger sizes.");
         uint[] pc = { (uint)batchCount, (uint)n };
         GlslBinaryOp3(VulkanLinalgKernels.Eigh, input, eigenvalues, eigenvectors,
             dispatchSize: batchCount * 256, pc, sizeof(uint) * 2u);

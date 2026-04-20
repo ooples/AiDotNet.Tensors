@@ -47,6 +47,9 @@ public sealed partial class MetalBackend : ILinalgBackend
         encoder.SetBytes(batchCount, 3);
         encoder.SetBytes(n, 4);
         encoder.SetBytes(upper ? 1 : 0, 5);
+        // Slot 0: threadgroup int for localInfo (4 bytes, rounded to the 16-byte
+        // alignment Metal requires for threadgroup memory).
+        encoder.SetThreadgroupMemoryLength(16, 0);
         encoder.DispatchThreadgroups(
             new MTLSize((uint)batchCount, 1, 1),
             new MTLSize(tpg, 1, 1));
@@ -71,6 +74,8 @@ public sealed partial class MetalBackend : ILinalgBackend
         encoder.SetBytes(batchCount, 3);
         encoder.SetBytes(m, 4);
         encoder.SetBytes(n, 5);
+        // Slot 0: threadgroup int for pivRow (4 bytes, 16-byte aligned).
+        encoder.SetThreadgroupMemoryLength(16, 0);
         encoder.DispatchThreadgroups(
             new MTLSize((uint)batchCount, 1, 1),
             new MTLSize(tpg, 1, 1));
@@ -95,6 +100,13 @@ public sealed partial class MetalBackend : ILinalgBackend
         encoder.SetBytes(batchCount, 3);
         encoder.SetBytes(m, 4);
         encoder.SetBytes(n, 5);
+        // Slots 0-3: four threadgroup floats (sNorm/sAlpha/sBeta/sV0), each
+        // 16-byte aligned. The per-kernel partials[1024] array is statically
+        // sized so it needs no explicit binding.
+        encoder.SetThreadgroupMemoryLength(16, 0);
+        encoder.SetThreadgroupMemoryLength(16, 1);
+        encoder.SetThreadgroupMemoryLength(16, 2);
+        encoder.SetThreadgroupMemoryLength(16, 3);
         encoder.DispatchThreadgroups(
             new MTLSize((uint)batchCount, 1, 1),
             new MTLSize(tpg, 1, 1));

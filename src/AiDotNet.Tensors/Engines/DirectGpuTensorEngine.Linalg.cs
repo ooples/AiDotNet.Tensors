@@ -24,6 +24,21 @@ public partial class DirectGpuTensorEngine
     private const int GpuLinalgMaxN = 256;
 
     /// <summary>
+    /// Backends that can report a compile-failure capability flag (currently
+    /// only OpenCL) pass through this probe. Returns true when linalg kernels
+    /// are known-good, false when they failed to compile and the caller must
+    /// fall back. Backends without a flag default to true.
+    /// </summary>
+    private static bool BackendLinalgReady(IDirectGpuBackend backend)
+    {
+#if !NET462
+        if (backend is AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend ocl)
+            return ocl.LinalgAvailable;
+#endif
+        return true;
+    }
+
+    /// <summary>
     /// GPU-accelerated Cholesky. Returns null on unsupported backends or
     /// oversized matrices so callers fall back to the CPU path.
     /// </summary>
@@ -32,6 +47,7 @@ public partial class DirectGpuTensorEngine
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
+        if (!BackendLinalgReady(backend)) return (null, null);
 
         int rank = input.Rank;
         if (rank < 2) return (null, null);
@@ -42,9 +58,13 @@ public partial class DirectGpuTensorEngine
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
+        // outBuf ownership transfers into the activation cache via FinishGpuOp
+        // on the success path (so it lives past this scope). On failure we must
+        // dispose it ourselves. infoBuf is downloaded synchronously and always
+        // disposed here — no deferred lifetime to preserve.
         using var inBuf = GetOrAllocateBuffer(backend, input);
+        using var infoBuf = AllocateInt32Buffer(backend, batch);
         var outBuf = AllocateOutputBuffer(backend, batch * n * n);
-        var infoBuf = AllocateInt32Buffer(backend, batch);
         try
         {
             lin.LinalgCholesky(inBuf.Buffer, outBuf.Buffer, infoBuf.Buffer, batch, n, upper);
@@ -52,13 +72,11 @@ public partial class DirectGpuTensorEngine
             var infoArr = DownloadInt32(backend, infoBuf.Buffer, batch);
             var factor = new Tensor<float>(factorArr, (int[])input._shape.Clone());
             var infoTensor = BuildInfoTensor(input._shape, infoArr);
-            infoBuf.Dispose();
             return (factor, infoTensor);
         }
         catch
         {
             outBuf.Dispose();
-            infoBuf.Dispose();
             return (null, null);
         }
     }
@@ -68,6 +86,7 @@ public partial class DirectGpuTensorEngine
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
+        if (!BackendLinalgReady(backend)) return (null, null);
 
         int rank = input.Rank;
         if (rank < 2) return (null, null);
@@ -79,9 +98,10 @@ public partial class DirectGpuTensorEngine
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
+        // outBuf lifetime transfers into the activation cache on success.
         using var inBuf = GetOrAllocateBuffer(backend, input);
+        using var pivBuf = AllocateInt32Buffer(backend, batch * k);
         var outBuf = AllocateOutputBuffer(backend, batch * m * n);
-        var pivBuf = AllocateInt32Buffer(backend, batch * k);
         try
         {
             lin.LinalgLuFactor(inBuf.Buffer, outBuf.Buffer, pivBuf.Buffer, batch, m, n);
@@ -93,13 +113,11 @@ public partial class DirectGpuTensorEngine
             pivShape[rank - 2] = k;
             var pivots = new Tensor<int>(pivShape);
             Array.Copy(pivArr, pivots.GetDataArray(), pivArr.Length);
-            pivBuf.Dispose();
             return (lu, pivots);
         }
         catch
         {
             outBuf.Dispose();
-            pivBuf.Dispose();
             return (null, null);
         }
     }
@@ -109,6 +127,7 @@ public partial class DirectGpuTensorEngine
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
+        if (!BackendLinalgReady(backend)) return (null, null);
 
         int rank = input.Rank;
         if (rank < 2) return (null, null);
@@ -120,6 +139,7 @@ public partial class DirectGpuTensorEngine
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
+        // qBuf/rBuf lifetime transfers into the activation cache on success.
         using var inBuf = GetOrAllocateBuffer(backend, input);
         var qBuf = AllocateOutputBuffer(backend, batch * m * k);
         var rBuf = AllocateOutputBuffer(backend, batch * k * n);
@@ -142,11 +162,20 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // NOTE on buffer lifetimes in this file: each "output" buffer passed to
+    // FinishGpuOp has its IGpuBuffer reference registered in the activation
+    // cache and the deferred-download map — ownership transfers, so the
+    // OwnedBuffer struct going out of scope without Dispose() is intentional
+    // (calling Dispose on success would double-free the GPU handle). Buffers
+    // that we download synchronously (info/pivots) use `using` and are
+    // released right after the download.
+
     /// <summary>GPU-accelerated symmetric eigendecomposition.</summary>
     internal (Tensor<float>? Eigenvalues, Tensor<float>? Eigenvectors) TryGpuEigh(Tensor<float> input)
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
+        if (!BackendLinalgReady(backend)) return (null, null);
 
         int rank = input.Rank;
         if (rank < 2) return (null, null);

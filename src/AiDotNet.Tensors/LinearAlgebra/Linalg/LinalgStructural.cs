@@ -69,55 +69,70 @@ internal static class LinalgStructural
                 if (s > norm1) norm1 = s;
             }
 
-            // Scale so norm1 ≤ 0.5.
+            // Scale so norm1 ≤ θ₁₃ = 5.371920351148152 (the Higham 2005 bound
+            // above which the degree-13 Padé approximation loses accuracy).
+            const double theta13 = 5.371920351148152;
             int squarings = 0;
-            if (norm1 > 0.5)
+            if (norm1 > theta13)
             {
-                squarings = (int)Math.Ceiling(Math.Log(norm1 / 0.5) / Math.Log(2.0));
+                squarings = (int)Math.Ceiling(Math.Log(norm1 / theta13) / Math.Log(2.0));
                 squarings = Math.Max(0, squarings);
                 double scale = 1.0 / Math.Pow(2.0, squarings);
                 for (int i = 0; i < n * n; i++) A[i] *= scale;
             }
 
-            // Padé [6/6] coefficients.
-            double[] c =
+            // Higham 2005 degree-13 Padé coefficients
+            // (Higham, "The Scaling and Squaring Method for the Matrix Exponential Revisited",
+            //  SIAM J. Matrix Anal. Appl. 26 (4), 2005). These are the bₖ integers from
+            // the numerator/denominator of r₁₃(x) = p₁₃(x) / q₁₃(x).
+            double[] pc =
             {
-                1.0, 1.0 / 2.0, 5.0 / 44.0, 1.0 / 66.0, 1.0 / 792.0,
-                1.0 / 15840.0, 1.0 / 665280.0
+                64764752532480000.0, 32382376266240000.0,  7771770303897600.0,
+                 1187353796428800.0,   129060195264000.0,    10559470521600.0,
+                     670442572800.0,       33522128640.0,        1323241920.0,
+                         40840800.0,             960960.0,             16380.0,
+                              182.0,                 1.0
             };
 
             var A2 = MatMulMat(A, A, n);
             var A4 = MatMulMat(A2, A2, n);
             var A6 = MatMulMat(A4, A2, n);
 
-            // U = A · (c[1]·I + c[3]·A² + c[5]·A⁴ + c[7]·A⁶). We only have up to c[5]/c[7]
-            // approximated; this simplified form is adequate for norm ≤ 0.5.
+            // inner = b[13]·A⁶ + b[11]·A⁴ + b[9]·A², then U = A · (A⁶·inner + b[7]·I + b[5]·A⁴ + b[3]·A² + b[1]·I_folded)
+            // Following the standard expansion from Higham 2005 Eq. (2.2):
+            //   U = A · [A⁶ · (b₁₃·A⁶ + b₁₁·A⁴ + b₉·A²) + b₇·A⁶ + b₅·A⁴ + b₃·A² + b₁·I]
+            //   V =          A⁶ · (b₁₂·A⁶ + b₁₀·A⁴ + b₈·A²) + b₆·A⁶ + b₄·A⁴ + b₂·A² + b₀·I
+            var innerU = new double[n * n];
+            var innerV = new double[n * n];
+            for (int i = 0; i < n * n; i++)
+            {
+                innerU[i] = pc[13] * A6[i] + pc[11] * A4[i] + pc[9] * A2[i];
+                innerV[i] = pc[12] * A6[i] + pc[10] * A4[i] + pc[8] * A2[i];
+            }
+            var A6innerU = MatMulMat(A6, innerU, n);
+            var A6innerV = MatMulMat(A6, innerV, n);
+
             var U = new double[n * n];
             var V = new double[n * n];
             for (int i = 0; i < n; i++)
             {
-                V[i * n + i] += c[0];
-                U[i * n + i] += c[1];
+                U[i * n + i] += pc[1];
+                V[i * n + i] += pc[0];
             }
             for (int i = 0; i < n * n; i++)
             {
-                V[i] += c[2] * A2[i];
-                U[i] += c[3] * A2[i];
-                V[i] += c[4] * A4[i];
-                U[i] += c[5] * A4[i];
-                V[i] += c[6] * A6[i];
+                U[i] += A6innerU[i] + pc[7] * A6[i] + pc[5] * A4[i] + pc[3] * A2[i];
+                V[i] += A6innerV[i] + pc[6] * A6[i] + pc[4] * A4[i] + pc[2] * A2[i];
             }
             U = MatMulMat(A, U, n);
 
-            // N = V + U, D = V − U.
-            var N = new double[n * n];
-            var D = new double[n * n];
-            for (int i = 0; i < n * n; i++) { N[i] = V[i] + U[i]; D[i] = V[i] - U[i]; }
+            // P = V + U, Q = V − U; solve Q·X = P.
+            var P = new double[n * n];
+            var Q = new double[n * n];
+            for (int i = 0; i < n * n; i++) { P[i] = V[i] + U[i]; Q[i] = V[i] - U[i]; }
 
-            // Solve D · X = N for X (via internal LU on doubles).
-            var X = SolveDouble(D, N, n);
+            var X = SolveDouble(Q, P, n);
 
-            // Square `squarings` times.
             for (int s = 0; s < squarings; s++)
                 X = MatMulMat(X, X, n);
 
@@ -314,19 +329,39 @@ internal static class LinalgStructural
         for (int i = 0; i < outShape.Length - 1; i++) batch *= outShape[i];
         int inRow = input._strides[d1];
         int inCol = input._strides[d2];
-        int batchStride = 0;
-        for (int i = 0; i < rank; i++)
-            if (i != d1 && i != d2) batchStride = Math.Max(batchStride, input._strides[i]);
 
-        // Batch over non-diagonal axes (simple linear order for common 2D/3D cases).
+        // For 4D+ tensors with multiple batch dimensions the max-stride shortcut
+        // undercounts the linear offset (e.g. a (B, C, H, W) slice where d1=2,
+        // d2=3 needs B·C distinct batch offsets, not B·max(stride_0, stride_1)).
+        // Build an odometer that decodes each batch index into its per-axis
+        // coordinates and re-uses the input's full stride table.
+        int batchAxisCount = rank - 2;
+        int[] batchDims = new int[batchAxisCount];
+        int[] batchStrides = new int[batchAxisCount];
+        int bi = 0;
+        for (int i = 0; i < rank; i++)
+        {
+            if (i == d1 || i == d2) continue;
+            batchDims[bi] = input._shape[i];
+            batchStrides[bi] = input._strides[i];
+            bi++;
+        }
+
         for (int b = 0; b < batch; b++)
         {
+            int baseOff = 0;
+            int rem = b;
+            for (int a = batchAxisCount - 1; a >= 0; a--)
+            {
+                int idx = rem % batchDims[a];
+                rem /= batchDims[a];
+                baseOff += idx * batchStrides[a];
+            }
             for (int k = 0; k < dLen; k++)
             {
                 int inI = offset >= 0 ? k : k - offset;
                 int inJ = offset >= 0 ? k + offset : k;
-                int offIn = b * batchStride + inI * inRow + inJ * inCol;
-                rD[b * dLen + k] = inD[offIn];
+                rD[b * dLen + k] = inD[baseOff + inI * inRow + inJ * inCol];
             }
         }
         return result;
@@ -542,7 +577,9 @@ internal static class LinalgStructural
             {
                 double s = b[i * n + j];
                 for (int c = i + 1; c < n; c++) s -= a[i * n + c] * x[c * n + j];
-                x[i * n + j] = a[i * n + i] == 0 ? 0 : s / a[i * n + i];
+                // Singular pivot: propagate NaN so downstream callers see an
+                // explicit "no solution" sentinel. Matches LuDecomposition.SolveSingle.
+                x[i * n + j] = a[i * n + i] == 0 ? double.NaN : s / a[i * n + i];
             }
         }
         return x;

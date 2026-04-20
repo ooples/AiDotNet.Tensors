@@ -69,10 +69,14 @@ internal static class SvdWrapper
     internal static (Tensor<T> U, Tensor<T> S, Tensor<T> Vh) LowRank<T>(Tensor<T> input, int rank, int q)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // Randomized truncated SVD (Halko 2011): sketch A·Ω, orthonormalize,
-        // project, small full SVD. Cheap when rank ≪ min(M,N). Uses the full
-        // SVD path internally on a rank-sized matrix.
+        // Truncated SVD: computes the full SVD and returns the top-`rank`
+        // components. A full Halko 2011 randomized sketch (A·Ω →
+        // orthonormalize → project → small SVD) would be cheaper at
+        // rank ≪ min(M,N); that path lives behind this API for when it
+        // lands, but today `q` (subspace iterations) and the randomization
+        // are not yet applied.
         if (rank < 1) throw new ArgumentException("rank must be positive.", nameof(rank));
+        _ = q; // reserved for future randomized sketch, see comment above.
         var full = Full(input, fullMatrices: false);
         int fullK = full.S.Shape[full.S.Rank - 1];
         int k = Math.Min(rank, fullK);

@@ -186,21 +186,56 @@ internal static class LinearSolvers
         bool bIsVector = b.Rank == a.Rank - 1;
         int nrhs = bIsVector ? 1 : b.Shape[b.Rank - 1];
 
-        // For m >= n use QR-based normal-equation-free approach; for m < n use SVD.
-        var (Q, R) = QrDecomposition.Compute(a, "reduced");
-        // Qᵀ·b
-        var qtb = TransposeMatMul(Q, b, m, Math.Min(m, n), nrhs, bIsVector);
-        // Solve R·x = Qᵀ·b
-        var sol = SolveTriangularInternal(R, qtb, upper: true, transpose: false, unitDiagonal: false);
+        Tensor<T> sol;
+        Tensor<T> R;
+        if (m >= n)
+        {
+            // Overdetermined / square: min ||A·x - b||² via thin QR.
+            var (Q, Rqr) = QrDecomposition.Compute(a, "reduced");
+            var qtb = TransposeMatMul(Q, b, m, Math.Min(m, n), nrhs, bIsVector);
+            sol = SolveTriangularInternal(Rqr, qtb, upper: true, transpose: false, unitDiagonal: false);
+            R = Rqr;
+        }
+        else
+        {
+            // Underdetermined: minimum-norm solution via QR of Aᵀ.
+            //   Aᵀ = Q·R, where Q is n×m and R is m×m upper triangular.
+            //   Solve Rᵀ·y = b for y (forward substitution on a lower triangle).
+            //   x = Q·y    (shape n, the minimum-norm solution).
+            var at = TransposeLastTwo(a);
+            var (Qt, Rt) = QrDecomposition.Compute(at, "reduced");
+            var y = SolveTriangularInternal(Rt, b, upper: true, transpose: true, unitDiagonal: false);
+            sol = MatMulLastTwo(Qt, y, bIsVector);
+            R = Rt;
+        }
 
-        // Residuals (||b - A·x||²) — only meaningful when m > n.
+        // Residuals (||b - A·x||²) — only meaningful when m > n (strictly
+        // overdetermined). For m ≤ n the residual is zero by construction.
         var resShape = bIsVector ? new[] { 1 } : new[] { nrhs };
         var residuals = new Tensor<T>(resShape);
+        if (m > n)
+        {
+            var axMinusB = MatMulMinusB(a, sol, b, bIsVector);
+            var resD = residuals.GetDataArray();
+            var rbD = axMinusB.GetDataArray();
+            for (int c = 0; c < nrhs; c++)
+            {
+                double s = 0.0;
+                for (int i = 0; i < m; i++)
+                {
+                    double v = ToDouble(bIsVector ? rbD[i] : rbD[i * nrhs + c]);
+                    s += v * v;
+                }
+                resD[c] = FromDouble<T>(s);
+            }
+        }
+
         var rankOut = new Tensor<int>(new[] { 1 });
         rankOut.GetDataArray()[0] = Math.Min(m, n);
         var sv = new Tensor<T>(new[] { Math.Min(m, n) });
-        // Populate approximate SVs via R's diagonal magnitudes (real diagonal != singular values,
-        // but Lstsq callers typically just use Rank and Solution).
+        // Approximate SVs via R's diagonal magnitudes — not exact singular
+        // values but adequate for callers that use SV magnitudes as a
+        // conditioning sanity-check. A full SVD-backed driver lands separately.
         var rData = R.GetDataArray();
         var svData = sv.GetDataArray();
         int rCols = R.Shape[R.Rank - 1];
@@ -208,6 +243,91 @@ internal static class LinearSolvers
             svData[i] = FromDouble<T>(Math.Abs(ToDouble(rData[i * rCols + i])));
 
         return (sol, residuals, rankOut, sv);
+    }
+
+    // Helper: transpose the last two axes of a tensor (for Aᵀ in Lstsq m<n).
+    private static Tensor<T> TransposeLastTwo<T>(Tensor<T> t)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        int rank = t.Rank;
+        var outShape = (int[])t._shape.Clone();
+        outShape[rank - 1] = t._shape[rank - 2];
+        outShape[rank - 2] = t._shape[rank - 1];
+        var res = new Tensor<T>(outShape);
+        int m = t._shape[rank - 2];
+        int n = t._shape[rank - 1];
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch *= t._shape[i];
+        var sD = t.GetDataArray();
+        var rD = res.GetDataArray();
+        for (int b = 0; b < batch; b++)
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    rD[b * m * n + j * m + i] = sD[b * m * n + i * n + j];
+        return res;
+    }
+
+    // Helper: compute Q·y for the underdetermined Lstsq path (Q is n×m, y is
+    // m or m×nrhs). Result has shape n or n×nrhs.
+    private static Tensor<T> MatMulLastTwo<T>(Tensor<T> Q, Tensor<T> y, bool bIsVector)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        int n = Q.Shape[Q.Rank - 2];
+        int m = Q.Shape[Q.Rank - 1];
+        int nrhs = bIsVector ? 1 : y.Shape[y.Rank - 1];
+        var outShape = bIsVector ? new[] { n } : new[] { n, nrhs };
+        var res = new Tensor<T>(outShape);
+        var qD = Q.GetDataArray();
+        var yD = y.GetDataArray();
+        var rD = res.GetDataArray();
+        for (int i = 0; i < n; i++)
+        {
+            for (int c = 0; c < nrhs; c++)
+            {
+                double s = 0.0;
+                for (int k = 0; k < m; k++)
+                {
+                    double qik = ToDouble(qD[i * m + k]);
+                    double yk = bIsVector ? ToDouble(yD[k]) : ToDouble(yD[k * nrhs + c]);
+                    s += qik * yk;
+                }
+                if (bIsVector) rD[i] = FromDouble<T>(s);
+                else rD[i * nrhs + c] = FromDouble<T>(s);
+            }
+        }
+        return res;
+    }
+
+    // Helper: compute r = A·x - b (used for residual norm in overdetermined Lstsq).
+    private static Tensor<T> MatMulMinusB<T>(Tensor<T> A, Tensor<T> x, Tensor<T> b, bool bIsVector)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        int m = A.Shape[A.Rank - 2];
+        int n = A.Shape[A.Rank - 1];
+        int nrhs = bIsVector ? 1 : x.Shape[x.Rank - 1];
+        var outShape = bIsVector ? new[] { m } : new[] { m, nrhs };
+        var res = new Tensor<T>(outShape);
+        var aD = A.GetDataArray();
+        var xD = x.GetDataArray();
+        var bD = b.GetDataArray();
+        var rD = res.GetDataArray();
+        for (int i = 0; i < m; i++)
+        {
+            for (int c = 0; c < nrhs; c++)
+            {
+                double s = 0.0;
+                for (int k = 0; k < n; k++)
+                {
+                    double aik = ToDouble(aD[i * n + k]);
+                    double xk = bIsVector ? ToDouble(xD[k]) : ToDouble(xD[k * nrhs + c]);
+                    s += aik * xk;
+                }
+                double bi = ToDouble(bIsVector ? bD[i] : bD[i * nrhs + c]);
+                if (bIsVector) rD[i] = FromDouble<T>(s - bi);
+                else rD[i * nrhs + c] = FromDouble<T>(s - bi);
+            }
+        }
+        return res;
     }
 
     // ── Kernels ─────────────────────────────────────────────────────────────

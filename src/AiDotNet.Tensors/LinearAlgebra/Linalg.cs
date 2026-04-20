@@ -49,8 +49,12 @@ public static class Linalg
     public static (Tensor<T> Eigenvalues, Tensor<T> Eigenvectors) Eigh<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // GPU fast-path (fp32, n ≤ 64 — shared-memory bound).
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        // GPU fast-path (fp32, n ≤ 64 — shared-memory bound). The current GPU
+        // kernels symmetrize from the upper triangle, so they match `upper=true`
+        // semantics; `upper=false` falls through to the CPU path that reads
+        // from the lower triangle. Widen this to all UPLO modes when the GPU
+        // kernel grows an explicit `upper` uniform.
+        if (typeof(T) == typeof(float) && upper && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
         {
             var (gW, gV) = gpu.TryGpuEigh((Tensor<float>)(object)input);
             if (gW is not null && gV is not null)

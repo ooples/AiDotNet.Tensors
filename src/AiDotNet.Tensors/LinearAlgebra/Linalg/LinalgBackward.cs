@@ -372,12 +372,23 @@ internal static class LinalgBackward
             if (n == 0) return; // d(I)/dA = 0
             if (n < 0)
             {
-                // For negative powers: Aⁿ = (A⁻¹)|n|. Fall back to Inv + positive-power path.
+                // For negative powers: Aⁿ = B^|n| where B = A⁻¹.
+                // 1) Compute gradB via the positive-power path into a local grad dict.
+                // 2) Propagate gradB → gradA via the inverse rule: gradA = -A⁻ᵀ · gradB · A⁻ᵀ.
                 var invA = Linalg.Inv(A);
                 var innerBackward = MatrixPowerBackward<T>();
+                var innerGrads = new Dictionary<Tensor<T>, Tensor<T>>();
                 var innerInputs = new[] { invA };
                 var innerSaved = new object[] { -n };
-                innerBackward(gradOutput, innerInputs, output, innerSaved, engine, grads);
+                innerBackward(gradOutput, innerInputs, output, innerSaved, engine, innerGrads);
+                if (innerGrads.TryGetValue(invA, out var gradInvA))
+                {
+                    var invAT = Transpose(invA);
+                    var tmp = MatMul(invAT, gradInvA);
+                    var gradAFromInv = MatMul(tmp, invAT);
+                    Negate(gradAFromInv);
+                    Accumulate(grads, A, gradAFromInv);
+                }
                 return;
             }
 

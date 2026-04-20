@@ -168,7 +168,17 @@ internal static class IterativeSolvers
 
             var sHat = precond is null ? s : ApplyPrecond(precond, s);
             var t = MatVec(aD, sHat, n);
-            omega = Dot(t, s) / Dot(t, t);
+            double tt = Dot(t, t);
+            // Breakdown check: if t is (nearly) the zero vector, ω is undefined
+            // and the algorithm has stagnated. Accept the current x (which
+            // already includes the α·p̂ update below for the Bi-step pass)
+            // and exit rather than producing NaN/Inf.
+            if (tt < double.Epsilon)
+            {
+                for (int i = 0; i < n; i++) x[i] += alpha * pHat[i];
+                break;
+            }
+            omega = Dot(t, s) / tt;
             for (int i = 0; i < n; i++) x[i] += alpha * pHat[i] + omega * sHat[i];
             for (int i = 0; i < n; i++) r[i] = s[i] - omega * t[i];
             if (Math.Sqrt(Dot(r, r)) / rrNorm0 < tol) break;

@@ -7,6 +7,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         private DirectOpenClKernel GetLinalgKernel(string name)
         {
+            if (!_linalgAvailable)
+                throw new NotSupportedException(
+                    "OpenCL Parity-211 linalg kernels failed to compile on this device — " +
+                    "check OpenClBackend.LinalgAvailable before dispatching, or let " +
+                    "DirectGpuTensorEngine route through the managed CPU fallback. " +
+                    $"Compile error: {_linalgCompileError ?? "unknown"}");
             if (!_kernelCache.TryGetValue(name, out var kernel))
                 throw new InvalidOperationException(
                     $"OpenCL Linalg kernel not found: {name}. Module may have failed to compile.");

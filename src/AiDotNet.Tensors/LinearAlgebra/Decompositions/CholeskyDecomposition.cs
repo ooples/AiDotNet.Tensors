@@ -70,13 +70,23 @@ internal static class CholeskyDecomposition
     private static int FactorSingle<T>(T[] a, int off, int n, bool upper)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // Try native tier — stubbed false today.
-        if (typeof(T) == typeof(float) && LapackProvider.HasLapack)
+        // Try native tier — stubbed false today but dispatches both fp32 and fp64.
+        if (LapackProvider.HasLapack)
         {
-            var span = new Span<T>(a, off, n * n);
-            if (LapackProvider.TryPotrf(upper, n,
-                System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(span), n, out int info))
-                return info;
+            if (typeof(T) == typeof(float))
+            {
+                var span = new Span<T>(a, off, n * n);
+                if (LapackProvider.TryPotrf(upper, n,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(span), n, out int info))
+                    return info;
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var span = new Span<T>(a, off, n * n);
+                if (LapackProvider.TryPotrf(upper, n,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(span), n, out int info))
+                    return info;
+            }
         }
 
         // Managed right-looking Cholesky. Fails gracefully: returns k+1 when the

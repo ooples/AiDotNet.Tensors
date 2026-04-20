@@ -53,9 +53,10 @@ extern ""C"" __global__ void parity211_cholesky(
     __syncthreads();
 
     for (int j = 0; j < n; ++j) {
-        // Diagonal: L[j,j] = sqrt(A[j,j] − Σ_{k<j} L[j,k]²).
+        // Diagonal: L[j,j] = sqrt(A[j,j] − Σ_{k<j} L[j,k]²). The diagonal
+        // element is on the diagonal regardless of triangle, so no ternary.
         if (tid == 0) {
-            float diag = upper ? Lb[j * n + j] : Lb[j * n + j];
+            float diag = Lb[j * n + j];
             for (int k = 0; k < j; ++k) {
                 float l_jk = upper ? Lb[k * n + j] : Lb[j * n + k];
                 diag -= l_jk * l_jk;

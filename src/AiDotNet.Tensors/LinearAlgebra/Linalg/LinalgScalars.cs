@@ -12,10 +12,15 @@ internal static class LinalgScalars
     internal static Tensor<T> Det<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // det(A) = (sign of perm) · product of LU diagonal.
-        var (lu, pivots) = LuDecomposition.Factor(input);
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank < 2) throw new ArgumentException("Det needs a 2D+ tensor.", nameof(input));
         int rank = input.Rank;
         int n = input.Shape[rank - 1];
+        if (input.Shape[rank - 2] != n)
+            throw new ArgumentException("Det needs a square matrix.", nameof(input));
+
+        // det(A) = (sign of perm) · product of LU diagonal.
+        var (lu, pivots) = LuDecomposition.Factor(input);
 
         var outShape = rank > 2
             ? TakePrefix(input._shape, rank - 2)
@@ -164,11 +169,18 @@ internal static class LinalgScalars
                         }
                         condVal = Math.Sqrt(fro2 * inv2);
                     }
-                    else // "nuc"
+                    else // "nuc" — ||A||_nuc · ||A⁻¹||_nuc = (Σσᵢ) · (Σ 1/σᵢ).
                     {
-                        double nuc = 0;
-                        for (int i = 0; i < k; i++) nuc += ToDouble(sData[b * k + i]);
-                        condVal = nuc; // simplified — Pyt uses ||A||_nuc · ||A⁻¹||_nuc which is expensive.
+                        double nucA = 0;
+                        double nucInv = 0;
+                        for (int i = 0; i < k; i++)
+                        {
+                            double v = ToDouble(sData[b * k + i]);
+                            nucA += v;
+                            if (v > 0) nucInv += 1.0 / v;
+                            else { nucInv = double.PositiveInfinity; break; }
+                        }
+                        condVal = double.IsInfinity(nucInv) ? double.PositiveInfinity : nucA * nucInv;
                     }
                 }
                 else if (pOrd is double dp && dp < 0 || pOrd is int ipn && ipn < 0)

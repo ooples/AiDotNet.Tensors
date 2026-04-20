@@ -121,6 +121,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly bool _supportsFp16;
         private readonly bool _supportsSubgroups;
         private bool _mixedPrecisionKernelsAvailable;
+        private bool _linalgAvailable;
+        private string? _linalgCompileError;
+
+        /// <summary>
+        /// True when the Parity-211 linalg kernels (Cholesky/LU/QR/Eigh)
+        /// compiled successfully on this backend. Callers should prefer
+        /// routing through <see cref="DirectGpuTensorEngine"/> which gates
+        /// on <see cref="ILinalgBackend"/> + this capability — a false value
+        /// means the caller should fall back to the managed CPU path.
+        /// </summary>
+        public bool LinalgAvailable => _linalgAvailable;
+
+        /// <summary>Diagnostic message when <see cref="LinalgAvailable"/> is false.</summary>
+        public string? LinalgCompileError => _linalgCompileError;
 
         /// <summary>
         /// Gets whether OpenCL is available on this system.
@@ -569,17 +583,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL Parity-210 compilation failed: {ex.Message}");
                 }
 
-                // Linalg decomposition kernels (#211 moat #2).
+                // Linalg decomposition kernels (#211 moat #2). Compilation
+                // failure flips _linalgAvailable=false and surfaces via
+                // <see cref="LinalgAvailable"/> so callers can route to CPU
+                // instead of hitting a late runtime throw from GetLinalgKernel.
                 try
                 {
                     var linalgProgram = CompileOrLoadCached(OpenClLinalgKernels.GetSource(), optimizationFlags, "Linalg kernels");
                     _programs.Add(linalgProgram);
                     foreach (var name in OpenClLinalgKernels.GetKernelNames())
                         _kernelCache[name] = new DirectOpenClKernel(_context, linalgProgram, name);
+                    _linalgAvailable = true;
                 }
                 catch (Exception ex)
                 {
+                    _linalgAvailable = false;
+                    _linalgCompileError = ex.Message;
+                    // Surface via Debug + Console (the latter ensures Release
+                    // builds still see the warning) so the capability gate
+                    // isn't silent in production. Callers gate on LinalgAvailable.
                     System.Diagnostics.Debug.WriteLine($"OpenCL Linalg compilation failed: {ex.Message}");
+                    Console.Error.WriteLine(
+                        $"[AiDotNet.Tensors][OpenCL] Parity-211 linalg kernels failed to compile; " +
+                        $"routing to CPU. Reason: {ex.Message}");
                 }
             }
             catch (Exception ex)

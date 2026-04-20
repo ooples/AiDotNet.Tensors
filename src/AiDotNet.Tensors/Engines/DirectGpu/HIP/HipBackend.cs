@@ -10143,6 +10143,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             _snnModule = IntPtr.Zero;
         }
 
+        if (_linalgModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
+        }
+
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })
         {
