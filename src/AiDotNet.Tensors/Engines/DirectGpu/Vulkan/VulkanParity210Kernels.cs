@@ -196,7 +196,10 @@ void main() {
     o[base_] = m;
     for (int k = 1; k < axisSize; ++k) {
         float x = a[base_ + k * innerSize];
-        if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
+        // Equal infinities would produce exp(NaN); count directly so
+        // [-inf,-inf] and [+inf,+inf] stay inf throughout the scan.
+        if (x == m && isinf(x)) { s += 1.0; }
+        else if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
         else { s += exp(x - m); }
         o[base_ + k * innerSize] = m + log(s);
     }
@@ -292,11 +295,15 @@ layout(set = 0, binding = 0) buffer Out { float o[]; };
 layout(set = 0, binding = 1) readonly buffer Mask { int mask[]; };     // 0/1 per element
 layout(set = 0, binding = 2) readonly buffer Prefix { int prefix[]; };
 layout(set = 0, binding = 3) readonly buffer Src { float src[]; };
-layout(push_constant) uniform P { int total; };
+layout(push_constant) uniform P { int total; int sourceLen; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= total) return;
-    if (mask[gid] != 0) o[gid] = src[prefix[gid]];
+    if (mask[gid] != 0) {
+        int srcIdx = prefix[gid];
+        // Guard against inconsistent prefix metadata or a short source.
+        if (srcIdx >= 0 && srcIdx < sourceLen) o[gid] = src[srcIdx];
+    }
 }";
 
     // =====================================================================
@@ -417,6 +424,8 @@ void main() {
     private const string I0I1Helpers = @"
 float p210_i0(float x) {
     float ax = abs(x);
+    // Asymptotic branch is exp(ax)/sqrt(ax); at ax=+inf that's inf/inf=NaN.
+    if (isinf(ax)) return 1.0 / 0.0;
     if (ax < 3.75) {
         float y = (x / 3.75); y = y * y;
         return 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492
@@ -431,6 +440,8 @@ float p210_i0(float x) {
 }
 float p210_i1(float x) {
     float ax = abs(x);
+    // I1 is odd: I1(+inf) = +inf, I1(-inf) = -inf.  Avoid exp/sqrt NaN.
+    if (isinf(ax)) return (x < 0.0) ? -1.0 / 0.0 : 1.0 / 0.0;
     float ans;
     if (ax < 3.75) {
         float y = (x / 3.75); y = y * y;

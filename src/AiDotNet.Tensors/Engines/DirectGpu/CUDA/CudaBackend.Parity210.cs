@@ -302,8 +302,10 @@ public sealed partial class CudaBackend : IParity210Backend
         IntPtr outPtr = output.Handle; IntPtr maskPtr = maskInt8.Handle;
         IntPtr prefPtr = prefixSumInt32.Handle; IntPtr srcPtr = source.Handle;
         int n = total;
-        void** args = stackalloc void*[5];
-        args[0] = &outPtr; args[1] = &maskPtr; args[2] = &prefPtr; args[3] = &srcPtr; args[4] = &n;
+        int sourceLen = source.Size;
+        void** args = stackalloc void*[6];
+        args[0] = &outPtr; args[1] = &maskPtr; args[2] = &prefPtr; args[3] = &srcPtr;
+        args[4] = &n; args[5] = &sourceLen;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

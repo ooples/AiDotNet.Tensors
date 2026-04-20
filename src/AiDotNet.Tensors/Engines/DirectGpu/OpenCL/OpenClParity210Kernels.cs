@@ -200,7 +200,10 @@ __kernel void parity210_logcumsumexp_axis(
     output[base_] = m;
     for (int k = 1; k < axisSize; ++k) {
         float x = input[base_ + k * innerSize];
-        if (x > m) { s = s * exp(m - x) + 1.0f; m = x; }
+        // Equal infinities would produce exp(NaN); count directly so
+        // [-inf,-inf] and [+inf,+inf] stay inf throughout the scan.
+        if (x == m && isinf(x)) { s += 1.0f; }
+        else if (x > m) { s = s * exp(m - x) + 1.0f; m = x; }
         else { s += exp(x - m); }
         output[base_ + k * innerSize] = m + log(s);
     }
@@ -314,11 +317,15 @@ __kernel void parity210_index_fill(
 __kernel void parity210_masked_scatter(
     __global float* output, __global const char* mask,
     __global const int* prefixSum, __global const float* source,
-    const int total)
+    const int total, const int sourceLen)
 {
     int gid = get_global_id(0);
     if (gid >= total) return;
-    if (mask[gid]) output[gid] = source[prefixSum[gid]];
+    if (mask[gid]) {
+        int srcIdx = prefixSum[gid];
+        // Guard against inconsistent prefix metadata or a short source.
+        if (srcIdx >= 0 && srcIdx < sourceLen) output[gid] = source[srcIdx];
+    }
 }
 
 // ============================================================================
@@ -494,6 +501,8 @@ __kernel void parity210_digamma(
 
 inline float p210_i0(float x) {
     float ax = fabs(x);
+    // Asymptotic branch is exp(ax)/sqrt(ax); at ax=+inf that's inf/inf=NaN.
+    if (isinf(ax)) return INFINITY;
     if (ax < 3.75f) {
         float y = (x / 3.75f); y = y * y;
         return 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
@@ -509,6 +518,8 @@ inline float p210_i0(float x) {
 
 inline float p210_i1(float x) {
     float ax = fabs(x);
+    // I1 is odd: I1(+inf) = +inf, I1(-inf) = -inf.  Avoid exp/sqrt NaN.
+    if (isinf(ax)) return copysign(INFINITY, x);
     float ans;
     if (ax < 3.75f) {
         float y = (x / 3.75f); y = y * y;

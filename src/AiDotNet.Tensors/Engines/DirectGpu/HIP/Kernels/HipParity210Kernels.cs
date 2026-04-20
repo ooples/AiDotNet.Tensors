@@ -263,7 +263,10 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_logcumsumexp_axis(
     output[base_] = m;
     for (int a = 1; a < axisSize; ++a) {
         float x = input[base_ + a * innerSize];
-        if (x > m) { s = s * expf(m - x) + 1.0f; m = x; }
+        // Equal infinities would produce expf(NaN); count directly so
+        // [-inf,-inf] and [+inf,+inf] stay inf throughout the scan.
+        if (x == m && isinf(x)) { s += 1.0f; }
+        else if (x > m) { s = s * expf(m - x) + 1.0f; m = x; }
         else { s += expf(x - m); }
         output[base_ + a * innerSize] = m + logf(s);
     }
@@ -360,11 +363,15 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_index_fill(
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_masked_scatter(
     float* output, const char* mask, const int* prefixSum,
-    const float* source, int total)
+    const float* source, int total, int sourceLen)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    if (mask[idx]) output[idx] = source[prefixSum[idx]];
+    if (mask[idx]) {
+        int srcIdx = prefixSum[idx];
+        // Guard against inconsistent prefix metadata or a short source.
+        if (srcIdx >= 0 && srcIdx < sourceLen) output[idx] = source[srcIdx];
+    }
 }
 
 // ==========================================================================
@@ -476,8 +483,10 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_erfinv(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float y = input[idx];
-    if (y >= 1.0f) { output[idx] = INFINITY; return; }
-    if (y <= -1.0f) { output[idx] = -INFINITY; return; }
+    // Domain: [-1, 1]. Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
+    if (y == 1.0f) { output[idx] = INFINITY; return; }
+    if (y == -1.0f) { output[idx] = -INFINITY; return; }
+    if (!(y > -1.0f && y < 1.0f)) { output[idx] = nanf(""""); return; }
     float ln = logf(1.0f - y * y);
     float a = 0.147f;
     float t = 2.0f / ((float)M_PI * a) + ln * 0.5f;
@@ -528,6 +537,9 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_digamma(
 
 __device__ inline float parity210_dev_i0(float x) {
     float ax = fabsf(x);
+    // Asymptotic branch is expf(ax)/sqrtf(ax); at ax=+inf that's inf/inf=NaN.
+    // I0 is even and diverges to +inf, so bypass the formula explicitly.
+    if (isinf(ax)) return INFINITY;
     if (ax < 3.75f) {
         float y = (x / 3.75f); y = y * y;
         return 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
@@ -543,6 +555,8 @@ __device__ inline float parity210_dev_i0(float x) {
 
 __device__ inline float parity210_dev_i1(float x) {
     float ax = fabsf(x);
+    // I1 is odd: I1(+inf) = +inf, I1(-inf) = -inf.  Avoid expf/sqrtf NaN.
+    if (isinf(ax)) return copysignf(INFINITY, x);
     float ans;
     if (ax < 3.75f) {
         float y = (x / 3.75f); y = y * y;

@@ -51,6 +51,9 @@ fn p210_erf(x: f32) -> f32 {
 
 fn p210_i0(x: f32) -> f32 {
     let ax = abs(x);
+    // Asymptotic branch is exp(ax)/sqrt(ax); at ax=+inf that's inf/inf=NaN.
+    // WGSL has no isinf(); abs > f32::MAX flags +/-inf.
+    if (ax > 3.4028234e38) { return 1.0 / 0.0; }
     if (ax < 3.75) {
         var y = x / 3.75;
         y = y * y;
@@ -66,6 +69,8 @@ fn p210_i0(x: f32) -> f32 {
 
 fn p210_i1(x: f32) -> f32 {
     let ax = abs(x);
+    // I1 is odd: I1(+inf) = +inf, I1(-inf) = -inf.  Avoid exp/sqrt NaN.
+    if (ax > 3.4028234e38) { if (x < 0.0) { return -1.0 / 0.0; } else { return 1.0 / 0.0; } }
     var ans : f32;
     if (ax < 3.75) {
         var y = x / 3.75; y = y * y;
@@ -252,7 +257,10 @@ struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
     o[base_] = m;
     for (var k : i32 = 1; k < p.axisSize; k = k + 1) {
         let x = a[base_ + k * p.innerSize];
-        if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
+        // Equal infinities would produce exp(NaN); count directly so
+        // [-inf,-inf] and [+inf,+inf] stay inf throughout the scan.
+        if (x == m && abs(x) > 3.4028234e38) { s = s + 1.0; }
+        else if (x > m) { s = s * exp(m - x) + 1.0; m = x; }
         else { s = s + exp(x - m); }
         o[base_ + k * p.innerSize] = m + log(s);
     }
@@ -342,8 +350,17 @@ struct P { size: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    // Numerically stable hypot.
+    // Numerically stable hypot.  IEEE behaviour: hypot(inf, y) = +inf for any y
+    // (including NaN), and hypot(NaN, finite) = NaN.  The scaled branch
+    // r = lo / hi would be inf/inf = NaN for (inf, inf) so short-circuit.
+    // WGSL has no isinf/isnan — abs > f32::MAX flags +/-inf, !(x == x) flags NaN.
     let ax = abs(a[gid]); let bx = abs(b[gid]);
+    let axInf = ax > 3.4028234e38;
+    let bxInf = bx > 3.4028234e38;
+    if (axInf || bxInf) { o[gid] = 1.0 / 0.0; return; }
+    let axNaN = !(ax == ax);
+    let bxNaN = !(bx == bx);
+    if (axNaN || bxNaN) { o[gid] = 0.0 / 0.0; return; }
     let hi = max(ax, bx); let lo = min(ax, bx);
     if (hi == 0.0) { o[gid] = 0.0; return; }
     let r = lo / hi;
@@ -499,10 +516,11 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let y = a[gid];
-    // Signed infinities at the boundary — matches CUDA/HIP/Metal so downstream
-    // isinf() checks stay honest.  WGSL has no INF literal so we use 1.0/0.0.
-    if (y >= 1.0) { o[gid] = 1.0 / 0.0; return; }
-    if (y <= -1.0) { o[gid] = -1.0 / 0.0; return; }
+    // Domain: [-1, 1].  Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
+    // WGSL has no INF / NaN literals so we construct them via 1.0/0.0 and 0.0/0.0.
+    if (y == 1.0) { o[gid] = 1.0 / 0.0; return; }
+    if (y == -1.0) { o[gid] = -1.0 / 0.0; return; }
+    if (y < -1.0 || y > 1.0) { o[gid] = 0.0 / 0.0; return; }
     let ln = log(1.0 - y * y);
     let ac = 0.147;
     let pi : f32 = 3.14159265358979;

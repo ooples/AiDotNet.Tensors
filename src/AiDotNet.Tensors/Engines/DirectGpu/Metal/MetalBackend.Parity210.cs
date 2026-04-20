@@ -448,6 +448,7 @@ public sealed partial class MetalBackend : IParity210Backend
         encoder.SetBuffer(pBuf, 2);
         encoder.SetBuffer(sBuf, 3);
         encoder.SetBytes(total, 4);
+        encoder.SetBytes(source.Size, 5);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
 
