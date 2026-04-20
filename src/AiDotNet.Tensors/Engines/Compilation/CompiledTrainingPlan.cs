@@ -463,6 +463,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return handle;
     }
 
+    /// <summary>
+    /// Build a parallel-chunked Action that dispatches a pointer-based binary
+    /// kernel (float* pA, pB, pR, int count) across ≈64 KB chunks. Used by
+    /// TensorAdd / TensorSubtract / TensorMultiply specialized forwards.
+    /// Single-core VectorXxxUnsafe peaks at ~4 GB/s DRAM; parallel chunks
+    /// saturate at ~12 GB/s on Zen 2. For length &lt; 32K elements (&lt;2 chunks)
+    /// the parallel dispatch overhead exceeds the savings — falls through to
+    /// a direct serial call.
+    /// </summary>
+    private static unsafe Action<IEngine> BuildParallelBinaryKernel(
+        GCHandle aH, GCHandle bH, GCHandle oH, int len,
+        PointerBinaryKernel kernel)
+    {
+        const int kElemsPerChunk = 16 * 1024; // 64 KB at float32
+        int chunks = System.Math.Min(
+            Helpers.CpuParallelSettings.MaxDegreeOfParallelism,
+            System.Math.Max(1, len / kElemsPerChunk));
+        if (chunks >= 2)
+        {
+            int chunkSize = (len + chunks - 1) / chunks;
+            chunkSize = (chunkSize + 31) & ~31;
+            int chunksCap = chunks;
+            int lenCap = len;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pA = (float*)aH.AddrOfPinnedObject();
+                    float* pB = (float*)bH.AddrOfPinnedObject();
+                    float* pR = (float*)oH.AddrOfPinnedObject();
+                    Helpers.PersistentParallelExecutor.Instance.Execute(chunksCap, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = System.Math.Min(chunkSize, lenCap - start);
+                        if (count > 0)
+                            kernel(pA + start, pB + start, pR + start, count);
+                    });
+                }
+            };
+        }
+        return eng =>
+        {
+            unsafe
+            {
+                kernel(
+                    (float*)aH.AddrOfPinnedObject(),
+                    (float*)bH.AddrOfPinnedObject(),
+                    (float*)oH.AddrOfPinnedObject(),
+                    len);
+            }
+        };
+    }
+
+    private unsafe delegate void PointerBinaryKernel(float* a, float* b, float* r, int count);
+
     internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step, List<GCHandle>? handleTracker = null)
     {
         if (typeof(T) != typeof(float)) return null;
@@ -637,7 +692,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dispatch for bandwidth-bound shapes. Single-core VectorAddUnsafe
         // peaks at ~4 GB/s; a 4-chunk parallel split saturates DRAM at
         // ~12 GB/s, cutting 786 KB adds (BERT residual) from ~200 µs to
-        // ~70 µs. Same threshold as the non-specialized TensorAdd path.
+        // ~70 µs.
         if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
@@ -647,33 +702,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
             var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
-            const int kElemsPerChunk = 16 * 1024; // 64 KB at float32
-            int addChunks = System.Math.Min(
-                Helpers.CpuParallelSettings.MaxDegreeOfParallelism,
-                System.Math.Max(1, len / kElemsPerChunk));
-            if (addChunks >= 2)
-            {
-                int chunkSize = (len + addChunks - 1) / addChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-                return eng =>
-                {
-                    unsafe
-                    {
-                        float* pA = (float*)aH.AddrOfPinnedObject();
-                        float* pB = (float*)bH.AddrOfPinnedObject();
-                        float* pR = (float*)oH.AddrOfPinnedObject();
-                        int lenCap = len;
-                        Helpers.PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = System.Math.Min(chunkSize, lenCap - start);
-                            if (count > 0)
-                                SimdKernels.VectorAddUnsafe(pA + start, pB + start, pR + start, count);
-                        });
-                    }
-                };
-            }
-            return eng => { unsafe { SimdKernels.VectorAddUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+            return BuildParallelBinaryKernel(aH, bH, oH, len,
+                (pA, pB, pR, count) => { unsafe { SimdKernels.VectorAddUnsafe(pA, pB, pR, count); } });
         }
         if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
@@ -692,7 +722,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
             var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
-            return eng => { unsafe { SimdKernels.VectorSubtractUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+            return BuildParallelBinaryKernel(aH, bH, oH, len,
+                (pA, pB, pR, count) => { unsafe { SimdKernels.VectorSubtractUnsafe(pA, pB, pR, count); } });
         }
         if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
@@ -701,7 +732,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return eng => eng.TensorSubtractInto(o, a, b);
         }
 
-        // TensorMultiply forward: pinned SIMD VectorMultiplyUnsafe
+        // TensorMultiply forward: pinned SIMD VectorMultiplyUnsafe with parallel chunking
         if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
@@ -711,7 +742,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
             var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
-            return eng => { unsafe { SimdKernels.VectorMultiplyUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+            return BuildParallelBinaryKernel(aH, bH, oH, len,
+                (pA, pB, pR, count) => { unsafe { SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, count); } });
         }
         if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
