@@ -21,6 +21,7 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.LinearAlgebra.Fft;
@@ -37,9 +38,23 @@ public static class Fft
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>Forward 1D complex FFT along the last axis.</summary>
+    /// <remarks>
+    /// GPU fast-path: when T == float, the active engine is a
+    /// <see cref="DirectGpuTensorEngine"/>, the transform length is a power
+    /// of two, no length override is requested, and the norm is Backward,
+    /// we dispatch to the engine's custom GPU FFT kernels (Cooley-Tukey on
+    /// CUDA/HIP/OpenCL — no cuFFT). Every other case uses the managed
+    /// Cooley-Tukey / Bluestein pipeline which is correct for arbitrary
+    /// length but runs on the CPU.
+    /// </remarks>
     public static Tensor<T> Fft1<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        if (TryGpuFft1(input, n, norm, inverse: false, out var gpuResult))
+        {
+            FftAutograd.RecordFft1(gpuResult!, input, gpuResult!.Shape[gpuResult.Rank - 1] / 2, norm);
+            return gpuResult!;
+        }
         var result = TransformComplex1D(input, n, norm, inverse: false);
         FftAutograd.RecordFft1(result, input, n ?? (input.Shape[input.Rank - 1] / 2), norm);
         return result;
@@ -49,30 +64,111 @@ public static class Fft
     public static Tensor<T> IFft1<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        if (TryGpuFft1(input, n, norm, inverse: true, out var gpuResult))
+        {
+            FftAutograd.RecordIFft1(gpuResult!, input, gpuResult!.Shape[gpuResult.Rank - 1] / 2, norm);
+            return gpuResult!;
+        }
         var result = TransformComplex1D(input, n, norm, inverse: true);
         FftAutograd.RecordIFft1(result, input, n ?? (input.Shape[input.Rank - 1] / 2), norm);
         return result;
     }
 
+    // GPU fast-path precondition checks. Returns true if it dispatched.
+    private static bool TryGpuFft1<T>(Tensor<T> input, int? nRequested, FftNorm norm, bool inverse, out Tensor<T>? result)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        result = null;
+        if (typeof(T) != typeof(float)) return false;
+        if (nRequested.HasValue) return false; // GPU kernel doesn't zero-pad / crop
+        if (norm != FftNorm.Backward) return false; // GPU kernel applies 1/n on inverse only
+        if (AiDotNetEngine.Current is not DirectGpuTensorEngine gpu) return false;
+
+        int last = input.Shape[input.Rank - 1];
+        if (last % 2 != 0) return false;
+        int n = last / 2;
+        if (!FftKernels.IsPowerOfTwo(n)) return false; // custom GPU kernel is pow2-only
+        if (n < 2) return false;
+
+        // Split interleaved input into separate real/imag tensors, dispatch via
+        // the engine's FFT(real, imag, ...) entrypoint (which routes to custom
+        // CUDA/HIP/OpenCL kernels on a GPU backend), then re-interleave.
+        int batch = input.Length / last;
+        var realShape = (int[])input._shape.Clone();
+        realShape[realShape.Length - 1] = n;
+        var realIn = new Tensor<float>(realShape);
+        var imagIn = new Tensor<float>(realShape);
+        var inD = (float[])(object)input.GetDataArray();
+        var reD = realIn.GetDataArray();
+        var imD = imagIn.GetDataArray();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                reD[b * n + i] = inD[b * last + 2 * i];
+                imD[b * n + i] = inD[b * last + 2 * i + 1];
+            }
+        }
+        gpu.FFT(realIn, imagIn, out Tensor<float> reOut, out Tensor<float> imOut);
+        if (inverse)
+        {
+            // gpu.FFT is forward-only; manually call IFFT if available.
+            gpu.IFFT(realIn, imagIn, out reOut, out imOut);
+        }
+        var outShape = (int[])input._shape.Clone();
+        var output = new Tensor<T>(outShape);
+        var oD = (float[])(object)output.GetDataArray();
+        var outReD = reOut.GetDataArray();
+        var outImD = imOut.GetDataArray();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                oD[b * last + 2 * i] = outReD[b * n + i];
+                oD[b * last + 2 * i + 1] = outImD[b * n + i];
+            }
+        }
+        result = output;
+        return true;
+    }
+
     /// <summary>Forward 2D complex FFT along the last two axes.</summary>
     public static Tensor<T> Fft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplexND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+    {
+        var result = TransformComplexND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+        FftAutograd.RecordFftN(result, input, s, axes: null, axesCount: 2, norm, inverse: false);
+        return result;
+    }
 
     /// <summary>Inverse 2D complex FFT along the last two axes.</summary>
     public static Tensor<T> IFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplexND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+    {
+        var result = TransformComplexND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+        FftAutograd.RecordFftN(result, input, s, axes: null, axesCount: 2, norm, inverse: true);
+        return result;
+    }
 
     /// <summary>Forward N-D complex FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> FftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplexND(input, s, axes, norm, inverse: false, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        var result = TransformComplexND(input, s, axes, norm, inverse: false, axesCount: ac);
+        FftAutograd.RecordFftN(result, input, s, axes, axesCount: ac, norm, inverse: false);
+        return result;
+    }
 
     /// <summary>Inverse N-D complex FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> IFftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplexND(input, s, axes, norm, inverse: true, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        var result = TransformComplexND(input, s, axes, norm, inverse: true, axesCount: ac);
+        FftAutograd.RecordFftN(result, input, s, axes, axesCount: ac, norm, inverse: true);
+        return result;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // REAL FFT (RFFT / IRFFT)
@@ -109,22 +205,44 @@ public static class Fft
     /// <summary>2D real FFT along the last two axes.</summary>
     public static Tensor<T> RFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransformND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+    {
+        int lastSize = s is null ? input.Shape[input.Rank - 1] : s[s.Length - 1];
+        var result = RealTransformND(input, s, axes: null, norm, inverse: false, axesCount: 2);
+        FftAutograd.RecordRFftN(result, input, s, axes: null, axesCount: 2, norm, inverse: false, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>2D inverse real FFT along the last two axes.</summary>
     public static Tensor<T> IRFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransformND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+    {
+        int lastSize = s is null ? 2 * (input.Shape[input.Rank - 1] / 2 - 1) : s[s.Length - 1];
+        var result = RealTransformND(input, s, axes: null, norm, inverse: true, axesCount: 2);
+        FftAutograd.RecordRFftN(result, input, s, axes: null, axesCount: 2, norm, inverse: true, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>N-D real FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> RFftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransformND(input, s, axes, norm, inverse: false, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        int lastSize = s is null ? input.Shape[input.Rank - 1] : s[s.Length - 1];
+        var result = RealTransformND(input, s, axes, norm, inverse: false, axesCount: ac);
+        FftAutograd.RecordRFftN(result, input, s, axes, axesCount: ac, norm, inverse: false, lastAxisSize: lastSize);
+        return result;
+    }
 
     /// <summary>N-D inverse real FFT along the specified (or trailing) axes.</summary>
     public static Tensor<T> IRFftN<T>(Tensor<T> input, int[]? s = null, int[]? axes = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransformND(input, s, axes, norm, inverse: true, axesCount: s?.Length ?? axes?.Length ?? input.Rank);
+    {
+        int ac = s?.Length ?? axes?.Length ?? input.Rank;
+        int lastSize = s is null ? 2 * (input.Shape[input.Rank - 1] / 2 - 1) : s[s.Length - 1];
+        var result = RealTransformND(input, s, axes, norm, inverse: true, axesCount: ac);
+        FftAutograd.RecordRFftN(result, input, s, axes, axesCount: ac, norm, inverse: true, lastAxisSize: lastSize);
+        return result;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // HERMITIAN FFT (HFFT / IHFFT)
@@ -143,10 +261,12 @@ public static class Fft
     public static Tensor<T> HFft<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        int realLen = n ?? 2 * (input.Shape[input.Rank - 1] / 2 - 1);
         // HFft(X, n) is algebraically IRFFT(conj(X), n) under the convention
-        // that the output is real. Equivalently: FFT of the full Hermitian-
-        // extended complex signal, taking the real part.
-        return RealTransform1D(ConjugateLastAxis(input), n, InvertNorm(norm), inverse: true);
+        // that the output is real.
+        var result = RealTransform1D(ConjugateLastAxis(input), n, InvertNorm(norm), inverse: true);
+        FftAutograd.RecordHFft(result, input, realLen, norm);
+        return result;
     }
 
     /// <summary>
@@ -156,10 +276,11 @@ public static class Fft
     public static Tensor<T> IHFft<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // IHFft(x, n) is algebraically conj(RFFT(x, n)) with the opposite
-        // normalization side — derives from HFft(IHFft(x)) = x.
+        int realLen = n ?? input.Shape[input.Rank - 1];
         var rfft = RealTransform1D(input, n, InvertNorm(norm), inverse: false);
-        return ConjugateLastAxis(rfft);
+        var result = ConjugateLastAxis(rfft);
+        FftAutograd.RecordIHFft(result, input, realLen, norm);
+        return result;
     }
 
     /// <summary>2D Hermitian FFT along the last two axes.</summary>

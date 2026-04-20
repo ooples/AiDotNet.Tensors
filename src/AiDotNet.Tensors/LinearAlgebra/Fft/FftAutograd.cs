@@ -154,6 +154,139 @@ internal static class FftAutograd
         return result;
     }
 
+    // ── 2D / ND complex variants ───────────────────────────────────────────
+    // Same rule as 1D: backward is the inverse transform under the dual norm,
+    // applied along the same axes / sizes.
+
+    internal static void RecordFftN<T>(Tensor<T> output, Tensor<T> input, int[]? s, int[]? axes, int axesCount, FftNorm norm, bool inverse)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        // Resolve nullable axes to a concrete array: default is the trailing
+        // `axesCount` axes of the output tensor.
+        int outRank = output.Rank;
+        int[] savedAxes = axes ?? DefaultTrailingAxes(outRank, axesCount);
+        int[] savedS = s ?? new int[] { };
+        string name = inverse ? "Fft.IFftN" : "Fft.FftN";
+        DifferentiableOps.RecordUnary(name, output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int[] ss = (int[])saved[0];
+            int[] axs = (int[])saved[1];
+            var dualNorm = DualNorm((FftNorm)saved[2]);
+            bool fwdWasInverse = (bool)saved[3];
+            int[]? sArg = ss.Length == 0 ? null : ss;
+            var gx = fwdWasInverse
+                ? Fft.FftN(gradOut, sArg, axs, dualNorm)
+                : Fft.IFftN(gradOut, sArg, axs, dualNorm);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { savedS, savedAxes, norm, inverse });
+    }
+
+    internal static void RecordRFftN<T>(Tensor<T> output, Tensor<T> input, int[]? s, int[]? axes, int axesCount, FftNorm norm, bool inverse, int lastAxisSize)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        int outRank = output.Rank;
+        int[] savedAxes = axes ?? DefaultTrailingAxes(outRank, axesCount);
+        int[] savedS = s ?? new int[] { };
+        string name = inverse ? "Fft.IRFftN" : "Fft.RFftN";
+        DifferentiableOps.RecordUnary(name, output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int[] ss = (int[])saved[0];
+            int[] axs = (int[])saved[1];
+            var dualNorm = DualNorm((FftNorm)saved[2]);
+            bool fwdWasInverse = (bool)saved[3];
+            int lastSize = (int)saved[4];
+            int[]? sArg = ss.Length == 0 ? null : ss;
+            Tensor<T> gx;
+            if (fwdWasInverse)
+            {
+                var rfft = Fft.RFftN(gradOut, sArg, axs, dualNorm);
+                gx = DoubleInteriorLastAxis(rfft, lastSize);
+            }
+            else
+            {
+                var halved = HalveInteriorLastAxis(gradOut, lastSize);
+                gx = Fft.IRFftN(halved, sArg, axs, dualNorm);
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { savedS, savedAxes, norm, inverse, lastAxisSize });
+    }
+
+    private static int[] DefaultTrailingAxes(int rank, int count)
+    {
+        var arr = new int[count];
+        for (int i = 0; i < count; i++) arr[i] = rank - count + i;
+        return arr;
+    }
+
+    // ── HFft / IHFft family ────────────────────────────────────────────────
+    // HFft(X) = IRFft(conj(X), n, dualNorm(norm))
+    //   ⇒ dL/dX = conj(doubleInterior(RFft(gradOut, n, norm)))
+    // IHFft(x) = conj(RFft(x, n, dualNorm(norm)))
+    //   ⇒ dL/dx = IRFft(halveInterior(conj(gradOut)), n, norm)
+
+    internal static void RecordHFft<T>(Tensor<T> output, Tensor<T> input, int n, FftNorm norm)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        DifferentiableOps.RecordUnary("Fft.HFft", output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int savedN = (int)saved[0];
+            var savedNorm = (FftNorm)saved[1];
+            var rfft = Fft.RFft(gradOut, savedN, savedNorm);
+            var doubled = DoubleInteriorBins<T>(rfft, savedN);
+            var gx = ConjugateLastAxis(doubled);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { n, norm });
+    }
+
+    internal static void RecordIHFft<T>(Tensor<T> output, Tensor<T> input, int n, FftNorm norm)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!DifferentiableOps.AnyTapeActive()) return;
+        DifferentiableOps.RecordUnary("Fft.IHFft", output, input, static (gradOut, inputs, _, saved, engine, grads) =>
+        {
+            int savedN = (int)saved[0];
+            var savedNorm = (FftNorm)saved[1];
+            var conj = ConjugateLastAxis(gradOut);
+            var halved = HalveInteriorBins<T>(conj, savedN);
+            var gx = Fft.IRFft(halved, savedN, savedNorm);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
+        }, new object[] { n, norm });
+    }
+
+    // ── ND versions of the scaling helpers used by RFftN backward ──────────
+    private static Tensor<T> HalveInteriorLastAxis<T>(Tensor<T> packed, int lastAxisSize)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+        => HalveInteriorBins(packed, lastAxisSize); // same rule — scales along last axis
+
+    private static Tensor<T> DoubleInteriorLastAxis<T>(Tensor<T> packed, int lastAxisSize)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+        => DoubleInteriorBins(packed, lastAxisSize);
+
+    // Complex conjugate along the packed-complex last axis.
+    private static Tensor<T> ConjugateLastAxis<T>(Tensor<T> packed)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>((int[])packed._shape.Clone());
+        var src = packed.GetDataArray();
+        var dst = result.GetDataArray();
+        int last = packed.Shape[packed.Rank - 1];
+        int batch = src.Length / last;
+        for (int b = 0; b < batch; b++)
+        {
+            int off = b * last;
+            for (int i = 0; i < last; i += 2)
+            {
+                dst[off + i] = src[off + i];
+                dst[off + i + 1] = ops.Negate(src[off + i + 1]);
+            }
+        }
+        return result;
+    }
+
     private static FftNorm DualNorm(FftNorm norm) => norm switch
     {
         FftNorm.Backward => FftNorm.Forward,

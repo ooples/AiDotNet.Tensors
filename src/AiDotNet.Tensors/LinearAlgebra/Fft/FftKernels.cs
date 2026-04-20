@@ -47,6 +47,15 @@ internal static class FftKernels
         ApplyScale(buf, n, inverse, norm);
     }
 
+    /// <summary>
+    /// Radix-2 entrypoint that bypasses the plan-cache machinery. Used by
+    /// <see cref="BluesteinPlan"/> to pre-FFT the chirp kernel at plan
+    /// construction time (recursive-safe: avoids cache lookup inside
+    /// Bluestein which is itself the cache population path).
+    /// </summary>
+    internal static void IterativeRadix2NoCache(Span<double> buf, int n, bool inverse)
+        => IterativeRadix2(buf, n, inverse);
+
     // ── Cooley-Tukey radix-2, iterative, in place ───────────────────────────
     // Standard decimation-in-time formulation: bit-reverse permute, then
     // log₂ n stages of butterflies with twiddle factors W_N^k = e^{−2πi k / N}
@@ -100,22 +109,10 @@ internal static class FftKernels
     // For the inverse transform we conjugate: a[n] = x[n] · e^{+iπn²/N} etc.
     private static void Bluestein(Span<double> buf, int n, bool inverse)
     {
-        int m = 1;
-        while (m < 2 * n - 1) m <<= 1;
-
-        double sign = inverse ? -1.0 : 1.0; // a uses e^{-iπn²/N * sign}, b uses e^{+iπn²/N * sign}
-
-        // Precompute chirp c[n] = e^{−sign · iπn²/N} (used in both a construction and final multiply).
-        double[] cRe = new double[n];
-        double[] cIm = new double[n];
-        for (int i = 0; i < n; i++)
-        {
-            // Use (i²) mod (2N) trick to avoid precision loss on large i.
-            long sq = ((long)i * i) % (2L * n);
-            double phase = -sign * Math.PI * sq / n;
-            cRe[i] = Math.Cos(phase);
-            cIm[i] = Math.Sin(phase);
-        }
+        var plan = FftPlanCache.GetOrCreateBluestein(n, inverse);
+        int m = plan.M;
+        var cRe = plan.ChirpRe;
+        var cIm = plan.ChirpIm;
 
         // a[i] = x[i] * c[i]  for i in [0, n), zero-padded to M.
         Span<double> a = new double[2 * m];
@@ -127,33 +124,17 @@ internal static class FftKernels
             a[2 * i + 1] = xRe * cIm[i] + xIm * cRe[i];
         }
 
-        // b[i] = conj(c[i]) for i in [0, n); b[M-i] = b[i] for i in [1, n); zeros elsewhere.
-        Span<double> b = new double[2 * m];
-        b[0] = cRe[0];
-        b[1] = -cIm[0];
-        for (int i = 1; i < n; i++)
-        {
-            double bRe = cRe[i];
-            double bIm = -cIm[i];
-            b[2 * i] = bRe;
-            b[2 * i + 1] = bIm;
-            b[2 * (m - i)] = bRe;
-            b[2 * (m - i) + 1] = bIm;
-        }
-
-        // Convolve via length-M radix-2 FFT: A = FFT(a), B = FFT(b),
-        // C = IFFT(A.*B). Both FFT/IFFT routed through IterativeRadix2 with
-        // normalization folded in by dividing by M after the inverse.
+        // Convolve: A = FFT(a); multiply by pre-transformed B spectrum from the
+        // cached plan (plan.BSpectrum{Re,Im}); IFFT; final chirp multiply.
         IterativeRadix2(a, m, inverse: false);
-        IterativeRadix2(b, m, inverse: false);
+        var bRe = plan.BSpectrumRe;
+        var bIm = plan.BSpectrumIm;
         for (int i = 0; i < m; i++)
         {
             double aRe = a[2 * i];
             double aIm = a[2 * i + 1];
-            double bRe = b[2 * i];
-            double bIm = b[2 * i + 1];
-            a[2 * i] = aRe * bRe - aIm * bIm;
-            a[2 * i + 1] = aRe * bIm + aIm * bRe;
+            a[2 * i] = aRe * bRe[i] - aIm * bIm[i];
+            a[2 * i + 1] = aRe * bIm[i] + aIm * bRe[i];
         }
         IterativeRadix2(a, m, inverse: true);
         double invM = 1.0 / m;

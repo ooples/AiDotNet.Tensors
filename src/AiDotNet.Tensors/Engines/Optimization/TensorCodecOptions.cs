@@ -62,6 +62,24 @@ public sealed class TensorCodecOptions
     /// Opt-in because it introduces bounded approximation error.</summary>
     public bool EnableSpectralDecomposition { get; set; }
 
+    /// <summary>
+    /// Phase A-FFT: Replace large-kernel Conv2D with FFT-based convolution
+    /// (<see cref="LinearAlgebra.Fft.FftConv.Conv2DSame"/>) when the kernel
+    /// size makes the FFT path cheaper. Opt-in because it assumes the Conv2D
+    /// op uses stride=1, dilation=1, groups=1, padding=same — if those hold,
+    /// the FFT path is numerically equivalent to floating-point roundoff;
+    /// otherwise the rewrite would change outputs.
+    /// </summary>
+    public bool EnableFftConv { get; set; }
+
+    /// <summary>
+    /// Minimum kernel side length (Kh OR Kw) for the <see cref="EnableFftConv"/>
+    /// pass to trigger. Defaults to 31 — below this the direct conv kernel is
+    /// typically faster than paying for two 2D FFTs + the per-output-channel
+    /// spectral multiply. Override per workload if your hardware tips earlier.
+    /// </summary>
+    public int FftConvKernelThreshold { get; set; } = 31;
+
     /// <summary>Maximum approximation error per element for spectral decomposition.
     /// Used as energyThreshold = 1.0 - tolerance for SVD rank selection.</summary>
     public float SpectralErrorTolerance { get; set; } = 1e-5f;

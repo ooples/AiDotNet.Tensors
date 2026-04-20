@@ -224,6 +224,81 @@ public class FftGradcheckTests
         return result;
     }
 
+    // ── Fft2 gradcheck ──────────────────────────────────────────────────────
+    [Theory]
+    [InlineData(4, 4, FftNorm.Backward)]
+    [InlineData(4, 4, FftNorm.Ortho)]
+    [InlineData(8, 4, FftNorm.Forward)]
+    public void Fft2_BackwardRule_MatchesFiniteDifference(int H, int W, FftNorm norm)
+    {
+        // Complex tensor with shape [H, 2W] interleaved re/im.
+        var x = MakeRandom(H * 2 * W, seed: 40);
+        var w = MakeRandom(H * 2 * W, seed: 41);
+
+        var wT = new Tensor<double>(new[] { H, 2 * W });
+        Array.Copy(w, wT.GetDataArray(), w.Length);
+        var analyticGrad = Fft.IFft2(wT, norm: DualNorm(norm));
+        double analyticDD = Dot(analyticGrad.GetDataArray(), x);
+
+        double numericDD = NumericDirectionalDerivative(x, xPerturbed =>
+        {
+            var t = new Tensor<double>(new[] { H, 2 * W });
+            Array.Copy(xPerturbed, t.GetDataArray(), xPerturbed.Length);
+            var y = Fft.Fft2(t, norm: norm);
+            return Dot(w, y.GetDataArray());
+        });
+
+        Assert.True(Math.Abs(analyticDD - numericDD) < 1e-4 * (1 + Math.Abs(analyticDD)),
+            $"Fft2 gradcheck H={H} W={W} norm={norm}: analytic={analyticDD}, numeric={numericDD}");
+    }
+
+    // ── RFft2 gradcheck ─────────────────────────────────────────────────────
+    [Theory]
+    [InlineData(4, 4, FftNorm.Backward)]
+    [InlineData(4, 4, FftNorm.Ortho)]
+    public void RFft2_BackwardRule_MatchesFiniteDifference(int H, int W, FftNorm norm)
+    {
+        var x = MakeRandom(H * W, seed: 50);
+        int freqW = W / 2 + 1;
+        var wRfft = MakeRandom(H * 2 * freqW, seed: 51);
+
+        // Analytic: halve interior last-axis bins of grad, then IRFft2 with dual norm.
+        var wHalved = HalveInteriorLastAxisArray(wRfft, H, W);
+        var wT = new Tensor<double>(new[] { H, 2 * freqW });
+        Array.Copy(wHalved, wT.GetDataArray(), wHalved.Length);
+        var analyticGrad = Fft.IRFft2(wT, s: new[] { H, W }, norm: DualNorm(norm));
+        double analyticDD = Dot(analyticGrad.GetDataArray(), x);
+
+        double numericDD = NumericDirectionalDerivative(x, xPerturbed =>
+        {
+            var t = new Tensor<double>(new[] { H, W });
+            Array.Copy(xPerturbed, t.GetDataArray(), xPerturbed.Length);
+            var y = Fft.RFft2(t, norm: norm);
+            return Dot(wRfft, y.GetDataArray());
+        });
+
+        Assert.True(Math.Abs(analyticDD - numericDD) < 1e-4 * (1 + Math.Abs(analyticDD)),
+            $"RFft2 gradcheck H={H} W={W} norm={norm}: analytic={analyticDD}, numeric={numericDD}");
+    }
+
+    private static double[] HalveInteriorLastAxisArray(double[] packed, int H, int W)
+    {
+        int freqW = W / 2 + 1;
+        bool evenW = W % 2 == 0;
+        var result = (double[])packed.Clone();
+        int interiorEnd = evenW ? freqW - 1 : freqW;
+        int rowLen = 2 * freqW;
+        for (int y = 0; y < H; y++)
+        {
+            for (int k = 1; k < interiorEnd; k++)
+            {
+                result[y * rowLen + 2 * k] *= 0.5;
+                result[y * rowLen + 2 * k + 1] *= 0.5;
+            }
+        }
+        return result;
+    }
+
     private static Tensor<double> DoubleInteriorBinsTensor(Tensor<double> packed, int n)
     {
         int K = n / 2 + 1;

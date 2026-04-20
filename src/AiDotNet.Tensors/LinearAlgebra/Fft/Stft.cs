@@ -42,7 +42,14 @@ public static class Stft
     /// <param name="padMode">Padding used when <paramref name="center"/> is true.</param>
     /// <param name="normalized">If true, scales each frame's spectrum by <c>1/√nFft</c> (ortho-style).</param>
     /// <param name="onesided">If true (default for real input), return only the non-negative frequency bins (length <c>nFft / 2 + 1</c>).</param>
-    /// <returns>Complex tensor shape <c>[..., freqs, 2·frames]</c>.</returns>
+    /// <param name="returnComplex">When <c>true</c> (default), complex bins are
+    /// stored interleaved in the last axis (shape <c>[..., freqs, 2·frames]</c>).
+    /// When <c>false</c>, an extra trailing size-2 axis holds the (re, im) pair
+    /// — shape <c>[..., freqs, frames, 2]</c> — matching torch.stft's
+    /// <c>return_complex=False</c> layout.</param>
+    /// <returns>Complex tensor: either interleaved
+    /// <c>[..., freqs, 2·frames]</c> (<paramref name="returnComplex"/>=true)
+    /// or paired <c>[..., freqs, frames, 2]</c> (false).</returns>
     public static Tensor<T> Forward<T>(
         Tensor<T> input,
         int nFft,
@@ -52,7 +59,8 @@ public static class Stft
         bool center = true,
         PadMode padMode = PadMode.Reflect,
         bool normalized = false,
-        bool onesided = true)
+        bool onesided = true,
+        bool returnComplex = true)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -147,6 +155,24 @@ public static class Stft
                 }
             }
         });
+
+        if (!returnComplex)
+        {
+            // Reshape from [..., freqs, 2·frames] to [..., freqs, frames, 2].
+            var reshapedShape = new int[outShape.Length + 1];
+            for (int i = 0; i < outShape.Length - 1; i++) reshapedShape[i] = outShape[i];
+            reshapedShape[outShape.Length - 1] = nFrames;
+            reshapedShape[outShape.Length] = 2;
+            var reshaped = new Tensor<T>(reshapedShape);
+            var srcD = output.GetDataArray();
+            var dstD = reshaped.GetDataArray();
+            int outerCount = batch * nFreqs;
+            // srcD layout: outer * 2 * nFrames (re/im interleaved per frame)
+            // dstD layout: outer * nFrames * 2 (re/im pair per frame)
+            // Both are the same byte order — it's just a reshape of the last axis.
+            Array.Copy(srcD, dstD, srcD.Length);
+            return reshaped;
+        }
 
         return output;
     }
