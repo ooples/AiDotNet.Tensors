@@ -6225,7 +6225,11 @@ public class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ps = poolSize, st = stride, pd = padding;
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2D", input, outputShape,
-                    (eng, output) => { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
+                        else { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             }
         }
@@ -6327,6 +6331,82 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         return result;
+    }
+
+    /// <summary>
+    /// Write-through MaxPool2D: runs the same dispatch as
+    /// <see cref="MaxPool2D{T}(Tensor{T}, int, int, int)"/> but writes into
+    /// the provided output tensor instead of renting a fresh one. Skips
+    /// the ~40-80 µs alloc+CopyTo pair per ResNet pool step.
+    /// </summary>
+    public void MaxPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (stride == 0) stride = poolSize;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
+        int outputWidth  = (width  + 2 * padding - poolSize) / stride + 1;
+
+        // NCHWc8 SIMD path
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0
+            && GradientTape<T>.Current is null)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)output;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.MaxPoolNchwc8(
+                srcF.AsSpan(), dstF.AsWritableSpan(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding);
+            return;
+        }
+
+        // Float fast paths
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            int ps = poolSize, st = stride, pd = padding;
+            if (pd == 0 && ps == 3)      MaxPool2DFloat3x3NoPad(inArr, outArr, bc, height, width, outputHeight, outputWidth, st);
+            else if (pd == 0 && ps == 2) MaxPool2DFloat2x2NoPad(inArr, outArr, bc, height, width, outputHeight, outputWidth, st);
+            else if (ps == 3)            MaxPool2DFloat3x3Padded(inArr, outArr, bc, height, width, outputHeight, outputWidth, st, pd);
+            else                         MaxPool2DFloatGeneric(inArr, outArr, bc, height, width, outputHeight, outputWidth, ps, st, pd);
+            return;
+        }
+
+        // Generic fallback
+        var inputData = input.GetDataArray();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int b = idx / channels, c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T maxValue = numOps.MinValue;
+                    for (int kh = 0; kh < poolSize; kh++)
+                    {
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
+                        {
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
+                            T value = inputData[inputBaseOffset + ih * width + iw];
+                            if (numOps.GreaterThan(value, maxValue)) maxValue = value;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = maxValue;
+                }
+        });
     }
 
     /// <inheritdoc/>
