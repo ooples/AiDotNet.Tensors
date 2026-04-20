@@ -39,12 +39,20 @@ public static class Fft
     /// <summary>Forward 1D complex FFT along the last axis.</summary>
     public static Tensor<T> Fft1<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplex1D(input, n, norm, inverse: false);
+    {
+        var result = TransformComplex1D(input, n, norm, inverse: false);
+        FftAutograd.RecordFft1(result, input, n ?? (input.Shape[input.Rank - 1] / 2), norm);
+        return result;
+    }
 
     /// <summary>Inverse 1D complex FFT along the last axis.</summary>
     public static Tensor<T> IFft1<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => TransformComplex1D(input, n, norm, inverse: true);
+    {
+        var result = TransformComplex1D(input, n, norm, inverse: true);
+        FftAutograd.RecordIFft1(result, input, n ?? (input.Shape[input.Rank - 1] / 2), norm);
+        return result;
+    }
 
     /// <summary>Forward 2D complex FFT along the last two axes.</summary>
     public static Tensor<T> Fft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
@@ -77,7 +85,12 @@ public static class Fft
     /// </summary>
     public static Tensor<T> RFft<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransform1D(input, n, norm, inverse: false);
+    {
+        int realLen = n ?? input.Shape[input.Rank - 1];
+        var result = RealTransform1D(input, n, norm, inverse: false);
+        FftAutograd.RecordRFft(result, input, realLen, norm);
+        return result;
+    }
 
     /// <summary>
     /// 1D complex-to-real inverse FFT along the last axis.
@@ -86,7 +99,12 @@ public static class Fft
     /// </summary>
     public static Tensor<T> IRFft<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => RealTransform1D(input, n, norm, inverse: true);
+    {
+        int realLen = n ?? 2 * (input.Shape[input.Rank - 1] / 2 - 1);
+        var result = RealTransform1D(input, n, norm, inverse: true);
+        FftAutograd.RecordIRFft(result, input, realLen, norm);
+        return result;
+    }
 
     /// <summary>2D real FFT along the last two axes.</summary>
     public static Tensor<T> RFft2<T>(Tensor<T> input, int[]? s = null, FftNorm norm = FftNorm.Backward)
