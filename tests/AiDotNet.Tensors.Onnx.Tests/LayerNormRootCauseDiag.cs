@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+#if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+#endif
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -68,6 +70,7 @@ public class LayerNormRootCauseDiag
         double t2 = TimeRawKernelParallel(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [2] Scalar kernel, Parallel.For:                {t2:F1} µs/call");
 
+#if NET5_0_OR_GREATER
         double t1s = TimeSimdKernelSerial(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [3] SIMD kernel, serial:                        {t1s:F1} µs/call");
 
@@ -79,6 +82,7 @@ public class LayerNormRootCauseDiag
 
         double t2f = TimeFusedOnePassParallel(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [6] SIMD one-pass fused, Parallel.For:          {t2f:F1} µs/call");
+#endif
 
         double t3 = TimeCpuEngineLayerNorm(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [7] CpuEngine.LayerNorm (full public API):      {t3:F1} µs/call");
@@ -86,11 +90,13 @@ public class LayerNormRootCauseDiag
         double t8 = TimeCpuEngineLayerNormInto(input, gamma, beta, batch, feat);
         _output.WriteLine($"  [8] CpuEngine.LayerNormFloatInto (write-thru):  {t8:F1} µs/call");
 
+#if NET5_0_OR_GREATER
         _output.WriteLine("");
         _output.WriteLine($"  Parallel.For overhead (scalar {t1:F0} → {t2:F0}): saves {t1 - t2:F0} µs");
         _output.WriteLine($"  SIMD gain at serial (scalar {t1:F0} → SIMD {t1s:F0}): saves {t1 - t1s:F0} µs");
         _output.WriteLine($"  One-pass gain at parallel (3-pass {t2s:F0} → 1-pass {t2f:F0}): saves {t2s - t2f:F0} µs");
         _output.WriteLine($"  Engine overhead (kernel {t2s:F0} → engine {t3:F0}): {t3 - t2s:+F0;-F0} µs");
+#endif
     }
 
     // ─── timed paths ────────────────────────────────────────────────────────
@@ -135,6 +141,7 @@ public class LayerNormRootCauseDiag
         return sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
     }
 
+#if NET5_0_OR_GREATER
     private static double TimeSimdKernelSerial(
         float[] input, float[] gamma, float[] beta, int batch, int fs)
     {
@@ -340,6 +347,7 @@ public class LayerNormRootCauseDiag
         for (; f < fs; f++)
             output[off + f] = (input[off + f] - m) * invStd * gamma[f] + beta[f];
     }
+#endif
 
     private static double TimeCpuEngineLayerNorm(
         float[] input, float[] gamma, float[] beta, int batch, int fs)

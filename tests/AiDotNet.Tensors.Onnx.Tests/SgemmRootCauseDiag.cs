@@ -69,6 +69,14 @@ public class SgemmRootCauseDiag
             double idealEmbarrassingly = tSequential;
             _output.WriteLine($"     Parallel-For scaling vs serial 1×: {16.0 * tSequential / 16.0 / tEmbarrassingly:F2}× ({16.0 * tSequential / tEmbarrassingly / 16.0 * 100:F0}% of ideal 1 call/core)");
 
+            // Path A measurement: how much of the parallel Sgemm time is
+            // spent in packing B? A memory-bound strided→tile repack of
+            // a ~9 MB B matrix at DDR4 bandwidth would be 100-500 µs parallel.
+            // If we pre-pack once at plan compile time, this vanishes.
+            double tPackBParallel = TimePackBOnlyParallel(cs.k, cs.n);
+            _output.WriteLine($"  [4] PackB only, 16× parallel (memory-bound):    {tPackBParallel * 1000:F1} µs  ({(double)cs.k * cs.n * 4 / tPackBParallel / 1e6:F0} MB/s)");
+            _output.WriteLine($"     PackB fraction of parallel Sgemm: {tPackBParallel / tParallel * 100:F1}%");
+
             _output.WriteLine("");
         }
     }
@@ -127,6 +135,40 @@ public class SgemmRootCauseDiag
         for (int it = 0; it < Iters; it++)
             System.Threading.Tasks.Parallel.For(0, cores, i =>
                 SimdGemm.SgemmSequential(bufs[i].a, bufs[i].b, bufs[i].c, m, k, n));
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / Iters;
+    }
+
+    // Proxy for PackB's cost: PackB rearranges B into a tile-striped
+    // layout. It's memory-bound (reads k*n floats, writes k*n floats),
+    // so its cost tracks copy-bandwidth closely. We split the copy across
+    // 16 chunks to mirror the parallel pack dispatch.
+    private static double TimePackBOnlyParallel(int k, int n)
+    {
+        var b = Rand(0xE05, k * n);
+        var packed = new float[k * n];
+        int cores = System.Environment.ProcessorCount;
+
+        for (int warm = 0; warm < Warmup; warm++)
+            System.Threading.Tasks.Parallel.For(0, cores, i =>
+            {
+                int chunk = (k * n + cores - 1) / cores;
+                int start = i * chunk;
+                int len = System.Math.Min(chunk, k * n - start);
+                if (len > 0)
+                    System.Array.Copy(b, start, packed, start, len);
+            });
+
+        var sw = Stopwatch.StartNew();
+        for (int it = 0; it < Iters; it++)
+            System.Threading.Tasks.Parallel.For(0, cores, i =>
+            {
+                int chunk = (k * n + cores - 1) / cores;
+                int start = i * chunk;
+                int len = System.Math.Min(chunk, k * n - start);
+                if (len > 0)
+                    System.Array.Copy(b, start, packed, start, len);
+            });
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds / Iters;
     }

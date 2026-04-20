@@ -4,6 +4,10 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.CpuJit;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+// Path A: pre-pack weight B matrices. ConditionalWeakTable holds packed
+// subs keyed on the B array's object identity so GC still reclaims when
+// the weight tensor is freed. Hit rate is ~100% in inference workloads
+// where the same initializer B is used on every forward call.
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
