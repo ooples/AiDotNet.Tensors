@@ -6409,6 +6409,112 @@ public class CpuEngine : ITensorLevelEngine
         });
     }
 
+    /// <summary>
+    /// Write-through AvgPool2D: same dispatch as
+    /// <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> but writes into
+    /// the provided output tensor. Used by ResNet's final global-average-
+    /// pool step and by GAP blocks in various CV architectures. Saves
+    /// ~40 µs per call by skipping the intermediate alloc+CopyTo.
+    /// </summary>
+    public void AvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (stride == 0) stride = poolSize;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
+        int outputWidth  = (width  + 2 * padding - poolSize) / stride + 1;
+
+        // NCHWc8 SIMD
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)output;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.AvgPoolNchwc8(
+                srcF.AsSpan(), dstF.AsWritableSpan(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding,
+                countIncludePad: false);
+            return;
+        }
+
+        // Float fast path
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+            Action<int> poolKernel = idx =>
+            {
+                int inputBase = idx * h * w;
+                int outputBase = idx * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        float sum = 0f;
+                        int count = 0;
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = Math.Min(ps, h - ihStart);
+                        int kwEnd = Math.Min(ps, w - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                sum += inArr[rowOff + kw];
+                                count++;
+                            }
+                        }
+                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
+                    }
+            };
+            if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
+            else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            return;
+        }
+
+        // Generic fallback
+        var inputData = input.GetDataArray();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int b = idx / channels, c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T sum = numOps.Zero;
+                    int count = 0;
+                    for (int kh = 0; kh < poolSize; kh++)
+                    {
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
+                        {
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
+                            sum = numOps.Add(sum, inputData[inputBaseOffset + ih * width + iw]);
+                            count++;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = count > 0
+                        ? numOps.Divide(sum, numOps.FromDouble(count))
+                        : numOps.Zero;
+                }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
@@ -6426,7 +6532,11 @@ public class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ps = poolSize, s = stride, p = padding;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
-                    (eng, output) => { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p);
+                        else { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AvgPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { st, st } });
             }
         }
