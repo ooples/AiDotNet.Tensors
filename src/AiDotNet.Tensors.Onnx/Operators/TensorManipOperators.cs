@@ -387,6 +387,13 @@ internal static class TensorManipOperators
             }
             if (uniform)
             {
+                // Uniform split requires the axis to be divisible by numOutputs.
+                // ONNX Split defaults to uniform; a non-uniform input will fail
+                // asymmetrically downstream otherwise.
+                if (x._shape[axis] % numOutputs != 0)
+                    throw new InvalidDataException(
+                        $"Uniform Split: axis {axis} size {x._shape[axis]} is not divisible " +
+                        $"by number of outputs {numOutputs}. Supply an explicit 'split' input.");
                 var parts = ctx.Engine.TensorSplit(x, numOutputs, axis);
                 if (parts.Length != numOutputs)
                     throw new InvalidDataException(
@@ -476,7 +483,7 @@ internal static class TensorManipOperators
                     }
                     if (GatherDebug.Enabled)
                     {
-                        int stepNo = System.Threading.Interlocked.Increment(ref GatherDebug.StepCounter);
+                        int stepNo = GatherDebug.NextStep();
                         GatherDebug.Log($"step#{stepNo} Gather ilen={idxArr.Length} idx[0..3]={(idxArr.Length > 0 ? idxArr[0] : -1)},{(idxArr.Length > 1 ? idxArr[1] : -1)},{(idxArr.Length > 2 ? idxArr[2] : -1)}");
                     }
                     var intIndices = new Tensor<int>(capturedIndices._shape, new Vector<int>(idxArr));

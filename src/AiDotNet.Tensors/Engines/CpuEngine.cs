@@ -1894,6 +1894,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
 
+        // torch.broadcast_to requires target.Rank >= source.Rank — we can't
+        // broadcast to fewer dimensions. Fail fast so the Tier-3 fallback
+        // doesn't silently miscompute shapes.
+        if (targetShape.Length < input.Rank)
+            throw new ArgumentException(
+                $"Broadcast target rank ({targetShape.Length}) must be >= source rank ({input.Rank}).",
+                nameof(targetShape));
+
         // Tier 1: exact shape match → identity. Zero cost.
         if (ShapesEqual1D(input._shape, targetShape)) return input;
 
@@ -12787,7 +12795,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // Validate parameters BEFORE indexing into them to avoid
+                // IndexOutOfRange on malformed inputs. Mirrors the eager-path
+                // validation below.
                 if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
+                if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
+                if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must be array of 3 elements [padD, padH, padW].", nameof(padding));
                 int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
                 int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
                 int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;

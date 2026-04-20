@@ -36,8 +36,11 @@ internal static class InitializerLoader
                 "too large for a single-tensor import.");
         int n = (int)total;
 
-        // Scalar tensors carry Dims.Count == 0 but a single element.
-        if (shape.Length == 0) { shape = new[] { 1 }; n = 1; }
+        // Scalar (rank-0) initializers: empty Dims but one element. Keep rank 0
+        // so ONNX ops like Shape([]) and broadcasts across rank-0 operands
+        // preserve the original semantics — rewriting the shape to [1] changes
+        // the observable rank and broke torchscript-exported scalar weights.
+        if (shape.Length == 0) { n = 1; }
 
         var tensor = new Tensor<T>(shape);
         var dst = tensor.AsWritableSpan();
@@ -141,6 +144,20 @@ internal static class InitializerLoader
                 $"expected {expectedBytes} bytes.");
     }
 
+    /// <summary>
+    /// Validate that a typed-field list in the initializer has at least the
+    /// declared element count. Prevents silent IndexOutOfRange / stale-memory
+    /// reads when a model was truncated mid-export or a lossy transcoder
+    /// dropped payload while leaving the dims list intact.
+    /// </summary>
+    private static void ValidateTypedFieldCount(TensorProto proto, int actual, int expected, string fieldName)
+    {
+        if (actual < expected)
+            throw new InvalidDataException(
+                $"ONNX initializer '{proto.Name}': {fieldName} has {actual} elements but dims imply {expected}. " +
+                "Model appears truncated or malformed.");
+    }
+
     private static void LoadInt<T>(TensorProto proto, Span<T> dst, int n) where T : unmanaged
     {
         // Integer initializers are almost always small (shape tensors, axes,
@@ -158,6 +175,9 @@ internal static class InitializerLoader
                 }
                 else
                 {
+                    // Typed-field payload: must match declared element count
+                    // so a truncated model doesn't silently read past the end.
+                    ValidateTypedFieldCount(proto, proto.Int32Data.Count, n, nameof(proto.Int32Data));
                     for (int i = 0; i < n; i++) asLong[i] = proto.Int32Data[i];
                 }
                 break;
@@ -170,6 +190,7 @@ internal static class InitializerLoader
                 }
                 else
                 {
+                    ValidateTypedFieldCount(proto, proto.Int64Data.Count, n, nameof(proto.Int64Data));
                     for (int i = 0; i < n; i++) asLong[i] = proto.Int64Data[i];
                 }
                 break;
@@ -182,6 +203,7 @@ internal static class InitializerLoader
                 }
                 else
                 {
+                    ValidateTypedFieldCount(proto, proto.Int32Data.Count, n, nameof(proto.Int32Data));
                     for (int i = 0; i < n; i++) asLong[i] = proto.Int32Data[i];
                 }
                 break;
@@ -194,6 +216,7 @@ internal static class InitializerLoader
                 }
                 else
                 {
+                    ValidateTypedFieldCount(proto, proto.Int32Data.Count, n, nameof(proto.Int32Data));
                     for (int i = 0; i < n; i++) asLong[i] = (uint)proto.Int32Data[i];
                 }
                 break;

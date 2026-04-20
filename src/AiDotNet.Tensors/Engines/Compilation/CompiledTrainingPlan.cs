@@ -1245,7 +1245,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
             var savedState = step.SavedState;
-            if (savedState != null && savedState.Length == 3
+            // Be lenient about length: some call paths extend SavedState with
+            // bias/layout hints past index 2. As long as the first three
+            // entries are the int[] stride/padding/dilation triple we need,
+            // honour the fast path.
+            if (savedState != null && savedState.Length >= 3
                 && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
             {
                 // Capture locals so the closure holds onto its own refs
