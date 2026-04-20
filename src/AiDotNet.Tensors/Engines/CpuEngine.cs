@@ -20299,6 +20299,73 @@ public class CpuEngine : ITensorLevelEngine
 
     #region Spatial Operations
 
+    /// <summary>
+    /// Write-through nearest-neighbour upsample. Mirrors the kernel used by
+    /// <see cref="Upsample{T}(Tensor{T}, int, int)"/> but writes into the
+    /// provided output tensor. Used by U-Net decoders, FPN top-down passes,
+    /// and image super-resolution heads — these typically do 4-5 upsamples
+    /// per inference.
+    /// </summary>
+    public void UpsampleInto<T>(Tensor<T> output, Tensor<T> input, int scaleH, int scaleW)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length < 2)
+            throw new ArgumentException("UpsampleInto requires tensor with at least 2 dimensions for height and width.");
+
+        int heightIdx = shape.Length - 2;
+        int widthIdx = shape.Length - 1;
+        int height = shape[heightIdx];
+        int width = shape[widthIdx];
+        int flatBatch = 1;
+        for (int i = 0; i < shape.Length - 2; i++) flatBatch *= shape[i];
+        int newHeight = height * scaleH;
+        int newWidth = width * scaleW;
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int h = height, w = width, sH = scaleH, sW = scaleW, nH = newHeight, nW = newWidth;
+            Action<int> kernel = fb =>
+            {
+                int inBase = fb * h * w;
+                int outBase = fb * nH * nW;
+                for (int oh = 0; oh < nH; oh++)
+                {
+                    int ih = oh / sH;
+                    int rowOut = outBase + oh * nW;
+                    int rowIn  = inBase  + ih * w;
+                    for (int ow = 0; ow < nW; ow++)
+                    {
+                        outArr[rowOut + ow] = inArr[rowIn + ow / sW];
+                    }
+                }
+            };
+            if (flatBatch > 8) Parallel.For(0, flatBatch, kernel);
+            else for (int fb = 0; fb < flatBatch; fb++) kernel(fb);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, flatBatch, fb =>
+        {
+            for (int oh = 0; oh < newHeight; oh++)
+            {
+                int ih = oh / scaleH;
+                for (int ow = 0; ow < newWidth; ow++)
+                {
+                    int iw = ow / scaleW;
+                    int inputIdx = (fb * height + ih) * width + iw;
+                    int outputIdx = (fb * newHeight + oh) * newWidth + ow;
+                    outputData[outputIdx] = inputData[inputIdx];
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
@@ -20317,7 +20384,11 @@ public class CpuEngine : ITensorLevelEngine
                 outShape[shape.Length - 2] *= scaleH;
                 outShape[shape.Length - 1] *= scaleW;
                 return scope.RecordUnary(LazyNodeType.Custom, "Upsample", input, outShape,
-                    (eng, output) => { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
+                        else { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
             }
         }
