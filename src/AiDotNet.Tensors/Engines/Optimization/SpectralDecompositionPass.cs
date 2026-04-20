@@ -1,6 +1,7 @@
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.LinearAlgebra.Fft;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -21,7 +22,11 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
 {
     public string Name => "SpectralDecomposition";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableSpectralDecomposition;
+    // The pass runs if EITHER spectral SVD decomposition OR FFT-conv rewrite
+    // is enabled — they're independent features sharing the same pass file.
+    public bool IsEnabled =>
+        TensorCodecOptions.Current.EnableSpectralDecomposition
+     || TensorCodecOptions.Current.EnableFftConv;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
@@ -30,9 +35,14 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         var result = new CompiledStep<T>[steps.Length];
         bool anyOptimized = false;
 
+        bool svdEnabled = TensorCodecOptions.Current.EnableSpectralDecomposition;
+        bool fftConvEnabled = TensorCodecOptions.Current.EnableFftConv;
+        int fftKernelThreshold = TensorCodecOptions.Current.FftConvKernelThreshold;
+
         for (int i = 0; i < steps.Length; i++)
         {
-            if (steps[i].OpType == OpType.TensorMatMul
+            if (svdEnabled
+                && steps[i].OpType == OpType.TensorMatMul
                 && steps[i].Inputs.Length == 2
                 && steps[i].Inputs[0].Rank == 2
                 && steps[i].Inputs[1].Rank == 2)
@@ -45,10 +55,68 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
                     continue;
                 }
             }
+            if (fftConvEnabled
+                && steps[i].OpType == OpType.Conv2D
+                && steps[i].Inputs.Length >= 2
+                && steps[i].Inputs[0].Rank == 4
+                && steps[i].Inputs[1].Rank == 4)
+            {
+                var optimized = TryRewriteConv2DToFft(steps[i], fftKernelThreshold);
+                if (optimized != null)
+                {
+                    result[i] = optimized;
+                    anyOptimized = true;
+                    continue;
+                }
+            }
             result[i] = steps[i];
         }
 
         return anyOptimized ? result : null;
+    }
+
+    /// <summary>
+    /// Replace a Conv2D step with a FFT-based equivalent when the kernel is
+    /// large enough that FFT convolution wins. Preconditions the pass assumes:
+    ///   * stride = 1, dilation = 1, groups = 1, padding = 'same'.
+    /// These hold for the typical large-kernel Conv2D call sites (diffusion
+    /// models, UNet encoder blocks) but the pass cannot verify them from the
+    /// delegate alone. Callers opt in via <see cref="TensorCodecOptions.EnableFftConv"/>
+    /// to acknowledge this contract; other configurations must stay on the
+    /// direct kernel or the rewrite silently produces wrong outputs.
+    /// </summary>
+    private static CompiledStep<T>? TryRewriteConv2DToFft<T>(CompiledStep<T> step, int kernelThreshold)
+    {
+        if (typeof(T) != typeof(float)) return null;
+
+        var weight = step.Inputs[1];
+        if (weight.Rank != 4) return null;
+        int Kh = weight._shape[2];
+        int Kw = weight._shape[3];
+        if (Kh < kernelThreshold && Kw < kernelThreshold) return null;
+
+        var capturedInput = step.Inputs[0];
+        var capturedWeight = weight;
+        // Bias is sometimes a third input (Conv2D with bias), sometimes baked
+        // into a separate add step; we forward it only when present as input 2.
+        Tensor<T>? capturedBias = step.Inputs.Length >= 3 ? step.Inputs[2] : null;
+
+        return new CompiledStep<T>(
+            "FftConv2D",
+            (eng, output) =>
+            {
+                var fftInput = (Tensor<float>)(object)capturedInput;
+                var fftWeight = (Tensor<float>)(object)capturedWeight;
+                var fftBias = capturedBias is null ? null : (Tensor<float>)(object)capturedBias;
+                var fftOut = FftConv.Conv2DSame(fftInput, fftWeight, fftBias);
+                var fftData = fftOut.GetDataArray();
+                var outArr = (float[])(object)output.GetDataArray();
+                System.Array.Copy(fftData, outArr, fftData.Length);
+            },
+            step.OutputBuffer,
+            step.Inputs,
+            step.BackwardFn,  // Keep original backward — FFT-conv is forward-only optim.
+            step.SavedState);
     }
 
     private static CompiledStep<T>? TryDecomposeWeight<T>(CompiledStep<T> step)

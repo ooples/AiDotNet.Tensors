@@ -6356,6 +6356,653 @@ public interface IEngine
     Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value);
 
     /// <summary>
+    /// Masked select: returns a 1D tensor containing elements of
+    /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
+    /// <see cref="Bit.True"/>. Mirrors <c>torch.masked_select</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Source tensor.</param>
+    /// <param name="mask">Bit-packed mask of the same shape as <paramref name="tensor"/>.</param>
+    /// <returns>A 1-D tensor of length <c>count(mask == Bit.True)</c>.</returns>
+    /// <remarks>
+    /// <para>
+    /// For Beginners: picks the elements of <paramref name="tensor"/> whose
+    /// corresponding <paramref name="mask"/> position is set, and lays them
+    /// out as a flat vector. Commonly used to extract the "valid" part of a
+    /// padded sequence or the non-zero entries of a sparse activation.
+    /// </para>
+    /// <para>Backward: gradient is scattered back to the original shape —
+    /// non-masked positions receive zero, masked positions receive the
+    /// incoming flat gradient.</para>
+    /// <para>
+    /// We use <see cref="Bit"/> (bit-packed) rather than <c>bool</c> so the
+    /// mask tensor costs 1 bit per position instead of a full byte — a
+    /// noticeable win on attention masks and long sequences. PyTorch stores
+    /// masks as full <c>bool</c> tensors.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask);
+
+    /// <summary>Rolls elements along the given axes with wrap-around (torch.roll).</summary>
+    Tensor<T> TensorRoll<T>(Tensor<T> tensor, int[] shifts, int[] axes);
+
+    /// <summary>Reverses the tensor along the given axes (torch.flip).</summary>
+    Tensor<T> TensorFlip<T>(Tensor<T> tensor, int[] axes);
+
+    /// <summary>Repeats each element along <paramref name="dim"/> <paramref name="repeats"/> times (torch.repeat_interleave).</summary>
+    Tensor<T> TensorRepeatInterleave<T>(Tensor<T> tensor, int repeats, int dim);
+
+    /// <summary>Flip along the last axis (torch.fliplr).</summary>
+    Tensor<T> TensorFliplr<T>(Tensor<T> tensor);
+
+    /// <summary>Flip along the first axis (torch.flipud).</summary>
+    Tensor<T> TensorFlipud<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Rotate 90° in the plane spanned by two axes (torch.rot90).
+    /// <paramref name="k"/> counts 90° turns (can be negative).
+    /// </summary>
+    Tensor<T> TensorRot90<T>(Tensor<T> tensor, int k = 1, int[]? axes = null);
+
+    /// <summary>Swap two dimensions (torch.swapaxes / numpy.swapaxes).</summary>
+    Tensor<T> TensorSwapAxes<T>(Tensor<T> tensor, int axis1, int axis2);
+
+    /// <summary>
+    /// Move a single dimension from <paramref name="source"/> to
+    /// <paramref name="destination"/> (torch.movedim).
+    /// </summary>
+    Tensor<T> TensorMoveDim<T>(Tensor<T> tensor, int source, int destination);
+
+    /// <summary>Promote to rank ≥1 (torch.atleast_1d).</summary>
+    Tensor<T> TensorAtLeast1D<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// General tensor contraction along arbitrary axes (torch.tensordot).
+    /// Internally builds an einsum equation and dispatches to TensorEinsum,
+    /// so it inherits the greedy path optimizer and fast-path routing.
+    /// </summary>
+    Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB);
+
+    /// <summary>
+    /// Fused matmul + bias add with default α = β = 1: <c>A · B + input</c>
+    /// (torch.addmm).
+    /// </summary>
+    Tensor<T> TensorAddMM<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Fused matmul + bias add with explicit scalars: <c>α · (A · B) + β · input</c>.
+    /// </summary>
+    Tensor<T> TensorAddMM<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b, T alpha, T beta);
+
+    /// <summary>1-D vector inner product Σ a[i]·b[i] (torch.linalg.vecdot).</summary>
+    T TensorVecDot<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Sum of the main diagonal of a 2-D tensor (torch.trace).</summary>
+    T TensorTrace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Place the last-dim values on the diagonal of a new (rank+1) tensor
+    /// (torch.diag_embed). <paramref name="offset"/> shifts the diagonal
+    /// (positive = super-diagonal, negative = sub-diagonal). Output's last
+    /// two dims both have length <c>L + |offset|</c>, where <c>L</c> is the
+    /// input's last-dim size.
+    /// </summary>
+    Tensor<T> TensorDiagEmbed<T>(Tensor<T> tensor, int offset = 0);
+
+    /// <summary>
+    /// Vector cross product a × b along <paramref name="dim"/> (torch.cross /
+    /// torch.linalg.cross). The named dim must have size 3.
+    /// </summary>
+    Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1);
+
+    /// <summary>
+    /// Build coordinate grids from 1-D input tensors (torch.meshgrid).
+    /// <paramref name="indexing"/> is "ij" (default, matrix-style) or "xy"
+    /// (Cartesian, swaps the first two output axes).
+    /// </summary>
+    Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij");
+
+    /// <summary>
+    /// Cartesian product of N 1-D tensors (torch.cartesian_prod). Output
+    /// shape is [∏ lengths, N]; each row is one combination.
+    /// </summary>
+    Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors);
+
+    /// <summary>
+    /// Kronecker product of 2-D matrices (torch.kron). Result shape is
+    /// <c>(m·p) × (n·q)</c> for inputs <c>A ∈ ℝ^{m×n}, B ∈ ℝ^{p×q}</c>.
+    /// Rank-1 inputs are promoted to <c>(1, len)</c>.
+    /// </summary>
+    Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Inner product contracting the last axis of both operands (torch.inner).
+    /// Output shape is <c>a.shape[:-1] + b.shape[:-1]</c>.
+    /// </summary>
+    Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Pairwise p-norm distances over the N rows of a [N, D] matrix
+    /// (torch.pdist). Output is a 1-D tensor of length N·(N−1)/2 ordered
+    /// (0,1), (0,2), …, (N−2, N−1).
+    /// </summary>
+    Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0);
+
+    /// <summary>
+    /// Cosine similarity along <paramref name="dim"/> with an
+    /// epsilon-clamped denominator (torch.nn.functional.cosine_similarity).
+    /// </summary>
+    Tensor<T> TensorCosineSimilarity<T>(Tensor<T> x1, Tensor<T> x2, int dim = -1, double eps = 1e-8);
+
+    /// <summary>
+    /// Cross pairwise distance: output[i, j] = ‖x1[i] − x2[j]‖_p
+    /// (torch.cdist).
+    /// </summary>
+    Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0);
+
+    /// <summary>Promote to rank ≥2 (torch.atleast_2d).</summary>
+    Tensor<T> TensorAtLeast2D<T>(Tensor<T> tensor);
+
+    /// <summary>Promote to rank ≥3 (torch.atleast_3d).</summary>
+    Tensor<T> TensorAtLeast3D<T>(Tensor<T> tensor);
+
+    /// <summary>Horizontal stack (torch.hstack): concat along axis 0 for 1D, axis 1 for ≥2D.</summary>
+    Tensor<T> TensorHStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Vertical stack (torch.vstack): 1D tensors become rows; then concat along axis 0.</summary>
+    Tensor<T> TensorVStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Depth stack (torch.dstack): promotes to ≥3D and concats along axis 2.</summary>
+    Tensor<T> TensorDStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Column stack (torch.column_stack): 1D tensors become columns; ≥2D concat along axis 1.</summary>
+    Tensor<T> TensorColumnStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Row stack (torch.row_stack), alias for vstack.</summary>
+    Tensor<T> TensorRowStack<T>(Tensor<T>[] tensors);
+
+    /// <summary>Horizontal split (torch.hsplit).</summary>
+    Tensor<T>[] TensorHSplit<T>(Tensor<T> tensor, int sections);
+
+    /// <summary>Vertical split (torch.vsplit).</summary>
+    Tensor<T>[] TensorVSplit<T>(Tensor<T> tensor, int sections);
+
+    /// <summary>Depth split (torch.dsplit).</summary>
+    Tensor<T>[] TensorDSplit<T>(Tensor<T> tensor, int sections);
+
+    // TensorBroadcastTo is already declared in the Phase B block above
+    // (line ~1956) with richer XML docs. Parity-210 re-declaration removed
+    // to avoid CS0111.
+
+    /// <summary>
+    /// Pick elements from the flattened tensor at the positions specified by
+    /// <paramref name="indices"/> (torch.take). Output shape matches
+    /// <paramref name="indices"/>.
+    /// </summary>
+    Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices);
+
+    /// <summary>
+    /// Gather along <paramref name="dim"/>: for every non-<paramref name="dim"/>
+    /// position, index into the source via the matching position in
+    /// <paramref name="indices"/> (torch.take_along_dim).
+    /// </summary>
+    Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim);
+
+    /// <summary>Cumulative product along <paramref name="axis"/> (torch.cumprod).</summary>
+    Tensor<T> TensorCumProd<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative max along <paramref name="axis"/> (torch.cummax — values only here).</summary>
+    Tensor<T> TensorCumMax<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative min along <paramref name="axis"/> (torch.cummin — values only here).</summary>
+    Tensor<T> TensorCumMin<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>Cumulative log-sum-exp along <paramref name="axis"/> (torch.logcumsumexp).</summary>
+    Tensor<T> TensorLogCumSumExp<T>(Tensor<T> tensor, int axis);
+
+    /// <summary>
+    /// Element-wise closeness check: |a − b| ≤ atol + rtol · |b|, with optional
+    /// NaN-equal semantics. Returns a bit-packed mask to save memory.
+    /// </summary>
+    Tensor<Bit> TensorIsClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false);
+
+    /// <summary>True if every element is close (torch.allclose).</summary>
+    bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false);
+
+    /// <summary>Element-wise test for set membership (torch.isin).</summary>
+    Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false);
+
+    /// <summary>Element-wise test for finite values — neither NaN nor ±∞ (torch.isfinite).</summary>
+    Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Replace NaN / +∞ / −∞ with finite substitutes (torch.nan_to_num).
+    /// Null parameters fall back to the PyTorch defaults: NaN → 0,
+    /// +∞ → dtype-max, −∞ → dtype-min (approximated here via double extremes
+    /// then saturated by the numeric ops).
+    /// </summary>
+    Tensor<T> TensorNanToNum<T>(Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null);
+
+    /// <summary>Element-wise NaN test (torch.isnan).</summary>
+    Tensor<Bit> TensorIsNan<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise ±∞ test (torch.isinf).</summary>
+    Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Sub-byte packed Gather over a byte-buffered packed tensor
+    /// (int1 / int2 / int4 / NF4 / FP4 — storage rides inside
+    /// <see cref="Tensor{Byte}"/>). Gathers rows directly in the packed
+    /// domain — no dequantisation needed. PyTorch forces dequant → gather →
+    /// requant for the same workload. The gather axis must not be the
+    /// last axis when <paramref name="valuesPerByte"/> &gt; 1 (crosses the
+    /// packing boundary).
+    /// </summary>
+    /// <param name="valuesPerByte">1 (plain byte), 2 (int4/NF4/FP4), 4 (int2), 8 (int1/BitNet).</param>
+    Tensor<byte> TensorGatherPacked(
+        Tensor<byte> packed, Tensor<int> indices, int axis, int valuesPerByte);
+
+    /// <summary>
+    /// Sub-byte packed Scatter — inverse of <see cref="TensorGatherPacked"/>.
+    /// </summary>
+    Tensor<byte> TensorScatterPacked(
+        Tensor<byte> packed, Tensor<int> indices, Tensor<byte> source, int axis, int valuesPerByte);
+
+
+    /// <summary>Element-wise logical AND on bit-packed masks (torch.logical_and).</summary>
+    Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical OR on bit-packed masks (torch.logical_or).</summary>
+    Tensor<Bit> TensorLogicalOr(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical XOR on bit-packed masks (torch.logical_xor).</summary>
+    Tensor<Bit> TensorLogicalXor(Tensor<Bit> a, Tensor<Bit> b);
+
+    /// <summary>Element-wise logical NOT on a bit-packed mask (torch.logical_not).</summary>
+    Tensor<Bit> TensorLogicalNot(Tensor<Bit> a);
+
+    /// <summary>
+    /// Upper-triangular fill: keep elements where (col − row) ≥ <paramref name="diagonal"/>;
+    /// zero everything else. Works on the last two dims; batch-preserving
+    /// (torch.triu).
+    /// </summary>
+    Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0);
+
+    /// <summary>
+    /// Lower-triangular fill: keep elements where (col − row) ≤ <paramref name="diagonal"/>;
+    /// zero everything else (torch.tril).
+    /// </summary>
+    Tensor<T> TensorTril<T>(Tensor<T> tensor, int diagonal = 0);
+
+    /// <summary>
+    /// Return coordinates of nonzero elements as a [N, rank] int tensor
+    /// (torch.nonzero). Ordered row-major over the input.
+    /// </summary>
+    Tensor<int> TensorNonzero<T>(Tensor<T> tensor);
+
+    /// <summary>Count nonzero elements in the flattened tensor (torch.count_nonzero).</summary>
+    int TensorCountNonzero<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise <c>max(x, min)</c> (torch.clamp_min).</summary>
+    Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min);
+
+    /// <summary>Element-wise <c>min(x, max)</c> (torch.clamp_max).</summary>
+    Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max);
+
+    /// <summary>
+    /// Single-pass element-wise min + max (torch.aminmax). Faster than calling
+    /// ReduceMin and ReduceMax separately because it visits memory once.
+    /// </summary>
+    (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Element-wise <c>clamp</c> with tensor-valued bounds (torch.clamp with
+    /// tensor min/max). Either bound may be <c>null</c>. Current v1 requires
+    /// exact-shape bounds; a broadcasting overload is a follow-up.
+    /// </summary>
+    Tensor<T> TensorClampTensor<T>(Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max);
+
+    /// <summary>
+    /// Write a (rank-1 smaller) slice into <paramref name="tensor"/> at a
+    /// single axis position (torch.select_scatter).
+    /// </summary>
+    Tensor<T> TensorSelectScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int index);
+
+    /// <summary>Element-wise sqrt(a² + b²) without under/overflow (torch.hypot).</summary>
+    Tensor<T> TensorHypot<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Copies the sign of <paramref name="b"/> onto the magnitude of <paramref name="a"/> (torch.copysign).</summary>
+    Tensor<T> TensorCopysign<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>IEEE truncation-toward-zero remainder; result has the sign of <paramref name="a"/> (torch.fmod).</summary>
+    Tensor<T> TensorFmod<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Python-style modulo; result has the sign of <paramref name="b"/> (torch.remainder).</summary>
+    Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Element-wise power computed in floating point (torch.float_power).</summary>
+    Tensor<T> TensorFloatPower<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Numerically-stable <c>log(exp(a) + exp(b))</c> (torch.logaddexp). Uses the
+    /// max-shift trick so no overflow for large inputs.
+    /// </summary>
+    Tensor<T> TensorLogAddExp<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Same as LogAddExp but in base-2 (torch.logaddexp2).</summary>
+    Tensor<T> TensorLogAddExp2<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Element-wise <c>x · 2^exp</c> (torch.ldexp). <paramref name="exp"/> must
+    /// be integer and broadcast to the same shape as <paramref name="x"/>.
+    /// </summary>
+    Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp);
+
+    /// <summary>
+    /// Element-wise next representable floating-point value after
+    /// <paramref name="a"/> toward <paramref name="b"/> (torch.nextafter).
+    /// </summary>
+    Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Flat-indexed scatter (torch.put). Writes <paramref name="source"/>[i]
+    /// into <paramref name="tensor"/> at flat position <paramref name="indices"/>[i].
+    /// The inverse of <see cref="TensorTake{T}"/>.
+    /// </summary>
+    Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source);
+
+    /// <summary>Complementary error function 1 − erf(x) (torch.special.erfc).</summary>
+    Tensor<T> TensorErfc<T>(Tensor<T> tensor);
+
+    /// <summary>x · log(y), with 0·log(y) = 0 by convention (torch.special.xlogy).</summary>
+    Tensor<T> TensorXlogy<T>(Tensor<T> x, Tensor<T> y);
+
+    /// <summary>x · log(1 + y), with 0·log(…) = 0 by convention (torch.special.xlog1py).</summary>
+    Tensor<T> TensorXlog1py<T>(Tensor<T> x, Tensor<T> y);
+
+    /// <summary>Log of the absolute value of the gamma function (torch.special.gammaln / torch.lgamma).</summary>
+    Tensor<T> TensorLgamma<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Digamma function ψ(x) = Γ'(x)/Γ(x) (torch.special.digamma). Uses
+    /// asymptotic series with recurrence shift; accuracy ~1e-5 on fp32 in
+    /// the common range x ∈ [0.1, 100].
+    /// </summary>
+    Tensor<T> TensorDigamma<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Inverse error function (torch.special.erfinv). Winitzki seed +
+    /// 2 Newton iterations — ~7-digit accuracy.
+    /// </summary>
+    Tensor<T> TensorErfinv<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Polygamma function ψ^{(n)}(x) (torch.special.polygamma). v1 supports
+    /// n=0 (alias for digamma) and n=1 (trigamma). Higher orders throw
+    /// NotImplementedException until the Hurwitz zeta path lands.
+    /// </summary>
+    Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor);
+
+    /// <summary>Modified Bessel function of the first kind, order 0 (torch.special.i0).</summary>
+    Tensor<T> TensorI0<T>(Tensor<T> tensor);
+
+    /// <summary>Modified Bessel function of the first kind, order 1 (torch.special.i1).</summary>
+    Tensor<T> TensorI1<T>(Tensor<T> tensor);
+
+    /// <summary>Exponentially-scaled I₀: e^(-|x|) · I₀(x) (torch.special.i0e). Safe for large x.</summary>
+    Tensor<T> TensorI0e<T>(Tensor<T> tensor);
+
+    /// <summary>Exponentially-scaled I₁: e^(-|x|) · I₁(x) (torch.special.i1e).</summary>
+    Tensor<T> TensorI1e<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Decompose floating-point values into mantissa ∈ [0.5, 1) and integer
+    /// exponent such that x = mantissa · 2^exp (torch.frexp). Zero maps to
+    /// (0, 0).
+    /// </summary>
+    (Tensor<T> Mantissa, Tensor<int> Exponent) TensorFrexp<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Sort along an axis; returns both the sorted values and the permutation
+    /// indices (torch.sort). Ascending by default, descending when
+    /// <paramref name="descending"/> is true.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
+
+    /// <summary>
+    /// Returns the indices that would sort the tensor along the given axis
+    /// (torch.argsort). Ascending by default, descending when
+    /// <paramref name="descending"/> is true.
+    /// </summary>
+    Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false);
+
+    /// <summary>
+    /// Hurwitz zeta function ζ(x, q) = Σ_{k=0}^∞ 1 / (k + q)^x.
+    /// When q is omitted (passed as 1), this reduces to the Riemann zeta.
+    /// Matches <c>torch.special.zeta(x, q)</c>.
+    /// </summary>
+    Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q);
+
+    /// <summary>
+    /// Sliding-window unfold (<c>torch.Tensor.unfold</c>). Slides a window
+    /// of length <paramref name="size"/> along <paramref name="dim"/> with
+    /// stride <paramref name="step"/>, replacing <c>shape[dim]</c> with
+    /// <c>(shape[dim] - size) / step + 1</c> and appending a new trailing
+    /// axis of length <paramref name="size"/>.
+    /// </summary>
+    Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step);
+
+    /// <summary>
+    /// torch.tensor_split(sections) equivalent. Splits <paramref name="tensor"/>
+    /// into exactly <paramref name="sections"/> chunks along <paramref name="dim"/>.
+    /// If the dim doesn't divide evenly, the first <c>dimSize % sections</c>
+    /// chunks get one extra element (matches NumPy / PyTorch semantics).
+    /// </summary>
+    Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int sections, int dim = 0);
+
+    /// <summary>
+    /// torch.tensor_split(indices_or_sections=[...]) equivalent. Splits at
+    /// the given indices along <paramref name="dim"/>; indices outside
+    /// <c>[0, dimSize]</c> produce empty chunks, matching PyTorch.
+    /// </summary>
+    Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0);
+
+    /// <summary>
+    /// torch.equal — returns true iff both tensors have the same shape and
+    /// every element compares equal. NaN is treated as not-equal (matches
+    /// PyTorch).
+    /// </summary>
+    bool TensorEqual<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// torch.eq — elementwise equality, returning a <see cref="Bit"/> tensor.
+    /// </summary>
+    Tensor<Bit> TensorEq<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// torch.eq with a scalar right-hand side.
+    /// </summary>
+    Tensor<Bit> TensorEqScalar<T>(Tensor<T> a, T scalar);
+
+    /// <summary>
+    /// torch.histc — 1-D histogram returning float counts. When
+    /// <paramref name="min"/> == <paramref name="max"/> (both default zero),
+    /// the tensor's own min/max are used as bounds. Values outside
+    /// [min, max] are discarded.
+    /// </summary>
+    Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max);
+
+    /// <summary>
+    /// torch.unique with return_inverse / return_counts. Returns the unique
+    /// values along with optional inverse-map (assigning each input element
+    /// to its unique bucket) and occurrence-count tensors. Inverse and
+    /// counts default to null when the caller doesn't ask for them.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueWithInfo<T>(
+        Tensor<T> input, bool sorted = true, bool returnInverse = false, bool returnCounts = false);
+
+    /// <summary>
+    /// torch.unique_consecutive with return_inverse / return_counts.
+    /// Collapses runs of equal adjacent values, optionally returning an
+    /// inverse-map into the collapsed sequence and per-run counts.
+    /// </summary>
+    (Tensor<T> Values, Tensor<int>? Inverse, Tensor<int>? Counts) TensorUniqueConsecutiveWithInfo<T>(
+        Tensor<T> input, bool returnInverse = false, bool returnCounts = false);
+
+    /// <summary>
+    /// Returns the <paramref name="k"/>-th smallest value of the flattened
+    /// tensor with its flat index. <paramref name="k"/> is 1-based
+    /// (torch.kthvalue convention).
+    /// </summary>
+    (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k);
+
+    /// <summary>
+    /// Median of the flattened tensor (torch.median). For even length returns
+    /// the lower median, matching PyTorch.
+    /// </summary>
+    T TensorMedian<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Unique values of the flattened tensor. When <paramref name="sorted"/>
+    /// is true (default), the result is ascending; otherwise the input order
+    /// is preserved (first occurrence).
+    /// </summary>
+    Tensor<T> TensorUnique<T>(Tensor<T> input, bool sorted = true);
+
+    /// <summary>
+    /// Branchless binary search. For each value in <paramref name="values"/>,
+    /// returns the insertion index into the sorted 1-D <paramref name="sortedSequence"/>
+    /// (torch.searchsorted).
+    /// </summary>
+    Tensor<int> TensorSearchSorted<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right = false);
+
+    /// <summary>
+    /// Counts values falling into <paramref name="bins"/> equal-width bins on
+    /// <c>[min, max]</c>. Values outside the range are dropped. Mirrors
+    /// <c>torch.histc</c>.
+    /// </summary>
+    Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max);
+
+    /// <summary>
+    /// N-dimensional histogram (torch.histogramdd). Input samples have shape
+    /// [N, D]; bins, mins, maxs all have length D. Output shape = bins[0] ×
+    /// … × bins[D-1] of int counts.
+    /// </summary>
+    Tensor<int> TensorHistogramDD<T>(Tensor<T> samples, int[] bins, T[] mins, T[] maxs);
+
+    /// <summary>
+    /// Count occurrences of each non-negative integer value (torch.bincount).
+    /// Output length = max(max(input) + 1, minLength).
+    /// </summary>
+    Tensor<int> TensorBinCount(Tensor<int> input, int? minLength = null);
+
+    /// <summary>
+    /// Chain of matrix multiplications. Builds an einsum expression and
+    /// dispatches to TensorEinsum, inheriting the greedy path optimiser —
+    /// so a chain like (A · B · C · D) picks an efficient contraction order
+    /// (torch.linalg.multi_dot).
+    /// </summary>
+    Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices);
+
+    /// <summary>
+    /// Median ignoring NaN values (torch.nanmedian). Returns NaN if every
+    /// value is NaN. Lower-median convention on even counts.
+    /// </summary>
+    T TensorNanMedian<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Most frequent value in the flattened tensor with its occurrence count
+    /// (torch.mode — flattened here; per-axis variant can come later). Ties
+    /// broken by smallest-value-wins.
+    /// </summary>
+    (T Value, int Count) TensorMode<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Bucketize values into the bins defined by a sorted 1-D
+    /// <paramref name="boundaries"/> tensor (torch.bucketize). Equivalent to
+    /// searchsorted with swapped argument order; kept as its own API for
+    /// familiarity.
+    /// </summary>
+    Tensor<int> TensorBucketize<T>(Tensor<T> input, Tensor<T> boundaries, bool right = false);
+
+    /// <summary>
+    /// Add values from <paramref name="source"/> into <paramref name="tensor"/>
+    /// at positions specified by <paramref name="indices"/> along
+    /// <paramref name="axis"/> (torch.index_add). Duplicate indices accumulate.
+    /// </summary>
+    Tensor<T> TensorIndexAdd<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source);
+
+    /// <summary>
+    /// Fill positions at <paramref name="indices"/> along <paramref name="axis"/>
+    /// with <paramref name="value"/> (torch.index_fill).
+    /// </summary>
+    Tensor<T> TensorIndexFill<T>(Tensor<T> tensor, int axis, Tensor<int> indices, T value);
+
+    /// <summary>
+    /// Copy slices from <paramref name="source"/> into <paramref name="tensor"/>
+    /// at positions specified by <paramref name="indices"/> along
+    /// <paramref name="axis"/> (torch.index_copy). Overwrites instead of
+    /// accumulates — duplicate indices keep the last written value.
+    /// </summary>
+    Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source);
+
+    /// <summary>
+    /// Full multi-axis scatter (torch.index_put). One 1-D index tensor per
+    /// tensor axis; all index tensors must have the same length; source
+    /// has that same length. With <paramref name="accumulate"/> = true,
+    /// duplicate-index writes sum (matching torch's index_put_(accumulate=True)).
+    /// </summary>
+    Tensor<T> TensorIndexPut<T>(Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false);
+
+    /// <summary>Broadcast <paramref name="tensor"/> to the shape of <paramref name="other"/> (torch.expand_as).</summary>
+    Tensor<T> TensorExpandAs<T>(Tensor<T> tensor, Tensor<T> other);
+
+    /// <summary>
+    /// Broadcast a set of tensors to a common shape (torch.broadcast_tensors).
+    /// Returns one output per input, each with the broadcast shape.
+    /// </summary>
+    Tensor<T>[] TensorBroadcastTensors<T>(Tensor<T>[] tensors);
+
+    /// <summary>
+    /// Unique *consecutive* values — only collapses runs of repeated values
+    /// (torch.unique_consecutive). Unlike Unique, does not change relative
+    /// order or remove non-adjacent repeats.
+    /// </summary>
+    Tensor<T> TensorUniqueConsecutive<T>(Tensor<T> input);
+
+    /// <summary>
+    /// Build a block-diagonal matrix from 2-D matrices (torch.block_diag).
+    /// Result shape = (Σ rows) × (Σ cols); off-diagonal blocks are zero.
+    /// </summary>
+    Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices);
+
+    /// <summary>
+    /// Overwrite a contiguous slice of <paramref name="tensor"/> along
+    /// <paramref name="dim"/> with <paramref name="source"/> (torch.slice_scatter).
+    /// </summary>
+    Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length);
+
+    /// <summary>
+    /// Scatter elements from <paramref name="source"/> into
+    /// <paramref name="tensor"/> at positions where <paramref name="mask"/> is
+    /// <see cref="Bit.True"/>, consuming the source in row-major order
+    /// (torch.masked_scatter).
+    /// </summary>
+    Tensor<T> TensorMaskedScatter<T>(Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source);
+
+    /// <summary>
+    /// Scatter with a reduction at each target slot (torch.scatter_reduce).
+    /// Supported modes: sum, prod, mean, amin, amax. When
+    /// <paramref name="includeSelf"/> is false, target positions that any
+    /// index touches are first reset to the reduction identity (0 for
+    /// sum/mean, 1 for prod, ±∞ equivalents for amin/amax) before
+    /// accumulating.
+    /// </summary>
+    Tensor<T> TensorScatterReduce<T>(
+        Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source,
+        ScatterReduceMode mode, bool includeSelf = true);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

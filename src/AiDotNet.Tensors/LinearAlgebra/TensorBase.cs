@@ -23,9 +23,9 @@ public abstract class TensorBase<T> : IDisposable
     /// Was <c>readonly</c> historically. The <see langword="readonly"/> was removed to
     /// support <see cref="RebindStorageFrom"/>, which is the ONLY path that should
     /// reassign this field. Under all other circumstances this field is effectively
-    /// readonly — the rebind operation is narrow (plan stitching, issue #170) and
-    /// intentionally bypasses the usual "views share storage, storage itself is
-    /// immutable" invariant.
+    /// readonly — the rebind operation is narrow (plan stitching per issue #170 and
+    /// memory-planning buffer reuse per issue #182) and intentionally bypasses the
+    /// usual "views share storage, storage itself is immutable" invariant.
     /// </remarks>
     internal TensorStorage<T> _storage;
 
@@ -62,10 +62,13 @@ public abstract class TensorBase<T> : IDisposable
     /// Rebinds this tensor's backing storage to alias <paramref name="source"/>'s storage.
     /// After a successful rebind, both tensors read from and write to the <i>same</i>
     /// underlying <see cref="Vector{T}"/> and <see cref="TensorStorage{T}"/> — no data
-    /// copy, no new allocation. Narrow use case: plan stitching (<see cref="AiDotNet.Tensors.Engines.Compilation.ICompiledPlan{T}.ThenAsync"/>)
+    /// copy, no new allocation. Narrow use cases:
+    /// plan stitching (<see cref="AiDotNet.Tensors.Engines.Compilation.ICompiledPlan{T}.ThenAsync"/>
     /// needs the downstream plan's captured input to point at the upstream plan's
     /// captured output so execute-time operations see each other's results without
-    /// going through a boundary memcpy.
+    /// going through a boundary memcpy), and memory-planning buffer reuse
+    /// (issue #182 — intermediate activations whose live ranges don't overlap
+    /// are aliased to a shared backing buffer to cut peak memory).
     /// </summary>
     /// <param name="source">The tensor whose storage this tensor should alias.</param>
     /// <exception cref="ArgumentNullException"><paramref name="source"/> is null.</exception>
@@ -88,6 +91,15 @@ public abstract class TensorBase<T> : IDisposable
     /// see the new storage. This is intentional — the common stitching case passes the
     /// input tensor directly to its first op (no pre-rebind views), so views are rare
     /// in practice.
+    /// </para>
+    /// <para>
+    /// <b>Refcount invariant.</b> Each <see cref="TensorBase{T}"/> instance holds
+    /// exactly one reference on its <see cref="_storage"/> (released in Dispose).
+    /// Rebinding must AddRef the new storage and Release the old one, in that order,
+    /// so a concurrent dispose of <paramref name="source"/> cannot drop the new storage
+    /// to zero between the two operations. Skipping refcount adjustment (as the earlier
+    /// implementation did) left the old storage leaked and the new storage one ref short,
+    /// leading to use-after-free when <paramref name="source"/> was disposed.
     /// </para>
     /// </remarks>
     internal void RebindStorageFrom(TensorBase<T> source)
@@ -125,12 +137,25 @@ public abstract class TensorBase<T> : IDisposable
                 "Rebind source must be contiguous with zero storage offset; " +
                 "views are not supported.", nameof(source));
 
-        // Atomic swap — both fields get the new backing together so an
-        // intervening read couldn't observe a half-rebound state. (This
-        // class's instances aren't thread-safe in the general case, but
-        // matching the two updates keeps intent explicit.)
-        _data = source._data;
+        // Fast path: already aliasing the same storage. Still refresh _data in
+        // case the source's _data field was swapped to a different Vector view
+        // (shouldn't happen with current code, but preserves source-of-truth).
+        if (ReferenceEquals(_storage, source._storage))
+        {
+            _data = source._data;
+            return;
+        }
+
+        // Acquire the new reference BEFORE releasing the old one. If we released
+        // first and source was the only live referent of its storage, it could
+        // be disposed concurrently and AddRef would throw ObjectDisposedException,
+        // leaving us with neither storage. Both fields update together so an
+        // intervening read couldn't observe a half-rebound state.
+        source._storage.AddRef();
+        var oldStorage = _storage;
         _storage = source._storage;
+        _data = source._data;
+        oldStorage.Release();
     }
 
     /// <summary>

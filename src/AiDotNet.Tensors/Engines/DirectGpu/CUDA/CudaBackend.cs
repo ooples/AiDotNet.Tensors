@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed class CudaBackend : IAsyncGpuBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend
 {
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
@@ -23,6 +23,18 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // cuDNN helpers — lazily initialized on first Conv2D call that routes
+    // through the cuDNN dispatch path. Kept private so disposal is linked
+    // to this backend's lifetime; the helpers' cuDNN handles survive
+    // repeated kernel invocations (workspace reuse + descriptor cache).
+    private CuDnnContext? _cudnnContext;
+    private CuDnnConvolution? _cudnnConv;
+    // Guards EnsureCudnnConv lazy-init against concurrent first callers.
+    // Without this, two threads entering EnsureCudnnConv simultaneously
+    // can both observe _cudnnConv == null and construct separate
+    // CuDnnContext/CuDnnConvolution instances — leaking the losing one
+    // and ending up with two threads working against different contexts.
+    private readonly object _cudnnInitLock = new();
     private CudaStream? _defaultStream;
     private IntPtr _activationModule;
     private IntPtr _convolutionModule;
@@ -44,6 +56,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
+    private IntPtr _parity210Module;
+    private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
@@ -682,6 +696,37 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
         CompileKernelModule(device, Kernels.CudaComplexKernels.GetSource(), "complex_kernels", Kernels.CudaComplexKernels.GetKernelNames());
+
+        // Parity-210: 40 hot-path kernels (movement / cumulative / indexing /
+        // element-wise special / pairwise) covering the #210 op surface.
+        // Optional — if NVRTC rejects something on an older toolkit we fall
+        // back to the CPU reference via CpuEngine inheritance.
+        try
+        {
+            _parity210Module = CompileKernelModule(device,
+                Kernels.CudaParity210Kernels.GetSource(),
+                "parity210_kernels",
+                Kernels.CudaParity210Kernels.GetKernelNames());
+        }
+        catch
+        {
+            _parity210Module = IntPtr.Zero;
+        }
+
+        // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:
+        // NVRTC failures fall through to the CPU reference via ILinalgBackend
+        // not being advertised by this backend.
+        try
+        {
+            _linalgModule = CompileKernelModule(device,
+                Kernels.CudaLinalgKernels.GetSource(),
+                "linalg_kernels",
+                Kernels.CudaLinalgKernels.GetKernelNames());
+        }
+        catch
+        {
+            _linalgModule = IntPtr.Zero;
+        }
     }
 
     private static string GetNvrtcLog(IntPtr program)
@@ -841,6 +886,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);
+        // Telemetry scope must reflect the path that actually executed, not
+        // the policy flag — Gemm below is unconditionally cuBLAS, so label
+        // the scope "MatMul.cuBLAS" regardless of UseCublasForMatMul. When a
+        // handwritten GEMM fallback lands later and MatMul branches on the
+        // flag, move this scope into each branch so profiler stats match
+        // the kernel that ran.
+        using var _profile = CudaDispatchPolicy.Scope(
+            "MatMul",
+            useVendor: true);
         var output = AllocateBuffer(M * N);
         Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
         return output;
@@ -2961,6 +3015,43 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        // cuDNN fast path (issue #201). Gated on the UseCudnnForConv
+        // policy + CuDnnConvolution.IsAvailable at init. Dispatches the
+        // GPU-pointer variant directly — caller-owned input / kernel /
+        // output buffers, no host round-trip. Scope is opened here so
+        // PerformanceProfiler stats distinguish "Conv2D.cuDNN" vs
+        // "Conv2D.generic" for consumers verifying which path ran.
+        if (CudaDispatchPolicy.UseCudnnForConv)
+        {
+            using var _profileCudnn = CudaDispatchPolicy.Scope("Conv2D", useVendor: true);
+            using var _ctxCudnn = PushContext();
+            EnsureCudnnConv();
+            // Stream affinity: cuDNN kernels launch onto this backend's
+            // default stream so they interleave correctly with the
+            // surrounding Cuda ops. Check the status — if stream binding
+            // silently fails, subsequent cuDNN work runs with wrong
+            // stream ordering and produces nondeterministic results.
+            CuDnnContext.CheckStatus(
+                CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
+                "cudnnSetStream");
+            _cudnnConv!.Conv2DForwardGpu(
+                inputDevPtr: input.Handle,
+                filterDevPtr: kernel.Handle,
+                outputDevPtr: output.Handle,
+                n: batch, c: inChannels, h: inHeight, w: inWidth,
+                k: outChannels, filterH: kernelH, filterW: kernelW,
+                outputHeight: outHeight, outputWidth: outWidth,
+                padH: padH, padW: padW,
+                strideH: strideH, strideW: strideW,
+                dilationH: dilationH, dilationW: dilationW);
+            return;
+        }
+
+        // Generic-kernel path — Winograd / tiled / im2col — when the policy
+        // opts out (debug / forced-generic) or cuDNN isn't available.
+        using var _profile = CudaDispatchPolicy.Scope(
+            "Conv2D",
+            useVendor: false);
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
@@ -3067,6 +3158,25 @@ public sealed class CudaBackend : IAsyncGpuBackend
             dArgs[16] = &dilationH;
             dArgs[17] = &dilationW;
             LaunchKernel3D(cudaKernel, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, dArgs, 0);
+        }
+    }
+
+    /// <summary>Lazily spin up the cuDNN context + convolution helper on
+    /// the first call that routes Conv2D through the vendor path. Both
+    /// live for the lifetime of this backend and are released in
+    /// <see cref="Dispose"/>. Thread-safe via double-checked locking so
+    /// concurrent Conv2D calls on the first dispatch can't each
+    /// double-initialize the cuDNN helper.</summary>
+    private void EnsureCudnnConv()
+    {
+        if (_cudnnConv is not null) return;
+        lock (_cudnnInitLock)
+        {
+            // Re-check inside the lock — another thread may have won the
+            // race to construct and we'd otherwise leak its instance.
+            if (_cudnnConv is not null) return;
+            _cudnnContext ??= new CuDnnContext();
+            _cudnnConv = new CuDnnConvolution(_cudnnContext);
         }
     }
 
@@ -4393,6 +4503,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("batchnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batchnorm_forward");
 
+        // Dispatch path telemetry — see Conv2D for the rationale.
+        using var _profile = CudaDispatchPolicy.Scope(
+            "BatchNorm",
+            useVendor: false);
         using var _ = PushContext();
         uint gridX = (uint)channels;
         IntPtr inputPtr = input.Handle;
@@ -10795,6 +10909,19 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
+        // cuDNN helper disposes its workspace + context. Only created if
+        // Conv2D routed through the vendor path at least once.
+        if (_cudnnConv is not null)
+        {
+            _cudnnConv.Dispose();
+            _cudnnConv = null;
+        }
+        if (_cudnnContext is not null)
+        {
+            _cudnnContext.Dispose();
+            _cudnnContext = null;
+        }
+
         if (_cublasHandle != IntPtr.Zero)
         {
             CuBlasNative.cublasDestroy(_cublasHandle);
@@ -10835,6 +10962,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
+        }
+
+        if (_parity210Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_parity210Module);
+            _parity210Module = IntPtr.Zero;
         }
 
         if (_fftModule != IntPtr.Zero)
@@ -10931,6 +11064,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_sparseModule);
             _sparseModule = IntPtr.Zero;
+        }
+
+        if (_linalgModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_linalgModule);
+            _linalgModule = IntPtr.Zero;
         }
 
         if (_cudaContext != IntPtr.Zero)

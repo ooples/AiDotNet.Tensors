@@ -1,4 +1,8 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -50,4 +54,66 @@ internal static class DeferredArrayMaterializer
     /// Removes a pending materialization without executing it (e.g., when the GPU buffer is reused).
     /// </summary>
     internal static void Remove(object array) => _pendingMaterializations.TryRemove(array, out _);
+
+    /// <summary>
+    /// Drains all pending materializers by invoking each registered callback.
+    /// Used at scope-end (e.g. <see cref="DirectGpuTensorEngine.MaterializeAllDeferred"/>)
+    /// so every GPU-resident tensor with a pending download is flushed to CPU.
+    /// </summary>
+    /// <param name="swallowErrors">
+    /// When <c>true</c>, per-entry <see cref="InvalidOperationException"/>s are
+    /// swallowed; the entry is still removed from the pending registry before
+    /// the callback runs (see below), so subsequent access to the array falls
+    /// through the normal data path rather than re-running a broken callback.
+    /// Matches the old <c>MaterializeAllDeferred</c> semantics where a torn-down
+    /// GPU context during dispose must not bring down the whole teardown path.
+    /// When <c>false</c>, exceptions propagate to the caller.
+    /// </param>
+    /// <remarks>
+    /// Each entry is <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey, TValue}.TryRemove(TKey, out TValue)"/>-removed
+    /// from the registry *before* its callback is invoked — so whether the
+    /// callback succeeds, fails, or is skipped, the array is no longer pending
+    /// after this call returns.
+    /// </remarks>
+    internal static void MaterializeAll(bool swallowErrors = true)
+    {
+        if (_pendingMaterializations.IsEmpty)
+            return;
+
+        // Snapshot keys so we can safely mutate the dictionary from each callback
+        // (Register's semantics are "remove on fire" via TryRemove).
+        var keys = _pendingMaterializations.Keys.ToArray();
+        List<Exception>? failures = null;
+        foreach (var key in keys)
+        {
+            if (!_pendingMaterializations.TryRemove(key, out var callback))
+                continue;
+
+            try { callback(key); }
+            catch (InvalidOperationException) when (swallowErrors)
+            {
+                // GPU buffer may be torn down; the entry was already removed
+                // above, so any subsequent call falls through the normal data
+                // path rather than re-running a broken callback.
+            }
+            catch (Exception ex)
+            {
+                // Drain-all semantics: a single failing callback must not pin
+                // the remaining entries. Collect the exceptions and surface
+                // them after the loop finishes so the registry ends in a
+                // clean "no pending" state regardless of how many entries
+                // raised.
+                (failures ??= new List<Exception>()).Add(ex);
+            }
+        }
+
+        if (failures is not null)
+        {
+            throw failures.Count == 1
+                ? failures[0]
+                : new AggregateException(
+                    "One or more deferred GPU-to-CPU materialization callbacks failed.",
+                    failures);
+        }
+    }
 }

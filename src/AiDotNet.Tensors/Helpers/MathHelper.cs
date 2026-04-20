@@ -114,6 +114,10 @@ public static class MathHelper
             return new UInt64Operations();
         if (typeof(T) == typeof(Bit))
             return new BitOperations();
+        if (typeof(T) == typeof(NumericOperations.Float8E4M3))
+            return new NumericOperations.Float8E4M3Operations();
+        if (typeof(T) == typeof(NumericOperations.Float8E5M2))
+            return new NumericOperations.Float8E5M2Operations();
 
         throw new NotSupportedException($"Numeric operations for type {typeof(T)} are not supported.");
     }

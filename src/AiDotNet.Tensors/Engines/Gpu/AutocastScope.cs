@@ -14,7 +14,13 @@ public enum PrecisionMode
     Float16,
 
     /// <summary>Brain floating point bf16 — same range as fp32, less precision. Preferred for training.</summary>
-    BFloat16
+    BFloat16,
+
+    /// <summary>FP8 E4M3 — 4x memory savings vs fp32, forward-pass default on NVIDIA H100+.</summary>
+    Float8E4M3,
+
+    /// <summary>FP8 E5M2 — wider range, less precision. Backward-pass default on NVIDIA H100+.</summary>
+    Float8E5M2,
 }
 
 /// <summary>
@@ -64,17 +70,160 @@ public sealed class AutocastScope : IDisposable
     public static PrecisionMode ActivePrecision => _current?.Precision ?? PrecisionMode.Float32;
 
     /// <summary>
+    /// Optional per-layer precision policy. When non-null,
+    /// <see cref="ShouldAutocast"/> defers to it for any call whose op name
+    /// also appears as a layer name — giving the user fine-grained control
+    /// over which layers keep FP32 compute even under a global FP16 scope.
+    /// </summary>
+    public LayerPrecisionPolicy? Policy { get; }
+
+    // Per-name FP32 / FP16 tensor cache. Lets layers store an FP32 master
+    // weight alongside an FP16 compute copy, both keyed by the same name.
+    // The cache is scope-local — Dispose clears it.
+    private readonly Dictionary<string, LinearAlgebra.Tensor<float>> _fp32Cache = new();
+    private readonly Dictionary<string, LinearAlgebra.Tensor<Half>> _fp16Cache = new();
+
+    /// <summary>
     /// Creates a new autocast scope with the specified precision.
     /// </summary>
     /// <param name="precision">The target precision for GPU operations.</param>
     public AutocastScope(PrecisionMode precision = PrecisionMode.Float16)
+        : this(precision, policy: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a new autocast scope with the specified precision and
+    /// optional per-layer precision policy.
+    /// </summary>
+    /// <param name="precision">The target precision for GPU operations.</param>
+    /// <param name="policy">Per-layer overrides. Null means the scope-wide
+    /// <paramref name="precision"/> applies to every layer.</param>
+    public AutocastScope(PrecisionMode precision, LayerPrecisionPolicy? policy)
     {
         if (precision == PrecisionMode.BFloat16)
             throw new NotSupportedException("BFloat16 autocast is not yet implemented. Use Float16 instead.");
         Precision = precision;
+        Policy = policy;
         _previous = _current;
         _current = this;
     }
+
+    /// <summary>
+    /// Registers <paramref name="fp32"/> as the FP32 master copy for
+    /// <paramref name="name"/>, casts it to FP16 compute copy, and caches
+    /// both. Subsequent calls with the same name return the cached FP16
+    /// copy without re-casting — unless the FP32 tensor reference has
+    /// changed (e.g. weight update during training replaces the master
+    /// tensor), in which case the stale FP16 cache entry is dropped and
+    /// the new FP32 is freshly re-cast.
+    /// </summary>
+    public LinearAlgebra.Tensor<Half> RegisterAndCastToFP16(string name, LinearAlgebra.Tensor<float> fp32)
+    {
+        if (string.IsNullOrEmpty(name)) throw new ArgumentException("Name required.", nameof(name));
+        if (fp32 is null) throw new ArgumentNullException(nameof(fp32));
+        if (_disposed) throw new ObjectDisposedException(nameof(AutocastScope));
+
+        // Invalidate the FP16 cache entry when the caller swaps in a
+        // different FP32 tensor for the same name. Without this check,
+        // training loops that rebuild weight tensors (rather than mutating
+        // in place) would keep receiving stale FP16 copies of the previous
+        // weights. Reference-equality is the right trigger — content
+        // mutations on the same instance are invisible to this cache by
+        // design; callers who mutate tensor contents in place must call
+        // InvalidateFP16Cache(name) explicitly.
+        if (_fp32Cache.TryGetValue(name, out var existingFp32) &&
+            !ReferenceEquals(existingFp32, fp32))
+        {
+            _fp16Cache.Remove(name);
+        }
+
+        _fp32Cache[name] = fp32;
+        if (_fp16Cache.TryGetValue(name, out var existing)) return existing;
+
+        var fp32Data = fp32.GetDataArray();
+        var fp16Tensor = new LinearAlgebra.Tensor<Half>(fp32._shape);
+        var fp16Span = fp16Tensor.AsWritableSpan();
+        for (int i = 0; i < fp32Data.Length; i++)
+            fp16Span[i] = (Half)fp32Data[i];
+        _fp16Cache[name] = fp16Tensor;
+        return fp16Tensor;
+    }
+
+    /// <summary>Returns the cached FP32 master tensor for <paramref name="name"/>, or null.</summary>
+    public LinearAlgebra.Tensor<float>? GetFP32Tensor(string name)
+        => _fp32Cache.TryGetValue(name, out var t) ? t : null;
+
+    /// <summary>Returns the cached FP16 compute tensor for <paramref name="name"/>, or null.</summary>
+    public LinearAlgebra.Tensor<Half>? GetFP16Tensor(string name)
+        => _fp16Cache.TryGetValue(name, out var t) ? t : null;
+
+    /// <summary>True iff a tensor is registered under <paramref name="name"/>.</summary>
+    public bool HasTensor(string name) => _fp32Cache.ContainsKey(name);
+
+    /// <summary>Clears the per-name cache. Called automatically on <see cref="Dispose"/>.</summary>
+    public void ClearTensors()
+    {
+        _fp32Cache.Clear();
+        _fp16Cache.Clear();
+    }
+
+    /// <summary>
+    /// True iff the configured policy forces <paramref name="layerName"/>
+    /// into FP32. Consumed by training-loop orchestration to bypass
+    /// autocast bookkeeping for FP32-pinned layers (matches PyTorch's
+    /// <c>torch.cuda.amp.autocast(enabled=False)</c> nested scope).
+    /// </summary>
+    public bool ShouldUseFP32(string layerName)
+        => Policy?.GetLayerPrecision(layerName) == PrecisionMode.Float32;
+
+    /// <summary>
+    /// True iff the layer's effective precision is MORE precise than the
+    /// scope-wide <see cref="Precision"/>. Layers matching this predicate
+    /// run in FP32 / FP16 / BF16 rather than the default. Typical callers:
+    /// training-loop wrappers that decide whether to insert a cast around
+    /// a layer's compute.
+    /// </summary>
+    public bool ShouldUseHigherPrecision(string layerName)
+    {
+        if (Policy is null) return false;
+        var layerPrec = Policy.GetLayerPrecision(layerName);
+        return PrecisionRank(layerPrec) > PrecisionRank(Precision);
+    }
+
+    /// <summary>Cast an FP16 tensor to FP32 (pure-CPU widen).</summary>
+    public static LinearAlgebra.Tensor<float> CastToFP32(LinearAlgebra.Tensor<Half> fp16)
+    {
+        if (fp16 is null) throw new ArgumentNullException(nameof(fp16));
+        var result = new LinearAlgebra.Tensor<float>(fp16._shape);
+        var src = fp16.AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
+        return result;
+    }
+
+    /// <summary>Cast an FP32 tensor to FP16 (pure-CPU narrow).</summary>
+    public static LinearAlgebra.Tensor<Half> CastToFP16(LinearAlgebra.Tensor<float> fp32)
+    {
+        if (fp32 is null) throw new ArgumentNullException(nameof(fp32));
+        var result = new LinearAlgebra.Tensor<Half>(fp32._shape);
+        var src = fp32.AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = (Half)src[i];
+        return result;
+    }
+
+    // Higher rank = more precise. Used by ShouldUseHigherPrecision to
+    // compare layer vs scope precision.
+    private static int PrecisionRank(PrecisionMode m) => m switch
+    {
+        PrecisionMode.Float32     => 4,
+        PrecisionMode.BFloat16    => 3,
+        PrecisionMode.Float16     => 2,
+        PrecisionMode.Float8E5M2  => 1,
+        PrecisionMode.Float8E4M3  => 0,
+        _                          => 0,
+    };
 
     /// <summary>
     /// Operations that benefit from fp16 compute (PyTorch allowlist).
@@ -133,5 +282,6 @@ public sealed class AutocastScope : IDisposable
         if (_disposed) return;
         _disposed = true;
         _current = _previous;
+        ClearTensors();
     }
 }

@@ -31,6 +31,14 @@ internal sealed class CompiledStep<T>
     /// <summary>Type-safe operation type for compiled plan dispatch (avoids string comparisons).</summary>
     internal readonly OpType OpType;
 
+    /// <summary>
+    /// Optional L1/L2-optimal tile size computed by <see cref="Optimization.TileSchedulingPass"/>.
+    /// <c>null</c> means the pass hasn't run or the op isn't tileable. Consumers that implement
+    /// tiled execution (custom GEMM/Conv closures) may read this to size inner loop nests; the
+    /// default SimdGemm path uses its own internal tiling and ignores this annotation.
+    /// </summary>
+    internal int? TileSize { get; set; }
+
     internal CompiledStep(
         string opName,
         Action<IEngine, Tensor<T>> execute,

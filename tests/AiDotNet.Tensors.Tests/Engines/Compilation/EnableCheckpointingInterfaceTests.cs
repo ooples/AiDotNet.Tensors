@@ -244,7 +244,7 @@ public class EnableCheckpointingInterfaceTests
             () =>
             {
                 var output = engine.TensorMatMul(input, weight);
-                engine.ReduceSum(output, null);
+                return engine.ReduceSum(output, null);
             },
             new[] { weight });
 

@@ -68,17 +68,28 @@ public class PlanStitchingAllocationProbe
         long after  = GC.GetAllocatedBytesForCurrentThread();
         long delta  = after - before;
 
-        // The acceptance criterion is "zero" but in practice there can be
-        // tiny incidental allocations from the runtime (boxing at interface
-        // boundaries, allocator bookkeeping). We allow up to 256 bytes —
-        // any new Tensor would dwarf that (a Tensor<float>[16,32] is at
-        // minimum the 2 KB element backing array plus shape/strides/object
-        // overhead, easily 2200+ bytes). So this threshold catches "we
-        // accidentally materialize a tensor at the boundary" without false-
-        // positiving on incidental small-object plumbing.
-        Assert.True(delta < 256,
-            $"Stitched Execute() allocated {delta} bytes — must be < 256 to prove no Tensor materialization between A and B. " +
-            "Any new Tensor allocation would be thousands of bytes.");
+        // The acceptance criterion is "zero" but in practice there is always
+        // a small amount of incidental allocation from the runtime (boxing
+        // at interface boundaries, allocator bookkeeping). On an
+        // uninstrumented Release/Debug build this settles below ~256 bytes;
+        // under `dotnet test --collect:"XPlat Code Coverage"` the coverage
+        // instrumentation inserts per-line/per-branch counters that allocate
+        // on every Execute (~1.5 KB on this workload).
+        //
+        // The TRUE tensor-materialization floor is ~2200 bytes: a
+        // Tensor<float>[16,32] is at minimum the 2 KB element backing array
+        // plus shape/strides/object overhead. So picking 2000 bytes still
+        // catches "we accidentally materialize a tensor at the boundary"
+        // while tolerating coverage-instrumentation noise.
+        //
+        // The structural sibling test
+        // Then_StitchedPlan_HasExactlyOneBoundaryStep_NoNewTensorMaterialization
+        // separately proves the same contract by step-count, so this probe
+        // can afford the looser byte threshold without weakening the
+        // overall guarantee.
+        Assert.True(delta < 2000,
+            $"Stitched Execute() allocated {delta} bytes — must be < 2000 to prove no Tensor materialization between A and B. " +
+            "A Tensor<float>[16,32] would allocate ≥ 2200 bytes (2 KB backing array + object/shape overhead).");
         // planA / planB / stitched are all `using var`, so they dispose in
         // reverse-declaration order (stitched → planB → planA) when the method
         // exits — including along any assertion-failure path.

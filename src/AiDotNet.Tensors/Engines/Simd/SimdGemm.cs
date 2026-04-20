@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.CpuJit;
@@ -709,16 +710,42 @@ internal static class SimdGemm
         int n)
     {
         c.Clear();
+        // Autotune dispatch: if the cache has a winning variant for this
+        // (KernelId, shape) combination, honour it. Today the catalog
+        // covers "sequential" vs "parallel" — falling back to the default
+        // UseParallelGemm toggle when no cached choice is present. Threaded
+        // into both the AVX-512 and AVX2 paths so autotuner decisions apply
+        // uniformly.
+        bool allowParallel = ResolveParallelFromAutotune(m, n, k);
+
         // B1: single gate. Avx512Sgemm.CanUse checks CPU + TFM. Falls back
-        // to the AVX2 path internally until the B2/B3 kernel ships.
+        // to the AVX2 path internally for small / misaligned shapes, so the
+        // gate is safe even when the 16×16 kernel wouldn't qualify.
         if (Avx512Sgemm.CanUse)
         {
-            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: true);
+            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: allowParallel);
             return;
         }
+
         // Iter 39: signal "we just cleared C" so the small-matmul fast path
         // can use store-only kernels (saves 12 loads + 12 adds per micro-tile).
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: true);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: allowParallel, clearedOutput: true);
+    }
+
+    /// <summary>
+    /// Consult <see cref="Helpers.Autotune.AutotuneCache"/> for a cached
+    /// winner of the SGEMM dispatch choice at this shape. Returns the
+    /// default <see cref="UseParallelGemm"/> when there's no hit.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ResolveParallelFromAutotune(int m, int n, int k)
+    {
+        var choice = Helpers.Autotune.AutotuneCache.Lookup(
+            Helpers.Autotune.BuiltInCatalog.SGEMM,
+            new Helpers.Autotune.ShapeProfile(m, n, k));
+        if (choice is null) return UseParallelGemm;
+        // Variant strings come from BuiltInCatalog.SgemmVariants.
+        return choice.Variant == "parallel";
     }
 
     /// <summary>
@@ -874,6 +901,43 @@ internal static class SimdGemm
             return;
         }
 #endif
+        // Non-intrinsics path (net471, or net5+ when Avx2/Fma unavailable).
+        // Use System.Numerics.Vector<float> — a portable SIMD primitive that
+        // the JIT lowers to SSE2 on net471, AVX2 on net5+ where available.
+        // Typical wins on net471: ~4-8× over the pure scalar triple-loop,
+        // closing most of the gap with the net5+ Avx2/Fma fast path.
+        //
+        // The Vector path does row-axpy (contiguous reads of B's p-th row
+        // into C's i-th row), so it requires transA=false and transB=false.
+        // For transB=true (common on Conv2DBackwardKernel's gradOut·im2col^T
+        // gemm), pre-transpose B into scratch and call the non-transpose path;
+        // the transpose cost is O(k*n) and amortized over the M*K work.
+        // For transA=true (less common), fall through to SgemmScalar — fixing
+        // that case is future work.
+        if (Vector.IsHardwareAccelerated && !transA && m > 0 && k > 0 && n > 0)
+        {
+            if (!transB)
+            {
+                SgemmVector(a, lda, b, ldb, c, m, k, n);
+                return;
+            }
+            // transB=true: B is laid out as [n, k] (original shape pre-transpose).
+            // b[j*ldb + p] is the logical B[p,j]. Transpose B once into scratch
+            // in [k, n] row-major, then use the regular axpy path with ldbT = n.
+            var bT = ArrayPool<float>.Shared.Rent(k * n);
+            try
+            {
+                for (int j = 0; j < n; j++)
+                    for (int p = 0; p < k; p++)
+                        bT[p * n + j] = b[j * ldb + p];
+                SgemmVector(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n);
+                return;
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(bT);
+            }
+        }
         SgemmScalar(a, lda, transA, b, ldb, transB, c, m, k, n);
     }
 
@@ -911,6 +975,78 @@ internal static class SimdGemm
                     c[cRowBase + j] += aip * bpj;
 #endif
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Non-transpose GEMM using <see cref="Vector{T}"/> — a portable SIMD
+    /// primitive available on both .NET Framework 4.7.1 and .NET 5+. This is
+    /// the path taken when <c>System.Runtime.Intrinsics</c> (Avx2/Fma) is not
+    /// available: net471 in particular previously fell through to
+    /// <see cref="SgemmScalar"/>'s pure scalar triple-loop, leaving the
+    /// Conv2D im2col+GEMM path ~4× over naive instead of the ~10× seen on
+    /// net5+. Vector&lt;float&gt; typically reaches ~8× over scalar on AVX2
+    /// hardware and ~4× on SSE2, closing most of the gap.
+    ///
+    /// <para><b>Algorithm:</b> axpy over N — for each (i, p), broadcast
+    /// A[i, p] into a Vector&lt;float&gt; and fused-multiply-add with B[p, :]
+    /// into C[i, :]. B's p-th row and C's i-th row are both contiguous in
+    /// the non-transpose case, so <see cref="MemoryMarshal.Cast{TFrom,TTo}(Span{TFrom})"/>
+    /// gives zero-copy Vector&lt;float&gt; views over them.</para>
+    ///
+    /// <para><b>Caller contract:</b> transA and transB must both be false. The
+    /// dispatcher in <see cref="SgemmAddInternal"/> enforces this before
+    /// calling.</para>
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static void SgemmVector(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c,
+        int m, int k, int n)
+    {
+        int vcount = Vector<float>.Count;
+        int nvec = n / vcount;
+        int nVecElems = nvec * vcount;
+        int nvecUnroll = nvec & ~3; // largest multiple of 4 ≤ nvec
+
+        for (int i = 0; i < m; i++)
+        {
+            int cRowBase = i * n;
+            int aRowBase = i * lda;
+            var cRow = c.Slice(cRowBase, n);
+            var cRowVec = MemoryMarshal.Cast<float, Vector<float>>(cRow.Slice(0, nVecElems));
+
+            for (int p = 0; p < k; p++)
+            {
+                float aip = a[aRowBase + p];
+                var aipVec = new Vector<float>(aip);
+
+                int bRowBase = p * ldb;
+                var bRow = b.Slice(bRowBase, n);
+                var bRowVec = MemoryMarshal.Cast<float, Vector<float>>(bRow.Slice(0, nVecElems));
+
+                // Unrolled x4 inner loop — exposes independent FMAs to the CPU's
+                // out-of-order pipeline. On net471 (SSE2/AVX2 via Vector<T>) the
+                // simple += form only issues one FMA per iteration, bottlenecked
+                // by the load-store dependency chain. Unrolling by 4 lets the
+                // CPU issue up to 4 independent vector loads + FMAs per cycle,
+                // roughly doubling throughput for small-k GEMMs.
+                int jv = 0;
+                for (; jv < nvecUnroll; jv += 4)
+                {
+                    cRowVec[jv]     += aipVec * bRowVec[jv];
+                    cRowVec[jv + 1] += aipVec * bRowVec[jv + 1];
+                    cRowVec[jv + 2] += aipVec * bRowVec[jv + 2];
+                    cRowVec[jv + 3] += aipVec * bRowVec[jv + 3];
+                }
+                for (; jv < nvec; jv++)
+                    cRowVec[jv] += aipVec * bRowVec[jv];
+
+                // Scalar tail for the last (n % vcount) elements.
+                for (int j = nVecElems; j < n; j++)
+                    c[cRowBase + j] += aip * b[bRowBase + j];
             }
         }
     }

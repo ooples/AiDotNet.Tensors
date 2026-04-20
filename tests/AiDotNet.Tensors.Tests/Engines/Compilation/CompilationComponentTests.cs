@@ -26,7 +26,7 @@ public class CompilationComponentTests
         var plan = cache.GetOrCompileInference(input._shape, () =>
         {
             compileCount++;
-            engine.TensorMatMul(input, weights);
+            return engine.TensorMatMul(input, weights);
         });
 
         Assert.NotNull(plan);
@@ -37,7 +37,7 @@ public class CompilationComponentTests
         var plan2 = cache.GetOrCompileInference(input._shape, () =>
         {
             compileCount++;
-            engine.TensorMatMul(input, weights);
+            return engine.TensorMatMul(input, weights);
         });
 
         Assert.Equal(1, compileCount); // Not recompiled
@@ -52,7 +52,7 @@ public class CompilationComponentTests
         var weights = CreateRandom(new[] { 8, 4 }, 43);
 
         cache.GetOrCompileInference(input._shape, () => engine.TensorMatMul(input, weights));
-        Assert.Equal(1, cache.InferencePlanCount);
+        Assert.Equal(1, cache.InferencePlanCount); // arrow expression already returns tensor
 
         cache.Invalidate();
         Assert.Equal(0, cache.InferencePlanCount);
@@ -625,7 +625,7 @@ public class CompilationComponentTests
         var input1 = CreateRandom(new[] { 4, 8 }, 42);
         var plan = cache.GetOrCompileInference(input1, () =>
         {
-            engine.TensorMatMul(input1, weights);
+            return engine.TensorMatMul(input1, weights);
         });
         var result1 = plan.Execute();
         var output1 = new float[result1.Length];
@@ -635,7 +635,7 @@ public class CompilationComponentTests
         var input2 = CreateRandom(new[] { 4, 8 }, 99);
         var plan2 = cache.GetOrCompileInference(input2, () =>
         {
-            engine.TensorMatMul(input2, weights);
+            return engine.TensorMatMul(input2, weights);
         });
         Assert.Same(plan, plan2); // Same cached plan
         var result2 = plan2.Execute();
@@ -671,7 +671,7 @@ public class CompilationComponentTests
         cache.GetOrCompileInference(input._shape, () =>
         {
             compileCount++;
-            engine.TensorMatMul(input, weights);
+            return engine.TensorMatMul(input, weights);
         }, symbolic);
 
         Assert.Equal(1, compileCount);
@@ -682,7 +682,7 @@ public class CompilationComponentTests
         cache.GetOrCompileInference(input2._shape, () =>
         {
             compileCount++;
-            engine.TensorMatMul(input2, weights);
+            return engine.TensorMatMul(input2, weights);
         }, symbolic2);
 
         // Both symbolic keys (ignoring dim 0) should be identical
