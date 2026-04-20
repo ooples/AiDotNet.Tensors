@@ -75,15 +75,30 @@ internal static class LinalgScalars
         {
             int s = 1;
             double logAbsDet = 0;
+            bool singular = false;
             for (int i = 0; i < n; i++)
             {
                 double v = ToDouble(luData[b * n * n + i * n + i]);
+                if (v == 0.0)
+                {
+                    // det(A) = 0: sign is 0, log|det| is −∞. Stop walking further.
+                    singular = true;
+                    break;
+                }
                 if (v < 0) s = -s;
                 logAbsDet += Math.Log(Math.Abs(v));
                 if (pivData[b * n + i] != i) s = -s;
             }
-            signData[b] = FromDouble<T>(s);
-            laData[b] = FromDouble<T>(logAbsDet);
+            if (singular)
+            {
+                signData[b] = FromDouble<T>(0.0);
+                laData[b] = FromDouble<T>(double.NegativeInfinity);
+            }
+            else
+            {
+                signData[b] = FromDouble<T>(s);
+                laData[b] = FromDouble<T>(logAbsDet);
+            }
         }
 
         return (sign, logAbs);
@@ -127,6 +142,9 @@ internal static class LinalgScalars
     internal static Tensor<T> Cond<T>(Tensor<T> input, object? p)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank < 2) throw new ArgumentException("Cond needs a 2D+ tensor.", nameof(input));
+
         // Default p = 2 (ratio of largest to smallest singular value).
         var pOrd = p ?? 2.0;
         bool useSvd = pOrd is double d && (d == 2.0 || d == -2.0)
@@ -164,15 +182,19 @@ internal static class LinalgScalars
                     {
                         double fro2 = 0;
                         for (int i = 0; i < k; i++) fro2 += ToDouble(sData[b * k + i]) * ToDouble(sData[b * k + i]);
-                        // For square matrices, cond_fro(A) = ||A||_F * ||A^-1||_F.
-                        // ||A^-1||_F² = Σ 1/σᵢ²
+                        // For square matrices, cond_fro(A) = ||A||_F · ||A⁻¹||_F.
+                        // ||A⁻¹||_F² = Σ 1/σᵢ². Any zero singular value makes
+                        // A singular, so ||A⁻¹||_F = ∞ — skipping zeros would
+                        // incorrectly claim a finite condition number.
                         double inv2 = 0;
+                        bool singular = false;
                         for (int i = 0; i < k; i++)
                         {
                             double v = ToDouble(sData[b * k + i]);
                             if (v > 0) inv2 += 1.0 / (v * v);
+                            else { singular = true; break; }
                         }
-                        condVal = Math.Sqrt(fro2 * inv2);
+                        condVal = singular ? double.PositiveInfinity : Math.Sqrt(fro2 * inv2);
                     }
                     else // "nuc" — ||A||_nuc · ||A⁻¹||_nuc = (Σσᵢ) · (Σ 1/σᵢ).
                     {
@@ -189,7 +211,15 @@ internal static class LinalgScalars
                     }
                 }
                 else if (pOrd is double dp && dp < 0 || pOrd is int ipn && ipn < 0)
-                    condVal = minS > 0 ? minS / maxS : double.PositiveInfinity;
+                {
+                    // p = −2 returns the *reciprocal* 2-norm condition number
+                    // σ_min / σ_max. For rank-deficient but nonzero matrices
+                    // that ratio is legitimately 0 (σ_min = 0 < σ_max).
+                    // Only a true zero matrix (σ_max = 0) yields 0/0 → NaN;
+                    // we report ∞ for that degenerate case to stay consistent
+                    // with PyTorch.
+                    condVal = maxS == 0 ? double.PositiveInfinity : minS / maxS;
+                }
                 else
                     condVal = minS > 0 ? maxS / minS : double.PositiveInfinity;
                 rData[b] = FromDouble<T>(condVal);

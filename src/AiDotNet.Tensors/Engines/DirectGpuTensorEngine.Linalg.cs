@@ -53,22 +53,35 @@ public partial class DirectGpuTensorEngine
         if (rank < 2) return (null, null);
         int n = input.Shape[rank - 1];
         if (input.Shape[rank - 2] != n) return (null, null);
+        if (n == 0) return (null, null); // Empty matrix — fall back to CPU.
         if (n > GpuLinalgMaxN) return (null, null);
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
+        if (batch == 0) return (null, null);
 
-        // outBuf ownership transfers into the activation cache via FinishGpuOp
-        // on the success path (so it lives past this scope). On failure we must
-        // dispose it ourselves. infoBuf is downloaded synchronously and always
-        // disposed here — no deferred lifetime to preserve.
+        // Split the try block at the ownership handoff to FinishGpuOp: any throw
+        // BEFORE the handoff disposes outBuf (we still own it); throws AFTER
+        // never run outBuf.Dispose (the activation cache owns it, disposing
+        // would double-free). infoBuf is sync-downloaded and `using`-scoped.
         using var inBuf = GetOrAllocateBuffer(backend, input);
         using var infoBuf = AllocateInt32Buffer(backend, batch);
         var outBuf = AllocateOutputBuffer(backend, batch * n * n);
+        float[] factorArr;
         try
         {
             lin.LinalgCholesky(inBuf.Buffer, outBuf.Buffer, infoBuf.Buffer, batch, n, upper);
-            var factorArr = FinishGpuOp<float>(backend, outBuf, batch * n * n);
+            factorArr = FinishGpuOp<float>(backend, outBuf, batch * n * n);
+            // Ownership of outBuf is now in the activation/deferred-download
+            // caches — do NOT Dispose it below.
+        }
+        catch
+        {
+            outBuf.Dispose();
+            return (null, null);
+        }
+        try
+        {
             var infoArr = DownloadInt32(backend, infoBuf.Buffer, batch);
             var factor = new Tensor<float>(factorArr, (int[])input._shape.Clone());
             var infoTensor = BuildInfoTensor(input._shape, infoArr);
@@ -76,8 +89,7 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            outBuf.Dispose();
-            return (null, null);
+            return (null, null); // outBuf already owned by caches; don't touch it.
         }
     }
 
@@ -92,20 +104,31 @@ public partial class DirectGpuTensorEngine
         if (rank < 2) return (null, null);
         int m = input.Shape[rank - 2];
         int n = input.Shape[rank - 1];
+        if (m == 0 || n == 0) return (null, null); // Empty matrix — fall back to CPU.
         if (Math.Max(m, n) > GpuLinalgMaxN) return (null, null);
         int k = Math.Min(m, n);
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
+        if (batch == 0) return (null, null);
 
-        // outBuf lifetime transfers into the activation cache on success.
         using var inBuf = GetOrAllocateBuffer(backend, input);
         using var pivBuf = AllocateInt32Buffer(backend, batch * k);
         var outBuf = AllocateOutputBuffer(backend, batch * m * n);
+        float[] luArr;
         try
         {
             lin.LinalgLuFactor(inBuf.Buffer, outBuf.Buffer, pivBuf.Buffer, batch, m, n);
-            var luArr = FinishGpuOp<float>(backend, outBuf, batch * m * n);
+            luArr = FinishGpuOp<float>(backend, outBuf, batch * m * n);
+            // Ownership transferred — do not dispose outBuf below.
+        }
+        catch
+        {
+            outBuf.Dispose();
+            return (null, null);
+        }
+        try
+        {
             var pivArr = DownloadInt32(backend, pivBuf.Buffer, batch * k);
             var lu = new Tensor<float>(luArr, (int[])input._shape.Clone());
             var pivShape = new int[rank - 1];
@@ -117,8 +140,7 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            outBuf.Dispose();
-            return (null, null);
+            return (null, null); // outBuf owned by caches; don't touch it.
         }
     }
 
@@ -133,21 +155,49 @@ public partial class DirectGpuTensorEngine
         if (rank < 2) return (null, null);
         int m = input.Shape[rank - 2];
         int n = input.Shape[rank - 1];
+        if (m == 0 || n == 0) return (null, null); // Empty matrix — fall back to CPU.
         if (Math.Max(m, n) > GpuLinalgMaxN) return (null, null);
         int k = Math.Min(m, n);
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
+        if (batch == 0) return (null, null);
 
-        // qBuf/rBuf lifetime transfers into the activation cache on success.
         using var inBuf = GetOrAllocateBuffer(backend, input);
         var qBuf = AllocateOutputBuffer(backend, batch * m * k);
         var rBuf = AllocateOutputBuffer(backend, batch * k * n);
+
+        // Pre-handoff phase: both qBuf and rBuf are owned by us, dispose on throw.
+        float[] qArr;
         try
         {
             lin.LinalgQrReduced(inBuf.Buffer, qBuf.Buffer, rBuf.Buffer, batch, m, n);
-            var qArr = FinishGpuOp<float>(backend, qBuf, batch * m * k);
-            var rArr = FinishGpuOp<float>(backend, rBuf, batch * k * n);
+            qArr = FinishGpuOp<float>(backend, qBuf, batch * m * k);
+            // qBuf ownership now in caches. rBuf still owned by us.
+        }
+        catch
+        {
+            qBuf.Dispose();
+            rBuf.Dispose();
+            return (null, null);
+        }
+
+        // Partial-handoff phase: qBuf is cache-owned, rBuf is ours.
+        float[] rArr;
+        try
+        {
+            rArr = FinishGpuOp<float>(backend, rBuf, batch * k * n);
+            // Now both qBuf and rBuf ownership lives in the caches.
+        }
+        catch
+        {
+            rBuf.Dispose(); // qBuf is already in the cache — don't touch it.
+            return (null, null);
+        }
+
+        // Post-handoff phase: neither qBuf nor rBuf belongs to us anymore.
+        try
+        {
             var qShape = (int[])input._shape.Clone();
             qShape[rank - 1] = k;
             var rShape = (int[])input._shape.Clone();
@@ -156,8 +206,6 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            qBuf.Dispose();
-            rBuf.Dispose();
             return (null, null);
         }
     }
@@ -181,20 +229,47 @@ public partial class DirectGpuTensorEngine
         if (rank < 2) return (null, null);
         int n = input.Shape[rank - 1];
         if (input.Shape[rank - 2] != n) return (null, null);
+        if (n == 0) return (null, null); // Empty matrix — fall back to CPU.
         // Eigh's shared-memory budget is tighter (2·n² floats).
         if (n > 64) return (null, null);
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
+        if (batch == 0) return (null, null);
 
         using var inBuf = GetOrAllocateBuffer(backend, input);
         var wBuf = AllocateOutputBuffer(backend, batch * n);
         var vBuf = AllocateOutputBuffer(backend, batch * n * n);
+
+        // Pre-handoff: both buffers owned by us.
+        float[] wArr;
         try
         {
             lin.LinalgEigh(inBuf.Buffer, wBuf.Buffer, vBuf.Buffer, batch, n);
-            var wArr = FinishGpuOp<float>(backend, wBuf, batch * n);
-            var vArr = FinishGpuOp<float>(backend, vBuf, batch * n * n);
+            wArr = FinishGpuOp<float>(backend, wBuf, batch * n);
+            // wBuf ownership handed off; vBuf still ours.
+        }
+        catch
+        {
+            wBuf.Dispose();
+            vBuf.Dispose();
+            return (null, null);
+        }
+
+        float[] vArr;
+        try
+        {
+            vArr = FinishGpuOp<float>(backend, vBuf, batch * n * n);
+            // Both buffers now cache-owned.
+        }
+        catch
+        {
+            vBuf.Dispose(); // wBuf is cache-owned — don't touch.
+            return (null, null);
+        }
+
+        try
+        {
             var wShape = new int[rank - 1];
             for (int i = 0; i < rank - 2; i++) wShape[i] = input._shape[i];
             wShape[rank - 2] = n;
@@ -202,8 +277,6 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            wBuf.Dispose();
-            vBuf.Dispose();
             return (null, null);
         }
     }
