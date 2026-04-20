@@ -841,13 +841,22 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
-        // Always route through ToArray() on the common path so lazy / GPU-
-        // resident tensors get materialized before returning CPU memory.
-        // The non-realizing optimization lives in GetLiveBackingArrayOrNull()
-        // for callers that deliberately opt out of materialization.
-        // Returning _storage.GetDataArray() on the contiguous path without
-        // realizing produced the BERT-SQuAD × 100 bug where subsequent
-        // executes returned the first execute's output verbatim.
+        // Eager simple-layout CPU tensors: hand back the backing array
+        // directly. Specializations (TryBuildSpecializedForward) capture
+        // this reference at compile time and need later writes — notably
+        // user-supplied graph-input data landing in a placeholder — to
+        // show up at replay. Returning a copy here was the missing piece
+        // that produced "importer plan outputs all zeros" on ONNX graphs:
+        // specializations pinned the placeholder's zero-initialized state
+        // and never saw the user's Execute-time input.
+        //
+        // Lazy or GPU-resident tensors still go through ToArray() so the
+        // realized CPU snapshot is what the caller sees. That path
+        // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
+        // upstream hasn't run yet would have had its placeholder-filled
+        // backing pinned, leaking stale/zero bytes into every replay.
+        var live = GetLiveBackingArrayOrNull();
+        if (live is not null) return live;
         return ToArray();
     }
 

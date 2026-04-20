@@ -48,6 +48,22 @@ public sealed class OnnxImportOptions
     public int? DefaultParametricDim { get; set; }
 
     /// <summary>
+    /// When <c>true</c>, the importer skips the NCHWc8/NCHWc16 layout
+    /// auto-promotion applied to qualifying 2D Convs and leaves activations
+    /// in the plain NCHW layout end-to-end. Default <c>false</c> (auto-
+    /// promote is on, which is the fast path).
+    /// <para>
+    /// Primary use: regression tests that need to compare the packed-layout
+    /// output against the NCHW reference output bit-for-bit — run the same
+    /// model twice, once with this flag off and once on, and assert
+    /// element-wise equivalence within tolerance. Setting this in production
+    /// trades Conv2D/pool throughput (the packed kernels are substantially
+    /// faster) for parity with the reference dispatch.
+    /// </para>
+    /// </summary>
+    public bool DisableNchwcAutoPromote { get; set; }
+
+    /// <summary>
     /// Extra translators to add ON TOP OF the built-in registry. Use the
     /// <see cref="SetConfigureRegistry{T}"/> method below to install a
     /// strongly-typed callback per element type.

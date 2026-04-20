@@ -12,6 +12,16 @@ namespace AiDotNet.Tensors.Onnx.Tests;
 /// BatchNormInference fused kernel, the packed MaxPool/GlobalAvgPool, and
 /// the auto-unpack before Gemm all cooperate and bit-match the NCHW
 /// reference.
+/// <para>
+/// The assertion is element-wise: the graph is run twice against the same
+/// serialized model — once with the default (NCHWc auto-promote on) and
+/// once with <see cref="OnnxImportOptions.DisableNchwcAutoPromote"/>
+/// flipped to force every Conv onto the plain NCHW dispatch. Any layout-
+/// dependent bug (mispacked channel, wrong stride into a packed buffer,
+/// unpack before a non-layout-aware op) moves the outputs apart; the
+/// smoke-style "finite and not collapsed" checks are preserved as
+/// cheap pre-filters so a gross failure surfaces its nature faster.
+/// </para>
 /// </summary>
 public class NchwcEndToEndRegression
 {
@@ -107,18 +117,56 @@ public class NchwcEndToEndRegression
 
         var bytes = OnnxTestGraphBuilder.Serialize(OnnxTestGraphBuilder.WrapModel(graph));
 
-        // Run through our engine — this triggers the full NCHWc pipeline.
-        // ImportAndExecute returns the single graph output flattened.
-        var ours = OnnxTestHelpers.ImportAndExecute(bytes, ("X", x));
+        // Packed run: default options, NCHWc auto-promote on.
+        var packed = RunOnce(bytes, x, disableNchwc: false);
 
-        Assert.Equal(10, ours.Length);
-        // Sanity: no NaN/Inf that'd indicate broken lane math.
-        foreach (var v in ours)
-            Assert.True(float.IsFinite(v), $"Non-finite output {v} — NCHWc pipeline likely corrupted");
-        // Sanity: outputs shouldn't be all zero or all one — that'd suggest
-        // Conv/BN silently short-circuited.
-        Assert.True(ours.Distinct().Count() >= 5,
-            "Output has <5 distinct values — pipeline likely collapsed");
+        // Reference run: DisableNchwcAutoPromote forces every Conv onto
+        // the plain NCHW path. Everything else (BN, ReLU, MaxPool, GAP,
+        // Flatten, Gemm) reruns verbatim on this layout.
+        var reference = RunOnce(bytes, x, disableNchwc: true);
+
+        Assert.Equal(10, packed.Length);
+        Assert.Equal(10, reference.Length);
+
+        // Pre-filter: gross breakage surfaces before the element-wise loop,
+        // so a 1e-7 mismatch doesn't mask a NaN/collapsed run.
+        foreach (var v in packed)
+            Assert.True(float.IsFinite(v), $"Non-finite output {v} in packed pipeline");
+        foreach (var v in reference)
+            Assert.True(float.IsFinite(v), $"Non-finite output {v} in NCHW reference");
+        Assert.True(reference.Distinct().Count() >= 5,
+            "Reference output has <5 distinct values — pipeline likely collapsed");
+
+        // Element-wise comparison against the NCHW reference. Tolerance
+        // covers Conv accumulation-order differences between the packed
+        // and unpacked kernels (FP32 add is not associative, so summing
+        // 9 kernel taps × 8 channels in a different order drifts a few
+        // ULPs per element and compounds through downstream ops).
+        for (int i = 0; i < reference.Length; i++)
+        {
+            float r = reference[i];
+            float p = packed[i];
+            float tol = 1e-4f * Math.Max(Math.Abs(r), 1f);
+            Assert.True(
+                Math.Abs(r - p) <= tol,
+                $"NCHWc diverged from NCHW reference at element {i}: " +
+                $"reference={r}, packed={p}, diff={Math.Abs(r - p)}, tol={tol}");
+        }
+    }
+
+    private static float[] RunOnce(byte[] modelBytes, float[] input, bool disableNchwc)
+    {
+        using var stream = new MemoryStream(modelBytes);
+        var engine = new CpuEngine();
+        var opts = new OnnxImportOptions { DisableNchwcAutoPromote = disableNchwc };
+        var result = OnnxImporter.Import<float>(stream, engine, opts);
+        Assert.Empty(result.UnsupportedOperators);
+        Assert.NotNull(result.Plan);
+        input.AsSpan().CopyTo(result.Inputs["X"].AsWritableSpan());
+        var output = result.Plan!.Execute();
+        var arr = new float[output.AsSpan().Length];
+        output.AsSpan().CopyTo(arr);
+        return arr;
     }
 
     private static float[] Random(int seed, int n, float lo = -1f, float hi = 1f)
