@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -50,4 +51,45 @@ internal static class DeferredArrayMaterializer
     /// Removes a pending materialization without executing it (e.g., when the GPU buffer is reused).
     /// </summary>
     internal static void Remove(object array) => _pendingMaterializations.TryRemove(array, out _);
+
+    /// <summary>
+    /// Drains all pending materializers by invoking each registered callback.
+    /// Used at scope-end (e.g. <see cref="DirectGpuTensorEngine.MaterializeAllDeferred"/>)
+    /// so every GPU-resident tensor with a pending download is flushed to CPU.
+    /// </summary>
+    /// <param name="swallowErrors">
+    /// When <c>true</c>, per-entry <see cref="InvalidOperationException"/>s are
+    /// swallowed (the entry stays pending so the caller can detect it later).
+    /// Matches the old <c>MaterializeAllDeferred</c> semantics where a torn-down
+    /// GPU context during dispose must not bring down the whole teardown path.
+    /// </param>
+    internal static void MaterializeAll(bool swallowErrors = true)
+    {
+        if (_pendingMaterializations.IsEmpty)
+            return;
+
+        // Snapshot keys so we can safely mutate the dictionary from each callback
+        // (Register's semantics are "remove on fire" via TryRemove).
+        var keys = _pendingMaterializations.Keys.ToArray();
+        foreach (var key in keys)
+        {
+            if (!_pendingMaterializations.TryRemove(key, out var callback))
+                continue;
+
+            if (swallowErrors)
+            {
+                try { callback(key); }
+                catch (InvalidOperationException)
+                {
+                    // GPU buffer may be torn down; leave the materializer dropped
+                    // so any subsequent call fails cleanly via the data path rather
+                    // than re-running a broken callback.
+                }
+            }
+            else
+            {
+                callback(key);
+            }
+        }
+    }
 }
