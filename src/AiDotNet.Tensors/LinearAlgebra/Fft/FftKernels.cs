@@ -58,40 +58,55 @@ internal static class FftKernels
 
     // ── Cooley-Tukey radix-2, iterative, in place ───────────────────────────
     // Standard decimation-in-time formulation: bit-reverse permute, then
-    // log₂ n stages of butterflies with twiddle factors W_N^k = e^{−2πi k / N}
-    // (conjugated for inverse). No recursion, no per-stage allocation.
-    private static void IterativeRadix2(Span<double> buf, int n, bool inverse)
+    // log₂ n stages of butterflies. Each stage is dispatched to the SIMD
+    // kernel (AVX-512 / AVX2 when available) or falls through to the scalar
+    // reference loop when either the lane width doesn't fit (small stages)
+    // or the runtime doesn't expose the intrinsics (e.g. ARM / net471).
+    private static unsafe void IterativeRadix2(Span<double> buf, int n, bool inverse)
     {
         BitReverseShuffle(buf, n);
         double sign = inverse ? 1.0 : -1.0;
-        for (int size = 2; size <= n; size <<= 1)
+        fixed (double* bufPtr = buf)
         {
-            int half = size >> 1;
-            double theta = sign * 2.0 * Math.PI / size;
-            double wStepReal = Math.Cos(theta);
-            double wStepImag = Math.Sin(theta);
-            for (int start = 0; start < n; start += size)
+            for (int size = 2; size <= n; size <<= 1)
             {
-                double wReal = 1.0, wImag = 0.0;
-                for (int k = 0; k < half; k++)
-                {
-                    int eIdx = 2 * (start + k);
-                    int oIdx = 2 * (start + k + half);
-                    double eRe = buf[eIdx], eIm = buf[eIdx + 1];
-                    double oRe = buf[oIdx], oIm = buf[oIdx + 1];
-                    // t = w * odd
-                    double tRe = wReal * oRe - wImag * oIm;
-                    double tIm = wReal * oIm + wImag * oRe;
-                    buf[eIdx] = eRe + tRe;
-                    buf[eIdx + 1] = eIm + tIm;
-                    buf[oIdx] = eRe - tRe;
-                    buf[oIdx + 1] = eIm - tIm;
-                    // Advance twiddle: w *= wStep.
-                    double nwRe = wReal * wStepReal - wImag * wStepImag;
-                    double nwIm = wReal * wStepImag + wImag * wStepReal;
-                    wReal = nwRe;
-                    wImag = nwIm;
-                }
+#if NET7_0_OR_GREATER
+                if (FftSimdKernels.TryRadix2Stage(bufPtr, n, size, inverse))
+                    continue;
+#endif
+                ScalarRadix2Stage(buf, n, size, sign);
+            }
+        }
+    }
+
+    // Scalar radix-2 stage (same math as before, extracted so the SIMD
+    // dispatcher can fall through to it for tiny stages where the vector
+    // lane count exceeds `half`).
+    private static void ScalarRadix2Stage(Span<double> buf, int n, int size, double sign)
+    {
+        int half = size >> 1;
+        double theta = sign * 2.0 * Math.PI / size;
+        double wStepReal = Math.Cos(theta);
+        double wStepImag = Math.Sin(theta);
+        for (int start = 0; start < n; start += size)
+        {
+            double wReal = 1.0, wImag = 0.0;
+            for (int k = 0; k < half; k++)
+            {
+                int eIdx = 2 * (start + k);
+                int oIdx = 2 * (start + k + half);
+                double eRe = buf[eIdx], eIm = buf[eIdx + 1];
+                double oRe = buf[oIdx], oIm = buf[oIdx + 1];
+                double tRe = wReal * oRe - wImag * oIm;
+                double tIm = wReal * oIm + wImag * oRe;
+                buf[eIdx] = eRe + tRe;
+                buf[eIdx + 1] = eIm + tIm;
+                buf[oIdx] = eRe - tRe;
+                buf[oIdx + 1] = eIm - tIm;
+                double nwRe = wReal * wStepReal - wImag * wStepImag;
+                double nwIm = wReal * wStepImag + wImag * wStepReal;
+                wReal = nwRe;
+                wImag = nwIm;
             }
         }
     }
