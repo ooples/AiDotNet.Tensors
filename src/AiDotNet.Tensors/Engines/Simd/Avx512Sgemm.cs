@@ -137,12 +137,26 @@ internal static class Avx512Sgemm
     }
 
     /// <summary>
+    /// K-block size for AVX-512 SGEMM. 16 × Kc × 4 bytes = panel size.
+    /// Kc=256 gives a 16 KB packed A panel that fits comfortably in L1
+    /// alongside the 16×16 accumulator tile and B's current K-column
+    /// (16 floats = 64 bytes). Previously the kernel ran the full K in
+    /// one pass; for BERT FFN up (K=768) the 48 KB A panel overflowed
+    /// L1 and cost 30% throughput to L1 misses.
+    /// </summary>
+    private const int AvxKBlock = 256;
+
+    /// <summary>
     /// B3 BLIS-lite driver: parallel over M-tiles, per M-tile we pack
     /// the 16 A rows into a contiguous <c>float[16 * k]</c> panel so the
     /// microkernel's inner K loop reads streamed memory instead of chasing
     /// lda-strided rows. That's ~80% of the GotoBLAS cache benefit with
-    /// 1/5 the code. Full 5-loop K-block + B-pack remains a future task
-    /// when we actually measure GEMMs past 4096×4096.
+    /// 1/5 the code.
+    ///
+    /// <para>K-blocking: wraps the M/N tile loop with a KK step that
+    /// packs only Kc K-columns per outer iter. The micro-kernel's inner
+    /// K loop fits in L1 for any K. C accumulates across KK blocks
+    /// naturally (micro-kernel already does load-add-store).</para>
     /// </summary>
     private static unsafe void RunTiledMnAligned(
         ReadOnlySpan<float> a, int lda,
@@ -165,36 +179,47 @@ internal static class Avx512Sgemm
                 float* aOuter = aPtr; float* bOuter = bPtr; float* cOuter = cPtr;
                 Parallel.For(0, mTiles, mt =>
                 {
-                    var packed = new float[16 * kLocal];
+                    // K-blocked outer: pack Kc rows at a time; inner M/N
+                    // tiles reuse the cached panel. Allocate the panel
+                    // once at max Kc and reuse across KK iters.
+                    var packed = new float[16 * System.Math.Min(AvxKBlock, kLocal)];
                     fixed (float* pPtr = packed)
                     {
-                        PackARowMajor16(aOuter + mt * 16 * ldaLocal, ldaLocal, pPtr, kLocal);
-                        for (int nt = 0; nt < nTilesLocal; nt++)
+                        for (int kk = 0; kk < kLocal; kk += AvxKBlock)
                         {
-                            Run16x16Tile(
-                                pPtr, kLocal,
-                                bOuter + nt * 16, ldbLocal,
-                                cOuter + mt * 16 * nLocal + nt * 16, nLocal,
-                                kLocal);
+                            int kBlock = System.Math.Min(AvxKBlock, kLocal - kk);
+                            PackARowMajor16(aOuter + mt * 16 * ldaLocal + kk, ldaLocal, pPtr, kBlock);
+                            for (int nt = 0; nt < nTilesLocal; nt++)
+                            {
+                                Run16x16Tile(
+                                    pPtr, kBlock,
+                                    bOuter + kk * ldbLocal + nt * 16, ldbLocal,
+                                    cOuter + mt * 16 * nLocal + nt * 16, nLocal,
+                                    kBlock);
+                            }
                         }
                     }
                 });
             }
             else
             {
-                var packed = new float[16 * k];
+                var packed = new float[16 * System.Math.Min(AvxKBlock, k)];
                 fixed (float* pPtr = packed)
                 {
                     for (int mt = 0; mt < mTiles; mt++)
                     {
-                        PackARowMajor16(aPtr + mt * 16 * lda, lda, pPtr, k);
-                        for (int nt = 0; nt < nTiles; nt++)
+                        for (int kk = 0; kk < k; kk += AvxKBlock)
                         {
-                            Run16x16Tile(
-                                pPtr, k,
-                                bPtr + nt * 16, ldb,
-                                cPtr + mt * 16 * n + nt * 16, n,
-                                k);
+                            int kBlock = System.Math.Min(AvxKBlock, k - kk);
+                            PackARowMajor16(aPtr + mt * 16 * lda + kk, lda, pPtr, kBlock);
+                            for (int nt = 0; nt < nTiles; nt++)
+                            {
+                                Run16x16Tile(
+                                    pPtr, kBlock,
+                                    bPtr + kk * ldb + nt * 16, ldb,
+                                    cPtr + mt * 16 * n + nt * 16, n,
+                                    kBlock);
+                            }
                         }
                     }
                 }
