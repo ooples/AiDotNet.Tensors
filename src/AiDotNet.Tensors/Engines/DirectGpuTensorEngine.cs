@@ -1184,19 +1184,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Materializes all pending deferred downloads. Called when a GpuScope ends
-    /// to ensure all result arrays have valid CPU data.
+    /// Materializes all pending deferred downloads at the end of a normal
+    /// <see cref="GpuScope"/> or cache clear. Propagates exceptions so callers
+    /// observe any failed download instead of silently seeing empty arrays.
     /// </summary>
-    /// <remarks>
-    /// Drains <see cref="Helpers.DeferredArrayMaterializer"/> with
-    /// <c>swallowErrors: true</c> so a torn-down GPU context during dispose does
-    /// not bring down the rest of the teardown path — any entry that fails stays
-    /// dropped so a later access sees a clean "not pending" state rather than
-    /// re-running a broken callback.
-    /// </remarks>
     internal void MaterializeAllDeferred()
     {
-        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: true);
+        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: false);
     }
 
     /// <summary>

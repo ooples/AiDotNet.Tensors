@@ -59,10 +59,19 @@ internal static class DeferredArrayMaterializer
     /// </summary>
     /// <param name="swallowErrors">
     /// When <c>true</c>, per-entry <see cref="InvalidOperationException"/>s are
-    /// swallowed (the entry stays pending so the caller can detect it later).
+    /// swallowed; the entry is still removed from the pending registry before
+    /// the callback runs (see below), so subsequent access to the array falls
+    /// through the normal data path rather than re-running a broken callback.
     /// Matches the old <c>MaterializeAllDeferred</c> semantics where a torn-down
     /// GPU context during dispose must not bring down the whole teardown path.
+    /// When <c>false</c>, exceptions propagate to the caller.
     /// </param>
+    /// <remarks>
+    /// Each entry is <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey, TValue}.TryRemove(TKey, out TValue)"/>-removed
+    /// from the registry *before* its callback is invoked — so whether the
+    /// callback succeeds, fails, or is skipped, the array is no longer pending
+    /// after this call returns.
+    /// </remarks>
     internal static void MaterializeAll(bool swallowErrors = true)
     {
         if (_pendingMaterializations.IsEmpty)
@@ -81,9 +90,9 @@ internal static class DeferredArrayMaterializer
                 try { callback(key); }
                 catch (InvalidOperationException)
                 {
-                    // GPU buffer may be torn down; leave the materializer dropped
-                    // so any subsequent call fails cleanly via the data path rather
-                    // than re-running a broken callback.
+                    // GPU buffer may be torn down; the entry was already removed
+                    // above, so any subsequent call falls through the normal data
+                    // path rather than re-running a broken callback.
                 }
             }
             else
