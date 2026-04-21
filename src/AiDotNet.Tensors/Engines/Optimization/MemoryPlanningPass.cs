@@ -42,8 +42,10 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         // rebound a later step's output to (say) Conv weight W's storage,
         // step N's Execute then clobbered W, and execute #2 fed the model
         // weights that were really leftover activation data.
+        // HashSet<T>(int, IEqualityComparer<T>) is net472+; use the no-
+        // capacity ctor so net471 compiles.
         var producedHere = new HashSet<Tensor<T>>(
-            steps.Length, ReferenceEqualityComparer<Tensor<T>>.Instance);
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = 0; i < steps.Length; i++)
             producedHere.Add(steps[i].OutputBuffer);
 
