@@ -526,6 +526,81 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     /// <summary>
+    /// Per-step timing instrumentation for systematic-debugging Phase 1
+    /// (identify which compiled steps dominate plan cost). Runs the same
+    /// step-loop as <see cref="Execute"/> but times each step individually
+    /// with Stopwatch and accumulates per-step ticks across <paramref name="iters"/>
+    /// measurement iterations. Warms up for <paramref name="warmup"/> full
+    /// plan runs first so JIT / cache effects are amortised.
+    ///
+    /// <para>Internal because this is a diagnostic tool — not part of the
+    /// public ICompiledPlan contract. The bookkeeping per-step (~20 ns for
+    /// two Stopwatch.GetTimestamp calls) would be visible on workloads with
+    /// sub-µs steps, so we DON'T fold this into the production Execute path.</para>
+    ///
+    /// <para>Returns a tuple per step: the OpName of the underlying lazy op
+    /// (same string the LazyNode carried), and the average wall-clock ms
+    /// that step took across the measurement iterations.</para>
+    /// </summary>
+    internal (string OpName, double AvgMs)[] ProfilePerStep(int warmup, int iters)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
+        if (iters <= 0) throw new ArgumentOutOfRangeException(nameof(iters));
+
+        var steps = _steps;
+        var engine = _engine;
+
+        // Warm up — run the full plan N times so JIT / CPU cache / branch
+        // predictor / allocator state matches steady-state conditions.
+        // Guard stitched sources before EACH warmup iteration (same contract
+        // as the measurement loop below): profiling a stitched plan whose
+        // source was disposed during warmup used to crash reading freed
+        // GCHandles instead of throwing the clean ObjectDisposedException.
+        for (int w = 0; w < warmup; w++)
+        {
+            for (int s = 0; s < _sourcePlans.Length; s++)
+            {
+                if (_sourcePlans[s]._disposed)
+                    throw new ObjectDisposedException(
+                        nameof(CompiledInferencePlan<T>),
+                        $"Stitched plan's source at index {s} has been disposed during warmup.");
+            }
+            for (int i = 0; i < steps.Length; i++)
+                steps[i].Execute(engine, steps[i].OutputBuffer);
+        }
+
+        var tickSums = new long[steps.Length];
+        for (int it = 0; it < iters; it++)
+        {
+            // Match Execute's stitched-disposal safety even in the profiling
+            // path — a caller profiling a stitched plan whose source was
+            // disposed mid-run should see the same crisp error, not a crash.
+            for (int s = 0; s < _sourcePlans.Length; s++)
+            {
+                if (_sourcePlans[s]._disposed)
+                    throw new ObjectDisposedException(
+                        nameof(CompiledInferencePlan<T>),
+                        $"Stitched plan's source at index {s} has been disposed during profiling.");
+            }
+
+            for (int k = 0; k < steps.Length; k++)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                steps[k].Execute(engine, steps[k].OutputBuffer);
+                long t1 = Stopwatch.GetTimestamp();
+                tickSums[k] += (t1 - t0);
+            }
+        }
+
+        double tickToMs = 1000.0 / Stopwatch.Frequency;
+        var result = new (string, double)[steps.Length];
+        for (int k = 0; k < steps.Length; k++)
+            result[k] = (steps[k].OpName, tickSums[k] * tickToMs / iters);
+        return result;
+    }
+
+    /// <summary>
     /// Compiles a lazy tensor scope into an inference plan.
     /// Runs optimization passes, pre-allocates all buffers, and builds step array.
     /// </summary>
@@ -571,6 +646,22 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var inputShape = inputTensor is not null
             ? (int[])inputTensor._shape.Clone()
             : Array.Empty<int>();
+
+        // Run step-mutating optimization passes BEFORE specialization.
+        // Specialization pins raw pointers into each input/output buffer
+        // at compile time; any pass that reorders steps or rebinds a
+        // tensor's storage afterward would leave those pinned pointers
+        // targeting the wrong memory. In particular:
+        //   * OperatorReorderingPass changes the observed lifetime of each
+        //     tensor (lastUse shifts when a consumer is pulled earlier).
+        //   * MemoryPlanningPass then rebinds tensors to share storage
+        //     with donors that died at the NEW position.
+        // Running them before specialization means the specializer pins
+        // the correct post-rebind, post-reorder tensors. Fixes the "final
+        // TensorAdd writes to the wrong buffer" failure that surfaced as
+        // ONNX Erf / Gelu / MNIST returning an upstream intermediate's
+        // value instead of the declared output.
+        steps = RunStepMutatingPasses(steps, engine);
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
         var specializedSteps = new CompiledStep<T>[steps.Count];
@@ -677,6 +768,33 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     /// <summary>
+    /// Pre-specialization passes: all passes that mutate the step list
+    /// (reorder, fuse, eliminate, rebind) must run before specialization
+    /// pins raw pointers. Mirrors the same enable flags used by the
+    /// post-specialization <see cref="RunCpuOptimizationPasses"/> path,
+    /// but skips passes that wrap Execute delegates (PointwiseFusion,
+    /// DataflowFusion) to keep the specialization layer free of
+    /// pre-fused opaque closures that would defeat subsequent pins.
+    /// </summary>
+    private static List<CompiledStep<T>> RunStepMutatingPasses(List<CompiledStep<T>> steps, IEngine engine)
+    {
+        if (steps.Count < 4) return steps;
+        var arr = steps.ToArray();
+        AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[] passes =
+        {
+            new AiDotNet.Tensors.Engines.Optimization.OperatorReorderingPass(),
+            new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass(),
+        };
+        foreach (var pass in passes)
+        {
+            if (!pass.IsEnabled) continue;
+            var optimized = pass.TryOptimize(arr, engine);
+            if (optimized is not null) arr = optimized;
+        }
+        return new List<CompiledStep<T>>(arr);
+    }
+
+    /// <summary>
     /// Runs CPU-level optimization passes on the compiled steps.
     /// Currently: spectral decomposition (Phase A) and dataflow fusion (Phase B).
     /// Each pass is independently toggleable via TensorCodecOptions.
@@ -702,6 +820,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (steps.Length < MinStepsForPasses && !hasConvOrAttention)
             return steps;
 
+        // Reordering + memory planning already ran pre-specialization in
+        // Compile(); re-running them here would reorder steps whose inputs
+        // are pinned to specific memory (spec stage pinned GCHandles), and
+        // would rebind storage that spec has already captured as raw
+        // pointers. Either produces silently-wrong output.
         ICpuOptimizationPass[] passes =
         {
             new ConstantFoldingPass(),
@@ -714,8 +837,6 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new SpectralDecompositionPass(),
             new DataflowFusionPass(),
             new MixedPrecisionPass(),
-            new OperatorReorderingPass(), // Reorder for cache locality (#182)
-            new MemoryPlanningPass(),     // Buffer reuse via lifetime analysis (#182)
             new TileSchedulingPass(),     // L1/L2 tile sizing for GEMM/Conv (#182)
         };
 

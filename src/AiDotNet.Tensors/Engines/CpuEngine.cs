@@ -1889,6 +1889,75 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Tensor Operations (Phase B: Epic 3)
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
+
+        // torch.broadcast_to requires target.Rank >= source.Rank — we can't
+        // broadcast to fewer dimensions. Fail fast so the Tier-3 fallback
+        // doesn't silently miscompute shapes.
+        if (targetShape.Length < input.Rank)
+            throw new ArgumentException(
+                $"Broadcast target rank ({targetShape.Length}) must be >= source rank ({input.Rank}).",
+                nameof(targetShape));
+
+        // Tier 1: exact shape match → identity. Zero cost.
+        if (ShapesEqual1D(input._shape, targetShape)) return input;
+
+        // Tier 2: target only differs from source by PREPENDING size-1 axes
+        // (source shape == target tail, all extra target leading axes == 1).
+        // This is a pure reshape — no broadcasting actually happens, just
+        // rank realignment. Dispatches to Reshape which is GraphMode-aware
+        // and performs zero data copy.
+        //
+        // This path owns the BERT MatMul weight-broadcast cost: a 2-D weight
+        // [K, N] becoming a batched [1, K, N] for rank-compatible matmul.
+        int rankDiff = targetShape.Length - input.Rank;
+        if (rankDiff >= 0)
+        {
+            bool leadingAllOne = true;
+            for (int i = 0; i < rankDiff; i++)
+                if (targetShape[i] != 1) { leadingAllOne = false; break; }
+            if (leadingAllOne)
+            {
+                bool tailMatches = true;
+                for (int i = 0; i < input.Rank; i++)
+                    if (targetShape[rankDiff + i] != input._shape[i]) { tailMatches = false; break; }
+                if (tailMatches) return Reshape(input, targetShape);
+            }
+        }
+
+        // Validate broadcast compatibility before falling through — want a crisp
+        // error with both shapes, not a confusing downstream failure.
+        int maxRank = Math.Max(input.Rank, targetShape.Length);
+        for (int i = 0; i < maxRank; i++)
+        {
+            int srcDim = (i < maxRank - input.Rank)         ? 1 : input._shape[i - (maxRank - input.Rank)];
+            int tgtDim = (i < maxRank - targetShape.Length) ? 1 : targetShape[i - (maxRank - targetShape.Length)];
+            if (srcDim != tgtDim && srcDim != 1)
+                throw new ArgumentException(
+                    $"BroadcastTo: cannot broadcast shape [{string.Join(",", input._shape)}] to " +
+                    $"[{string.Join(",", targetShape)}] — source dim {srcDim} at axis {i} must equal target dim {tgtDim} or be 1.");
+        }
+
+        // Tier 3: general broadcast (genuine size-1 → size-N expansion at
+        // some axis). Fall through to the existing broadcast kernel via a
+        // zero-add. Equivalent cost to the old idiom; callers used to
+        // allocate the zero tensor themselves which made Tier 1 / Tier 2
+        // fast paths unreachable. Now the primitive handles Tier 1/2
+        // correctly and only burns the full kernel when genuinely needed.
+        return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+    }
+
+    private static bool ShapesEqual1D(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -1915,6 +1984,257 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
         AutoTracer.RecordOp("Reshape", result, eng => result);
         return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReorderToNchwc<T>(Tensor<T> tensor, LinearAlgebra.TensorLayout targetLayout)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!targetLayout.IsChannelPacked())
+            throw new ArgumentException($"Target layout {targetLayout} is not a channel-packed layout.", nameof(targetLayout));
+        if (tensor.Layout == targetLayout) return tensor;
+        if (tensor.Rank != 4)
+            throw new ArgumentException($"NCHWc reorder requires rank-4 input, got rank {tensor.Rank}.");
+        int cBlock = targetLayout.CBlock();
+        int n = tensor._shape[0], c = tensor._shape[1], h = tensor._shape[2], w = tensor._shape[3];
+        if (c % cBlock != 0)
+            throw new ArgumentException($"NCHWc reorder requires C ({c}) divisible by cBlock ({cBlock}).");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedLayout = targetLayout;
+                var capturedCBlock = cBlock;
+                var capturedShape = (int[])tensor._shape.Clone();
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReorderToNchwc(captured, capturedLayout);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = capturedLayout;
+                    });
+                // Mirror the layout on the placeholder at RECORD time. A later
+                // layout-sensitive op in the same scope (e.g. ReorderToNchw
+                // below) inspects Layout during recording and would otherwise
+                // observe the default Nchw — short-circuiting a required reorder.
+                lazy.Layout = capturedLayout;
+                return lazy;
+            }
+        }
+
+        // Eager path. Shape stays the same flat-length; we just rearrange.
+        var result = new Tensor<T>(tensor._shape) { Layout = targetLayout };
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = (Tensor<float>)(object)tensor;
+            var dstF = (Tensor<float>)(object)result;
+            Simd.NchwcReorder.ToNchwc(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+        }
+        else
+        {
+            // Generic scalar reorder — same index math as the float path.
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            int hw = h * w;
+            int outerC = c / cBlock;
+            for (int ni = 0; ni < n; ni++)
+            {
+                int srcN = ni * c * hw;
+                int dstN = ni * c * hw;
+                for (int oc = 0; oc < outerC; oc++)
+                {
+                    int srcOc = srcN + oc * cBlock * hw;
+                    int dstOc = dstN + oc * hw * cBlock;
+                    for (int p = 0; p < hw; p++)
+                    {
+                        int dstBase = dstOc + p * cBlock;
+                        for (int cb = 0; cb < cBlock; cb++)
+                            dst[dstBase + cb] = src[srcOc + cb * hw + p];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReorderToNchw<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.Layout == LinearAlgebra.TensorLayout.Nchw) return tensor;
+        if (tensor.Rank != 4)
+            throw new ArgumentException($"NCHWc → NCHW reorder requires rank-4 input, got rank {tensor.Rank}.");
+        int cBlock = tensor.Layout.CBlock();
+        int n = tensor._shape[0], c = tensor._shape[1], h = tensor._shape[2], w = tensor._shape[3];
+        if (c % cBlock != 0)
+            throw new ArgumentException($"NCHWc → NCHW reorder requires C ({c}) divisible by cBlock ({cBlock}).");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedShape = (int[])tensor._shape.Clone();
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReorderToNchw(captured);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = LinearAlgebra.TensorLayout.Nchw;
+                    });
+                // Propagate Layout at record time (see matching comment in
+                // ReorderToNchwc above) so downstream layout-sensitive ops
+                // within the same scope see Nchw and don't short-circuit.
+                lazy.Layout = LinearAlgebra.TensorLayout.Nchw;
+                return lazy;
+            }
+        }
+
+        var result = new Tensor<T>(tensor._shape) { Layout = LinearAlgebra.TensorLayout.Nchw };
+        if (typeof(T) == typeof(float))
+        {
+            var srcF = (Tensor<float>)(object)tensor;
+            var dstF = (Tensor<float>)(object)result;
+            Simd.NchwcReorder.ToNchw(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+        }
+        else
+        {
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            int hw = h * w;
+            int outerC = c / cBlock;
+            for (int ni = 0; ni < n; ni++)
+            {
+                int srcN = ni * c * hw;
+                int dstN = ni * c * hw;
+                for (int oc = 0; oc < outerC; oc++)
+                {
+                    int srcOc = srcN + oc * hw * cBlock;
+                    int dstOc = dstN + oc * cBlock * hw;
+                    for (int p = 0; p < hw; p++)
+                    {
+                        int srcBase = srcOc + p * cBlock;
+                        for (int cb = 0; cb < cBlock; cb++)
+                            dst[dstOc + cb * hw + p] = src[srcBase + cb];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (x.Rank != 4)
+            throw new ArgumentException($"BatchNormInference requires rank-4 input, got rank {x.Rank}.");
+
+        // GraphMode: record lazy node — never execute eagerly, or the plan
+        // would bake placeholder data into the frozen BN output.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance;
+                double capE = epsilon;
+                return scope.RecordVariadic(LazyNodeType.Custom, "BatchNormInference",
+                    new[] { x, gamma, beta, mean, variance }, x._shape,
+                    (eng, output) =>
+                    {
+                        var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        output.Layout = r.Layout;
+                    },
+                    savedState: new object[] { epsilon });
+            }
+        }
+
+        // Float fast paths — the common case for ONNX vision models.
+        if (typeof(T) == typeof(float))
+        {
+            int C = x._shape[1];
+            int H = x._shape[2];
+            int W = x._shape[3];
+            int N = x._shape[0];
+            var xf = (Tensor<float>)(object)x;
+            var gammaF = (Tensor<float>)(object)gamma;
+            var betaF  = (Tensor<float>)(object)beta;
+            var meanF  = (Tensor<float>)(object)mean;
+            var varF   = (Tensor<float>)(object)variance;
+            var result = new Tensor<float>(x._shape) { Layout = x.Layout };
+            if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
+            {
+                Simd.NchwcBatchNorm.RunNchwc8(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+            }
+            else if (x.Layout == LinearAlgebra.TensorLayout.Nchw)
+            {
+                Simd.NchwcBatchNorm.RunNchw(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+            }
+            else
+            {
+                // Any other packed layout (e.g. Nchwc16 that didn't hit the
+                // Nchwc8 branch above) isn't safe to interpret as plain NCHW
+                // — RunNchw would index into the buffer with the wrong stride
+                // and produce garbage. Unpack to plain NCHW first, then run
+                // the generic NCHW kernel, and mark the result as Nchw.
+                var unpackedT = new Tensor<float>(new[] { N, C, H, W }) { Layout = LinearAlgebra.TensorLayout.Nchw };
+                Simd.NchwcReorder.ToNchw(xf.AsSpan(), unpackedT.AsWritableSpan(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                Simd.NchwcBatchNorm.RunNchw(
+                    unpackedT.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+                result.Layout = LinearAlgebra.TensorLayout.Nchw;
+            }
+            return (Tensor<T>)(object)result;
+        }
+
+        // Generic scalar fallback for non-float T. Pre-combine scale/bias, then FMA.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
+        int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
+        int spatial = hh * ww;
+        var gData = gamma.GetDataArray();
+        var bData = beta.GetDataArray();
+        var mData = mean.GetDataArray();
+        var vData = variance.GetDataArray();
+        var scaleArr = new T[cc];
+        var biasArr = new T[cc];
+        for (int c = 0; c < cc; c++)
+        {
+            T s = numOps.Divide(gData[c], numOps.Sqrt(numOps.Add(vData[c], eps)));
+            scaleArr[c] = s;
+            biasArr[c] = numOps.Subtract(bData[c], numOps.Multiply(s, mData[c]));
+        }
+        var outT = new Tensor<T>(x._shape) { Layout = x.Layout };
+        var inSpan = x.AsSpan();
+        var outSpan = outT.AsWritableSpan();
+        for (int ni = 0; ni < nn; ni++)
+        {
+            for (int c = 0; c < cc; c++)
+            {
+                int baseIdx = (ni * cc + c) * spatial;
+                T s = scaleArr[c], b2 = biasArr[c];
+                for (int sp = 0; sp < spatial; sp++)
+                    outSpan[baseIdx + sp] = numOps.Add(numOps.Multiply(inSpan[baseIdx + sp], s), b2);
+            }
+        }
+        return outT;
     }
 
     /// <inheritdoc/>
@@ -2482,7 +2802,10 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, a._shape,
+                // Same broadcast-shape fix as TensorBroadcastMultiply —
+                // a._shape is not always the final broadcast shape.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastSubtractBackward);
             }
@@ -2535,7 +2858,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, a._shape,
+                // Same broadcast-shape fix as TensorBroadcastMultiply.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastDivideBackward);
             }
@@ -2565,7 +2890,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, a._shape,
+                // Broadcast output shape follows NumPy rules — must be computed
+                // from both operands, not just a._shape. The previous `a._shape`
+                // assumption held only when a was the "larger" operand; when
+                // b is broader (e.g. scalar * [B, H, S, D]), the recorded
+                // output buffer was too small and the eager TensorBroadcastMultiply
+                // inside the closure overran it with "Destination is too short".
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
                     (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
@@ -5942,6 +6274,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
+        // NCHWc8 float fast path — SIMD per-lane reduce. Gated before the
+        // gradient-tape branch: inference-only, no backward needed here.
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0
+            && GradientTape<T>.Current is null)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)result;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.MaxPoolNchwc8(
+                srcF.GetDataArray(), dstF.GetDataArray(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding);
+            return result;
+        }
+
         // When tape is active, use WithIndices variant so backward can access max indices
         var tape = GradientTape<T>.Current;
         if (tape is not null)
@@ -6071,6 +6420,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
+
+        // NCHWc8 float fast path: one SIMD add per source cell, one FMA per
+        // output cell for the divide. count_include_pad=0 is the engine's
+        // default (pad cells excluded from the average).
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)result;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.AvgPoolNchwc8(
+                srcF.GetDataArray(), dstF.GetDataArray(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding,
+                countIncludePad: false);
+            return result;
+        }
 
         // Float fast path: direct array access, no virtual dispatch
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
@@ -8767,6 +9134,42 @@ public partial class CpuEngine : ITensorLevelEngine
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
 
+        // Phase 2D BERT-attention fix: for float, bypass
+        // MatrixMultiplyHelper.TryGemm's per-slice validation + memory
+        // conversion overhead and call SimdGemm.SgemmSequential directly.
+        //
+        // BatchMatMulRootCauseDiag showed this saves ~40 µs per slice
+        // (×12 slices on BERT attention = ~480 µs total), taking the
+        // attn-scores [12,256,64]×[12,64,256] call from 920 µs → 441 µs
+        // and attn×V [12,256,256]×[12,256,64] from 588 µs → 474 µs.
+        // SgemmSequential (not Sgemm) is the right SGEMM variant here —
+        // we're already inside Parallel.For, so letting the inner SGEMM
+        // also spawn a Parallel.For would nest workers over the thread
+        // pool. In practice the nested case measured equivalent for
+        // BERT-scale slices (SGEMM's internal work threshold isn't hit),
+        // but SgemmSequential is the documented correct pattern.
+        if (typeof(T) == typeof(float))
+        {
+            var aF = (float[])(object)aData;
+            var bF = (float[])(object)bData;
+            var rF = (float[])(object)rData;
+
+            Parallel.For(0, batchSize, batch =>
+            {
+                int aOffset = batch * matrixSizeA;
+                int bOffset = batch * matrixSizeB;
+                int resultOffset = batch * matrixSizeResult;
+
+                Simd.SimdGemm.SgemmSequential(
+                    aF.AsSpan(aOffset, matrixSizeA),
+                    bF.AsSpan(bOffset, matrixSizeB),
+                    rF.AsSpan(resultOffset, matrixSizeResult),
+                    m, n, p);
+            });
+
+            return result;
+        }
+
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
@@ -8855,46 +9258,435 @@ public partial class CpuEngine : ITensorLevelEngine
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();
 
-        Parallel.For(0, batch * outChannels, idx =>
+        // NCHWc fast path: when the caller pre-reordered input + kernel into
+        // channel-packed layout (input.Layout == Nchwc8 and kernel's
+        // first-axis group is divisible by 8), route through the direct
+        // NCHWc conv kernel. Each lane broadcasts one input channel and
+        // FMAs against the matching 8-wide kernel row — this is the path
+        // ORT/oneDNN use to get close to peak FMA throughput on AVX2.
+        // NCHWc16 (AVX-512) fast path — preferred when the runtime has
+        // Avx512F and the shapes are aligned to cBlock=16. Double the FMA
+        // throughput per cycle vs the cb=8 Vector256 kernel.
+        if (typeof(T) == typeof(float) &&
+            input.Layout == LinearAlgebra.TensorLayout.Nchwc16 &&
+            inChannels % Simd.NchwcConv2D16.CBlock == 0 &&
+            outChannels % Simd.NchwcConv2D16.CBlock == 0)
         {
-            int b = idx / outChannels;
-            int oc = idx % outChannels;
+            int kernelLen16 = outChannels * inChannels * kernelHeight * kernelWidth;
+            var packedKernel16 = new float[kernelLen16];
+            Simd.NchwcReorder.KernelToOihwIo(
+                (float[])(object)kernelData,
+                packedKernel16,
+                outChannels, inChannels, kernelHeight, kernelWidth,
+                Simd.NchwcConv2D16.CBlock);
+            Simd.NchwcConv2D16.Run(
+                (float[])(object)inputData,
+                packedKernel16,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+            result.Layout = LinearAlgebra.TensorLayout.Nchwc16;
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            return result;
+        }
 
-            for (int oh = 0; oh < outputHeight; oh++)
+        if (typeof(T) == typeof(float) &&
+            input.Layout == LinearAlgebra.TensorLayout.Nchwc8 &&
+            inChannels % Simd.NchwcConv2D.CBlock == 0 &&
+            outChannels % Simd.NchwcConv2D.CBlock == 0)
+        {
+            // Kernel must be in OIHWio packed form. Detect via a conservative
+            // shape check: if it's stored flat with length outC * inC * kH * kW
+            // we reorder on-the-fly. The proper ConvBn-NCHWc fusion path
+            // will pre-reorder the kernel into a constant initializer.
+            int kernelLen = outChannels * inChannels * kernelHeight * kernelWidth;
+            var packedKernel = new float[kernelLen];
+            Simd.NchwcReorder.KernelToOihwIo(
+                (float[])(object)kernelData,
+                packedKernel,
+                outChannels, inChannels, kernelHeight, kernelWidth,
+                Simd.NchwcConv2D.CBlock);
+            Simd.NchwcConv2D.Run(
+                (float[])(object)inputData,
+                packedKernel,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+            result.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            return result;
+        }
+
+        // Fast path: im2col + SimdGemm for float tensors. The naive nested-
+        // loop kernel below is O(batch × outC × outH × outW × inC × kH × kW)
+        // of scalar multiplies — NO vectorization, NO cache blocking. Real
+        // conv runtimes (ORT/MKL/cuDNN) lower to GEMM-on-lowered-input for
+        // exactly this reason: once the image is unfolded, the heavy compute
+        // is a single [outC × K] @ [K × (oH·oW)] matmul that hits the tuned
+        // BLAS path. This closes ~95% of the ResNet-50 gap vs ORT.
+        if (typeof(T) == typeof(float))
+        {
+            // Packed layouts (Nchwc8 / Nchwc16) that fell through to this
+            // fallback must be unpacked first — Conv2DIm2colGemm reads the
+            // buffer assuming plain NCHW row-major indexing, so reading a
+            // packed buffer would silently produce wrong outputs.
+            if (input.Layout == LinearAlgebra.TensorLayout.Nchwc8 ||
+                input.Layout == LinearAlgebra.TensorLayout.Nchwc16)
             {
-                for (int ow = 0; ow < outputWidth; ow++)
+                int cBlock = input.Layout == LinearAlgebra.TensorLayout.Nchwc16 ? 16 : 8;
+                if (inChannels % cBlock != 0)
+                    throw new NotSupportedException(
+                        $"Conv2D fallback: packed {input.Layout} input with inChannels={inChannels} " +
+                        $"not divisible by cBlock={cBlock} cannot be unpacked safely.");
+                var unpackedData = new float[batch * inChannels * height * width];
+                Simd.NchwcReorder.ToNchw(
+                    ((float[])(object)inputData).AsSpan(), unpackedData.AsSpan(),
+                    batch, inChannels, height, width, cBlock);
+                inputData = (T[])(object)unpackedData;
+            }
+            Conv2DIm2colGemm(
+                (float[])(object)inputData,
+                (float[])(object)kernelData,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+        }
+        else
+        {
+            Parallel.For(0, batch * outChannels, idx =>
+            {
+                int b = idx / outChannels;
+                int oc = idx % outChannels;
+
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    T sum = numOps.Zero;
-
-                    for (int ic = 0; ic < inChannels; ic++)
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int kh = 0; kh < kernelHeight; kh++)
-                        {
-                            for (int kw = 0; kw < kernelWidth; kw++)
-                            {
-                                int ih = oh * strideH + kh * dilationH - padH;
-                                int iw = ow * strideW + kw * dilationW - padW;
+                        T sum = numOps.Zero;
 
-                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                        for (int ic = 0; ic < inChannels; ic++)
+                        {
+                            for (int kh = 0; kh < kernelHeight; kh++)
+                            {
+                                for (int kw = 0; kw < kernelWidth; kw++)
                                 {
-                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                                    int kernelIdx = ((oc * inChannels + ic) * kernelHeight + kh) * kernelWidth + kw;
-                                    sum = numOps.Add(sum, numOps.Multiply(inputData[inputIdx], kernelData[kernelIdx]));
+                                    int ih = oh * strideH + kh * dilationH - padH;
+                                    int iw = ow * strideW + kw * dilationW - padW;
+
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    {
+                                        int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                        int kernelIdx = ((oc * inChannels + ic) * kernelHeight + kh) * kernelWidth + kw;
+                                        sum = numOps.Add(sum, numOps.Multiply(inputData[inputIdx], kernelData[kernelIdx]));
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                    outputData[outputIdx] = sum;
+                        int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                        outputData[outputIdx] = sum;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
             new object[] { stride, padding, dilation });
         AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
+    }
+
+    // Per-kernel pre-transposed array cache for the small-N Conv fast path.
+    // ConditionalWeakTable holds entries weakly by the kernel float[] reference
+    // — they survive exactly as long as the kernel does. For inference on a
+    // fixed ONNX model every Conv layer's kernel is stable, so the first call
+    // populates the cache and every subsequent call reuses the transposed
+    // buffer for ~0 µs. Multi-threaded callers are handled inside
+    // ConditionalWeakTable.GetValue which is documented thread-safe.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], float[]>
+        _kernelTransposeCache = new();
+
+    /// <summary>
+    /// im2col + SGEMM float conv. Unfolds the input tensor into a matrix
+    /// where each row is one receptive field's flattened patch, then runs a
+    /// single blocked GEMM against the kernel-as-matrix layout. Closes the
+    /// gap vs tuned conv runtimes that rely on the same lowering.
+    /// </summary>
+    private static void Conv2DIm2colGemm(
+        float[] input, float[] kernel, float[] output,
+        int batch, int inC, int H, int W,
+        int outC, int kH, int kW,
+        int oH, int oW,
+        int sH, int sW, int padH, int padW, int dH, int dW)
+    {
+        int K = inC * kH * kW;         // im2col row length (kernel @ one patch).
+        int N = oH * oW;               // patches per image.
+        int kernelRowsPerPatch = K;
+        // Kernel is already in [outC, inC, kH, kW] = [outC, K] row-major;
+        // this IS the GEMM's A matrix layout (M=outC, K=K).
+        // im2col builds B as [K, N] per-image so GEMM produces [outC, N].
+        // We allocate one col buffer per image and reuse via a thread-local
+        // pool to avoid per-batch allocations hot-path.
+        //
+        // Parallel-batch policy: we ONLY parallelize across the batch axis
+        // for small per-image GEMMs. When the per-image GEMM is large enough
+        // (>= 50M FLOPs per image), the inner SgemmBlocked already
+        // parallelizes across K and saturates cores — adding an outer
+        // Parallel.For would double-dip and waste threads. For small
+        // per-image work, the inner GEMM can't usefully parallelize, so
+        // batch-level parallelism is how we get thread-scaling.
+        long perImageCost = (long)outC * K * N;
+        bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
+
+        void ProcessImage(int b)
+        {
+            // Rent a scratch col buffer of size [K, N] = K*N floats.
+            var col = System.Buffers.ArrayPool<float>.Shared.Rent(K * N);
+            try
+            {
+                // im2col: for each output position (oh, ow) and each kernel
+                // cell (ic, kh, kw), write input[b, ic, ih, iw] (or 0 on
+                // padding) to col[(ic*kH*kW + kh*kW + kw), oh*oW + ow].
+                //
+                // The outer ic loop is embarrassingly parallel — different
+                // input channels write to disjoint col rows. For ResNet
+                // stage1 (inC=64, col buffer 7.2 MB) the serial im2col was
+                // ~3 ms = 2.4 GB/s, ~10× below RAM peak on a 16-core box.
+                // Parallelising the ic loop distributes the memory-bound
+                // copy across cores. Gate at inC × K × N ≥ 1 M to avoid
+                // paying task-pool dispatch on small shapes (stage3/stage4
+                // im2col is already sub-millisecond).
+                long im2colOps = (long)inC * kH * kW * oH * oW;
+                void CopyChannel(int ic)
+                {
+                    for (int kh = 0; kh < kH; kh++)
+                    {
+                        for (int kw = 0; kw < kW; kw++)
+                        {
+                            int rowBase = (ic * kH + kh) * kW + kw;
+                            int rowOff = rowBase * N;
+                            for (int oh = 0; oh < oH; oh++)
+                            {
+                                int ih = oh * sH + kh * dH - padH;
+                                if ((uint)ih >= (uint)H)
+                                {
+                                    // Whole row padded — zero the block.
+                                    int zeroStart = rowOff + oh * oW;
+                                    Array.Clear(col, zeroStart, oW);
+                                    continue;
+                                }
+                                int inputRowBase = ((b * inC + ic) * H + ih) * W;
+                                int colRowStart = rowOff + oh * oW;
+                                for (int ow = 0; ow < oW; ow++)
+                                {
+                                    int iw = ow * sW + kw * dW - padW;
+                                    col[colRowStart + ow] = (uint)iw < (uint)W ? input[inputRowBase + iw] : 0f;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (im2colOps >= 1_000_000L)
+                {
+                    Parallel.For(0, inC, CopyChannel);
+                }
+                else
+                {
+                    for (int ic = 0; ic < inC; ic++) CopyChannel(ic);
+                }
+
+                // Output slice for this image: [outC, oH*oW] starting at
+                // (b * outC * N) in the packed NCHW output.
+                int outOff = b * outC * N;
+                var outSpan = output.AsSpan(outOff, outC * N);
+                outSpan.Clear();
+
+                // Phase 2C small-N fast path: when N (output patches)
+                // is small and M (outC) is large, SimdGemm's standard
+                // blocked kernel underperforms (stage4 1×512×7×7 3×3
+                // conv = SGEMM[M=512, K=4608, N=49] hits only 18 GFLOPS
+                // vs 100+ on balanced shapes). Diagnostic data from
+                // Conv2DKernelSplitDiag showed the SAME FLOPs with
+                // M↔N swapped runs at 116 GFLOPS — 6.4× faster.
+                //
+                // Fix: when the gate fires, explicitly transpose col and
+                // kernel into the fast-shape layout, run SGEMM on
+                // [N, K] × [K, M] → [N, M], then transpose back to
+                // [M, N]. Rent transposed buffers from ArrayPool so we
+                // don't churn the GC.
+                //
+                // Gate tuning: fires when N ≤ 128 AND M ≥ 128. Empirically
+                // stage4 (N=49, M=512) hits the gate; stages 1-3 all have
+                // N > 128 so they skip it (their direct SGEMM is fast).
+                // The 1×1 ResNet bottleneck and BERT shapes all have
+                // either N > 128 or M < 128, so they also skip.
+                if (N <= 128 && outC >= 128)
+                {
+                    // col stored [K, N] → colT [N, K]
+                    var colT = System.Buffers.ArrayPool<float>.Shared.Rent(N * K);
+                    // output computed as [N, M], then transposed to [M, N]
+                    var outT = System.Buffers.ArrayPool<float>.Shared.Rent(N * outC);
+                    // Kernel pre-transpose cache: for a given input kernel
+                    // float[] reference, keep a pre-transposed [K, M] copy.
+                    // This is the "fast-forward transform" — moves the 2.4 MB
+                    // kernel transpose (~1 ms even parallelised) out of the
+                    // hot path. Kernel arrays are stable across Conv2D calls
+                    // for the same model, so the cache hits for every call
+                    // after the first. ConditionalWeakTable uses reference
+                    // equality and collects entries when the kernel is GC'd.
+                    float[] kernelT = GetOrBuildTransposedKernel(kernel, outC, K);
+                    try
+                    {
+                        TransposeFloatSerial(col, 0, colT, 0, K, N);
+
+                        int outOffInArray = outOff;
+                        AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
+                            colT.AsSpan(0, N * K),
+                            kernelT.AsSpan(0, K * outC),
+                            outT.AsSpan(0, N * outC),
+                            N, K, outC);
+
+                        TransposeFloatSerial(outT, 0, output, outOffInArray, N, outC);
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<float>.Shared.Return(outT);
+                        System.Buffers.ArrayPool<float>.Shared.Return(colT);
+                        // NOTE: kernelT is NOT returned to ArrayPool — it's
+                        // owned by the cache and lives as long as the kernel.
+                    }
+                }
+                else
+                {
+                    // Sgemm (vs SgemmSequential) lets SimdGemm spawn its own
+                    // Parallel.For when the workload crosses ParallelWorkThreshold.
+                    // For batch=1 inference the outer per-image loop has no
+                    // parallelism to offer, so the SGEMM-internal one is the
+                    // only source of multi-core throughput.
+                    AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
+                        kernel.AsSpan(0, outC * K),
+                        col.AsSpan(0, K * N),
+                        outSpan,
+                        outC, K, N);
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(col);
+            }
+        }
+
+        /// <summary>
+        /// Blocked row/col transpose for the small-N SGEMM fast path above.
+        /// src is [rows, cols] row-major; dst is [cols, rows] row-major.
+        /// Uses a 32×32 blocked traversal with the INNER loop over <c>r</c>
+        /// so dst writes within a block are contiguous (stride 1 in <c>r</c>
+        /// maps to stride 1 in <c>dst[c*rows + r]</c>). This is the
+        /// "transpose by contiguous writes" layout — SIMD-friendly and
+        /// cache-line-aligned. Uses <c>Unsafe.Add</c> on raw refs to skip
+        /// per-element Span bounds checks.
+        /// </summary>
+        // Persistent cache of pre-transposed kernel arrays for the small-N
+        // fast path. Keyed by the caller's kernel float[] reference via
+        // ConditionalWeakTable — the cache entry stays alive exactly as
+        // long as the kernel itself, so folding inference on a fixed
+        // model gets amortised kernel-transpose cost of zero after the
+        // first call per Conv layer, and transient kernels (training
+        // loops, ad-hoc computations) drop from the cache when the
+        // kernel array is GC'd.
+        static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
+        {
+            return _kernelTransposeCache.GetValue(kernel, k =>
+            {
+                var kernelT = new float[cols * rows];
+                TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
+                return kernelT;
+            });
+        }
+
+        /// <summary>
+        /// Serial blocked transpose on raw arrays. Takes arrays + offsets
+        /// so callers can work with ArrayPool-rented buffers without span
+        /// juggling. Inner loop order: outer c (block-contiguous dst rows),
+        /// inner r (stride-1 dst writes). Uses <c>Unsafe.Add</c> on array
+        /// refs to elide bounds checks.
+        /// </summary>
+        static void TransposeFloatSerial(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
+        {
+            const int BLK = 32;
+            ref float srcRef = ref src[srcOff];
+            ref float dstRef = ref dst[dstOff];
+            for (int cb = 0; cb < cols; cb += BLK)
+            {
+                int cEnd = Math.Min(cb + BLK, cols);
+                for (int rb = 0; rb < rows; rb += BLK)
+                {
+                    int rEnd = Math.Min(rb + BLK, rows);
+                    for (int c = cb; c < cEnd; c++)
+                    {
+                        int dstRowBase = c * rows;
+                        for (int r = rb; r < rEnd; r++)
+                        {
+                            System.Runtime.CompilerServices.Unsafe.Add(ref dstRef, dstRowBase + r) =
+                                System.Runtime.CompilerServices.Unsafe.Add(ref srcRef, r * cols + c);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Parallel variant that distributes the outer col-block iteration
+        /// across cores. For the ResNet stage4 kernel (2.4 MB, 144 col
+        /// blocks) → ~9 blocks per core on a 16-core box ≈ 36 KB working
+        /// set per core (fits in L1). Uses raw array refs to bypass
+        /// per-element Span bounds checks inside the parallel closure.
+        /// </summary>
+        static void TransposeFloatParallel(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
+        {
+            const int BLK = 32;
+            int numColBlocks = (cols + BLK - 1) / BLK;
+            System.Threading.Tasks.Parallel.For(0, numColBlocks, colBlockIdx =>
+            {
+                int cb = colBlockIdx * BLK;
+                int cEnd = Math.Min(cb + BLK, cols);
+                ref float srcRef = ref src[srcOff];
+                ref float dstRef = ref dst[dstOff];
+                for (int rb = 0; rb < rows; rb += BLK)
+                {
+                    int rEnd = Math.Min(rb + BLK, rows);
+                    for (int c = cb; c < cEnd; c++)
+                    {
+                        int dstRowBase = c * rows;
+                        for (int r = rb; r < rEnd; r++)
+                        {
+                            System.Runtime.CompilerServices.Unsafe.Add(ref dstRef, dstRowBase + r) =
+                                System.Runtime.CompilerServices.Unsafe.Add(ref srcRef, r * cols + c);
+                        }
+                    }
+                }
+            });
+        }
+
+        if (parallelBatch)
+        {
+            Parallel.For(0, batch, ProcessImage);
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++) ProcessImage(b);
+        }
     }
 
     /// <inheritdoc/>
@@ -11753,7 +12545,36 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
     {
-        // Use the core implementation directly - we don't need indices for simple forward
+        if (input == null) throw new ArgumentNullException(nameof(input));
+
+        // GraphMode recording was missing here — without it, MaxPool3D runs
+        // eagerly under a GraphMode scope and its output never makes it into
+        // the compiled plan. ONNX-imported 3D MaxPool plans had the final
+        // tensor buffer always zero because no step produced it.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must have 3 elements.", nameof(poolSize));
+                if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must have 3 elements.", nameof(stride));
+                if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must have 3 elements.", nameof(padding));
+
+                int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
+                int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
+                int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], outD, outH, outW };
+                var capturedInput = input;
+                var capturedPool = poolSize;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "MaxPool3D", input, outShape,
+                    (eng, output) => { var r = eng.MaxPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
+            }
+        }
+
         return MaxPool3DCore(input, poolSize, stride, padding);
     }
 
@@ -12010,6 +12831,34 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> AvgPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        // Mirror the MaxPool3D GraphMode-recording fix — without this, 3D
+        // avg-pool outputs are zero in a compiled plan.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Validate parameters BEFORE indexing into them to avoid
+                // IndexOutOfRange on malformed inputs. Mirrors the eager-path
+                // validation below.
+                if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
+                if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
+                if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must be array of 3 elements [padD, padH, padW].", nameof(padding));
+                int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
+                int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
+                int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], outD, outH, outW };
+                var capturedInput = input;
+                var capturedPool = poolSize;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool3D", input, outShape,
+                    (eng, output) => { var r = eng.AvgPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
+            }
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
@@ -20731,6 +21580,44 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
 
+        // NCHWc8 fast path: channel-axis concat where every input is
+        // NCHWc8 and each C is divisible by the cBlock. Physical layout is
+        // [N, cg, H, W, 8], so concat along cg is contiguous-block memcpy
+        // per-batch — no index math per element.
+        bool nchwcChannelConcat =
+            typeof(T) == typeof(float) &&
+            axis == 1 &&
+            rank == 4 &&
+            tensors.All(t => t.Layout == LinearAlgebra.TensorLayout.Nchwc8 &&
+                             t._shape[1] % Simd.NchwcPool.CBlock == 0);
+        if (nchwcChannelConcat)
+        {
+            int cb = Simd.NchwcPool.CBlock;
+            int N = firstShape[0], H = firstShape[2], W = firstShape[3];
+            int cgOut = totalAxisSize / cb;
+            int outImageStride = cgOut * H * W * cb; // floats per batch image
+            var outF = (T[])(object)outputData;
+            int dstCgOffset = 0;
+            foreach (var t in tensors)
+            {
+                int cgIn = t._shape[1] / cb;
+                int inImageStride = cgIn * H * W * cb;
+                var srcF = (Tensor<float>)(object)t;
+                var srcData = srcF.GetDataArray();
+                int copyPerImage = cgIn * H * W * cb;
+                for (int n = 0; n < N; n++)
+                {
+                    int dstBase = n * outImageStride + dstCgOffset * H * W * cb;
+                    int srcBase = n * inImageStride;
+                    Array.Copy(srcData, srcBase, (float[])(object)outF, dstBase, copyPerImage);
+                }
+                dstCgOffset += cgIn;
+            }
+            var packedResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+            packedResult.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            return packedResult;
+        }
+
         var outputStrides = ComputeStrides(outputShape);
 
         int axisOffset = 0;
@@ -21492,7 +22379,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = new int[axes.Length];
                 for (int i = 0; i < axes.Length; i++) outShape[i] = tensor._shape[axes[i]];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorPermute", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Permute's eager path returns a strided view; .Contiguous()
+                    // materializes it into row-major memory so AsSpan doesn't
+                    // throw "non-contiguous" when copying into the pre-allocated
+                    // output. O(n) materialization cost, paid once per Execute.
+                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes).Contiguous(); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
             }
         }
@@ -22624,27 +23515,42 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
 
-        // GraphMode: execute eagerly and record each split result individually
+        // GraphMode: record each split result as its own lazy node. We must
+        // NOT perform the eager split here — that would force AsSpan on the
+        // input tensor, which triggers Realize on its entire upstream lazy
+        // chain. For ONNX import specifically, that chain may include ops
+        // that read from graph-input placeholders; realizing them before the
+        // caller has filled those placeholders bakes placeholder=0 data into
+        // those nodes' IsRealized state, which the later plan replay cannot
+        // undo (AsSpan subsequently returns whatever the upstream step wrote,
+        // which IS correct — but ONLY because the plan's step delegate
+        // overwrites the buffer; meanwhile any op whose closure captured a
+        // pre-realize snapshot of the data — e.g. a specialization that pins
+        // inputA.GetDataArray() during compile — now holds a stale array).
+        // Shape is all we need at record time, and that comes from
+        // tensor._shape directly.
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                if (axis < 0) axis = tensor._shape.Length + axis;
+                int axisSizeLazy = tensor._shape[axis];
+                if (axisSizeLazy % numSplits != 0)
+                    throw new ArgumentException(
+                        $"Cannot split axis of size {axisSizeLazy} into {numSplits} equal parts");
+                int splitSizeLazy = axisSizeLazy / numSplits;
+
                 var ct = tensor; int cn = numSplits; int ca = axis;
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                var eagerResults = TensorSplit(ct, cn, ca);
-                GraphMode.SetCurrent(savedScope);
-                // Record each split as a separate lazy node
-                var lazyResults = new Tensor<T>[eagerResults.Length];
-                for (int s = 0; s < eagerResults.Length; s++)
+                var lazyResults = new Tensor<T>[numSplits];
+                for (int s = 0; s < numSplits; s++)
                 {
                     int splitIdx = s;
-                    var eager = eagerResults[s];
-                    lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, eager._shape,
+                    var outShape = (int[])tensor._shape.Clone();
+                    outShape[ca] = splitSizeLazy;
+                    lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, outShape,
                         (eng, output) => { var r = eng.TensorSplit(ct, cn, ca)[splitIdx]; r.AsSpan().CopyTo(output.AsWritableSpan()); },
                         BackwardFunctions<T>.SplitBackward, new object[] { numSplits, axis, s });
-                    eager.AsSpan().CopyTo(lazyResults[s].AsWritableSpan());
                 }
                 return lazyResults;
             }
@@ -22658,6 +23564,45 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Cannot split axis of size {axisSize} into {numSplits} equal parts");
 
         int splitSize = axisSize / numSplits;
+
+        // NCHWc8 fast path: channel-axis split on a packed tensor. Slicing
+        // logical axis=1 on the raw Tensor does the wrong thing (physical
+        // layout is [N, cg, H, W, 8]), so we cut per-channel-group with
+        // direct memcpy when splitSize is a multiple of the cBlock.
+        if (typeof(T) == typeof(float)
+            && tensor.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && tensor.Rank == 4
+            && axis == 1
+            && splitSize % Simd.NchwcPool.CBlock == 0)
+        {
+            int cb = Simd.NchwcPool.CBlock;
+            int N = tensor._shape[0], H = tensor._shape[2], W = tensor._shape[3];
+            int cgTotal = axisSize / cb;
+            int cgPerSplit = splitSize / cb;
+            int inImageStride = cgTotal * H * W * cb;
+            int outImageStride = cgPerSplit * H * W * cb;
+            int copyPerImage = outImageStride;
+            var srcF = (Tensor<float>)(object)tensor;
+            var srcData = srcF.GetDataArray();
+            var packedResults = new Tensor<T>[numSplits];
+            for (int i = 0; i < numSplits; i++)
+            {
+                var splitShape = (int[])tensor._shape.Clone();
+                splitShape[1] = splitSize;
+                var dst = new Tensor<float>(splitShape) { Layout = LinearAlgebra.TensorLayout.Nchwc8 };
+                var dstData = dst.GetDataArray();
+                int srcCgStart = i * cgPerSplit;
+                for (int n = 0; n < N; n++)
+                {
+                    int srcBase = n * inImageStride + srcCgStart * H * W * cb;
+                    int dstBase = n * outImageStride;
+                    Array.Copy(srcData, srcBase, dstData, dstBase, copyPerImage);
+                }
+                packedResults[i] = (Tensor<T>)(object)dst;
+            }
+            return packedResults;
+        }
+
         var results = new Tensor<T>[numSplits];
 
         for (int i = 0; i < numSplits; i++)
@@ -24794,10 +25739,17 @@ public partial class CpuEngine : ITensorLevelEngine
         // Step 1: Conv2D
         var result = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
 
-        // Step 2: Add bias if provided
+        // Step 2: Add bias if provided. Right-align broadcast: a rank-1
+        // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
+        // with the NCHW result's channel axis, not the innermost (W) dim.
         if (bias != null)
         {
-            result = TensorBroadcastAdd(result, bias);
+            var biasView = bias;
+            if (bias.Rank == 1 && result.Rank == 4 && bias._shape[0] == result._shape[1])
+            {
+                biasView = Reshape(bias, new[] { 1, bias._shape[0], 1, 1 });
+            }
+            result = TensorBroadcastAdd(result, biasView);
         }
 
         // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)
@@ -27255,6 +28207,22 @@ public partial class CpuEngine : ITensorLevelEngine
         int width = input._shape[3];
         int spatialSize = height * width;
 
+        // NCHWc8 float fast path. Output is [N, C, 1, 1] so we stay NCHW on
+        // the result — pool collapses the spatial dim, leaving the packed
+        // channel layout ambiguous; downstream FC/gemm wants plain NCHW.
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var flat = new Tensor<float>(new[] { batch, channels });
+            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.GetDataArray(), flat.GetDataArray(),
+                batch, channels, height, width);
+            var reshaped = flat.Reshape(new[] { batch, channels, 1, 1 });
+            reshaped.Layout = LinearAlgebra.TensorLayout.Nchw;
+            return (Tensor<T>)(object)reshaped;
+        }
+
         var inputData = input.GetFlattenedData();
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
@@ -27488,50 +28456,50 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSigmoid<T>(Tensor<T> tensor)
     {
-        return Sigmoid(tensor);
+        var r = Sigmoid(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorReLU<T>(Tensor<T> tensor)
     {
-        return ReLU(tensor);
+        var r = ReLU(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorGELU<T>(Tensor<T> tensor)
     {
-        return GELU(tensor);
+        var r = GELU(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSiLU<T>(Tensor<T> tensor)
     {
         // SiLU (Sigmoid Linear Unit) is mathematically equivalent to Swish
-        return Swish(tensor);
+        var r = Swish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTanh<T>(Tensor<T> tensor)
     {
-        return Tanh(tensor);
+        var r = Tanh(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-        return LeakyReLU(tensor, alpha);
+        var r = LeakyReLU(tensor, alpha); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorMish<T>(Tensor<T> tensor)
     {
-        return Mish(tensor);
+        var r = Mish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHardSwish<T>(Tensor<T> tensor)
     {
-        return HardSwish(tensor);
+        var r = HardSwish(tensor); r.Layout = tensor.Layout; return r;
     }
 
     #endregion

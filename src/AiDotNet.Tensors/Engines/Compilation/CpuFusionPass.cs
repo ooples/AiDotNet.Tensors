@@ -115,6 +115,16 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
 
                     if (activation != FusedActivationType.None)
                     {
+                        // Reject the activation if it has downstream consumers we
+                        // would strand. Fusion rewrites MatMul+Add+Activation into
+                        // a single FusedLinear node, but doesn't redirect
+                        // external consumers of the activation's output — so any
+                        // downstream node that read from the activation would be
+                        // left pointing at a node we removed. Safer to leave the
+                        // activation standalone when it's shared.
+                        if (consumerCounts.ContainsKey(nodes[j]) && consumerCounts[nodes[j]] > 1)
+                            break;
+
                         activationNode = nodes[j];
                         activationIndex = j;
                         break;
@@ -128,6 +138,17 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
         if (fused == null)
             return false;
 
+        // Rewire the final-output tensor's LazySource to point at the new
+        // fused node. Downstream consumers read their inputs' LazySource via
+        // GetInputNodes() — if it still points at the now-removed activation
+        // / add node, DCE rebuilds its consumer map and drops the fused node
+        // because nothing in the current list claims to consume it. That was
+        // the ONNX-import multi-op-chain breakage: a Gemm+Relu+Add graph
+        // fused to FusedLinearReLU + Add, DCE rebuilt counts, FusedLinearReLU
+        // had 0 consumers in the rebuilt map, and got dropped — leaving Add
+        // reading a pre-trace tensor that only held the input placeholder.
+        SetLazySource(fused);
+
         // Mark consumed nodes for removal
         removed.Add(matmul);
         removed.Add(addNode);
@@ -135,6 +156,18 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             removed.Add(activationNode);
 
         return true;
+    }
+
+    private static void SetLazySource(ILazyNode node)
+    {
+        // Rewire the output tensor's LazySource to the fused node so downstream
+        // GetInputNodes() sees it as the producer. Works for both float and
+        // double; no-op if the output type doesn't match either.
+        switch (node)
+        {
+            case LazyNode<float> f: f.Output.LazySource = f; break;
+            case LazyNode<double> d: d.Output.LazySource = d; break;
+        }
     }
 
     private static bool IsConsumerOf(ILazyNode consumer, ILazyNode producer)

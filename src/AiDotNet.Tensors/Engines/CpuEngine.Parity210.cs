@@ -429,58 +429,10 @@ public partial class CpuEngine
         return TensorSplit(tensor, sections, 2);
     }
 
-    /// <inheritdoc/>
-    public virtual Tensor<T> TensorBroadcastTo<T>(Tensor<T> tensor, int[] shape)
-    {
-        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (shape == null) throw new ArgumentNullException(nameof(shape));
-        int srcRank = tensor.Rank;
-        int dstRank = shape.Length;
-        if (dstRank < srcRank)
-            throw new ArgumentException("Broadcast target rank must be >= source rank");
-
-        // Right-align source shape against target. A source dim must either
-        // equal the target dim or be 1 (broadcast).
-        var padded = new int[dstRank];
-        int offset = dstRank - srcRank;
-        for (int i = 0; i < dstRank; i++)
-        {
-            int srcDim = i < offset ? 1 : tensor._shape[i - offset];
-            if (srcDim != shape[i] && srcDim != 1)
-                throw new ArgumentException(
-                    $"Cannot broadcast dim {srcDim} (source idx {i - offset}) to {shape[i]}");
-            padded[i] = srcDim;
-        }
-
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        var dst = result.AsWritableSpan();
-        var src = tensor.AsSpan();
-
-        int outTotal = result.Length;
-        var srcStrides = new int[dstRank];
-        // Compute source strides treating broadcast (size-1) dims as stride 0.
-        int stride = 1;
-        for (int i = dstRank - 1; i >= 0; i--)
-        {
-            srcStrides[i] = padded[i] == 1 ? 0 : stride;
-            stride *= padded[i];
-        }
-        var idx = new int[dstRank];
-        for (int linear = 0; linear < outTotal; linear++)
-        {
-            int srcPos = 0;
-            for (int k = 0; k < dstRank; k++) srcPos += idx[k] * srcStrides[k];
-            dst[linear] = src[srcPos];
-            for (int k = dstRank - 1; k >= 0; k--)
-            {
-                idx[k]++;
-                if (idx[k] < shape[k]) break;
-                idx[k] = 0;
-            }
-        }
-        return result;
-    }
+    // TensorBroadcastTo moved to CpuEngine.cs (Tier-1/2/3 fast path landed
+    // in #231 — identity → reshape-for-rank-pad → broadcast). The older
+    // implementation that used to live here has been removed to avoid the
+    // partial-class duplicate-definition error.
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices)

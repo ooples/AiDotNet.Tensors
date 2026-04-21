@@ -42,8 +42,19 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         // VulkanBackend is a singleton — don't dispose
     }
 
-    private void SkipIfNoGpu() =>
+    private void SkipIfNoGpu()
+    {
         Skip.If(!_isVulkanAvailable, "Vulkan GPU backend not available");
+        // Octonion + hyperbolic kernels are emitted as GLSL and compiled at
+        // runtime. When libshaderc is missing the pipelines silently
+        // no-op (GlslQuadOp returns early), the output buffer stays at
+        // its zero-allocation fill, and the CPU↔GPU comparison reads
+        // "GPU=0" vs a non-zero CPU result. That's an environment gap,
+        // not a kernel bug — skip here instead of failing on every dev
+        // box that hasn't installed shaderc.
+        Skip.If(_vulkan is not null && !_vulkan.IsGlslCompilerAvailable,
+            "GLSL runtime compiler (libshaderc) unavailable — install to run octonion/hyperbolic GPU tests.");
+    }
 
     private static float[] RandomFloats(int count, int seed, float scale = 1f)
     {

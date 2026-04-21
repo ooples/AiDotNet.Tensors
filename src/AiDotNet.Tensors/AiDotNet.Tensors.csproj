@@ -40,6 +40,8 @@
     <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
+    <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx" />
+    <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx.Tests" />
     <InternalsVisibleTo Include="HarmonicEngine" />
     <InternalsVisibleTo Include="HarmonicEngine.Tests" />
   </ItemGroup>

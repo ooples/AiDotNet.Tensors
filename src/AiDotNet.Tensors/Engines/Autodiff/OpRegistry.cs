@@ -113,7 +113,11 @@ internal static class OpRegistry
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
-        "TensorBroadcastTo", "TensorExpandAs", "TensorBroadcastTensors",
+        // TensorBroadcastTo belongs to the Delegator set below (composed
+        // from Reshape / TensorBroadcastAdd which record themselves) —
+        // listing it here too tripped the duplicate-check in
+        // TapeCompletenessTests.OpRegistry_HasNoDuplicates.
+        "TensorExpandAs", "TensorBroadcastTensors",
         "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
 
@@ -288,6 +292,14 @@ internal static class OpRegistry
 
         // Rounding (non-differentiable, STE would need explicit annotation)
         "TensorFloor", "TensorCeiling", "TensorRound",
+
+        // Layout reorders (pure data movement, not a differentiable op —
+        // any gradient propagates through the inverse layout reorder)
+        "ReorderToNchwc", "ReorderToNchw",
+
+        // Inference-only BatchNorm (training-mode BatchNorm uses the
+        // separate BatchNormBackward path above)
+        "BatchNormInference",
     };
 
     /// <summary>
@@ -312,6 +324,7 @@ internal static class OpRegistry
         "TensorConv2D",      // -> Conv2D (records)
 
         // Composed from recorded sub-ops (backward through constituents)
+        "TensorBroadcastTo", // -> Reshape or TensorBroadcastAdd (both record)
         "TensorLogSumExp",   // ReduceMax + BroadcastSubtract + TensorExp + ReduceSum + TensorLog + TensorAdd
         "TensorNorm",        // TensorMultiply + ReduceSum + TensorSqrt
         "TensorNormalize",   // TensorNorm + TensorDivide

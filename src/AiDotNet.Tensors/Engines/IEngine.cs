@@ -1924,6 +1924,72 @@ public interface IEngine
     Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape);
 
     /// <summary>
+    /// Broadcasts <paramref name="input"/> to <paramref name="targetShape"/> under NumPy
+    /// broadcasting rules (right-align dims; each source dim must match the target
+    /// or be 1; missing leading dims are treated as 1). Returns a tensor with
+    /// <paramref name="targetShape"/>.
+    /// <para>
+    /// This is a proper broadcast primitive — callers should use it instead of the
+    /// <c>TensorBroadcastAdd(x, new Tensor&lt;T&gt;(targetShape))</c> idiom, which allocates
+    /// a zero tensor and performs a full element-wise add purely to materialize a
+    /// broadcast. Those idioms are O(prod(targetShape)) time + 2× memory traffic; this
+    /// primitive short-circuits the common cases:
+    /// </para>
+    /// <list type="number">
+    ///   <item><b>Identity</b>: source shape equals target → returned as-is, zero cost.</item>
+    ///   <item><b>Leading-1s</b>: source shape matches target tail and target only adds
+    ///   leading size-1 axes → dispatches to <see cref="Reshape"/>, zero data copy.
+    ///   This path owns the BERT MatMul bias-broadcast cost (weight <c>[K, N]</c> →
+    ///   batched <c>[1, K, N]</c>), which profiling showed as 99.6% of plan time under the
+    ///   old idiom.</item>
+    ///   <item><b>General broadcast</b>: genuine size-1 → size-N expansion along some
+    ///   axis — materialized via the existing broadcast kernel. Equivalent cost to the
+    ///   old idiom, which is acceptable because real expansion cases are rare vs.
+    ///   leading-axis alignment.</item>
+    /// </list>
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="input">The source tensor.</param>
+    /// <param name="targetShape">The target shape to broadcast to.</param>
+    /// <returns>A tensor of shape <paramref name="targetShape"/> holding the broadcasted values.</returns>
+    /// <exception cref="ArgumentException">Thrown when shapes are not broadcast-compatible.</exception>
+    Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape);
+
+    /// <summary>
+    /// Reorders a 4-D NCHW tensor (shape <c>[N, C, H, W]</c>) into NCHWc
+    /// channel-packed layout. The returned tensor's
+    /// <see cref="LinearAlgebra.TensorBase{T}.Layout"/> is set to match
+    /// <paramref name="targetLayout"/> so layout-aware op dispatchers can
+    /// route through the channel-packed fast paths. Requires
+    /// <c>C % cBlock == 0</c>.
+    /// </summary>
+    /// <typeparam name="T">Element type; AVX2+FMA float fast path is
+    /// provided. Other T falls back to the scalar reorder.</typeparam>
+    Tensor<T> ReorderToNchwc<T>(Tensor<T> tensor, LinearAlgebra.TensorLayout targetLayout);
+
+    /// <summary>
+    /// Inverse of <see cref="ReorderToNchwc{T}"/> — returns an NCHWc tensor
+    /// back to NCHW (<c>[N, C, H, W]</c>). If the input is already NCHW,
+    /// returns it unchanged.
+    /// </summary>
+    Tensor<T> ReorderToNchw<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Inference-mode batch normalization with pre-computed running statistics.
+    /// Fuses the six broadcast ops (sub, add, sqrt, div, mul, add) of the naive
+    /// form into a single <c>out = scale' * x + bias'</c> pass with
+    /// <c>scale' = gamma / sqrt(var + eps)</c>. Honours <c>x.Layout</c>: the
+    /// NCHWc8 fast path processes 8-wide lanes with Vector256 FMA.
+    /// </summary>
+    /// <param name="x">Input tensor, rank-4 NCHW or NCHWc.</param>
+    /// <param name="gamma">Scale, shape [C].</param>
+    /// <param name="beta">Bias, shape [C].</param>
+    /// <param name="mean">Running mean, shape [C].</param>
+    /// <param name="variance">Running variance, shape [C].</param>
+    /// <param name="epsilon">Numerical stabiliser.</param>
+    Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon);
+
+    /// <summary>
     /// Performs batched matrix multiplication on 3D tensors.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -6464,8 +6530,9 @@ public interface IEngine
     /// <summary>Depth split (torch.dsplit).</summary>
     Tensor<T>[] TensorDSplit<T>(Tensor<T> tensor, int sections);
 
-    /// <summary>Broadcast <paramref name="tensor"/> to <paramref name="shape"/> (torch.broadcast_to).</summary>
-    Tensor<T> TensorBroadcastTo<T>(Tensor<T> tensor, int[] shape);
+    // TensorBroadcastTo declared above (see line 1956) — the earlier
+    // declaration won over the Parity210 block on merge and the duplicate
+    // here was removed to avoid the interface-duplicate-member error.
 
     /// <summary>
     /// Pick elements from the flattened tensor at the positions specified by

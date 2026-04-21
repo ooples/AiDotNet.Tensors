@@ -143,7 +143,7 @@ internal static class OpTypeParser
         "Conv2D" => OpType.Conv2D,
         "DepthwiseConv2D" => OpType.DepthwiseConv2D,
         "ConvTranspose2D" => OpType.ConvTranspose2D,
-        "BatchNorm" => OpType.BatchNorm,
+        "BatchNorm" or "BatchNormInference" => OpType.BatchNorm,
         "LayerNorm" => OpType.LayerNorm,
         "GroupNorm" => OpType.GroupNorm,
         "InstanceNorm" => OpType.InstanceNorm,

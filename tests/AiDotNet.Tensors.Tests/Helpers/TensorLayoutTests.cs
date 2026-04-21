@@ -1,6 +1,7 @@
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using TensorLayout = AiDotNet.Tensors.Helpers.TensorLayout;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
