@@ -15226,6 +15226,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             return BatchNormBackward4D(gradOutput, input, gamma, mean, variance, eps, numOps, out gradGamma, out gradBeta);
         }
+        // Rank-3 inputs were routed through BatchNorm3D on the forward path
+        // (channels = _shape[0], spatial = _shape[1] * _shape[2]). The 2D
+        // fallback below assumes channels = _shape[1] and indexes mean[f]
+        // / var[f] / gamma[f] for f in [0, _shape[1]) — out-of-bounds for
+        // any 3D shape with _shape[1] > _shape[0]. Dispatch to the matching
+        // backward instead. (#233)
+        if (input._shape.Length == 3)
+        {
+            return BatchNormBackward3D(gradOutput, input, gamma, mean, variance, eps, numOps, out gradGamma, out gradBeta);
+        }
 
         // 2D case: [batch, features]
         int batch = input._shape[0];
@@ -15450,6 +15460,84 @@ public partial class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+    }
+
+    /// <summary>
+    /// Backward pass for 3D batch normalization <c>[channels, height, width]</c>,
+    /// matching the layout used by <see cref="BatchNorm3D{T}"/> on the forward
+    /// pass: <c>channels = _shape[0]</c>, <c>spatial = _shape[1] * _shape[2]</c>,
+    /// reduction is per-channel across spatial. Standard batch-norm-backward
+    /// formula with N = spatial size:
+    /// <para>
+    /// <c>dx = (γ · invStd / N) · (N · dy − Σdy − norm · invStd · Σ(dy · (x − μ)))</c>
+    /// </para>
+    /// where <c>invStd = 1 / sqrt(var + eps)</c> and <c>norm = (x − μ) · invStd</c>.
+    /// </summary>
+    private Tensor<T> BatchNormBackward3D<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, T eps, INumericOperations<T> numOps, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
+    {
+        int channels = input._shape[0];
+        int height = input._shape[1];
+        int width = input._shape[2];
+        int spatialSize = height * width;
+        T spatialT = numOps.FromDouble(spatialSize);
+
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
+
+        var gradGammaData = new T[channels];
+        var gradBetaData = new T[channels];
+        var gradInputData = new T[input.Length];
+
+        Parallel.For(0, channels, c =>
+        {
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[c], eps)));
+            T mean_c = meanData[c];
+            T gamma_c = gammaData[c];
+
+            // Pass 1: accumulate per-channel reductions over the spatial axis.
+            T sumGrad = numOps.Zero;
+            T sumGradX = numOps.Zero;
+            T gGamma = numOps.Zero;
+            T gBeta = numOps.Zero;
+            int channelOffset = c * spatialSize;
+            for (int s = 0; s < spatialSize; s++)
+            {
+                T x = inputData[channelOffset + s];
+                T gOut = gradOutputData[channelOffset + s];
+                T centered = numOps.Subtract(x, mean_c);
+                T normalized = numOps.Multiply(centered, invStd);
+                gGamma = numOps.Add(gGamma, numOps.Multiply(gOut, normalized));
+                gBeta = numOps.Add(gBeta, gOut);
+                sumGrad = numOps.Add(sumGrad, gOut);
+                sumGradX = numOps.Add(sumGradX, numOps.Multiply(gOut, centered));
+            }
+            gradGammaData[c] = gGamma;
+            gradBetaData[c] = gBeta;
+
+            // Pass 2: write gradInput using the accumulated sums.
+            T gammaSumGrad = numOps.Multiply(gamma_c, sumGrad);
+            T gammaSumGradX = numOps.Multiply(gamma_c, sumGradX);
+            T invStdOverSpatial = numOps.Divide(invStd, spatialT);
+            for (int s = 0; s < spatialSize; s++)
+            {
+                T x = inputData[channelOffset + s];
+                T gOut = gradOutputData[channelOffset + s];
+                T centered = numOps.Subtract(x, mean_c);
+                T normalized = numOps.Multiply(centered, invStd);
+                T gradNorm = numOps.Multiply(gamma_c, gOut);
+                T term1 = numOps.Multiply(spatialT, gradNorm);
+                T term2 = gammaSumGrad;
+                T term3 = numOps.Multiply(normalized, numOps.Multiply(invStd, gammaSumGradX));
+                gradInputData[channelOffset + s] = numOps.Multiply(invStdOverSpatial, numOps.Subtract(numOps.Subtract(term1, term2), term3));
+            }
+        });
+
+        gradGamma = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradBetaData));
         return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 

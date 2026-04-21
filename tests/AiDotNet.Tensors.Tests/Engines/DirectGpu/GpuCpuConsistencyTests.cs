@@ -19,6 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// - Data transfer corruption
 /// - Memory layout mismatches
 /// </summary>
+[Collection("VulkanGlobalState")]
 public class GpuCpuConsistencyTests
 {
     private readonly bool _isVulkanAvailable;

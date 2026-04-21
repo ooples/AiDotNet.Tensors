@@ -17,6 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// octonion algebra operations. Each test runs the operation on CPU, then on GPU,
 /// and verifies element-wise equality within floating-point tolerance.
 /// </summary>
+[Collection("VulkanGlobalState")]
 public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
 {
     private readonly VulkanBackend? _vulkan;
