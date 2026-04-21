@@ -17,21 +17,38 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// surfaced the bug (LagLlama / MOIRAI / UniTS / TimeGPT / TimeLLM /
 /// Timer FeedForwardLayer stacks).
 /// </summary>
-public class FusedLinearBiasGradIntegrationTests
+public class FusedLinearBiasGradIntegrationTests : IDisposable
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly bool _previousReplayMode;
 
     public FusedLinearBiasGradIntegrationTests()
     {
-        // Don't let a previous test's compiled backward recycle into this one.
+        // AutoTrainingCompiler.ReplayMode is process-wide static state;
+        // capture the prior value so Dispose can restore it and we don't
+        // leak a false into tests that expect replay mode on.
+        _previousReplayMode = AutoTrainingCompiler.ReplayMode;
         AutoTrainingCompiler.ReplayMode = false;
     }
+
+    public void Dispose() => AutoTrainingCompiler.ReplayMode = _previousReplayMode;
 
     /// <summary>
     /// Two-layer FFL (the shape that actually trips the consuming
     /// models): <c>[B, T, F_in] → linear(act) → linear → sum</c>. Runs
-    /// SGD for several steps and verifies loss decreases monotonically
-    /// and every parameter — including both biases — actually changed.
+    /// SGD for several steps and verifies three things about every
+    /// activation kernel:
+    /// <list type="number">
+    ///   <item>Every gradient has a shape matching its parameter (the
+    ///     #234 regression).</item>
+    ///   <item>Final loss is strictly below the initial loss, with at
+    ///     most one uptick allowed over the run — non-convex activations
+    ///     like Sigmoid/GELU can briefly overshoot at lr = 0.01.</item>
+    ///   <item>Every parameter, including both biases, actually
+    ///     changed from its initial value. A non-reducing bias gradient
+    ///     would skip the optimizer update (wrong-shape `TensorAdd` used
+    ///     to throw) and leave the parameter pinned at init.</item>
+    /// </list>
     /// </summary>
     [Theory]
     [InlineData(FusedActivationType.None)]
@@ -50,6 +67,12 @@ public class FusedLinearBiasGradIntegrationTests
         var w2 = NewRandomDouble(new[] { FH, FOut }, rng, 0.1);
         var b2 = NewRandomDouble(new[] { 1, FOut }, rng, 0.01);
         var target = NewRandomDouble(new[] { B, T, FOut }, rng, 0.5);
+
+        // Snapshot initial parameters for the post-run mutation check.
+        var w1Init = w1.AsSpan().ToArray();
+        var b1Init = b1.AsSpan().ToArray();
+        var w2Init = w2.AsSpan().ToArray();
+        var b2Init = b2.AsSpan().ToArray();
 
         var lossHistory = new List<double>();
         const double lr = 0.01;
@@ -83,18 +106,38 @@ public class FusedLinearBiasGradIntegrationTests
             ApplyGradDouble(b2, grads[b2], lr);
         }
 
-        // Loss must move in the right direction over the run. We allow
-        // a single uptick for non-convex kernels like Sigmoid/GELU, but
-        // the final loss must be strictly below the initial.
+        // Final loss below initial.
         Assert.True(lossHistory[^1] < lossHistory[0],
-            $"Loss didn't decrease for activation {act}: " +
+            $"Final loss not below initial for activation {act}: " +
             string.Join(" → ", lossHistory.Select(l => l.ToString("G4"))));
+
+        // At most one uptick over the run. Non-convex activations can
+        // overshoot once at lr=0.01, but repeated upticks mean the
+        // update direction itself is wrong (which is what a broken bias
+        // gradient would cause).
+        int upticks = 0;
+        for (int i = 1; i < lossHistory.Count; i++)
+            if (lossHistory[i] > lossHistory[i - 1]) upticks++;
+        Assert.True(upticks <= 1,
+            $"Loss oscillated for activation {act} ({upticks} upticks): " +
+            string.Join(" → ", lossHistory.Select(l => l.ToString("G4"))));
+
+        // Every parameter — including both biases — moved. If a bias
+        // gradient came back wrong-shape, the downstream TensorAdd
+        // would have thrown; if it came back right-shape-but-zero,
+        // that slot would have stayed at its init value.
+        AssertMutated(w1Init, w1.AsSpan(), $"w1 (act={act})");
+        AssertMutated(b1Init, b1.AsSpan(), $"b1 (act={act})");
+        AssertMutated(w2Init, w2.AsSpan(), $"w2 (act={act})");
+        AssertMutated(b2Init, b2.AsSpan(), $"b2 (act={act})");
     }
 
     /// <summary>
     /// Same model shape in <c>float</c>. Even though float rank-2 hits
     /// the BLAS fast path, rank-3 goes through the same fallback —
     /// verify that fallback is right for float too, not just double.
+    /// Same three guarantees as the double variant: shape-correct
+    /// gradients, final loss below initial, every parameter moved.
     /// </summary>
     [Fact]
     public void TwoLayerFFL_Rank3Float_TrainsCleanly()
@@ -109,7 +152,12 @@ public class FusedLinearBiasGradIntegrationTests
         var b2 = NewRandomFloat(new[] { 1, FOut }, rng, 0.01f);
         var target = NewRandomFloat(new[] { B, T, FOut }, rng, 0.5f);
 
-        double initialLoss = 0, finalLoss = 0;
+        var w1Init = w1.AsSpan().ToArray();
+        var b1Init = b1.AsSpan().ToArray();
+        var w2Init = w2.AsSpan().ToArray();
+        var b2Init = b2.AsSpan().ToArray();
+
+        float initialLoss = 0, finalLoss = 0;
         for (int step = 0; step < 5; step++)
         {
             using var tape = new GradientTape<float>();
@@ -132,7 +180,12 @@ public class FusedLinearBiasGradIntegrationTests
             ApplyGradFloat(b2, grads[b2], 0.01f);
         }
 
-        Assert.True(finalLoss < initialLoss);
+        Assert.True(finalLoss < initialLoss,
+            $"Final loss not below initial: {initialLoss:G4} → {finalLoss:G4}");
+        AssertMutated(w1Init, w1.AsSpan(), "w1 (float)");
+        AssertMutated(b1Init, b1.AsSpan(), "b1 (float)");
+        AssertMutated(w2Init, w2.AsSpan(), "w2 (float)");
+        AssertMutated(b2Init, b2.AsSpan(), "b2 (float)");
     }
 
     /// <summary>
@@ -140,11 +193,12 @@ public class FusedLinearBiasGradIntegrationTests
     /// actually use must produce a shape-identical gradient.
     /// </summary>
     [Theory]
-    [InlineData(new int[] { 3, 4 }, new int[] { 4, 6 }, new int[] { 6 })]         // [M,K] × [K,N] + [N]
-    [InlineData(new int[] { 3, 4 }, new int[] { 4, 6 }, new int[] { 1, 6 })]     // [M,K] × [K,N] + [1,N]
-    [InlineData(new int[] { 2, 5, 4 }, new int[] { 4, 6 }, new int[] { 6 })]     // [B,T,K] × [K,N] + [N]
-    [InlineData(new int[] { 2, 5, 4 }, new int[] { 4, 6 }, new int[] { 1, 6 })]   // [B,T,K] × [K,N] + [1,N]
-    [InlineData(new int[] { 1, 8, 1 }, new int[] { 1, 24 }, new int[] { 1, 24 })] // exact #234 repro
+    [InlineData(new int[] { 3, 4 }, new int[] { 4, 6 }, new int[] { 6 })]            // [M,K] × [K,N] + [N]
+    [InlineData(new int[] { 3, 4 }, new int[] { 4, 6 }, new int[] { 1, 6 })]         // [M,K] × [K,N] + [1,N]
+    [InlineData(new int[] { 2, 5, 4 }, new int[] { 4, 6 }, new int[] { 6 })]         // [B,T,K] × [K,N] + [N]
+    [InlineData(new int[] { 2, 5, 4 }, new int[] { 4, 6 }, new int[] { 1, 6 })]      // [B,T,K] × [K,N] + [1,N]
+    [InlineData(new int[] { 2, 5, 4 }, new int[] { 4, 6 }, new int[] { 1, 1, 6 })]   // [B,T,K] × [K,N] + [1,1,N] — both SumToShape branches
+    [InlineData(new int[] { 1, 8, 1 }, new int[] { 1, 24 }, new int[] { 1, 24 })]    // exact #234 repro
     public void BiasShapeVariants_AllReturnCorrectGradShape(int[] inShape, int[] wShape, int[] bShape)
     {
         var rng = new Random(2024);
@@ -183,7 +237,7 @@ public class FusedLinearBiasGradIntegrationTests
         var weights = NewRandomDouble(new[] { 1, 24 }, new Random(6), 0.1);
         var bias = NewRandomDouble(new[] { 1, 24 }, new Random(7), 0.01);
 
-        double[] firstBiasGrad = null!;
+        double[] firstBiasGrad = Array.Empty<double>();
         for (int i = 0; i < 3; i++)
         {
             using var tape = new GradientTape<double>();
@@ -234,5 +288,28 @@ public class FusedLinearBiasGradIntegrationTests
         var p = param.AsWritableSpan();
         var g = grad.AsSpan();
         for (int i = 0; i < p.Length; i++) p[i] -= lr * g[i];
+    }
+
+    /// <summary>
+    /// Asserts at least one element of <paramref name="after"/> differs from
+    /// its initial value in <paramref name="before"/>. Used to confirm a
+    /// parameter actually received an update — a shape-mismatched gradient
+    /// would have thrown before we got here; a zero gradient would leave
+    /// the parameter at its init value and this assertion would fire.
+    /// </summary>
+    private static void AssertMutated(double[] before, ReadOnlySpan<double> after, string label)
+    {
+        Assert.Equal(before.Length, after.Length);
+        for (int i = 0; i < before.Length; i++)
+            if (before[i] != after[i]) return;
+        Assert.Fail($"{label}: no element changed from initial value after training.");
+    }
+
+    private static void AssertMutated(float[] before, ReadOnlySpan<float> after, string label)
+    {
+        Assert.Equal(before.Length, after.Length);
+        for (int i = 0; i < before.Length; i++)
+            if (before[i] != after[i]) return;
+        Assert.Fail($"{label}: no element changed from initial value after training.");
     }
 }

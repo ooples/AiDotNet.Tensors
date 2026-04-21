@@ -14,14 +14,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// regimes, repeat-backward across tapes, and both floating-point
 /// precisions.
 /// </summary>
-public class BatchNorm3DIntegrationTests
+public class BatchNorm3DIntegrationTests : IDisposable
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly bool _previousReplayMode;
 
     public BatchNorm3DIntegrationTests()
     {
+        // Capture AutoTrainingCompiler.ReplayMode so Dispose can restore
+        // the process-wide value; leaving it pinned at false would
+        // shadow replay-mode coverage in any subsequent test class.
+        _previousReplayMode = AutoTrainingCompiler.ReplayMode;
         AutoTrainingCompiler.ReplayMode = false;
     }
+
+    public void Dispose() => AutoTrainingCompiler.ReplayMode = _previousReplayMode;
 
     /// <summary>
     /// Training loop: `[C, H, W] → BatchNorm → ReLU → MSE loss`. Verify
@@ -114,33 +121,46 @@ public class BatchNorm3DIntegrationTests
         var betaData = new double[C];
         for (int i = 0; i < C; i++) betaData[i] = rng.NextDouble() - 0.5;
 
-        // 3D path
+        // 3D path — independent scope.
         var input3 = new Tensor<double>(inputData.AsSpan().ToArray(), new[] { C, H, W });
         var gamma3 = new Tensor<double>((double[])gammaData.Clone(), new[] { C });
         var beta3 = new Tensor<double>((double[])betaData.Clone(), new[] { C });
+        Tensor<double> gInput3, gGamma3, gBeta3;
         using (var tape = new GradientTape<double>())
         {
             var y = _engine.BatchNorm(input3, gamma3, beta3, 1e-5, out _, out _);
             var loss = _engine.ReduceSum(y, null);
             var grads = tape.ComputeGradients(loss, new[] { input3, gamma3, beta3 });
-            var input4 = new Tensor<double>(inputData.AsSpan().ToArray(), new[] { 1, C, H, W });
-            var gamma4 = new Tensor<double>((double[])gammaData.Clone(), new[] { C });
-            var beta4 = new Tensor<double>((double[])betaData.Clone(), new[] { C });
+            gInput3 = grads[input3];
+            gGamma3 = grads[gamma3];
+            gBeta3 = grads[beta3];
+        }
 
-            using var tape4 = new GradientTape<double>();
+        // 4D path — independent scope, separate tape. Reshape-only copy
+        // of the same data [C, H, W] → [1, C, H, W] drives the
+        // established 4D backward kernel.
+        var input4 = new Tensor<double>(inputData.AsSpan().ToArray(), new[] { 1, C, H, W });
+        var gamma4 = new Tensor<double>((double[])gammaData.Clone(), new[] { C });
+        var beta4 = new Tensor<double>((double[])betaData.Clone(), new[] { C });
+        Tensor<double> gInput4, gGamma4, gBeta4;
+        using (var tape4 = new GradientTape<double>())
+        {
             var y4 = _engine.BatchNorm(input4, gamma4, beta4, 1e-5, out _, out _);
             var loss4 = _engine.ReduceSum(y4, null);
             var grads4 = tape4.ComputeGradients(loss4, new[] { input4, gamma4, beta4 });
-
-            // γ + β grads (same shape, direct compare).
-            AssertClose(grads[gamma3].AsSpan(), grads4[gamma4].AsSpan(), "gamma", 1e-9);
-            AssertClose(grads[beta3].AsSpan(), grads4[beta4].AsSpan(), "beta", 1e-9);
-
-            // Input grads: 3D is [C, H, W], 4D is [1, C, H, W]. Same
-            // underlying element count, element-by-element should match.
-            Assert.Equal(grads[input3].Length, grads4[input4].Length);
-            AssertClose(grads[input3].AsSpan(), grads4[input4].AsSpan(), "input", 1e-9);
+            gInput4 = grads4[input4];
+            gGamma4 = grads4[gamma4];
+            gBeta4 = grads4[beta4];
         }
+
+        // γ + β grads: same shape, direct compare.
+        AssertClose(gGamma3.AsSpan(), gGamma4.AsSpan(), "gamma", 1e-9);
+        AssertClose(gBeta3.AsSpan(), gBeta4.AsSpan(), "beta", 1e-9);
+
+        // Input grads: 3D is [C, H, W], 4D is [1, C, H, W]. Same underlying
+        // element count; element-by-element should match within FP tolerance.
+        Assert.Equal(gInput3.Length, gInput4.Length);
+        AssertClose(gInput3.AsSpan(), gInput4.AsSpan(), "input", 1e-9);
     }
 
     /// <summary>
@@ -155,7 +175,9 @@ public class BatchNorm3DIntegrationTests
         var gamma = NewRandomDouble(new[] { 2 }, new Random(12), 1.0);
         var beta = NewRandomDouble(new[] { 2 }, new Random(13), 0.5);
 
-        double[] firstInputGrad = null!, firstGammaGrad = null!, firstBetaGrad = null!;
+        double[] firstInputGrad = Array.Empty<double>();
+        double[] firstGammaGrad = Array.Empty<double>();
+        double[] firstBetaGrad = Array.Empty<double>();
         for (int i = 0; i < 3; i++)
         {
             using var tape = new GradientTape<double>();
