@@ -8526,6 +8526,91 @@ public interface IEngine
     Tensor<T> TensorCTCLoss<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths, int[] targetLengths, int blank = 0);
 
     #endregion
+
+    #region Vision Detection (NMS, BoxIoU, BoxConvert, MasksToBoxes — Issue #217)
+
+    /// <summary>
+    /// Converts bounding boxes between encodings.
+    /// Input shape <c>[..., 4]</c>; the last axis encodes the four box
+    /// values per the requested formats.
+    /// </summary>
+    /// <param name="boxes">Boxes in <paramref name="from"/> format.</param>
+    /// <param name="from">Source box format.</param>
+    /// <param name="to">Destination box format.</param>
+    /// <returns>Boxes in <paramref name="to"/> format with the same shape.</returns>
+    Tensor<T> BoxConvert<T>(Tensor<T> boxes, BoxFormat from, BoxFormat to);
+
+    /// <summary>
+    /// Computes the area of each box. Input <c>[..., 4]</c> in
+    /// <see cref="BoxFormat.XYXY"/>; output <c>[...]</c>. Boxes with
+    /// <c>x2 &lt; x1</c> or <c>y2 &lt; y1</c> get area 0 (no negative
+    /// areas), matching torchvision's <c>box_area</c>.
+    /// </summary>
+    Tensor<T> BoxArea<T>(Tensor<T> boxes);
+
+    /// <summary>
+    /// Pairwise intersection-over-union between two box sets, both in
+    /// <see cref="BoxFormat.XYXY"/>.
+    /// Inputs <c>[N, 4]</c> and <c>[M, 4]</c>; output <c>[N, M]</c>.
+    /// IoU is 0 wherever the union is 0. Differentiable.
+    /// </summary>
+    Tensor<T> BoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Generalized IoU (Rezatofighi et al. 2019). Same input/output
+    /// shapes as <see cref="BoxIou{T}"/>; returns IoU − (|enclose − union|)
+    /// / |enclose|, in <c>(−1, 1]</c>. Differentiable.
+    /// </summary>
+    Tensor<T> GeneralizedBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Distance IoU (Zheng et al. 2020). IoU minus the squared centre
+    /// distance normalised by the enclosing box's diagonal.
+    /// Differentiable.
+    /// </summary>
+    Tensor<T> DistanceBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Complete IoU (Zheng et al. 2020). DIoU plus an aspect-ratio
+    /// consistency penalty α·v. Differentiable.
+    /// </summary>
+    Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Greedy non-maximum suppression. Sorts boxes by score (descending)
+    /// then iteratively keeps the top-scoring box and discards every
+    /// remaining box whose IoU with the kept box is &gt; <paramref name="iouThreshold"/>.
+    /// Returns the indices of kept boxes (into the original input order),
+    /// in score-descending order.
+    /// </summary>
+    /// <param name="boxes">Boxes <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>.</param>
+    /// <param name="scores">Per-box scores <c>[N]</c>.</param>
+    /// <param name="iouThreshold">IoU above which a lower-scoring box is suppressed.</param>
+    Tensor<int> Nms<T>(Tensor<T> boxes, Tensor<T> scores, double iouThreshold);
+
+    /// <summary>
+    /// Per-class NMS via the torchvision trick of offsetting each class's
+    /// boxes into a disjoint coordinate strip, so a single global NMS
+    /// only suppresses boxes within the same class. Returns kept indices
+    /// in score-descending order.
+    /// </summary>
+    /// <param name="boxes">Boxes <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>.</param>
+    /// <param name="scores">Per-box scores <c>[N]</c>.</param>
+    /// <param name="classIds">Per-box class id <c>[N]</c>; boxes with the same
+    /// id compete against each other only.</param>
+    /// <param name="iouThreshold">IoU above which a lower-scoring box is suppressed.</param>
+    Tensor<int> BatchedNms<T>(Tensor<T> boxes, Tensor<T> scores, Tensor<int> classIds, double iouThreshold);
+
+    /// <summary>
+    /// Computes the tight axis-aligned bounding box of each foreground
+    /// region in a stack of binary masks. Input <c>[N, H, W]</c>;
+    /// output <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>. Empty masks
+    /// (all zero) get <c>[0, 0, 0, 0]</c>, matching
+    /// torchvision's <c>masks_to_boxes</c>.
+    /// </summary>
+    Tensor<T> MasksToBoxes<T>(Tensor<T> masks);
+
+    #endregion
 }
 
 /// <summary>
