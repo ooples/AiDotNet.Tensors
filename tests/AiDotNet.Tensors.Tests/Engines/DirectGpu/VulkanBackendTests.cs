@@ -21,6 +21,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// - Edge cases and boundary conditions
 /// - Thread safety
 /// </summary>
+[Collection("VulkanGlobalState")]
 public class VulkanBackendTests : IDisposable
 {
     private readonly bool _isVulkanAvailable;

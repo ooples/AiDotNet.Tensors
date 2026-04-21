@@ -259,16 +259,24 @@ public class BatchNorm3DIntegrationTests : IDisposable
 
     private static void AssertAllFinite(ReadOnlySpan<double> span, string label)
     {
+        // double.IsFinite is .NET Core 2.1+ — net471 ships only IsNaN/IsInfinity,
+        // so spell it out the long way for cross-TFM compatibility.
         for (int i = 0; i < span.Length; i++)
-            Assert.True(double.IsFinite(span[i]),
-                $"{label}: non-finite at [{i}] = {span[i]}");
+        {
+            double v = span[i];
+            Assert.True(!double.IsNaN(v) && !double.IsInfinity(v),
+                $"{label}: non-finite at [{i}] = {v}");
+        }
     }
 
     private static void AssertAllFinite(ReadOnlySpan<float> span, string label)
     {
         for (int i = 0; i < span.Length; i++)
-            Assert.True(float.IsFinite(span[i]),
-                $"{label}: non-finite at [{i}] = {span[i]}");
+        {
+            float v = span[i];
+            Assert.True(!float.IsNaN(v) && !float.IsInfinity(v),
+                $"{label}: non-finite at [{i}] = {v}");
+        }
     }
 
     private static void AssertClose(ReadOnlySpan<double> expected, ReadOnlySpan<double> actual, string label, double tol)
