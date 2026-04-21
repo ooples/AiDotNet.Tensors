@@ -3420,8 +3420,61 @@ internal static class BackwardFunctions<T>
 
         if (inputs.Length > 2)
         {
-            var biasGrad = engine.ReduceSum(gradOutput, new[] { 0 }, keepDims: false);
-            DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
+            var bias = inputs[2];
+            // PyTorch parity: dL/dbias = grad_output.sum_to_size(bias.shape).
+            // The previous implementation reduced only axis 0, which is correct
+            // when gradOutput is rank-2 [batch, features] but leaves the time
+            // axis intact for rank-3 [batch, seq, features] — bias-grad came
+            // out as [seq, features] instead of [features], crashing the next
+            // optimizer step on a shape-mismatched TensorAdd. (#234)
+            //
+            // Sum every leading axis of gradOutput that bias does NOT have a
+            // matching size for. Bias may be declared as [F], [1, F], or
+            // [1, 1, …, F] (the LagLlama / MOIRAI pattern); in all those
+            // shapes the trailing F is the feature axis and every preceding
+            // dim (whether explicitly 1 or implicit by lower rank) collapses.
+            int outRank = gradOutput.Rank;
+            int biasRank = bias.Rank;
+            // axesToReduce = leading axes of gradOutput that bias doesn't
+            // align with, plus any leading axes of bias that are size-1.
+            // Equivalently: we want the result reduced down to bias's shape.
+            // First: reduce gradOutput over the leading (outRank - biasRank)
+            // axes so the result has bias.Rank.
+            Tensor<T> biasGrad = gradOutput;
+            int leadingExtra = outRank - biasRank;
+            if (leadingExtra > 0)
+            {
+                var leadingAxes = new int[leadingExtra];
+                for (int i = 0; i < leadingExtra; i++) leadingAxes[i] = i;
+                biasGrad = engine.ReduceSum(biasGrad, leadingAxes, keepDims: false);
+            }
+            // Then: reduce any axis where bias is size-1 but biasGrad isn't
+            // (the size-1 axes of bias broadcast across the corresponding
+            // axes of gradOutput).
+            for (int axis = 0; axis < bias.Rank; axis++)
+            {
+                if (bias._shape[axis] == 1 && axis < biasGrad.Rank && biasGrad._shape[axis] != 1)
+                {
+                    biasGrad = engine.ReduceSum(biasGrad, new[] { axis }, keepDims: true);
+                }
+            }
+            // Final shape may differ from bias._shape only when biasGrad
+            // emerged with rank < bias.Rank (e.g. bias [1, F] but
+            // accumulated reduction left [F]). Reshape so the downstream
+            // accumulator's shape check passes.
+            if (!ShapesEqualLocal(biasGrad._shape, bias._shape) && biasGrad.Length == bias.Length)
+            {
+                biasGrad = engine.Reshape(biasGrad, bias._shape);
+            }
+            DifferentiableOps.AccumulateGrad(grads, bias, biasGrad, engine);
+
+            static bool ShapesEqualLocal(int[] a, int[] b)
+            {
+                if (a.Length != b.Length) return false;
+                for (int i = 0; i < a.Length; i++)
+                    if (a[i] != b[i]) return false;
+                return true;
+            }
         }
     }
 
