@@ -148,4 +148,36 @@ public class FusedLinearRank3BiasGradTests
 
         Assert.Equal(new[] { 1, 24 }, grads[bias]._shape);
     }
+
+    /// <summary>
+    /// Bias declared with two leading 1s ([1, 1, F]). Our SumToShape
+    /// helper reduces every leading axis the target doesn't have and
+    /// every target axis that's size-1 where the gradient isn't — this
+    /// case exercises both branches. If the helper stopped after the
+    /// rank match, bias-grad would come out as [8, 24] instead of
+    /// [1, 1, 24] and the optimizer TensorAdd would throw.
+    /// </summary>
+    [Fact]
+    public void FusedLinearBackward_Rank3Double_BiasWithTwoLeadingOnes_PreservesShape()
+    {
+        var input = new Tensor<double>(new[] { 2, 8, 24 });
+        var weights = new Tensor<double>(new[] { 24, 24 });
+        var bias = new Tensor<double>(new[] { 1, 1, 24 });
+
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = 0.25;
+        for (int i = 0; i < weights.Length; i++) weights.AsWritableSpan()[i] = 0.1;
+
+        using var tape = new GradientTape<double>();
+        var y = _engine.FusedLinear(input, weights, bias, FusedActivationType.None);
+        var loss = _engine.ReduceSum(y, null);
+        var grads = tape.ComputeGradients(loss, new[] { input, weights, bias });
+
+        Assert.Equal(new[] { 1, 1, 24 }, grads[bias]._shape);
+
+        // Value check: dL/dbias[0,0,f] = B · T = 16.
+        var bSpan = grads[bias].AsSpan();
+        for (int i = 0; i < bSpan.Length; i++)
+            Assert.True(Math.Abs(bSpan[i] - 16.0) < 1e-9,
+                $"bias-grad[0,0,{i}] = {bSpan[i]}, expected 16");
+    }
 }
