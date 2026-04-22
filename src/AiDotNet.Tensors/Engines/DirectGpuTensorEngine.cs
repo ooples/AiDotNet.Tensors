@@ -12407,27 +12407,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
-        // Issue #226 fix: buffers that flow through FinishGpuOp MUST NOT be
-        // `using`-scoped. FinishGpuOp defers materialization by registering a
-        // callback that closes over the GPU buffer; if the caller `using`-
-        // disposes the OwnedBuffer at try-scope exit, the closure's
-        // DownloadBuffer call later fires on a freed handle and raises
-        // cuMemcpyDtoH Invalid value. Mirror the TryRunUnary pattern:
-        // plain var for FinishGpuOp-bound buffers, dispose only on the
-        // exception path.
-        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-        var bufOut = AllocateOutputBuffer(backend, input.Length);
-        using var bufRunMean = AllocateOutputBuffer(backend, input.Shape._dims[1]);
-        using var bufRunVar = AllocateOutputBuffer(backend, input.Shape._dims[1]);
-        var bufSaveMean = AllocateOutputBuffer(backend, input.Shape._dims[1]);
-        var bufSaveInvVar = AllocateOutputBuffer(backend, input.Shape._dims[1]);
+        // Issue #226 fix + leak-on-partial-alloc fix: buffers flowing
+        // through FinishGpuOp MUST NOT be `using`-scoped (FinishGpuOp's
+        // deferred-download closure captures them; a sync `using` Dispose
+        // would free the GPU handle before MaterializeIfDeferred fires).
+        // BUT a plain `var` allocation that runs BEFORE the cleanup `try`
+        // would leak if a LATER allocation throws — none of the partial
+        // state ever reaches catch. Allocate the FinishGpuOp-bound buffers
+        // inside the try as `default(OwnedBuffer)` slots, then dispose
+        // them in catch only when ownership wasn't successfully handed
+        // off to FinishGpuOp. The `using var` inputs/intermediates self-
+        // dispose on stack unwind regardless of where the throw lands.
+        var bufOut = default(OwnedBuffer);
+        var bufSaveMean = default(OwnedBuffer);
+        var bufSaveInvVar = default(OwnedBuffer);
+        bool ownershipTransferred = false;
         try
         {
             int batch = input.Shape._dims[0];
             int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
+            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, input.Length);
+            using var bufRunMean = AllocateOutputBuffer(backend, channels);
+            using var bufRunVar = AllocateOutputBuffer(backend, channels);
+            bufSaveMean = AllocateOutputBuffer(backend, channels);
+            bufSaveInvVar = AllocateOutputBuffer(backend, channels);
             backend.Fill(bufRunMean.Buffer, 0f, channels);
             backend.Fill(bufRunVar.Buffer, 1f, channels);
             backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
@@ -12436,16 +12443,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufSaveMean, channels), new[] { channels });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufSaveInvVar, channels), new[] { channels });
+            ownershipTransferred = true;
             return new Tensor<T>(result, input.Shape._dims);
         }
         catch (Exception)
         {
-            // FinishGpuOp-bound buffers weren't disposed at scope exit (on
-            // purpose — see comment above). Dispose them here on the
-            // exception path so we don't leak on fallback.
-            bufOut.Dispose();
-            bufSaveMean.Dispose();
-            bufSaveInvVar.Dispose();
+            if (!ownershipTransferred)
+            {
+                bufOut.Dispose();
+                bufSaveMean.Dispose();
+                bufSaveInvVar.Dispose();
+            }
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12455,28 +12463,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
-        int outerSize = input.Shape._dims[0];
-        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-
-        // scoped (see BatchNorm above for the full rationale).
-        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-        var bufOut = AllocateOutputBuffer(backend, input.Length);
-        var bufMean = AllocateOutputBuffer(backend, outerSize);
-        var bufVar = AllocateOutputBuffer(backend, outerSize);
+        // Issue #226 + leak-on-partial-alloc fix — see BatchNorm above for
+        // the full rationale on the default(OwnedBuffer) + ownership-flag
+        // pattern.
+        var bufOut = default(OwnedBuffer);
+        var bufMean = default(OwnedBuffer);
+        var bufVar = default(OwnedBuffer);
+        bool ownershipTransferred = false;
         try
         {
+            int outerSize = input.Shape._dims[0];
             int normSize = input.Length / outerSize;
+            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, input.Length);
+            bufMean = AllocateOutputBuffer(backend, outerSize);
+            bufVar = AllocateOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufMean, outerSize), new[] { outerSize });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufVar, outerSize), new[] { outerSize });
+            ownershipTransferred = true;
             return new Tensor<T>(result, input.Shape._dims);
         }
         catch (Exception)
         {
-            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            if (!ownershipTransferred)
+            {
+                bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            }
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12486,28 +12503,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
-        int batch = input.Shape._dims[0];
-        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
-        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-        var bufOut = AllocateOutputBuffer(backend, input.Length);
-        var bufMean = AllocateOutputBuffer(backend, batch * numGroups);
-        var bufVar = AllocateOutputBuffer(backend, batch * numGroups);
+        // Issue #226 + leak-on-partial-alloc fix — see BatchNorm above.
+        var bufOut = default(OwnedBuffer);
+        var bufMean = default(OwnedBuffer);
+        var bufVar = default(OwnedBuffer);
+        bool ownershipTransferred = false;
         try
         {
+            int batch = input.Shape._dims[0];
             int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
+            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, input.Length);
+            bufMean = AllocateOutputBuffer(backend, batch * numGroups);
+            bufVar = AllocateOutputBuffer(backend, batch * numGroups);
             backend.GroupNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, numGroups, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufMean, batch * numGroups), new[] { batch, numGroups });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufVar, batch * numGroups), new[] { batch, numGroups });
+            ownershipTransferred = true;
             return new Tensor<T>(result, input.Shape._dims);
         }
         catch (Exception)
         {
-            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            if (!ownershipTransferred)
+            {
+                bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            }
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12517,28 +12542,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
-        int batch = input.Shape._dims[0];
-        int channels = input.Shape._dims[1];
-        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
-        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-        var bufOut = AllocateOutputBuffer(backend, input.Length);
-        var bufMean = AllocateOutputBuffer(backend, batch * channels);
-        var bufVar = AllocateOutputBuffer(backend, batch * channels);
+        // Issue #226 + leak-on-partial-alloc fix — see BatchNorm above.
+        var bufOut = default(OwnedBuffer);
+        var bufMean = default(OwnedBuffer);
+        var bufVar = default(OwnedBuffer);
+        bool ownershipTransferred = false;
         try
         {
+            int batch = input.Shape._dims[0];
+            int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
+            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, input.Length);
+            bufMean = AllocateOutputBuffer(backend, batch * channels);
+            bufVar = AllocateOutputBuffer(backend, batch * channels);
             backend.InstanceNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufMean, batch * channels), new[] { batch, channels });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufVar, batch * channels), new[] { batch, channels });
+            ownershipTransferred = true;
             return new Tensor<T>(result, input.Shape._dims);
         }
         catch (Exception)
         {
-            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            if (!ownershipTransferred)
+            {
+                bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            }
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12548,24 +12581,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
-        int outerSize = input.Shape._dims[0];
-        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
-        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-        var bufOut = AllocateOutputBuffer(backend, input.Length);
-        var bufRms = AllocateOutputBuffer(backend, outerSize);
+        // Issue #226 + leak-on-partial-alloc fix — see BatchNorm above.
+        var bufOut = default(OwnedBuffer);
+        var bufRms = default(OwnedBuffer);
+        bool ownershipTransferred = false;
         try
         {
+            int outerSize = input.Shape._dims[0];
             int normSize = input.Length / outerSize;
+            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, input.Length);
+            bufRms = AllocateOutputBuffer(backend, outerSize);
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             rms = new Tensor<T>(FinishGpuOp<T>(backend, bufRms, outerSize), new[] { outerSize });
+            ownershipTransferred = true;
             return new Tensor<T>(result, input.Shape._dims);
         }
         catch (Exception)
         {
-            bufOut.Dispose(); bufRms.Dispose();
+            if (!ownershipTransferred)
+            {
+                bufOut.Dispose(); bufRms.Dispose();
+            }
             return base.RMSNorm(input, gamma, epsilon, out rms);
         }
     }
