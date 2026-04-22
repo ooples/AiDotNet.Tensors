@@ -8788,6 +8788,24 @@ public interface IEngine
     Tensor<T> TimeStretch<T>(Tensor<T> waveform, double rate,
         int nFft = 512, int hopLength = 128);
 
+    /// <summary>
+    /// Decode an encoded image byte blob into an HWC <c>Tensor&lt;byte&gt;</c>.
+    /// <para><paramref name="encoded"/> is the raw file/stream bytes.
+    /// <paramref name="format"/> may be <c>null</c> for auto-detection by
+    /// magic bytes (PNG / JPEG / WebP).</para>
+    /// <para>Output shape: <c>[H, W, channels]</c>. channels = 1 (grey),
+    /// 3 (RGB), or 4 (RGBA) — depending on source.</para>
+    /// </summary>
+    Tensor<byte> ImageDecode(byte[] encoded, ImageFormat? format = null);
+
+    /// <summary>
+    /// Encode an HWC <c>Tensor&lt;byte&gt;</c> into a byte blob.
+    /// <paramref name="image"/> shape <c>[H, W, channels]</c>; channels
+    /// 1 / 3 / 4. <paramref name="quality"/> (0-100) applies only to
+    /// lossy formats (JPEG, WebP).
+    /// </summary>
+    byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90);
+
     #endregion
 }
 
