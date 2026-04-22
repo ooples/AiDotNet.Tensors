@@ -889,27 +889,6 @@ public abstract class TensorBase<T> : IDisposable
         return _storage.GetDataArray();
     }
 
-    /// <summary>
-    /// Gets the BACKING storage array without triggering lazy realization
-    /// and without ever returning a copy. Returns <c>null</c> when the
-    /// tensor's layout is not a simple contiguous-at-offset-0-whose-storage-
-    /// length-matches-logical-length view of its backing storage — in which
-    /// case callers that need a live pin must skip their specialization and
-    /// fall back to the general AsSpan-based path. Live callers (the
-    /// TryBuildSpecializedForward pinners) use this to avoid the Realize-
-    /// triggered-during-compile cascade that bakes placeholder=0 data into
-    /// every upstream IsRealized node (issue surfaced by BERT-SQuAD × 100
-    /// sample replay: first execute correct, subsequent executes returned
-    /// the first execute's output verbatim because some specialization
-    /// pinned a ToArray snapshot taken during compile-time realize).
-    /// </summary>
-    internal T[]? GetLiveBackingArrayOrNull()
-    {
-        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
-            return null;
-        return _storage.GetDataArray();
-    }
-
     // ================================================================
     // Clone and Transform
     // ================================================================
