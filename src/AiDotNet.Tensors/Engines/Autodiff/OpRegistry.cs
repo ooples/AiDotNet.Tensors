@@ -165,6 +165,11 @@ internal static class OpRegistry
         "TensorConstantPad",
         "TensorCosineSimilarityLoss",
         "TensorUpsampleBilinear",
+
+        // Vision Detection IoU family (Issue #217) — record through
+        // DifferentiableOps.RecordBinary inside each CpuEngine.Detection.cs
+        // method; backward is in BackwardFunctions<T>.*IouBackward.
+        "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
     };
 
     /// <summary>
@@ -312,6 +317,32 @@ internal static class OpRegistry
         "BoxConvert", "BoxArea",
         "Nms", "BatchedNms",
         "MasksToBoxes",
+
+        // Geometry / sampling (Issue #217) — forward only in v1. Backward
+        // for these is a substantial kernel-by-kernel follow-up
+        // (interpolate modes × align_corners × 1D/2D/3D). The existing
+        // GridSample 3-arg overload is already in DifferentiableOps above;
+        // these are the new extended overloads + Interpolate / PadNd /
+        // AffineGrid3D.
+        "Interpolate", "InterpolateByScale", "PadNd", "AffineGrid3D",
+
+        // Vision RoI family (Issue #217 tail) — forward only in v1; backward
+        // for RoIAlign et al. is tracked as a follow-up.
+        "RoIAlign", "RoIPool", "PsRoIAlign", "PsRoIPool",
+
+        // Audio primitives (Issue #217 tail).
+        // - Spectrogram / PitchShift / TimeStretch compose the existing
+        //   differentiable STFT + ISTFT paths, but the compositions
+        //   themselves aren't currently tape-recorded end-to-end.
+        // - AmplitudeToDB / MuLawEncoding / MuLawDecoding / ComputeDeltas /
+        //   Resample are element-wise or small-window kernels without
+        //   wired backward yet.
+        "Spectrogram", "PitchShift", "TimeStretch",
+        "AmplitudeToDB", "MuLawEncoding", "MuLawDecoding",
+        "ComputeDeltas", "Resample",
+
+        // Image codec — byte-level I/O, not meaningfully differentiable.
+        "ImageDecode",
     };
 
     /// <summary>
