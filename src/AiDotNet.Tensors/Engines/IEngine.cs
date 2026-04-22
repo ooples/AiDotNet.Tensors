@@ -8577,6 +8577,36 @@ public interface IEngine
     Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
 
     /// <summary>
+    /// Backward pass for <see cref="BoxIou{T}"/>. Given upstream gradient
+    /// <paramref name="gradOutput"/> <c>[N, M]</c> and the forward inputs
+    /// <paramref name="boxesA"/> <c>[N, 4]</c>, <paramref name="boxesB"/>
+    /// <c>[M, 4]</c>, returns gradients with respect to both box sets.
+    /// The tie subgradient at max/min kinks is 0 (torchvision convention).
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) BoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="GeneralizedBoxIou{T}"/>.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) GeneralizedBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="DistanceBoxIou{T}"/>.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) DistanceBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="CompleteBoxIou{T}"/>. Follows
+    /// Zheng et al. 2020 in treating α as a constant (stop-gradient) when
+    /// backpropping through the aspect-ratio term.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) CompleteBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
     /// Greedy non-maximum suppression. Sorts boxes by score (descending)
     /// then iteratively keeps the top-scoring box and discards every
     /// remaining box whose IoU with the kept box is &gt; <paramref name="iouThreshold"/>.
@@ -8603,12 +8633,200 @@ public interface IEngine
 
     /// <summary>
     /// Computes the tight axis-aligned bounding box of each foreground
-    /// region in a stack of binary masks. Input <c>[N, H, W]</c>;
-    /// output <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>. Empty masks
-    /// (all zero) get <c>[0, 0, 0, 0]</c>, matching
-    /// torchvision's <c>masks_to_boxes</c>.
+    /// region in a stack of binary masks. Input <c>[N, H, W]</c> — any
+    /// numeric / bool type; foreground = any non-zero element. Output is
+    /// <c>Tensor&lt;int&gt;</c> <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>
+    /// because box coordinates are pixel indices and must have an integer
+    /// range independent of mask storage (a <c>Tensor&lt;byte&gt;</c> mask
+    /// would cap coords at 255; a <c>Tensor&lt;bool&gt;</c> mask has no
+    /// sensible numeric coord type). Empty masks (all zero) get
+    /// <c>[0, 0, 0, 0]</c>, matching torchvision's <c>masks_to_boxes</c>.
     /// </summary>
-    Tensor<T> MasksToBoxes<T>(Tensor<T> masks);
+    Tensor<int> MasksToBoxes<T>(Tensor<T> masks);
+
+    #endregion
+
+    #region Geometry / sampling (Interpolate, Pad, GridSample, AffineGrid — Issue #217)
+
+    /// <summary>
+    /// Resamples an input tensor to the given target spatial sizes.
+    /// <para>Input layout is NCHW-family: <c>[N, C, *]</c> where <c>*</c>
+    /// is 1 (1D), 2 (2D) or 3 (3D) spatial dims.
+    /// <paramref name="sizes"/> gives the target spatial dims only
+    /// (same length as input's spatial rank).</para>
+    /// <para>Matches <c>torch.nn.functional.interpolate(..., size=, mode=,
+    /// align_corners=)</c>. Bicubic / antialias follow torchvision's
+    /// Catmull-Rom convention; area mode averages source pixels covered
+    /// by each output cell (adaptive_avg_pool equivalent).</para>
+    /// </summary>
+    Tensor<T> Interpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners = false);
+
+    /// <summary>
+    /// Same as <see cref="Interpolate{T}"/> but sizes are derived from
+    /// per-spatial-axis <paramref name="scaleFactors"/> — each factor
+    /// multiplies the corresponding input spatial extent, floor to int.
+    /// </summary>
+    Tensor<T> InterpolateByScale<T>(Tensor<T> input, double[] scaleFactors, InterpolateMode mode, bool alignCorners = false);
+
+    /// <summary>
+    /// Pads a tensor along arbitrary trailing axes. Matches
+    /// <c>torch.nn.functional.pad(input, pad, mode, value)</c>.
+    /// <para><paramref name="pad"/> is a flat <c>[before_n, after_n,
+    /// before_{n-1}, after_{n-1}, …]</c> list (PyTorch convention:
+    /// innermost axis first). Its length must be even and ≤ 2 × input rank.</para>
+    /// <para><paramref name="value"/> is only used when
+    /// <paramref name="mode"/> = <see cref="PadMode.Constant"/>.</para>
+    /// </summary>
+    Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!);
+
+    /// <summary>
+    /// Full-featured <c>GridSample</c> overload with explicit mode,
+    /// padding-mode, and <c>align_corners</c>. The legacy 3-arg
+    /// <see cref="GridSample{T}"/> delegates to this one with
+    /// mode=<see cref="GridSampleMode.Bilinear"/>,
+    /// padding=<see cref="GridSamplePadding.Zeros"/>,
+    /// alignCorners=false (torchvision defaults).
+    /// Input is NHWC <c>[N, H, W, C]</c>; grid is <c>[N, outH, outW, 2]</c>.
+    /// </summary>
+    Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
+    /// Extended <c>GridSample</c> backward with explicit mode / padding /
+    /// align-corners, matching the forward overload above. Non-default
+    /// (mode != Bilinear, padding != Zeros, alignCorners == true) paths
+    /// currently delegate through the managed CpuEngine implementation —
+    /// specialised GPU backward kernels for each mode × padding variant
+    /// are tracked as a follow-up.
+    /// </summary>
+    Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
+    /// Extended <c>GridSample</c> backward w.r.t. grid, symmetric to
+    /// <see cref="GridSampleBackwardInput{T}(Tensor{T}, Tensor{T}, int[], GridSampleMode, GridSamplePadding, bool)"/>.
+    /// </summary>
+    Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
+    /// 3D affine-grid generator. Given an affine matrix
+    /// <paramref name="theta"/> of shape <c>[N, 3, 4]</c>, returns a
+    /// sampling grid of shape <c>[N, outD, outH, outW, 3]</c> in
+    /// <c>[-1, 1]</c> normalised coords. The 2D overload of
+    /// <see cref="AffineGrid{T}"/> covers the common image case.
+    /// </summary>
+    Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false);
+
+    #endregion
+
+    #region Vision RoI + Audio primitives (Issue #217 — tail)
+
+    /// <summary>
+    /// torchvision's <c>roi_align</c>. Input <c>[N, C, H, W]</c>, boxes
+    /// <c>[K, 5]</c> where each row is <c>(batch_idx, x1, y1, x2, y2)</c>
+    /// in image coords (before <paramref name="spatialScale"/>). Output
+    /// <c>[K, C, outH, outW]</c>. <paramref name="samplingRatio"/> ≤ 0 =
+    /// adaptive (ceil(box_size / out_size)).
+    /// <paramref name="aligned"/>=true uses the corrected
+    /// <c>(x + 0.5) · spatialScale - 0.5</c> mapping from torchvision 0.7+.
+    /// </summary>
+    Tensor<T> RoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth,
+        float spatialScale, int samplingRatio, bool aligned);
+
+    /// <summary>
+    /// torchvision's <c>roi_pool</c> — max-pool inside each RoI.
+    /// Signature analogous to <see cref="RoIAlign{T}"/> except no
+    /// sub-pixel sampling (uses integer ROI bounds).
+    /// </summary>
+    Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, float spatialScale);
+
+    /// <summary>
+    /// Position-sensitive RoIAlign (R-FCN). Input
+    /// <c>[N, outH·outW·Cout, H, W]</c> where each
+    /// <c>outH·outW</c> slice holds a position-specific score map.
+    /// Output <c>[K, Cout, outH, outW]</c>.
+    /// </summary>
+    Tensor<T> PsRoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale, int samplingRatio);
+
+    /// <summary>Position-sensitive RoI-pool (R-FCN).</summary>
+    Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale);
+
+    /// <summary>Magnitude spectrogram |STFT(x)|. Thin wrapper over STFT
+    /// that returns only the magnitude half.</summary>
+    Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
+
+    /// <summary>
+    /// Convert amplitude to dB: <c>20 · log10(max(x, minAmplitude))</c>.
+    /// Matches torchaudio's <c>AmplitudeToDB</c> with
+    /// <c>stype='amplitude'</c>. For power input, scale the output by 0.5.
+    /// </summary>
+    Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null);
+
+    /// <summary>μ-law companding encoder (ITU-T G.711 / torchaudio).
+    /// Maps <c>[-1, 1]</c> floats to <c>[0, μ]</c> integer codes — the
+    /// encoded domain is explicitly <c>Tensor&lt;int&gt;</c> so downstream
+    /// callers can't accidentally feed analog floats where codes are expected.</summary>
+    Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256);
+
+    /// <summary>μ-law companding decoder — accepts the integer codes
+    /// produced by <see cref="MuLawEncoding{T}"/> and returns analog values
+    /// of type <c>T</c> in <c>[-1, 1]</c>.</summary>
+    Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256);
+
+    /// <summary>
+    /// Time-axis derivative for audio feature stacks. Matches torchaudio's
+    /// <c>compute_deltas</c>: Savitzky-Golay style filter over a
+    /// <c>winLength</c> window along the time axis (last axis).
+    /// </summary>
+    Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5);
+
+    /// <summary>
+    /// Polyphase resampler. Reduces to a rational ratio
+    /// <c>newRate / origRate</c> and applies an FIR polyphase filter.
+    /// Simplified low-pass used — for production use a windowed sinc.
+    /// </summary>
+    Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate);
+
+    /// <summary>
+    /// Pitch shift by <paramref name="nSteps"/> semitones via phase
+    /// vocoder on the existing STFT. Composes STFT → phase-rate
+    /// modification → ISTFT → resample.
+    /// </summary>
+    Tensor<T> PitchShift<T>(Tensor<T> waveform, int sampleRate, double nSteps,
+        int nFft = 512, int hopLength = 128);
+
+    /// <summary>
+    /// Time-stretch by <paramref name="rate"/> via phase vocoder.
+    /// <c>rate &gt; 1</c> speeds up, <c>rate &lt; 1</c> slows down;
+    /// pitch is preserved.
+    /// </summary>
+    Tensor<T> TimeStretch<T>(Tensor<T> waveform, double rate,
+        int nFft = 512, int hopLength = 128);
+
+    /// <summary>
+    /// Decode an encoded image byte blob into an HWC <c>Tensor&lt;byte&gt;</c>.
+    /// <para><paramref name="encoded"/> is the raw file/stream bytes.
+    /// <paramref name="format"/> may be <c>null</c> for auto-detection by
+    /// magic bytes (PNG / JPEG / WebP).</para>
+    /// <para>Output shape: <c>[H, W, channels]</c>. channels = 1 (grey),
+    /// 3 (RGB), or 4 (RGBA) — depending on source.</para>
+    /// </summary>
+    Tensor<byte> ImageDecode(byte[] encoded, ImageFormat? format = null);
+
+    /// <summary>
+    /// Encode an HWC <c>Tensor&lt;byte&gt;</c> into a byte blob.
+    /// <paramref name="image"/> shape <c>[H, W, channels]</c>; channels
+    /// 1 / 3 / 4. <paramref name="quality"/> (0-100) applies only to
+    /// lossy formats (JPEG, WebP).
+    /// </summary>
+    byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90);
 
     #endregion
 }

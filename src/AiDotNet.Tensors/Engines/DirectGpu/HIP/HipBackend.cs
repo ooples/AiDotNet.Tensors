@@ -84,6 +84,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _complexModule;
     private IntPtr _parity210Module;
     private IntPtr _linalgModule;
+    private IntPtr _detectionModule;
+    private IntPtr _geometryModule;
+    private IntPtr _roiModule;
+    private IntPtr _audioModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -549,6 +553,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _linalgModule = IntPtr.Zero;
+            }
+
+            // Vision detection kernels (#217). IDetectionBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipDetectionKernels.GetSource(), "detection",
+                    ref _detectionModule, Kernels.HipDetectionKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP detection kernel compilation failed: {ex.Message}");
+                _detectionModule = IntPtr.Zero;
+            }
+
+            // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipGeometryKernels.GetSource(), "geometry",
+                    ref _geometryModule, Kernels.HipGeometryKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP geometry kernel compilation failed: {ex.Message}");
+                _geometryModule = IntPtr.Zero;
+            }
+
+            // RoI family (#217 tail). IRoiBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipRoiKernels.GetSource(), "roi",
+                    ref _roiModule, Kernels.HipRoiKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP RoI kernel compilation failed: {ex.Message}");
+                _roiModule = IntPtr.Zero;
+            }
+
+            // Audio primitives (#217 tail). IAudioBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipAudioKernels.GetSource(), "audio",
+                    ref _audioModule, Kernels.HipAudioKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP audio kernel compilation failed: {ex.Message}");
+                _audioModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
@@ -10148,6 +10200,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             HipNativeBindings.hipModuleUnload(_linalgModule);
             _linalgModule = IntPtr.Zero;
         }
+
+        // Unload the Issue #217 kernel modules (detection / geometry / roi / audio).
+        foreach (var modRef in new[] { _detectionModule, _geometryModule, _roiModule, _audioModule })
+        {
+            if (modRef != IntPtr.Zero)
+                HipNativeBindings.hipModuleUnload(modRef);
+        }
+        _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
 
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })

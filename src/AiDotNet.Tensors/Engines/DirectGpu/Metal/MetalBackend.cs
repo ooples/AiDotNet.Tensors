@@ -59,6 +59,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _parity210Library;
     private IntPtr _linalgLibrary;
     private IntPtr _fftLibrary;
+    private IntPtr _detectionLibrary;
+    private IntPtr _geometryLibrary;
+    private IntPtr _roiLibrary;
+    private IntPtr _audioLibrary;
 
     #region Properties
 
@@ -244,6 +248,52 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal Linalg pre-compilation warning: {ex.Message}");
             _linalgLibrary = IntPtr.Zero;
+        }
+
+        // Vision detection kernels (#217). IDetectionBackend dispatch.
+        try
+        {
+            _detectionLibrary = _shaderLibrary.CompileLibrary("Detection",
+                MetalDetectionKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Detection pre-compilation warning: {ex.Message}");
+            _detectionLibrary = IntPtr.Zero;
+        }
+
+        // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
+        try
+        {
+            _geometryLibrary = _shaderLibrary.CompileLibrary("Geometry",
+                MetalGeometryKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Geometry pre-compilation warning: {ex.Message}");
+            _geometryLibrary = IntPtr.Zero;
+        }
+
+        // RoI family (#217 tail). IRoiBackend dispatch.
+        try
+        {
+            _roiLibrary = _shaderLibrary.CompileLibrary("Roi", MetalRoiKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal RoI pre-compilation warning: {ex.Message}");
+            _roiLibrary = IntPtr.Zero;
+        }
+
+        // Audio primitives (#217 tail). IAudioBackend dispatch.
+        try
+        {
+            _audioLibrary = _shaderLibrary.CompileLibrary("Audio", MetalAudioKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Audio pre-compilation warning: {ex.Message}");
+            _audioLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external

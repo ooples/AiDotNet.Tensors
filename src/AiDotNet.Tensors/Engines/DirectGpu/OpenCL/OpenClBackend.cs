@@ -583,6 +583,73 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL Parity-210 compilation failed: {ex.Message}");
                 }
 
+                // Compile Vision-Detection kernels (Issue #217). Optional —
+                // same fallback pattern as Parity-210: on compile failure
+                // the kernels are simply absent from _kernelCache, the
+                // IDetectionBackend implementation throws on call, and
+                // DirectGpuTensorEngine catches that and falls through to
+                // the CpuEngine path.
+                try
+                {
+                    var detectionProgram = CompileOrLoadCached(OpenClDetectionKernels.GetSource(), optimizationFlags, "Detection kernels");
+                    // Commit program + kernels together so a partial failure
+                    // doesn't leave _kernelCache in a half-populated state.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClDetectionKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, detectionProgram, name)));
+                    _programs.Add(detectionProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Detection compilation failed: {ex.Message}");
+                }
+
+                // Compile Geometry / sampling kernels (Issue #217 second half).
+                try
+                {
+                    var geometryProgram = CompileOrLoadCached(OpenClGeometryKernels.GetSource(), optimizationFlags, "Geometry kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClGeometryKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, geometryProgram, name)));
+                    _programs.Add(geometryProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Geometry compilation failed: {ex.Message}");
+                }
+
+                // Compile RoI kernels (Issue #217 tail).
+                try
+                {
+                    var roiProgram = CompileOrLoadCached(OpenClRoiKernels.GetSource(), optimizationFlags, "RoI kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClRoiKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, roiProgram, name)));
+                    _programs.Add(roiProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL RoI compilation failed: {ex.Message}");
+                }
+
+                // Compile audio kernels (Issue #217 tail).
+                try
+                {
+                    var audioProgram = CompileOrLoadCached(OpenClAudioKernels.GetSource(), optimizationFlags, "Audio kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClAudioKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, audioProgram, name)));
+                    _programs.Add(audioProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Audio compilation failed: {ex.Message}");
+                }
+
                 // Linalg decomposition kernels (#211 moat #2). Compilation
                 // failure flips _linalgAvailable=false and surfaces via
                 // <see cref="LinalgAvailable"/> so callers can route to CPU

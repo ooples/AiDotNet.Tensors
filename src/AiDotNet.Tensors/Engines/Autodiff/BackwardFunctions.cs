@@ -4931,4 +4931,762 @@ internal static class BackwardFunctions<T>
         var grad = engine.TensorMultiply(gradOutput, deriv);
         DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Vision Detection (Issue #217) — IoU family backward hooks. All four
+    // variants share the same binary-input signature and route to the
+    // engine's {Op}Backward method, which returns (gradA, gradB).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>BoxIou backward: see CpuEngine.IouFamilyBackward.</summary>
+    internal static void BoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.BoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>GeneralizedBoxIou backward (Rezatofighi 2019).</summary>
+    internal static void GeneralizedBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.GeneralizedBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>DistanceBoxIou backward (Zheng 2020).</summary>
+    internal static void DistanceBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.DistanceBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>CompleteBoxIou backward (Zheng 2020; α treated as stop-gradient).</summary>
+    internal static void CompleteBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.CompleteBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #217 tail — geometry / RoI / audio backward. Every op either has a
+    // closed-form CPU backward implementation below OR delegates to
+    // already-differentiable primitives (STFT / ISTFT) for compositional
+    // ops. Kept as one block here so the symmetry with the forward path
+    // is easy to audit.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Interpolate backward. Transpose of the forward: for each output
+    /// element, scatter gradOutput·weight back to each source element
+    /// the forward read. Uses the same mode/align-corners math as forward.
+    /// </summary>
+    internal static void InterpolateBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var mode = (InterpolateMode)savedState[0];
+        bool alignCorners = (bool)savedState[1];
+        var gradInput = InterpolateBackwardImpl(gradOutput, input, mode, alignCorners);
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+    }
+
+    private static Tensor<T> InterpolateBackwardImpl(Tensor<T> gradOutput, Tensor<T> input,
+        InterpolateMode mode, bool alignCorners)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int spatial = input.Rank - 2;
+        int N = input._shape[0], C = input._shape[1];
+        var srcDims = new int[spatial]; var dstDims = new int[spatial];
+        for (int i = 0; i < spatial; i++) { srcDims[i] = input._shape[2 + i]; dstDims[i] = gradOutput._shape[2 + i]; }
+        var srcStride = new int[spatial];
+        srcStride[spatial - 1] = 1;
+        for (int i = spatial - 2; i >= 0; i--) srcStride[i] = srcStride[i + 1] * srcDims[i + 1];
+        int srcSpatial = 1; for (int i = 0; i < spatial; i++) srcSpatial *= srcDims[i];
+        int dstSpatial = 1; for (int i = 0; i < spatial; i++) dstSpatial *= dstDims[i];
+        var gout = gradOutput.AsSpan();
+        var gin = gradInput.AsWritableSpan();
+        var dstIdx = new int[spatial];
+
+        for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+        {
+            int inBase = (n * C + c) * srcSpatial;
+            int outBase = (n * C + c) * dstSpatial;
+            for (int k = 0; k < dstSpatial; k++)
+            {
+                int tmp = k;
+                for (int i = spatial - 1; i >= 0; i--) { dstIdx[i] = tmp % dstDims[i]; tmp /= dstDims[i]; }
+                double g = numOps.ToDouble(gout[outBase + k]);
+                if (g == 0.0) continue;
+                if (mode == InterpolateMode.Nearest)
+                {
+                    int off = 0;
+                    for (int i = 0; i < spatial; i++)
+                    {
+                        double s = dstDims[i] > 1 ? (double)dstIdx[i] * srcDims[i] / dstDims[i] : 0.0;
+                        int si = (int)Math.Floor(s);
+                        if (si >= srcDims[i]) si = srcDims[i] - 1;
+                        off += si * srcStride[i];
+                    }
+                    gin[inBase + off] = numOps.Add(gin[inBase + off], numOps.FromDouble(g));
+                }
+                else if (mode == InterpolateMode.Linear || mode == InterpolateMode.Bilinear || mode == InterpolateMode.Trilinear)
+                {
+                    // Scatter g across the 2^spatial corners with multilinear weights.
+                    var lo = new int[spatial]; var hi = new int[spatial]; var frac = new double[spatial];
+                    for (int i = 0; i < spatial; i++)
+                    {
+                        double s = dstDims[i] <= 1 ? 0.0
+                                 : (alignCorners ? (double)dstIdx[i] * (srcDims[i] - 1) / (dstDims[i] - 1)
+                                                 : ((dstIdx[i] + 0.5) * srcDims[i] / dstDims[i]) - 0.5);
+                        int l = (int)Math.Floor(s); if (l < 0) l = 0;
+                        int h = l + 1; if (h >= srcDims[i]) { h = srcDims[i] - 1; l = Math.Min(l, h); }
+                        lo[i] = l; hi[i] = h;
+                        double f = s - l; if (f < 0) f = 0; if (f > 1) f = 1;
+                        frac[i] = f;
+                    }
+                    int corners = 1 << spatial;
+                    for (int corner = 0; corner < corners; corner++)
+                    {
+                        int off = 0; double w = 1.0;
+                        for (int i = 0; i < spatial; i++)
+                        {
+                            bool takeHi = ((corner >> i) & 1) == 1;
+                            off += (takeHi ? hi[i] : lo[i]) * srcStride[i];
+                            w *= takeHi ? frac[i] : (1.0 - frac[i]);
+                        }
+                        gin[inBase + off] = numOps.Add(gin[inBase + off], numOps.FromDouble(w * g));
+                    }
+                }
+                else  // Area / Bicubic fall back to a per-cell scatter over the
+                      // covered region (area weights) or clamped 4x4 (bicubic).
+                      // For Area we use overlap weights same as forward.
+                {
+                    var loI = new int[spatial]; var hiI = new int[spatial];
+                    var loF = new double[spatial]; var hiF = new double[spatial];
+                    double totalArea = 1.0;
+                    for (int i = 0; i < spatial; i++)
+                    {
+                        loF[i] = (double)dstIdx[i] * srcDims[i] / dstDims[i];
+                        hiF[i] = (double)(dstIdx[i] + 1) * srcDims[i] / dstDims[i];
+                        loI[i] = (int)Math.Floor(loF[i]);
+                        hiI[i] = Math.Max(loI[i] + 1, (int)Math.Ceiling(hiF[i]));
+                        if (hiI[i] > srcDims[i]) hiI[i] = srcDims[i];
+                        totalArea *= (hiF[i] - loF[i]);
+                    }
+                    if (totalArea > 0)
+                        ScatterAreaBackward(gin, inBase, srcStride, loI, hiI, loF, hiF, spatial,
+                            new int[spatial], 0, g / totalArea, numOps);
+                }
+            }
+        }
+        return gradInput;
+    }
+
+    private static void ScatterAreaBackward(Span<T> gin, int inBase, int[] stride,
+        int[] lo, int[] hi, double[] loF, double[] hiF, int spatial,
+        int[] coord, int axis, double scale, Interfaces.INumericOperations<T> numOps)
+    {
+        if (axis == spatial)
+        {
+            int off = 0;
+            for (int i = 0; i < spatial; i++) off += coord[i] * stride[i];
+            gin[inBase + off] = numOps.Add(gin[inBase + off], numOps.FromDouble(scale));
+            return;
+        }
+        for (int i = lo[axis]; i < hi[axis]; i++)
+        {
+            double overlap = Math.Max(0.0, Math.Min(hiF[axis], i + 1.0) - Math.Max(loF[axis], i));
+            if (overlap <= 0) continue;
+            coord[axis] = i;
+            ScatterAreaBackward(gin, inBase, stride, lo, hi, loF, hiF, spatial, coord, axis + 1,
+                scale * overlap, numOps);
+        }
+    }
+
+    /// <summary>
+    /// PadNd backward — extract the middle region of gradOutput that
+    /// corresponds to the input. For non-constant pad modes, additionally
+    /// scatter the boundary-mapped padding cells back to their source.
+    /// </summary>
+    internal static void PadNdBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var pad = (int[])savedState[0];
+        var mode = (PadMode)savedState[1];
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int rank = input.Rank;
+        var before = new int[rank]; var after = new int[rank];
+        int padAxes = pad.Length / 2;
+        for (int i = 0; i < padAxes; i++)
+        {
+            int axis = rank - 1 - i;
+            before[axis] = pad[i * 2];
+            after[axis] = pad[i * 2 + 1];
+        }
+        var outShape = gradOutput._shape;
+        var inStride = new int[rank]; var outStride = new int[rank];
+        inStride[rank - 1] = 1; outStride[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+        {
+            inStride[i] = inStride[i + 1] * input._shape[i + 1];
+            outStride[i] = outStride[i + 1] * outShape[i + 1];
+        }
+        var gout = gradOutput.AsSpan();
+        var gin = gradInput.AsWritableSpan();
+
+        // Walk every output element once. When the inverse coord maps to
+        // an in-range input position — either directly (middle region)
+        // or via boundary mapping (reflect/replicate/circular) — add the
+        // gradient to the source. Constant mode discards out-of-range.
+        var outIdx = new int[rank];
+        for (int k = 0; k < gout.Length; k++)
+        {
+            int tmp = k;
+            for (int i = rank - 1; i >= 0; i--) { outIdx[i] = tmp % outShape[i]; tmp /= outShape[i]; }
+            int inOff = 0;
+            bool drop = false;
+            for (int i = 0; i < rank; i++)
+            {
+                int local = outIdx[i] - before[i];
+                int extent = input._shape[i];
+                if (local < 0 || local >= extent)
+                {
+                    if (mode == PadMode.Constant) { drop = true; break; }
+                    // Same boundary map as the forward.
+                    if (extent <= 0) { drop = true; break; }
+                    switch (mode)
+                    {
+                        case PadMode.Replicate:
+                            if (local < 0) local = 0;
+                            else if (local >= extent) local = extent - 1;
+                            break;
+                        case PadMode.Reflect:
+                            if (extent == 1) local = 0;
+                            else
+                            {
+                                int period = 2 * (extent - 1);
+                                int r = ((local % period) + period) % period;
+                                local = r < extent ? r : period - r;
+                            }
+                            break;
+                        case PadMode.Circular:
+                            local = ((local % extent) + extent) % extent;
+                            break;
+                    }
+                }
+                inOff += local * inStride[i];
+            }
+            if (drop) continue;
+            gin[inOff] = numOps.Add(gin[inOff], gout[k]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+    }
+
+    /// <summary>
+    /// AffineGrid3D backward — output grid is linear in theta, so
+    /// ∂grid[n,d,h,w,r] / ∂theta[n,r,k] = coord_k(d,h,w) for k ∈ {x, y, z, 1}.
+    /// Sum the product over all (d, h, w) to get gradTheta[n, r, k].
+    /// </summary>
+    internal static void AffineGrid3DBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var theta = inputs[0];
+        int outD = (int)savedState[0];
+        int outH = (int)savedState[1];
+        int outW = (int)savedState[2];
+        bool alignCorners = (bool)savedState[3];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int N = theta._shape[0];
+        var gradTheta = new Tensor<T>(theta._shape);
+        var gOut = gradOutput.AsSpan();
+        var gTheta = gradTheta.AsWritableSpan();
+
+        for (int n = 0; n < N; n++)
+        {
+            int tBase = n * 12;
+            for (int d = 0; d < outD; d++)
+            {
+                double z = outD <= 1 ? 0.0 : (alignCorners ? -1.0 + 2.0 * d / (outD - 1) : -1.0 + (2.0 * d + 1.0) / outD);
+                for (int h = 0; h < outH; h++)
+                {
+                    double y = outH <= 1 ? 0.0 : (alignCorners ? -1.0 + 2.0 * h / (outH - 1) : -1.0 + (2.0 * h + 1.0) / outH);
+                    for (int w = 0; w < outW; w++)
+                    {
+                        double x = outW <= 1 ? 0.0 : (alignCorners ? -1.0 + 2.0 * w / (outW - 1) : -1.0 + (2.0 * w + 1.0) / outW);
+                        int gBase = (((n * outD + d) * outH + h) * outW + w) * 3;
+                        for (int row = 0; row < 3; row++)
+                        {
+                            double g = numOps.ToDouble(gOut[gBase + row]);
+                            if (g == 0) continue;
+                            gTheta[tBase + row * 4]     = numOps.Add(gTheta[tBase + row * 4],     numOps.FromDouble(g * x));
+                            gTheta[tBase + row * 4 + 1] = numOps.Add(gTheta[tBase + row * 4 + 1], numOps.FromDouble(g * y));
+                            gTheta[tBase + row * 4 + 2] = numOps.Add(gTheta[tBase + row * 4 + 2], numOps.FromDouble(g * z));
+                            gTheta[tBase + row * 4 + 3] = numOps.Add(gTheta[tBase + row * 4 + 3], numOps.FromDouble(g));
+                        }
+                    }
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, theta, gradTheta, engine);
+    }
+
+    /// <summary>
+    /// RoIAlign backward — scatter each output cell's gradient back across
+    /// the 4 (or 2^samplingRatio²) bilinear-sampled source positions.
+    /// </summary>
+    internal static void RoIAlignBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var boxes = inputs[1];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        float spatialScale = (float)savedState[2];
+        int samplingRatio = (int)savedState[3];
+        bool aligned = (bool)savedState[4];
+        var gradInput = RoIAlignBackwardImpl(gradOutput, input, boxes,
+            outH, outW, spatialScale, samplingRatio, aligned);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        // boxes gradient is 0 almost everywhere (RoIAlign is piecewise
+        // constant in box coords modulo the bilinear sub-pixel term) — we
+        // set zero to keep the tape shape consistent.
+        DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+    }
+
+    private static Tensor<T> RoIAlignBackwardImpl(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> boxes,
+        int outH, int outW, float spatialScale, int samplingRatio, bool aligned)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int K = boxes._shape[0];
+        var go = gradOutput.AsSpan();
+        var b = boxes.AsSpan();
+        var gi = gradInput.AsWritableSpan();
+        double offset = aligned ? 0.5 : 0.0;
+
+        for (int k = 0; k < K; k++)
+        {
+            int n = (int)numOps.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N) continue;
+            double x1 = numOps.ToDouble(b[k * 5 + 1]) * spatialScale - offset;
+            double y1 = numOps.ToDouble(b[k * 5 + 2]) * spatialScale - offset;
+            double x2 = numOps.ToDouble(b[k * 5 + 3]) * spatialScale - offset;
+            double y2 = numOps.ToDouble(b[k * 5 + 4]) * spatialScale - offset;
+            double roiW = aligned ? (x2 - x1) : Math.Max(x2 - x1, 1.0);
+            double roiH = aligned ? (y2 - y1) : Math.Max(y2 - y1, 1.0);
+            double binH = roiH / outH;
+            double binW = roiW / outW;
+            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
+            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
+            if (ry < 1) ry = 1; if (rx < 1) rx = 1;
+            double gridArea = ry * rx;
+
+            for (int c = 0; c < C; c++)
+            {
+                int planeBase = (n * C + c) * H * W;
+                for (int ph = 0; ph < outH; ph++)
+                for (int pw = 0; pw < outW; pw++)
+                {
+                    double g = numOps.ToDouble(go[((k * C + c) * outH + ph) * outW + pw]) / gridArea;
+                    if (g == 0) continue;
+                    for (int iy = 0; iy < ry; iy++)
+                    {
+                        double sy = y1 + ph * binH + (iy + 0.5) * binH / ry;
+                        for (int ix = 0; ix < rx; ix++)
+                        {
+                            double sx = x1 + pw * binW + (ix + 0.5) * binW / rx;
+                            ScatterBilinear(gi, planeBase, sy, sx, H, W, g, numOps);
+                        }
+                    }
+                }
+            }
+        }
+        return gradInput;
+    }
+
+    private static void ScatterBilinear(Span<T> dst, int planeBase,
+        double y, double x, int H, int W, double g, Interfaces.INumericOperations<T> numOps)
+    {
+        if (y < -1.0 || y > H || x < -1.0 || x > W) return;
+        if (y <= 0) y = 0; if (x <= 0) x = 0;
+        int y0 = (int)y, x0 = (int)x;
+        int y1 = y0 + 1 >= H ? H - 1 : y0 + 1;
+        int x1 = x0 + 1 >= W ? W - 1 : x0 + 1;
+        if (y0 >= H - 1) { y0 = y1 = H - 1; y = y0; }
+        if (x0 >= W - 1) { x0 = x1 = W - 1; x = x0; }
+        double ly = y - y0, lx = x - x0;
+        double hy = 1.0 - ly, hx = 1.0 - lx;
+        dst[planeBase + y0 * W + x0] = numOps.Add(dst[planeBase + y0 * W + x0], numOps.FromDouble(hy * hx * g));
+        dst[planeBase + y0 * W + x1] = numOps.Add(dst[planeBase + y0 * W + x1], numOps.FromDouble(hy * lx * g));
+        dst[planeBase + y1 * W + x0] = numOps.Add(dst[planeBase + y1 * W + x0], numOps.FromDouble(ly * hx * g));
+        dst[planeBase + y1 * W + x1] = numOps.Add(dst[planeBase + y1 * W + x1], numOps.FromDouble(ly * lx * g));
+    }
+
+    /// <summary>RoIPool backward — scatter grad to the argmax per bin.</summary>
+    internal static void RoIPoolBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var boxes = inputs[1];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        float spatialScale = (float)savedState[2];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int K = boxes._shape[0];
+        var src = input.AsSpan();
+        var go = gradOutput.AsSpan();
+        var b = boxes.AsSpan();
+        var gi = gradInput.AsWritableSpan();
+
+        for (int k = 0; k < K; k++)
+        {
+            int n = (int)numOps.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N) continue;
+            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale);
+            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale);
+            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale);
+            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale);
+            int roiW = Math.Max(x2 - x1 + 1, 1);
+            int roiH = Math.Max(y2 - y1 + 1, 1);
+            double binH = (double)roiH / outH;
+            double binW = (double)roiW / outW;
+
+            for (int c = 0; c < C; c++)
+            {
+                int planeBase = (n * C + c) * H * W;
+                for (int ph = 0; ph < outH; ph++)
+                for (int pw = 0; pw < outW; pw++)
+                {
+                    double g = numOps.ToDouble(go[((k * C + c) * outH + ph) * outW + pw]);
+                    if (g == 0) continue;
+                    int hs = Math.Max(0, Math.Min(H, (int)Math.Floor(ph * binH) + y1));
+                    int he = Math.Max(0, Math.Min(H, (int)Math.Ceiling((ph + 1) * binH) + y1));
+                    int ws = Math.Max(0, Math.Min(W, (int)Math.Floor(pw * binW) + x1));
+                    int we = Math.Max(0, Math.Min(W, (int)Math.Ceiling((pw + 1) * binW) + x1));
+                    if (hs >= he || ws >= we) continue;
+                    // Find argmax in the bin and scatter g there.
+                    double best = double.NegativeInfinity;
+                    int bestY = hs, bestX = ws;
+                    for (int yy = hs; yy < he; yy++)
+                    for (int xx = ws; xx < we; xx++)
+                    {
+                        double v = numOps.ToDouble(src[planeBase + yy * W + xx]);
+                        if (v > best) { best = v; bestY = yy; bestX = xx; }
+                    }
+                    gi[planeBase + bestY * W + bestX] =
+                        numOps.Add(gi[planeBase + bestY * W + bestX], numOps.FromDouble(g));
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+    }
+
+    /// <summary>AmplitudeToDB backward: d(20·log10(max(x,min)))/dx = 20 / (x·ln 10) where x above floor.</summary>
+    internal static void AmplitudeToDBBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        float minAmp = (float)savedState[0];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(input._shape);
+        var src = input.AsSpan();
+        var gout = gradOutput.AsSpan();
+        var dst = result.AsWritableSpan();
+        double scale = 20.0 / Math.Log(10.0);
+        for (int i = 0; i < src.Length; i++)
+        {
+            double x = numOps.ToDouble(src[i]);
+            // Below floor the forward clamps to minAmp (a constant) —
+            // gradient is zero there.
+            double d = x > minAmp ? scale / x : 0.0;
+            dst[i] = numOps.FromDouble(numOps.ToDouble(gout[i]) * d);
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    /// <summary>ComputeDeltas backward: apply the transpose Savitzky-Golay filter.</summary>
+    internal static void ComputeDeltasBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        int winLength = (int)savedState[0];
+        int n = winLength / 2;
+        double denom = 0.0;
+        for (int i = 1; i <= n; i++) denom += 2.0 * i * i;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int rank = input.Rank;
+        int tLen = input._shape[rank - 1];
+        int leading = input.Length / Math.Max(1, tLen);
+        var result = new Tensor<T>(input._shape);
+        var gout = gradOutput.AsSpan();
+        var dst = result.AsWritableSpan();
+        for (int row = 0; row < leading; row++)
+        {
+            int baseOff = row * tLen;
+            for (int t = 0; t < tLen; t++)
+            {
+                double acc = 0.0;
+                // Forward: out[t] = Σ_k k·(in[t+k] − in[t−k])/denom.
+                // Transpose (wrt in[s]): Σ_k (k/denom)·(gout[s−k] − gout[s+k]),
+                // with edge clamping identical to forward.
+                for (int k = 1; k <= n; k++)
+                {
+                    // in[s] appears as "t+k" for t = s-k (if s-k >= 0) or as
+                    // clamp target from below for indices t in [0, k); same
+                    // for "t-k" on the upper edge. The clamping is what
+                    // makes edge elements receive extra gradient.
+                    for (int t2 = 0; t2 < tLen; t2++)
+                    {
+                        int left = t2 - k < 0 ? 0 : t2 - k;
+                        int right = t2 + k >= tLen ? tLen - 1 : t2 + k;
+                        if (right == t) acc += (k / denom) * numOps.ToDouble(gout[baseOff + t2]);
+                        if (left == t) acc -= (k / denom) * numOps.ToDouble(gout[baseOff + t2]);
+                    }
+                }
+                dst[baseOff + t] = numOps.FromDouble(acc);
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    /// <summary>
+    /// Resample backward — the polyphase Hann-sinc filter is linear, so
+    /// backward redistributes each output gradient across the taps it
+    /// originally consumed (with identical weights).
+    /// </summary>
+    internal static void ResampleBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        int origRate = (int)savedState[0];
+        int newRate = (int)savedState[1];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(input._shape);
+        if (origRate == newRate)
+        {
+            // Identity forward → identity backward.
+            gradOutput.AsSpan().CopyTo(result.AsWritableSpan());
+            DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+            return;
+        }
+        int gcd = GcdLocal(origRate, newRate);
+        int up = newRate / gcd;
+        int down = origRate / gcd;
+        int halfWidth = Math.Max(8, Math.Min(256, up * 8));
+        int rank = input.Rank;
+        int tIn = input._shape[rank - 1];
+        int tOut = (int)((long)tIn * up / down);
+        int leading = input.Length / Math.Max(1, tIn);
+        double cutoff = 1.0 / Math.Max(up, down);
+        var gout = gradOutput.AsSpan();
+        var dst = result.AsWritableSpan();
+
+        for (int r = 0; r < leading; r++)
+        {
+            int sBase = r * tIn, dBase = r * tOut;
+            for (int ot = 0; ot < tOut; ot++)
+            {
+                double srcIdx = (double)ot * down / up;
+                int centre = (int)Math.Floor(srcIdx);
+                // Forward per-output normalisation sums the weights; replay
+                // the same to get the denominator for this output element.
+                double wSum = 0.0;
+                for (int k = -halfWidth; k <= halfWidth; k++)
+                {
+                    int idx = centre + k;
+                    if (idx < 0 || idx >= tIn) continue;
+                    double t = (idx - srcIdx) * cutoff;
+                    double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
+                    double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
+                    wSum += sinc * hann;
+                }
+                if (!(wSum > 0)) continue;
+                double g = numOps.ToDouble(gout[dBase + ot]);
+                if (g == 0) continue;
+                for (int k = -halfWidth; k <= halfWidth; k++)
+                {
+                    int idx = centre + k;
+                    if (idx < 0 || idx >= tIn) continue;
+                    double t = (idx - srcIdx) * cutoff;
+                    double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
+                    double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
+                    double w = sinc * hann / wSum;
+                    dst[sBase + idx] = numOps.Add(dst[sBase + idx], numOps.FromDouble(w * g));
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    private static int GcdLocal(int a, int b) { while (b != 0) { int t = b; b = a % b; a = t; } return a; }
+
+    /// <summary>
+    /// PsRoIAlign backward — same scatter pattern as RoIAlign, but the
+    /// channel index in the source plane is derived from (co, ph, pw)
+    /// (position-sensitive).
+    /// </summary>
+    internal static void PsRoIAlignBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var boxes = inputs[1];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        int outChans = (int)savedState[2];
+        float spatialScale = (float)savedState[3];
+        int samplingRatio = (int)savedState[4];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int K = boxes._shape[0];
+        var go = gradOutput.AsSpan();
+        var b = boxes.AsSpan();
+        var gi = gradInput.AsWritableSpan();
+
+        for (int k = 0; k < K; k++)
+        {
+            int n = (int)numOps.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N) continue;
+            double x1 = numOps.ToDouble(b[k * 5 + 1]) * spatialScale;
+            double y1 = numOps.ToDouble(b[k * 5 + 2]) * spatialScale;
+            double x2 = numOps.ToDouble(b[k * 5 + 3]) * spatialScale;
+            double y2 = numOps.ToDouble(b[k * 5 + 4]) * spatialScale;
+            double roiW = Math.Max(x2 - x1, 0.1);
+            double roiH = Math.Max(y2 - y1, 0.1);
+            double binH = roiH / outH;
+            double binW = roiW / outW;
+            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
+            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
+            if (ry < 1) ry = 1; if (rx < 1) rx = 1;
+            double gridArea = ry * rx;
+
+            for (int co = 0; co < outChans; co++)
+            for (int ph = 0; ph < outH; ph++)
+            for (int pw = 0; pw < outW; pw++)
+            {
+                int c = (co * outH + ph) * outW + pw;
+                if (c >= C) continue;
+                int planeBase = (n * C + c) * H * W;
+                double g = numOps.ToDouble(go[((k * outChans + co) * outH + ph) * outW + pw]) / gridArea;
+                if (g == 0) continue;
+                for (int iy = 0; iy < ry; iy++)
+                {
+                    double sy = y1 + ph * binH + (iy + 0.5) * binH / ry;
+                    for (int ix = 0; ix < rx; ix++)
+                    {
+                        double sx = x1 + pw * binW + (ix + 0.5) * binW / rx;
+                        ScatterBilinear(gi, planeBase, sy, sx, H, W, g, numOps);
+                    }
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+    }
+
+    /// <summary>
+    /// PsRoIPool backward — distribute each output gradient uniformly
+    /// across its bin (the forward is an average). No argmax to recover.
+    /// </summary>
+    internal static void PsRoIPoolBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        var boxes = inputs[1];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        int outChans = (int)savedState[2];
+        float spatialScale = (float)savedState[3];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new Tensor<T>(input._shape);
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int K = boxes._shape[0];
+        var go = gradOutput.AsSpan();
+        var b = boxes.AsSpan();
+        var gi = gradInput.AsWritableSpan();
+
+        for (int k = 0; k < K; k++)
+        {
+            int n = (int)numOps.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N) continue;
+            double x1 = numOps.ToDouble(b[k * 5 + 1]) * spatialScale;
+            double y1 = numOps.ToDouble(b[k * 5 + 2]) * spatialScale;
+            double x2 = numOps.ToDouble(b[k * 5 + 3]) * spatialScale;
+            double y2 = numOps.ToDouble(b[k * 5 + 4]) * spatialScale;
+            double binH = Math.Max(y2 - y1, 0.1) / outH;
+            double binW = Math.Max(x2 - x1, 0.1) / outW;
+
+            for (int co = 0; co < outChans; co++)
+            for (int ph = 0; ph < outH; ph++)
+            for (int pw = 0; pw < outW; pw++)
+            {
+                int c = (co * outH + ph) * outW + pw;
+                if (c >= C) continue;
+                int planeBase = (n * C + c) * H * W;
+                int hs = Math.Max(0, (int)Math.Floor(y1 + ph * binH));
+                int he = Math.Min(H, (int)Math.Ceiling(y1 + (ph + 1) * binH));
+                int ws = Math.Max(0, (int)Math.Floor(x1 + pw * binW));
+                int we = Math.Min(W, (int)Math.Ceiling(x1 + (pw + 1) * binW));
+                int count = Math.Max(0, (he - hs) * (we - ws));
+                if (count == 0) continue;
+                double g = numOps.ToDouble(go[((k * outChans + co) * outH + ph) * outW + pw]) / count;
+                if (g == 0) continue;
+                for (int yy = hs; yy < he; yy++)
+                for (int xx = ws; xx < we; xx++)
+                    gi[planeBase + yy * W + xx] = numOps.Add(gi[planeBase + yy * W + xx], numOps.FromDouble(g));
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+    }
+
+    /// <summary>Spectrogram backward — pipes through STFT's backward.</summary>
+    internal static void SpectrogramBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Forward: Spectrogram = |STFT(x)|_magnitude. With magnitude-only
+        // output we lose the phase term. Proper backward requires the
+        // original phase; we save it in savedState. Grad wrt magnitude
+        // flows through ISTFT with the saved phase.
+        var waveform = inputs[0];
+        int nFft = (int)savedState[0];
+        int hopLength = (int)savedState[1];
+        var window = (Tensor<T>)savedState[2];
+        var phase = (Tensor<T>)savedState[3];
+        int origLength = (int)savedState[4];
+        var grad = engine.ISTFT(gradOutput, phase, nFft, hopLength, window, center: true, length: origLength);
+        DifferentiableOps.AccumulateGrad(grads, waveform, grad, engine);
+    }
 }

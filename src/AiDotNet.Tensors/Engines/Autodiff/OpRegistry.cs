@@ -169,6 +169,24 @@ internal static class OpRegistry
         "TensorConstantPad",
         "TensorCosineSimilarityLoss",
         "TensorUpsampleBilinear",
+
+        // Vision Detection IoU family (Issue #217) — record through
+        // DifferentiableOps.RecordBinary inside each CpuEngine.Detection.cs
+        // method; backward is in BackwardFunctions<T>.*IouBackward.
+        "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
+
+        // Geometry / sampling (Issue #217) — backward wired in
+        // BackwardFunctions<T>.{InterpolateBackward, PadNdBackward,
+        // AffineGrid3DBackward}. InterpolateByScale is a delegator to
+        // Interpolate.
+        "Interpolate", "PadNd", "AffineGrid3D",
+
+        // Vision RoI family (Issue #217 tail) — backward wired
+        // in BackwardFunctions<T>.{RoIAlign,RoIPool,PsRoIAlign,PsRoIPool}Backward.
+        "RoIAlign", "RoIPool", "PsRoIAlign", "PsRoIPool",
+
+        // Audio element-wise / linear ops — backward wired.
+        "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
     };
 
     /// <summary>
@@ -305,15 +323,37 @@ internal static class OpRegistry
         // separate BatchNormBackward path above)
         "BatchNormInference",
 
-        // Vision Detection — Issue #217. Forward-only in v1; backward
-        // candidates (BoxIoU family is continuous in box coords and is
-        // used as the DETR matching loss) come in a follow-up. NMS /
-        // BatchedNms / MasksToBoxes are inherently non-differentiable
-        // (discrete output / argmin).
+        // Vision Detection — Issue #217. The four IoU variants (BoxIou,
+        // GeneralizedBoxIou, DistanceBoxIou, CompleteBoxIou) ARE
+        // differentiable and have explicit backward functions registered
+        // in BackwardFunctions — they're not in this list. BoxConvert /
+        // BoxArea are linear-ish but not yet wired. NMS / BatchedNms
+        // (score-ordered discrete index selection) and MasksToBoxes
+        // (hard argmin/argmax of a boolean region) are inherently
+        // non-differentiable.
         "BoxConvert", "BoxArea",
-        "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
         "Nms", "BatchedNms",
         "MasksToBoxes",
+
+        // PitchShift / TimeStretch: phase-vocoder compositions that
+        // manipulate mag/phase arrays outside the tape; their backward
+        // would require a non-trivial inverse phase-vocoder pass. These
+        // ops are typically used at preprocessing/augmentation time, not
+        // inside a loss, so marking them non-differentiable is
+        // operationally correct until explicit training demand appears.
+        "PitchShift", "TimeStretch",
+
+        // μ-law encode/decode — the encoded domain is discrete int codes
+        // (not floats), so gradients are meaningless across the quantiser.
+        // Use it pre-/post-training only.
+        "MuLawEncoding", "MuLawDecoding",
+
+        // Image codec — byte-level I/O, not meaningfully differentiable.
+        "ImageDecode",
+
+        // InterpolateByScale is a pure delegator to Interpolate (which is
+        // in DifferentiableOps) — it performs no recording of its own.
+        "InterpolateByScale",
     };
 
     /// <summary>

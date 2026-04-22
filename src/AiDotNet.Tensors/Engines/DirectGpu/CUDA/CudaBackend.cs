@@ -57,6 +57,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
+    private IntPtr _detectionModule;
+    private IntPtr _geometryModule;
+    private IntPtr _roiModule;
+    private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -711,6 +715,68 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _parity210Module = IntPtr.Zero;
+        }
+
+        // Vision detection kernels (Issue #217). Same best-effort policy as
+        // parity-210: NVRTC failures fall through to the CpuEngine path
+        // (DirectGpuTensorEngine.Detection.cs catches and base.* delegates).
+        try
+        {
+            _detectionModule = CompileKernelModule(device,
+                Kernels.CudaDetectionKernels.GetSource(),
+                "detection_kernels",
+                Kernels.CudaDetectionKernels.GetKernelNames());
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"CUDA detection kernel compilation failed: {ex.Message}");
+            _detectionModule = IntPtr.Zero;
+        }
+
+        // Geometry / sampling kernels (Issue #217 second half). Same
+        // best-effort policy — NVRTC failure falls through to CpuEngine.
+        try
+        {
+            _geometryModule = CompileKernelModule(device,
+                Kernels.CudaGeometryKernels.GetSource(),
+                "geometry_kernels",
+                Kernels.CudaGeometryKernels.GetKernelNames());
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"CUDA geometry kernel compilation failed: {ex.Message}");
+            _geometryModule = IntPtr.Zero;
+        }
+
+        // RoI kernels (Issue #217 tail).
+        try
+        {
+            _roiModule = CompileKernelModule(device,
+                Kernels.CudaRoiKernels.GetSource(),
+                "roi_kernels",
+                Kernels.CudaRoiKernels.GetKernelNames());
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"CUDA RoI kernel compilation failed: {ex.Message}");
+            _roiModule = IntPtr.Zero;
+        }
+
+        // Audio kernels (Issue #217 tail).
+        try
+        {
+            _audioModule = CompileKernelModule(device,
+                Kernels.CudaAudioKernels.GetSource(),
+                "audio_kernels",
+                Kernels.CudaAudioKernels.GetKernelNames());
+        }
+        catch (Exception ex)
+        {
+            // Preserve the compile error for post-mortem — without this
+            // log, a NVRTC failure silently degrades the audio ops to
+            // CpuEngine with no indication why.
+            System.Diagnostics.Debug.WriteLine($"CUDA audio kernel compilation failed: {ex.Message}");
+            _audioModule = IntPtr.Zero;
         }
 
         // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:
@@ -11070,6 +11136,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_linalgModule);
             _linalgModule = IntPtr.Zero;
+        }
+
+        if (_detectionModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_detectionModule);
+            _detectionModule = IntPtr.Zero;
+        }
+
+        if (_geometryModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_geometryModule);
+            _geometryModule = IntPtr.Zero;
+        }
+
+        if (_roiModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_roiModule);
+            _roiModule = IntPtr.Zero;
+        }
+
+        if (_audioModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_audioModule);
+            _audioModule = IntPtr.Zero;
         }
 
         if (_cudaContext != IntPtr.Zero)
