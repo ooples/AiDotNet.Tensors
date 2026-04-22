@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// High-performance General Matrix Multiply (GEMM) using BLIS/GotoBLAS tiled architecture.
 /// C[m,n] += A[m,k] * B[k,n] with FMA micro-kernel, panel packing, and cache-level blocking.
 /// </summary>
-internal static class SimdGemm
+internal static partial class SimdGemm
 {
     // Cache blocking parameters (tuned for typical L1=32KB, L2=512KB, L3=8MB+)
     // Iter 2: Mc lowered 256→128 for more row blocks (better parallel utilization).

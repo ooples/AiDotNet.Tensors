@@ -271,6 +271,16 @@ class Program
             return;
         }
 
+        // Transformer-FFN matmul suite (Issue #245): covers small-M
+        // tall-skinny shapes from ChronosBolt/MOMENT/TimesFM/VisionTS that
+        // DiT-XL square benchmarks miss. Acceptance surface for Issues
+        // #242/#243/#244 fixes (~8-15min).
+        if (args[0] == "--transformer-ffn")
+        {
+            BenchmarkRunner.Run<TransformerFFNBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
         if (args[0] == "--vs-tensorcodec-gaps")
         {
@@ -383,6 +393,7 @@ class Program
         Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
+        Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
 #endif
     }
 }
