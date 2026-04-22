@@ -3329,17 +3329,32 @@ internal static class BackwardFunctions<T>
     {
         // Apply activation derivative to gradOutput before linear backward.
         // We need the pre-activation (linear output) for correct GELU/Swish derivatives.
+        // The pre-activation is SAVED during forward (CpuEngine.FusedLinear tape path)
+        // to avoid re-running a full matmul here — re-computation was ~98% of backward
+        // time on paper-scale transformers (e.g. 34s / 35s on ChronosBolt paper
+        // defaults: 27 calls × 1.27s each).
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];
-            // Re-compute pre-activation: linear = input @ weights + bias
-            var preActivation = engine.TensorMatMul(inputs[0], inputs[1]);
-            if (inputs.Length > 2)
-                preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
+            Tensor<T> preActivation;
+            if (savedState.Length >= 2 && savedState[1] is Tensor<T> cached)
+            {
+                // Fast path: use the pre-activation captured during forward.
+                preActivation = cached;
+            }
+            else
+            {
+                // Legacy path (backward-compat for tapes recorded by an older
+                // forward that didn't save pre-activation): fall back to
+                // re-computing. Slow but correct.
+                preActivation = engine.TensorMatMul(inputs[0], inputs[1]);
+                if (inputs.Length > 2)
+                    preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
+            }
             gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine);
         }
 
-        FusedLinearBackwardCore(gradOutput, inputs, output, savedState, engine, grads);
+        FusedLinearBackwardCore(gradOutput, inputs, output, savedState ?? Array.Empty<object>(), engine, grads);
     }
 
     private static Tensor<T> ApplyActivationDerivative(
@@ -3408,10 +3423,71 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        // Fallback: engine calls (non-float or non-2D, or BLAS refused)
+        // Fallback: engine calls (non-float or non-2D, or BLAS refused).
+        //
+        // Fallback: engine calls (non-float or non-2D, or BLAS refused).
+        //
+        // Transformer hot path: input is typically rank-3 [B, T, K], weight is
+        // rank-2 [K, N]. Flatten leading dims of input/gradOutput to 2D so both
+        // matmuls hit the optimized TensorMatMul2D fast path. The old fallback
+        // called TransposeLastTwoDims (a full copy of the weight tensor each
+        // call) and routed through TensorMatMulBatched, which doesn't reach
+        // the 2D SIMD-blocked fast path. At paper-scale ChronosBolt this was
+        // ~98% of Train wall-clock (30 s / 34 s per iteration; 27 calls ×
+        // ~1.1 s each). Reshape is a zero-copy view on contiguous inputs.
         fusedFallback:
-        var weightT = TransposeLastTwoDims(inputs[1], engine);
-        var inputGradFb = engine.TensorMatMul(gradOutput, weightT);
+        bool fastPath = inputs[1].Rank == 2
+                     && gradOutput.Rank >= 2 && inputs[0].Rank >= 2
+                     && inputs[0].IsContiguous && gradOutput.IsContiguous
+                     && inputs[0]._shape[inputs[0].Rank - 1] == inputs[1]._shape[0]
+                     && gradOutput._shape[gradOutput.Rank - 1] == inputs[1]._shape[1];
+        if (fastPath)
+        {
+            int K = inputs[1]._shape[0];
+            int N = inputs[1]._shape[1];
+            int rowsI = 1;
+            for (int d = 0; d < inputs[0].Rank - 1; d++) rowsI *= inputs[0]._shape[d];
+            int rowsG = 1;
+            for (int d = 0; d < gradOutput.Rank - 1; d++) rowsG *= gradOutput._shape[d];
+
+            if (rowsI == rowsG)
+            {
+                // dL/dInput = gradOutput @ weight^T   (shapes: [rowsG, N] × [N, K] = [rowsG, K])
+                var gFlat = rowsG == gradOutput.Length / N && gradOutput.Rank == 2
+                    ? gradOutput
+                    : engine.Reshape(gradOutput, new[] { rowsG, N });
+                var wT = engine.TensorTranspose(inputs[1]); // [N, K] — 2D transpose is cheap
+                var inputGradFlat = engine.TensorMatMul(gFlat, wT);
+                var inputGradFast = inputs[0].Rank == 2
+                    ? inputGradFlat
+                    : engine.Reshape(inputGradFlat, inputs[0]._shape);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFast, engine);
+
+                // dL/dWeight = input^T @ gradOutput   (shapes: [K, rowsI] × [rowsG, N] = [K, N])
+                var iFlat = inputs[0].Rank == 2
+                    ? inputs[0]
+                    : engine.Reshape(inputs[0], new[] { rowsI, K });
+                var iFlatT = engine.TensorTranspose(iFlat);
+                var weightGradFast = engine.TensorMatMul(iFlatT, gFlat);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
+
+                if (inputs.Length > 2)
+                {
+                    // Pass the original-rank gradOutput (not the leading-dim-flattened
+                    // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
+                    // — SumToShape needs to see the same rank it's reducing into,
+                    // matching the slow-path behaviour below. Flattening here would
+                    // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
+                    var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
+                }
+                return;
+            }
+        }
+
+        // Slow general fallback for shapes the fast path doesn't handle.
+        var weightT_Slow = TransposeLastTwoDims(inputs[1], engine);
+        var inputGradFb = engine.TensorMatMul(gradOutput, weightT_Slow);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFb, engine);
 
         // Weight gradient mirrors the bias issue (#234): for rank-3 inputs
