@@ -8577,6 +8577,36 @@ public interface IEngine
     Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB);
 
     /// <summary>
+    /// Backward pass for <see cref="BoxIou{T}"/>. Given upstream gradient
+    /// <paramref name="gradOutput"/> <c>[N, M]</c> and the forward inputs
+    /// <paramref name="boxesA"/> <c>[N, 4]</c>, <paramref name="boxesB"/>
+    /// <c>[M, 4]</c>, returns gradients with respect to both box sets.
+    /// The tie subgradient at max/min kinks is 0 (torchvision convention).
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) BoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="GeneralizedBoxIou{T}"/>.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) GeneralizedBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="DistanceBoxIou{T}"/>.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) DistanceBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
+    /// Backward pass for <see cref="CompleteBoxIou{T}"/>. Follows
+    /// Zheng et al. 2020 in treating α as a constant (stop-gradient) when
+    /// backpropping through the aspect-ratio term.
+    /// </summary>
+    (Tensor<T> gradA, Tensor<T> gradB) CompleteBoxIouBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> boxesA, Tensor<T> boxesB);
+
+    /// <summary>
     /// Greedy non-maximum suppression. Sorts boxes by score (descending)
     /// then iteratively keeps the top-scoring box and discards every
     /// remaining box whose IoU with the kept box is &gt; <paramref name="iouThreshold"/>.
@@ -8603,12 +8633,72 @@ public interface IEngine
 
     /// <summary>
     /// Computes the tight axis-aligned bounding box of each foreground
-    /// region in a stack of binary masks. Input <c>[N, H, W]</c>;
-    /// output <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>. Empty masks
-    /// (all zero) get <c>[0, 0, 0, 0]</c>, matching
-    /// torchvision's <c>masks_to_boxes</c>.
+    /// region in a stack of binary masks. Input <c>[N, H, W]</c> — any
+    /// numeric / bool type; foreground = any non-zero element. Output is
+    /// <c>Tensor&lt;int&gt;</c> <c>[N, 4]</c> in <see cref="BoxFormat.XYXY"/>
+    /// because box coordinates are pixel indices and must have an integer
+    /// range independent of mask storage (a <c>Tensor&lt;byte&gt;</c> mask
+    /// would cap coords at 255; a <c>Tensor&lt;bool&gt;</c> mask has no
+    /// sensible numeric coord type). Empty masks (all zero) get
+    /// <c>[0, 0, 0, 0]</c>, matching torchvision's <c>masks_to_boxes</c>.
     /// </summary>
-    Tensor<T> MasksToBoxes<T>(Tensor<T> masks);
+    Tensor<int> MasksToBoxes<T>(Tensor<T> masks);
+
+    #endregion
+
+    #region Geometry / sampling (Interpolate, Pad, GridSample, AffineGrid — Issue #217)
+
+    /// <summary>
+    /// Resamples an input tensor to the given target spatial sizes.
+    /// <para>Input layout is NCHW-family: <c>[N, C, *]</c> where <c>*</c>
+    /// is 1 (1D), 2 (2D) or 3 (3D) spatial dims.
+    /// <paramref name="sizes"/> gives the target spatial dims only
+    /// (same length as input's spatial rank).</para>
+    /// <para>Matches <c>torch.nn.functional.interpolate(..., size=, mode=,
+    /// align_corners=)</c>. Bicubic / antialias follow torchvision's
+    /// Catmull-Rom convention; area mode averages source pixels covered
+    /// by each output cell (adaptive_avg_pool equivalent).</para>
+    /// </summary>
+    Tensor<T> Interpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners = false);
+
+    /// <summary>
+    /// Same as <see cref="Interpolate{T}"/> but sizes are derived from
+    /// per-spatial-axis <paramref name="scaleFactors"/> — each factor
+    /// multiplies the corresponding input spatial extent, floor to int.
+    /// </summary>
+    Tensor<T> InterpolateByScale<T>(Tensor<T> input, double[] scaleFactors, InterpolateMode mode, bool alignCorners = false);
+
+    /// <summary>
+    /// Pads a tensor along arbitrary trailing axes. Matches
+    /// <c>torch.nn.functional.pad(input, pad, mode, value)</c>.
+    /// <para><paramref name="pad"/> is a flat <c>[before_n, after_n,
+    /// before_{n-1}, after_{n-1}, …]</c> list (PyTorch convention:
+    /// innermost axis first). Its length must be even and ≤ 2 × input rank.</para>
+    /// <para><paramref name="value"/> is only used when
+    /// <paramref name="mode"/> = <see cref="PadMode.Constant"/>.</para>
+    /// </summary>
+    Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!);
+
+    /// <summary>
+    /// Full-featured <c>GridSample</c> overload with explicit mode,
+    /// padding-mode, and <c>align_corners</c>. The legacy 3-arg
+    /// <see cref="GridSample{T}"/> delegates to this one with
+    /// mode=<see cref="GridSampleMode.Bilinear"/>,
+    /// padding=<see cref="GridSamplePadding.Zeros"/>,
+    /// alignCorners=false (torchvision defaults).
+    /// Input is NHWC <c>[N, H, W, C]</c>; grid is <c>[N, outH, outW, 2]</c>.
+    /// </summary>
+    Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
+    /// 3D affine-grid generator. Given an affine matrix
+    /// <paramref name="theta"/> of shape <c>[N, 3, 4]</c>, returns a
+    /// sampling grid of shape <c>[N, outD, outH, outW, 3]</c> in
+    /// <c>[-1, 1]</c> normalised coords. The 2D overload of
+    /// <see cref="AffineGrid{T}"/> covers the common image case.
+    /// </summary>
+    Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false);
 
     #endregion
 }

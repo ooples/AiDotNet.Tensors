@@ -59,6 +59,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _parity210Library;
     private IntPtr _linalgLibrary;
     private IntPtr _fftLibrary;
+    private IntPtr _detectionLibrary;
 
     #region Properties
 
@@ -244,6 +245,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal Linalg pre-compilation warning: {ex.Message}");
             _linalgLibrary = IntPtr.Zero;
+        }
+
+        // Vision detection kernels (#217). IDetectionBackend dispatch.
+        try
+        {
+            _detectionLibrary = _shaderLibrary.CompileLibrary("Detection",
+                MetalDetectionKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Detection pre-compilation warning: {ex.Message}");
+            _detectionLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external

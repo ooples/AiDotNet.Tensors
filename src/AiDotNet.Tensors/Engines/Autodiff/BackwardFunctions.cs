@@ -4931,4 +4931,50 @@ internal static class BackwardFunctions<T>
         var grad = engine.TensorMultiply(gradOutput, deriv);
         DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Vision Detection (Issue #217) — IoU family backward hooks. All four
+    // variants share the same binary-input signature and route to the
+    // engine's {Op}Backward method, which returns (gradA, gradB).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>BoxIou backward: see CpuEngine.IouFamilyBackward.</summary>
+    internal static void BoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.BoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>GeneralizedBoxIou backward (Rezatofighi 2019).</summary>
+    internal static void GeneralizedBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.GeneralizedBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>DistanceBoxIou backward (Zheng 2020).</summary>
+    internal static void DistanceBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.DistanceBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
+
+    /// <summary>CompleteBoxIou backward (Zheng 2020; α treated as stop-gradient).</summary>
+    internal static void CompleteBoxIouBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (gA, gB) = engine.CompleteBoxIouBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
+    }
 }

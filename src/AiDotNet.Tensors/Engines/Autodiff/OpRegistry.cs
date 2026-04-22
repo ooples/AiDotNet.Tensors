@@ -301,13 +301,15 @@ internal static class OpRegistry
         // separate BatchNormBackward path above)
         "BatchNormInference",
 
-        // Vision Detection — Issue #217. Forward-only in v1; backward
-        // candidates (BoxIoU family is continuous in box coords and is
-        // used as the DETR matching loss) come in a follow-up. NMS /
-        // BatchedNms / MasksToBoxes are inherently non-differentiable
-        // (discrete output / argmin).
+        // Vision Detection — Issue #217. The four IoU variants (BoxIou,
+        // GeneralizedBoxIou, DistanceBoxIou, CompleteBoxIou) ARE
+        // differentiable and have explicit backward functions registered
+        // in BackwardFunctions — they're not in this list. BoxConvert /
+        // BoxArea are linear-ish but not yet wired. NMS / BatchedNms
+        // (score-ordered discrete index selection) and MasksToBoxes
+        // (hard argmin/argmax of a boolean region) are inherently
+        // non-differentiable.
         "BoxConvert", "BoxArea",
-        "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
         "Nms", "BatchedNms",
         "MasksToBoxes",
     };

@@ -84,6 +84,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _complexModule;
     private IntPtr _parity210Module;
     private IntPtr _linalgModule;
+    private IntPtr _detectionModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -549,6 +550,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _linalgModule = IntPtr.Zero;
+            }
+
+            // Vision detection kernels (#217). IDetectionBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipDetectionKernels.GetSource(), "detection",
+                    ref _detectionModule, Kernels.HipDetectionKernels.GetKernelNames());
+            }
+            catch
+            {
+                _detectionModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");

@@ -583,6 +583,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL Parity-210 compilation failed: {ex.Message}");
                 }
 
+                // Compile Vision-Detection kernels (Issue #217). Optional —
+                // same fallback pattern as Parity-210: on compile failure
+                // the kernels are simply absent from _kernelCache, the
+                // IDetectionBackend implementation throws on call, and
+                // DirectGpuTensorEngine catches that and falls through to
+                // the CpuEngine path.
+                try
+                {
+                    var detectionProgram = CompileOrLoadCached(OpenClDetectionKernels.GetSource(), optimizationFlags, "Detection kernels");
+                    _programs.Add(detectionProgram);
+                    foreach (var name in OpenClDetectionKernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, detectionProgram, name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Detection compilation failed: {ex.Message}");
+                }
+
                 // Linalg decomposition kernels (#211 moat #2). Compilation
                 // failure flips _linalgAvailable=false and surfaces via
                 // <see cref="LinalgAvailable"/> so callers can route to CPU

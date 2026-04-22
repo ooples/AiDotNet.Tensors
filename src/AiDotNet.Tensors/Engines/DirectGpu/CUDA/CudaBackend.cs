@@ -57,6 +57,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
+    private IntPtr _detectionModule;
     private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -711,6 +712,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _parity210Module = IntPtr.Zero;
+        }
+
+        // Vision detection kernels (Issue #217). Same best-effort policy as
+        // parity-210: NVRTC failures fall through to the CpuEngine path
+        // (DirectGpuTensorEngine.Detection.cs catches and base.* delegates).
+        try
+        {
+            _detectionModule = CompileKernelModule(device,
+                Kernels.CudaDetectionKernels.GetSource(),
+                "detection_kernels",
+                Kernels.CudaDetectionKernels.GetKernelNames());
+        }
+        catch
+        {
+            _detectionModule = IntPtr.Zero;
         }
 
         // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:
