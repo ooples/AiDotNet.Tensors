@@ -26688,13 +26688,24 @@ public partial class CpuEngine : ITensorLevelEngine
             // into a single fused entry for backward.
             Tensor<T> fusedResult = TensorMatMul(input, weights);
             if (bias != null) fusedResult = TensorBroadcastAdd(fusedResult, bias);
-            if (activation != FusedActivationType.None) ApplyFusedActivationInPlace(fusedResult, activation);
+
+            // Save pre-activation BEFORE in-place activation so backward does not
+            // have to re-run a full matmul to recover it (was 98% of backward time
+            // on paper-scale transformers). The saved tensor is a detached clone
+            // so the in-place activation below does not corrupt it.
+            Tensor<T>? savedPreActivation = null;
+            if (activation != FusedActivationType.None)
+            {
+                savedPreActivation = fusedResult.Clone();
+                ApplyFusedActivationInPlace(fusedResult, activation);
+            }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
-            // Record single fused entry with activation info for backward
+            // Record single fused entry with activation info AND the captured
+            // pre-activation for backward.
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
             object[]? savedState = activation != FusedActivationType.None
-                ? new object[] { activation } // save activation type
+                ? new object[] { activation, savedPreActivation! } // [0]=activation, [1]=pre-activation
                 : null;
             Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fusedResult, fusedInputs,
                 Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, savedState);
