@@ -86,6 +86,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _linalgModule;
     private IntPtr _detectionModule;
     private IntPtr _geometryModule;
+    private IntPtr _roiModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -573,6 +574,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _geometryModule = IntPtr.Zero;
+            }
+
+            // RoI family (#217 tail). IRoiBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipRoiKernels.GetSource(), "roi",
+                    ref _roiModule, Kernels.HipRoiKernels.GetKernelNames());
+            }
+            catch
+            {
+                _roiModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");

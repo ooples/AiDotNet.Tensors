@@ -59,6 +59,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _parity210Module;
     private IntPtr _detectionModule;
     private IntPtr _geometryModule;
+    private IntPtr _roiModule;
     private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -742,6 +743,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _geometryModule = IntPtr.Zero;
+        }
+
+        // RoI kernels (Issue #217 tail).
+        try
+        {
+            _roiModule = CompileKernelModule(device,
+                Kernels.CudaRoiKernels.GetSource(),
+                "roi_kernels",
+                Kernels.CudaRoiKernels.GetKernelNames());
+        }
+        catch
+        {
+            _roiModule = IntPtr.Zero;
         }
 
         // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:

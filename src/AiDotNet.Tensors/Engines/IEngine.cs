@@ -8701,6 +8701,94 @@ public interface IEngine
     Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false);
 
     #endregion
+
+    #region Vision RoI + Audio primitives (Issue #217 — tail)
+
+    /// <summary>
+    /// torchvision's <c>roi_align</c>. Input <c>[N, C, H, W]</c>, boxes
+    /// <c>[K, 5]</c> where each row is <c>(batch_idx, x1, y1, x2, y2)</c>
+    /// in image coords (before <paramref name="spatialScale"/>). Output
+    /// <c>[K, C, outH, outW]</c>. <paramref name="samplingRatio"/> ≤ 0 =
+    /// adaptive (ceil(box_size / out_size)).
+    /// <paramref name="aligned"/>=true uses the corrected
+    /// <c>(x + 0.5) · spatialScale - 0.5</c> mapping from torchvision 0.7+.
+    /// </summary>
+    Tensor<T> RoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth,
+        float spatialScale, int samplingRatio, bool aligned);
+
+    /// <summary>
+    /// torchvision's <c>roi_pool</c> — max-pool inside each RoI.
+    /// Signature analogous to <see cref="RoIAlign{T}"/> except no
+    /// sub-pixel sampling (uses integer ROI bounds).
+    /// </summary>
+    Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, float spatialScale);
+
+    /// <summary>
+    /// Position-sensitive RoIAlign (R-FCN). Input
+    /// <c>[N, outH·outW·Cout, H, W]</c> where each
+    /// <c>outH·outW</c> slice holds a position-specific score map.
+    /// Output <c>[K, Cout, outH, outW]</c>.
+    /// </summary>
+    Tensor<T> PsRoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale, int samplingRatio);
+
+    /// <summary>Position-sensitive RoI-pool (R-FCN).</summary>
+    Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale);
+
+    /// <summary>Magnitude spectrogram |STFT(x)|. Thin wrapper over STFT
+    /// that returns only the magnitude half.</summary>
+    Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
+
+    /// <summary>
+    /// Convert amplitude to dB: <c>20 · log10(max(x, minAmplitude))</c>.
+    /// Matches torchaudio's <c>AmplitudeToDB</c> with
+    /// <c>stype='amplitude'</c>. For power input, scale the output by 0.5.
+    /// </summary>
+    Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null);
+
+    /// <summary>μ-law companding encoder (ITU-T G.711 / torchaudio).
+    /// Maps <c>[-1, 1]</c> floats to <c>[0, μ]</c> integer codes.</summary>
+    Tensor<T> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256);
+
+    /// <summary>μ-law companding decoder.</summary>
+    Tensor<T> MuLawDecoding<T>(Tensor<T> input, int quantizationChannels = 256);
+
+    /// <summary>
+    /// Time-axis derivative for audio feature stacks. Matches torchaudio's
+    /// <c>compute_deltas</c>: Savitzky-Golay style filter over a
+    /// <c>winLength</c> window along the time axis (last axis).
+    /// </summary>
+    Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5);
+
+    /// <summary>
+    /// Polyphase resampler. Reduces to a rational ratio
+    /// <c>newRate / origRate</c> and applies an FIR polyphase filter.
+    /// Simplified low-pass used — for production use a windowed sinc.
+    /// </summary>
+    Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate);
+
+    /// <summary>
+    /// Pitch shift by <paramref name="nSteps"/> semitones via phase
+    /// vocoder on the existing STFT. Composes STFT → phase-rate
+    /// modification → ISTFT → resample.
+    /// </summary>
+    Tensor<T> PitchShift<T>(Tensor<T> waveform, int sampleRate, double nSteps,
+        int nFft = 512, int hopLength = 128);
+
+    /// <summary>
+    /// Time-stretch by <paramref name="rate"/> via phase vocoder.
+    /// <c>rate &gt; 1</c> speeds up, <c>rate &lt; 1</c> slows down;
+    /// pitch is preserved.
+    /// </summary>
+    Tensor<T> TimeStretch<T>(Tensor<T> waveform, double rate,
+        int nFft = 512, int hopLength = 128);
+
+    #endregion
 }
 
 /// <summary>

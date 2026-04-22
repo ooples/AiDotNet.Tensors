@@ -61,6 +61,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _fftLibrary;
     private IntPtr _detectionLibrary;
     private IntPtr _geometryLibrary;
+    private IntPtr _roiLibrary;
 
     #region Properties
 
@@ -270,6 +271,17 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal Geometry pre-compilation warning: {ex.Message}");
             _geometryLibrary = IntPtr.Zero;
+        }
+
+        // RoI family (#217 tail). IRoiBackend dispatch.
+        try
+        {
+            _roiLibrary = _shaderLibrary.CompileLibrary("Roi", MetalRoiKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal RoI pre-compilation warning: {ex.Message}");
+            _roiLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
