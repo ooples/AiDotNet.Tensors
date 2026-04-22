@@ -4,6 +4,23 @@
 // DirectGpuTensorEngine type-tests against this interface when
 // dispatching; backends that don't implement it transparently fall
 // through to the CpuEngine path via inheritance.
+//
+// ── Architectural note ──────────────────────────────────────────────
+// This file intentionally follows the established repo pattern for
+// optional GPU-side capability surfaces: IParity210Backend,
+// ILinalgBackend, IFftBackend, IGeometryBackend, IRoiBackend, and
+// IAudioBackend all use the same shape. The user-facing Tensor<T>
+// contracts live on IEngine proper — these interfaces carry only the
+// low-level IGpuBuffer-based kernel launchers that are internal
+// plumbing between DirectGpuTensorEngine and a concrete backend, and
+// are not meant to be implemented by engines themselves.
+//
+// Folding them into IEngine would force every engine (CpuEngine, the
+// differentiable wrappers, tracing engines) to expose buffer-level
+// methods they have no use for, and would prevent backends from
+// shipping partial capabilities (e.g. a backend that has detection
+// kernels but hasn't yet built RoI ones). The probe-style optional
+// capability pattern is therefore preserved by design.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu
 {
