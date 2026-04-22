@@ -35,6 +35,7 @@ int reflect_index(int i, int extent) {
 }
 
 int pad_boundary(int idx, int extent, int mode) {
+    if (extent <= 0) return 0;
     if (mode == 2) { if (idx < 0) return 0; if (idx >= extent) return extent - 1; return idx; }
     if (mode == 1) return reflect_index(idx, extent);
     int r = ((idx % extent) + extent) % extent;
@@ -104,7 +105,7 @@ void main() {
             acc += wy[yy] * rowAcc;
         }
         output_[gid] = acc;
-    } else {
+    } else {  // Area — overlap-weighted averaging
         float yLo = float(y) * Hin / Hout;
         float yHi = float(y + 1) * Hin / Hout;
         float xLo = float(x) * Win / Wout;
@@ -115,9 +116,18 @@ void main() {
         if (xH <= xL) xH = xL + 1;
         if (yH > Hin) yH = Hin;
         if (xH > Win) xH = Win;
-        float acc = 0.0; int count = 0;
-        for (int yy = yL; yy < yH; yy++) for (int xx = xL; xx < xH; xx++) { acc += input_[srcBase + yy * Win + xx]; count++; }
-        output_[gid] = count > 0 ? acc / count : 0.0;
+        float totalArea = (yHi - yLo) * (xHi - xLo);
+        float acc = 0.0;
+        for (int yy = yL; yy < yH; yy++) {
+            float oy = max(0.0, min(yHi, float(yy + 1)) - max(yLo, float(yy)));
+            if (oy <= 0.0) continue;
+            for (int xx = xL; xx < xH; xx++) {
+                float ox = max(0.0, min(xHi, float(xx + 1)) - max(xLo, float(xx)));
+                if (ox <= 0.0) continue;
+                acc += oy * ox * input_[srcBase + yy * Win + xx];
+            }
+        }
+        output_[gid] = totalArea > 0.0 ? acc / totalArea : 0.0;
     }
 }
 ";

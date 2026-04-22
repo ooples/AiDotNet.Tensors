@@ -129,10 +129,12 @@ extern ""C"" __global__ __launch_bounds__(256) void detection_complete_box_iou(
     float ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
     float bx1 = b[j * 4], by1 = b[j * 4 + 1], bx2 = b[j * 4 + 2], by2 = b[j * 4 + 3];
 
-    float aw = ax2 - ax1, ah = ay2 - ay1;
-    float bw = bx2 - bx1, bh = by2 - by1;
-    float areaA = fmaxf(aw, 0.0f) * fmaxf(ah, 0.0f);
-    float areaB = fmaxf(bw, 0.0f) * fmaxf(bh, 0.0f);
+    // Clamp widths/heights to match the backward's convention; degenerate
+    // boxes (x2<x1 etc.) contribute zero to the aspect term in both passes.
+    float aw = fmaxf(ax2 - ax1, 0.0f), ah = fmaxf(ay2 - ay1, 0.0f);
+    float bw = fmaxf(bx2 - bx1, 0.0f), bh = fmaxf(by2 - by1, 0.0f);
+    float areaA = aw * ah;
+    float areaB = bw * bh;
     float ix1 = fmaxf(ax1, bx1), iy1 = fmaxf(ay1, by1);
     float ix2 = fminf(ax2, bx2), iy2 = fminf(ay2, by2);
     float inter = fmaxf(ix2 - ix1, 0.0f) * fmaxf(iy2 - iy1, 0.0f);

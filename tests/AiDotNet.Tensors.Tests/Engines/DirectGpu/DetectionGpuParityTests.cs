@@ -22,15 +22,17 @@ public class DetectionGpuParityTests : IDisposable
 
     public DetectionGpuParityTests()
     {
+        // Only swallow PlatformNotSupportedException / DllNotFoundException
+        // (no native GPU runtime on this machine). A real kernel / module
+        // compilation regression should surface as a test failure, not a
+        // silent skip.
         try
         {
             _gpu = new DirectGpuTensorEngine();
             _gpuAvailable = _gpu.IsGpuAvailable && BackendImplementsDetection();
         }
-        catch
-        {
-            _gpuAvailable = false;
-        }
+        catch (PlatformNotSupportedException) { _gpuAvailable = false; }
+        catch (System.DllNotFoundException) { _gpuAvailable = false; }
     }
 
     private bool BackendImplementsDetection()

@@ -67,6 +67,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> InterpolateByScale<T>(Tensor<T> input, double[] scaleFactors, InterpolateMode mode, bool alignCorners = false)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         if (scaleFactors is null) throw new ArgumentNullException(nameof(scaleFactors));
         int spatialRank = input.Rank - 2;
         if (scaleFactors.Length != spatialRank)
@@ -306,10 +307,10 @@ public partial class CpuEngine
     }
 
     /// <summary>
-    /// Area interpolation — averages every source pixel covered by each
-    /// output cell. Handles both downsampling (multi-source-per-dst, the
-    /// common case) and upsampling (degenerate — equivalent to nearest-
-    /// neighbour when srcSize == dstSize).
+    /// Area interpolation — each output cell is a weighted average of
+    /// every source pixel it covers, where the weight is the fractional
+    /// overlap of the output cell onto that source pixel. This matches
+    /// torchvision's adaptive_avg_pool semantics on non-integer scales.
     /// </summary>
     private static void InterpolateArea<T>(Tensor<T> input, Tensor<T> output, Interfaces.INumericOperations<T> ops)
     {
@@ -328,6 +329,7 @@ public partial class CpuEngine
 
         var dstIdx = new int[spatial];
         var loI = new int[spatial]; var hiI = new int[spatial];
+        var loF = new double[spatial]; var hiF = new double[spatial];
 
         for (int n = 0; n < N; n++)
         for (int c = 0; c < C; c++)
@@ -338,38 +340,49 @@ public partial class CpuEngine
             {
                 int tmp = k;
                 for (int i = spatial - 1; i >= 0; i--) { dstIdx[i] = tmp % dstDims[i]; tmp /= dstDims[i]; }
-                int cellCount = 1;
+                double totalArea = 1.0;
                 for (int i = 0; i < spatial; i++)
                 {
-                    double lo = (double)dstIdx[i] * srcDims[i] / dstDims[i];
-                    double hi = (double)(dstIdx[i] + 1) * srcDims[i] / dstDims[i];
-                    loI[i] = (int)Math.Floor(lo);
-                    hiI[i] = Math.Max(loI[i] + 1, (int)Math.Ceiling(hi));
+                    loF[i] = (double)dstIdx[i] * srcDims[i] / dstDims[i];
+                    hiF[i] = (double)(dstIdx[i] + 1) * srcDims[i] / dstDims[i];
+                    loI[i] = (int)Math.Floor(loF[i]);
+                    hiI[i] = Math.Max(loI[i] + 1, (int)Math.Ceiling(hiF[i]));
                     if (hiI[i] > srcDims[i]) hiI[i] = srcDims[i];
-                    cellCount *= (hiI[i] - loI[i]);
+                    totalArea *= (hiF[i] - loF[i]);
                 }
                 double acc = 0.0;
-                SumRegion(src, srcBase, srcStride, loI, hiI, spatial, ops, ref acc, new int[spatial], 0);
-                dst[dstBase + k] = ops.FromDouble(acc / Math.Max(1, cellCount));
+                WeightedRegion(src, srcBase, srcStride, loI, hiI, loF, hiF, spatial, ops,
+                    ref acc, new int[spatial], 0, 1.0);
+                dst[dstBase + k] = ops.FromDouble(totalArea > 0 ? acc / totalArea : 0);
             }
         }
     }
 
-    private static void SumRegion<T>(ReadOnlySpan<T> src, int srcBase, int[] stride,
-        int[] lo, int[] hi, int spatial, Interfaces.INumericOperations<T> ops,
-        ref double acc, int[] coord, int axis)
+    /// <summary>
+    /// Recursive overlap-weighted sum. Each source texel contributes
+    /// <c>Π overlap_i</c> where <c>overlap_i = min(hiF, i+1) − max(loF, i)</c>
+    /// along each spatial axis. Boundary texels therefore contribute
+    /// only their fractional coverage, which is what "area" interpolation
+    /// actually means.
+    /// </summary>
+    private static void WeightedRegion<T>(ReadOnlySpan<T> src, int srcBase, int[] stride,
+        int[] lo, int[] hi, double[] loF, double[] hiF, int spatial, Interfaces.INumericOperations<T> ops,
+        ref double acc, int[] coord, int axis, double weightSoFar)
     {
         if (axis == spatial)
         {
             int off = 0;
             for (int i = 0; i < spatial; i++) off += coord[i] * stride[i];
-            acc += ops.ToDouble(src[srcBase + off]);
+            acc += weightSoFar * ops.ToDouble(src[srcBase + off]);
             return;
         }
         for (int i = lo[axis]; i < hi[axis]; i++)
         {
+            double overlap = Math.Max(0.0, Math.Min(hiF[axis], i + 1.0) - Math.Max(loF[axis], i));
+            if (overlap <= 0) continue;
             coord[axis] = i;
-            SumRegion(src, srcBase, stride, lo, hi, spatial, ops, ref acc, coord, axis + 1);
+            WeightedRegion(src, srcBase, stride, lo, hi, loF, hiF, spatial, ops,
+                ref acc, coord, axis + 1, weightSoFar * overlap);
         }
     }
 
@@ -456,6 +469,9 @@ public partial class CpuEngine
 
     private static int MapBoundary(int idx, int extent, PadMode mode)
     {
+        // Zero-sized axis: every remapped index collapses to 0 (the
+        // alternative is undefined modulo-by-zero).
+        if (extent <= 0) return 0;
         switch (mode)
         {
             case PadMode.Replicate:

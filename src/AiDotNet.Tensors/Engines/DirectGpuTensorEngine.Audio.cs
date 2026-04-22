@@ -47,38 +47,63 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
-    public override Tensor<T> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
-        => DispatchMuLaw(input, quantizationChannels, encoding: true)
-           ?? base.MuLawEncoding(input, quantizationChannels);
+    public override Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
+    {
+        // GPU kernel writes float-valued codes into a float buffer; convert
+        // to int on the CPU side so the public contract holds. For really
+        // large inputs where T=float we could add a dedicated int-writing
+        // kernel later — tracked separately; correctness first.
+        if (typeof(T) == typeof(float))
+        {
+            if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
+            {
+                int len = input.Length;
+                if (len == 0) return new Tensor<int>((int[])input._shape.Clone());
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                var outBuf = AllocateOutputBuffer(backend, len);
+                try
+                {
+                    audio.MuLawEncoding(inBuf.Buffer, outBuf.Buffer, len, quantizationChannels);
+                    var arr = FinishGpuOp<float>(backend, outBuf, len);
+                    var outInt = new Tensor<int>((int[])input._shape.Clone());
+                    var dst = outInt.AsWritableSpan();
+                    for (int i = 0; i < len; i++) dst[i] = (int)arr[i];
+                    return outInt;
+                }
+                catch { outBuf.Dispose(); throw; }
+            }
+        }
+        return base.MuLawEncoding(input, quantizationChannels);
+    }
 
     /// <inheritdoc/>
-    public override Tensor<T> MuLawDecoding<T>(Tensor<T> input, int quantizationChannels = 256)
-        => DispatchMuLaw(input, quantizationChannels, encoding: false)
-           ?? base.MuLawDecoding(input, quantizationChannels);
-
-    private Tensor<T>? DispatchMuLaw<T>(Tensor<T> input, int qc, bool encoding)
+    public override Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
-        if (typeof(T) != typeof(float)) return null;
-        try
+        // Upload the int codes as floats (kernel expects float), decode on
+        // GPU, return as T via the normal FinishGpuOp path.
+        if (typeof(T) == typeof(float))
         {
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
                 int len = input.Length;
                 if (len == 0) return new Tensor<T>((int[])input._shape.Clone());
-                using var inBuf = GetOrAllocateBuffer(backend, input);
+                var floatInput = new Tensor<float>((int[])input._shape.Clone());
+                var src = input.AsSpan();
+                var dst = floatInput.AsWritableSpan();
+                for (int i = 0; i < len; i++) dst[i] = src[i];
+
+                using var inBuf = GetOrAllocateBuffer(backend, floatInput);
                 var outBuf = AllocateOutputBuffer(backend, len);
                 try
                 {
-                    if (encoding) audio.MuLawEncoding(inBuf.Buffer, outBuf.Buffer, len, qc);
-                    else audio.MuLawDecoding(inBuf.Buffer, outBuf.Buffer, len, qc);
+                    audio.MuLawDecoding(inBuf.Buffer, outBuf.Buffer, len, quantizationChannels);
                     var arr = FinishGpuOp<T>(backend, outBuf, len);
                     return new Tensor<T>(arr, (int[])input._shape.Clone());
                 }
                 catch { outBuf.Dispose(); throw; }
             }
         }
-        catch { }
-        return null;
+        return base.MuLawDecoding<T>(input, quantizationChannels);
     }
 
     /// <inheritdoc/>

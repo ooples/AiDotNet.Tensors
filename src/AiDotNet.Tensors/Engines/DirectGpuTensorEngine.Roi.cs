@@ -20,32 +20,52 @@ public partial class DirectGpuTensorEngine
             && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
-                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                int N = input._shape[0], C = input._shape[1];
+                int H = input._shape[2], W = input._shape[3];
+                int K = boxes._shape[0];
+                if (K == 0) return new Tensor<T>(new[] { 0, C, outputHeight, outputWidth });
+                int outLen = CheckedOutLen(K, C, outputHeight, outputWidth);
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                var outBuf = AllocateOutputBuffer(backend, outLen);
+                try
                 {
-                    int N = input._shape[0], C = input._shape[1];
-                    int H = input._shape[2], W = input._shape[3];
-                    int K = boxes._shape[0];
-                    if (K == 0) return new Tensor<T>(new[] { 0, C, outputHeight, outputWidth });
-                    int outLen = K * C * outputHeight * outputWidth;
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
-                    var outBuf = AllocateOutputBuffer(backend, outLen);
-                    try
-                    {
-                        roi.RoIAlign(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
-                            N, C, H, W, K, outputHeight, outputWidth,
-                            spatialScale, samplingRatio, aligned);
-                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { K, C, outputHeight, outputWidth });
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    roi.RoIAlign(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                        N, C, H, W, K, outputHeight, outputWidth,
+                        spatialScale, samplingRatio, aligned);
+                    var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                    return new Tensor<T>(arr, new[] { K, C, outputHeight, outputWidth });
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.RoIAlign(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
+    }
+
+    /// <summary>
+    /// Compute an output-element count in checked long arithmetic so a
+    /// pathologically large shape can't wrap around to a small positive
+    /// int and allocate an undersized buffer.
+    /// </summary>
+    private static int CheckedOutLen(int a, int b, int c, int d)
+    {
+        long n = checked((long)a * b * c * d);
+        if (n > int.MaxValue)
+            throw new OverflowException(
+                $"RoI output element count {n} exceeds Int32.MaxValue — " +
+                "split the K dimension or reduce output size.");
+        return (int)n;
+    }
+
+    private static int CheckedOutLen(int a, int b, int c, int d, int e)
+    {
+        long n = checked((long)a * b * c * d * e);
+        if (n > int.MaxValue)
+            throw new OverflowException(
+                $"RoI output element count {n} exceeds Int32.MaxValue.");
+        return (int)n;
     }
 
     /// <inheritdoc/>
@@ -56,30 +76,26 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
-                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                int N = input._shape[0], C = input._shape[1];
+                int H = input._shape[2], W = input._shape[3];
+                int K = boxes._shape[0];
+                if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
+                int outLen = CheckedOutLen(K, outputChannels, outputHeight, outputWidth);
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                var outBuf = AllocateOutputBuffer(backend, outLen);
+                try
                 {
-                    int N = input._shape[0], C = input._shape[1];
-                    int H = input._shape[2], W = input._shape[3];
-                    int K = boxes._shape[0];
-                    if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
-                    int outLen = K * outputChannels * outputHeight * outputWidth;
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
-                    var outBuf = AllocateOutputBuffer(backend, outLen);
-                    try
-                    {
-                        roi.PsRoIAlign(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
-                            N, C, H, W, K, outputHeight, outputWidth, outputChannels,
-                            spatialScale, samplingRatio);
-                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    roi.PsRoIAlign(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                        N, C, H, W, K, outputHeight, outputWidth, outputChannels,
+                        spatialScale, samplingRatio);
+                    var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                    return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.PsRoIAlign(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
     }
@@ -91,29 +107,25 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
-                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                int N = input._shape[0], C = input._shape[1];
+                int H = input._shape[2], W = input._shape[3];
+                int K = boxes._shape[0];
+                if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
+                int outLen = CheckedOutLen(K, outputChannels, outputHeight, outputWidth);
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                var outBuf = AllocateOutputBuffer(backend, outLen);
+                try
                 {
-                    int N = input._shape[0], C = input._shape[1];
-                    int H = input._shape[2], W = input._shape[3];
-                    int K = boxes._shape[0];
-                    if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
-                    int outLen = K * outputChannels * outputHeight * outputWidth;
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
-                    var outBuf = AllocateOutputBuffer(backend, outLen);
-                    try
-                    {
-                        roi.PsRoIPool(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
-                            N, C, H, W, K, outputHeight, outputWidth, outputChannels, spatialScale);
-                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    roi.PsRoIPool(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                        N, C, H, W, K, outputHeight, outputWidth, outputChannels, spatialScale);
+                    var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                    return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.PsRoIPool(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
     }
@@ -126,29 +138,25 @@ public partial class DirectGpuTensorEngine
             && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
-                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                int N = input._shape[0], C = input._shape[1];
+                int H = input._shape[2], W = input._shape[3];
+                int K = boxes._shape[0];
+                if (K == 0) return new Tensor<T>(new[] { 0, C, outputHeight, outputWidth });
+                int outLen = CheckedOutLen(K, C, outputHeight, outputWidth);
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                var outBuf = AllocateOutputBuffer(backend, outLen);
+                try
                 {
-                    int N = input._shape[0], C = input._shape[1];
-                    int H = input._shape[2], W = input._shape[3];
-                    int K = boxes._shape[0];
-                    if (K == 0) return new Tensor<T>(new[] { 0, C, outputHeight, outputWidth });
-                    int outLen = K * C * outputHeight * outputWidth;
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
-                    var outBuf = AllocateOutputBuffer(backend, outLen);
-                    try
-                    {
-                        roi.RoIPool(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
-                            N, C, H, W, K, outputHeight, outputWidth, spatialScale);
-                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { K, C, outputHeight, outputWidth });
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    roi.RoIPool(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                        N, C, H, W, K, outputHeight, outputWidth, spatialScale);
+                    var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                    return new Tensor<T>(arr, new[] { K, C, outputHeight, outputWidth });
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.RoIPool(input, boxes, outputHeight, outputWidth, spatialScale);
     }

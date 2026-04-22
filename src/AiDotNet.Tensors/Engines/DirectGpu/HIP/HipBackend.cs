@@ -10197,6 +10197,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             _linalgModule = IntPtr.Zero;
         }
 
+        // Unload the Issue #217 kernel modules (detection / geometry / roi / audio).
+        foreach (var modRef in new[] { _detectionModule, _geometryModule, _roiModule, _audioModule })
+        {
+            if (modRef != IntPtr.Zero)
+                HipNativeBindings.hipModuleUnload(modRef);
+        }
+        _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
+
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })
         {

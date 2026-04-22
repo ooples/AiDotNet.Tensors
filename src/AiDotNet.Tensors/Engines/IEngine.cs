@@ -8752,11 +8752,15 @@ public interface IEngine
     Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null);
 
     /// <summary>μ-law companding encoder (ITU-T G.711 / torchaudio).
-    /// Maps <c>[-1, 1]</c> floats to <c>[0, μ]</c> integer codes.</summary>
-    Tensor<T> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256);
+    /// Maps <c>[-1, 1]</c> floats to <c>[0, μ]</c> integer codes — the
+    /// encoded domain is explicitly <c>Tensor&lt;int&gt;</c> so downstream
+    /// callers can't accidentally feed analog floats where codes are expected.</summary>
+    Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256);
 
-    /// <summary>μ-law companding decoder.</summary>
-    Tensor<T> MuLawDecoding<T>(Tensor<T> input, int quantizationChannels = 256);
+    /// <summary>μ-law companding decoder — accepts the integer codes
+    /// produced by <see cref="MuLawEncoding{T}"/> and returns analog values
+    /// of type <c>T</c> in <c>[-1, 1]</c>.</summary>
+    Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256);
 
     /// <summary>
     /// Time-axis derivative for audio feature stacks. Matches torchaudio's

@@ -113,7 +113,7 @@ kernel void roi_pool(
     if (wend < 0) wend = 0; if (wend > W) wend = W;
     int planeBase = (n * C + c) * H * W;
     if (hend <= hstart || wend <= wstart) { output[gid] = 0.0; return; }
-    float best = -3.4e38;
+    float best = -3.402823466e+38;  // full -FLT_MAX so a region of very negative values still reports its true max
     for (int yy = hstart; yy < hend; yy++)
         for (int xx = wstart; xx < wend; xx++) {
             float v = input[planeBase + yy * W + xx];

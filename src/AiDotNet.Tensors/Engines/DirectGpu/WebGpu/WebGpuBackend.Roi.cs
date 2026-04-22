@@ -1,5 +1,16 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// WebGPU RoI launcher shims — async-only, same pattern as Detection/Geometry.
+// WebGPU RoI launcher shims — ASYNC-ONLY, matching the established
+// WebGPU pattern also used by Detection, Geometry, and Parity-210.
+//
+// WebGpuBackend deliberately does NOT implement the synchronous
+// IRoiBackend interface because WebGPU's compute submission API is
+// intrinsically Task-based: every dispatch waits on queue.onSubmittedWorkDone.
+// Fabricating a sync wrapper would either deadlock (waiting on a
+// Promise resolution from the same thread the JS event loop needs) or
+// silently drop errors. DirectGpuTensorEngine therefore falls through
+// to CpuEngine when the active backend is WebGPU — the same convention
+// as the other capability surfaces. Direct callers that hold a
+// WebGpuBackend can invoke these *Async methods explicitly.
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 

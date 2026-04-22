@@ -109,7 +109,7 @@ struct P {
     if (wend < 0) { wend = 0; } if (wend > p.W) { wend = p.W; }
     let planeBase = (n * p.C + c) * p.H * p.W;
     if (hend <= hstart || wend <= wstart) { output_[gid] = 0.0; return; }
-    var best : f32 = -3.4e38;
+    var best : f32 = -3.402823466e+38;
     for (var yy : i32 = hstart; yy < hend; yy = yy + 1) {
         for (var xx : i32 = wstart; xx < wend; xx = xx + 1) {
             let v = input_[planeBase + yy * p.W + xx];

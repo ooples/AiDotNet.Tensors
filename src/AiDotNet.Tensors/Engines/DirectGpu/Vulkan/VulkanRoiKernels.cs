@@ -183,7 +183,7 @@ void main() {
     if (wend < 0) wend = 0; if (wend > W) wend = W;
     uint planeBase = uint((n * C + c) * H * W);
     if (hend <= hstart || wend <= wstart) { output_[gid] = 0.0; return; }
-    float best = -3.4e38;
+    float best = -3.402823466e+38;  // full -FLT_MAX
     for (int yy = hstart; yy < hend; yy++)
         for (int xx = wstart; xx < wend; xx++) {
             float v = input_[planeBase + uint(yy * W + xx)];

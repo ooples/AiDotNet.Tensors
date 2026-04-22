@@ -184,6 +184,8 @@ public partial class CpuEngine
         for (int k = 0; k < K; k++)
         {
             int n = (int)ops.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N)
+                throw new ArgumentException($"PsRoIAlign batch idx {n} out of range [0, {N}).");
             double x1 = ops.ToDouble(b[k * 5 + 1]) * spatialScale;
             double y1 = ops.ToDouble(b[k * 5 + 2]) * spatialScale;
             double x2 = ops.ToDouble(b[k * 5 + 3]) * spatialScale;
@@ -241,6 +243,8 @@ public partial class CpuEngine
         for (int k = 0; k < K; k++)
         {
             int n = (int)ops.ToDouble(b[k * 5]);
+            if (n < 0 || n >= N)
+                throw new ArgumentException($"PsRoIPool batch idx {n} out of range [0, {N}).");
             double x1 = ops.ToDouble(b[k * 5 + 1]) * spatialScale;
             double y1 = ops.ToDouble(b[k * 5 + 2]) * spatialScale;
             double x2 = ops.ToDouble(b[k * 5 + 3]) * spatialScale;
@@ -327,11 +331,11 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
+    public virtual Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
-        var result = new Tensor<T>(input._shape);
+        var result = new Tensor<int>(input._shape);
         var dst = result.AsWritableSpan();
         double mu = quantizationChannels - 1;
         double logMu = Log1pFallback(mu);
@@ -340,16 +344,15 @@ public partial class CpuEngine
             double x = ops.ToDouble(src[i]);
             if (x > 1) x = 1; else if (x < -1) x = -1;
             double y = Math.Sign(x) * Log1pFallback(mu * Math.Abs(x)) / logMu;
-            // Quantise to [0, mu] integer code (stored as float).
-            double q = Math.Floor((y + 1) * 0.5 * mu + 0.5);
-            if (q < 0) q = 0; if (q > mu) q = mu;
-            dst[i] = ops.FromDouble(q);
+            int q = (int)Math.Floor((y + 1) * 0.5 * mu + 0.5);
+            if (q < 0) q = 0; else if (q > mu) q = (int)mu;
+            dst[i] = q;
         }
         return result;
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> MuLawDecoding<T>(Tensor<T> input, int quantizationChannels = 256)
+    public virtual Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
@@ -358,7 +361,7 @@ public partial class CpuEngine
         double mu = quantizationChannels - 1;
         for (int i = 0; i < src.Length; i++)
         {
-            double q = ops.ToDouble(src[i]);
+            double q = src[i];
             double y = (q / mu) * 2 - 1;
             double x = Math.Sign(y) * (Math.Pow(1 + mu, Math.Abs(y)) - 1) / mu;
             dst[i] = ops.FromDouble(x);
@@ -494,6 +497,8 @@ public partial class CpuEngine
         int nFft = 512, int hopLength = 128)
     {
         if (rate <= 0) throw new ArgumentException("rate must be positive.");
+        if (nFft < 2) throw new ArgumentException("nFft must be at least 2 (Hann window divides by nFft−1).");
+        if (hopLength <= 0) throw new ArgumentException("hopLength must be positive.");
         if (Math.Abs(rate - 1.0) < 1e-12) return waveform.Clone();
         int winLength = nFft;
         var window = new Tensor<T>(new int[] { winLength });

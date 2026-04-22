@@ -118,10 +118,11 @@ void main() {
     float ax1 = a[i * 4]; float ay1 = a[i * 4 + 1]; float ax2 = a[i * 4 + 2]; float ay2 = a[i * 4 + 3];
     float bx1 = b[j * 4]; float by1 = b[j * 4 + 1]; float bx2 = b[j * 4 + 2]; float by2 = b[j * 4 + 3];
 
-    float aw = ax2 - ax1; float ah = ay2 - ay1;
-    float bw = bx2 - bx1; float bh = by2 - by1;
-    float areaA = max(aw, 0.0) * max(ah, 0.0);
-    float areaB = max(bw, 0.0) * max(bh, 0.0);
+    // Clamp to match the backward's convention.
+    float aw = max(ax2 - ax1, 0.0); float ah = max(ay2 - ay1, 0.0);
+    float bw = max(bx2 - bx1, 0.0); float bh = max(by2 - by1, 0.0);
+    float areaA = aw * ah;
+    float areaB = bw * bh;
     float ix1 = max(ax1, bx1); float iy1 = max(ay1, by1);
     float ix2 = min(ax2, bx2); float iy2 = min(ay2, by2);
     float inter = max(ix2 - ix1, 0.0) * max(iy2 - iy1, 0.0);

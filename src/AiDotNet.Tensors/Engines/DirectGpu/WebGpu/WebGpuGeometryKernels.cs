@@ -44,6 +44,7 @@ fn reflect_index(i: i32, extent: i32) -> i32 {
 }
 
 fn pad_boundary(idx: i32, extent: i32, mode: i32) -> i32 {
+    if (extent <= 0) { return 0; }
     if (mode == 2) {
         if (idx < 0) { return 0; }
         if (idx >= extent) { return extent - 1; }
@@ -122,7 +123,7 @@ struct P {
             acc = acc + wy[yy] * rowAcc;
         }
         output_[gid] = acc;
-    } else {
+    } else {  // Area — overlap-weighted averaging
         let yLo = f32(y) * f32(p.Hin) / f32(p.Hout);
         let yHi = f32(y + 1) * f32(p.Hin) / f32(p.Hout);
         let xLo = f32(x) * f32(p.Win) / f32(p.Wout);
@@ -133,15 +134,18 @@ struct P {
         if (xH <= xL) { xH = xL + 1; }
         if (yH > p.Hin) { yH = p.Hin; }
         if (xH > p.Win) { xH = p.Win; }
+        let totalArea = (yHi - yLo) * (xHi - xLo);
         var acc : f32 = 0.0;
-        var count : i32 = 0;
         for (var yy : i32 = yL; yy < yH; yy = yy + 1) {
+            let oy = max(0.0, min(yHi, f32(yy + 1)) - max(yLo, f32(yy)));
+            if (oy <= 0.0) { continue; }
             for (var xx : i32 = xL; xx < xH; xx = xx + 1) {
-                acc = acc + input_[srcBase + yy * p.Win + xx];
-                count = count + 1;
+                let ox = max(0.0, min(xHi, f32(xx + 1)) - max(xLo, f32(xx)));
+                if (ox <= 0.0) { continue; }
+                acc = acc + oy * ox * input_[srcBase + yy * p.Win + xx];
             }
         }
-        if (count > 0) { output_[gid] = acc / f32(count); } else { output_[gid] = 0.0; }
+        if (totalArea > 0.0) { output_[gid] = acc / totalArea; } else { output_[gid] = 0.0; }
     }
 }
 ";

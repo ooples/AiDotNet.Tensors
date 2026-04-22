@@ -59,16 +59,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat);
 
         /// <summary>
-        /// Backward kernel for the pairwise IoU family. One thread per
-        /// (i, j) cell computes its per-coordinate contributions and
-        /// accumulates into <c>gradA</c> / <c>gradB</c> via atomic adds.
+        /// Backward kernel for the pairwise IoU family. Implemented as
+        /// two independent passes (atomics-free, portable to WebGPU
+        /// which has no <c>atomic&lt;f32&gt;</c>):
+        /// <list type="bullet">
+        ///   <item><c>detection_iou_backward_a</c> — one thread per row
+        ///     of <c>A</c>, iterates <c>j = 0..M</c>, writes the four
+        ///     coord gradients for <c>gradA[i]</c> directly.</item>
+        ///   <item><c>detection_iou_backward_b</c> — symmetric for
+        ///     <c>gradB</c>.</item>
+        /// </list>
         /// <paramref name="variant"/> is an int code matching the CPU
         /// enum: 0 = IoU, 1 = GIoU, 2 = DIoU, 3 = CIoU. The CIoU variant
         /// treats α as stop-gradient (Zheng 2020 / torchvision).
         /// <para>Shapes: gradOutput = N×M; boxesA = N×4; boxesB = M×4;
         /// gradA = N×4; gradB = M×4.</para>
-        /// <para>Caller MUST zero <paramref name="gradA"/> and <paramref name="gradB"/>
-        /// before the launch — the kernel only atomically adds.</para>
+        /// <para>The kernel writes final gradients directly — callers do
+        /// NOT need to pre-zero <paramref name="gradA"/> or <paramref name="gradB"/>.</para>
         /// </summary>
         void IouFamilyBackward(
             IGpuBuffer gradOutput, IGpuBuffer boxesA, IGpuBuffer boxesB,

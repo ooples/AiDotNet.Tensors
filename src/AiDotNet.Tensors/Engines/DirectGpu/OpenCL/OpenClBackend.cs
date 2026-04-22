@@ -592,9 +592,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var detectionProgram = CompileOrLoadCached(OpenClDetectionKernels.GetSource(), optimizationFlags, "Detection kernels");
-                    _programs.Add(detectionProgram);
+                    // Commit program + kernels together so a partial failure
+                    // doesn't leave _kernelCache in a half-populated state.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OpenClDetectionKernels.GetKernelNames())
-                        _kernelCache[name] = new DirectOpenClKernel(_context, detectionProgram, name);
+                        built.Add((name, new DirectOpenClKernel(_context, detectionProgram, name)));
+                    _programs.Add(detectionProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex)
                 {
@@ -605,9 +609,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var geometryProgram = CompileOrLoadCached(OpenClGeometryKernels.GetSource(), optimizationFlags, "Geometry kernels");
-                    _programs.Add(geometryProgram);
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OpenClGeometryKernels.GetKernelNames())
-                        _kernelCache[name] = new DirectOpenClKernel(_context, geometryProgram, name);
+                        built.Add((name, new DirectOpenClKernel(_context, geometryProgram, name)));
+                    _programs.Add(geometryProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex)
                 {
@@ -618,9 +624,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var roiProgram = CompileOrLoadCached(OpenClRoiKernels.GetSource(), optimizationFlags, "RoI kernels");
-                    _programs.Add(roiProgram);
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OpenClRoiKernels.GetKernelNames())
-                        _kernelCache[name] = new DirectOpenClKernel(_context, roiProgram, name);
+                        built.Add((name, new DirectOpenClKernel(_context, roiProgram, name)));
+                    _programs.Add(roiProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex)
                 {
@@ -631,9 +639,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var audioProgram = CompileOrLoadCached(OpenClAudioKernels.GetSource(), optimizationFlags, "Audio kernels");
-                    _programs.Add(audioProgram);
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OpenClAudioKernels.GetKernelNames())
-                        _kernelCache[name] = new DirectOpenClKernel(_context, audioProgram, name);
+                        built.Add((name, new DirectOpenClKernel(_context, audioProgram, name)));
+                    _programs.Add(audioProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex)
                 {

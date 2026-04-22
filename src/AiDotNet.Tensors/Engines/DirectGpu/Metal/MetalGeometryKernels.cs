@@ -47,6 +47,7 @@ inline int reflect_index(int i, int extent) {
 }
 
 inline int pad_boundary(int idx, int extent, int mode) {
+    if (extent <= 0) return 0;
     if (mode == 2) { if (idx < 0) return 0; if (idx >= extent) return extent - 1; return idx; }
     if (mode == 1) return reflect_index(idx, extent);
     int r = ((idx % extent) + extent) % extent;
@@ -113,7 +114,7 @@ kernel void geometry_interpolate_2d(
             acc += wy[yy] * rowAcc;
         }
         output[gid] = acc;
-    } else {
+    } else {  // Area — overlap-weighted averaging
         float yLo = (float)y * Hin / Hout;
         float yHi = (float)(y + 1) * Hin / Hout;
         float xLo = (float)x * Win / Wout;
@@ -124,9 +125,18 @@ kernel void geometry_interpolate_2d(
         if (xH <= xL) xH = xL + 1;
         if (yH > Hin) yH = Hin;
         if (xH > Win) xH = Win;
-        float acc = 0.0; int count = 0;
-        for (int yy = yL; yy < yH; yy++) for (int xx = xL; xx < xH; xx++) { acc += src[yy * Win + xx]; count++; }
-        output[gid] = count > 0 ? acc / count : 0.0;
+        float totalArea = (yHi - yLo) * (xHi - xLo);
+        float acc = 0.0;
+        for (int yy = yL; yy < yH; yy++) {
+            float oy = max(0.0f, min(yHi, (float)(yy + 1)) - max(yLo, (float)yy));
+            if (oy <= 0.0f) continue;
+            for (int xx = xL; xx < xH; xx++) {
+                float ox = max(0.0f, min(xHi, (float)(xx + 1)) - max(xLo, (float)xx));
+                if (ox <= 0.0f) continue;
+                acc += oy * ox * src[yy * Win + xx];
+            }
+        }
+        output[gid] = totalArea > 0.0 ? acc / totalArea : 0.0;
     }
 }
 

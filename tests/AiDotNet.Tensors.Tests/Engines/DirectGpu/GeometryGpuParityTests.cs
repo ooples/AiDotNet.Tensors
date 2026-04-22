@@ -26,7 +26,8 @@ public class GeometryGpuParityTests : IDisposable
             _gpu = new DirectGpuTensorEngine();
             _gpuAvailable = _gpu.IsGpuAvailable && BackendImplementsGeometry();
         }
-        catch { _gpuAvailable = false; }
+        catch (PlatformNotSupportedException) { _gpuAvailable = false; }
+        catch (System.DllNotFoundException) { _gpuAvailable = false; }
     }
 
     private bool BackendImplementsGeometry()

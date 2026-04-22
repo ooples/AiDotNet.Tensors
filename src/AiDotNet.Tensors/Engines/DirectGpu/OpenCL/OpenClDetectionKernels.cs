@@ -128,10 +128,11 @@ __kernel void detection_complete_box_iou(
     float ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
     float bx1 = b[j * 4], by1 = b[j * 4 + 1], bx2 = b[j * 4 + 2], by2 = b[j * 4 + 3];
 
-    float aw = ax2 - ax1, ah = ay2 - ay1;
-    float bw = bx2 - bx1, bh = by2 - by1;
-    float areaA = max(aw, 0.0f) * max(ah, 0.0f);
-    float areaB = max(bw, 0.0f) * max(bh, 0.0f);
+    // Clamp to match the backward's convention.
+    float aw = max(ax2 - ax1, 0.0f), ah = max(ay2 - ay1, 0.0f);
+    float bw = max(bx2 - bx1, 0.0f), bh = max(by2 - by1, 0.0f);
+    float areaA = aw * ah;
+    float areaB = bw * bh;
     float ix1 = max(ax1, bx1), iy1 = max(ay1, by1);
     float ix2 = min(ax2, bx2), iy2 = min(ay2, by2);
     float inter = max(ix2 - ix1, 0.0f) * max(iy2 - iy1, 0.0f);

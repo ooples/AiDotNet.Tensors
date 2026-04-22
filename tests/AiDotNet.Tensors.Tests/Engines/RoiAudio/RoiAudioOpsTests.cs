@@ -92,8 +92,11 @@ public class RoiAudioOpsTests
     public void MuLaw_EncodeDecodeRoundtrip()
     {
         var input = new Tensor<float>(new float[] { 0f, 0.1f, -0.1f, 0.5f, -0.5f, 0.99f, -0.99f }, new[] { 7 });
-        var enc = _cpu.MuLawEncoding(input);
-        var dec = _cpu.MuLawDecoding(enc);
+        Tensor<int> enc = _cpu.MuLawEncoding(input);
+        // Encoded codes must be int in [0, 255] — verify both type and range.
+        foreach (int code in enc.AsSpan())
+            Assert.InRange(code, 0, 255);
+        var dec = _cpu.MuLawDecoding<float>(enc);
         var orig = input.AsSpan();
         var back = dec.AsSpan();
         for (int i = 0; i < orig.Length; i++)

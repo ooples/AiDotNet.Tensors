@@ -139,10 +139,11 @@ struct P { n: i32, m: i32 };
     let ax1 = a[i * 4]; let ay1 = a[i * 4 + 1]; let ax2 = a[i * 4 + 2]; let ay2 = a[i * 4 + 3];
     let bx1 = b[j * 4]; let by1 = b[j * 4 + 1]; let bx2 = b[j * 4 + 2]; let by2 = b[j * 4 + 3];
 
-    let aw = ax2 - ax1; let ah = ay2 - ay1;
-    let bw = bx2 - bx1; let bh = by2 - by1;
-    let areaA = max(aw, 0.0) * max(ah, 0.0);
-    let areaB = max(bw, 0.0) * max(bh, 0.0);
+    // Clamp to match the backward's convention.
+    let aw = max(ax2 - ax1, 0.0); let ah = max(ay2 - ay1, 0.0);
+    let bw = max(bx2 - bx1, 0.0); let bh = max(by2 - by1, 0.0);
+    let areaA = aw * ah;
+    let areaB = bw * bh;
     let ix1 = max(ax1, bx1); let iy1 = max(ay1, by1);
     let ix2 = min(ax2, bx2); let iy2 = min(ay2, by2);
     let inter = max(ix2 - ix1, 0.0) * max(iy2 - iy1, 0.0);
