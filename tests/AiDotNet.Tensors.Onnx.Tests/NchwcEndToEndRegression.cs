@@ -130,10 +130,11 @@ public class NchwcEndToEndRegression
 
         // Pre-filter: gross breakage surfaces before the element-wise loop,
         // so a 1e-7 mismatch doesn't mask a NaN/collapsed run.
+        // float.IsFinite is net5+; inline the equivalent so net471 also builds.
         foreach (var v in packed)
-            Assert.True(float.IsFinite(v), $"Non-finite output {v} in packed pipeline");
+            Assert.True(!float.IsNaN(v) && !float.IsInfinity(v), $"Non-finite output {v} in packed pipeline");
         foreach (var v in reference)
-            Assert.True(float.IsFinite(v), $"Non-finite output {v} in NCHW reference");
+            Assert.True(!float.IsNaN(v) && !float.IsInfinity(v), $"Non-finite output {v} in NCHW reference");
         Assert.True(reference.Distinct().Count() >= 5,
             "Reference output has <5 distinct values — pipeline likely collapsed");
 

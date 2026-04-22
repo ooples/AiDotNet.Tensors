@@ -133,8 +133,9 @@ public class DetectionGpuParityTests : IDisposable
     {
         SkipIfUnavailable();
         var boxes = RandBoxes(10, 17);
-        foreach (BoxFormat from in Enum.GetValues<BoxFormat>())
-            foreach (BoxFormat to in Enum.GetValues<BoxFormat>())
+        // Enum.GetValues<T>() is net5+; cast the non-generic form for net471.
+        foreach (BoxFormat from in (BoxFormat[])Enum.GetValues(typeof(BoxFormat)))
+            foreach (BoxFormat to in (BoxFormat[])Enum.GetValues(typeof(BoxFormat)))
             {
                 if (from == to) continue;
                 AssertClose(_gpu!.BoxConvert(boxes, from, to), _cpu.BoxConvert(boxes, from, to));
