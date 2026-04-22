@@ -3473,7 +3473,12 @@ internal static class BackwardFunctions<T>
 
                 if (inputs.Length > 2)
                 {
-                    var biasGradFast = SumToShape(gFlat, inputs[2]._shape, engine);
+                    // Pass the original-rank gradOutput (not the leading-dim-flattened
+                    // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
+                    // — SumToShape needs to see the same rank it's reducing into,
+                    // matching the slow-path behaviour below. Flattening here would
+                    // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
+                    var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
                     DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
                 }
                 return;
