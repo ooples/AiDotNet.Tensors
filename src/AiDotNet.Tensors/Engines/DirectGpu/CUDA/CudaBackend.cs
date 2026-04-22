@@ -727,8 +727,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
                 "detection_kernels",
                 Kernels.CudaDetectionKernels.GetKernelNames());
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"CUDA detection kernel compilation failed: {ex.Message}");
             _detectionModule = IntPtr.Zero;
         }
 
@@ -741,8 +742,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
                 "geometry_kernels",
                 Kernels.CudaGeometryKernels.GetKernelNames());
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"CUDA geometry kernel compilation failed: {ex.Message}");
             _geometryModule = IntPtr.Zero;
         }
 
@@ -754,8 +756,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
                 "roi_kernels",
                 Kernels.CudaRoiKernels.GetKernelNames());
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"CUDA RoI kernel compilation failed: {ex.Message}");
             _roiModule = IntPtr.Zero;
         }
 
@@ -767,8 +770,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
                 "audio_kernels",
                 Kernels.CudaAudioKernels.GetKernelNames());
         }
-        catch
+        catch (Exception ex)
         {
+            // Preserve the compile error for post-mortem — without this
+            // log, a NVRTC failure silently degrades the audio ops to
+            // CpuEngine with no indication why.
+            System.Diagnostics.Debug.WriteLine($"CUDA audio kernel compilation failed: {ex.Message}");
             _audioModule = IntPtr.Zero;
         }
 

@@ -163,6 +163,8 @@ extern ""C"" __global__ __launch_bounds__(256) void ps_roi_align(
     if (rx < 1) rx = 1;
 
     int c = (co * outH + ph) * outW + pw;
+    // Guard against malformed PS-RoI: if C doesn't match outputChannels·outH·outW, bail out cleanly.
+    if (c >= C) { output[gid] = 0.0f; return; }
     int planeBase = (n * C + c) * H * W;
     float acc = 0;
     for (int iy = 0; iy < ry; iy++) {
@@ -198,6 +200,8 @@ extern ""C"" __global__ __launch_bounds__(256) void ps_roi_pool(
     float binW = fmaxf(x2 - x1, 0.1f) / outW;
 
     int c = (co * outH + ph) * outW + pw;
+    // Guard against malformed PS-RoI: if C doesn't match outputChannels·outH·outW, bail out cleanly.
+    if (c >= C) { output[gid] = 0.0f; return; }
     int planeBase = (n * C + c) * H * W;
     int hs = (int)fmaxf(0.0f, floorf(y1 + ph * binH));
     int he = (int)fminf((float)H, ceilf(y1 + (ph + 1) * binH));

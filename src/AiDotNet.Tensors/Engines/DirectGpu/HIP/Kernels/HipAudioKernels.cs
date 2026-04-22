@@ -76,6 +76,7 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_compute_deltas(
     int row = gid / timeAxis;
 
     int n = winLength / 2;
+    if (n < 1) { output[gid] = 0.0f; return; }
     float denom = 0.0f;
     for (int i = 1; i <= n; i++) denom += 2.0f * i * i;
     float acc = 0.0f;

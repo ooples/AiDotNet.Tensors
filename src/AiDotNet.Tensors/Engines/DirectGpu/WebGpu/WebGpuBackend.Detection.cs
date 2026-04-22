@@ -82,34 +82,41 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradA, IGpuBuffer gradB,
         int n, int m, int variant)
     {
-        if (n <= 0 || m <= 0) return;
+        // See CudaBackend.Detection for rationale.
+        if (n <= 0 && m <= 0) return;
 
-        var pipeA = await GetOrCreatePipelineAsync(
-            DetectionModuleKey + ":IouBackwardA", WebGpuDetectionKernels.IouBackwardA, "main");
-        using (var uniforms = new WebGpuBuffer(
-            UniformInts(n, m, variant),
-            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst))
-        using (var bind = new WebGpuBindGroup(pipeA,
-            AsWgpu(gradOutput), AsWgpu(boxesA), AsWgpu(boxesB), AsWgpu(gradA)))
+        if (n > 0)
         {
-            var (wg, _) = _device.CalculateWorkgroups1D(n);
-            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
-                pipeA, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
-            await WebGpuNativeBindings.SubmitAndWaitAsync();
+            var pipeA = await GetOrCreatePipelineAsync(
+                DetectionModuleKey + ":IouBackwardA", WebGpuDetectionKernels.IouBackwardA, "main");
+            using (var uniforms = new WebGpuBuffer(
+                UniformInts(n, m, variant),
+                WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst))
+            using (var bind = new WebGpuBindGroup(pipeA,
+                AsWgpu(gradOutput), AsWgpu(boxesA), AsWgpu(boxesB), AsWgpu(gradA)))
+            {
+                var (wg, _) = _device.CalculateWorkgroups1D(n);
+                await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+                    pipeA, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+                await WebGpuNativeBindings.SubmitAndWaitAsync();
+            }
         }
 
-        var pipeB = await GetOrCreatePipelineAsync(
-            DetectionModuleKey + ":IouBackwardB", WebGpuDetectionKernels.IouBackwardB, "main");
-        using (var uniforms = new WebGpuBuffer(
-            UniformInts(n, m, variant),
-            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst))
-        using (var bind = new WebGpuBindGroup(pipeB,
-            AsWgpu(gradOutput), AsWgpu(boxesA), AsWgpu(boxesB), AsWgpu(gradB)))
+        if (m > 0)
         {
-            var (wg, _) = _device.CalculateWorkgroups1D(m);
-            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
-                pipeB, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
-            await WebGpuNativeBindings.SubmitAndWaitAsync();
+            var pipeB = await GetOrCreatePipelineAsync(
+                DetectionModuleKey + ":IouBackwardB", WebGpuDetectionKernels.IouBackwardB, "main");
+            using (var uniforms = new WebGpuBuffer(
+                UniformInts(n, m, variant),
+                WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst))
+            using (var bind = new WebGpuBindGroup(pipeB,
+                AsWgpu(gradOutput), AsWgpu(boxesA), AsWgpu(boxesB), AsWgpu(gradB)))
+            {
+                var (wg, _) = _device.CalculateWorkgroups1D(m);
+                await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+                    pipeB, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+                await WebGpuNativeBindings.SubmitAndWaitAsync();
+            }
         }
     }
 }

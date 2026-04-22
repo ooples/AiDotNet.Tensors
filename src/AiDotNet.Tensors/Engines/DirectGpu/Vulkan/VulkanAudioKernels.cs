@@ -65,6 +65,7 @@ void main() {
     int t = gid % timeAxis;
     int row = gid / timeAxis;
     int n = winLength / 2;
+    if (n < 1) { output_[gid] = 0.0; return; }
     float denom = 0.0;
     for (int i = 1; i <= n; i++) denom += 2.0 * i * i;
     float acc = 0.0;

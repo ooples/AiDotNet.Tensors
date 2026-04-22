@@ -96,27 +96,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IGpuBuffer gradA, IGpuBuffer gradB,
             int n, int m, int variant)
         {
-            if (n <= 0 || m <= 0) return;
+            // See CudaBackend.Detection for rationale — don't leak pooled
+            // buffer contents when one of n/m is zero.
+            if (n <= 0 && m <= 0) return;
 
-            var kA = GetDetectionKernel("detection_iou_backward_a");
-            kA.SetArg(0, DetectionBufHandle(gradOutput));
-            kA.SetArg(1, DetectionBufHandle(boxesA));
-            kA.SetArg(2, DetectionBufHandle(boxesB));
-            kA.SetArg(3, DetectionBufHandle(gradA));
-            kA.SetArg(4, n);
-            kA.SetArg(5, m);
-            kA.SetArg(6, variant);
-            kA.Execute1D(RoundUpToDetectionGroup(n), DetectionLocalSize);
+            if (n > 0)
+            {
+                var kA = GetDetectionKernel("detection_iou_backward_a");
+                kA.SetArg(0, DetectionBufHandle(gradOutput));
+                kA.SetArg(1, DetectionBufHandle(boxesA));
+                kA.SetArg(2, DetectionBufHandle(boxesB));
+                kA.SetArg(3, DetectionBufHandle(gradA));
+                kA.SetArg(4, n);
+                kA.SetArg(5, m);
+                kA.SetArg(6, variant);
+                kA.Execute1D(RoundUpToDetectionGroup(n), DetectionLocalSize);
+            }
 
-            var kB = GetDetectionKernel("detection_iou_backward_b");
-            kB.SetArg(0, DetectionBufHandle(gradOutput));
-            kB.SetArg(1, DetectionBufHandle(boxesA));
-            kB.SetArg(2, DetectionBufHandle(boxesB));
-            kB.SetArg(3, DetectionBufHandle(gradB));
-            kB.SetArg(4, n);
-            kB.SetArg(5, m);
-            kB.SetArg(6, variant);
-            kB.Execute1D(RoundUpToDetectionGroup(m), DetectionLocalSize);
+            if (m > 0)
+            {
+                var kB = GetDetectionKernel("detection_iou_backward_b");
+                kB.SetArg(0, DetectionBufHandle(gradOutput));
+                kB.SetArg(1, DetectionBufHandle(boxesA));
+                kB.SetArg(2, DetectionBufHandle(boxesB));
+                kB.SetArg(3, DetectionBufHandle(gradB));
+                kB.SetArg(4, n);
+                kB.SetArg(5, m);
+                kB.SetArg(6, variant);
+                kB.Execute1D(RoundUpToDetectionGroup(m), DetectionLocalSize);
+            }
         }
     }
 }

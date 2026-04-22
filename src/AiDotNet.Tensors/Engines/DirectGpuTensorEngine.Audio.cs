@@ -14,34 +14,25 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null)
     {
-        if (typeof(T) == typeof(float))
+        if (typeof(T) == typeof(float) && !topDb.HasValue)
         {
-            try
+            // topDb=null has no reduction dependency so the GPU path is
+            // safe. topDb path needs a global peak; we leave it to CPU.
+            if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
-                if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
+                int len = input.Length;
+                if (len == 0) return new Tensor<T>((int[])input._shape.Clone());
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                var outBuf = AllocateOutputBuffer(backend, len);
+                try
                 {
-                    int len = input.Length;
-                    if (len == 0) return new Tensor<T>((int[])input._shape.Clone());
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    var outBuf = AllocateOutputBuffer(backend, len);
-                    try
-                    {
-                        // When topDb is requested, we still need the peak to set
-                        // the floor. Rather than reduce on GPU here we route
-                        // through CPU for that case (rare fast path).
-                        if (!topDb.HasValue)
-                        {
-                            audio.AmplitudeToDB(inBuf.Buffer, outBuf.Buffer, len,
-                                minAmplitude, 0.0f, clipTopDb: false);
-                            var arr = FinishGpuOp<T>(backend, outBuf, len);
-                            return new Tensor<T>(arr, (int[])input._shape.Clone());
-                        }
-                    }
-                    catch { outBuf.Dispose(); throw; }
-                    outBuf.Dispose();
+                    audio.AmplitudeToDB(inBuf.Buffer, outBuf.Buffer, len,
+                        minAmplitude, 0.0f, clipTopDb: false);
+                    var arr = FinishGpuOp<T>(backend, outBuf, len);
+                    return new Tensor<T>(arr, (int[])input._shape.Clone());
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.AmplitudeToDB(input, minAmplitude, topDb);
     }
@@ -49,10 +40,9 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
     {
-        // GPU kernel writes float-valued codes into a float buffer; convert
-        // to int on the CPU side so the public contract holds. For really
-        // large inputs where T=float we could add a dedicated int-writing
-        // kernel later — tracked separately; correctness first.
+        if (quantizationChannels <= 1)
+            throw new ArgumentException("quantizationChannels must be > 1 (μ = qc − 1 must be positive).",
+                nameof(quantizationChannels));
         if (typeof(T) == typeof(float))
         {
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
@@ -79,8 +69,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
-        // Upload the int codes as floats (kernel expects float), decode on
-        // GPU, return as T via the normal FinishGpuOp path.
+        if (quantizationChannels <= 1)
+            throw new ArgumentException("quantizationChannels must be > 1.", nameof(quantizationChannels));
         if (typeof(T) == typeof(float))
         {
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
@@ -109,26 +99,28 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5)
     {
+        if (winLength < 3 || (winLength & 1) == 0)
+            throw new ArgumentException(
+                "winLength must be an odd integer >= 3 (denominator 2·Σk² collapses to 0 otherwise).",
+                nameof(winLength));
         if (typeof(T) == typeof(float) && input.Rank >= 1)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
-                if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
+                int timeAxis = input._shape[input.Rank - 1];
+                if (timeAxis == 0)
+                    return new Tensor<T>((int[])input._shape.Clone());
+                int leading = input.Length / timeAxis;
+                using var inBuf = GetOrAllocateBuffer(backend, input);
+                var outBuf = AllocateOutputBuffer(backend, input.Length);
+                try
                 {
-                    int timeAxis = input._shape[input.Rank - 1];
-                    int leading = input.Length / timeAxis;
-                    using var inBuf = GetOrAllocateBuffer(backend, input);
-                    var outBuf = AllocateOutputBuffer(backend, input.Length);
-                    try
-                    {
-                        audio.ComputeDeltas(inBuf.Buffer, outBuf.Buffer, leading, timeAxis, winLength);
-                        var arr = FinishGpuOp<T>(backend, outBuf, input.Length);
-                        return new Tensor<T>(arr, (int[])input._shape.Clone());
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    audio.ComputeDeltas(inBuf.Buffer, outBuf.Buffer, leading, timeAxis, winLength);
+                    var arr = FinishGpuOp<T>(backend, outBuf, input.Length);
+                    return new Tensor<T>(arr, (int[])input._shape.Clone());
                 }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.ComputeDeltas(input, winLength);
     }
@@ -136,42 +128,50 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
-        if (typeof(T) == typeof(float) && waveform.Rank >= 1 && origRate > 0 && newRate > 0 && origRate != newRate)
+        if (typeof(T) == typeof(float) && waveform.Rank >= 1
+            && origRate > 0 && newRate > 0 && origRate != newRate)
         {
-            try
+            if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
-                if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
+                int inLen = waveform._shape[waveform.Rank - 1];
+                if (inLen == 0)
                 {
-                    int gcd = Gcd(origRate, newRate);
-                    int up = newRate / gcd;
-                    int down = origRate / gcd;
-                    int halfWidth = Math.Max(8, Math.Min(256, up * 8));
-
-                    int inLen = waveform._shape[waveform.Rank - 1];
-                    int outLen = (int)((long)inLen * up / down);
-                    int leading = waveform.Length / inLen;
-                    int outTotal = leading * outLen;
-                    if (outTotal == 0)
-                    {
-                        var emptyShape = (int[])waveform._shape.Clone();
-                        emptyShape[waveform.Rank - 1] = outLen;
-                        return new Tensor<T>(emptyShape);
-                    }
-
-                    using var inBuf = GetOrAllocateBuffer(backend, waveform);
-                    var outBuf = AllocateOutputBuffer(backend, outTotal);
-                    try
-                    {
-                        audio.Resample(inBuf.Buffer, outBuf.Buffer, leading, inLen, outLen, up, down, halfWidth);
-                        var arr = FinishGpuOp<T>(backend, outBuf, outTotal);
-                        var outShape = (int[])waveform._shape.Clone();
-                        outShape[waveform.Rank - 1] = outLen;
-                        return new Tensor<T>(arr, outShape);
-                    }
-                    catch { outBuf.Dispose(); throw; }
+                    var emptyShape = (int[])waveform._shape.Clone();
+                    emptyShape[waveform.Rank - 1] = 0;
+                    return new Tensor<T>(emptyShape);
                 }
+                int gcd = Gcd(origRate, newRate);
+                int up = newRate / gcd;
+                int down = origRate / gcd;
+                int halfWidth = Math.Max(8, Math.Min(256, up * 8));
+
+                int outLen = (int)((long)inLen * up / down);
+                int leading = waveform.Length / inLen;
+                // Widened arithmetic guards int overflow on huge waveforms.
+                long outTotal64 = checked((long)leading * outLen);
+                if (outTotal64 > int.MaxValue)
+                    throw new OverflowException(
+                        $"Resample output element count {outTotal64} exceeds Int32.MaxValue.");
+                int outTotal = (int)outTotal64;
+                if (outTotal == 0)
+                {
+                    var emptyShape = (int[])waveform._shape.Clone();
+                    emptyShape[waveform.Rank - 1] = outLen;
+                    return new Tensor<T>(emptyShape);
+                }
+
+                using var inBuf = GetOrAllocateBuffer(backend, waveform);
+                var outBuf = AllocateOutputBuffer(backend, outTotal);
+                try
+                {
+                    audio.Resample(inBuf.Buffer, outBuf.Buffer, leading, inLen, outLen, up, down, halfWidth);
+                    var arr = FinishGpuOp<T>(backend, outBuf, outTotal);
+                    var outShape = (int[])waveform._shape.Clone();
+                    outShape[waveform.Rank - 1] = outLen;
+                    return new Tensor<T>(arr, outShape);
+                }
+                catch { outBuf.Dispose(); throw; }
             }
-            catch { }
         }
         return base.Resample(waveform, origRate, newRate);
     }

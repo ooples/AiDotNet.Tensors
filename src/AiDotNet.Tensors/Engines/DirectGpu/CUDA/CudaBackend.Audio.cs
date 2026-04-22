@@ -60,7 +60,10 @@ public sealed partial class CudaBackend : IAudioBackend
     public unsafe void ComputeDeltas(IGpuBuffer input, IGpuBuffer output,
         int leading, int timeAxis, int winLength)
     {
-        int total = leading * timeAxis;
+        long totalLong = (long)leading * timeAxis;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"ComputeDeltas total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         if (total <= 0) return;
         var kernel = ResolveAudioKernel("audio_compute_deltas");
         using var _ = PushContext();
@@ -76,7 +79,10 @@ public sealed partial class CudaBackend : IAudioBackend
     public unsafe void Resample(IGpuBuffer input, IGpuBuffer output,
         int leading, int inLen, int outLen, int up, int down, int halfWidth)
     {
-        int total = leading * outLen;
+        long totalLong = (long)leading * outLen;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Resample total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         if (total <= 0) return;
         var kernel = ResolveAudioKernel("audio_resample");
         using var _ = PushContext();

@@ -77,6 +77,7 @@ struct P { leading: i32, timeAxis: i32, winLength: i32 };
     let t = gid % p.timeAxis;
     let row = gid / p.timeAxis;
     let n = p.winLength / 2;
+    if (n < 1) { output_[gid] = 0.0; return; }
     var denom : f32 = 0.0;
     for (var i : i32 = 1; i <= n; i = i + 1) { denom = denom + f32(2 * i * i); }
     var acc : f32 = 0.0;

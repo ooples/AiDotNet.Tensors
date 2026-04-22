@@ -78,7 +78,11 @@ public sealed partial class CudaBackend : IDetectionBackend
         IGpuBuffer gradA, IGpuBuffer gradB,
         int n, int m, int variant)
     {
-        if (n <= 0 || m <= 0) return;
+        // Don't short-circuit on n==0 or m==0: the kernel's inner for-loop
+        // over the other dim is empty in that case and each thread writes
+        // zero, which is the correct gradient. Skipping would leak stale
+        // pooled-buffer values into autodiff.
+        if (n <= 0 && m <= 0) return;
         var kernelA = ResolveDetectionKernel("detection_iou_backward_a");
         var kernelB = ResolveDetectionKernel("detection_iou_backward_b");
         using var _ = PushContext();
@@ -86,16 +90,22 @@ public sealed partial class CudaBackend : IDetectionBackend
         IntPtr gAPtr = gradA.Handle, gBPtr = gradB.Handle;
         int nn = n, mm = m, vv = variant;
 
-        uint gridA = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** argsA = stackalloc void*[7];
-        argsA[0] = &goPtr; argsA[1] = &aPtr; argsA[2] = &bPtr;
-        argsA[3] = &gAPtr; argsA[4] = &nn; argsA[5] = &mm; argsA[6] = &vv;
-        LaunchKernel(kernelA, gridA, DefaultBlockSize, argsA);
+        if (n > 0)
+        {
+            uint gridA = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsA = stackalloc void*[7];
+            argsA[0] = &goPtr; argsA[1] = &aPtr; argsA[2] = &bPtr;
+            argsA[3] = &gAPtr; argsA[4] = &nn; argsA[5] = &mm; argsA[6] = &vv;
+            LaunchKernel(kernelA, gridA, DefaultBlockSize, argsA);
+        }
 
-        uint gridB = (uint)((m + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** argsB = stackalloc void*[7];
-        argsB[0] = &goPtr; argsB[1] = &aPtr; argsB[2] = &bPtr;
-        argsB[3] = &gBPtr; argsB[4] = &nn; argsB[5] = &mm; argsB[6] = &vv;
-        LaunchKernel(kernelB, gridB, DefaultBlockSize, argsB);
+        if (m > 0)
+        {
+            uint gridB = (uint)((m + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsB = stackalloc void*[7];
+            argsB[0] = &goPtr; argsB[1] = &aPtr; argsB[2] = &bPtr;
+            argsB[3] = &gBPtr; argsB[4] = &nn; argsB[5] = &mm; argsB[6] = &vv;
+            LaunchKernel(kernelB, gridB, DefaultBlockSize, argsB);
+        }
     }
 }

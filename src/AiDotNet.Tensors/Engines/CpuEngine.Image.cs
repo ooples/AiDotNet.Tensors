@@ -42,8 +42,13 @@ public partial class CpuEngine
         if (image.Rank != 3)
             throw new ArgumentException("image must be rank-3 [H, W, C].");
         int C = image._shape[2];
-        if (C != 1 && C != 3 && C != 4)
-            throw new ArgumentException("channels must be 1 (grey), 3 (RGB), or 4 (RGBA).");
+        // PNG colour types 0/2/3/4/6 map to C in {1, 3, 1, 2, 4}. Accept
+        // all five (2 = grey+alpha) to match what PngCodec.Encode actually
+        // supports. Only JPEG is channel-restricted below.
+        if (C != 1 && C != 2 && C != 3 && C != 4)
+            throw new ArgumentException("channels must be 1 (grey), 2 (grey+alpha), 3 (RGB), or 4 (RGBA).");
+        if (format == ImageFormat.Jpeg && C == 2)
+            throw new ArgumentException("JPEG does not support 2-channel grey+alpha.");
         return format switch
         {
             ImageFormat.Png => PngCodec.Encode(image),
@@ -88,10 +93,14 @@ internal static class PngCodec
 
         while (pos < data.Length)
         {
+            if (pos + 8 > data.Length) throw new InvalidDataException("PNG: truncated chunk header.");
             int chunkLen = ReadBE(data, pos); pos += 4;
+            if (chunkLen < 0 || chunkLen > data.Length - pos - 4)
+                throw new InvalidDataException("PNG: chunk length exceeds buffer.");
             string type = System.Text.Encoding.ASCII.GetString(data, pos, 4); pos += 4;
             if (type == "IHDR")
             {
+                if (chunkLen < 13) throw new InvalidDataException("PNG: truncated IHDR.");
                 width = ReadBE(data, pos); height = ReadBE(data, pos + 4);
                 bitDepth = data[pos + 8]; colorType = data[pos + 9];
                 interlace = data[pos + 12];
@@ -109,6 +118,8 @@ internal static class PngCodec
             if (type == "IEND") break;
         }
 
+        if (width <= 0 || height <= 0 || (long)width * height > int.MaxValue / 8)
+            throw new InvalidDataException($"PNG: invalid or oversized dimensions {width}×{height}.");
         if (bitDepth != 8) throw new NotSupportedException("PNG: only 8-bit depth supported.");
         if (interlace != 0) throw new NotSupportedException("PNG: interlaced images not supported.");
         int channels = colorType switch { 0 => 1, 2 => 3, 3 => 1, 4 => 2, 6 => 4, _ => throw new InvalidDataException("PNG: unknown colour type.") };

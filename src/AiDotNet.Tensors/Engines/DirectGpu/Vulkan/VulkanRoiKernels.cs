@@ -101,6 +101,7 @@ void main() {
     if (ry < 1) ry = 1;
     if (rx < 1) rx = 1;
     int c = (co * outH + ph) * outW + pw;
+    if (c >= C) { output_[gid] = 0.0; return; }
     uint planeBase = uint((n * C + c) * H * W);
     float acc = 0.0;
     for (int iy = 0; iy < ry; iy++) {
@@ -137,6 +138,7 @@ void main() {
     float binH = max(y2 - y1, 0.1) / outH;
     float binW = max(x2 - x1, 0.1) / outW;
     int c = (co * outH + ph) * outW + pw;
+    if (c >= C) { output_[gid] = 0.0; return; }
     int hs = int(max(0.0, floor(y1 + ph * binH)));
     int he = int(min(float(H), ceil(y1 + (ph + 1) * binH)));
     int ws = int(max(0.0, floor(x1 + pw * binW)));

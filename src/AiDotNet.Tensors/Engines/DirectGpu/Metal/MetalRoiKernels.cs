@@ -155,6 +155,7 @@ kernel void ps_roi_align(
     if (rx < 1) rx = 1;
 
     int c = (co * outH + ph) * outW + pw;
+    if (c >= C) { output[gid] = 0.0; return; }
     int planeBase = (n * C + c) * H * W;
     float acc = 0;
     for (int iy = 0; iy < ry; iy++) {
@@ -194,6 +195,7 @@ kernel void ps_roi_pool(
     float binW = max(x2 - x1, 0.1f) / outW;
 
     int c = (co * outH + ph) * outW + pw;
+    if (c >= C) { output[gid] = 0.0; return; }
     int planeBase = (n * C + c) * H * W;
     int hs = (int)max(0.0f, floor(y1 + ph * binH));
     int he = (int)min(float(H), ceil(y1 + (ph + 1) * binH));

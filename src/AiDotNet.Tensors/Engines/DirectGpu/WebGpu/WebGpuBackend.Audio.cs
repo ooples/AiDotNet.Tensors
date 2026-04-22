@@ -54,7 +54,11 @@ public sealed partial class WebGpuBackend
     public async Task ComputeDeltasAsync(IGpuBuffer input, IGpuBuffer output,
         int leading, int timeAxis, int winLength)
     {
-        int total = leading * timeAxis;
+        // Widened arithmetic — large feature stacks can wrap in int.
+        long totalLong = (long)leading * timeAxis;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"ComputeDeltas total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         if (total <= 0) return;
         var pipe = await GetOrCreatePipelineAsync(
             AudioModuleKey + ":ComputeDeltas", WebGpuAudioKernels.ComputeDeltas, "main");
@@ -69,7 +73,10 @@ public sealed partial class WebGpuBackend
     public async Task ResampleAsync(IGpuBuffer input, IGpuBuffer output,
         int leading, int inLen, int outLen, int up, int down, int halfWidth)
     {
-        int total = leading * outLen;
+        long totalLong2 = (long)leading * outLen;
+        if (totalLong2 > int.MaxValue)
+            throw new OverflowException($"Resample total {totalLong2} exceeds Int32.MaxValue.");
+        int total = (int)totalLong2;
         if (total <= 0) return;
         var pipe = await GetOrCreatePipelineAsync(
             AudioModuleKey + ":Resample", WebGpuAudioKernels.Resample, "main");

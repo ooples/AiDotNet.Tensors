@@ -75,24 +75,31 @@ public sealed partial class HipBackend : IDetectionBackend
         IGpuBuffer gradA, IGpuBuffer gradB,
         int n, int m, int variant)
     {
-        if (n <= 0 || m <= 0) return;
+        // See CudaBackend.Detection for the rationale on not short-circuiting n=0 XOR m=0.
+        if (n <= 0 && m <= 0) return;
         var kernelA = ResolveDetectionKernel("detection_iou_backward_a");
         var kernelB = ResolveDetectionKernel("detection_iou_backward_b");
         IntPtr goPtr = gradOutput.Handle, aPtr = boxesA.Handle, bPtr = boxesB.Handle;
         IntPtr gAPtr = gradA.Handle, gBPtr = gradB.Handle;
         int nn = n, mm = m, vv = variant;
 
-        uint gridA = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** argsA = stackalloc void*[7];
-        argsA[0] = &goPtr; argsA[1] = &aPtr; argsA[2] = &bPtr;
-        argsA[3] = &gAPtr; argsA[4] = &nn; argsA[5] = &mm; argsA[6] = &vv;
-        LaunchKernel(kernelA, gridA, DefaultBlockSize, argsA);
+        if (n > 0)
+        {
+            uint gridA = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsA = stackalloc void*[7];
+            argsA[0] = &goPtr; argsA[1] = &aPtr; argsA[2] = &bPtr;
+            argsA[3] = &gAPtr; argsA[4] = &nn; argsA[5] = &mm; argsA[6] = &vv;
+            LaunchKernel(kernelA, gridA, DefaultBlockSize, argsA);
+        }
 
-        uint gridB = (uint)((m + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** argsB = stackalloc void*[7];
-        argsB[0] = &goPtr; argsB[1] = &aPtr; argsB[2] = &bPtr;
-        argsB[3] = &gBPtr; argsB[4] = &nn; argsB[5] = &mm; argsB[6] = &vv;
-        LaunchKernel(kernelB, gridB, DefaultBlockSize, argsB);
+        if (m > 0)
+        {
+            uint gridB = (uint)((m + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsB = stackalloc void*[7];
+            argsB[0] = &goPtr; argsB[1] = &aPtr; argsB[2] = &bPtr;
+            argsB[3] = &gBPtr; argsB[4] = &nn; argsB[5] = &mm; argsB[6] = &vv;
+            LaunchKernel(kernelB, gridB, DefaultBlockSize, argsB);
+        }
         Synchronize();
     }
 }

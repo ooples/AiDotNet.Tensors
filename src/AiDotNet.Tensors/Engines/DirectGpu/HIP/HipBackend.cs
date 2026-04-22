@@ -561,8 +561,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
                 CompileKernelModule(Kernels.HipDetectionKernels.GetSource(), "detection",
                     ref _detectionModule, Kernels.HipDetectionKernels.GetKernelNames());
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"HIP detection kernel compilation failed: {ex.Message}");
                 _detectionModule = IntPtr.Zero;
             }
 
@@ -572,8 +573,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
                 CompileKernelModule(Kernels.HipGeometryKernels.GetSource(), "geometry",
                     ref _geometryModule, Kernels.HipGeometryKernels.GetKernelNames());
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"HIP geometry kernel compilation failed: {ex.Message}");
                 _geometryModule = IntPtr.Zero;
             }
 
@@ -583,8 +585,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
                 CompileKernelModule(Kernels.HipRoiKernels.GetSource(), "roi",
                     ref _roiModule, Kernels.HipRoiKernels.GetKernelNames());
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"HIP RoI kernel compilation failed: {ex.Message}");
                 _roiModule = IntPtr.Zero;
             }
 
@@ -594,8 +597,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
                 CompileKernelModule(Kernels.HipAudioKernels.GetSource(), "audio",
                     ref _audioModule, Kernels.HipAudioKernels.GetKernelNames());
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"HIP audio kernel compilation failed: {ex.Message}");
                 _audioModule = IntPtr.Zero;
             }
 

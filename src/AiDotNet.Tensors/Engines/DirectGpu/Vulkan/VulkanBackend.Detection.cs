@@ -58,11 +58,19 @@ public sealed unsafe partial class VulkanBackend : IDetectionBackend
         IGpuBuffer gradA, IGpuBuffer gradB,
         int n, int m, int variant)
     {
-        if (n <= 0 || m <= 0) return;
+        // Don't short-circuit on n==0 or m==0: the kernels iterate the
+        // "other" dim with a for-loop, so when M==0 the A-side kernel
+        // writes zero sums for each of N rows (correct), and symmetric
+        // for N==0. Skipping the dispatch would leak whatever stale data
+        // was in the pooled gradA/gradB buffers into autodiff. Only bail
+        // when BOTH dims are zero (nothing to write).
+        if (n <= 0 && m <= 0) return;
         var pc = new uint[] { (uint)n, (uint)m, (uint)variant };
-        GlslQuadOp(VulkanDetectionKernels.IouBackwardA,
-            gradOutput, boxesA, boxesB, gradA, n, pc, DetectionPushNMVariant);
-        GlslQuadOp(VulkanDetectionKernels.IouBackwardB,
-            gradOutput, boxesA, boxesB, gradB, m, pc, DetectionPushNMVariant);
+        if (n > 0)
+            GlslQuadOp(VulkanDetectionKernels.IouBackwardA,
+                gradOutput, boxesA, boxesB, gradA, n, pc, DetectionPushNMVariant);
+        if (m > 0)
+            GlslQuadOp(VulkanDetectionKernels.IouBackwardB,
+                gradOutput, boxesA, boxesB, gradB, m, pc, DetectionPushNMVariant);
     }
 }

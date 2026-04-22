@@ -171,6 +171,7 @@ fn ps_bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
     if (ry < 1) { ry = 1; }
     if (rx < 1) { rx = 1; }
     let c = (co * p.outH + ph) * p.outW + pw;
+    if (c >= p.C) { output_[gid] = 0.0; return; }
     let planeBase = (n * p.C + c) * p.H * p.W;
     var acc : f32 = 0.0;
     for (var iy : i32 = 0; iy < ry; iy = iy + 1) {

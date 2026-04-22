@@ -89,7 +89,9 @@ public sealed partial class MetalBackend : IDetectionBackend
         IGpuBuffer gradA, IGpuBuffer gradB,
         int n, int m, int variant)
     {
-        if (n <= 0 || m <= 0) return;
+        // See CudaBackend.Detection for rationale — dispatch each side
+        // independently when only one dim is zero.
+        if (n <= 0 && m <= 0) return;
         ThrowIfDisposed();
         if (gradOutput is not MetalGpuBuffer goBuf
             || boxesA is not MetalGpuBuffer aBuf
@@ -99,35 +101,41 @@ public sealed partial class MetalBackend : IDetectionBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
         // A-side: N threads.
-        var pipeA = GetDetectionPipeline("detection_iou_backward_a");
-        var (tgrA, tpgA) = pipeA.Calculate1DDispatch(n);
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        if (n > 0)
         {
-            encoder.SetPipelineState(pipeA.Handle);
-            encoder.SetBuffer(goBuf, 0);
-            encoder.SetBuffer(aBuf, 1);
-            encoder.SetBuffer(bBuf, 2);
-            encoder.SetBuffer(gABuf, 3);
-            encoder.SetBytes(n, 4);
-            encoder.SetBytes(m, 5);
-            encoder.SetBytes(variant, 6);
-            encoder.DispatchThreadgroups(tgrA, tpgA);
+            var pipeA = GetDetectionPipeline("detection_iou_backward_a");
+            var (tgrA, tpgA) = pipeA.Calculate1DDispatch(n);
+            using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+            {
+                encoder.SetPipelineState(pipeA.Handle);
+                encoder.SetBuffer(goBuf, 0);
+                encoder.SetBuffer(aBuf, 1);
+                encoder.SetBuffer(bBuf, 2);
+                encoder.SetBuffer(gABuf, 3);
+                encoder.SetBytes(n, 4);
+                encoder.SetBytes(m, 5);
+                encoder.SetBytes(variant, 6);
+                encoder.DispatchThreadgroups(tgrA, tpgA);
+            }
         }
 
         // B-side: M threads.
-        var pipeB = GetDetectionPipeline("detection_iou_backward_b");
-        var (tgrB, tpgB) = pipeB.Calculate1DDispatch(m);
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        if (m > 0)
         {
-            encoder.SetPipelineState(pipeB.Handle);
-            encoder.SetBuffer(goBuf, 0);
-            encoder.SetBuffer(aBuf, 1);
-            encoder.SetBuffer(bBuf, 2);
-            encoder.SetBuffer(gBBuf, 3);
-            encoder.SetBytes(n, 4);
-            encoder.SetBytes(m, 5);
-            encoder.SetBytes(variant, 6);
-            encoder.DispatchThreadgroups(tgrB, tpgB);
+            var pipeB = GetDetectionPipeline("detection_iou_backward_b");
+            var (tgrB, tpgB) = pipeB.Calculate1DDispatch(m);
+            using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+            {
+                encoder.SetPipelineState(pipeB.Handle);
+                encoder.SetBuffer(goBuf, 0);
+                encoder.SetBuffer(aBuf, 1);
+                encoder.SetBuffer(bBuf, 2);
+                encoder.SetBuffer(gBBuf, 3);
+                encoder.SetBytes(n, 4);
+                encoder.SetBytes(m, 5);
+                encoder.SetBytes(variant, 6);
+                encoder.DispatchThreadgroups(tgrB, tpgB);
+            }
         }
     }
 }
