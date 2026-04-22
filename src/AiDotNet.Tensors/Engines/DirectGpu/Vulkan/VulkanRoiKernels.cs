@@ -8,6 +8,7 @@ layout(local_size_x = 256) in;
 
     private const string Helper = @"
 float bilinear_sample(uint planeBase, float y, float x, int H, int W) {
+    if (H <= 0 || W <= 0) return 0.0;
     if (y < -1.0 || y > float(H) || x < -1.0 || x > float(W)) return 0.0;
     if (y <= 0.0) y = 0.0;
     if (x <= 0.0) x = 0.0;

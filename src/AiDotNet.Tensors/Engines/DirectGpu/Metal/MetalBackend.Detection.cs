@@ -25,7 +25,10 @@ public sealed partial class MetalBackend : IDetectionBackend
         if (a is not MetalGpuBuffer aBuf || b is not MetalGpuBuffer bBuf
             || output is not MetalGpuBuffer outBuf)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        int total = n * m;
+        long totalLong = (long)n * m;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         var pipeline = GetDetectionPipeline(kernelName);
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();

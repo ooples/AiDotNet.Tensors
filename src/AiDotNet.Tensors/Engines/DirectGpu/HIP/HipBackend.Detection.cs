@@ -10,7 +10,9 @@ public sealed partial class HipBackend : IDetectionBackend
     {
         if (_detectionModule == IntPtr.Zero)
             throw new InvalidOperationException(
-                "Detection HIP module was not compiled (hipRTC rejected source?). Falling back to CPU reference.");
+                "Detection HIP module was not compiled (hipRTC rejected source?). " +
+                "DirectGpuTensorEngine catches this and routes to the CpuEngine reference; " +
+                "direct callers to HipBackend see this exception.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
             throw new InvalidOperationException($"HIP kernel not found: {name}");
         return kernel;
@@ -20,8 +22,11 @@ public sealed partial class HipBackend : IDetectionBackend
         string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int m)
     {
         if (n <= 0 || m <= 0) return;
+        long totalLong = (long)n * m;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
         var kernel = ResolveDetectionKernel(kernelName);
-        int total = n * m;
+        int total = (int)totalLong;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = a.Handle, bPtr = b.Handle, oPtr = output.Handle;
         int nn = n, mm = m;

@@ -38,6 +38,7 @@ kernel void audio_mulaw_encoding(
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= length) return;
+    if (quantizationChannels < 2) { output[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
     float logMu = log(1.0 + mu);
     float x = input[gid];
@@ -57,6 +58,7 @@ kernel void audio_mulaw_decoding(
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= length) return;
+    if (quantizationChannels < 2) { output[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
     float q = input[gid];
     float y = (q / mu) * 2.0 - 1.0;
@@ -103,6 +105,7 @@ kernel void audio_resample(
 {
     int total = leading * outLen;
     if ((int)gid >= total) return;
+    if (halfWidth < 1 || up <= 0 || down <= 0) { output[gid] = 0.0; return; }
     int ot = (int)gid % outLen;
     int row = (int)gid / outLen;
     int sBase = row * inLen;

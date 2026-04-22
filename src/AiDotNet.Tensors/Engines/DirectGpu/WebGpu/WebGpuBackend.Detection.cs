@@ -20,7 +20,10 @@ public sealed partial class WebGpuBackend
         IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
     {
         if (n <= 0 || m <= 0) return;
-        int total = n * m;
+        long totalLong = (long)n * m;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         var pipelineId = await GetOrCreatePipelineAsync(
             DetectionModuleKey + ":" + tag, source, "main");
         using var uniforms = new WebGpuBuffer(

@@ -85,6 +85,7 @@ __kernel void audio_resample(
     int gid = get_global_id(0);
     int total = leading * outLen;
     if (gid >= total) return;
+    if (halfWidth < 1 || up <= 0 || down <= 0) { output[gid] = 0.0f; return; }
     int ot = gid % outLen;
     int row = gid / outLen;
     int sBase = row * inLen;

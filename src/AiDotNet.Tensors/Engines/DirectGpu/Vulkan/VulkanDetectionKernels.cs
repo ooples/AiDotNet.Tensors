@@ -9,6 +9,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// </summary>
 public static class VulkanDetectionKernels
 {
+    // Vulkan spec guarantees maxComputeWorkGroupInvocations >= 128 (spec
+    // minimum), and every consumer GPU in the last decade supports 1024.
+    // 256 is the idiomatic work-group size used across every other kernel
+    // file in this repo (Parity-210, Linalg, FFT, Detection forward).
+    // Specialization constants would require runtime device queries that
+    // existing pipelines don't use; keeping 256 matches the repo-wide
+    // convention and is safe on all conformant Vulkan implementations.
     private const string Header = @"#version 450
 layout(local_size_x = 256) in;
 ";

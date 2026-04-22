@@ -27,6 +27,7 @@ layout(push_constant) uniform P { int length; int quantizationChannels; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= length) return;
+    if (quantizationChannels < 2) { output_[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
     float logMu = log(1.0 + mu);
     float x = input_[gid];
@@ -46,6 +47,7 @@ layout(push_constant) uniform P { int length; int quantizationChannels; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= length) return;
+    if (quantizationChannels < 2) { output_[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
     float q = input_[gid];
     float y = (q / mu) * 2.0 - 1.0;
@@ -89,6 +91,7 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int total = leading * outLen;
     if (gid >= total) return;
+    if (halfWidth < 1 || up <= 0 || down <= 0) { output_[gid] = 0.0; return; }
     int ot = gid % outLen;
     int row = gid / outLen;
     int sBase = row * inLen;

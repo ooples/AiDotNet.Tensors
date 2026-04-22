@@ -11,6 +11,10 @@ public sealed partial class WebGpuBackend
         float minAmplitude, float topDb, bool clipTopDb)
     {
         if (length <= 0) return;
+        if (!(minAmplitude > 0.0f))
+            throw new ArgumentException(
+                $"minAmplitude must be > 0 (log10 needs a positive floor); got {minAmplitude}.",
+                nameof(minAmplitude));
         var pipe = await GetOrCreatePipelineAsync(
             AudioModuleKey + ":AmplitudeToDB", WebGpuAudioKernels.AmplitudeToDB, "main");
         var u = new float[4];
@@ -28,6 +32,7 @@ public sealed partial class WebGpuBackend
     public async Task MuLawEncodingAsync(IGpuBuffer input, IGpuBuffer output, int length, int qc)
     {
         if (length <= 0) return;
+        if (qc < 2) throw new ArgumentException("qc must be >= 2.", nameof(qc));
         var pipe = await GetOrCreatePipelineAsync(
             AudioModuleKey + ":MuLawEncoding", WebGpuAudioKernels.MuLawEncoding, "main");
         using var uniforms = new WebGpuBuffer(UniformInts(length, qc),
@@ -41,6 +46,7 @@ public sealed partial class WebGpuBackend
     public async Task MuLawDecodingAsync(IGpuBuffer input, IGpuBuffer output, int length, int qc)
     {
         if (length <= 0) return;
+        if (qc < 2) throw new ArgumentException("qc must be >= 2.", nameof(qc));
         var pipe = await GetOrCreatePipelineAsync(
             AudioModuleKey + ":MuLawDecoding", WebGpuAudioKernels.MuLawDecoding, "main");
         using var uniforms = new WebGpuBuffer(UniformInts(length, qc),
@@ -73,6 +79,10 @@ public sealed partial class WebGpuBackend
     public async Task ResampleAsync(IGpuBuffer input, IGpuBuffer output,
         int leading, int inLen, int outLen, int up, int down, int halfWidth)
     {
+        if (up <= 0 || down <= 0)
+            throw new ArgumentException("up and down must both be positive.");
+        if (halfWidth < 1)
+            throw new ArgumentException("halfWidth must be >= 1 (Hann window needs at least one tap).", nameof(halfWidth));
         long totalLong2 = (long)leading * outLen;
         if (totalLong2 > int.MaxValue)
             throw new OverflowException($"Resample total {totalLong2} exceeds Int32.MaxValue.");

@@ -99,6 +99,9 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_resample(
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = leading * outLen;
     if (gid >= total) return;
+    // Defensive: halfWidth == 0 → Hann cos(2π·k/0) divides by zero.
+    // up == 0 or down == 0 are nonsense for resampling.
+    if (halfWidth < 1 || up <= 0 || down <= 0) { output[gid] = 0.0f; return; }
     int ot = gid % outLen;
     int row = gid / outLen;
     int sBase = row * inLen;

@@ -43,7 +43,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void DispatchPairwiseIou(string kernelName,
             IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
         {
-            int total = n * m;
+            long totalLong = (long)n * m;
+            if (totalLong > int.MaxValue)
+                throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
+            int total = (int)totalLong;
             if (total <= 0) return;
             var k = GetDetectionKernel(kernelName);
             k.SetArg(0, DetectionBufHandle(boxesA));

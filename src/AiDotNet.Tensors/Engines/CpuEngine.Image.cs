@@ -41,6 +41,9 @@ public partial class CpuEngine
         if (image is null) throw new ArgumentNullException(nameof(image));
         if (image.Rank != 3)
             throw new ArgumentException("image must be rank-3 [H, W, C].");
+        if ((format == ImageFormat.Jpeg || format == ImageFormat.WebP) && (quality < 0 || quality > 100))
+            throw new ArgumentOutOfRangeException(nameof(quality),
+                $"quality must be in [0, 100] for lossy formats; got {quality}.");
         int C = image._shape[2];
         // PNG colour types 0/2/3/4/6 map to C in {1, 3, 1, 2, 4}. Accept
         // all five (2 = grey+alpha) to match what PngCodec.Encode actually
@@ -359,6 +362,8 @@ internal static class JpegBinding
         {
             int r = tjDecompressHeader3(h, data, (ulong)data.Length, out int w, out int height, out _, out _);
             if (r != 0) throw new InvalidDataException("JPEG header read failed.");
+            if (w <= 0 || height <= 0 || (long)w * height * 3 > int.MaxValue)
+                throw new InvalidDataException($"JPEG: invalid or oversized dimensions {w}×{height}.");
             var px = new byte[w * height * 3];
             r = tjDecompress2(h, data, (ulong)data.Length, px, w, 0, height, TJPF_RGB, 0);
             if (r != 0) throw new InvalidDataException("JPEG decode failed.");
@@ -424,6 +429,11 @@ internal static class WebPBinding
                 "'webp' can be loaded.", ex);
         }
         if (ptr == IntPtr.Zero) throw new InvalidDataException("WebP decode failed.");
+        if (w <= 0 || h <= 0 || (long)w * h * 4 > int.MaxValue)
+        {
+            WebPFree(ptr);
+            throw new InvalidDataException($"WebP: invalid or oversized dimensions {w}×{h}.");
+        }
         try
         {
             var bytes = new byte[w * h * 4];

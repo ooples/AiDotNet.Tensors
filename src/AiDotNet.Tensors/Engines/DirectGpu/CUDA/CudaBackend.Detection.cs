@@ -23,9 +23,12 @@ public sealed partial class CudaBackend : IDetectionBackend
         string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int m)
     {
         if (n <= 0 || m <= 0) return;
+        long totalLong = (long)n * m;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
         var kernel = ResolveDetectionKernel(kernelName);
         using var _ = PushContext();
-        int total = n * m;
+        int total = (int)totalLong;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = a.Handle, bPtr = b.Handle, oPtr = output.Handle;
         int nn = n, mm = m;

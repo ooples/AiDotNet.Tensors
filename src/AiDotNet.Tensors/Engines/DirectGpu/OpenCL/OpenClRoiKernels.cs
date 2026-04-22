@@ -14,6 +14,7 @@ public static class OpenClRoiKernels
 inline float bilinear_sample(__global const float* src, int planeBase,
     float y, float x, int H, int W)
 {
+    if (H <= 0 || W <= 0) return 0.0f;
     if (y < -1.0f || y > (float)H || x < -1.0f || x > (float)W) return 0.0f;
     if (y <= 0) y = 0;
     if (x <= 0) x = 0;

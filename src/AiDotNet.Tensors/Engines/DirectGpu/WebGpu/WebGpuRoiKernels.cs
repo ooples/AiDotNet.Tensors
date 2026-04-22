@@ -20,6 +20,7 @@ struct P {
 
 fn bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
     var y = y_in; var x = x_in;
+    if (p.H <= 0 || p.W <= 0) { return 0.0; }
     if (y < -1.0 || y > f32(p.H) || x < -1.0 || x > f32(p.W)) { return 0.0; }
     if (y <= 0.0) { y = 0.0; }
     if (x <= 0.0) { x = 0.0; }
@@ -132,6 +133,7 @@ struct P {
 
 fn ps_bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
     var y = y_in; var x = x_in;
+    if (p.H <= 0 || p.W <= 0) { return 0.0; }
     if (y < -1.0 || y > f32(p.H) || x < -1.0 || x > f32(p.W)) { return 0.0; }
     if (y <= 0.0) { y = 0.0; }
     if (x <= 0.0) { x = 0.0; }

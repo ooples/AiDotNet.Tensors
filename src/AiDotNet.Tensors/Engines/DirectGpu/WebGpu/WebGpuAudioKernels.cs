@@ -35,6 +35,7 @@ struct P { length: i32, quantizationChannels: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.length) { return; }
+    if (p.quantizationChannels < 2) { output_[gid] = 0.0; return; }
     let mu = f32(p.quantizationChannels - 1);
     let logMu = log(1.0 + mu);
     var x = input_[gid];
@@ -56,6 +57,7 @@ struct P { length: i32, quantizationChannels: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.length) { return; }
+    if (p.quantizationChannels < 2) { output_[gid] = 0.0; return; }
     let mu = f32(p.quantizationChannels - 1);
     let q = input_[gid];
     let y = (q / mu) * 2.0 - 1.0;
@@ -101,6 +103,7 @@ struct P { leading: i32, inLen: i32, outLen: i32, up: i32, down: i32, halfWidth:
     let gid = i32(id.x);
     let total = p.leading * p.outLen;
     if (gid >= total) { return; }
+    if (p.halfWidth < 1 || p.up <= 0 || p.down <= 0) { output_[gid] = 0.0; return; }
     let ot = gid % p.outLen;
     let row = gid / p.outLen;
     let sBase = row * p.inLen;

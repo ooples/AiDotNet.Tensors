@@ -16,7 +16,10 @@ public sealed unsafe partial class VulkanBackend : IDetectionBackend
         IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
     {
         if (n <= 0 || m <= 0) return;
-        int total = n * m;
+        long totalLong = (long)n * m;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException($"Pairwise IoU total {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         var pc = new uint[] { (uint)n, (uint)m };
         GlslBinaryOp(shader, boxesA, boxesB, output, total, pc, DetectionPushNm);
     }
