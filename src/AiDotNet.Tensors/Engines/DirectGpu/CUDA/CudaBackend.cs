@@ -58,6 +58,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
     private IntPtr _detectionModule;
+    private IntPtr _geometryModule;
     private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -727,6 +728,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _detectionModule = IntPtr.Zero;
+        }
+
+        // Geometry / sampling kernels (Issue #217 second half). Same
+        // best-effort policy — NVRTC failure falls through to CpuEngine.
+        try
+        {
+            _geometryModule = CompileKernelModule(device,
+                Kernels.CudaGeometryKernels.GetSource(),
+                "geometry_kernels",
+                Kernels.CudaGeometryKernels.GetKernelNames());
+        }
+        catch
+        {
+            _geometryModule = IntPtr.Zero;
         }
 
         // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:
