@@ -133,7 +133,7 @@ public static class OnnxImporter
         //    layers. Only fires when the input to Div is a regular tensor
         //    (not a constant) and the output of the final Mul has no other
         //    consumers, so rewrite is semantically equivalent.
-        var rewrittenNodes = GeluPatternRewriter.Rewrite(graph.Node);
+        var rewrittenNodes = GeluPatternRewriter.Rewrite(graph.Node, graph.Initializer);
 
         // ── Topologically sort nodes ──────────────────────────────────────
         var sortedNodes = TopologicalSort(graph, tensorsByName.Keys, rewrittenNodes);
