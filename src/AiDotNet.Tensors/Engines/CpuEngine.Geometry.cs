@@ -267,11 +267,11 @@ public partial class CpuEngine
                     double acc = 0.0;
                     for (int yy = 0; yy < 4; yy++)
                     {
-                        int yi = Math.Clamp(y0 - 1 + yy, 0, H - 1);
+                        int yi = ClampInt(y0 - 1 + yy, 0, H - 1);
                         double rowAcc = 0.0;
                         for (int xx = 0; xx < 4; xx++)
                         {
-                            int xi = Math.Clamp(x0 - 1 + xx, 0, W - 1);
+                            int xi = ClampInt(x0 - 1 + xx, 0, W - 1);
                             rowAcc += wx[xx] * ops.ToDouble(src[srcBase + yi * W + xi]);
                         }
                         acc += wy[yy] * rowAcc;
@@ -586,8 +586,8 @@ public partial class CpuEngine
                 if ((uint)y >= H || (uint)x >= W) return ops.Zero;
                 break;
             case GridSamplePadding.Border:
-                y = Math.Clamp(y, 0, H - 1);
-                x = Math.Clamp(x, 0, W - 1);
+                y = ClampInt(y, 0, H - 1);
+                x = ClampInt(x, 0, W - 1);
                 break;
             case GridSamplePadding.Reflection:
                 y = ReflectIndex(y, H);
@@ -596,6 +596,9 @@ public partial class CpuEngine
         }
         return src[((n * H + y) * W + x) * C + c];
     }
+
+    /// <summary>Math.Clamp isn't on net471. Inline helper.</summary>
+    private static int ClampInt(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
 
     private static int ReflectIndex(int i, int extent)
     {
