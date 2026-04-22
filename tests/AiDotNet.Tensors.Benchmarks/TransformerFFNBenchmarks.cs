@@ -63,6 +63,7 @@ public class TransformerFFNBenchmarks
     private Tensor<double> _dSmall_64x512 = null!;
     private Tensor<double> _dSmall_8x1024 = null!;
     private Tensor<double> _dSmall_16x256 = null!;
+    private Tensor<double> _dDown_64x2048 = null!;   // FFN-down input; kept out of the measured method
 
     private Tensor<double> _dW_512x2048 = null!;
     private Tensor<double> _dW_2048x512 = null!;
@@ -105,6 +106,7 @@ public class TransformerFFNBenchmarks
         _dSmall_64x512  = Tensor<double>.CreateRandom(64, 512);
         _dSmall_8x1024  = Tensor<double>.CreateRandom(8, 1024);
         _dSmall_16x256  = Tensor<double>.CreateRandom(16, 256);
+        _dDown_64x2048  = Tensor<double>.CreateRandom(64, 2048);
 
         _dW_512x2048   = Tensor<double>.CreateRandom(512, 2048);
         _dW_2048x512   = Tensor<double>.CreateRandom(2048, 512);
@@ -167,10 +169,7 @@ public class TransformerFFNBenchmarks
 
     [Benchmark(Description = "Dgemm ChronosBolt FFN down [64, 2048] x [2048, 512]")]
     public Tensor<double> Dgemm_ChronosBolt_FFNDown_64()
-    {
-        var x = Tensor<double>.CreateRandom(64, 2048);
-        return _engine.TensorMatMul(x, _dW_2048x512);
-    }
+        => _engine.TensorMatMul(_dDown_64x2048, _dW_2048x512);
 
     [Benchmark(Description = "Dgemm MOMENT      FFN up   [8, 1024] x [1024, 4096]")]
     public Tensor<double> Dgemm_MOMENT_FFNUp()
