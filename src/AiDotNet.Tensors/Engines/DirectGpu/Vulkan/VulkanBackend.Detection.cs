@@ -43,6 +43,9 @@ public sealed unsafe partial class VulkanBackend : IDetectionBackend
     public void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
     {
         if (n <= 0) return;
+        if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+            throw new ArgumentException(
+                $"fromFormat/toFormat must be 0/1/2; got {fromFormat}, {toFormat}.");
         var pc = new uint[] { (uint)n, (uint)fromFormat, (uint)toFormat };
         GlslUnaryOp(VulkanDetectionKernels.BoxConvert, boxes, output, n, pc, DetectionPushNFromTo);
     }

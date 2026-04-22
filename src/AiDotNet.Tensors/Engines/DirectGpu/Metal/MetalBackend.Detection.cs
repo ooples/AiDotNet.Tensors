@@ -69,6 +69,9 @@ public sealed partial class MetalBackend : IDetectionBackend
     public void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
     {
         if (n <= 0) return;
+        if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+            throw new ArgumentException(
+                $"fromFormat/toFormat must be 0/1/2; got {fromFormat}, {toFormat}.");
         ThrowIfDisposed();
         if (boxes is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer outBuf)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");

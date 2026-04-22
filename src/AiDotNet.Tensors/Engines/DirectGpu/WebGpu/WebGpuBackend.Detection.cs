@@ -65,6 +65,9 @@ public sealed partial class WebGpuBackend
         int n, int fromFormat, int toFormat)
     {
         if (n <= 0) return;
+        if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+            throw new ArgumentException(
+                $"fromFormat/toFormat must be 0/1/2; got {fromFormat}, {toFormat}.");
         var pipelineId = await GetOrCreatePipelineAsync(
             DetectionModuleKey + ":BoxConvert", WebGpuDetectionKernels.BoxConvert, "main");
         using var uniforms = new WebGpuBuffer(

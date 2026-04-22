@@ -63,6 +63,12 @@ public sealed partial class CudaBackend : IDetectionBackend
     public unsafe void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
     {
         if (n <= 0) return;
+        // Range-check format codes so a bogus int doesn't hit an undefined
+        // case in the kernel's switch (which falls through to CXCYWH without
+        // this check).
+        if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+            throw new ArgumentException(
+                $"fromFormat/toFormat must be 0 (XYXY), 1 (XYWH), or 2 (CXCYWH); got {fromFormat}, {toFormat}.");
         var kernel = ResolveDetectionKernel("detection_box_convert");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);

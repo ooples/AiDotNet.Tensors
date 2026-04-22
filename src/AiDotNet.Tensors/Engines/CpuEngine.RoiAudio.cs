@@ -169,6 +169,8 @@ public partial class CpuEngine
         float spatialScale, int samplingRatio)
     {
         if (input.Rank != 4) throw new ArgumentException("PsRoIAlign input must be [N, C, H, W].");
+        if (boxes.Rank != 2 || boxes._shape[1] != 5)
+            throw new ArgumentException("PsRoIAlign boxes must be [K, 5] = (batch_idx, x1, y1, x2, y2).");
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         if (C != outputChannels * outputHeight * outputWidth)
             throw new ArgumentException($"PsRoIAlign requires C == outputChannels * outH * outW ({outputChannels * outputHeight * outputWidth}); got {C}.");
@@ -228,6 +230,8 @@ public partial class CpuEngine
         int outputHeight, int outputWidth, int outputChannels, float spatialScale)
     {
         if (input.Rank != 4) throw new ArgumentException("PsRoIPool input must be [N, C, H, W].");
+        if (boxes.Rank != 2 || boxes._shape[1] != 5)
+            throw new ArgumentException("PsRoIPool boxes must be [K, 5].");
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         if (C != outputChannels * outputHeight * outputWidth)
             throw new ArgumentException("PsRoIPool requires C == outputChannels * outH * outW.");
@@ -333,6 +337,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
     {
+        if (quantizationChannels < 2)
+            throw new ArgumentException("quantizationChannels must be >= 2 (μ = qc − 1 must be positive).",
+                nameof(quantizationChannels));
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
         var result = new Tensor<int>(input._shape);
@@ -354,6 +361,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
+        if (quantizationChannels < 2)
+            throw new ArgumentException("quantizationChannels must be >= 2.", nameof(quantizationChannels));
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
         var result = new Tensor<T>(input._shape);
@@ -381,6 +390,8 @@ public partial class CpuEngine
         int rank = input.Rank;
         if (rank < 1) throw new ArgumentException("input must have at least 1 axis.");
         int tLen = input._shape[rank - 1];
+        if (tLen <= 0)
+            return new Tensor<T>((int[])input._shape.Clone());
         int leading = input.Length / tLen;
 
         var result = new Tensor<T>(input._shape);
@@ -410,6 +421,13 @@ public partial class CpuEngine
     public virtual Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
         if (origRate <= 0 || newRate <= 0) throw new ArgumentException("rates must be positive.");
+        if (waveform.Rank < 1) throw new ArgumentException("waveform must have at least 1 axis.");
+        if (waveform._shape[waveform.Rank - 1] == 0)
+        {
+            var empty = (int[])waveform._shape.Clone();
+            empty[waveform.Rank - 1] = 0;
+            return new Tensor<T>(empty);
+        }
         if (origRate == newRate) return waveform.Clone();
         int gcd = Gcd(origRate, newRate);
         int up = newRate / gcd;

@@ -60,6 +60,9 @@ public sealed partial class HipBackend : IDetectionBackend
     public unsafe void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
     {
         if (n <= 0) return;
+        if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+            throw new ArgumentException(
+                $"fromFormat/toFormat must be 0 (XYXY), 1 (XYWH), or 2 (CXCYWH); got {fromFormat}, {toFormat}.");
         var kernel = ResolveDetectionKernel("detection_box_convert");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr bPtr = boxes.Handle, oPtr = output.Handle;

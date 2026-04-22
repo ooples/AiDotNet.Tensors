@@ -76,6 +76,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
         {
             if (n <= 0) return;
+            if ((uint)fromFormat > 2 || (uint)toFormat > 2)
+                throw new ArgumentException(
+                    $"fromFormat/toFormat must be 0/1/2; got {fromFormat}, {toFormat}.");
             var k = GetDetectionKernel("detection_box_convert");
             k.SetArg(0, DetectionBufHandle(boxes));
             k.SetArg(1, DetectionBufHandle(output));
