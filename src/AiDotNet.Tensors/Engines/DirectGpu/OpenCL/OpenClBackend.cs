@@ -601,6 +601,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL Detection compilation failed: {ex.Message}");
                 }
 
+                // Compile Geometry / sampling kernels (Issue #217 second half).
+                try
+                {
+                    var geometryProgram = CompileOrLoadCached(OpenClGeometryKernels.GetSource(), optimizationFlags, "Geometry kernels");
+                    _programs.Add(geometryProgram);
+                    foreach (var name in OpenClGeometryKernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, geometryProgram, name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Geometry compilation failed: {ex.Message}");
+                }
+
                 // Linalg decomposition kernels (#211 moat #2). Compilation
                 // failure flips _linalgAvailable=false and surfaces via
                 // <see cref="LinalgAvailable"/> so callers can route to CPU

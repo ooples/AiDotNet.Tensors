@@ -85,6 +85,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _parity210Module;
     private IntPtr _linalgModule;
     private IntPtr _detectionModule;
+    private IntPtr _geometryModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -561,6 +562,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _detectionModule = IntPtr.Zero;
+            }
+
+            // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipGeometryKernels.GetSource(), "geometry",
+                    ref _geometryModule, Kernels.HipGeometryKernels.GetKernelNames());
+            }
+            catch
+            {
+                _geometryModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
