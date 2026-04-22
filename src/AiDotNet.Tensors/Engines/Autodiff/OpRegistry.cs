@@ -170,6 +170,19 @@ internal static class OpRegistry
         // DifferentiableOps.RecordBinary inside each CpuEngine.Detection.cs
         // method; backward is in BackwardFunctions<T>.*IouBackward.
         "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
+
+        // Geometry / sampling (Issue #217) — backward wired in
+        // BackwardFunctions<T>.{InterpolateBackward, PadNdBackward,
+        // AffineGrid3DBackward}. InterpolateByScale is a delegator to
+        // Interpolate.
+        "Interpolate", "PadNd", "AffineGrid3D",
+
+        // Vision RoI family (Issue #217 tail) — backward wired
+        // in BackwardFunctions<T>.{RoIAlign,RoIPool,PsRoIAlign,PsRoIPool}Backward.
+        "RoIAlign", "RoIPool", "PsRoIAlign", "PsRoIPool",
+
+        // Audio element-wise / linear ops — backward wired.
+        "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
     };
 
     /// <summary>
@@ -318,31 +331,25 @@ internal static class OpRegistry
         "Nms", "BatchedNms",
         "MasksToBoxes",
 
-        // Geometry / sampling (Issue #217) — forward only in v1. Backward
-        // for these is a substantial kernel-by-kernel follow-up
-        // (interpolate modes × align_corners × 1D/2D/3D). The existing
-        // GridSample 3-arg overload is already in DifferentiableOps above;
-        // these are the new extended overloads + Interpolate / PadNd /
-        // AffineGrid3D.
-        "Interpolate", "InterpolateByScale", "PadNd", "AffineGrid3D",
+        // PitchShift / TimeStretch: phase-vocoder compositions that
+        // manipulate mag/phase arrays outside the tape; their backward
+        // would require a non-trivial inverse phase-vocoder pass. These
+        // ops are typically used at preprocessing/augmentation time, not
+        // inside a loss, so marking them non-differentiable is
+        // operationally correct until explicit training demand appears.
+        "PitchShift", "TimeStretch",
 
-        // Vision RoI family (Issue #217 tail) — forward only in v1; backward
-        // for RoIAlign et al. is tracked as a follow-up.
-        "RoIAlign", "RoIPool", "PsRoIAlign", "PsRoIPool",
-
-        // Audio primitives (Issue #217 tail).
-        // - Spectrogram / PitchShift / TimeStretch compose the existing
-        //   differentiable STFT + ISTFT paths, but the compositions
-        //   themselves aren't currently tape-recorded end-to-end.
-        // - AmplitudeToDB / MuLawEncoding / MuLawDecoding / ComputeDeltas /
-        //   Resample are element-wise or small-window kernels without
-        //   wired backward yet.
-        "Spectrogram", "PitchShift", "TimeStretch",
-        "AmplitudeToDB", "MuLawEncoding", "MuLawDecoding",
-        "ComputeDeltas", "Resample",
+        // μ-law encode/decode — the encoded domain is discrete int codes
+        // (not floats), so gradients are meaningless across the quantiser.
+        // Use it pre-/post-training only.
+        "MuLawEncoding", "MuLawDecoding",
 
         // Image codec — byte-level I/O, not meaningfully differentiable.
         "ImageDecode",
+
+        // InterpolateByScale is a pure delegator to Interpolate (which is
+        // in DifferentiableOps) — it performs no recording of its own.
+        "InterpolateByScale",
     };
 
     /// <summary>

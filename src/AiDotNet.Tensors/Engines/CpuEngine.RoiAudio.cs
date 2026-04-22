@@ -7,6 +7,7 @@
 // where practical.
 
 using System;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -20,6 +21,17 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> RoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth,
+        float spatialScale, int samplingRatio, bool aligned)
+    {
+        var result = RoIAlignImpl(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
+        DifferentiableOps.RecordBinary("RoIAlign", result, input, boxes,
+            BackwardFunctions<T>.RoIAlignBackward,
+            new object[] { outputHeight, outputWidth, spatialScale, samplingRatio, aligned });
+        return result;
+    }
+
+    private Tensor<T> RoIAlignImpl<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth,
         float spatialScale, int samplingRatio, bool aligned)
     {
@@ -107,6 +119,16 @@ public partial class CpuEngine
     public virtual Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {
+        var result = RoIPoolImpl(input, boxes, outputHeight, outputWidth, spatialScale);
+        DifferentiableOps.RecordBinary("RoIPool", result, input, boxes,
+            BackwardFunctions<T>.RoIPoolBackward,
+            new object[] { outputHeight, outputWidth, spatialScale });
+        return result;
+    }
+
+    private Tensor<T> RoIPoolImpl<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, float spatialScale)
+    {
         if (input.Rank != 4) throw new ArgumentException("RoIPool input must be [N, C, H, W].");
         if (boxes.Rank != 2 || boxes._shape[1] != 5) throw new ArgumentException("RoIPool boxes must be [K, 5].");
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -165,6 +187,17 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> PsRoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale, int samplingRatio)
+    {
+        var result = PsRoIAlignImpl(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
+        DifferentiableOps.RecordBinary("PsRoIAlign", result, input, boxes,
+            BackwardFunctions<T>.PsRoIAlignBackward,
+            new object[] { outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio });
+        return result;
+    }
+
+    private Tensor<T> PsRoIAlignImpl<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, int outputChannels,
         float spatialScale, int samplingRatio)
     {
@@ -229,6 +262,16 @@ public partial class CpuEngine
     public virtual Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, int outputChannels, float spatialScale)
     {
+        var result = PsRoIPoolImpl(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
+        DifferentiableOps.RecordBinary("PsRoIPool", result, input, boxes,
+            BackwardFunctions<T>.PsRoIPoolBackward,
+            new object[] { outputHeight, outputWidth, outputChannels, spatialScale });
+        return result;
+    }
+
+    private Tensor<T> PsRoIPoolImpl<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels, float spatialScale)
+    {
         if (input.Rank != 4) throw new ArgumentException("PsRoIPool input must be [N, C, H, W].");
         if (boxes.Rank != 2 || boxes._shape[1] != 5)
             throw new ArgumentException("PsRoIPool boxes must be [K, 5].");
@@ -287,12 +330,17 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
-        // Thin wrapper: run STFT and return only magnitude. STFT here
-        // takes (input, nFft, hop, window, center) — the winLength arg
-        // on our Spectrogram API is absorbed into the window shape.
+        // Run STFT and return only magnitude. Backward uses the saved
+        // phase to pipe the magnitude gradient through ISTFT — see
+        // BackwardFunctions<T>.SpectrogramBackward.
         var win = window ?? HannWindow<T>(winLength);
         STFT(waveform, nFft, hopLength, win, center: true,
-            out var mag, out _);
+            out var mag, out var phase);
+        int origLength = waveform._shape[waveform.Rank - 1];
+        DifferentiableOps.RecordUnary(
+            "Spectrogram", mag, waveform,
+            BackwardFunctions<T>.SpectrogramBackward,
+            new object[] { nFft, hopLength, win, phase, origLength });
         return mag;
     }
 
@@ -308,6 +356,18 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null)
+    {
+        var result = AmplitudeToDBImpl(input, minAmplitude, topDb);
+        // topDb clips post-hoc against the peak — the clip mask ideally
+        // zeros gradient where clipped, but that needs a saved mask.
+        // For the common topDb=null path the backward is exact.
+        DifferentiableOps.RecordUnary("AmplitudeToDB", result, input,
+            BackwardFunctions<T>.AmplitudeToDBBackward,
+            new object[] { minAmplitude });
+        return result;
+    }
+
+    private Tensor<T> AmplitudeToDBImpl<T>(Tensor<T> input, float minAmplitude, float? topDb)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
@@ -381,6 +441,15 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5)
     {
+        var result = ComputeDeltasImpl(input, winLength);
+        DifferentiableOps.RecordUnary("ComputeDeltas", result, input,
+            BackwardFunctions<T>.ComputeDeltasBackward,
+            new object[] { winLength });
+        return result;
+    }
+
+    private Tensor<T> ComputeDeltasImpl<T>(Tensor<T> input, int winLength)
+    {
         if (winLength < 3 || (winLength & 1) == 0)
             throw new ArgumentException("winLength must be an odd integer >= 3.");
         int n = winLength / 2;
@@ -419,6 +488,15 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
+    {
+        var result = ResampleImpl(waveform, origRate, newRate);
+        DifferentiableOps.RecordUnary("Resample", result, waveform,
+            BackwardFunctions<T>.ResampleBackward,
+            new object[] { origRate, newRate });
+        return result;
+    }
+
+    private Tensor<T> ResampleImpl<T>(Tensor<T> waveform, int origRate, int newRate)
     {
         if (origRate <= 0 || newRate <= 0) throw new ArgumentException("rates must be positive.");
         if (waveform.Rank < 1) throw new ArgumentException("waveform must have at least 1 axis.");

@@ -21,6 +21,16 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Interpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners = false)
     {
+        var result = InterpolateImpl(input, sizes, mode, alignCorners);
+        AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
+            "Interpolate", result, input,
+            AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.InterpolateBackward,
+            new object[] { mode, alignCorners });
+        return result;
+    }
+
+    private Tensor<T> InterpolateImpl<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners)
+    {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (sizes is null) throw new ArgumentNullException(nameof(sizes));
         if (input.Rank < 3)
@@ -80,6 +90,7 @@ public partial class CpuEngine
             sizes[i] = (int)Math.Floor(input._shape[2 + i] * scaleFactors[i]);
             if (sizes[i] < 1) sizes[i] = 1;
         }
+        // Interpolate records itself; InterpolateByScale is a pure delegator.
         return Interpolate(input, sizes, mode, alignCorners);
     }
 
@@ -393,6 +404,16 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!)
     {
+        var result = PadNdImpl(input, pad, mode, value);
+        AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
+            "PadNd", result, input,
+            AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.PadNdBackward,
+            new object[] { (int[])pad.Clone(), mode });
+        return result;
+    }
+
+    private Tensor<T> PadNdImpl<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!)
+    {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (pad is null) throw new ArgumentNullException(nameof(pad));
         if ((pad.Length & 1) != 0)
@@ -656,6 +677,16 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false)
+    {
+        var result = AffineGrid3DImpl(theta, outputDepth, outputHeight, outputWidth, alignCorners);
+        AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
+            "AffineGrid3D", result, theta,
+            AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.AffineGrid3DBackward,
+            new object[] { outputDepth, outputHeight, outputWidth, alignCorners });
+        return result;
+    }
+
+    private Tensor<T> AffineGrid3DImpl<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners)
     {
         if (theta.Rank != 3 || theta._shape[1] != 3 || theta._shape[2] != 4)
             throw new ArgumentException("theta must be [N, 3, 4].");
