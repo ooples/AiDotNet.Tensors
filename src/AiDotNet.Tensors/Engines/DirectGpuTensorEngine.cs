@@ -12396,19 +12396,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
+        // Issue #226 fix: buffers that flow through FinishGpuOp MUST NOT be
+        // `using`-scoped. FinishGpuOp defers materialization by registering a
+        // callback that closes over the GPU buffer; if the caller `using`-
+        // disposes the OwnedBuffer at try-scope exit, the closure's
+        // DownloadBuffer call later fires on a freed handle and raises
+        // cuMemcpyDtoH Invalid value. Mirror the TryRunUnary pattern:
+        // plain var for FinishGpuOp-bound buffers, dispose only on the
+        // exception path.
+        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, input.Length);
+        using var bufRunMean = AllocateOutputBuffer(backend, input.Shape._dims[1]);
+        using var bufRunVar = AllocateOutputBuffer(backend, input.Shape._dims[1]);
+        var bufSaveMean = AllocateOutputBuffer(backend, input.Shape._dims[1]);
+        var bufSaveInvVar = AllocateOutputBuffer(backend, input.Shape._dims[1]);
         try
         {
             int batch = input.Shape._dims[0];
             int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
-            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufRunMean = AllocateOutputBuffer(backend, channels);
-            using var bufRunVar = AllocateOutputBuffer(backend, channels);
-            using var bufSaveMean = AllocateOutputBuffer(backend, channels);
-            using var bufSaveInvVar = AllocateOutputBuffer(backend, channels);
             backend.Fill(bufRunMean.Buffer, 0f, channels);
             backend.Fill(bufRunVar.Buffer, 1f, channels);
             backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
@@ -12421,6 +12429,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
+            // FinishGpuOp-bound buffers weren't disposed at scope exit (on
+            // purpose — see comment above). Dispose them here on the
+            // exception path so we don't leak on fallback.
+            bufOut.Dispose();
+            bufSaveMean.Dispose();
+            bufSaveInvVar.Dispose();
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12430,16 +12444,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
+        int outerSize = input.Shape._dims[0];
+        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-
+        // scoped (see BatchNorm above for the full rationale).
+        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, input.Length);
+        var bufMean = AllocateOutputBuffer(backend, outerSize);
+        var bufVar = AllocateOutputBuffer(backend, outerSize);
         try
         {
-            int outerSize = input.Shape._dims[0];
             int normSize = input.Length / outerSize;
-            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufMean = AllocateOutputBuffer(backend, outerSize);
-            using var bufVar = AllocateOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
@@ -12449,6 +12465,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12458,17 +12475,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
+        int batch = input.Shape._dims[0];
+        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
+        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, input.Length);
+        var bufMean = AllocateOutputBuffer(backend, batch * numGroups);
+        var bufVar = AllocateOutputBuffer(backend, batch * numGroups);
         try
         {
-            int batch = input.Shape._dims[0];
             int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
-            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufMean = AllocateOutputBuffer(backend, batch * numGroups);
-            using var bufVar = AllocateOutputBuffer(backend, batch * numGroups);
             backend.GroupNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, numGroups, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
@@ -12478,6 +12496,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12487,17 +12506,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
+        int batch = input.Shape._dims[0];
+        int channels = input.Shape._dims[1];
+        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
+        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+        using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, input.Length);
+        var bufMean = AllocateOutputBuffer(backend, batch * channels);
+        var bufVar = AllocateOutputBuffer(backend, batch * channels);
         try
         {
-            int batch = input.Shape._dims[0];
-            int channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
-            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufMean = AllocateOutputBuffer(backend, batch * channels);
-            using var bufVar = AllocateOutputBuffer(backend, batch * channels);
             backend.InstanceNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
@@ -12507,6 +12527,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -12516,14 +12537,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
+        int outerSize = input.Shape._dims[0];
+        // Issue #226 fix: FinishGpuOp-bound buffers must not be `using`-scoped.
+        using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, input.Length);
+        var bufRms = AllocateOutputBuffer(backend, outerSize);
         try
         {
-            int outerSize = input.Shape._dims[0];
             int normSize = input.Length / outerSize;
-            using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufRms = AllocateOutputBuffer(backend, outerSize);
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
@@ -12532,6 +12554,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
+            bufOut.Dispose(); bufRms.Dispose();
             return base.RMSNorm(input, gamma, epsilon, out rms);
         }
     }

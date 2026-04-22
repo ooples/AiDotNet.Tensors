@@ -41,11 +41,38 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         if (IsRealized) return;
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
-        // Realize input first if it's also lazy
-        if (Input is { LazySource: ILazyNode inputNode } && !inputNode.IsRealized)
-            inputNode.Realize(engine);
+        // Issue #238: the Execute delegate re-invokes the engine op (e.g.,
+        // `eng.NativeComplexIFFTReal(ci)`), which checks GraphMode.IsActive.
+        // When Realize is triggered via EnsureMaterialized while tracing is
+        // still in progress (scope not yet disposed, nobody else suppressed
+        // GraphMode), the re-invoked op records ANOTHER CrossTypeLazyNode,
+        // returns a new lazy tensor, and the lambda's `r.AsSpan()` forces
+        // Realize on that new node → infinite recursion until StackOverflow.
+        //
+        // LazyNode<T>.Realize already suspends GraphMode for exactly this
+        // reason — mirror that pattern here so cross-type ops (FFT,
+        // ComplexMagnitude, ComplexPhase, IFFTReal) are protected too.
+        var savedScope = GraphMode.Current;
+        GraphMode.SetCurrent(null);
+        try
+        {
+            // Realize input first if it's also lazy
+            if (Input is { LazySource: ILazyNode inputNode } && !inputNode.IsRealized)
+                inputNode.Realize(engine);
 
-        Execute(engine, Output);
+            Execute(engine, Output);
+        }
+        catch
+        {
+            // Roll back so a retry or diagnostic access doesn't observe
+            // uninitialised output data.
+            IsRealized = false;
+            throw;
+        }
+        finally
+        {
+            GraphMode.SetCurrent(savedScope);
+        }
     }
 
     public ILazyNode[] GetInputNodes()

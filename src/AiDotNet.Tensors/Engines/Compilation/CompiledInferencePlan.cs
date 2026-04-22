@@ -728,7 +728,18 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         Tensor<T> finalOutput;
         if (explicitOutput is not null)
         {
-            explicitOutput.LazySource = null;
+            // Issue #238 partial mitigation: if the plan captured zero steps
+            // (e.g., a pure cross-type chain where every node is a
+            // CrossTypeLazyNode or a LazyNode<OtherT> — neither of which
+            // Compile currently admits into steps), the lazy source chain
+            // is the ONLY way the output ever gets populated. Clearing
+            // LazySource here would strand the output at its uninitialised
+            // rent value. When optimizedSteps IS non-empty, the output
+            // already shares storage with a compiled-step buffer (or the
+            // forward ended in a view op whose producer IS in steps), so
+            // clearing is safe.
+            if (optimizedSteps.Length > 0)
+                explicitOutput.LazySource = null;
             finalOutput = explicitOutput;
         }
         else

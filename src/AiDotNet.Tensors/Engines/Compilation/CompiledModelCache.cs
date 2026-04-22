@@ -57,6 +57,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // the caller must invoke plan.Execute() with current data in the input tensors.
             using var scope = GraphMode.Enable();
             var explicitOutput = forward();
+            ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput);
 
             // Dispose old plan if shape changed
@@ -107,6 +108,7 @@ public sealed class CompiledModelCache<T> : IDisposable
 
             using var scope = GraphMode.Enable();
             var explicitOutput = forward();
+            ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput);
 
             if (_inferencePlans.TryGetValue(key, out var old))
@@ -147,6 +149,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // Trace forward + loss under GraphMode and compile with backward
             using var scope = GraphMode.Enable();
             var explicitLoss = forwardAndLoss();
+            ThrowIfForwardRecordedNothing(scope, explicitLoss);
             var plan = scope.CompileTraining(parameters, explicitLoss);
 
             // Dispose old plan if exists
@@ -205,6 +208,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // Compile with the current concrete shape
             using var scope = GraphMode.Enable();
             var explicitOutput = forward();
+            ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput);
 
             if (_inferencePlans.TryGetValue(key, out var old))
@@ -215,6 +219,36 @@ public sealed class CompiledModelCache<T> : IDisposable
             _inferencePlans[key] = plan;
             return plan;
         }
+    }
+
+    /// <summary>
+    /// Issue #239 guard: surface a clear, actionable error when the traced
+    /// forward lambda doesn't record any tensor operations. A zero-op plan
+    /// with zero captured inputs is always a mistake — <see cref="ICompiledPlan{T}.SetInputs"/>
+    /// cannot wire user data into a graph that has no nodes, and the
+    /// resulting <c>ArgumentException</c> ("This plan was compiled with 0
+    /// captured input(s)") gives the user no hint about WHY the plan is
+    /// empty. The most common cause: the forward body allocates a fresh
+    /// tensor with <c>new Tensor&lt;T&gt;(...)</c> and fills it via indexer
+    /// writes, both of which bypass the lazy-graph tracer entirely.
+    /// </summary>
+    private static void ThrowIfForwardRecordedNothing<TElem>(LazyTensorScope scope, Tensor<TElem>? explicitOutput)
+    {
+        if (scope.NodeCount > 0)
+            return;
+        // Allow a truly trivial "return constant" forward only when the
+        // caller explicitly returned null — in practice no caller does, but
+        // we match the existing CompileInference contract.
+        if (explicitOutput is null)
+            return;
+        throw new ArgumentException(
+            "The forward lambda did not record any tensor operations, so the compiled plan " +
+            "has zero steps and cannot accept inputs. This typically happens when the forward " +
+            "uses `new Tensor<T>(...)` and writes values through the indexer — both bypass the " +
+            "lazy-graph tracer. Use engine operations on the input tensor (TensorAdd, " +
+            "TensorMultiply, MatMul, activation methods, etc.) so the tracer captures the " +
+            "computation graph. See issue #239.",
+            "forward");
     }
 
     public void Dispose()

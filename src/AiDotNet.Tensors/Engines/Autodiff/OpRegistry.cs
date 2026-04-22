@@ -109,11 +109,15 @@ internal static class OpRegistry
         // sit here as stubs with no backward).
         "TensorSort",
 
-        // Parity-210 indexing family (forward only in v1)
+        // Parity-210 indexing family (forward only in v1).
+        // TensorBroadcastTo deliberately omitted here — it's classified under
+        // "composed from recorded sub-ops" below because our implementation
+        // dispatches through Reshape or TensorBroadcastAdd (both record
+        // their own autograd steps), so it gets backward for free.
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
-        "TensorBroadcastTo", "TensorExpandAs", "TensorBroadcastTensors",
+        "TensorExpandAs", "TensorBroadcastTensors",
         "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
 

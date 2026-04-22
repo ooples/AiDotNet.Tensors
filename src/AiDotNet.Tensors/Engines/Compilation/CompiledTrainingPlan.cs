@@ -452,7 +452,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 continue;
             }
             var step = forwardSteps[i];
-            var specialized = TryBuildSpecializedForward(step, pinnedHandles);
+            // Training plans mutate parameters in-place between Step() calls,
+            // so the SgemmWithCachedB pre-pack cache (keyed on B's array
+            // reference) would serve stale weights. Disable the cached path
+            // for training specialization; correctness over cache-hit speed.
+            var specialized = TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
@@ -642,7 +646,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private unsafe delegate void PointerBinaryKernel(float* a, float* b, float* r, int count);
 
-    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step, List<GCHandle>? handleTracker = null)
+    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(
+        CompiledStep<T> step,
+        List<GCHandle>? handleTracker = null,
+        bool allowCachedB = true)
     {
         if (typeof(T) != typeof(float)) return null;
 
@@ -661,14 +668,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var cB = (float[])(object)inputB.GetDataArray();
             var cOut = (float[])(object)output.GetDataArray();
 
+            if (allowCachedB)
+            {
+                return eng =>
+                {
+                    if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                        // Path A pre-pack cache — B (weight) is constant across
+                        // inference calls, so SgemmWithCachedB amortises PackB
+                        // cost. Falls through to standard Sgemm for non-cache-
+                        // eligible shapes (n > Nc=4096).
+                        SimdGemm.SgemmWithCachedB(cA.AsSpan(0, M * K), cB, cOut.AsSpan(0, M * N), M, K, N);
+                };
+            }
+
+            // Training plan path: parameters (B) are updated in-place between
+            // Step() calls, so the pre-packed-B cache would serve stale weights.
+            // Skip SgemmWithCachedB and re-pack on every call (measurable cost
+            // during training, but correctness-first). Fixes
+            // CompiledTrainingPlanRebindingTests.Step_SeesInPlaceParameterUpdates
+            // and Step_ViaCompiledModelCache_SeesUpdates.
             return eng =>
             {
                 if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                    // Path A pre-pack cache — B (weight) is constant across
-                    // inference calls, so SgemmWithCachedB amortises PackB
-                    // cost. Falls through to standard Sgemm for non-cache-
-                    // eligible shapes (n > Nc=4096).
-                    SimdGemm.SgemmWithCachedB(cA.AsSpan(0, M * K), cB, cOut.AsSpan(0, M * N), M, K, N);
+                    SimdGemm.Sgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
             };
         }
 
