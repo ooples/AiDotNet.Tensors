@@ -8692,6 +8692,24 @@ public interface IEngine
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
 
     /// <summary>
+    /// Extended <c>GridSample</c> backward with explicit mode / padding /
+    /// align-corners, matching the forward overload above. Non-default
+    /// (mode != Bilinear, padding != Zeros, alignCorners == true) paths
+    /// currently delegate through the managed CpuEngine implementation —
+    /// specialised GPU backward kernels for each mode × padding variant
+    /// are tracked as a follow-up.
+    /// </summary>
+    Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
+    /// Extended <c>GridSample</c> backward w.r.t. grid, symmetric to
+    /// <see cref="GridSampleBackwardInput{T}(Tensor{T}, Tensor{T}, int[], GridSampleMode, GridSamplePadding, bool)"/>.
+    /// </summary>
+    Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners);
+
+    /// <summary>
     /// 3D affine-grid generator. Given an affine matrix
     /// <paramref name="theta"/> of shape <c>[N, 3, 4]</c>, returns a
     /// sampling grid of shape <c>[N, outD, outH, outW, 3]</c> in

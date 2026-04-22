@@ -625,6 +625,36 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        // The existing 3-arg GridSampleBackwardInput is hard-coded to
+        // bilinear + zeros + alignCorners=false (torchvision defaults).
+        // For non-default settings, specialised GPU kernels are a
+        // follow-up; the managed impl here matches the forward default
+        // only. Guard so callers asking for non-default backward get a
+        // clear error rather than a silent mismatched gradient.
+        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros || alignCorners)
+            throw new NotSupportedException(
+                $"GridSample backward is currently supported only for " +
+                $"Bilinear + Zeros + alignCorners=false. Requested " +
+                $"{mode}/{padding}/alignCorners={alignCorners}.");
+        return GridSampleBackwardInput(gradOutput, grid, inputShape);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros || alignCorners)
+            throw new NotSupportedException(
+                $"GridSample backward is currently supported only for " +
+                $"Bilinear + Zeros + alignCorners=false. Requested " +
+                $"{mode}/{padding}/alignCorners={alignCorners}.");
+        return GridSampleBackwardGrid(gradOutput, input, grid);
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false)
     {
         if (theta.Rank != 3 || theta._shape[1] != 3 || theta._shape[2] != 4)

@@ -17,6 +17,16 @@ public static class OpenClGeometryKernels
     };
 
     public static string GetSource() => @"
+// Geometry kernels use double for the source-coord math (torchvision
+// parity — integer-ratio resizes need 1e-16 precision to match CPU).
+// Enable fp64 explicitly; devices without fp64 support fall through to
+// the managed CpuEngine reference at the engine level.
+#ifdef cl_khr_fp64
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
 // ============================================================================
 // Shared device helpers.
 // ============================================================================
