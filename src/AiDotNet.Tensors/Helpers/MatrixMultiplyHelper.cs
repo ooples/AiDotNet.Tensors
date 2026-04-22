@@ -158,14 +158,21 @@ internal static class MatrixMultiplyHelper
     {
         int block = GetBlockSize<T>();
         int numRowBlocks = (m + block - 1) / block;
+        int numColBlocks = (n + block - 1) / block;
         bool parallel = allowParallel &&
             (long)m * n >= GetParallelThreshold() &&
             Environment.ProcessorCount > 1;
 
-        Action<int> multiplyBlock = iiBlock =>
+        // Single-block worker — processes one (iiBlock, jjBlock) tile over
+        // the full K axis. Writes to the disjoint C[iStart..iEnd, jStart..jEnd]
+        // slice so parallel invocations across the (M, N) grid are race-free.
+        Action<int, int> multiplyTile = (iiBlock, jjBlock) =>
         {
             int iStart = iiBlock * block;
             int iEnd = Math.Min(iStart + block, m);
+            int jStart = jjBlock * block;
+            int jEnd = Math.Min(jStart + block, n);
+            int nLenTotal = jEnd - jStart;
             var aSpan = a.Span;
             var bSpan = b.Span;
             var cSpan = c.Span;
@@ -173,22 +180,18 @@ internal static class MatrixMultiplyHelper
             for (int kk = 0; kk < k; kk += block)
             {
                 int kLen = Math.Min(block, k - kk);
-                for (int jj = 0; jj < n; jj += block)
+                for (int i = iStart; i < iEnd; i++)
                 {
-                    int nLen = Math.Min(block, n - jj);
-                    for (int i = iStart; i < iEnd; i++)
-                    {
-                        int aRowOffset = aOffset + (i * aStride) + kk;
-                        int cRowOffset = cOffset + (i * cStride) + jj;
+                    int aRowOffset = aOffset + (i * aStride) + kk;
+                    int cRowOffset = cOffset + (i * cStride) + jStart;
 
-                        for (int kIndex = 0; kIndex < kLen; kIndex++)
-                        {
-                            T aik = aSpan[aRowOffset + kIndex];
-                            int bRowOffset = bOffset + ((kk + kIndex) * bStride) + jj;
-                            var cBlock = cSpan.Slice(cRowOffset, nLen);
-                            var bBlock = bSpan.Slice(bRowOffset, nLen);
-                            numOps.MultiplyAdd(cBlock, bBlock, aik, cBlock);
-                        }
+                    for (int kIndex = 0; kIndex < kLen; kIndex++)
+                    {
+                        T aik = aSpan[aRowOffset + kIndex];
+                        int bRowOffset = bOffset + ((kk + kIndex) * bStride) + jStart;
+                        var cBlock = cSpan.Slice(cRowOffset, nLenTotal);
+                        var bBlock = bSpan.Slice(bRowOffset, nLenTotal);
+                        numOps.MultiplyAdd(cBlock, bBlock, aik, cBlock);
                     }
                 }
             }
@@ -196,14 +199,39 @@ internal static class MatrixMultiplyHelper
 
         if (parallel)
         {
-            Parallel.For(0, numRowBlocks, multiplyBlock);
+            // 2D parallelism: parallelize over the (iiBlock, jjBlock) grid so
+            // transformer shapes with small M (M≤128 → numRowBlocks ≤ 2) still
+            // saturate multi-core machines. At M=64 with block=45 on a 16-core
+            // box, the old M-axis-only partition spawned 2 tasks; the 2D grid
+            // with N=512, block=45 gives 2×12=24 tasks — full utilization.
+            int total = numRowBlocks * numColBlocks;
+            int procs = Environment.ProcessorCount;
+            // Only go 2D when the row partition alone under-subscribes the
+            // available cores. DiT-XL-class square shapes with large M are
+            // already saturated by M-axis; keep them on the simpler path.
+            if (numRowBlocks * 2 < procs && numColBlocks > 1)
+            {
+                Parallel.For(0, total, blockIdx =>
+                {
+                    int ii = blockIdx / numColBlocks;
+                    int jj = blockIdx % numColBlocks;
+                    multiplyTile(ii, jj);
+                });
+            }
+            else
+            {
+                Parallel.For(0, numRowBlocks, iiBlock =>
+                {
+                    for (int jjBlock = 0; jjBlock < numColBlocks; jjBlock++)
+                        multiplyTile(iiBlock, jjBlock);
+                });
+            }
             return;
         }
 
         for (int iiBlock = 0; iiBlock < numRowBlocks; iiBlock++)
-        {
-            multiplyBlock(iiBlock);
-        }
+        for (int jjBlock = 0; jjBlock < numColBlocks; jjBlock++)
+            multiplyTile(iiBlock, jjBlock);
     }
 
     private static bool TryGetArraySegment<T>(ReadOnlyMemory<T> memory, out T[] array, out int offset)
@@ -243,7 +271,22 @@ internal static class MatrixMultiplyHelper
         }
         else if (typeof(T) == typeof(double) && a is double[] ad && b is double[] bd && c is double[] cd)
         {
-            return BlasProvider.TryGemm(m, n, k, ad, aOffset, k, bd, bOffset, n, cd, cOffset, n);
+            if (BlasProvider.TryGemm(m, n, k, ad, aOffset, k, bd, bOffset, n, cd, cOffset, n))
+            {
+                return true;
+            }
+
+            // BLAS unavailable — route double through SimdGemm.Dgemm (issue
+            // #243). The scalar fallback in MultiplyBlocked handles the
+            // below-threshold path; this gives the mid-to-large shapes an
+            // AVX2 FMA kernel without needing OpenBLAS.
+            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] BLAS unavailable, using SimdGemm.Dgemm fallback");
+            SimdGemm.Dgemm(
+                ad.AsSpan(aOffset, m * k),
+                bd.AsSpan(bOffset, k * n),
+                cd.AsSpan(cOffset, m * n),
+                m, k, n);
+            return true;
         }
 
         return false;
