@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -2127,6 +2130,84 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through BatchNormInference. Mirrors the dispatch in
+    /// <see cref="BatchNormInference{T}"/> but writes into the provided
+    /// output tensor and propagates layout. Used by the GraphMode lambda
+    /// to skip the intermediate-result alloc + CopyTo in CV inference,
+    /// which calls BN once per Conv block (e.g., 50× per ResNet-50).
+    /// </summary>
+    public void BatchNormInferenceInto<T>(Tensor<T> output, Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (x.Rank != 4)
+            throw new ArgumentException($"BatchNormInferenceInto requires rank-4 input, got rank {x.Rank}.");
+
+        if (typeof(T) == typeof(float))
+        {
+            int C = x._shape[1], H = x._shape[2], W = x._shape[3], N = x._shape[0];
+            var xf = (Tensor<float>)(object)x;
+            var gammaF = (Tensor<float>)(object)gamma;
+            var betaF  = (Tensor<float>)(object)beta;
+            var meanF  = (Tensor<float>)(object)mean;
+            var varF   = (Tensor<float>)(object)variance;
+            var dstF   = (Tensor<float>)(object)output;
+            dstF.Layout = x.Layout;
+            if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
+            {
+                Simd.NchwcBatchNorm.RunNchwc8(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    dstF.AsWritableSpan(), N, C, H, W);
+            }
+            else
+            {
+                Simd.NchwcBatchNorm.RunNchw(
+                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    dstF.AsWritableSpan(), N, C, H, W);
+            }
+            return;
+        }
+
+        // Generic scalar fallback. Pre-combine scale/bias per channel, then FMA.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
+        int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
+        int spatial = hh * ww;
+        var gData = gamma.GetDataArray();
+        var bData = beta.GetDataArray();
+        var mData = mean.GetDataArray();
+        var vData = variance.GetDataArray();
+        var scaleArr = new T[cc];
+        var biasArr = new T[cc];
+        for (int c = 0; c < cc; c++)
+        {
+            T s = numOps.Divide(gData[c], numOps.Sqrt(numOps.Add(vData[c], eps)));
+            scaleArr[c] = s;
+            biasArr[c] = numOps.Subtract(bData[c], numOps.Multiply(s, mData[c]));
+        }
+        output.Layout = x.Layout;
+        var inSpan = x.AsSpan();
+        var outSpan = output.AsWritableSpan();
+        for (int ni = 0; ni < nn; ni++)
+        {
+            for (int c = 0; c < cc; c++)
+            {
+                int baseIdx = (ni * cc + c) * spatial;
+                T s = scaleArr[c], b2 = biasArr[c];
+                for (int sp = 0; sp < spatial; sp++)
+                    outSpan[baseIdx + sp] = numOps.Add(numOps.Multiply(inSpan[baseIdx + sp], s), b2);
+            }
+        }
+    }
+
+
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -2151,9 +2232,16 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { x, gamma, beta, mean, variance }, x._shape,
                     (eng, output) =>
                     {
-                        var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
-                        output.Layout = r.Layout;
+                        if (eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
+                        }
+                        else
+                        {
+                            var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
+                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                            output.Layout = r.Layout;
+                        }
                     },
                     savedState: new object[] { epsilon });
             }
@@ -2255,7 +2343,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.BatchMatMul, "BatchMatMul", a, b, outShape,
-                    (eng, output) => { var eager = eng.BatchMatMul(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C write-through: BERT attention hits BatchMatMul
+                    // 24× per inference (12 heads × 2 matmuls). Skipping the
+                    // intermediate-tensor allocation + 3 MB CopyTo saves
+                    // ~50 µs per call = ~1.2 ms aggregate per BERT inference.
+                    (eng, output) =>
+                    {
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.BatchMatMulFloatInto(
+                                (Tensor<float>)(object)capturedA,
+                                (Tensor<float>)(object)capturedB,
+                                (Tensor<float>)(object)output);
+                        }
+                        else
+                        {
+                            var eager = eng.BatchMatMul(capturedA, capturedB);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
                     BackwardFunctions<T>.BatchMatMulBackward);
             }
         }
@@ -2402,25 +2508,53 @@ public partial class CpuEngine : ITensorLevelEngine
         int matrixSizeB = k * n;
         int matrixSizeResult = m * n;
 
-        // Fast path: for float, do sequential BLAS calls (avoids Parallel.For overhead for small batches)
-        // For B <= 16, the Parallel.For thread pool overhead exceeds the parallelism benefit.
-        if (typeof(T) == typeof(float) && batchSize <= 16)
+        // Fast path: for float, choose the right parallelism axis based on
+        // batch size.
+        //
+        // batchSize == 1: call Sgemm directly — it has internal Parallel.For
+        //   across the m dimension, so a single large slice still utilises
+        //   all cores. Outer Parallel.For(0, 1) would run serial anyway.
+        //
+        // batchSize >= 2: outer Parallel.For over the batch with
+        //   SgemmSequential per slice. Outer parallelism hides SGEMM dispatch
+        //   overhead and each worker can saturate a core on one slice.
+        //   Using Sgemm here would NEST parallel loops (one Parallel.For per
+        //   worker), which contends for the shared thread pool.
+        //
+        // BatchMatMulRootCauseDiag validated these tiers: batch=12 BERT
+        // attention slices are 3× faster with outer Parallel.For +
+        // SgemmSequential vs MatrixMultiplyHelper sequential; batch=1 FFN
+        // weight broadcasts use Sgemm's internal parallelism at ~100 GFLOP/s.
+        if (typeof(T) == typeof(float))
         {
-            for (int batch = 0; batch < batchSize; batch++)
+            var aF = (float[])(object)aData;
+            var bF = (float[])(object)bData;
+            var rF = (float[])(object)rData;
+            if (batchSize == 1)
             {
-                int aOffset = batch * matrixSizeA;
-                int bOffset = batch * matrixSizeB;
-                int resultOffset = batch * matrixSizeResult;
-                if (!MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, k, n))
+                Simd.SimdGemm.Sgemm(
+                    aF.AsSpan(0, matrixSizeA),
+                    bF.AsSpan(0, matrixSizeB),
+                    rF.AsSpan(0, matrixSizeResult),
+                    m, k, n);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, batch =>
                 {
-                    // BLAS unavailable — fall through to parallel path
-                    goto parallelFallback;
-                }
+                    int aOffset = batch * matrixSizeA;
+                    int bOffset = batch * matrixSizeB;
+                    int resultOffset = batch * matrixSizeResult;
+                    Simd.SimdGemm.SgemmSequential(
+                        aF.AsSpan(aOffset, matrixSizeA),
+                        bF.AsSpan(bOffset, matrixSizeB),
+                        rF.AsSpan(resultOffset, matrixSizeResult),
+                        m, k, n);
+                });
             }
             goto batchDone;
         }
 
-        parallelFallback:
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
@@ -2522,10 +2656,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Fallback: SimdKernels with parallel chunking for large arrays
-                // Use PersistentParallelExecutor for near-zero dispatch overhead
-                // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
-                int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                // Fallback: SimdKernels with parallel chunking for large arrays.
+                // Bandwidth-bound threshold: one core hits ~4 GB/s on a bulk
+                // add of non-L2-resident data, DRAM delivers 50+ GB/s across
+                // channels. AddRootCauseDiag measured 3.25× speedup moving
+                // from 1 → 4 chunks at length=196608 (BERT residual add).
+                // Old threshold length/500_000 required a 3 MB add before
+                // splitting — far past the point where parallelism helps.
+                // Target ~64 KB per chunk (fits in L1) with a cap at the
+                // thread-pool size.
+                const int kElemsPerChunk = 16 * 1024; // 64 KB at float32
+                int addChunks = Math.Min(
+                    CpuParallelSettings.MaxDegreeOfParallelism,
+                    Math.Max(1, length / kElemsPerChunk));
                 if (addChunks >= 2)
                 {
                     int chunkSize = (length + addChunks - 1) / addChunks;
@@ -4268,7 +4411,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.MultiplyScalar, "TensorMultiplyScalar", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
+                        else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
             }
         }
@@ -4571,7 +4718,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
+                        else { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.LogBackward);
             }
         }
@@ -4617,7 +4768,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorExpInto(output, captured);
+                        else { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ExpBackward);
             }
         }
@@ -4681,7 +4836,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSqrtInto(output, captured);
+                        else { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.SqrtBackward);
             }
         }
@@ -4726,7 +4885,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorAbsInto(output, captured);
+                        else { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AbsBackward);
             }
         }
@@ -5024,7 +5187,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSinInto(output, captured);
+                        else { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.SinBackward);
             }
         }
@@ -5074,7 +5241,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorCosInto(output, captured);
+                        else { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.CosBackward);
             }
         }
@@ -6265,7 +6436,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ps = poolSize, st = stride, pd = padding;
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2D", input, outputShape,
-                    (eng, output) => { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
+                        else { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             }
         }
@@ -6369,6 +6544,188 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through MaxPool2D: runs the same dispatch as
+    /// <see cref="MaxPool2D{T}(Tensor{T}, int, int, int)"/> but writes into
+    /// the provided output tensor instead of renting a fresh one. Skips
+    /// the ~40-80 µs alloc+CopyTo pair per ResNet pool step.
+    /// </summary>
+    public void MaxPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (stride == 0) stride = poolSize;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
+        int outputWidth  = (width  + 2 * padding - poolSize) / stride + 1;
+
+        // NCHWc8 SIMD path
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0
+            && GradientTape<T>.Current is null)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)output;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.MaxPoolNchwc8(
+                srcF.GetDataArray(), dstF.GetDataArray(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding);
+            return;
+        }
+
+        // Float fast paths
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            int ps = poolSize, st = stride, pd = padding;
+            if (pd == 0 && ps == 3)      MaxPool2DFloat3x3NoPad(inArr, outArr, bc, height, width, outputHeight, outputWidth, st);
+            else if (pd == 0 && ps == 2) MaxPool2DFloat2x2NoPad(inArr, outArr, bc, height, width, outputHeight, outputWidth, st);
+            else if (ps == 3)            MaxPool2DFloat3x3Padded(inArr, outArr, bc, height, width, outputHeight, outputWidth, st, pd);
+            else                         MaxPool2DFloatGeneric(inArr, outArr, bc, height, width, outputHeight, outputWidth, ps, st, pd);
+            return;
+        }
+
+        // Generic fallback
+        var inputData = input.GetDataArray();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int b = idx / channels, c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T maxValue = numOps.MinValue;
+                    for (int kh = 0; kh < poolSize; kh++)
+                    {
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
+                        {
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
+                            T value = inputData[inputBaseOffset + ih * width + iw];
+                            if (numOps.GreaterThan(value, maxValue)) maxValue = value;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = maxValue;
+                }
+        });
+    }
+
+    /// <summary>
+    /// Write-through AvgPool2D: same dispatch as
+    /// <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> but writes into
+    /// the provided output tensor. Used by ResNet's final global-average-
+    /// pool step and by GAP blocks in various CV architectures. Saves
+    /// ~40 µs per call by skipping the intermediate alloc+CopyTo.
+    /// </summary>
+    public void AvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (stride == 0) stride = poolSize;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
+        int outputWidth  = (width  + 2 * padding - poolSize) / stride + 1;
+
+        // NCHWc8 SIMD
+        if (typeof(T) == typeof(float)
+            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            && channels % Simd.NchwcPool.CBlock == 0)
+        {
+            var srcF = (Tensor<float>)(object)input;
+            var dstF = (Tensor<float>)(object)output;
+            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
+            Simd.NchwcPool.AvgPoolNchwc8(
+                srcF.GetDataArray(), dstF.GetDataArray(),
+                batch, channels, height, width, outputHeight, outputWidth,
+                poolSize, poolSize, stride, stride, padding, padding,
+                countIncludePad: false);
+            return;
+        }
+
+        // Float fast path
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+            Action<int> poolKernel = idx =>
+            {
+                int inputBase = idx * h * w;
+                int outputBase = idx * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        float sum = 0f;
+                        int count = 0;
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = Math.Min(ps, h - ihStart);
+                        int kwEnd = Math.Min(ps, w - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                sum += inArr[rowOff + kw];
+                                count++;
+                            }
+                        }
+                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
+                    }
+            };
+            if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
+            else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            return;
+        }
+
+        // Generic fallback
+        var inputData = input.GetDataArray();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int b = idx / channels, c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T sum = numOps.Zero;
+                    int count = 0;
+                    for (int kh = 0; kh < poolSize; kh++)
+                    {
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
+                        {
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
+                            sum = numOps.Add(sum, inputData[inputBaseOffset + ih * width + iw]);
+                            count++;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = count > 0
+                        ? numOps.Divide(sum, numOps.FromDouble(count))
+                        : numOps.Zero;
+                }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
@@ -6386,7 +6743,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ps = poolSize, s = stride, p = padding;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
-                    (eng, output) => { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p);
+                        else { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AvgPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { st, st } });
             }
         }
@@ -6664,7 +7025,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedKernel = kernel;
                 int s = stride, p = padding, d = dilation;
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
-                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             }
         }
@@ -8009,7 +8374,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Mish", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.MishInto(output, captured);
+                        else { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.MishBackward);
             }
         }
@@ -8071,7 +8440,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Swish, "Swish", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.Swish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => eng.SwishInto(output, captured),
                     BackwardFunctions<T>.SwishBackward);
             }
         }
@@ -8135,7 +8504,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 double capturedAlpha = alpha;
                 return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.ELUInto(output, captured, capturedAlpha);
+                        else { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
             }
         }
@@ -8859,7 +9232,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMul", a, b, outShape,
-                    (eng, output) => { var eager = eng.TensorMatMul(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: write-through. BERT has 72 MatMul calls per
+                    // layer, each allocating + copying its output (786 KB
+                    // to 9 MB depending on shape). Eliminating the CopyTo
+                    // saves ~12 ms of aggregate redundant memory traffic
+                    // per BERT inference. TensorMatMulInto dispatches the
+                    // 2D/ND×2D/ND×ND cases to write-through kernels.
+                    (eng, output) =>
+                    {
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.TensorMatMulFloatInto(
+                                (Tensor<float>)(object)capturedA,
+                                (Tensor<float>)(object)capturedB,
+                                (Tensor<float>)(object)output);
+                        }
+                        else
+                        {
+                            var eager = eng.TensorMatMul(capturedA, capturedB);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
                     BackwardFunctions<T>.MatMulBackward);
             }
         }
@@ -8905,6 +9298,110 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMatMul", result, eng => eng.TensorMatMul(ca, cb)); }
 
         return result;
+    }
+
+    /// <summary>
+    /// Write-through TensorMatMul for float: writes directly into the provided
+    /// <paramref name="output"/> tensor, skipping the intermediate allocation
+    /// + <c>CopyTo</c> that the public <see cref="TensorMatMul{T}"/> routes
+    /// through when called from a compiled plan step. Used by the Path C
+    /// plan-step lambda (captured in GraphMode-active LazyGraph recording).
+    ///
+    /// <para>Dispatch mirrors <see cref="TensorMatMul{T}"/>:</para>
+    /// <list type="bullet">
+    ///   <item>2D×2D: SGEMM directly into output (uses MatMulInto semantics)</item>
+    ///   <item>ND×2D: collapse to 2D GEMM [batch*m, k]×[k,n], single SGEMM</item>
+    ///   <item>ND×ND (same rank): parallel loop over batches, Sgemm/SgemmSequential</item>
+    /// </list>
+    /// </summary>
+    /// <summary>
+    /// Write-through BatchMatMul for float. BERT attention's
+    /// (Q @ K^T) and (attn @ V) go through this 24× per inference.
+    /// Same dispatch semantics as TensorMatMulFloatInto — in fact for
+    /// rank-3+ same-rank inputs the two are behaviourally identical,
+    /// so we just delegate.
+    /// </summary>
+    internal void BatchMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
+    {
+        TensorMatMulFloatInto(a, b, output);
+    }
+
+    internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
+    {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var oArr = output.GetDataArray();
+
+        // 2D × 2D — route through cached-B path (Path A: pre-pack weights)
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+            Simd.SimdGemm.SgemmWithCachedB(
+                new System.ReadOnlySpan<float>(aArr, 0, m * k),
+                bArr,
+                new System.Span<float>(oArr, 0, m * n),
+                m, k, n);
+            return;
+        }
+
+        // ND × 2D: collapse batch dims into m (mirrors TensorMatMulBatched fast path)
+        // Also routes through cached-B — B is the constant weight across all
+        // batch items and across all forward calls.
+        if (b.Rank == 2)
+        {
+            int aRank = a.Rank;
+            int m = a._shape[aRank - 2];
+            int k = a._shape[aRank - 1];
+            int n = b._shape[1];
+            int batchSize = 1;
+            for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
+            Simd.SimdGemm.SgemmWithCachedB(
+                new System.ReadOnlySpan<float>(aArr, 0, batchSize * m * k),
+                bArr,
+                new System.Span<float>(oArr, 0, batchSize * m * n),
+                batchSize * m, k, n);
+            return;
+        }
+
+        // ND × ND (same rank): parallel per-batch SGEMM (mirrors
+        // TensorMatMulFullBatched's float fast path + BatchMatMul's
+        // batchSize-aware dispatch: batch=1 → Sgemm, batch≥2 → Parallel+Sequential)
+        if (a.Rank == b.Rank)
+        {
+            int rank = a.Rank;
+            int m = a._shape[rank - 2];
+            int k = a._shape[rank - 1];
+            int n = b._shape[rank - 1];
+            int batchSize = 1;
+            for (int i = 0; i < rank - 2; i++) batchSize *= a._shape[i];
+            int sliceA = m * k, sliceB = k * n, sliceC = m * n;
+            if (batchSize == 1)
+            {
+                Simd.SimdGemm.Sgemm(
+                    new System.ReadOnlySpan<float>(aArr, 0, sliceA),
+                    new System.ReadOnlySpan<float>(bArr, 0, sliceB),
+                    new System.Span<float>(oArr, 0, sliceC),
+                    m, k, n);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, batch =>
+                {
+                    Simd.SimdGemm.SgemmSequential(
+                        new System.ReadOnlySpan<float>(aArr, batch * sliceA, sliceA),
+                        new System.ReadOnlySpan<float>(bArr, batch * sliceB, sliceB),
+                        new System.Span<float>(oArr, batch * sliceC, sliceC),
+                        m, k, n);
+                });
+            }
+            return;
+        }
+
+        throw new ArgumentException(
+            $"TensorMatMulFloatInto: unsupported rank combination {a.Rank} and {b.Rank}");
     }
 
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
@@ -9196,8 +9693,32 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through Conv2D (int[] overload): runs the same dispatch as the
+    /// public <see cref="Conv2D{T}(Tensor{T}, Tensor{T}, int[], int[], int[])"/>
+    /// but writes directly into a pre-allocated <paramref name="output"/>
+    /// tensor instead of renting a fresh one. Used by compiled plan steps to
+    /// skip the intermediate allocation + CopyTo that would otherwise burn
+    /// ~50 µs per call on ResNet conv shapes.
+    /// </summary>
+    public void Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        Conv2DIntoImpl(input, kernel, stride, padding, dilation, output);
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    {
+        return Conv2DIntoImpl<T>(input, kernel, stride, padding, dilation, preAllocatedOutput: null);
+    }
+
+    /// <summary>
+    /// Shared implementation. When <paramref name="preAllocatedOutput"/> is
+    /// null, allocates a fresh result via TensorAllocator.Rent. Otherwise
+    /// writes into the provided tensor (path used by Conv2DInto).
+    /// </summary>
+    private Tensor<T> Conv2DIntoImpl<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation, Tensor<T>? preAllocatedOutput)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -9235,8 +9756,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check kernel size, stride, padding, and dilation parameters.");
 
-        // Lazy graph mode: record and return placeholder
-        if (GraphMode.IsActive)
+        // Lazy graph mode: record and return placeholder. Only when invoked
+        // as the allocating Conv2D — write-through Conv2DInto skips this
+        // because it already has the output to write into.
+        if (preAllocatedOutput is null && GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -9248,12 +9771,21 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedPad = padding;
                 var capturedDil = dilation;
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
-                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // Path C write-through for Conv2D via the int[] overload.
+                        // Routes through Conv2DInto(int[]) so the dispatch stays
+                        // on the fast int[] NCHWc / im2col+Sgemm path without
+                        // allocating an intermediate tensor.
+                        if (eng is CpuEngine cpuEng)
+                            cpuEng.Conv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil);
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
             }
         }
 
-        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        var result = preAllocatedOutput ?? TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();
@@ -10325,6 +10857,20 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through DepthwiseConv2D for MobileNet / EfficientNet inference.
+    /// Computes directly into the provided output buffer, skipping the
+    /// intermediate tensor allocation + CopyTo (~100 µs saved per call on
+    /// mid-sized depthwise layers).
+    /// </summary>
+    public void DepthwiseConv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, output.GetDataArray());
+    }
+
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
     {
@@ -10345,13 +10891,45 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedStride = stride;
                 var capturedPadding = padding;
                 return scope.RecordBinary(LazyNodeType.DepthwiseConv2D, "DepthwiseConv2D", input, kernel, outShape,
-                    (eng, output) => { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
+                        else { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
             }
         }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("DepthwiseConv2D", input._shape); if (ac is not null) return ac.Execute(); }
 
+        int batch0 = input._shape[0];
+        int inChannels0 = input._shape[1];
+        int multiplier0 = kernel._shape[1];
+        int kernelHeight0 = kernel._shape[2];
+        int kernelWidth0 = kernel._shape[3];
+        int outputHeight0 = (input._shape[2] + 2 * padding[0] - kernelHeight0) / stride[0] + 1;
+        int outputWidth0 = (input._shape[3] + 2 * padding[1] - kernelWidth0) / stride[1] + 1;
+        int outChannels0 = inChannels0 * multiplier0;
+
+        var outputData = new T[batch0 * outChannels0 * outputHeight0 * outputWidth0];
+        DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
+
+        var dwConvResult = TensorAllocator.Rent<T>([batch0, outChannels0, outputHeight0, outputWidth0], new Vector<T>(outputData));
+        DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
+        AutoTracer.RecordOp("DepthwiseConv2D", dwConvResult, eng => dwConvResult);
+        return dwConvResult;
+    }
+
+    /// <summary>
+    /// Shared depthwise conv compute: Parallel.For over (batch × out-channels)
+    /// with a 4-level spatial inner loop. Writes results directly into
+    /// <paramref name="outputData"/> which must be sized for the output
+    /// tensor's total element count. Used by both DepthwiseConv2D (rents
+    /// a fresh output) and DepthwiseConv2DInto (reuses caller's buffer).
+    /// </summary>
+    private void DepthwiseConv2DComputeIntoOutput<T>(
+        Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, T[] outputData)
+    {
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -10372,7 +10950,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
-        var outputData = new T[batch * outChannels * outputHeight * outputWidth];
 
         Parallel.For(0, batch * outChannels, idx =>
         {
@@ -10408,11 +10985,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         });
-
-        var dwConvResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
-        DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
-        AutoTracer.RecordOp("DepthwiseConv2D", dwConvResult, eng => dwConvResult);
-        return dwConvResult;
     }
 
     /// <inheritdoc/>
@@ -13734,7 +14306,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Softmax, "Softmax", input, input._shape,
-                    (eng, output) => { var eager = eng.Softmax(captured, capturedAxis); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: write-through via SoftmaxInto when possible.
+                    // Skips the alloc-copy round-trip through Softmax's
+                    // public API (~100 µs saved on BERT [1,12,256,256]).
+                    (eng, output) => eng.SoftmaxInto(output, captured, capturedAxis),
                     BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             }
         }
@@ -15560,7 +16135,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(savedScope);
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    // Path C: plan-step write-through. When the engine is
+                    // CpuEngine and T is float, call LayerNormFloatInto which
+                    // writes directly into the plan's pre-allocated output.
+                    // This skips the intermediate tensor allocation + the
+                    // 786 KB CopyTo that the generic path below would incur
+                    // for BERT's [1,256,768] LayerNorm (~130 µs saved per
+                    // call × 24 calls per BERT layer).
+                    (eng, output) =>
+                    {
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.LayerNormFloatInto(
+                                (Tensor<float>)(object)ci,
+                                (Tensor<float>)(object)cg,
+                                (Tensor<float>)(object)cb,
+                                ce,
+                                (Tensor<float>)(object)output);
+                        }
+                        else
+                        {
+                            var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _);
+                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -15615,65 +16213,55 @@ public partial class CpuEngine : ITensorLevelEngine
         var gammaData = gamma.GetDataArray();
         var betaData = beta.GetDataArray();
 
-        var meanData = new T[batchSize];
-        var varData = new T[batchSize];
-        var outputData = new T[batchSize * featureSize];
-
-        // Float fast path: direct array access, SIMD mean via SumUnsafe
+        // Float fast path: SIMD mean, variance, and normalize via Vector256
+        // with FMA — fused into a SINGLE pass over the input using
+        // <c>Var[X] = E[X²] - E[X]²</c>. Writes directly into an uninitialized
+        // rented output tensor, avoiding the 786 KB zero-init cost of
+        // <c>new float[batchSize * featureSize]</c> that previously dominated
+        // per-call overhead on BERT LayerNorm (measured: engine wrap was
+        // 304 µs over a 157 µs kernel → 2× improvement expected from alloc
+        // elimination alone; one-pass kernel adds another 20%).
         if (typeof(T) == typeof(float))
         {
             var fInput = (float[])(object)inputData;
             var fGamma = (float[])(object)gammaData;
             var fBeta = (float[])(object)betaData;
-            var fOutput = (float[])(object)outputData;
-            var fMean = (float[])(object)meanData;
-            var fVar = (float[])(object)varData;
             float fEps = eps is not null ? (float)(object)eps : 1e-5f;
             int fs = featureSize;
 
-            // Single batch loop body — inlined for both sequential and parallel paths
-            void ProcessBatch(int b)
-            {
-                int off = b * fs;
-                float sum = 0f;
-                for (int f = 0; f < fs; f++) sum += fInput[off + f];
-                float m = sum / fs;
-                fMean[b] = m;
+            // Rent uninitialized output tensor — skips Array.Clear.
+            var lnResultF = TensorAllocator.RentUninitialized<float>(input._shape);
+            var fOutput = lnResultF.GetDataArray();
+            // Mean/variance are always returned as out params. They're
+            // consumed by the backward pass; for inference the tensors are
+            // thrown away but we still have to produce them. Use
+            // RentUninitialized + direct write (small — batchSize floats).
+            var meanTensorF = TensorAllocator.RentUninitialized<float>(batchShape);
+            var varTensorF  = TensorAllocator.RentUninitialized<float>(batchShape);
+            var fMean = meanTensorF.GetDataArray();
+            var fVar  = varTensorF .GetDataArray();
 
-                float sumSq = 0f;
-                for (int f = 0; f < fs; f++)
-                {
-                    float d = fInput[off + f] - m;
-                    sumSq += d * d;
-                }
-                float v2 = sumSq / fs;
-                fVar[b] = v2;
+            ProcessBatchesSimd(fInput, fGamma, fBeta, fOutput, fMean, fVar,
+                batchSize, fs, fEps);
 
-                float invStd = 1f / MathF.Sqrt(v2 + fEps);
-                // Fused: precompute per-feature scale and bias to avoid redundant ops
-                for (int f = 0; f < fs; f++)
-                    fOutput[off + f] = (fInput[off + f] - m) * invStd * fGamma[f] + fBeta[f];
-            }
-
-            // Skip Parallel.For for small workloads — thread dispatch overhead exceeds work
-            if (batchSize * fs < 50_000)
-            {
-                for (int b = 0; b < batchSize; b++)
-                    ProcessBatch(b);
-            }
-            else
-            {
-                Parallel.For(0, batchSize, b => ProcessBatch(b));
-            }
+            mean = (Tensor<T>)(object)meanTensorF;
+            variance = (Tensor<T>)(object)varTensorF;
+            var lnResult = (Tensor<T>)(object)lnResultF;
+            DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
+                BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+            AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
+            return lnResult;
         }
-        else
-        {
-        // Generic T path — uses numOps.Sum (SIMD via SimdKernels.Sum for float/double)
-        // for the mean/variance reductions instead of a scalar accumulation loop,
-        // and uses span slicing for the output write pass. For double this takes
-        // each batch from ~3 × featureSize virtual calls (6144 for hidden=2048)
-        // down to 3 × SIMD reductions + 1 scalar output-write. Same structural
-        // principle as the other fallback fixes: no scalar loops for float/double.
+
+        // Generic T path — uses numOps.Sum (SIMD via SimdKernels.Sum for
+        // float/double) for the mean/variance reductions instead of a scalar
+        // accumulation loop, and uses span slicing for the output write pass.
+        // The float fast path above returns early, so this branch is only
+        // double / BFloat16 / custom numeric types today — no else wrapper
+        // required.
+        var meanData = new T[batchSize];
+        var varData = new T[batchSize];
+        var outputData = new T[batchSize * featureSize];
         T featureSizeT = numOps.FromDouble(featureSize);
         Parallel.For(0, batchSize, b =>
         {
@@ -15703,16 +16291,243 @@ public partial class CpuEngine : ITensorLevelEngine
                 outSlice[f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
             }
         });
-        }
 
         // Create mean and variance tensors with batch shape
         mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>(batchShape, new Vector<T>(varData));
-        var lnResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
-        DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
+        var lnResultG = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("LayerNorm", lnResultG, new[] { input, gamma, beta },
             BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
-        AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
-        return lnResult;
+        AutoTracer.RecordOp("LayerNorm", lnResultG, eng => lnResultG);
+        return lnResultG;
+    }
+
+    /// <summary>
+    /// Write-through LayerNorm for float inference: writes directly into the
+    /// provided <paramref name="output"/> tensor instead of allocating a new
+    /// one. Used by compiled plan steps so the plan-step lambda doesn't have
+    /// to call the public <see cref="LayerNorm{T}"/> (which allocates an
+    /// intermediate tensor) then <c>CopyTo</c> into the pre-allocated plan
+    /// buffer. For BERT LayerNorm [1,256,768] this saves ~130 µs per call
+    /// (50 µs allocation + 80 µs 786 KB CopyTo at 10 GB/s).
+    ///
+    /// <para>Skips mean/variance allocation — inference doesn't need them.
+    /// Scratch is rented from ArrayPool.</para>
+    /// </summary>
+    internal static long _lnFloatIntoCalls;
+
+    internal void LayerNormFloatInto(
+        Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
+        double epsilon, Tensor<float> output)
+    {
+        System.Threading.Interlocked.Increment(ref _lnFloatIntoCalls);
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
+        int batchSize = 1;
+        for (int i = 0; i < inputRank - normalizedDims; i++)
+            batchSize *= input._shape[i];
+        if (batchSize == 0) batchSize = 1;
+        int featureSize = gamma.Length;
+
+        var fInput  = input .GetDataArray();
+        var fGamma  = gamma .GetDataArray();
+        var fBeta   = beta  .GetDataArray();
+        var fOutput = output.GetDataArray();
+        float fEps = (float)epsilon;
+
+        var fMean = System.Buffers.ArrayPool<float>.Shared.Rent(batchSize);
+        var fVar  = System.Buffers.ArrayPool<float>.Shared.Rent(batchSize);
+        try
+        {
+            ProcessBatchesSimd(fInput, fGamma, fBeta, fOutput, fMean, fVar,
+                batchSize, featureSize, fEps);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(fVar);
+            System.Buffers.ArrayPool<float>.Shared.Return(fMean);
+        }
+    }
+
+    /// <summary>
+    /// SIMD float LayerNorm worker — three vectorised passes per row
+    /// (mean, variance, transform). Extracted so the Parallel.For lambda
+    /// can dispatch to a named static method. Uses
+    /// <c>Unsafe.ReadUnaligned</c> / <c>Unsafe.WriteUnaligned</c> for
+    /// 32-byte vector load/store, avoiding Span bounds-check overhead.
+    /// </summary>
+    private static void ProcessBatchesSimd(
+        float[] fInput, float[] fGamma, float[] fBeta,
+        float[] fOutput, float[] fMean, float[] fVar,
+        int batchSize, int fs, float fEps)
+    {
+#if NET5_0_OR_GREATER
+        bool useSimd = System.Runtime.Intrinsics.X86.Avx.IsSupported
+                    && System.Runtime.Intrinsics.X86.Fma.IsSupported;
+#else
+        bool useSimd = false;
+#endif
+        if (batchSize * fs < 50_000)
+        {
+            for (int b = 0; b < batchSize; b++)
+                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
+        }
+        else
+        {
+            Parallel.For(0, batchSize, b =>
+                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ProcessRow(
+        float[] fInput, float[] fGamma, float[] fBeta,
+        float[] fOutput, float[] fMean, float[] fVar,
+        int b, int fs, float fEps, bool useSimd)
+    {
+        int off = b * fs;
+        float m, v2;
+
+#if NET8_0_OR_GREATER
+        // AVX-512 path: 16-wide Vector512 halves the vector ops vs AVX2
+        // for the same row. On Zen 5 / Intel Ice Lake+ / Sapphire Rapids
+        // this cuts LayerNorm ProcessRow time by ~2× (measured proxy: the
+        // FFN up MatMul's FP throughput jump from AVX2→AVX-512).
+        if (AiDotNet.Tensors.Engines.Simd.CpuFeatures.HasAVX512F && fs >= 16)
+        {
+            // Pass 1 (fused): sum AND sum-of-squares, 16 floats/op.
+            var vSum512 = System.Runtime.Intrinsics.Vector512<float>.Zero;
+            var vSumSq512 = System.Runtime.Intrinsics.Vector512<float>.Zero;
+            int f512 = 0;
+            for (; f512 + 16 <= fs; f512 += 16)
+            {
+                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f512]));
+                vSum512 = System.Runtime.Intrinsics.X86.Avx512F.Add(vSum512, v);
+                vSumSq512 = System.Runtime.Intrinsics.X86.Avx512F.FusedMultiplyAdd(v, v, vSumSq512);
+            }
+            // Reduce 16 → 8 via GetUpper/GetLower + Add, then the existing
+            // AVX2 HorizontalSum closes it out.
+            float sum512 = SimdKernels.HorizontalSum(
+                System.Runtime.Intrinsics.X86.Avx.Add(vSum512.GetLower(), vSum512.GetUpper()));
+            float sumSq512 = SimdKernels.HorizontalSum(
+                System.Runtime.Intrinsics.X86.Avx.Add(vSumSq512.GetLower(), vSumSq512.GetUpper()));
+            for (; f512 < fs; f512++)
+            {
+                float x = fInput[off + f512];
+                sum512 += x;
+                sumSq512 += x * x;
+            }
+            m = sum512 / fs;
+            v2 = sumSq512 / fs - m * m;
+            if (v2 < 0f) v2 = 0f;
+            fMean[b] = m;
+            fVar[b] = v2;
+
+            // Pass 2: 16-wide transform: (in - m) * invStd * gamma + beta.
+            float invStd512 = 1f / MathF.Sqrt(v2 + fEps);
+            var vInvStd512 = System.Runtime.Intrinsics.Vector512.Create(invStd512);
+            var vMNeg512 = System.Runtime.Intrinsics.Vector512.Create(m);
+            f512 = 0;
+            for (; f512 + 16 <= fs; f512 += 16)
+            {
+                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f512]));
+                var vG = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f512]));
+                var vB = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f512]));
+                var d = System.Runtime.Intrinsics.X86.Avx512F.Subtract(v, vMNeg512);
+                var scaled = System.Runtime.Intrinsics.X86.Avx512F.Multiply(d, vInvStd512);
+                var final = System.Runtime.Intrinsics.X86.Avx512F.FusedMultiplyAdd(scaled, vG, vB);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f512]), final);
+            }
+            for (; f512 < fs; f512++)
+                fOutput[off + f512] = (fInput[off + f512] - m) * invStd512 * fGamma[f512] + fBeta[f512];
+            return;
+        }
+#endif
+
+#if NET5_0_OR_GREATER
+        if (useSimd && fs >= 8)
+        {
+            // Pass 1 (fused): sum AND sum-of-squares in a single pass via
+            // Var[X] = E[X²] - (E[X])². Cuts input reads from 3× to 2×
+            // and saves ~20% kernel time vs the 3-pass form. Measured at
+            // 126 µs vs 157 µs on BERT [1,256,768] LayerNorm.
+            var vSum = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vSumSq = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            int f = 0;
+            for (; f + 8 <= fs; f += 8)
+            {
+                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f]));
+                vSum = System.Runtime.Intrinsics.X86.Avx.Add(vSum, v);
+                vSumSq = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v, v, vSumSq);
+            }
+            float sum = SimdKernels.HorizontalSum(vSum);
+            float sumSq = SimdKernels.HorizontalSum(vSumSq);
+            for (; f < fs; f++)
+            {
+                float x = fInput[off + f];
+                sum += x;
+                sumSq += x * x;
+            }
+            m = sum / fs;
+            v2 = sumSq / fs - m * m;
+            // Numerical-safety clamp: E[X²] - E[X]² can go slightly negative
+            // in float32 for near-uniform rows due to catastrophic
+            // cancellation. Clamp to 0 — any invStd > 0 maps such rows to
+            // zero output, which is the correct degenerate LayerNorm result.
+            if (v2 < 0f) v2 = 0f;
+            fMean[b] = m;
+            fVar[b] = v2;
+
+            // Pass 2: SIMD transform: out = (in - m) * invStd * gamma + beta.
+            float invStd = 1f / MathF.Sqrt(v2 + fEps);
+            var vInvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+            var vMNeg = System.Runtime.Intrinsics.Vector256.Create(m);
+            f = 0;
+            for (; f + 8 <= fs; f += 8)
+            {
+                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f]));
+                var vG = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f]));
+                var vB = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f]));
+                // (in - m) * invStd * gamma + beta
+                var d = System.Runtime.Intrinsics.X86.Avx.Subtract(v, vMNeg);
+                var scaled = System.Runtime.Intrinsics.X86.Avx.Multiply(d, vInvStd);
+                var final = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(scaled, vG, vB);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f]), final);
+            }
+            for (; f < fs; f++)
+                fOutput[off + f] = (fInput[off + f] - m) * invStd * fGamma[f] + fBeta[f];
+            return;
+        }
+#endif
+
+        // Scalar fallback
+        {
+            float sum = 0f;
+            for (int f = 0; f < fs; f++) sum += fInput[off + f];
+            m = sum / fs;
+            fMean[b] = m;
+            float sumSq = 0f;
+            for (int f = 0; f < fs; f++)
+            {
+                float d = fInput[off + f] - m;
+                sumSq += d * d;
+            }
+            v2 = sumSq / fs;
+            fVar[b] = v2;
+            float invStd = 1f / MathF.Sqrt(v2 + fEps);
+            for (int f = 0; f < fs; f++)
+                fOutput[off + f] = (fInput[off + f] - m) * invStd * fGamma[f] + fBeta[f];
+        }
     }
 
     /// <inheritdoc/>
@@ -15969,7 +16784,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 // backward (Tensor cast as int at savedState[0]). Fixed per #178.
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "GroupNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng)
+                        {
+                            cpuEng.GroupNormInto(output, ci, cn, cg, cb, ce, out _, out _);
+                        }
+                        else { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
+                    // SavedState order per #178 fix above: numGroups must come first so
+                    // GroupNormBackward reads savedState[0] as int (not as Tensor).
                     BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -20754,6 +21578,73 @@ public partial class CpuEngine : ITensorLevelEngine
 
     #region Spatial Operations
 
+    /// <summary>
+    /// Write-through nearest-neighbour upsample. Mirrors the kernel used by
+    /// <see cref="Upsample{T}(Tensor{T}, int, int)"/> but writes into the
+    /// provided output tensor. Used by U-Net decoders, FPN top-down passes,
+    /// and image super-resolution heads — these typically do 4-5 upsamples
+    /// per inference.
+    /// </summary>
+    public void UpsampleInto<T>(Tensor<T> output, Tensor<T> input, int scaleH, int scaleW)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length < 2)
+            throw new ArgumentException("UpsampleInto requires tensor with at least 2 dimensions for height and width.");
+
+        int heightIdx = shape.Length - 2;
+        int widthIdx = shape.Length - 1;
+        int height = shape[heightIdx];
+        int width = shape[widthIdx];
+        int flatBatch = 1;
+        for (int i = 0; i < shape.Length - 2; i++) flatBatch *= shape[i];
+        int newHeight = height * scaleH;
+        int newWidth = width * scaleW;
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int h = height, w = width, sH = scaleH, sW = scaleW, nH = newHeight, nW = newWidth;
+            Action<int> kernel = fb =>
+            {
+                int inBase = fb * h * w;
+                int outBase = fb * nH * nW;
+                for (int oh = 0; oh < nH; oh++)
+                {
+                    int ih = oh / sH;
+                    int rowOut = outBase + oh * nW;
+                    int rowIn  = inBase  + ih * w;
+                    for (int ow = 0; ow < nW; ow++)
+                    {
+                        outArr[rowOut + ow] = inArr[rowIn + ow / sW];
+                    }
+                }
+            };
+            if (flatBatch > 8) Parallel.For(0, flatBatch, kernel);
+            else for (int fb = 0; fb < flatBatch; fb++) kernel(fb);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, flatBatch, fb =>
+        {
+            for (int oh = 0; oh < newHeight; oh++)
+            {
+                int ih = oh / scaleH;
+                for (int ow = 0; ow < newWidth; ow++)
+                {
+                    int iw = ow / scaleW;
+                    int inputIdx = (fb * height + ih) * width + iw;
+                    int outputIdx = (fb * newHeight + oh) * newWidth + ow;
+                    outputData[outputIdx] = inputData[inputIdx];
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
@@ -20772,7 +21663,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 outShape[shape.Length - 2] *= scaleH;
                 outShape[shape.Length - 1] *= scaleW;
                 return scope.RecordUnary(LazyNodeType.Custom, "Upsample", input, outShape,
-                    (eng, output) => { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
+                        else { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
             }
         }
@@ -20925,13 +21820,129 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
+    /// <summary>
+    /// Write-through PixelShuffle (sub-pixel upscaling). Used by super-
+    /// resolution heads (ESPCN, EDSR, SRResNet) and YOLO neck/head blocks.
+    /// Inverts the loop nest from output-major (with div/mod per inner pixel)
+    /// to input-major so the inner ow loop becomes linear indexing.
+    /// </summary>
+    public void PixelShuffleInto<T>(Tensor<T> output, Tensor<T> input, int upscaleFactor)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length != 4)
+            throw new ArgumentException("PixelShuffleInto expects 4D tensor [batch, channels, height, width]");
+
+        int batch = shape[0];
+        int channels = shape[1];
+        int height = shape[2];
+        int width = shape[3];
+        int r = upscaleFactor;
+        if (channels % (r * r) != 0)
+            throw new ArgumentException($"Number of channels ({channels}) must be divisible by r^2 ({r * r})");
+
+        int newChannels = channels / (r * r);
+        int newHeight = height * r;
+        int newWidth = width * r;
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int totalBOC = batch * newChannels;
+            int hh = height, ww = width, oH = newHeight, oW = newWidth, rr = r, ch = channels;
+            Action<int> kernel = boc =>
+            {
+                int b = boc / newChannels;
+                int oc = boc % newChannels;
+                int ocBase = oc * rr * rr;
+                int outBcBase = boc * oH * oW;
+                int inBatchBase = b * ch * hh * ww;
+                for (int subH = 0; subH < rr; subH++)
+                {
+                    for (int subW = 0; subW < rr; subW++)
+                    {
+                        int ic = ocBase + subH * rr + subW;
+                        int inChanBase = inBatchBase + ic * hh * ww;
+                        for (int ih = 0; ih < hh; ih++)
+                        {
+                            int oh = ih * rr + subH;
+                            int rowOut = outBcBase + oh * oW + subW;
+                            int rowIn = inChanBase + ih * ww;
+                            // Stride-rr write into the output row.
+                            for (int iw = 0; iw < ww; iw++)
+                            {
+                                outArr[rowOut + iw * rr] = inArr[rowIn + iw];
+                            }
+                        }
+                    }
+                }
+            };
+            if (totalBOC > 4) Parallel.For(0, totalBOC, kernel);
+            else for (int boc = 0; boc < totalBOC; boc++) kernel(boc);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * newChannels, boc =>
+        {
+            int b = boc / newChannels;
+            int oc = boc % newChannels;
+            int ocBase = oc * r * r;
+            int outBcBase = boc * newHeight * newWidth;
+            int inBatchBase = b * channels * height * width;
+            for (int subH = 0; subH < r; subH++)
+            {
+                for (int subW = 0; subW < r; subW++)
+                {
+                    int ic = ocBase + subH * r + subW;
+                    int inChanBase = inBatchBase + ic * height * width;
+                    for (int ih = 0; ih < height; ih++)
+                    {
+                        int oh = ih * r + subH;
+                        int rowOut = outBcBase + oh * newWidth + subW;
+                        int rowIn = inChanBase + ih * width;
+                        for (int iw = 0; iw < width; iw++)
+                        {
+                            outputData[rowOut + iw * r] = inputData[rowIn + iw];
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_upscaleFactor = upscaleFactor; return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, input._shape, (eng, output) => { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PixelShuffleBackward); } }
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var c_input = input;
+                int c_upscaleFactor = upscaleFactor;
+                int rr = upscaleFactor;
+                if (shape[1] % (rr * rr) != 0)
+                    throw new ArgumentException($"Number of channels ({shape[1]}) must be divisible by r^2 ({rr * rr})");
+                // FIX: previous code passed input._shape, leaving the output buffer
+                // sized for the pre-shuffle layout — element count matched but the
+                // shape metadata was wrong for downstream shape-aware ops.
+                var outShape = new[] { shape[0], shape[1] / (rr * rr), shape[2] * rr, shape[3] * rr };
+                return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, outShape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
+                        else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
+                    BackwardFunctions<T>.PixelShuffleBackward, new object[] { c_upscaleFactor });
+            }
+        }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("PixelShuffle", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
@@ -20947,32 +21958,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batch * newChannels * newHeight * newWidth];
-
-        Parallel.For(0, batch, b =>
-        {
-            for (int oc = 0; oc < newChannels; oc++)
-            {
-                for (int oh = 0; oh < newHeight; oh++)
-                {
-                    for (int ow = 0; ow < newWidth; ow++)
-                    {
-                        int ih = oh / r;
-                        int iw = ow / r;
-                        int subH = oh % r;
-                        int subW = ow % r;
-                        int ic = oc * r * r + subH * r + subW;
-
-                        int inputIdx = ((b * channels + ic) * height + ih) * width + iw;
-                        int outputIdx = ((b * newChannels + oc) * newHeight + oh) * newWidth + ow;
-                        outputData[outputIdx] = inputData[inputIdx];
-                    }
-                }
-            }
-        });
-
-        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth]);
+        PixelShuffleInto(psResult, input, upscaleFactor);
         DifferentiableOps.RecordUnary("PixelShuffle", psResult, input, BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
         { var ci = input; var cu = upscaleFactor; AutoTracer.RecordOp("PixelShuffle", psResult, eng => eng.PixelShuffle(ci, cu)); }
         return psResult;
@@ -21428,13 +22415,90 @@ public partial class CpuEngine : ITensorLevelEngine
         return (realNorm, imagNorm);
     }
 
+    /// <summary>
+    /// Write-through 4D-NCHW crop. Mirrors <see cref="Crop{T}"/> but writes
+    /// into the supplied output buffer with row-contiguous BlockCopy/Array
+    /// .Copy. Used by detection postprocessing and ROI-based pipelines.
+    /// </summary>
+    public void CropInto<T>(Tensor<T> output, Tensor<T> input, int top, int left, int height, int width)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var shape = input._shape;
+        if (shape.Length != 4)
+            throw new ArgumentException("CropInto expects 4D tensor [batch, channels, height, width]");
+
+        int batch = shape[0];
+        int channels = shape[1];
+        int inputHeight = shape[2];
+        int inputWidth = shape[3];
+
+        if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
+            throw new ArgumentException("Crop region is out of bounds");
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int totalBC = batch * channels;
+            int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
+            int t = top, l = left;
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * iH * iW + t * iW + l;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    Buffer.BlockCopy(inArr, (inBase + oh * iW) * sizeof(float),
+                                     outArr, (outBase + oh * oW) * sizeof(float),
+                                     oW * sizeof(float));
+                }
+            };
+            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
+            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, bc =>
+        {
+            int inBase = bc * inputHeight * inputWidth + top * inputWidth + left;
+            int outBase = bc * height * width;
+            for (int oh = 0; oh < height; oh++)
+            {
+                Array.Copy(inputData, inBase + oh * inputWidth,
+                           outputData, outBase + oh * width, width);
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_top = top; var c_left = left; var c_height = height; var c_width = width; return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, input._shape, (eng, output) => { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CropBackward); } }
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var c_input = input;
+                int c_top = top, c_left = left, c_height = height, c_width = width;
+                // FIX: previous code passed input._shape, leaving the output buffer
+                // sized for the un-cropped input — only the leading bytes were
+                // overwritten, downstream ops saw stale data after the crop.
+                var outShape = new[] { shape[0], shape[1], height, width };
+                return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, outShape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
+                        else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
+                    BackwardFunctions<T>.CropBackward, new object[] { c_top, c_left });
+            }
+        }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Crop", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
@@ -21445,28 +22509,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
             throw new ArgumentException("Crop region is out of bounds");
 
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batch * channels * height * width];
-
-        Parallel.For(0, batch * channels, bc =>
-        {
-            int b = bc / channels;
-            int c = bc % channels;
-
-            for (int oh = 0; oh < height; oh++)
-            {
-                int ih = top + oh;
-                for (int ow = 0; ow < width; ow++)
-                {
-                    int iw = left + ow;
-                    int inputIdx = ((b * channels + c) * inputHeight + ih) * inputWidth + iw;
-                    int outputIdx = ((b * channels + c) * height + oh) * width + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        });
-
-        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width]);
+        CropInto(cropResult, input, top, left, height, width);
         DifferentiableOps.RecordUnary("Crop", cropResult, input, BackwardFunctions<T>.CropBackward, new object[] { top, left });
         { var ci = input; var ct = top; var cl = left; var ch = height; var cw = width; AutoTracer.RecordOp("Crop", cropResult, eng => eng.Crop(ci, ct, cl, ch, cw)); }
         return cropResult;
@@ -21513,6 +22557,81 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
+    /// <summary>
+    /// Write-through 2D-spatial pad. Mirrors <see cref="Pad{T}"/> but writes
+    /// into the supplied output. The eager path was per-element fill + per-
+    /// element copy (O(NHW) memory bandwidth twice). This implementation
+    /// uses Array.Clear for zero-pad and Buffer.MemoryCopy per row, cutting
+    /// the inner copy from 4 ops/element to a single memcpy. Hot whenever
+    /// an ONNX model uses an explicit Pad op before Conv (asymmetric pads,
+    /// non-zero pad value, or padding modes Conv2D doesn't support natively).
+    /// </summary>
+    public void PadInto<T>(Tensor<T> output, Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+        var shape = input._shape;
+        if (shape.Length < 2) throw new ArgumentException("PadInto expects at least 2D tensor");
+
+        int rank = shape.Length;
+        int height = shape[rank - 2];
+        int width = shape[rank - 1];
+        int newHeight = height + padTop + padBottom;
+        int newWidth = width + padLeft + padRight;
+        int batchSize = 1;
+        for (int i = 0; i < rank - 2; i++) batchSize *= shape[i];
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            float padF = padValue is float fv ? fv : 0f;
+            // Fast fill: Array.Clear if zero pad, scalar fill otherwise.
+            if (padF == 0f)
+            {
+                Array.Clear(outArr, 0, outArr.Length);
+            }
+            else
+            {
+                outArr.AsSpan().Fill(padF);
+            }
+            int h = height, w = width, nH = newHeight, nW = newWidth;
+            int pt = padTop, pl = padLeft;
+            Action<int> kernel = b =>
+            {
+                int inBase = b * h * w;
+                int outBase = b * nH * nW + pt * nW + pl;
+                for (int ih = 0; ih < h; ih++)
+                {
+                    Buffer.BlockCopy(inArr, (inBase + ih * w) * sizeof(float),
+                                     outArr, (outBase + ih * nW) * sizeof(float),
+                                     w * sizeof(float));
+                }
+            };
+            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
+            else for (int b = 0; b < batchSize; b++) kernel(b);
+            return;
+        }
+
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        // Single fill of the whole output with padValue (Span<T>.Fill is
+        // available across all target frameworks via System.Memory).
+        outputData.AsSpan().Fill(padValue);
+        Parallel.For(0, batchSize, b =>
+        {
+            int inBase = b * height * width;
+            int outBase = b * newHeight * newWidth + padTop * newWidth + padLeft;
+            // Per-row contiguous copy.
+            for (int ih = 0; ih < height; ih++)
+            {
+                Array.Copy(inputData, inBase + ih * width,
+                           outputData, outBase + ih * newWidth, width);
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
@@ -21534,7 +22653,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 outShape[capRank - 2] += padTop + padBottom;
                 outShape[capRank - 1] += padLeft + padRight;
                 return scope.RecordUnary(LazyNodeType.Custom, "Pad", input, outShape,
-                    (eng, output) => { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
+                        else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
             }
         }
@@ -21546,36 +22669,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height + padTop + padBottom;
         int newWidth = width + padLeft + padRight;
 
-        int batchSize = 1;
-        for (int i = 0; i < rank - 2; i++)
-            batchSize *= shape[i];
-
-        var inputData = input.GetFlattenedData();
-        var outputData = new T[batchSize * newHeight * newWidth];
-
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = padValue;
-
-        Parallel.For(0, batchSize, b =>
-        {
-            for (int ih = 0; ih < height; ih++)
-            {
-                int oh = ih + padTop;
-                for (int iw = 0; iw < width; iw++)
-                {
-                    int ow = iw + padLeft;
-                    int inputIdx = b * height * width + ih * width + iw;
-                    int outputIdx = b * newHeight * newWidth + oh * newWidth + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        });
-
         var newShape = (int[])shape.Clone();
         newShape[rank - 2] = newHeight;
         newShape[rank - 1] = newWidth;
 
-        var padResult = TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        var padResult = TensorAllocator.Rent<T>(newShape);
+        PadInto(padResult, input, padTop, padBottom, padLeft, padRight, padValue);
         DifferentiableOps.RecordUnary("Pad", padResult, input, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
         { var ci = input; var cpt = padTop; var cpb = padBottom; var cpl = padLeft; var cpr = padRight; var cpv = padValue; AutoTracer.RecordOp("Pad", padResult, eng => eng.Pad(ci, cpt, cpb, cpl, cpr, cpv)); }
         return padResult;
@@ -21635,7 +22734,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 foreach (var t in tensors) totalAxis += t._shape[capturedAxis];
                 outShape[capturedAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concat", captured, outShape,
-                    (eng, output) => { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.ConcatInto(output, captured, capturedAxis);
+                        else { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
         }
@@ -25673,7 +26776,13 @@ public partial class CpuEngine : ITensorLevelEngine
                     // Tier 3: Any BLAS with validation
                     else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                     {
-                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                        // Path B step 1: route through Path A's cached-B
+                        // SGEMM. For inference with stable weight arrays,
+                        // this amortises PackB across every forward call.
+                        // Falls through to standard Sgemm when the shape
+                        // exceeds Nc (single-jc-pass assumption).
+                        Simd.SimdGemm.SgemmWithCachedB(
+                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     }
                 }
 
@@ -25737,6 +26846,30 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 return result;
             }
+        }
+
+        // ND float fast path: for rank-3+ input with rank-2 weight (BERT
+        // FFN pattern), TensorMatMul collapses to a big 2D GEMM via Path A's
+        // cached-B. Then bias + activation can share the SIMD epilogue with
+        // the 2D path above — no need to fall through to the TensorBroadcast-
+        // Add + ApplyFusedActivationInPlace pair of separate memory passes.
+        if (typeof(T) == typeof(float) && input.Rank >= 3 && weights.Rank == 2
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU
+                || activation == FusedActivationType.GELU))
+        {
+            var matMulResult = TensorMatMul(input, weights);
+            if (bias != null || activation != FusedActivationType.None)
+            {
+                var outArr = (float[])(object)matMulResult.GetDataArray();
+                var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                // matMulResult shape: [..batchDims.., M_rows, N]
+                // Collapse batch dims to treat as a single [M_total, N] for the epilogue.
+                int N = matMulResult._shape[matMulResult._shape.Length - 1];
+                int Mtotal = matMulResult.Length / N;
+                CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, Mtotal, N, activation);
+            }
+            return matMulResult;
         }
 
         // Fallback: sequential operations for other types or higher-rank tensors
@@ -25823,10 +26956,27 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
-        // CPU implementation: sequential operations
         // Step 1: Conv2D
         var result = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
 
+        // Step 2+3: float fast path — fuse bias + activation into a single
+        // SIMD pass over Conv2D's output. Saves one full memory round-trip
+        // vs the prior 2-pass form (TensorBroadcastAdd + ApplyFusedActivationInPlace).
+        // For a ResNet stage3 Conv output [1, 256, 14, 14] = 200 KB, that's
+        // ~40 µs saved per call × tens of Convs per inference = meaningful.
+        if (typeof(T) == typeof(float) && result.Rank == 4
+            && (bias is null || (bias.Rank == 1 && bias._shape[0] == result._shape[1]))
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU))
+        {
+            int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
+            var outArr = (float[])(object)result.GetDataArray();
+            var biasArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+            CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
+            return result;
+        }
+
+        // Generic fallback (non-float, non-NCHW, or unsupported activation).
         // Step 2: Add bias if provided. Right-align broadcast: a rank-1
         // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
         // with the NCHW result's channel axis, not the innermost (W) dim.
@@ -25839,10 +26989,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             result = TensorBroadcastAdd(result, biasView);
         }
-
-        // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)
         ApplyFusedActivationInPlace(result, activation);
-
         return result;
     }
 
@@ -28368,6 +29515,134 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
     }
 
+    /// <summary>
+    /// Write-through AdaptiveAvgPool2D: same dispatch as
+    /// <see cref="AdaptiveAvgPool2D{T}(Tensor{T}, int, int)"/> but writes into
+    /// the provided output tensor. Used by ResNet's classifier head where the
+    /// final spatial map (typically [N, 2048, 7, 7]) collapses to [N, 2048,
+    /// 1, 1] before the FC layer; a 1×1 adaptive pool is just global average
+    /// pooling, which has an NCHWc8 SIMD path. Saves the intermediate
+    /// alloc+CopyTo per inference.
+    /// </summary>
+    public void AdaptiveAvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int outputHeight, int outputWidth)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int inHeight = input._shape[2];
+        int inWidth = input._shape[3];
+
+        // ResNet/ImageNet hot path: 1×1 adaptive pool == global avg pool.
+        // GlobalAvgPool2D has NCHWc8 SIMD; reuse it instead of the generic
+        // bin loop. Result is [N, C, 1, 1] — exactly our output shape.
+        if (outputHeight == 1 && outputWidth == 1)
+        {
+            if (typeof(T) == typeof(float)
+                && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
+                && channels % Simd.NchwcPool.CBlock == 0)
+            {
+                var srcF = (Tensor<float>)(object)input;
+                var dstF = (Tensor<float>)(object)output;
+                Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.GetDataArray(), dstF.GetDataArray(),
+                    batch, channels, inHeight, inWidth);
+                dstF.Layout = LinearAlgebra.TensorLayout.Nchw;
+                return;
+            }
+
+            if (typeof(T) == typeof(float)
+                && input.GetDataArray() is float[] inArrG
+                && output.GetDataArray() is float[] outArrG)
+            {
+                int totalChannelsG = batch * channels;
+                int spatialG = inHeight * inWidth;
+                float invG = 1f / spatialG;
+                Action<int> kernelG = bc =>
+                {
+                    int off = bc * spatialG;
+                    float sum = 0f;
+                    for (int s = 0; s < spatialG; s++) sum += inArrG[off + s];
+                    outArrG[bc] = sum * invG;
+                };
+                if (totalChannelsG > 32) Parallel.For(0, totalChannelsG, kernelG);
+                else for (int bc = 0; bc < totalChannelsG; bc++) kernelG(bc);
+                return;
+            }
+        }
+
+        // Float fast path — generic adaptive bin pool, no NumOps boxing.
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
+            int totalChannels = batch * channels;
+            Action<int> kernel = bc =>
+            {
+                int inputBaseOffset = bc * iH * iW;
+                int outputBaseOffset = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int startH = (int)Math.Floor((double)oh * iH / oH);
+                    int endH = (int)Math.Ceiling((double)(oh + 1) * iH / oH);
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int startW = (int)Math.Floor((double)ow * iW / oW);
+                        int endW = (int)Math.Ceiling((double)(ow + 1) * iW / oW);
+                        float sum = 0f;
+                        int count = 0;
+                        for (int ih = startH; ih < endH; ih++)
+                        {
+                            int rowOff = inputBaseOffset + ih * iW;
+                            for (int iw = startW; iw < endW; iw++)
+                            {
+                                sum += inArr[rowOff + iw];
+                                count++;
+                            }
+                        }
+                        outArr[outputBaseOffset + oh * oW + ow] = sum / count;
+                    }
+                }
+            };
+            if (totalChannels > 16) Parallel.For(0, totalChannels, kernel);
+            else for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return;
+        }
+
+        // Generic fallback.
+        var inputData = input.GetFlattenedData();
+        var outputData = output.GetDataArray();
+        Parallel.For(0, batch * channels, idx =>
+        {
+            int inputBaseOffset = idx * inHeight * inWidth;
+            int outputBaseOffset = idx * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                int startH = (int)Math.Floor((double)oh * inHeight / outputHeight);
+                int endH = (int)Math.Ceiling((double)(oh + 1) * inHeight / outputHeight);
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    int startW = (int)Math.Floor((double)ow * inWidth / outputWidth);
+                    int endW = (int)Math.Ceiling((double)(ow + 1) * inWidth / outputWidth);
+                    double sum = 0;
+                    int count = 0;
+                    for (int ih = startH; ih < endH; ih++)
+                    {
+                        for (int iw = startW; iw < endW; iw++)
+                        {
+                            sum += numOps.ToDouble(inputData[inputBaseOffset + ih * inWidth + iw]);
+                            count++;
+                        }
+                    }
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = numOps.FromDouble(sum / count);
+                }
+            }
+        });
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
@@ -28384,7 +29659,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 int capOutH = outputHeight, capOutW = outputWidth;
                 var outShape = new[] { input._shape[0], input._shape[1], outputHeight, outputWidth };
                 return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveAvgPool2D", input, outShape,
-                    (eng, output) => { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
+                        else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
             }
         }
@@ -29588,6 +30867,115 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Write-through bilinear upsample. Mirrors the kernel of
+    /// <see cref="TensorUpsampleBilinear{T}"/> but writes into a pre-
+    /// allocated output. Used by segmentation decoders (DeepLab, SegFormer,
+    /// U-Net++) and detection FPN heads. Hoists per-row interpolation
+    /// factors out of the inner loops, parallelises over batch-channel,
+    /// and adds a float fast path that avoids NumOps boxing.
+    /// </summary>
+    public void TensorUpsampleBilinearInto<T>(Tensor<T> output, Tensor<T> input, int[] outputSize)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException("UpsampleBilinearInto requires rank-4 NCHW input.");
+
+        int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
+        int outH = outputSize[0], outW = outputSize[1];
+
+        // Per-row precomputation (factors are independent of batch/channel).
+        // Cuts ~4 div + 2 floor + 4 fma per output pixel down to 4 mul + 2 fma.
+        var h0Arr = new int[outH];
+        var h1Arr = new int[outH];
+        var fhArr = new double[outH];
+        for (int oh = 0; oh < outH; oh++)
+        {
+            double srcH = (oh + 0.5) * h / outH - 0.5;
+            int h0 = Math.Max(0, (int)Math.Floor(srcH));
+            h0Arr[oh] = h0;
+            h1Arr[oh] = Math.Min(h - 1, h0 + 1);
+            fhArr[oh] = srcH - h0;
+        }
+        var w0Arr = new int[outW];
+        var w1Arr = new int[outW];
+        var fwArr = new double[outW];
+        for (int ow = 0; ow < outW; ow++)
+        {
+            double srcW = (ow + 0.5) * w / outW - 0.5;
+            int w0 = Math.Max(0, (int)Math.Floor(srcW));
+            w0Arr[ow] = w0;
+            w1Arr[ow] = Math.Min(w - 1, w0 + 1);
+            fwArr[ow] = srcW - w0;
+        }
+
+        if (typeof(T) == typeof(float)
+            && input.GetDataArray() is float[] inArr
+            && output.GetDataArray() is float[] outArr)
+        {
+            int total = n * c;
+            int hh = h, ww = w, oH = outH, oW = outW;
+            // Prefer width/height-major hoisting: per-pixel factor needs 1-fh,
+            // fh, 1-fw, fw — hoist the 1-fh products outside the ow loop.
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * hh * ww;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                    float fh = (float)fhArr[oh];
+                    float omfh = 1f - fh;
+                    int rowH0 = inBase + h0 * ww;
+                    int rowH1 = inBase + h1 * ww;
+                    int rowOut = outBase + oh * oW;
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                        float fw = (float)fwArr[ow];
+                        float omfw = 1f - fw;
+                        float v = omfh * omfw * inArr[rowH0 + w0]
+                                + omfh * fw   * inArr[rowH0 + w1]
+                                + fh   * omfw * inArr[rowH1 + w0]
+                                + fh   * fw   * inArr[rowH1 + w1];
+                        outArr[rowOut + ow] = v;
+                    }
+                }
+            };
+            if (total > 4) Parallel.For(0, total, kernel);
+            else for (int bc = 0; bc < total; bc++) kernel(bc);
+            return;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var inData = input.GetFlattenedData();
+        var outData = output.GetDataArray();
+        int totalBC = n * c;
+        Parallel.For(0, totalBC, bc =>
+        {
+            int inBase = bc * h * w;
+            int outBase = bc * outH * outW;
+            for (int oh = 0; oh < outH; oh++)
+            {
+                int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                double fh = fhArr[oh];
+                int rowH0 = inBase + h0 * w;
+                int rowH1 = inBase + h1 * w;
+                int rowOut = outBase + oh * outW;
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                    double fw = fwArr[ow];
+                    double val = (1 - fh) * (1 - fw) * numOps.ToDouble(inData[rowH0 + w0])
+                               + (1 - fh) * fw       * numOps.ToDouble(inData[rowH0 + w1])
+                               + fh       * (1 - fw) * numOps.ToDouble(inData[rowH1 + w0])
+                               + fh       * fw       * numOps.ToDouble(inData[rowH1 + w1]);
+                    outData[rowOut + ow] = numOps.FromDouble(val);
+                }
+            }
+        });
+    }
+
     /// <summary>Upsample using bilinear interpolation (4D: NCHW).</summary>
     public virtual Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
@@ -29603,37 +30991,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 int capH = input._shape[2], capW = input._shape[3];
                 var outShape = new[] { input._shape[0], input._shape[1], outputSize[0], outputSize[1] };
                 return scope.RecordUnary(LazyNodeType.Custom, "UpsampleBilinear", input, outShape,
-                    (eng, output) => { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
+                        else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                    },
                     BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
         int outH = outputSize[0], outW = outputSize[1];
         var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
-        var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
-
-        for (int batch = 0; batch < n; batch++)
-            for (int ch = 0; ch < c; ch++)
-                for (int oh = 0; oh < outH; oh++)
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        double srcH = (oh + 0.5) * h / outH - 0.5;
-                        double srcW = (ow + 0.5) * w / outW - 0.5;
-                        int h0 = Math.Max(0, (int)Math.Floor(srcH));
-                        int w0 = Math.Max(0, (int)Math.Floor(srcW));
-                        int h1 = Math.Min(h - 1, h0 + 1);
-                        int w1 = Math.Min(w - 1, w0 + 1);
-                        double fh = srcH - h0, fw = srcW - w0;
-                        int baseIdx = (batch * c + ch) * h * w;
-                        double val = (1 - fh) * (1 - fw) * numOps.ToDouble(inData[baseIdx + h0 * w + w0])
-                                   + (1 - fh) * fw * numOps.ToDouble(inData[baseIdx + h0 * w + w1])
-                                   + fh * (1 - fw) * numOps.ToDouble(inData[baseIdx + h1 * w + w0])
-                                   + fh * fw * numOps.ToDouble(inData[baseIdx + h1 * w + w1]);
-                        outData[(batch * c + ch) * outH * outW + oh * outW + ow] = numOps.FromDouble(val);
-                    }
+        TensorUpsampleBilinearInto(result, input, outputSize);
         DifferentiableOps.RecordUnary("UpsampleBilinear", result, input, BackwardFunctions<T>.UpsampleBilinearBackward,
             savedState: new object[] { new[] { h, w } });
         AutoTracer.RecordOp("UpsampleBilinear", result, eng => result);

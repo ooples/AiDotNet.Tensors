@@ -59,10 +59,20 @@ public class PlanStitchingAllocationProbe
         // amortized. Ten replays is plenty for the steady-state to settle.
         for (int i = 0; i < 10; i++) stitched.Execute();
 
-        // Now measure a single Execute under tight conditions.
+        // Stabilize GC state so the allocation measurement isn't polluted by
+        // pending finalizers from unrelated warmup work.
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+
+        // Gen2 GC scavenges ArrayPool.Shared's per-core caches — the tiled
+        // SGEMM path rents ~64 KB packed-A buffers per matmul via that pool,
+        // and right after a Collect the first Execute is forced to allocate
+        // fresh arrays that never existed in the warmup measurements. Re-warm
+        // the pool post-collect so the measurement only sees steady-state
+        // allocation, not the pool's rehydration cost.
+        for (int i = 0; i < 3; i++) stitched.Execute();
+
         long before = GC.GetAllocatedBytesForCurrentThread();
         stitched.Execute();
         long after  = GC.GetAllocatedBytesForCurrentThread();

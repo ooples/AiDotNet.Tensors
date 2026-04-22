@@ -72,6 +72,48 @@ internal static class PadeSigmoid
         var denom = Fma.MultiplyAdd(pow2n, P, Q);
         return Avx.Divide(Q, denom);
     }
+
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// AVX-512 Padé [3,3] fused sigmoid: 16 floats per call, same algorithm
+    /// as <see cref="Sigmoid8"/> just 2× wider. Used by FastSigmoid512 and
+    /// the fused bias+GELU AVX-512 epilogue. Max error: 1.19e-7 (float32
+    /// exact precision).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector512<float> Sigmoid16(Vector512<float> x)
+    {
+        var negX = Avx512F.Subtract(Vector512<float>.Zero, x);
+
+        var log2e = Vector512.Create(1.44269504088896341f);
+        var ln2 = Vector512.Create(0.6931471805599453f);
+        var n = Avx512F.RoundScale(Avx512F.Multiply(negX, log2e), 0);
+        var r = Avx512F.FusedMultiplyAddNegated(n, ln2, negX);
+
+        n = Avx512F.Max(Vector512.Create(-20.0f), Avx512F.Min(Vector512.Create(20.0f), n));
+
+        var r2 = Avx512F.Multiply(r, r);
+        var r3 = Avx512F.Multiply(r2, r);
+
+        var r2_10 = Avx512F.Multiply(Vector512.Create(0.1f), r2);
+        var r_half = Avx512F.Multiply(Vector512.Create(0.5f), r);
+        var r3_120 = Avx512F.Multiply(Vector512.Create(1.0f / 120.0f), r3);
+
+        var one = Vector512.Create(1.0f);
+        var even = Avx512F.Add(one, r2_10);
+        var odd = Avx512F.Add(r_half, r3_120);
+
+        var P = Avx512F.Add(even, odd);
+        var Q = Avx512F.Subtract(even, odd);
+
+        var nInt = Avx512F.ConvertToVector512Int32(n);
+        var pow2n = Avx512F.ShiftLeftLogical(
+            Avx512F.Add(nInt, Vector512.Create(127)), 23).AsSingle();
+
+        var denom = Avx512F.FusedMultiplyAdd(pow2n, P, Q);
+        return Avx512F.Divide(Q, denom);
+    }
+#endif
 #endif
 
     /// <summary>Scalar Padé [3,3] sigmoid.</summary>

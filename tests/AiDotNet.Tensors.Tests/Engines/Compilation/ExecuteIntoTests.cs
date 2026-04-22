@@ -131,8 +131,19 @@ public class ExecuteIntoTests
         Assert.NotEqual(outAnchor, outNew);
 
         // Verify output matches the expected matmul on the new input directly.
+        // The compiled plan and the eager TensorMatMul can use different GEMM
+        // kernels (specialized SIMD vs reference), whose accumulation orders
+        // differ by a ULP or two at single-precision. Compare with a float-
+        // scale tolerance (1e-5 abs) rather than bit-exact equality, which
+        // would make this test flake on any CPU/JIT state change.
         var expected = engine.TensorMatMul(newInput, weight).AsSpan().ToArray();
-        Assert.Equal(expected, outNew);
+        Assert.Equal(expected.Length, outNew.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float diff = MathF.Abs(expected[i] - outNew[i]);
+            Assert.True(diff < 1e-5f,
+                $"outNew[{i}] = {outNew[i]}, expected = {expected[i]}, diff = {diff}");
+        }
     }
 
     [Fact]
