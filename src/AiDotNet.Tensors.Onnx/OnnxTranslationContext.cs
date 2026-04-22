@@ -12,14 +12,26 @@ namespace AiDotNet.Tensors.Onnx;
 public sealed class OnnxTranslationContext<T> where T : unmanaged
 {
     private readonly Dictionary<string, Tensor<T>> _tensorsByName;
+    private readonly HashSet<string> _placeholderInputs;
 
-    internal OnnxTranslationContext(IEngine engine, Dictionary<string, Tensor<T>> tensorsByName, OnnxImportOptions options, long defaultOpset = 13)
+    internal OnnxTranslationContext(IEngine engine, Dictionary<string, Tensor<T>> tensorsByName, OnnxImportOptions options, long defaultOpset = 13, HashSet<string>? placeholderInputs = null)
     {
         Engine = engine;
         _tensorsByName = tensorsByName;
         Options = options;
         DefaultOpset = defaultOpset;
+        _placeholderInputs = placeholderInputs ?? new HashSet<string>(StringComparer.Ordinal);
     }
+
+    /// <summary>
+    /// Returns <c>true</c> if <paramref name="name"/> refers to a graph input
+    /// placeholder (user-supplied runtime tensor) rather than a constant
+    /// initializer or a node-output tensor. Translators use this to route
+    /// ops whose semantics depend on runtime input content (e.g. OneHot,
+    /// ConstantOfShape) through the lazy path instead of eagerly baking
+    /// trace-time placeholder contents into the plan.
+    /// </summary>
+    public bool IsPlaceholderInput(string name) => _placeholderInputs.Contains(name);
 
     /// <summary>The engine against which engine ops are traced.</summary>
     public IEngine Engine { get; }

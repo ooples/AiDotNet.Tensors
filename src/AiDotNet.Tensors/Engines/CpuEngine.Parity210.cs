@@ -429,11 +429,10 @@ public partial class CpuEngine
         return TensorSplit(tensor, sections, 2);
     }
 
-    // TensorBroadcastTo is implemented in CpuEngine.cs (Phase B block) with
-    // tiered fast paths (identity, Reshape-only for leading-1 prepend, then
-    // TensorBroadcastAdd fallback). The generic scalar-stride implementation
-    // that used to live here duplicated the signature and caused CS0111 —
-    // removed in the feature/169 ↔ main merge.
+    // TensorBroadcastTo moved to CpuEngine.cs (Tier-1/2/3 fast path landed
+    // in #231 — identity → reshape-for-rank-pad → broadcast). The older
+    // implementation that used to live here has been removed to avoid the
+    // partial-class duplicate-definition error.
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices)

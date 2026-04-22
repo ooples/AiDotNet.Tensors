@@ -66,9 +66,21 @@ internal static class TensorManipOperators
                 ctx.PutTensor(node.Output[0], ctx.Engine.TensorMultiply(sign, floored));
                 return;
             }
-            // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16) and BOOL: pass
-            // through. For bool, downstream ops typically consume 0/1 floats
-            // via our Not / Where translators.
+            if (to == 9)
+            {
+                // BOOL: normalize to 0/1. Forwarding the raw tensor preserved
+                // magnitudes (-3, 2, etc.), which broke downstream consumers
+                // that expected boolean {0, 1} — a subsequent Cast(…, INT) or
+                // arithmetic Where/Not would silently use the wrong values.
+                // Emit (x != 0) → 1 else 0 via sign-of-abs:
+                //   |x| > 0 ⇒ sign(|x|) == 1 ; |x| == 0 ⇒ sign == 0.
+                var absX = ctx.Engine.TensorAbs(x);
+                var normalized = ctx.Engine.TensorSign(absX);
+                ctx.PutTensor(node.Output[0], normalized);
+                return;
+            }
+            // Float-family (FLOAT / DOUBLE / HALF / BFLOAT16): pass through
+            // since our plan represents every tensor as the same T.
             ctx.PutTensor(node.Output[0], x);
         }
     }
@@ -116,10 +128,25 @@ internal static class TensorManipOperators
             {
                 if (raw[i] == 0)
                 {
-                    // allowzero=0 (default): copy the corresponding input dim
-                    // (requires a corresponding axis exists in input). With
-                    // allowzero=1 the 0 is a literal dimension.
-                    result[i] = allowZero ? 0 : (i < inputShape.Length ? inputShape[i] : 0);
+                    if (allowZero)
+                    {
+                        // allowzero=1 — literal zero dimension.
+                        result[i] = 0;
+                    }
+                    else
+                    {
+                        // allowzero=0 (default): copy the corresponding input
+                        // dim. Per ONNX spec, a copy-dim is only valid when
+                        // the source axis actually exists; silently collapsing
+                        // to a literal 0 built an invalid plan without flagging
+                        // the malformed graph.
+                        if (i >= inputShape.Length)
+                            throw new InvalidDataException(
+                                $"Reshape copy-dim at axis {i} has no corresponding input axis " +
+                                $"(input rank {inputShape.Length}). Set allowzero=1 if a literal zero " +
+                                "dimension was intended.");
+                        result[i] = inputShape[i];
+                    }
                     known *= result[i];
                 }
                 else if (raw[i] == -1)
@@ -375,6 +402,13 @@ internal static class TensorManipOperators
             }
             if (uniform)
             {
+                // Uniform split requires the axis to be divisible by numOutputs.
+                // ONNX Split defaults to uniform; a non-uniform input will fail
+                // asymmetrically downstream otherwise.
+                if (x._shape[axis] % numOutputs != 0)
+                    throw new InvalidDataException(
+                        $"Uniform Split: axis {axis} size {x._shape[axis]} is not divisible " +
+                        $"by number of outputs {numOutputs}. Supply an explicit 'split' input.");
                 var parts = ctx.Engine.TensorSplit(x, numOutputs, axis);
                 if (parts.Length != numOutputs)
                     throw new InvalidDataException(
@@ -464,7 +498,7 @@ internal static class TensorManipOperators
                     }
                     if (GatherDebug.Enabled)
                     {
-                        int stepNo = System.Threading.Interlocked.Increment(ref GatherDebug.StepCounter);
+                        int stepNo = GatherDebug.NextStep();
                         GatherDebug.Log($"step#{stepNo} Gather ilen={idxArr.Length} idx[0..3]={(idxArr.Length > 0 ? idxArr[0] : -1)},{(idxArr.Length > 1 ? idxArr[1] : -1)},{(idxArr.Length > 2 ? idxArr[2] : -1)}");
                     }
                     var intIndices = new Tensor<int>(capturedIndices._shape, new Vector<int>(idxArr));

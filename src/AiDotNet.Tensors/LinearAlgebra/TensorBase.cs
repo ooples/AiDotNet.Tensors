@@ -841,8 +841,51 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
+        // Eager simple-layout CPU tensors: hand back the backing array
+        // directly. Specializations (TryBuildSpecializedForward) capture
+        // this reference at compile time and need later writes — notably
+        // user-supplied graph-input data landing in a placeholder — to
+        // show up at replay. Returning a copy here was the missing piece
+        // that produced "importer plan outputs all zeros" on ONNX graphs:
+        // specializations pinned the placeholder's zero-initialized state
+        // and never saw the user's Execute-time input.
+        //
+        // Lazy or GPU-resident tensors still go through ToArray() so the
+        // realized CPU snapshot is what the caller sees. That path
+        // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
+        // upstream hasn't run yet would have had its placeholder-filled
+        // backing pinned, leaking stale/zero bytes into every replay.
+        var live = GetLiveBackingArrayOrNull();
+        if (live is not null) return live;
+        return ToArray();
+    }
+
+    /// <summary>
+    /// Gets the BACKING storage array without triggering lazy realization
+    /// and without ever returning a copy. Returns <c>null</c> when the
+    /// tensor's layout is not a simple contiguous-at-offset-0-whose-storage-
+    /// length-matches-logical-length view of its backing storage — in which
+    /// case callers that need a live pin must skip their specialization and
+    /// fall back to the general AsSpan-based path. Live callers (the
+    /// TryBuildSpecializedForward pinners) use this to avoid the Realize-
+    /// triggered-during-compile cascade that bakes placeholder=0 data into
+    /// every upstream IsRealized node (issue surfaced by BERT-SQuAD × 100
+    /// sample replay: first execute correct, subsequent executes returned
+    /// the first execute's output verbatim because some specialization
+    /// pinned a ToArray snapshot taken during compile-time realize).
+    /// </summary>
+    internal T[]? GetLiveBackingArrayOrNull()
+    {
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
-            return ToArray();
+            return null;
+        // GPU-resident tensors keep the authoritative data on-device; the
+        // CPU backing array may hold stale/placeholder bytes that haven't
+        // been copied back. Pinning that into a specialization would read
+        // the wrong values at replay. Force these callers onto the AsSpan
+        // path, which goes through EnsureMaterialized and copies GPU→CPU
+        // before the caller touches the buffer.
+        if (_device != TensorDevice.CPU)
+            return null;
         return _storage.GetDataArray();
     }
 
@@ -878,6 +921,12 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance(_shape);
+        // Packed layouts (Nchwc8/Nchwc16) reinterpret the flat buffer via a
+        // different stride pattern; a contiguous element-for-element copy
+        // that leaves Layout at the default Nchw would send later ops down
+        // the wrong dispatch branch. Propagate the source layout so the
+        // copy stays semantically identical.
+        result.Layout = Layout;
         if (Length == 0) return result;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
@@ -902,6 +951,10 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
+        // Transform walks flat index i in source order. A packed source
+        // with the default Nchw layout on the result would mislabel the
+        // output; propagate so downstream dispatch stays correct.
+        result.Layout = Layout;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
             var src = _data.AsSpan();
@@ -923,6 +976,7 @@ public abstract class TensorBase<T> : IDisposable
     {
         ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
+        result.Layout = Layout;
         var indices = new int[Rank];
         for (int i = 0; i < Length; i++)
         {

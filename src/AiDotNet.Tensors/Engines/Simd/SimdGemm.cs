@@ -710,6 +710,15 @@ internal static class SimdGemm
         int n)
     {
         c.Clear();
+        // B1 fast-path: Avx512Sgemm.CanUse checks CPU + TFM. When the AVX-512
+        // kernel is available we route there (its internal dispatcher handles
+        // its own parallelism decision) and bypass the autotune resolution
+        // below, which is for the SgemmAddInternal fallback path only.
+        if (Avx512Sgemm.CanUse)
+        {
+            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: true);
+            return;
+        }
         // Autotune dispatch: if the cache has a winning variant for this
         // (KernelId, shape) combination, honour it. Today the catalog
         // covers "sequential" vs "parallel" — falling back to the default

@@ -73,8 +73,17 @@ public class BertExecute100Samples
             var ortByName = new Dictionary<string, float[]>();
             foreach (var r in ortResults)
             {
-                try { ortByName[r.Name] = r.AsTensor<float>().ToArray(); continue; } catch { }
-                try { ortByName[r.Name] = r.AsTensor<long>().ToArray().Select(x => (float)x).ToArray(); continue; } catch { }
+                // ORT outputs come in multiple dtypes; we normalize to float for
+                // comparison. Failing to convert means the model output has a
+                // type we don't yet handle — fail explicitly so the acceptance
+                // test doesn't go green by silently dropping outputs.
+                bool converted = false;
+                try { ortByName[r.Name] = r.AsTensor<float>().ToArray(); converted = true; } catch { }
+                if (!converted)
+                {
+                    try { ortByName[r.Name] = r.AsTensor<long>().ToArray().Select(x => (float)x).ToArray(); converted = true; } catch { }
+                }
+                Assert.True(converted, $"ORT output '{r.Name}' has unsupported dtype; extend the test's conversion list.");
             }
 
             FillFloat(result.Inputs["input_ids:0"], inputIds);
@@ -85,9 +94,11 @@ public class BertExecute100Samples
 
             foreach (var kv in ortByName)
             {
-                if (!result.Outputs.TryGetValue(kv.Key, out var ours)) continue;
-                var oursSpan = ours.AsSpan();
-                if (oursSpan.Length != kv.Value.Length) continue;
+                Assert.True(result.Outputs.TryGetValue(kv.Key, out var ours),
+                    $"AiDotNet plan did not produce output '{kv.Key}' that ORT did.");
+                var oursSpan = ours!.AsSpan();
+                Assert.True(oursSpan.Length == kv.Value.Length,
+                    $"Output '{kv.Key}' length mismatch: AiDotNet {oursSpan.Length}, ORT {kv.Value.Length}.");
                 for (int i = 0; i < kv.Value.Length; i++)
                 {
                     float d = Math.Abs(kv.Value[i] - oursSpan[i]);

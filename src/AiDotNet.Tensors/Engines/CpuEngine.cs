@@ -1897,6 +1897,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
 
+        // torch.broadcast_to requires target.Rank >= source.Rank — we can't
+        // broadcast to fewer dimensions. Fail fast so the Tier-3 fallback
+        // doesn't silently miscompute shapes.
+        if (targetShape.Length < input.Rank)
+            throw new ArgumentException(
+                $"Broadcast target rank ({targetShape.Length}) must be >= source rank ({input.Rank}).",
+                nameof(targetShape));
+
         // Tier 1: exact shape match → identity. Zero cost.
         if (ShapesEqual1D(input._shape, targetShape)) return input;
 
@@ -2004,13 +2012,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedLayout = targetLayout;
                 var capturedCBlock = cBlock;
                 var capturedShape = (int[])tensor._shape.Clone();
-                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchwc", tensor, capturedShape,
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchwc(captured, capturedLayout);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                         output.Layout = capturedLayout;
                     });
+                // Mirror the layout on the placeholder at RECORD time. A later
+                // layout-sensitive op in the same scope (e.g. ReorderToNchw
+                // below) inspects Layout during recording and would otherwise
+                // observe the default Nchw — short-circuiting a required reorder.
+                lazy.Layout = capturedLayout;
+                return lazy;
             }
         }
 
@@ -2068,13 +2082,18 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 var capturedShape = (int[])tensor._shape.Clone();
-                return scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
+                var lazy = scope.RecordUnary(LazyNodeType.Custom, "ReorderToNchw", tensor, capturedShape,
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchw(captured);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                         output.Layout = LinearAlgebra.TensorLayout.Nchw;
                     });
+                // Propagate Layout at record time (see matching comment in
+                // ReorderToNchwc above) so downstream layout-sensitive ops
+                // within the same scope see Nchw and don't short-circuit.
+                lazy.Layout = LinearAlgebra.TensorLayout.Nchw;
+                return lazy;
             }
         }
 
@@ -2188,6 +2207,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -2247,12 +2267,27 @@ public partial class CpuEngine : ITensorLevelEngine
                     meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
                     result.AsWritableSpan(), N, C, H, W);
             }
-            else
+            else if (x.Layout == LinearAlgebra.TensorLayout.Nchw)
             {
                 Simd.NchwcBatchNorm.RunNchw(
                     xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
                     meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
                     result.AsWritableSpan(), N, C, H, W);
+            }
+            else
+            {
+                // Any other packed layout (e.g. Nchwc16 that didn't hit the
+                // Nchwc8 branch above) isn't safe to interpret as plain NCHW
+                // — RunNchw would index into the buffer with the wrong stride
+                // and produce garbage. Unpack to plain NCHW first, then run
+                // the generic NCHW kernel, and mark the result as Nchw.
+                var unpackedT = new Tensor<float>(new[] { N, C, H, W }) { Layout = LinearAlgebra.TensorLayout.Nchw };
+                Simd.NchwcReorder.ToNchw(xf.AsSpan(), unpackedT.AsWritableSpan(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                Simd.NchwcBatchNorm.RunNchw(
+                    unpackedT.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
+                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
+                    result.AsWritableSpan(), N, C, H, W);
+                result.Layout = LinearAlgebra.TensorLayout.Nchw;
             }
             return (Tensor<T>)(object)result;
         }
@@ -6425,7 +6460,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)result;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.MaxPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding);
             return result;
@@ -6538,7 +6573,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)output;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.MaxPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding);
             return;
@@ -6614,7 +6649,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)output;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.AvgPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding,
                 countIncludePad: false);
@@ -6758,7 +6793,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstF = (Tensor<float>)(object)result;
             dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             Simd.NchwcPool.AvgPoolNchwc8(
-                srcF.AsSpan(), dstF.AsWritableSpan(),
+                srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding,
                 countIncludePad: false);
@@ -9831,6 +9866,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // BLAS path. This closes ~95% of the ResNet-50 gap vs ORT.
         if (typeof(T) == typeof(float))
         {
+            // Packed layouts (Nchwc8 / Nchwc16) that fell through to this
+            // fallback must be unpacked first — Conv2DIm2colGemm reads the
+            // buffer assuming plain NCHW row-major indexing, so reading a
+            // packed buffer would silently produce wrong outputs.
+            if (input.Layout == LinearAlgebra.TensorLayout.Nchwc8 ||
+                input.Layout == LinearAlgebra.TensorLayout.Nchwc16)
+            {
+                int cBlock = input.Layout == LinearAlgebra.TensorLayout.Nchwc16 ? 16 : 8;
+                if (inChannels % cBlock != 0)
+                    throw new NotSupportedException(
+                        $"Conv2D fallback: packed {input.Layout} input with inChannels={inChannels} " +
+                        $"not divisible by cBlock={cBlock} cannot be unpacked safely.");
+                var unpackedData = new float[batch * inChannels * height * width];
+                Simd.NchwcReorder.ToNchw(
+                    ((float[])(object)inputData).AsSpan(), unpackedData.AsSpan(),
+                    batch, inChannels, height, width, cBlock);
+                inputData = (T[])(object)unpackedData;
+            }
             Conv2DIm2colGemm(
                 (float[])(object)inputData,
                 (float[])(object)kernelData,
@@ -9916,8 +9969,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // im2col builds B as [K, N] per-image so GEMM produces [outC, N].
         // We allocate one col buffer per image and reuse via a thread-local
         // pool to avoid per-batch allocations hot-path.
-        // For small K*N totals we do the whole batch sequentially; for large
-        // we parallelize across batch.
+        //
+        // Parallel-batch policy: we ONLY parallelize across the batch axis
+        // for small per-image GEMMs. When the per-image GEMM is large enough
+        // (>= 50M FLOPs per image), the inner SgemmBlocked already
+        // parallelizes across K and saturates cores — adding an outer
+        // Parallel.For would double-dip and waste threads. For small
+        // per-image work, the inner GEMM can't usefully parallelize, so
+        // batch-level parallelism is how we get thread-scaling.
         long perImageCost = (long)outC * K * N;
         bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
 
@@ -13352,7 +13411,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // Validate parameters BEFORE indexing into them to avoid
+                // IndexOutOfRange on malformed inputs. Mirrors the eager-path
+                // validation below.
                 if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
+                if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
+                if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
+                if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must be array of 3 elements [padD, padH, padW].", nameof(padding));
                 int outD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
                 int outH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
                 int outW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
@@ -15736,6 +15801,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             return BatchNormBackward4D(gradOutput, input, gamma, mean, variance, eps, numOps, out gradGamma, out gradBeta);
         }
+        // Rank-3 inputs were routed through BatchNorm3D on the forward path
+        // (channels = _shape[0], spatial = _shape[1] * _shape[2]). The 2D
+        // fallback below assumes channels = _shape[1] and indexes mean[f]
+        // / var[f] / gamma[f] for f in [0, _shape[1]) — out-of-bounds for
+        // any 3D shape with _shape[1] > _shape[0]. Dispatch to the matching
+        // backward instead. (#233)
+        if (input._shape.Length == 3)
+        {
+            return BatchNormBackward3D(gradOutput, input, gamma, mean, variance, eps, numOps, out gradGamma, out gradBeta);
+        }
 
         // 2D case: [batch, features]
         int batch = input._shape[0];
@@ -15960,6 +16035,84 @@ public partial class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+    }
+
+    /// <summary>
+    /// Backward pass for 3D batch normalization <c>[channels, height, width]</c>,
+    /// matching the layout used by <see cref="BatchNorm3D{T}"/> on the forward
+    /// pass: <c>channels = _shape[0]</c>, <c>spatial = _shape[1] * _shape[2]</c>,
+    /// reduction is per-channel across spatial. Standard batch-norm-backward
+    /// formula with N = spatial size:
+    /// <para>
+    /// <c>dx = (γ · invStd / N) · (N · dy − Σdy − norm · invStd · Σ(dy · (x − μ)))</c>
+    /// </para>
+    /// where <c>invStd = 1 / sqrt(var + eps)</c> and <c>norm = (x − μ) · invStd</c>.
+    /// </summary>
+    private Tensor<T> BatchNormBackward3D<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, T eps, INumericOperations<T> numOps, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
+    {
+        int channels = input._shape[0];
+        int height = input._shape[1];
+        int width = input._shape[2];
+        int spatialSize = height * width;
+        T spatialT = numOps.FromDouble(spatialSize);
+
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
+
+        var gradGammaData = new T[channels];
+        var gradBetaData = new T[channels];
+        var gradInputData = new T[input.Length];
+
+        Parallel.For(0, channels, c =>
+        {
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[c], eps)));
+            T mean_c = meanData[c];
+            T gamma_c = gammaData[c];
+
+            // Pass 1: accumulate per-channel reductions over the spatial axis.
+            T sumGrad = numOps.Zero;
+            T sumGradX = numOps.Zero;
+            T gGamma = numOps.Zero;
+            T gBeta = numOps.Zero;
+            int channelOffset = c * spatialSize;
+            for (int s = 0; s < spatialSize; s++)
+            {
+                T x = inputData[channelOffset + s];
+                T gOut = gradOutputData[channelOffset + s];
+                T centered = numOps.Subtract(x, mean_c);
+                T normalized = numOps.Multiply(centered, invStd);
+                gGamma = numOps.Add(gGamma, numOps.Multiply(gOut, normalized));
+                gBeta = numOps.Add(gBeta, gOut);
+                sumGrad = numOps.Add(sumGrad, gOut);
+                sumGradX = numOps.Add(sumGradX, numOps.Multiply(gOut, centered));
+            }
+            gradGammaData[c] = gGamma;
+            gradBetaData[c] = gBeta;
+
+            // Pass 2: write gradInput using the accumulated sums.
+            T gammaSumGrad = numOps.Multiply(gamma_c, sumGrad);
+            T gammaSumGradX = numOps.Multiply(gamma_c, sumGradX);
+            T invStdOverSpatial = numOps.Divide(invStd, spatialT);
+            for (int s = 0; s < spatialSize; s++)
+            {
+                T x = inputData[channelOffset + s];
+                T gOut = gradOutputData[channelOffset + s];
+                T centered = numOps.Subtract(x, mean_c);
+                T normalized = numOps.Multiply(centered, invStd);
+                T gradNorm = numOps.Multiply(gamma_c, gOut);
+                T term1 = numOps.Multiply(spatialT, gradNorm);
+                T term2 = gammaSumGrad;
+                T term3 = numOps.Multiply(normalized, numOps.Multiply(invStd, gammaSumGradX));
+                gradInputData[channelOffset + s] = numOps.Multiply(invStdOverSpatial, numOps.Subtract(numOps.Subtract(term1, term2), term3));
+            }
+        });
+
+        gradGamma = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradBetaData));
         return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
@@ -26824,6 +26977,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback (non-float, non-NCHW, or unsupported activation).
+        // Step 2: Add bias if provided. Right-align broadcast: a rank-1
+        // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
+        // with the NCHW result's channel axis, not the innermost (W) dim.
         if (bias != null)
         {
             var biasView = bias;
@@ -29295,7 +29451,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)input;
             var flat = new Tensor<float>(new[] { batch, channels });
-            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.AsSpan(), flat.AsWritableSpan(),
+            Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.GetDataArray(), flat.GetDataArray(),
                 batch, channels, height, width);
             var reshaped = flat.Reshape(new[] { batch, channels, 1, 1 });
             reshaped.Layout = LinearAlgebra.TensorLayout.Nchw;
@@ -29391,7 +29547,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var srcF = (Tensor<float>)(object)input;
                 var dstF = (Tensor<float>)(object)output;
-                Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.AsSpan(), dstF.AsWritableSpan(),
+                Simd.NchwcPool.GlobalAvgPoolNchwc8(srcF.GetDataArray(), dstF.GetDataArray(),
                     batch, channels, inHeight, inWidth);
                 dstF.Layout = LinearAlgebra.TensorLayout.Nchw;
                 return;

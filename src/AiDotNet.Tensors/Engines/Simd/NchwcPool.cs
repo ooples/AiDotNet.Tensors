@@ -26,7 +26,7 @@ internal static class NchwcPool
     /// MaxPool on NCHWc8 <c>[N, cg, H, W, 8]</c> → <c>[N, cg, oH, oW, 8]</c>.
     /// </summary>
     public static void MaxPoolNchwc8(
-        ReadOnlySpan<float> input, Span<float> output,
+        float[] input, float[] output,
         int N, int C, int H, int W, int oH, int oW,
         int kH, int kW, int sH, int sW, int padH, int padW)
     {
@@ -38,8 +38,10 @@ internal static class NchwcPool
         int outStrideCg = oH * oW * CBlock;
         int outStrideH = oW * CBlock;
 
-        var inArr = input.ToArray();
-        var outArr = new float[output.Length];
+        // Closure captures the caller's arrays directly — no ToArray()
+        // copies, no allocation of a temporary output buffer.
+        var inArr = input;
+        var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
 #endif
@@ -98,18 +100,22 @@ internal static class NchwcPool
                 }
             }
         });
-
-        outArr.AsSpan().CopyTo(output);
+        // `outArr` IS the caller's `output` — writes land directly.
     }
 
     /// <summary>
     /// AvgPool on NCHWc8 <c>[N, cg, H, W, 8]</c> → <c>[N, cg, oH, oW, 8]</c>.
-    /// Divisor is the full kernel area (matches ONNX default
-    /// <c>count_include_pad=0</c> only for interior cells; a proper
-    /// count-excluding-pad mode would require per-output area tracking).
+    /// Divisor honours <paramref name="countIncludePad"/>:
+    /// <list type="bullet">
+    ///   <item><c>true</c> — divisor is the full kernel area <c>kH*kW</c>
+    ///     (ONNX <c>count_include_pad = 1</c>).</item>
+    ///   <item><c>false</c> — divisor is the number of in-bounds source
+    ///     cells contributing to the output, so pad cells don't dilute the
+    ///     average (ONNX default <c>count_include_pad = 0</c>).</item>
+    /// </list>
     /// </summary>
     public static void AvgPoolNchwc8(
-        ReadOnlySpan<float> input, Span<float> output,
+        float[] input, float[] output,
         int N, int C, int H, int W, int oH, int oW,
         int kH, int kW, int sH, int sW, int padH, int padW,
         bool countIncludePad)
@@ -123,8 +129,8 @@ internal static class NchwcPool
         int outStrideH = oW * CBlock;
         int kernelArea = kH * kW;
 
-        var inArr = input.ToArray();
-        var outArr = new float[output.Length];
+        var inArr = input;
+        var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
 #endif
@@ -185,8 +191,7 @@ internal static class NchwcPool
                 }
             }
         });
-
-        outArr.AsSpan().CopyTo(output);
+        // `outArr` IS the caller's `output` — writes land directly.
     }
 
     /// <summary>
@@ -194,7 +199,7 @@ internal static class NchwcPool
     /// then reshaped by caller to <c>[N, C, 1, 1]</c>. Divisor is <c>H*W</c>.
     /// </summary>
     public static void GlobalAvgPoolNchwc8(
-        ReadOnlySpan<float> input, Span<float> output,
+        float[] input, float[] output,
         int N, int C, int H, int W)
     {
         int cg = C / CBlock;
@@ -203,8 +208,8 @@ internal static class NchwcPool
         int inStrideCg = spatial * CBlock;
         float inv = 1f / spatial;
 
-        var inArr = input.ToArray();
-        var outArr = new float[N * C];
+        var inArr = input;
+        var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
 #endif
@@ -240,7 +245,6 @@ internal static class NchwcPool
             int outBase = n * C + ocg * CBlock;
             for (int cb = 0; cb < CBlock; cb++) outArr[outBase + cb] = acc[cb] * inv;
         });
-
-        outArr.AsSpan().CopyTo(output);
+        // `outArr` IS the caller's `output`.
     }
 }

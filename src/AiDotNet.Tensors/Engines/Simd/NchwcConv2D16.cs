@@ -24,9 +24,9 @@ internal static class NchwcConv2D16
     public const int CBlock = 16;
 
     public static void Run(
-        ReadOnlySpan<float> input,          // [N, cgIn, H, W, 16]
-        ReadOnlySpan<float> kernel,         // [cgOut, cgIn, kH, kW, 16_in, 16_out]
-        Span<float> output,                 // [N, cgOut, oH, oW, 16]
+        float[] input,                       // [N, cgIn, H, W, 16]
+        float[] kernel,                      // [cgOut, cgIn, kH, kW, 16_in, 16_out]
+        float[] output,                      // [N, cgOut, oH, oW, 16]
         int N, int inC, int H, int W,
         int outC, int kH, int kW,
         int oH, int oW,
@@ -48,7 +48,7 @@ internal static class NchwcConv2D16
         int kStrideKh  = kW * CBlock * CBlock;
         int kStrideKw  = CBlock * CBlock;
 
-        output.Clear();
+        Array.Clear(output, 0, output.Length);
 
         int _N = N, _cgIn = cgIn, _cgOut = cgOut, _H = H, _W = W, _oH = oH, _oW = oW;
         int _kH = kH, _kW = kW, _sH = sH, _sW = sW, _padH = padH, _padW = padW, _dH = dH, _dW = dW;
@@ -56,9 +56,12 @@ internal static class NchwcConv2D16
         int _outStrideN = outStrideN, _outStrideCg = outStrideCg, _outStrideH = outStrideH;
         int _kStrideOcg = kStrideOcg, _kStrideIcg = kStrideIcg, _kStrideKh = kStrideKh, _kStrideKw = kStrideKw;
 
-        var inArr = input.ToArray();
-        var kArr = kernel.ToArray();
-        var outArr = new float[output.Length];
+        // Same zero-copy refactor as NchwcConv2D: closure captures the
+        // caller-owned float[] arrays directly, no temporary allocations,
+        // no copy-back.
+        var inArr = input;
+        var kArr = kernel;
+        var outArr = output;
 
 #if NET8_0_OR_GREATER
         bool useSimd = Avx512F.IsSupported;
@@ -143,7 +146,6 @@ internal static class NchwcConv2D16
                 }
             }
         });
-
-        outArr.AsSpan().CopyTo(output);
+        // `outArr` IS the caller's `output` array.
     }
 }

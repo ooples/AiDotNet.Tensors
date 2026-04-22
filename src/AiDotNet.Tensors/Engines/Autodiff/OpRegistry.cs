@@ -117,6 +117,10 @@ internal static class OpRegistry
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
+        // TensorBroadcastTo belongs to the Delegator set below (composed
+        // from Reshape / TensorBroadcastAdd which record themselves) —
+        // listing it here too tripped the duplicate-check in
+        // TapeCompletenessTests.OpRegistry_HasNoDuplicates.
         "TensorExpandAs", "TensorBroadcastTensors",
         "TensorTake", "TensorTakeAlongDim", "TensorPut",
         "TensorBlockDiag", "TensorSliceScatter",
@@ -300,6 +304,16 @@ internal static class OpRegistry
         // Inference-only BatchNorm (training-mode BatchNorm uses the
         // separate BatchNormBackward path above)
         "BatchNormInference",
+
+        // Vision Detection — Issue #217. Forward-only in v1; backward
+        // candidates (BoxIoU family is continuous in box coords and is
+        // used as the DETR matching loss) come in a follow-up. NMS /
+        // BatchedNms / MasksToBoxes are inherently non-differentiable
+        // (discrete output / argmin).
+        "BoxConvert", "BoxArea",
+        "BoxIou", "GeneralizedBoxIou", "DistanceBoxIou", "CompleteBoxIou",
+        "Nms", "BatchedNms",
+        "MasksToBoxes",
     };
 
     /// <summary>

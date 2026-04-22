@@ -1357,14 +1357,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
             var savedState = step.SavedState;
-            if (savedState != null && savedState.Length == 3
+            // Be lenient about length: some call paths extend SavedState with
+            // bias/layout hints past index 2. As long as the first three
+            // entries are the int[] stride/padding/dilation triple we need,
+            // honour the fast path.
+            if (savedState != null && savedState.Length >= 3
                 && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
             {
                 // Path C write-through: use Conv2DInto (int[]) directly so we
                 // skip the intermediate-tensor allocation + CopyTo. Routes
                 // through the same int[] dispatch as Conv2D but shortcuts
                 // the Rent with the plan's pre-allocated output buffer.
-                // Saves ~50 µs per ResNet Conv.
+                // Saves ~50 µs per ResNet Conv. Capture locals so the closure
+                // holds onto its own refs without walking savedState every
+                // Execute.
                 var capStride = stride;
                 var capPadding = padding;
                 var capDilation = dilation;
@@ -1379,7 +1385,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                 };
             }
-            // Default stride/padding/dilation when savedState is absent.
+            // Default stride/padding/dilation when savedState is absent —
+            // the int[] overload requires arrays, so hoist constant arrays
+            // out of the closure.
             var defStride = new[] { 1, 1 };
             var defPadding = new[] { 0, 0 };
             var defDilation = new[] { 1, 1 };

@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Onnx.Protos;
 
 namespace AiDotNet.Tensors.Onnx;
@@ -10,11 +9,10 @@ namespace AiDotNet.Tensors.Onnx;
 /// <para>The typical 5-node chain (numbers are ONNX op types):</para>
 /// <code>
 /// t0 = Div(x, √2)              // constant 1.41421356…
-///    | Mul(x, 1/√2)            // equivalent form, 0.70710678…
 /// t1 = Erf(t0)
 /// t2 = Add(t1, 1.0)            // constant 1.0
-/// t3 = Mul(x, t2)              // commuted forms allowed
-/// y  = Mul(t3, 0.5)            // commuted forms allowed
+/// t3 = Mul(x, t2) OR Mul(x, 0.5) first
+/// y  = Mul(t3, 0.5) OR Mul(t3, t_half)
 /// </code>
 ///
 /// <para>Our A-S 7.1.26 Erf approximation has max error 1.5e-7 which is
@@ -23,44 +21,37 @@ namespace AiDotNet.Tensors.Onnx;
 /// same kernel ORT does, so a pattern rewrite gives bit-exact logit
 /// parity instead of ~5-6 absolute divergence.</para>
 ///
-/// <para>Rewriting is safe when:</para>
-/// <list type="bullet">
-///   <item>Each intermediate tensor (t0, t1, t2, t3) has exactly one
-///   consumer — otherwise another op would see the wrong value after
-///   collapse.</item>
-///   <item>Every constant in the chain matches its expected numeric value
-///   (√2 or 1/√2, 1.0, 0.5) within a tight FP tolerance. Validating the
-///   constants stops us from collapsing e.g. a general polynomial
-///   activation into <c>Gelu</c> (silent miscompile).</item>
-///   <item>The non-constant operand of each Mul resolves to the SAME
-///   tensor <c>x</c> that feeds the Div/Mul-by-1/√2. Without this
-///   cross-check, a commuted <c>Mul(const, x)</c> can mis-route
-///   <c>xName</c> onto the constant tensor.</item>
-/// </list>
+/// <para>Rewriting is safe when the intermediate tensors (t0, t1, t2, t3)
+/// have exactly one consumer — the next link in the chain. If any
+/// intermediate is also consumed by an unrelated op, the rewrite is
+/// suppressed so downstream consumers still see the correct value.</para>
 /// </summary>
 internal static class GeluPatternRewriter
 {
-    // Float tolerance for constant matching. 1e-5 is ~ULP × 10 at √2,
-    // generous enough to accept fp32 round-trips through exporters that
-    // store doubles and fp16 serialisations that widen to fp32, tight
-    // enough to reject any reasonable non-GELU constant.
-    private const double ConstTol = 1e-5;
+    /// <summary>
+    /// Look up the scalar value of an initializer by tensor name. Returns
+    /// <c>null</c> when the name doesn't name an initializer or the
+    /// initializer isn't a single-element scalar.
+    /// </summary>
+    internal delegate double? ScalarInitLookup(string tensorName);
 
-    private static readonly double Sqrt2        = Math.Sqrt(2.0);          // ≈ 1.4142135624
-    private static readonly double InvSqrt2     = 1.0 / Math.Sqrt(2.0);    // ≈ 0.7071067812
-    private const double Half                   = 0.5;
-    private const double One                    = 1.0;
+    internal static IReadOnlyList<NodeProto> Rewrite(IReadOnlyList<NodeProto> nodes)
+        => Rewrite(nodes, static _ => null);
 
+    /// <summary>
+    /// Rewrite the Div/Mul → Erf → Add → Mul → Mul chain into a single
+    /// <c>Gelu</c> op only when the three embedded constants match the
+    /// GELU formula (√2 in the Div/Mul, 1.0 in the Add, 0.5 in one of the
+    /// Muls). Without the constant check we were rewriting structurally
+    /// identical but semantically different subgraphs to Gelu — silently
+    /// changing numerics. Callers pass a <paramref name="scalarLookup"/>
+    /// that returns the initializer scalar by name or <c>null</c> if the
+    /// tensor isn't a known scalar constant.
+    /// </summary>
     internal static IReadOnlyList<NodeProto> Rewrite(
         IReadOnlyList<NodeProto> nodes,
-        IReadOnlyList<TensorProto>? initializers = null)
+        ScalarInitLookup scalarLookup)
     {
-        // Build a name → scalar-float lookup for constants referenced by
-        // the chain. Non-scalar initializers are ignored (a GELU constant
-        // is always a scalar). Missing initializers are treated as "not a
-        // known constant" which will fail validation below.
-        var scalarConsts = BuildScalarConstants(initializers);
-
         // Build consumer counts once: for each tensor name, how many nodes
         // consume it (strict > 1 disqualifies the chain from rewrite).
         var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -97,41 +88,57 @@ internal static class GeluPatternRewriter
             if (toSkip.Contains(divIdx)) continue;
 
             var divNode = nodes[divIdx];
-
-            // Step 1: divNode is either Div(x, √2) or Mul(x, 1/√2).
-            // Resolve xName (the non-constant operand) and verify the
-            // constant. If either check fails we leave the chain alone.
-            if (!TryResolveDivStage(divNode, scalarConsts, out string? xName))
-                continue;
+            if (divNode.OpType != "Div" && divNode.OpType != "Mul") continue;
+            if (divNode.Input.Count < 2) continue;
             if (GetCount(consumers, divNode.Output[0]) != 1) continue;
 
-            // Step 2: Add(erfOut, 1.0) or Add(1.0, erfOut). Non-erf input
-            // must be the constant 1.0.
+            // The Div/Mul carries the √2 (or 1/√2 for the Mul form). Identify
+            // x = the non-constant operand, verify the constant is √2 ±1e-3
+            // (Div) or 1/√2 ±1e-3 (Mul). Either operand position is valid.
+            string xName;
+            if (!TryIdentifyX(divNode, scalarLookup, out xName, out double divConst)) continue;
+            const double Sqrt2 = 1.41421356237309504880;
+            const double InvSqrt2 = 0.70710678118654752440;
+            if (divNode.OpType == "Div")
+            {
+                if (Math.Abs(divConst - Sqrt2) > 1e-3) continue;
+            }
+            else
+            {
+                // Mul(x, 1/√2) is mathematically the same as Div(x, √2).
+                if (Math.Abs(divConst - InvSqrt2) > 1e-3) continue;
+            }
+
             if (!TryFindSoleConsumer(nodes, consumers, n.Output[0], out int addIdx)) continue;
             var addNode = nodes[addIdx];
             if (addNode.OpType != "Add") continue;
-            if (!TryValidateAddStage(addNode, n.Output[0], scalarConsts)) continue;
+            if (addNode.Input.Count < 2) continue;
+            // Add(Erf(…), 1.0) — the non-Erf operand must be scalar 1.0.
+            string erfOut = n.Output[0];
+            string addConstName = addNode.Input[0] == erfOut ? addNode.Input[1] :
+                                  addNode.Input[1] == erfOut ? addNode.Input[0] : null!;
+            if (addConstName is null) continue;
+            double? addConst = scalarLookup(addConstName);
+            if (addConst is null || Math.Abs(addConst.Value - 1.0) > 1e-3) continue;
 
-            // Step 3: mul1Node = Mul(x, addOut) or Mul(addOut, x). The
-            // non-addOut input must be the same xName we resolved above.
             if (!TryFindSoleConsumer(nodes, consumers, addNode.Output[0], out int mul1Idx)) continue;
             var mul1Node = nodes[mul1Idx];
             if (mul1Node.OpType != "Mul") continue;
-            if (!TryValidateMul1Stage(mul1Node, addNode.Output[0], xName!)) continue;
 
-            // Step 4: mul2Node = Mul(mul1Out, 0.5) or Mul(0.5, mul1Out).
-            // The non-mul1Out input must be the constant 0.5.
             if (!TryFindSoleConsumer(nodes, consumers, mul1Node.Output[0], out int mul2Idx)) continue;
             var mul2Node = nodes[mul2Idx];
             if (mul2Node.OpType != "Mul") continue;
-            if (!TryValidateMul2Stage(mul2Node, mul1Node.Output[0], scalarConsts)) continue;
 
-            // All stages validated. Register replacement at the earliest
-            // source index so the emitted Gelu lands where the chain
-            // started; later topo-sort handles ordering regardless.
+            // Across the final two Muls, exactly one operand must be the 0.5
+            // constant and the pair of non-constant operands must be {x, Add_out}.
+            if (!HasGeluFinalMuls(mul1Node, mul2Node, xName, addNode.Output[0], scalarLookup)) continue;
+
+            // Pattern matched. Register replacement at the earliest source
+            // index so the emitted Gelu lands where Div was in the original
+            // stream; later topo-sort handles ordering correctly regardless.
             int earliest = Math.Min(Math.Min(divIdx, i), Math.Min(Math.Min(addIdx, mul1Idx), mul2Idx));
             var geluNode = new NodeProto { OpType = "Gelu" };
-            geluNode.Input.Add(xName!);
+            geluNode.Input.Add(xName);
             geluNode.Output.Add(mul2Node.Output[0]);
             replacements[earliest] = geluNode;
             foreach (var idx in new[] { divIdx, i, addIdx, mul1Idx, mul2Idx })
@@ -151,206 +158,6 @@ internal static class GeluPatternRewriter
         }
         return result;
     }
-
-    /// <summary>
-    /// Resolves the <c>x</c> operand of the chain's entry op (Div or Mul
-    /// by a constant) and verifies the constant is √2 for Div or 1/√2 for
-    /// Mul. Returns false if the node shape, constant value, or operand
-    /// role doesn't match the expected GELU form.
-    /// </summary>
-    private static bool TryResolveDivStage(
-        NodeProto divNode,
-        Dictionary<string, double> scalarConsts,
-        out string? xName)
-    {
-        xName = null;
-        if (divNode.Input.Count < 2) return false;
-
-        if (divNode.OpType == "Div")
-        {
-            // Div is non-commutative: Div(numerator, denominator).
-            // x must be the numerator, √2 the denominator.
-            if (!scalarConsts.TryGetValue(divNode.Input[1], out double denom))
-                return false;
-            if (!NearlyEqual(denom, Sqrt2)) return false;
-            // Guard against Div(const, x) where Input[0] is itself a
-            // constant — that's not the GELU form.
-            if (scalarConsts.ContainsKey(divNode.Input[0])) return false;
-            xName = divNode.Input[0];
-            return true;
-        }
-
-        if (divNode.OpType == "Mul")
-        {
-            // Mul is commutative — pick whichever input is the 1/√2
-            // constant; the OTHER input must be the non-constant x.
-            if (TryGetConstInput(divNode, scalarConsts, out int constIdx, out double constVal))
-            {
-                if (!NearlyEqual(constVal, InvSqrt2)) return false;
-                xName = divNode.Input[1 - constIdx];
-                // Reject if "non-const" operand is also a scalar constant
-                // (can't happen with a well-formed lookup — this is a
-                // belt-and-suspenders check against degenerate graphs).
-                if (scalarConsts.ContainsKey(xName)) return false;
-                return true;
-            }
-            return false;
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Verifies that <paramref name="addNode"/> is <c>Add(erfOut, 1.0)</c>
-    /// in either operand order: one input must equal <paramref name="erfOutName"/>
-    /// and the other must be a scalar constant ≈ 1.0.
-    /// </summary>
-    private static bool TryValidateAddStage(
-        NodeProto addNode,
-        string erfOutName,
-        Dictionary<string, double> scalarConsts)
-    {
-        if (addNode.Input.Count < 2) return false;
-        string a = addNode.Input[0], b = addNode.Input[1];
-        if (a == erfOutName)
-        {
-            return scalarConsts.TryGetValue(b, out double val) && NearlyEqual(val, One);
-        }
-        if (b == erfOutName)
-        {
-            return scalarConsts.TryGetValue(a, out double val) && NearlyEqual(val, One);
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Verifies that <paramref name="mul1Node"/> is <c>Mul(addOut, x)</c>
-    /// in either operand order: one input must equal <paramref name="addOutName"/>
-    /// and the OTHER must equal <paramref name="xName"/>. This is the
-    /// check that stops a commuted <c>Mul(const, something)</c> from
-    /// sneaking through.
-    /// </summary>
-    private static bool TryValidateMul1Stage(
-        NodeProto mul1Node, string addOutName, string xName)
-    {
-        if (mul1Node.Input.Count < 2) return false;
-        string a = mul1Node.Input[0], b = mul1Node.Input[1];
-        return (a == addOutName && b == xName) || (a == xName && b == addOutName);
-    }
-
-    /// <summary>
-    /// Verifies that <paramref name="mul2Node"/> is <c>Mul(mul1Out, 0.5)</c>
-    /// in either operand order: one input must equal
-    /// <paramref name="mul1OutName"/> and the other must be a scalar
-    /// constant ≈ 0.5.
-    /// </summary>
-    private static bool TryValidateMul2Stage(
-        NodeProto mul2Node, string mul1OutName, Dictionary<string, double> scalarConsts)
-    {
-        if (mul2Node.Input.Count < 2) return false;
-        string a = mul2Node.Input[0], b = mul2Node.Input[1];
-        if (a == mul1OutName)
-        {
-            return scalarConsts.TryGetValue(b, out double val) && NearlyEqual(val, Half);
-        }
-        if (b == mul1OutName)
-        {
-            return scalarConsts.TryGetValue(a, out double val) && NearlyEqual(val, Half);
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// For a commutative binary op, returns whichever input is a scalar
-    /// initializer constant and the output index (0 or 1) of that input.
-    /// Returns false if neither or both inputs are constant (the "both
-    /// constant" case is already degenerate — the producer should have
-    /// constant-folded it).
-    /// </summary>
-    private static bool TryGetConstInput(
-        NodeProto node,
-        Dictionary<string, double> scalarConsts,
-        out int constIdx, out double constVal)
-    {
-        bool a = scalarConsts.TryGetValue(node.Input[0], out double va);
-        bool b = scalarConsts.TryGetValue(node.Input[1], out double vb);
-        if (a && !b) { constIdx = 0; constVal = va; return true; }
-        if (!a && b) { constIdx = 1; constVal = vb; return true; }
-        constIdx = -1; constVal = 0; return false;
-    }
-
-    /// <summary>
-    /// Extracts scalar (single-element) float/double initializers into a
-    /// name → double lookup. Non-scalar initializers are skipped —
-    /// GELU constants are always scalars, so a broadcast tensor named
-    /// like a scalar would still be rejected via the scalar-check here.
-    /// </summary>
-    private static Dictionary<string, double> BuildScalarConstants(
-        IReadOnlyList<TensorProto>? initializers)
-    {
-        var dict = new Dictionary<string, double>(StringComparer.Ordinal);
-        if (initializers is null) return dict;
-        for (int i = 0; i < initializers.Count; i++)
-        {
-            var init = initializers[i];
-            if (string.IsNullOrEmpty(init.Name)) continue;
-            if (!IsScalarShape(init)) continue;
-            if (TryReadScalarAsDouble(init, out double val))
-                dict[init.Name] = val;
-        }
-        return dict;
-    }
-
-    private static bool IsScalarShape(TensorProto proto)
-    {
-        // Dims.Count == 0 is the canonical scalar. Count == 1 with dim[0]==1
-        // is the common rank-1 singleton that exporters emit for broadcast
-        // constants. Both collapse to a single element.
-        if (proto.Dims.Count == 0) return true;
-        long total = 1;
-        for (int i = 0; i < proto.Dims.Count; i++) total *= proto.Dims[i];
-        return total == 1;
-    }
-
-    // ONNX TensorProto.DataType enum values (mirror InitializerLoader's
-    // private constants; duplicated here to avoid widening visibility).
-    private const int DT_FLOAT = 1;
-    private const int DT_DOUBLE = 11;
-
-    private static bool TryReadScalarAsDouble(TensorProto proto, out double value)
-    {
-        value = 0;
-        if (proto.DataType == DT_FLOAT)
-        {
-            if (!proto.RawData.IsEmpty && proto.RawData.Length >= sizeof(float))
-            {
-                value = MemoryMarshal.Cast<byte, float>(proto.RawData.Span)[0];
-                return true;
-            }
-            if (proto.FloatData.Count >= 1)
-            {
-                value = proto.FloatData[0];
-                return true;
-            }
-        }
-        else if (proto.DataType == DT_DOUBLE)
-        {
-            if (!proto.RawData.IsEmpty && proto.RawData.Length >= sizeof(double))
-            {
-                value = MemoryMarshal.Cast<byte, double>(proto.RawData.Span)[0];
-                return true;
-            }
-            if (proto.DoubleData.Count >= 1)
-            {
-                value = proto.DoubleData[0];
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static bool NearlyEqual(double a, double b)
-        => Math.Abs(a - b) <= ConstTol * Math.Max(1.0, Math.Abs(b));
 
     private static int GetCount(Dictionary<string, int> counts, string name)
     {
@@ -378,5 +185,78 @@ internal static class GeluPatternRewriter
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Identify the non-constant input of a Div/Mul node where the other
+    /// operand is a scalar initializer. Returns false (+ zeros) when
+    /// neither operand is a recognizable scalar (safe: rewrite skips).
+    /// </summary>
+    private static bool TryIdentifyX(NodeProto divMul, ScalarInitLookup scalarLookup, out string xName, out double constVal)
+    {
+        xName = string.Empty;
+        constVal = 0.0;
+        double? lhs = scalarLookup(divMul.Input[0]);
+        double? rhs = scalarLookup(divMul.Input[1]);
+        if (lhs is null && rhs is not null)
+        {
+            xName = divMul.Input[0];
+            constVal = rhs.Value;
+            return true;
+        }
+        if (rhs is null && lhs is not null)
+        {
+            // For Div, this means Div(const, x) which is NOT the GELU pattern
+            // (GELU needs x as the dividend). For Mul it's symmetric and OK.
+            if (divMul.OpType == "Div") return false;
+            xName = divMul.Input[1];
+            constVal = lhs.Value;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Verify the last two Muls of the GELU chain match the structure
+    /// <c>Mul(Add_out, 0.5) → Mul(x, that)</c> OR <c>Mul(x, 0.5) →
+    /// Mul(that, Add_out)</c> — order is not fixed by ONNX exporters.
+    /// </summary>
+    private static bool HasGeluFinalMuls(
+        NodeProto mul1, NodeProto mul2, string xName, string addOut,
+        ScalarInitLookup scalarLookup)
+    {
+        if (mul1.Input.Count < 2 || mul2.Input.Count < 2) return false;
+
+        // Gather the pair of non-constant operands across both Muls.
+        // One Mul must have a scalar 0.5 input; the other must not.
+        double? half1 = FindHalfOperand(mul1, scalarLookup, out string? mul1Other);
+        double? half2 = FindHalfOperand(mul2, scalarLookup, out string? mul2Other);
+        bool mul1HasHalf = half1 is not null && Math.Abs(half1.Value - 0.5) < 1e-3;
+        bool mul2HasHalf = half2 is not null && Math.Abs(half2.Value - 0.5) < 1e-3;
+        // Exactly one of the two Muls should carry the 0.5 constant.
+        if (mul1HasHalf == mul2HasHalf) return false;
+
+        // The non-0.5 operand of the "half" Mul must be either x or addOut.
+        // The other Mul's pair of non-constant inputs must be {mul1.Output, the remaining of {x, addOut}}.
+        string halfMulOther = mul1HasHalf ? mul1Other! : mul2Other!;
+        if (halfMulOther != xName && halfMulOther != addOut) return false;
+
+        string expectedPartner = halfMulOther == xName ? addOut : xName;
+        NodeProto otherMul = mul1HasHalf ? mul2 : mul1;
+        NodeProto halfMul = mul1HasHalf ? mul1 : mul2;
+        // otherMul's inputs must be { halfMul.Output, expectedPartner }.
+        bool a = otherMul.Input[0] == halfMul.Output[0] && otherMul.Input[1] == expectedPartner;
+        bool b = otherMul.Input[1] == halfMul.Output[0] && otherMul.Input[0] == expectedPartner;
+        return a || b;
+    }
+
+    private static double? FindHalfOperand(NodeProto mul, ScalarInitLookup scalarLookup, out string? otherInput)
+    {
+        double? lhs = scalarLookup(mul.Input[0]);
+        double? rhs = scalarLookup(mul.Input[1]);
+        if (lhs is not null && rhs is null) { otherInput = mul.Input[1]; return lhs; }
+        if (rhs is not null && lhs is null) { otherInput = mul.Input[0]; return rhs; }
+        otherInput = null;
+        return null;
     }
 }

@@ -37,9 +37,9 @@ internal static class NchwcConv2D
     /// <c>cgIn = inC / 8</c>, <c>cgOut = outC / 8</c>. Pad is symmetric.
     /// </summary>
     public static void Run(
-        ReadOnlySpan<float> input,           // [N, cgIn, H, W, 8]
-        ReadOnlySpan<float> kernel,          // [cgOut, cgIn, kH, kW, 8_in, 8_out]
-        Span<float> output,                  // [N, cgOut, oH, oW, 8]
+        float[] input,                       // [N, cgIn, H, W, 8]
+        float[] kernel,                      // [cgOut, cgIn, kH, kW, 8_in, 8_out]
+        float[] output,                      // [N, cgOut, oH, oW, 8]
         int N, int inC, int H, int W,
         int outC, int kH, int kW,
         int oH, int oW,
@@ -63,7 +63,7 @@ internal static class NchwcConv2D
         int kStrideKh = kW * CBlock * CBlock;
         int kStrideKw = CBlock * CBlock;
 
-        output.Clear();
+        Array.Clear(output, 0, output.Length);
 
         // Local copies for lambda capture.
         int _N = N, _cgIn = cgIn, _cgOut = cgOut, _H = H, _W = W, _oH = oH, _oW = oW;
@@ -75,10 +75,12 @@ internal static class NchwcConv2D
         // Parallelize across (N × cgOut). Each task owns one output channel
         // group of one batch image — no write conflicts, good cache reuse
         // (all kernels for this ocg fit in L2 for typical ResNet shapes).
+        // Closure captures the float[] arrays directly — no ToArray() copies,
+        // no temporary output allocation, no copy-back.
         int totalTasks = N * cgOut;
-        var inArr = input.ToArray();        // .NET lacks a way to capture Span in closure
-        var kArr = kernel.ToArray();
-        var outArr = new float[output.Length];
+        var inArr = input;
+        var kArr = kernel;
+        var outArr = output;
 
 #if NET5_0_OR_GREATER
         bool useSimd = Avx2.IsSupported && Fma.IsSupported;
@@ -170,8 +172,7 @@ internal static class NchwcConv2D
                 }
             }
         });
-
-        // Copy back.
-        outArr.AsSpan().CopyTo(output);
+        // `outArr` IS the caller's `output` array — writes landed directly,
+        // no copy-back needed.
     }
 }

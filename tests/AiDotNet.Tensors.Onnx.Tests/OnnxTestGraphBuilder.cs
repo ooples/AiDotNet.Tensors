@@ -12,9 +12,15 @@ namespace AiDotNet.Tensors.Onnx.Tests;
 internal static class OnnxTestGraphBuilder
 {
     /// <summary>
+    /// <summary>
     /// Builds a single-node ONNX model: <c>Op(inputs...) -&gt; output</c>.
-    /// Inputs declared as graph inputs, output as graph output, no
-    /// initializers. Caller supplies input tensors at execute time.
+    /// Inputs declared as graph inputs, output as graph output. Optional
+    /// <paramref name="initializers"/> become const weights bound by name
+    /// and added as additional node inputs after the user-declared
+    /// <paramref name="inputs"/>. When <paramref name="domain"/> is supplied
+    /// the node carries it AND the emitted ModelProto declares a matching
+    /// <c>OperatorSetIdProto</c> for that domain (ONNX validation rejects
+    /// models with non-default node domains that aren't in opset_import).
     /// </summary>
     internal static ModelProto SingleOp(
         string opType,
@@ -52,7 +58,9 @@ internal static class OnnxTestGraphBuilder
             foreach (var a in attributes) node.Attribute.Add(a);
         graph.Node.Add(node);
 
-        return WrapModel(graph);
+        // Thread the node's non-default domain through to WrapModel so the
+        // emitted ModelProto declares the matching OperatorSetIdProto.
+        return WrapModel(graph, extraDomain: string.IsNullOrEmpty(domain) ? null : domain);
     }
 
     internal static ValueInfoProto MakeValueInfo(string name, int[] shape, int elemType)
@@ -109,17 +117,25 @@ internal static class OnnxTestGraphBuilder
     /// <summary>
     /// Wraps a GraphProto in a minimal ModelProto with IR version and opset
     /// that ONNX Runtime accepts. Opset 13 is the baseline most modern
-    /// exporters emit.
+    /// exporters emit. When the graph uses a non-default domain on any of
+    /// its nodes, pass <paramref name="extraDomain"/> so <c>opset_import</c>
+    /// contains the matching <see cref="OperatorSetIdProto"/> — ONNX
+    /// validation otherwise rejects the model with "No opset import for
+    /// domain 'X'".
     /// </summary>
-    internal static ModelProto WrapModel(GraphProto graph, int opsetVersion = 13)
+    internal static ModelProto WrapModel(GraphProto graph, int opsetVersion = 13, string? extraDomain = null, int extraDomainVersion = 1)
     {
-        return new ModelProto
+        var model = new ModelProto
         {
             IrVersion = 7,
             ProducerName = "AiDotNet.Tensors.Onnx.Tests",
             Graph = graph,
+            // Default domain "" must always be declared.
             OpsetImport = { new OperatorSetIdProto { Version = opsetVersion } },
         };
+        if (!string.IsNullOrEmpty(extraDomain))
+            model.OpsetImport.Add(new OperatorSetIdProto { Domain = extraDomain, Version = extraDomainVersion });
+        return model;
     }
 
     internal static byte[] Serialize(ModelProto model)

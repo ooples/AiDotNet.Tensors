@@ -404,6 +404,7 @@ internal static class ConvOperators
                 && group == 1
                 && !hasBias
                 && !GraphMode.IsActive
+                && !ctx.Options.DisableNchwcAutoPromote
                 && paddedInput.Layout == LinearAlgebra.TensorLayout.Nchw
                 && paddedInput._shape[1] % LayoutPlanner.PreferredCBlock == 0
                 && kernel._shape[0] % LayoutPlanner.PreferredCBlock == 0)

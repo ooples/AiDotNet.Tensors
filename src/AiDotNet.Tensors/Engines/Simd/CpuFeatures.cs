@@ -81,7 +81,19 @@ internal static class CpuFeatures
         _hasAVX512F    = Avx512F.IsSupported;
         _hasAVX512BW   = Avx512BW.IsSupported;
         _hasAVX512DQ   = Avx512DQ.IsSupported;
-        _hasAVX512VNNI = Avx512Vbmi.IsSupported; // VNNI not exposed directly; Vbmi is a close proxy on Ice Lake+.
+        // AVX-512 VNNI and AVX-512 VBMI use separate CPUID bits
+        // (CPUID.(EAX=7,ECX=0):ECX[bit 11] for VNNI vs ECX[bit 1] for VBMI),
+        // so the earlier Avx512Vbmi.IsSupported proxy was unsafe: Ice Lake
+        // ships VNNI without full VBMI support, so we would have reported
+        // "no VNNI" on machines that actually have it.
+        //
+        // .NET 8/9's System.Runtime.Intrinsics.X86 does not yet expose an
+        // Avx512Vnni type with an IsSupported probe (the 256-bit AvxVnni
+        // is exposed, but 512-bit VNNI is not). Until .NET exposes the type
+        // directly (or we ship a P/Invoke into CPUID), report false and let
+        // callers route to AVX-512F / AVX2 paths. The dispatch tables below
+        // all have non-VNNI fallbacks.
+        _hasAVX512VNNI = false;
 #endif
 
         // Detect vendor from multiple sources for cross-platform support

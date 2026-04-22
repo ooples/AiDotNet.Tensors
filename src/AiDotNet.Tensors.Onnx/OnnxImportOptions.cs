@@ -48,22 +48,63 @@ public sealed class OnnxImportOptions
     public int? DefaultParametricDim { get; set; }
 
     /// <summary>
-    /// Extra translators to add ON TOP OF the built-in registry. Use this
-    /// to plug in custom-op translators for domain-specific operators
-    /// (e.g. <c>com.mycompany.MyOp</c>) without forking the importer.
-    /// The <see cref="Action{T}"/> receives the registry the importer will
-    /// use; callers typically call <c>r.Register(new MyOp())</c> inside.
-    /// Runs AFTER the built-in set, so custom registrations can shadow
-    /// built-in translators if needed.
+    /// When <c>true</c>, the importer skips the NCHWc8/NCHWc16 layout
+    /// auto-promotion applied to qualifying 2D Convs and leaves activations
+    /// in the plain NCHW layout end-to-end. Default <c>false</c> (auto-
+    /// promote is on, which is the fast path).
+    /// <para>
+    /// Primary use: regression tests that need to compare the packed-layout
+    /// output against the NCHW reference output bit-for-bit — run the same
+    /// model twice, once with this flag off and once on, and assert
+    /// element-wise equivalence within tolerance. Setting this in production
+    /// trades Conv2D/pool throughput (the packed kernels are substantially
+    /// faster) for parity with the reference dispatch.
+    /// </para>
+    /// </summary>
+    public bool DisableNchwcAutoPromote { get; set; }
+
+    /// <summary>
+    /// Extra translators to add ON TOP OF the built-in registry. Use the
+    /// <see cref="SetConfigureRegistry{T}"/> method below to install a
+    /// strongly-typed callback per element type.
+    /// </summary>
+    /// <remarks>
+    /// Stored as an untyped <see cref="Delegate"/> because
+    /// <see cref="OnnxImportOptions"/> itself isn't generic (the same
+    /// instance can be passed to <c>Import&lt;float&gt;</c>, <c>Import&lt;double&gt;</c>,
+    /// etc.) — the importer dispatches by matching <c>T</c> at invocation time.
+    /// </remarks>
+    internal Delegate? ConfigureRegistryDelegate { get; set; }
+
+    /// <summary>
+    /// Installs a strongly-typed configuration callback for the
+    /// <typeparamref name="T"/>-specialized translator registry. Runs AFTER
+    /// the built-in set, so custom registrations can shadow built-ins.
+    /// Calling multiple times with the same <typeparamref name="T"/> overrides
+    /// the previous callback for that type.
     /// <para>
     /// Example:
     /// <code>
-    /// var opts = new OnnxImportOptions
-    /// {
-    ///     ConfigureRegistry = r =&gt; r.Register(new MyCustomOp&lt;float&gt;()),
-    /// };
+    /// var opts = new OnnxImportOptions();
+    /// opts.SetConfigureRegistry&lt;float&gt;(r =&gt; r.Register(new MyCustomOp&lt;float&gt;()));
     /// </code>
     /// </para>
     /// </summary>
-    public Action<object>? ConfigureRegistry { get; set; }
+    public void SetConfigureRegistry<T>(Action<OnnxOpTranslatorRegistry<T>> configure)
+        where T : unmanaged
+    {
+        ConfigureRegistryDelegate = configure ?? throw new ArgumentNullException(nameof(configure));
+    }
+
+    /// <summary>
+    /// Invokes the stored configuration callback against <paramref name="registry"/>
+    /// if one was installed via <see cref="SetConfigureRegistry{T}"/> for the
+    /// matching <typeparamref name="T"/>. Called internally by the importer.
+    /// </summary>
+    internal void ApplyConfigureRegistry<T>(OnnxOpTranslatorRegistry<T> registry)
+        where T : unmanaged
+    {
+        if (ConfigureRegistryDelegate is Action<OnnxOpTranslatorRegistry<T>> typed)
+            typed(registry);
+    }
 }

@@ -42,6 +42,24 @@ internal static class NchwcBatchNorm
         Span<float> output,
         int N, int C, int H, int W)
     {
+        // Shape + buffer-length invariants. NCHWc8 requires C divisible by
+        // CBlock; gamma/beta/mean/variance are per-channel (length C); input
+        // and output are N·C·H·W floats. Catching this here gives a clear
+        // error instead of a downstream AccessViolation when the kernel
+        // indexes past a wrongly-sized scale or bias span.
+        if (N < 0 || C < 0 || H < 0 || W < 0)
+            throw new ArgumentException("N/C/H/W must all be non-negative.");
+        if (C % CBlock != 0)
+            throw new ArgumentException(
+                $"RunNchwc8 requires C ({C}) divisible by CBlock ({CBlock}).", nameof(C));
+        long expected = (long)N * C * H * W;
+        if (input.Length < expected || output.Length < expected)
+            throw new ArgumentException(
+                $"input/output must hold at least N·C·H·W = {expected} floats.");
+        if (gamma.Length < C || beta.Length < C || mean.Length < C || variance.Length < C)
+            throw new ArgumentException(
+                $"gamma/beta/mean/variance must each hold at least C = {C} floats.");
+
         int cg = C / CBlock;
         int spatial = H * W;
         int hwC = spatial * CBlock;
