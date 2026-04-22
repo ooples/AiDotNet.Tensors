@@ -60,6 +60,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _linalgLibrary;
     private IntPtr _fftLibrary;
     private IntPtr _detectionLibrary;
+    private IntPtr _geometryLibrary;
 
     #region Properties
 
@@ -257,6 +258,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal Detection pre-compilation warning: {ex.Message}");
             _detectionLibrary = IntPtr.Zero;
+        }
+
+        // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
+        try
+        {
+            _geometryLibrary = _shaderLibrary.CompileLibrary("Geometry",
+                MetalGeometryKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Geometry pre-compilation warning: {ex.Message}");
+            _geometryLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
