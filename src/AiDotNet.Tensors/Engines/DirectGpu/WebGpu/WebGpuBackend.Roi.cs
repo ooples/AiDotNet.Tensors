@@ -60,5 +60,62 @@ public sealed partial class WebGpuBackend
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, u.BufferId, wg, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
+
+    public async Task PsRoIAlignAsync(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale, int samplingRatio)
+    {
+        int total = K * outputChannels * outH * outW;
+        if (total <= 0) return;
+        var pipe = await GetOrCreatePipelineAsync(
+            RoiModuleKey + ":PsRoIAlign", WebGpuRoiKernels.PsRoIAlign, "main");
+        var uniform = new float[10];
+        uniform[0] = System.BitConverter.Int32BitsToSingle(N);
+        uniform[1] = System.BitConverter.Int32BitsToSingle(C);
+        uniform[2] = System.BitConverter.Int32BitsToSingle(H);
+        uniform[3] = System.BitConverter.Int32BitsToSingle(W);
+        uniform[4] = System.BitConverter.Int32BitsToSingle(K);
+        uniform[5] = System.BitConverter.Int32BitsToSingle(outH);
+        uniform[6] = System.BitConverter.Int32BitsToSingle(outW);
+        uniform[7] = System.BitConverter.Int32BitsToSingle(outputChannels);
+        uniform[8] = spatialScale;
+        uniform[9] = System.BitConverter.Int32BitsToSingle(samplingRatio);
+        int padded = ((uniform.Length + 3) / 4) * 4;
+        var padBuf = new float[padded];
+        Array.Copy(uniform, padBuf, uniform.Length);
+        using var u = new WebGpuBuffer(padBuf, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe, AsWgpu(input), AsWgpu(boxes), AsWgpu(output));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, u.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task PsRoIPoolAsync(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale)
+    {
+        int total = K * outputChannels * outH * outW;
+        if (total <= 0) return;
+        var pipe = await GetOrCreatePipelineAsync(
+            RoiModuleKey + ":PsRoIPool", WebGpuRoiKernels.PsRoIPool, "main");
+        var uniform = new float[9];
+        uniform[0] = System.BitConverter.Int32BitsToSingle(N);
+        uniform[1] = System.BitConverter.Int32BitsToSingle(C);
+        uniform[2] = System.BitConverter.Int32BitsToSingle(H);
+        uniform[3] = System.BitConverter.Int32BitsToSingle(W);
+        uniform[4] = System.BitConverter.Int32BitsToSingle(K);
+        uniform[5] = System.BitConverter.Int32BitsToSingle(outH);
+        uniform[6] = System.BitConverter.Int32BitsToSingle(outW);
+        uniform[7] = System.BitConverter.Int32BitsToSingle(outputChannels);
+        uniform[8] = spatialScale;
+        int padded = ((uniform.Length + 3) / 4) * 4;
+        var padBuf = new float[padded];
+        Array.Copy(uniform, padBuf, uniform.Length);
+        using var u = new WebGpuBuffer(padBuf, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe, AsWgpu(input), AsWgpu(boxes), AsWgpu(output));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, u.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
 }
 #endif

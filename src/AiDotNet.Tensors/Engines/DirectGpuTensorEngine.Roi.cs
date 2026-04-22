@@ -49,6 +49,76 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> PsRoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale, int samplingRatio)
+    {
+        if (typeof(T) == typeof(float) && input.Rank == 4
+            && boxes.Rank == 2 && boxes._shape[1] == 5)
+        {
+            try
+            {
+                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                {
+                    int N = input._shape[0], C = input._shape[1];
+                    int H = input._shape[2], W = input._shape[3];
+                    int K = boxes._shape[0];
+                    if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
+                    int outLen = K * outputChannels * outputHeight * outputWidth;
+                    using var inBuf = GetOrAllocateBuffer(backend, input);
+                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                    var outBuf = AllocateOutputBuffer(backend, outLen);
+                    try
+                    {
+                        roi.PsRoIAlign(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                            N, C, H, W, K, outputHeight, outputWidth, outputChannels,
+                            spatialScale, samplingRatio);
+                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                        return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
+                    }
+                    catch { outBuf.Dispose(); throw; }
+                }
+            }
+            catch { }
+        }
+        return base.PsRoIAlign(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels, float spatialScale)
+    {
+        if (typeof(T) == typeof(float) && input.Rank == 4
+            && boxes.Rank == 2 && boxes._shape[1] == 5)
+        {
+            try
+            {
+                if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
+                {
+                    int N = input._shape[0], C = input._shape[1];
+                    int H = input._shape[2], W = input._shape[3];
+                    int K = boxes._shape[0];
+                    if (K == 0) return new Tensor<T>(new[] { 0, outputChannels, outputHeight, outputWidth });
+                    int outLen = K * outputChannels * outputHeight * outputWidth;
+                    using var inBuf = GetOrAllocateBuffer(backend, input);
+                    using var bBuf = GetOrAllocateBuffer(backend, boxes);
+                    var outBuf = AllocateOutputBuffer(backend, outLen);
+                    try
+                    {
+                        roi.PsRoIPool(inBuf.Buffer, bBuf.Buffer, outBuf.Buffer,
+                            N, C, H, W, K, outputHeight, outputWidth, outputChannels, spatialScale);
+                        var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                        return new Tensor<T>(arr, new[] { K, outputChannels, outputHeight, outputWidth });
+                    }
+                    catch { outBuf.Dispose(); throw; }
+                }
+            }
+            catch { }
+        }
+        return base.PsRoIPool(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {

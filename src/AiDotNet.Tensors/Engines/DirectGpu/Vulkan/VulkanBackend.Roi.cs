@@ -33,4 +33,37 @@ public sealed unsafe partial class VulkanBackend : IRoiBackend
         };
         GlslBinaryOp(VulkanRoiKernels.RoIPool, input, boxes, output, total, pc, RoiPoolPushSize);
     }
+
+    // Push constants for PsRoI: RoIAlign = 8 ints + 1 float + 1 int = 40;
+    // RoIPool = 8 ints + 1 float = 36.
+    private const uint PsRoiAlignPushSize = 40u;
+    private const uint PsRoiPoolPushSize = 36u;
+
+    public void PsRoIAlign(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale, int samplingRatio)
+    {
+        int total = K * outputChannels * outH * outW;
+        if (total <= 0) return;
+        uint ss = BitConverter.ToUInt32(BitConverter.GetBytes(spatialScale), 0);
+        var pc = new uint[] {
+            (uint)N, (uint)C, (uint)H, (uint)W, (uint)K, (uint)outH, (uint)outW,
+            (uint)outputChannels, ss, (uint)samplingRatio
+        };
+        GlslBinaryOp(VulkanRoiKernels.PsRoIAlign, input, boxes, output, total, pc, PsRoiAlignPushSize);
+    }
+
+    public void PsRoIPool(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale)
+    {
+        int total = K * outputChannels * outH * outW;
+        if (total <= 0) return;
+        uint ss = BitConverter.ToUInt32(BitConverter.GetBytes(spatialScale), 0);
+        var pc = new uint[] {
+            (uint)N, (uint)C, (uint)H, (uint)W, (uint)K, (uint)outH, (uint)outW,
+            (uint)outputChannels, ss
+        };
+        GlslBinaryOp(VulkanRoiKernels.PsRoIPool, input, boxes, output, total, pc, PsRoiPoolPushSize);
+    }
 }

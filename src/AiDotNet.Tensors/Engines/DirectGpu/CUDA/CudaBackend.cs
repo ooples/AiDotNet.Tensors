@@ -60,6 +60,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     private IntPtr _detectionModule;
     private IntPtr _geometryModule;
     private IntPtr _roiModule;
+    private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -756,6 +757,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         catch
         {
             _roiModule = IntPtr.Zero;
+        }
+
+        // Audio kernels (Issue #217 tail).
+        try
+        {
+            _audioModule = CompileKernelModule(device,
+                Kernels.CudaAudioKernels.GetSource(),
+                "audio_kernels",
+                Kernels.CudaAudioKernels.GetKernelNames());
+        }
+        catch
+        {
+            _audioModule = IntPtr.Zero;
         }
 
         // Linalg decomposition kernels (#211 moat #2). Same best-effort policy:

@@ -627,6 +627,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL RoI compilation failed: {ex.Message}");
                 }
 
+                // Compile audio kernels (Issue #217 tail).
+                try
+                {
+                    var audioProgram = CompileOrLoadCached(OpenClAudioKernels.GetSource(), optimizationFlags, "Audio kernels");
+                    _programs.Add(audioProgram);
+                    foreach (var name in OpenClAudioKernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, audioProgram, name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL Audio compilation failed: {ex.Message}");
+                }
+
                 // Linalg decomposition kernels (#211 moat #2). Compilation
                 // failure flips _linalgAvailable=false and surfaces via
                 // <see cref="LinalgAvailable"/> so callers can route to CPU

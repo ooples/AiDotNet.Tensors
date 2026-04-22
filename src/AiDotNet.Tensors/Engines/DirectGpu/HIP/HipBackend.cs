@@ -87,6 +87,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _detectionModule;
     private IntPtr _geometryModule;
     private IntPtr _roiModule;
+    private IntPtr _audioModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -585,6 +586,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             catch
             {
                 _roiModule = IntPtr.Zero;
+            }
+
+            // Audio primitives (#217 tail). IAudioBackend dispatch.
+            try
+            {
+                CompileKernelModule(Kernels.HipAudioKernels.GetSource(), "audio",
+                    ref _audioModule, Kernels.HipAudioKernels.GetKernelNames());
+            }
+            catch
+            {
+                _audioModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");

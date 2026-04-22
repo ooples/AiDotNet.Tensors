@@ -46,6 +46,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.SetArg(10, spatialScale);
             k.Execute1D(RoundUpRoi(total), RoiLocalSize);
         }
+
+        public void PsRoIAlign(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+            int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+            float spatialScale, int samplingRatio)
+        {
+            int total = K * outputChannels * outH * outW;
+            if (total <= 0) return;
+            var k = GetRoiKernel("ps_roi_align");
+            k.SetArg(0, RoiHandle(input));
+            k.SetArg(1, RoiHandle(boxes));
+            k.SetArg(2, RoiHandle(output));
+            k.SetArg(3, N); k.SetArg(4, C); k.SetArg(5, H); k.SetArg(6, W);
+            k.SetArg(7, K); k.SetArg(8, outH); k.SetArg(9, outW); k.SetArg(10, outputChannels);
+            k.SetArg(11, spatialScale); k.SetArg(12, samplingRatio);
+            k.Execute1D(RoundUpRoi(total), RoiLocalSize);
+        }
+
+        public void PsRoIPool(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+            int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+            float spatialScale)
+        {
+            int total = K * outputChannels * outH * outW;
+            if (total <= 0) return;
+            var k = GetRoiKernel("ps_roi_pool");
+            k.SetArg(0, RoiHandle(input));
+            k.SetArg(1, RoiHandle(boxes));
+            k.SetArg(2, RoiHandle(output));
+            k.SetArg(3, N); k.SetArg(4, C); k.SetArg(5, H); k.SetArg(6, W);
+            k.SetArg(7, K); k.SetArg(8, outH); k.SetArg(9, outW); k.SetArg(10, outputChannels);
+            k.SetArg(11, spatialScale);
+            k.Execute1D(RoundUpRoi(total), RoiLocalSize);
+        }
     }
 }
 #endif

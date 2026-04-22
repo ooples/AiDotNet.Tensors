@@ -3,7 +3,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public static class WebGpuRoiKernels
 {
-    public static string[] GetKernelNames() => new[] { "roi_align", "roi_pool" };
+    public static string[] GetKernelNames() => new[]
+    {
+        "roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool",
+    };
 
     public static string RoIAlign => @"
 @group(0) @binding(0) var<storage, read> input_ : array<f32>;
@@ -114,6 +117,112 @@ struct P {
         }
     }
     output_[gid] = best;
+}
+";
+
+    public static string PsRoIAlign => @"
+@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(1) var<storage, read> boxes : array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_ : array<f32>;
+struct P {
+    N: i32, C: i32, H: i32, W: i32, K: i32, outH: i32, outW: i32, outputChannels: i32,
+    spatialScale: f32, samplingRatio: i32
+};
+@group(0) @binding(3) var<uniform> p : P;
+
+fn ps_bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
+    var y = y_in; var x = x_in;
+    if (y < -1.0 || y > f32(p.H) || x < -1.0 || x > f32(p.W)) { return 0.0; }
+    if (y <= 0.0) { y = 0.0; }
+    if (x <= 0.0) { x = 0.0; }
+    var y0 = i32(y);
+    var x0 = i32(x);
+    var y1 = select(y0 + 1, p.H - 1, y0 + 1 >= p.H);
+    var x1 = select(x0 + 1, p.W - 1, x0 + 1 >= p.W);
+    if (y0 >= p.H - 1) { y0 = p.H - 1; y1 = p.H - 1; y = f32(y0); }
+    if (x0 >= p.W - 1) { x0 = p.W - 1; x1 = p.W - 1; x = f32(x0); }
+    let ly = y - f32(y0); let lx = x - f32(x0);
+    let hy = 1.0 - ly; let hx = 1.0 - lx;
+    return hy * hx * input_[planeBase + y0 * p.W + x0]
+         + hy * lx * input_[planeBase + y0 * p.W + x1]
+         + ly * hx * input_[planeBase + y1 * p.W + x0]
+         + ly * lx * input_[planeBase + y1 * p.W + x1];
+}
+
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    let total = p.K * p.outputChannels * p.outH * p.outW;
+    if (gid >= total) { return; }
+    let pw = gid % p.outW; let t1 = gid / p.outW;
+    let ph = t1 % p.outH; let t2 = t1 / p.outH;
+    let co = t2 % p.outputChannels; let k = t2 / p.outputChannels;
+    let n = i32(boxes[k * 5]);
+    if (n < 0 || n >= p.N) { output_[gid] = 0.0; return; }
+    let x1 = boxes[k * 5 + 1] * p.spatialScale;
+    let y1 = boxes[k * 5 + 2] * p.spatialScale;
+    let x2 = boxes[k * 5 + 3] * p.spatialScale;
+    let y2 = boxes[k * 5 + 4] * p.spatialScale;
+    let roiW = max(x2 - x1, 0.1);
+    let roiH = max(y2 - y1, 0.1);
+    let binH = roiH / f32(p.outH);
+    let binW = roiW / f32(p.outW);
+    var ry = select(i32(ceil(roiH / f32(p.outH))), p.samplingRatio, p.samplingRatio > 0);
+    var rx = select(i32(ceil(roiW / f32(p.outW))), p.samplingRatio, p.samplingRatio > 0);
+    if (ry < 1) { ry = 1; }
+    if (rx < 1) { rx = 1; }
+    let c = (co * p.outH + ph) * p.outW + pw;
+    let planeBase = (n * p.C + c) * p.H * p.W;
+    var acc : f32 = 0.0;
+    for (var iy : i32 = 0; iy < ry; iy = iy + 1) {
+        let sy = y1 + f32(ph) * binH + (f32(iy) + 0.5) * binH / f32(ry);
+        for (var ix : i32 = 0; ix < rx; ix = ix + 1) {
+            let sx = x1 + f32(pw) * binW + (f32(ix) + 0.5) * binW / f32(rx);
+            acc = acc + ps_bilinear_sample(planeBase, sy, sx);
+        }
+    }
+    output_[gid] = acc / f32(ry * rx);
+}
+";
+
+    public static string PsRoIPool => @"
+@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(1) var<storage, read> boxes : array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_ : array<f32>;
+struct P {
+    N: i32, C: i32, H: i32, W: i32, K: i32, outH: i32, outW: i32, outputChannels: i32,
+    spatialScale: f32
+};
+@group(0) @binding(3) var<uniform> p : P;
+
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    let total = p.K * p.outputChannels * p.outH * p.outW;
+    if (gid >= total) { return; }
+    let pw = gid % p.outW; let t1 = gid / p.outW;
+    let ph = t1 % p.outH; let t2 = t1 / p.outH;
+    let co = t2 % p.outputChannels; let k = t2 / p.outputChannels;
+    let n = i32(boxes[k * 5]);
+    if (n < 0 || n >= p.N) { output_[gid] = 0.0; return; }
+    let x1 = boxes[k * 5 + 1] * p.spatialScale;
+    let y1 = boxes[k * 5 + 2] * p.spatialScale;
+    let x2 = boxes[k * 5 + 3] * p.spatialScale;
+    let y2 = boxes[k * 5 + 4] * p.spatialScale;
+    let binH = max(y2 - y1, 0.1) / f32(p.outH);
+    let binW = max(x2 - x1, 0.1) / f32(p.outW);
+    let c = (co * p.outH + ph) * p.outW + pw;
+    var hs = i32(max(0.0, floor(y1 + f32(ph) * binH)));
+    var he = i32(min(f32(p.H), ceil(y1 + f32(ph + 1) * binH)));
+    var ws = i32(max(0.0, floor(x1 + f32(pw) * binW)));
+    var we = i32(min(f32(p.W), ceil(x1 + f32(pw + 1) * binW)));
+    let planeBase = (n * p.C + c) * p.H * p.W;
+    var acc : f32 = 0.0; var cnt : i32 = 0;
+    for (var yy : i32 = hs; yy < he; yy = yy + 1) {
+        for (var xx : i32 = ws; xx < we; xx = xx + 1) {
+            acc = acc + input_[planeBase + yy * p.W + xx];
+            cnt = cnt + 1;
+        }
+    }
+    if (cnt > 0) { output_[gid] = acc / f32(cnt); } else { output_[gid] = 0.0; }
 }
 ";
 }

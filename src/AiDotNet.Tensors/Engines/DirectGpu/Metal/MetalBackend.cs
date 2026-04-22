@@ -62,6 +62,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _detectionLibrary;
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
+    private IntPtr _audioLibrary;
 
     #region Properties
 
@@ -282,6 +283,17 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             System.Diagnostics.Debug.WriteLine($"Metal RoI pre-compilation warning: {ex.Message}");
             _roiLibrary = IntPtr.Zero;
+        }
+
+        // Audio primitives (#217 tail). IAudioBackend dispatch.
+        try
+        {
+            _audioLibrary = _shaderLibrary.CompileLibrary("Audio", MetalAudioKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Audio pre-compilation warning: {ex.Message}");
+            _audioLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external

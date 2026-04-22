@@ -3,7 +3,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 {
     public static class MetalRoiKernels
     {
-        public static string[] GetKernelNames() => new[] { "roi_align", "roi_pool" };
+        public static string[] GetKernelNames() => new[]
+        {
+            "roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool",
+        };
 
         public const string Source = @"
 #include <metal_stdlib>
@@ -117,6 +120,89 @@ kernel void roi_pool(
             if (v > best) best = v;
         }
     output[gid] = best;
+}
+
+kernel void ps_roi_align(
+    device const float* input [[buffer(0)]],
+    device const float* boxes [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& C [[buffer(4)]],
+    constant int& H [[buffer(5)]], constant int& W [[buffer(6)]],
+    constant int& K [[buffer(7)]], constant int& outH [[buffer(8)]],
+    constant int& outW [[buffer(9)]], constant int& outputChannels [[buffer(10)]],
+    constant float& spatialScale [[buffer(11)]], constant int& samplingRatio [[buffer(12)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = K * outputChannels * outH * outW;
+    if ((int)gid >= total) return;
+    int pw = (int)gid % outW; int t1 = (int)gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+
+    int n = int(boxes[k * 5]);
+    if (n < 0 || n >= N) { output[gid] = 0.0; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float roiW = max(x2 - x1, 0.1f);
+    float roiH = max(y2 - y1, 0.1f);
+    float binH = roiH / outH;
+    float binW = roiW / outW;
+    int ry = samplingRatio > 0 ? samplingRatio : int(ceil(roiH / outH));
+    int rx = samplingRatio > 0 ? samplingRatio : int(ceil(roiW / outW));
+    if (ry < 1) ry = 1;
+    if (rx < 1) rx = 1;
+
+    int c = (co * outH + ph) * outW + pw;
+    int planeBase = (n * C + c) * H * W;
+    float acc = 0;
+    for (int iy = 0; iy < ry; iy++) {
+        float sy = y1 + ph * binH + (iy + 0.5f) * binH / ry;
+        for (int ix = 0; ix < rx; ix++) {
+            float sx = x1 + pw * binW + (ix + 0.5f) * binW / rx;
+            acc += bilinear_sample_msl(input, planeBase, sy, sx, H, W);
+        }
+    }
+    output[gid] = acc / (ry * rx);
+}
+
+kernel void ps_roi_pool(
+    device const float* input [[buffer(0)]],
+    device const float* boxes [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& C [[buffer(4)]],
+    constant int& H [[buffer(5)]], constant int& W [[buffer(6)]],
+    constant int& K [[buffer(7)]], constant int& outH [[buffer(8)]],
+    constant int& outW [[buffer(9)]], constant int& outputChannels [[buffer(10)]],
+    constant float& spatialScale [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = K * outputChannels * outH * outW;
+    if ((int)gid >= total) return;
+    int pw = (int)gid % outW; int t1 = (int)gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+
+    int n = int(boxes[k * 5]);
+    if (n < 0 || n >= N) { output[gid] = 0.0; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float binH = max(y2 - y1, 0.1f) / outH;
+    float binW = max(x2 - x1, 0.1f) / outW;
+
+    int c = (co * outH + ph) * outW + pw;
+    int planeBase = (n * C + c) * H * W;
+    int hs = (int)max(0.0f, floor(y1 + ph * binH));
+    int he = (int)min(float(H), ceil(y1 + (ph + 1) * binH));
+    int ws = (int)max(0.0f, floor(x1 + pw * binW));
+    int we = (int)min(float(W), ceil(x1 + (pw + 1) * binW));
+    float acc = 0; int cnt = 0;
+    for (int yy = hs; yy < he; yy++)
+        for (int xx = ws; xx < we; xx++) { acc += input[planeBase + yy * W + xx]; cnt++; }
+    output[gid] = cnt > 0 ? acc / cnt : 0.0;
 }
 ";
     }

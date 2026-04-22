@@ -70,6 +70,85 @@ void main() {
 }
 ";
 
+    public static string PsRoIAlign => Header + @"
+layout(set = 0, binding = 0) readonly buffer I { float input_[]; };
+layout(set = 0, binding = 1) readonly buffer B { float boxes[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float output_[]; };
+layout(push_constant) uniform P {
+    int N; int C; int H; int W; int K; int outH; int outW; int outputChannels;
+    float spatialScale; int samplingRatio;
+};
+" + Helper + @"
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = K * outputChannels * outH * outW;
+    if (gid >= total) return;
+    int pw = gid % outW; int t1 = gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+    int n = int(boxes[k * 5]);
+    if (n < 0 || n >= N) { output_[gid] = 0.0; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float roiW = max(x2 - x1, 0.1);
+    float roiH = max(y2 - y1, 0.1);
+    float binH = roiH / outH;
+    float binW = roiW / outW;
+    int ry = samplingRatio > 0 ? samplingRatio : int(ceil(roiH / outH));
+    int rx = samplingRatio > 0 ? samplingRatio : int(ceil(roiW / outW));
+    if (ry < 1) ry = 1;
+    if (rx < 1) rx = 1;
+    int c = (co * outH + ph) * outW + pw;
+    uint planeBase = uint((n * C + c) * H * W);
+    float acc = 0.0;
+    for (int iy = 0; iy < ry; iy++) {
+        float sy = y1 + ph * binH + (float(iy) + 0.5) * binH / ry;
+        for (int ix = 0; ix < rx; ix++) {
+            float sx = x1 + pw * binW + (float(ix) + 0.5) * binW / rx;
+            acc += bilinear_sample(planeBase, sy, sx, H, W);
+        }
+    }
+    output_[gid] = acc / float(ry * rx);
+}
+";
+
+    public static string PsRoIPool => Header + @"
+layout(set = 0, binding = 0) readonly buffer I { float input_[]; };
+layout(set = 0, binding = 1) readonly buffer B { float boxes[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float output_[]; };
+layout(push_constant) uniform P {
+    int N; int C; int H; int W; int K; int outH; int outW; int outputChannels; float spatialScale;
+};
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = K * outputChannels * outH * outW;
+    if (gid >= total) return;
+    int pw = gid % outW; int t1 = gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+    int n = int(boxes[k * 5]);
+    if (n < 0 || n >= N) { output_[gid] = 0.0; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float binH = max(y2 - y1, 0.1) / outH;
+    float binW = max(x2 - x1, 0.1) / outW;
+    int c = (co * outH + ph) * outW + pw;
+    int hs = int(max(0.0, floor(y1 + ph * binH)));
+    int he = int(min(float(H), ceil(y1 + (ph + 1) * binH)));
+    int ws = int(max(0.0, floor(x1 + pw * binW)));
+    int we = int(min(float(W), ceil(x1 + (pw + 1) * binW)));
+    uint planeBase = uint((n * C + c) * H * W);
+    float acc = 0.0; int cnt = 0;
+    for (int yy = hs; yy < he; yy++)
+        for (int xx = ws; xx < we; xx++) { acc += input_[planeBase + uint(yy * W + xx)]; cnt++; }
+    output_[gid] = cnt > 0 ? acc / float(cnt) : 0.0;
+}
+";
+
     public static string RoIPool => Header + @"
 layout(set = 0, binding = 0) readonly buffer I { float input_[]; };
 layout(set = 0, binding = 1) readonly buffer B { float boxes[]; };

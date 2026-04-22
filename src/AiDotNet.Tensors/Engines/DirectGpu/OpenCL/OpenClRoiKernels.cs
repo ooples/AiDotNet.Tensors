@@ -5,7 +5,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClRoiKernels
 {
-    public static string[] GetKernelNames() => new[] { "roi_align", "roi_pool" };
+    public static string[] GetKernelNames() => new[]
+    {
+        "roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool",
+    };
 
     public static string GetSource() => @"
 inline float bilinear_sample(__global const float* src, int planeBase,
@@ -112,6 +115,84 @@ __kernel void roi_pool(
             if (v > best) best = v;
         }
     output[gid] = best;
+}
+
+// Position-sensitive RoIAlign (R-FCN).
+__kernel void ps_roi_align(
+    __global const float* input, __global const float* boxes,
+    __global float* output,
+    const int N, const int C, const int H, const int W, const int K,
+    const int outH, const int outW, const int outputChannels,
+    const float spatialScale, const int samplingRatio)
+{
+    int gid = get_global_id(0);
+    int total = K * outputChannels * outH * outW;
+    if (gid >= total) return;
+    int pw = gid % outW; int t1 = gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+
+    int n = (int)boxes[k * 5];
+    if (n < 0 || n >= N) { output[gid] = 0.0f; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float roiW = fmax(x2 - x1, 0.1f);
+    float roiH = fmax(y2 - y1, 0.1f);
+    float binH = roiH / outH;
+    float binW = roiW / outW;
+    int ry = samplingRatio > 0 ? samplingRatio : (int)ceil(roiH / outH);
+    int rx = samplingRatio > 0 ? samplingRatio : (int)ceil(roiW / outW);
+    if (ry < 1) ry = 1;
+    if (rx < 1) rx = 1;
+
+    int c = (co * outH + ph) * outW + pw;
+    int planeBase = (n * C + c) * H * W;
+    float acc = 0;
+    for (int iy = 0; iy < ry; iy++) {
+        float sy = y1 + ph * binH + (iy + 0.5f) * binH / ry;
+        for (int ix = 0; ix < rx; ix++) {
+            float sx = x1 + pw * binW + (ix + 0.5f) * binW / rx;
+            acc += bilinear_sample(input, planeBase, sy, sx, H, W);
+        }
+    }
+    output[gid] = acc / (ry * rx);
+}
+
+__kernel void ps_roi_pool(
+    __global const float* input, __global const float* boxes,
+    __global float* output,
+    const int N, const int C, const int H, const int W, const int K,
+    const int outH, const int outW, const int outputChannels,
+    const float spatialScale)
+{
+    int gid = get_global_id(0);
+    int total = K * outputChannels * outH * outW;
+    if (gid >= total) return;
+    int pw = gid % outW; int t1 = gid / outW;
+    int ph = t1 % outH; int t2 = t1 / outH;
+    int co = t2 % outputChannels; int k = t2 / outputChannels;
+
+    int n = (int)boxes[k * 5];
+    if (n < 0 || n >= N) { output[gid] = 0.0f; return; }
+    float x1 = boxes[k * 5 + 1] * spatialScale;
+    float y1 = boxes[k * 5 + 2] * spatialScale;
+    float x2 = boxes[k * 5 + 3] * spatialScale;
+    float y2 = boxes[k * 5 + 4] * spatialScale;
+    float binH = fmax(y2 - y1, 0.1f) / outH;
+    float binW = fmax(x2 - x1, 0.1f) / outW;
+
+    int c = (co * outH + ph) * outW + pw;
+    int planeBase = (n * C + c) * H * W;
+    int hs = (int)fmax(0.0f, floor(y1 + ph * binH));
+    int he = (int)fmin((float)H, ceil(y1 + (ph + 1) * binH));
+    int ws = (int)fmax(0.0f, floor(x1 + pw * binW));
+    int we = (int)fmin((float)W, ceil(x1 + (pw + 1) * binW));
+    float acc = 0; int cnt = 0;
+    for (int yy = hs; yy < he; yy++)
+        for (int xx = ws; xx < we; xx++) { acc += input[planeBase + yy * W + xx]; cnt++; }
+    output[gid] = cnt > 0 ? acc / cnt : 0.0f;
 }
 ";
 }
