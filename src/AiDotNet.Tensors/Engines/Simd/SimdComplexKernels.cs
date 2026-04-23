@@ -55,6 +55,96 @@ public static class SimdComplexKernels
     }
 
     /// <summary>
+    /// SIMD complex pointwise multiply for single precision, with optional
+    /// conjugate-b ("HRR unbind") flag. Float mirror of
+    /// <see cref="ComplexMultiplyDouble"/> — the engine layer dispatches
+    /// to whichever matches <c>T</c>. Uses Vector256&lt;float&gt; (8 lanes)
+    /// plus FMA when available.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexMultiplyFloatConjugatable(
+        ReadOnlySpan<float> aR, ReadOnlySpan<float> aI,
+        ReadOnlySpan<float> bR, ReadOnlySpan<float> bI,
+        Span<float> cR, Span<float> cI,
+        bool conjugateB = false)
+    {
+        int n = aR.Length;
+        if (aI.Length != n || bR.Length != n || bI.Length != n || cR.Length != n || cI.Length != n)
+            throw new ArgumentException(
+                "All six spans must have identical length for ComplexMultiplyFloatConjugatable.");
+
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 8)
+        {
+            int simdLen = n & ~7;
+            if (conjugateB)
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+
+                    if (Fma.IsSupported)
+                    {
+                        SimdKernels.WriteVector256(cR, i, Fma.MultiplyAdd(ai, bi, Avx.Multiply(ar, br)));
+                        SimdKernels.WriteVector256(cI, i, Fma.MultiplyAddNegated(ar, bi, Avx.Multiply(ai, br)));
+                    }
+                    else
+                    {
+                        SimdKernels.WriteVector256(cR, i, Avx.Add(Avx.Multiply(ar, br), Avx.Multiply(ai, bi)));
+                        SimdKernels.WriteVector256(cI, i, Avx.Subtract(Avx.Multiply(ai, br), Avx.Multiply(ar, bi)));
+                    }
+                }
+            }
+            else
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+
+                    if (Fma.IsSupported)
+                    {
+                        SimdKernels.WriteVector256(cR, i, Fma.MultiplyAddNegated(ai, bi, Avx.Multiply(ar, br)));
+                        SimdKernels.WriteVector256(cI, i, Fma.MultiplyAdd(ai, br, Avx.Multiply(ar, bi)));
+                    }
+                    else
+                    {
+                        SimdKernels.WriteVector256(cR, i, Avx.Subtract(Avx.Multiply(ar, br), Avx.Multiply(ai, bi)));
+                        SimdKernels.WriteVector256(cI, i, Avx.Add(Avx.Multiply(ar, bi), Avx.Multiply(ai, br)));
+                    }
+                }
+            }
+        }
+#endif
+
+        if (conjugateB)
+        {
+            for (; i < n; i++)
+            {
+                float ar = aR[i], ai = aI[i], br = bR[i], bi = bI[i];
+                cR[i] = ar * br + ai * bi;
+                cI[i] = ai * br - ar * bi;
+            }
+        }
+        else
+        {
+            for (; i < n; i++)
+            {
+                float ar = aR[i], ai = aI[i], br = bR[i], bi = bI[i];
+                cR[i] = ar * br - ai * bi;
+                cI[i] = ar * bi + ai * br;
+            }
+        }
+    }
+
+    /// <summary>
     /// SIMD complex pointwise multiply for double precision, with optional
     /// conjugate-b ("HRR unbind") flag. Computes per element:
     /// <code>

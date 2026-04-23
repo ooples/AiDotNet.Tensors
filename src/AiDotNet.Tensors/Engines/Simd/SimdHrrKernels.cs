@@ -55,6 +55,34 @@ public static class SimdHrrKernels
     /// <exception cref="ArgumentException">Mismatched span lengths.</exception>
     /// <exception cref="ArgumentOutOfRangeException">An index is outside
     /// <c>[0, input.Length)</c>.</exception>
+    /// <summary>
+    /// Float overload of <see cref="GatherDouble"/>. Index arithmetic is
+    /// type-independent so the scalar loop is as fast as a SIMD gather
+    /// would be on modern hardware (VGATHERDPS latency ≥ scalar on Zen).
+    /// </summary>
+    /// <inheritdoc cref="GatherDouble"/>
+    [MethodImpl(HotInline)]
+    public static void GatherFloat(
+        ReadOnlySpan<float> input,
+        ReadOnlySpan<int> indices,
+        Span<float> output)
+    {
+        int n = indices.Length;
+        if (output.Length != n)
+            throw new ArgumentException(
+                $"Output length ({output.Length}) must equal indices length ({indices.Length}).");
+
+        int inputLen = input.Length;
+        for (int i = 0; i < n; i++)
+        {
+            int idx = indices[i];
+            if ((uint)idx >= (uint)inputLen)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {idx} at position {i} is outside input range [0, {inputLen}).");
+            output[i] = input[idx];
+        }
+    }
+
     [MethodImpl(HotInline)]
     public static void GatherDouble(
         ReadOnlySpan<double> input,
@@ -139,6 +167,51 @@ public static class SimdHrrKernels
     /// <paramref name="seed"/> so the same seed reproduces the same
     /// codebook across runs — critical for HRR experiments' reproducibility.</para>
     /// </summary>
+    /// <summary>
+    /// Float overload of <see cref="UnitPhaseCodebookDouble"/>. Same
+    /// deterministic xorshift64* PRNG; sin/cos use <see cref="MathF"/>
+    /// for the single-precision path.
+    /// </summary>
+    /// <inheritdoc cref="UnitPhaseCodebookDouble"/>
+    public static void UnitPhaseCodebookFloat(
+        Span<float> outR, Span<float> outI,
+        int seed, int V, int D,
+        bool kPsk = false, int k = 0)
+    {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be non-negative.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be non-negative.");
+        long total = (long)V * D;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        int n = (int)total;
+        if (outR.Length != n || outI.Length != n)
+            throw new ArgumentException(
+                $"outR ({outR.Length}) and outI ({outI.Length}) must both have length V*D = {n}.");
+        if (kPsk && k <= 0)
+            throw new ArgumentOutOfRangeException(nameof(k),
+                "k must be positive when kPsk is true.");
+
+        ulong state = unchecked((ulong)seed * 0x9E3779B97F4A7C15UL | 1);
+        const float TwoPi = 2f * MathF.PI;
+        float kPskStep = kPsk ? TwoPi / k : 0f;
+
+        for (int i = 0; i < n; i++)
+        {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            ulong r = state * 0x2545F4914F6CDD1DUL;
+            float u01 = (float)((r >> 11) * (1.0 / (1UL << 53)));
+            float phase = u01 * TwoPi;
+            if (kPsk)
+            {
+                phase = MathF.Floor(phase / kPskStep + 0.5f) * kPskStep;
+            }
+            outR[i] = MathF.Cos(phase);
+            outI[i] = MathF.Sin(phase);
+        }
+    }
+
     public static void UnitPhaseCodebookDouble(
         Span<double> outR, Span<double> outI,
         int seed, int V, int D,
@@ -199,6 +272,89 @@ public static class SimdHrrKernels
     /// handles 4 doubles per lane. Parallelises across V when the total
     /// work exceeds the thread-dispatch threshold.</para>
     /// </summary>
+    /// <summary>
+    /// Float overload of <see cref="PhaseCoherenceDecodeDouble"/>. Uses
+    /// Vector256&lt;float&gt; (8-wide) which roughly doubles throughput
+    /// vs the double path when precision allows.
+    /// </summary>
+    /// <inheritdoc cref="PhaseCoherenceDecodeDouble"/>
+    public static void PhaseCoherenceDecodeFloat(
+        ReadOnlySpan<float> codesR, ReadOnlySpan<float> codesI,
+        ReadOnlySpan<float> queryR, ReadOnlySpan<float> queryI,
+        Span<float> scores,
+        int V, int D)
+    {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V));
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D));
+        long total = (long)V * D;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        int nCodes = (int)total;
+        if (codesR.Length != nCodes || codesI.Length != nCodes)
+            throw new ArgumentException(
+                $"codesR ({codesR.Length}) and codesI ({codesI.Length}) must both have length V*D = {nCodes}.");
+        if (queryR.Length != D || queryI.Length != D)
+            throw new ArgumentException(
+                $"queryR ({queryR.Length}) and queryI ({queryI.Length}) must both have length D = {D}.");
+        if (scores.Length != V)
+            throw new ArgumentException($"scores length ({scores.Length}) must equal V = {V}.");
+
+        for (int v = 0; v < V; v++)
+        {
+            int rowOff = v * D;
+            scores[v] = PhaseCoherenceRowFloat(codesR.Slice(rowOff, D), codesI.Slice(rowOff, D), queryR, queryI);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static float PhaseCoherenceRowFloat(
+        ReadOnlySpan<float> cR, ReadOnlySpan<float> cI,
+        ReadOnlySpan<float> qR, ReadOnlySpan<float> qI)
+    {
+        int n = cR.Length;
+        int i = 0;
+        float acc = 0f;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 8)
+        {
+            var v = Vector256<float>.Zero;
+            int simdLen = n & ~7;
+            if (Fma.IsSupported)
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var crv = SimdKernels.ReadVector256(cR, i);
+                    var civ = SimdKernels.ReadVector256(cI, i);
+                    var qrv = SimdKernels.ReadVector256(qR, i);
+                    var qiv = SimdKernels.ReadVector256(qI, i);
+                    v = Fma.MultiplyAdd(crv, qrv, v);
+                    v = Fma.MultiplyAdd(civ, qiv, v);
+                }
+            }
+            else
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var crv = SimdKernels.ReadVector256(cR, i);
+                    var civ = SimdKernels.ReadVector256(cI, i);
+                    var qrv = SimdKernels.ReadVector256(qR, i);
+                    var qiv = SimdKernels.ReadVector256(qI, i);
+                    v = Avx.Add(v, Avx.Add(Avx.Multiply(crv, qrv), Avx.Multiply(civ, qiv)));
+                }
+            }
+            // Horizontal sum of 8 lanes: reuse SimdKernels.HorizontalSum.
+            acc = SimdKernels.HorizontalSum(v);
+        }
+#endif
+
+        for (; i < n; i++)
+        {
+            acc += cR[i] * qR[i] + cI[i] * qI[i];
+        }
+        return acc;
+    }
+
     public static void PhaseCoherenceDecodeDouble(
         ReadOnlySpan<double> codesR, ReadOnlySpan<double> codesI,
         ReadOnlySpan<double> queryR, ReadOnlySpan<double> queryI,
@@ -348,6 +504,123 @@ public static class SimdHrrKernels
     /// per issue #248 the hand-rolled version accounted for roughly half
     /// of the total cycle-12 wall-clock at D=16384 × 1M pairs.</para>
     /// </summary>
+    /// <summary>
+    /// Float overload of <see cref="HRRBindAccumulateDouble"/>. Same
+    /// kernel structure with Vector256&lt;float&gt; (8-wide).
+    /// </summary>
+    /// <inheritdoc cref="HRRBindAccumulateDouble"/>
+    public static void HRRBindAccumulateFloat(
+        ReadOnlySpan<float> keyCodeR, ReadOnlySpan<float> keyCodeI,
+        ReadOnlySpan<float> valPermCodeR, ReadOnlySpan<float> valPermCodeI,
+        ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
+        Span<float> memoryR, Span<float> memoryI,
+        int D)
+    {
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D));
+        if (memoryR.Length != D || memoryI.Length != D)
+            throw new ArgumentException(
+                $"memoryR ({memoryR.Length}) and memoryI ({memoryI.Length}) must both have length D = {D}.");
+        if (keyCodeR.Length != keyCodeI.Length)
+            throw new ArgumentException("keyCodeR and keyCodeI must have matching length.");
+        if (valPermCodeR.Length != valPermCodeI.Length)
+            throw new ArgumentException("valPermCodeR and valPermCodeI must have matching length.");
+        if (keyIds.Length != valIds.Length)
+            throw new ArgumentException(
+                $"keyIds ({keyIds.Length}) and valIds ({valIds.Length}) must have matching length.");
+        if (keyCodeR.Length % D != 0)
+            throw new ArgumentException(
+                $"keyCode length ({keyCodeR.Length}) must be divisible by D = {D}.");
+        if (valPermCodeR.Length % D != 0)
+            throw new ArgumentException(
+                $"valPermCode length ({valPermCodeR.Length}) must be divisible by D = {D}.");
+
+        int nKeys = keyCodeR.Length / D;
+        int nVals = valPermCodeR.Length / D;
+        int N = keyIds.Length;
+
+        for (int n = 0; n < N; n++)
+        {
+            int kId = keyIds[n];
+            int vId = valIds[n];
+            if ((uint)kId >= (uint)nKeys)
+                throw new ArgumentOutOfRangeException(nameof(keyIds),
+                    $"keyIds[{n}] = {kId} is outside [0, {nKeys}).");
+            if ((uint)vId >= (uint)nVals)
+                throw new ArgumentOutOfRangeException(nameof(valIds),
+                    $"valIds[{n}] = {vId} is outside [0, {nVals}).");
+
+            int kOff = kId * D;
+            int vOff = vId * D;
+
+            AccumulateBindRowFloat(
+                keyCodeR.Slice(kOff, D), keyCodeI.Slice(kOff, D),
+                valPermCodeR.Slice(vOff, D), valPermCodeI.Slice(vOff, D),
+                memoryR, memoryI);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static void AccumulateBindRowFloat(
+        ReadOnlySpan<float> aR, ReadOnlySpan<float> aI,
+        ReadOnlySpan<float> bR, ReadOnlySpan<float> bI,
+        Span<float> memR, Span<float> memI)
+    {
+        int n = aR.Length;
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 8)
+        {
+            int simdLen = n & ~7;
+            if (Fma.IsSupported)
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+                    var mr = SimdKernels.ReadVector256((ReadOnlySpan<float>)memR, i);
+                    var mi = SimdKernels.ReadVector256((ReadOnlySpan<float>)memI, i);
+
+                    mr = Fma.MultiplyAdd(ar, br, mr);
+                    mr = Fma.MultiplyAddNegated(ai, bi, mr);
+                    mi = Fma.MultiplyAdd(ar, bi, mi);
+                    mi = Fma.MultiplyAdd(ai, br, mi);
+
+                    SimdKernels.WriteVector256(memR, i, mr);
+                    SimdKernels.WriteVector256(memI, i, mi);
+                }
+            }
+            else
+            {
+                for (; i < simdLen; i += 8)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+                    var mr = SimdKernels.ReadVector256((ReadOnlySpan<float>)memR, i);
+                    var mi = SimdKernels.ReadVector256((ReadOnlySpan<float>)memI, i);
+
+                    mr = Avx.Add(mr, Avx.Subtract(Avx.Multiply(ar, br), Avx.Multiply(ai, bi)));
+                    mi = Avx.Add(mi, Avx.Add(Avx.Multiply(ar, bi), Avx.Multiply(ai, br)));
+
+                    SimdKernels.WriteVector256(memR, i, mr);
+                    SimdKernels.WriteVector256(memI, i, mi);
+                }
+            }
+        }
+#endif
+
+        for (; i < n; i++)
+        {
+            float ar = aR[i], ai = aI[i], br = bR[i], bi = bI[i];
+            memR[i] += ar * br - ai * bi;
+            memI[i] += ar * bi + ai * br;
+        }
+    }
+
     public static void HRRBindAccumulateDouble(
         ReadOnlySpan<double> keyCodeR, ReadOnlySpan<double> keyCodeI,
         ReadOnlySpan<double> valPermCodeR, ReadOnlySpan<double> valPermCodeI,

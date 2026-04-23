@@ -8463,14 +8463,17 @@ public interface IEngine
     // These five methods replace the hand-rolled stitching of 6+
     // TensorPrimitives calls per HRR bind/unbind that blocked scaling in
     // the HRE research campaign's cycle 12 build. All accept split
-    // Re/Im double spans so the AVX2 + FMA path stays dense (4 lanes ×
-    // 64-bit). No autograd hooks — these are eager kernels; callers
-    // that need a gradient tape must use the Tensor-returning
-    // NativeComplexMultiply family above.
+    // Re/Im spans generic on T; internally the CPU path dispatches to
+    // AVX2+FMA kernels for float and double, falling back to a scalar
+    // numeric-ops loop for other T. GPU backends override with native
+    // kernels where available; unsupported T falls through to CPU.
+    // No autograd hooks — these are eager kernels; callers that need a
+    // gradient tape must use the Tensor-returning NativeComplexMultiply
+    // family above.
 
     /// <summary>
-    /// Pointwise complex multiply on split Re/Im <c>double</c> spans,
-    /// optionally conjugating operand B (HRR unbind form).
+    /// Pointwise complex multiply on split Re/Im spans, optionally
+    /// conjugating operand B (HRR unbind form).
     /// <list type="bullet">
     ///   <item><paramref name="conjugateB"/> = false: <c>c = a · b</c></item>
     ///   <item><paramref name="conjugateB"/> = true:  <c>c = a · conj(b)</c></item>
@@ -8478,32 +8481,39 @@ public interface IEngine
     /// Single SIMD kernel; replaces 6 chained TensorPrimitives calls per
     /// HRR bind / unbind. See issue #248 op 1.
     /// </summary>
-    void NativeComplexPointwiseMultiplyDouble(
-        ReadOnlySpan<double> aRe, ReadOnlySpan<double> aIm,
-        ReadOnlySpan<double> bRe, ReadOnlySpan<double> bIm,
-        Span<double> cRe, Span<double> cIm,
+    /// <typeparam name="T">Element type. float / double have SIMD fast
+    /// paths on AVX2+FMA; other numeric T fall back to the generic
+    /// scalar loop via <c>INumericOperations&lt;T&gt;</c>.</typeparam>
+    void NativeComplexPointwiseMultiply<T>(
+        ReadOnlySpan<T> aRe, ReadOnlySpan<T> aIm,
+        ReadOnlySpan<T> bRe, ReadOnlySpan<T> bIm,
+        Span<T> cRe, Span<T> cIm,
         bool conjugateB = false);
 
     /// <summary>
-    /// Indexed gather on a <c>double</c> span: <c>output[i] = input[indices[i]]</c>.
-    /// Standard permutation-gather primitive for HRR's Plate-style
-    /// non-commutative binding. See issue #248 op 2.
+    /// Indexed gather: <c>output[i] = input[indices[i]]</c>. Standard
+    /// permutation-gather primitive for HRR's Plate-style non-commutative
+    /// binding. See issue #248 op 2.
     /// </summary>
-    void NativeGatherDouble(
-        ReadOnlySpan<double> input,
+    /// <typeparam name="T">Element type; works for any unmanaged T — the
+    /// kernel does index-only addressing, no arithmetic on the data.</typeparam>
+    void NativeGather<T>(
+        ReadOnlySpan<T> input,
         ReadOnlySpan<int> indices,
-        Span<double> output);
+        Span<T> output);
 
     /// <summary>
-    /// Generate a V×D unit-phase complex codebook (<c>double</c>): every
-    /// entry is <c>exp(iθ)</c> for a uniformly random phase, split into
+    /// Generate a V×D unit-phase complex codebook: every entry is
+    /// <c>exp(iθ)</c> for a uniformly random phase, split into
     /// <paramref name="outRe"/> (cos) and <paramref name="outIm"/> (sin)
     /// flattened row-major. Optional K-PSK quantization snaps phases to
     /// multiples of <c>2π/k</c>. Deterministic given <paramref name="seed"/>.
     /// See issue #248 op 3.
     /// </summary>
-    void NativeUnitPhaseCodebookDouble(
-        Span<double> outRe, Span<double> outIm,
+    /// <typeparam name="T">Element type. float / double hit the vectorised
+    /// path; other numeric T go through the generic scalar loop.</typeparam>
+    void NativeUnitPhaseCodebook<T>(
+        Span<T> outRe, Span<T> outIm,
         int seed, int V, int D,
         bool kPsk = false, int k = 0);
 
@@ -8515,10 +8525,10 @@ public interface IEngine
     /// allocation overhead that dominated issue #248's decode path.
     /// See issue #248 op 4.
     /// </summary>
-    void NativeComplexPhaseCoherenceDecodeDouble(
-        ReadOnlySpan<double> codesRe, ReadOnlySpan<double> codesIm,
-        ReadOnlySpan<double> queryRe, ReadOnlySpan<double> queryIm,
-        Span<double> scores,
+    void NativeComplexPhaseCoherenceDecode<T>(
+        ReadOnlySpan<T> codesRe, ReadOnlySpan<T> codesIm,
+        ReadOnlySpan<T> queryRe, ReadOnlySpan<T> queryIm,
+        Span<T> scores,
         int V, int D);
 
     /// <summary>
@@ -8530,11 +8540,11 @@ public interface IEngine
     /// pre-permuted so the gather + permute + multiply + accumulate
     /// collapses into one kernel. See issue #248 op 5.
     /// </summary>
-    void NativeHRRBindAccumulateDouble(
-        ReadOnlySpan<double> keyCodeRe, ReadOnlySpan<double> keyCodeIm,
-        ReadOnlySpan<double> valPermCodeRe, ReadOnlySpan<double> valPermCodeIm,
+    void NativeHRRBindAccumulate<T>(
+        ReadOnlySpan<T> keyCodeRe, ReadOnlySpan<T> keyCodeIm,
+        ReadOnlySpan<T> valPermCodeRe, ReadOnlySpan<T> valPermCodeIm,
         ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
-        Span<double> memoryRe, Span<double> memoryIm,
+        Span<T> memoryRe, Span<T> memoryIm,
         int D);
 
     /// <summary>

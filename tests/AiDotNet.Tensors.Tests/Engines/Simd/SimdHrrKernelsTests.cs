@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Simd;
 using Xunit;
 
@@ -392,5 +393,114 @@ public class SimdHrrKernelsTests
                 keyR, keyI, valR, valI,
                 new[] { 0 }, new[] { 0 },
                 memR, memI, D));
+    }
+
+    // ─── IEngine generic dispatch (CpuEngine, float + double) ─────────
+
+    [Fact]
+    public void CpuEngine_NativeComplexPointwiseMultiply_Double_MatchesDirectKernel()
+    {
+        const int n = 16;
+        var rng = new Random(0xB12);
+        var aR = new double[n]; var aI = new double[n];
+        var bR = new double[n]; var bI = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            aR[i] = rng.NextDouble(); aI[i] = rng.NextDouble();
+            bR[i] = rng.NextDouble(); bI[i] = rng.NextDouble();
+        }
+        var eng = new CpuEngine();
+        var cR = new double[n]; var cI = new double[n];
+        eng.NativeComplexPointwiseMultiply<double>(aR, aI, bR, bI, cR, cI, conjugateB: true);
+
+        var refR = new double[n]; var refI = new double[n];
+        SimdComplexKernels.ComplexMultiplyDouble(aR, aI, bR, bI, refR, refI, conjugateB: true);
+        Assert.Equal(refR, cR);
+        Assert.Equal(refI, cI);
+    }
+
+    [Fact]
+    public void CpuEngine_NativeComplexPointwiseMultiply_Float_MatchesDirectKernel()
+    {
+        const int n = 16;
+        var rng = new Random(0xB34);
+        var aR = new float[n]; var aI = new float[n];
+        var bR = new float[n]; var bI = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            aR[i] = (float)rng.NextDouble(); aI[i] = (float)rng.NextDouble();
+            bR[i] = (float)rng.NextDouble(); bI[i] = (float)rng.NextDouble();
+        }
+        var eng = new CpuEngine();
+        var cR = new float[n]; var cI = new float[n];
+        eng.NativeComplexPointwiseMultiply<float>(aR, aI, bR, bI, cR, cI, conjugateB: false);
+
+        var refR = new float[n]; var refI = new float[n];
+        SimdComplexKernels.ComplexMultiplyFloatConjugatable(aR, aI, bR, bI, refR, refI, conjugateB: false);
+        Assert.Equal(refR, cR);
+        Assert.Equal(refI, cI);
+    }
+
+    [Fact]
+    public void CpuEngine_NativeGather_Double_MatchesKernel()
+    {
+        var input = new double[] { 5, 4, 3, 2, 1 };
+        var indices = new[] { 4, 3, 2, 1, 0 };
+        var output = new double[indices.Length];
+        new CpuEngine().NativeGather<double>(input, indices, output);
+        Assert.Equal(new double[] { 1, 2, 3, 4, 5 }, output);
+    }
+
+    [Fact]
+    public void CpuEngine_NativeUnitPhaseCodebook_Float_IsUnitMagnitude()
+    {
+        const int V = 8, D = 32;
+        var outR = new float[V * D];
+        var outI = new float[V * D];
+        new CpuEngine().NativeUnitPhaseCodebook<float>(outR, outI, seed: 99, V, D);
+        for (int i = 0; i < V * D; i++)
+        {
+            float mag2 = outR[i] * outR[i] + outI[i] * outI[i];
+            Assert.True(Math.Abs(mag2 - 1f) < 1e-5f, $"Entry {i} |z|² = {mag2}");
+        }
+    }
+
+    [Fact]
+    public void CpuEngine_NativePhaseCoherenceDecode_Double_EqualsDirectKernel()
+    {
+        const int V = 4, D = 8;
+        var rng = new Random(0xD33);
+        var codesR = new double[V * D]; var codesI = new double[V * D];
+        var queryR = new double[D]; var queryI = new double[D];
+        for (int i = 0; i < V * D; i++) { codesR[i] = rng.NextDouble(); codesI[i] = rng.NextDouble(); }
+        for (int i = 0; i < D; i++) { queryR[i] = rng.NextDouble(); queryI[i] = rng.NextDouble(); }
+
+        var engScores = new double[V];
+        new CpuEngine().NativeComplexPhaseCoherenceDecode<double>(codesR, codesI, queryR, queryI, engScores, V, D);
+        var refScores = new double[V];
+        SimdHrrKernels.PhaseCoherenceDecodeDouble(codesR, codesI, queryR, queryI, refScores, V, D);
+        Assert.Equal(refScores, engScores);
+    }
+
+    [Fact]
+    public void CpuEngine_NativeHRRBindAccumulate_Float_EqualsDirectKernel()
+    {
+        const int D = 16;
+        const int nKeys = 3, nVals = 3;
+        var rng = new Random(0xE55);
+        var keyR = new float[nKeys * D]; var keyI = new float[nKeys * D];
+        var valR = new float[nVals * D]; var valI = new float[nVals * D];
+        for (int i = 0; i < keyR.Length; i++) { keyR[i] = (float)rng.NextDouble(); keyI[i] = (float)rng.NextDouble(); }
+        for (int i = 0; i < valR.Length; i++) { valR[i] = (float)rng.NextDouble(); valI[i] = (float)rng.NextDouble(); }
+        var keyIds = new[] { 0, 1, 2, 2 };
+        var valIds = new[] { 2, 1, 0, 0 };
+
+        var engMemR = new float[D]; var engMemI = new float[D];
+        new CpuEngine().NativeHRRBindAccumulate<float>(keyR, keyI, valR, valI, keyIds, valIds, engMemR, engMemI, D);
+
+        var refMemR = new float[D]; var refMemI = new float[D];
+        SimdHrrKernels.HRRBindAccumulateFloat(keyR, keyI, valR, valI, keyIds, valIds, refMemR, refMemI, D);
+        Assert.Equal(refMemR, engMemR);
+        Assert.Equal(refMemI, engMemI);
     }
 }

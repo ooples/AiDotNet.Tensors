@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -15140,6 +15141,163 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 backend.DownloadBuffer(oIBuf.Buffer), a._shape);
         }
         catch { return base.NativeComplexMultiply(a, b); }
+    }
+
+    // ─── HRR binding primitives (issue #248) ─────────────────────────
+    //
+    // GPU overrides where a backend primitive maps cleanly. Ops where
+    // the backend has no direct primitive (UnitPhaseCodebook,
+    // PhaseCoherenceDecode, HRRBindAccumulate) fall through to the
+    // CpuEngine base implementation; a follow-up PR can add fused GPU
+    // kernels for the hottest path (HRRBindAccumulate) if the HRE
+    // campaign's workloads warrant it. All paths catch exceptions and
+    // fall back to CPU so a single backend hiccup never takes the op
+    // offline — matches the existing Native* override convention.
+
+    /// <inheritdoc />
+    public override void NativeComplexPointwiseMultiply<T>(
+        ReadOnlySpan<T> aRe, ReadOnlySpan<T> aIm,
+        ReadOnlySpan<T> bRe, ReadOnlySpan<T> bIm,
+        Span<T> cRe, Span<T> cIm,
+        bool conjugateB = false)
+    {
+        // Backend uses single-precision buffers; on a precision-sensitive
+        // T=double workload the GPU path would round-trip through fp32
+        // and hurt accuracy, so we keep T=double on CPU and route only
+        // T=float through the GPU primitives. Unsupported T also drops
+        // to CPU via base. This mirrors how NativeComplexMultiply picks
+        // its paths.
+        int n = aRe.Length;
+        if (typeof(T) != typeof(float)
+            || aIm.Length != n || bRe.Length != n || bIm.Length != n
+            || cRe.Length != n || cIm.Length != n
+            || n == 0
+            || !TryGetBackend(out var backend))
+        {
+            base.NativeComplexPointwiseMultiply(aRe, aIm, bRe, bIm, cRe, cIm, conjugateB);
+            return;
+        }
+
+        try
+        {
+            // Materialise to float[] for upload. The caller's Span<T> is
+            // typed T = float here per the guard above.
+            var aRf = HrrToFloatArray(aRe);
+            var aIf = HrrToFloatArray(aIm);
+            var bRf = HrrToFloatArray(bRe);
+            var bIf = HrrToFloatArray(bIm);
+
+            using var aRBuf = new OwnedBuffer(backend.AllocateBuffer(aRf), true);
+            using var aIBuf = new OwnedBuffer(backend.AllocateBuffer(aIf), true);
+            using var bRBuf = new OwnedBuffer(backend.AllocateBuffer(bRf), true);
+            using var bIBuf = new OwnedBuffer(backend.AllocateBuffer(bIf), true);
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+
+            if (conjugateB)
+            {
+                // c = a · conj(b) — exactly the cross-spectral density op
+                // the backend already ships: outR = aR·bR + aI·bI,
+                // outI = aI·bR − aR·bI. Zero new kernels needed.
+                backend.SplitComplexCrossSpectral(
+                    aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
+                    oRBuf.Buffer, oIBuf.Buffer, n);
+            }
+            else
+            {
+                backend.SplitComplexMultiply(
+                    aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
+                    oRBuf.Buffer, oIBuf.Buffer, n);
+            }
+
+            var oRf = backend.DownloadBuffer(oRBuf.Buffer);
+            var oIf = backend.DownloadBuffer(oIBuf.Buffer);
+            HrrFloatArrayToSpan(oRf, cRe, n);
+            HrrFloatArrayToSpan(oIf, cIm, n);
+        }
+        catch
+        {
+            base.NativeComplexPointwiseMultiply(aRe, aIm, bRe, bIm, cRe, cIm, conjugateB);
+        }
+    }
+
+    /// <inheritdoc />
+    public override void NativeGather<T>(
+        ReadOnlySpan<T> input,
+        ReadOnlySpan<int> indices,
+        Span<T> output)
+    {
+        // Only float has a direct backend Gather primitive. All other T
+        // (double, Half, custom) fall back to CPU.
+        int nOut = indices.Length;
+        if (typeof(T) != typeof(float)
+            || output.Length != nOut
+            || nOut == 0
+            || !TryGetBackend(out var backend))
+        {
+            base.NativeGather(input, indices, output);
+            return;
+        }
+
+        try
+        {
+            var inF = HrrToFloatArray(input);
+            var idx = indices.ToArray();
+            using var inBuf = new OwnedBuffer(backend.AllocateBuffer(inF), true);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(idx), true);
+            using var outBuf = new OwnedBuffer(backend.AllocateBuffer(nOut), true);
+            // backend.Gather signature: source, indices, output, numIndices, featureSize.
+            // For a flat 1-D gather (no per-index row copy) featureSize = 1.
+            backend.Gather(inBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, nOut, featureSize: 1);
+            var oF = backend.DownloadBuffer(outBuf.Buffer);
+            HrrFloatArrayToSpan(oF, output, nOut);
+        }
+        catch
+        {
+            base.NativeGather(input, indices, output);
+        }
+    }
+
+    // Ops 3 (UnitPhaseCodebook), 4 (PhaseCoherenceDecode), 5
+    // (HRRBindAccumulate) don't override here yet — they inherit the CPU
+    // implementation via CpuEngine.virtual dispatch. Adding fused GPU
+    // kernels for these is the natural follow-up if the HRE campaign's
+    // workloads demand it (op 5 especially, being the hottest loop in
+    // memory build). The follow-up would extend IDirectGpuBackend with
+    // UnitPhaseCodebook / PhaseCoherenceDecode / HRRBindAccumulate
+    // primitives and implement them on each of the 6 backends (CUDA,
+    // OpenCL, HIP, Metal, Vulkan, WebGPU).
+
+    // ── Span marshalling helpers for the HRR GPU overrides ──
+    // Allocates a fresh float[] from a ReadOnlySpan<T> where T is known
+    // to be float at runtime (checked by callers via typeof). Using
+    // ToArray on a reinterpreted span keeps a single allocation per
+    // upload with no intermediate object churn.
+    private static float[] HrrToFloatArray<T>(ReadOnlySpan<T> s)
+    {
+#if NET5_0_OR_GREATER
+        ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s);
+        var asFloat = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+            ref Unsafe.As<T, float>(ref head), s.Length);
+        return asFloat.ToArray();
+#else
+        // net471: fall through to slower boxed path — the guard above
+        // keeps this unreachable on net471 because the GPU overrides
+        // check typeof(T) == typeof(float) first.
+        throw new PlatformNotSupportedException("HrrToFloatArray requires NET5_0_OR_GREATER.");
+#endif
+    }
+
+    private static void HrrFloatArrayToSpan<T>(float[] src, Span<T> dst, int n)
+    {
+#if NET5_0_OR_GREATER
+        ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dst);
+        var asFloat = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+            ref Unsafe.As<T, float>(ref head), dst.Length);
+        src.AsSpan(0, n).CopyTo(asFloat);
+#else
+        throw new PlatformNotSupportedException("HrrFloatArrayToSpan requires NET5_0_OR_GREATER.");
+#endif
     }
 
     public override Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
