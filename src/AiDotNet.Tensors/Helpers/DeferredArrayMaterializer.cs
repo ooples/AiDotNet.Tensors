@@ -31,10 +31,23 @@ internal static class DeferredArrayMaterializer
     /// Registers a deferred materialization callback for the given array.
     /// When TryMaterialize is called with this array, the callback runs to populate it.
     /// </summary>
+    /// <remarks>
+    /// Ordering: <see cref="Interlocked.Increment(ref int)"/> BEFORE
+    /// <c>TryAdd</c>. If the increment happened after a successful TryAdd,
+    /// there would be a window where a concurrent <see cref="TryMaterialize"/>
+    /// reads <c>_pendingCount == 0</c> and skips the dictionary check even
+    /// though the entry is now registered — causing the callback to be
+    /// silently missed. Incrementing first makes the counter a conservative
+    /// over-estimate during the window: readers see ""might be pending"",
+    /// do a harmless dictionary lookup, and find nothing, returning the
+    /// correct ""not pending"" result. Rolled back with
+    /// <see cref="Interlocked.Decrement"/> if TryAdd fails (duplicate key).
+    /// </remarks>
     internal static void Register(object array, Action<object> materializeCallback)
     {
-        if (_pendingMaterializations.TryAdd(array, materializeCallback))
-            Interlocked.Increment(ref _pendingCount);
+        Interlocked.Increment(ref _pendingCount);
+        if (!_pendingMaterializations.TryAdd(array, materializeCallback))
+            Interlocked.Decrement(ref _pendingCount);
     }
 
     /// <summary>
