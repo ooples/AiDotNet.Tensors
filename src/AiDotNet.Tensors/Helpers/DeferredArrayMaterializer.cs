@@ -2,7 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Linq;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -18,12 +18,36 @@ internal static class DeferredArrayMaterializer
     private static readonly ConcurrentDictionary<object, Action<object>> _pendingMaterializations = new();
 
     /// <summary>
+    /// Lock-free fast-path indicator. Incremented by <see cref="Register"/>, decremented
+    /// by <see cref="TryMaterialize"/> and <see cref="Remove"/>. When this is 0,
+    /// the CPU-only fast path in <see cref="TryMaterialize"/> returns immediately
+    /// with a single volatile-int read, avoiding ConcurrentDictionary bucket-lock
+    /// contention that was observed (2026-04-22) to serialize parallel tensor
+    /// workloads via <c>ConcurrentDictionary&lt;T,U&gt;.IsEmpty</c>.
+    /// </summary>
+    private static int _pendingCount;
+
+    /// <summary>
     /// Registers a deferred materialization callback for the given array.
     /// When TryMaterialize is called with this array, the callback runs to populate it.
     /// </summary>
+    /// <remarks>
+    /// Ordering: <see cref="Interlocked.Increment(ref int)"/> BEFORE
+    /// <c>TryAdd</c>. If the increment happened after a successful TryAdd,
+    /// there would be a window where a concurrent <see cref="TryMaterialize"/>
+    /// reads <c>_pendingCount == 0</c> and skips the dictionary check even
+    /// though the entry is now registered — causing the callback to be
+    /// silently missed. Incrementing first makes the counter a conservative
+    /// over-estimate during the window: readers see ""might be pending"",
+    /// do a harmless dictionary lookup, and find nothing, returning the
+    /// correct ""not pending"" result. Rolled back with
+    /// <see cref="Interlocked.Decrement"/> if TryAdd fails (duplicate key).
+    /// </remarks>
     internal static void Register(object array, Action<object> materializeCallback)
     {
-        _pendingMaterializations.TryAdd(array, materializeCallback);
+        Interlocked.Increment(ref _pendingCount);
+        if (!_pendingMaterializations.TryAdd(array, materializeCallback))
+            Interlocked.Decrement(ref _pendingCount);
     }
 
     /// <summary>
@@ -32,13 +56,19 @@ internal static class DeferredArrayMaterializer
     /// </summary>
     internal static bool TryMaterialize(object array)
     {
-        // Fast path: if nothing is pending (common case for CPU-only code), skip the dictionary lookup entirely.
-        // IsEmpty checks Count == 0 with minimal overhead — avoids full TryRemove lookup.
-        if (_pendingMaterializations.IsEmpty)
+        // Fast path for CPU-only workloads: a single volatile-int read with no
+        // ConcurrentDictionary access at all. Observed 2026-04-22 that using
+        // `_pendingMaterializations.IsEmpty` here caused Monitor.Enter_Slowpath
+        // contention inside the ConcurrentDictionary under high-fanout parallel
+        // tensor forward passes (44s of unmanaged wait time per 30s of parallel
+        // work across 4 workers — one of the root causes of the HRE report-card
+        // hang).
+        if (Volatile.Read(ref _pendingCount) == 0)
             return false;
 
         if (_pendingMaterializations.TryRemove(array, out var callback))
         {
+            Interlocked.Decrement(ref _pendingCount);
             callback(array);
             return true;
         }
@@ -48,12 +78,20 @@ internal static class DeferredArrayMaterializer
     /// <summary>
     /// Checks if the given array has a pending deferred download.
     /// </summary>
-    internal static bool IsPending(object array) => _pendingMaterializations.ContainsKey(array);
+    internal static bool IsPending(object array)
+    {
+        if (Volatile.Read(ref _pendingCount) == 0) return false;
+        return _pendingMaterializations.ContainsKey(array);
+    }
 
     /// <summary>
     /// Removes a pending materialization without executing it (e.g., when the GPU buffer is reused).
     /// </summary>
-    internal static void Remove(object array) => _pendingMaterializations.TryRemove(array, out _);
+    internal static void Remove(object array)
+    {
+        if (_pendingMaterializations.TryRemove(array, out _))
+            Interlocked.Decrement(ref _pendingCount);
+    }
 
     /// <summary>
     /// Drains all pending materializers by invoking each registered callback.
@@ -88,6 +126,7 @@ internal static class DeferredArrayMaterializer
         {
             if (!_pendingMaterializations.TryRemove(key, out var callback))
                 continue;
+            Interlocked.Decrement(ref _pendingCount);
 
             try { callback(key); }
             catch (InvalidOperationException) when (swallowErrors)
