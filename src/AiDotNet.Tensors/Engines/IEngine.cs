@@ -8458,6 +8458,85 @@ public interface IEngine
     /// <exception cref="ArgumentException">Thrown if tensor lengths don't match.</exception>
     Tensor<Complex<T>> NativeComplexMultiply<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b);
 
+    // ─── HRR binding primitives (issue #248) ─────────────────────────
+    //
+    // These five methods replace the hand-rolled stitching of 6+
+    // TensorPrimitives calls per HRR bind/unbind that blocked scaling in
+    // the HRE research campaign's cycle 12 build. All accept split
+    // Re/Im double spans so the AVX2 + FMA path stays dense (4 lanes ×
+    // 64-bit). No autograd hooks — these are eager kernels; callers
+    // that need a gradient tape must use the Tensor-returning
+    // NativeComplexMultiply family above.
+
+    /// <summary>
+    /// Pointwise complex multiply on split Re/Im <c>double</c> spans,
+    /// optionally conjugating operand B (HRR unbind form).
+    /// <list type="bullet">
+    ///   <item><paramref name="conjugateB"/> = false: <c>c = a · b</c></item>
+    ///   <item><paramref name="conjugateB"/> = true:  <c>c = a · conj(b)</c></item>
+    /// </list>
+    /// Single SIMD kernel; replaces 6 chained TensorPrimitives calls per
+    /// HRR bind / unbind. See issue #248 op 1.
+    /// </summary>
+    void NativeComplexPointwiseMultiplyDouble(
+        ReadOnlySpan<double> aRe, ReadOnlySpan<double> aIm,
+        ReadOnlySpan<double> bRe, ReadOnlySpan<double> bIm,
+        Span<double> cRe, Span<double> cIm,
+        bool conjugateB = false);
+
+    /// <summary>
+    /// Indexed gather on a <c>double</c> span: <c>output[i] = input[indices[i]]</c>.
+    /// Standard permutation-gather primitive for HRR's Plate-style
+    /// non-commutative binding. See issue #248 op 2.
+    /// </summary>
+    void NativeGatherDouble(
+        ReadOnlySpan<double> input,
+        ReadOnlySpan<int> indices,
+        Span<double> output);
+
+    /// <summary>
+    /// Generate a V×D unit-phase complex codebook (<c>double</c>): every
+    /// entry is <c>exp(iθ)</c> for a uniformly random phase, split into
+    /// <paramref name="outRe"/> (cos) and <paramref name="outIm"/> (sin)
+    /// flattened row-major. Optional K-PSK quantization snaps phases to
+    /// multiples of <c>2π/k</c>. Deterministic given <paramref name="seed"/>.
+    /// See issue #248 op 3.
+    /// </summary>
+    void NativeUnitPhaseCodebookDouble(
+        Span<double> outRe, Span<double> outIm,
+        int seed, int V, int D,
+        bool kPsk = false, int k = 0);
+
+    /// <summary>
+    /// Full-vocabulary phase-coherence decode: for each candidate
+    /// v ∈ [0, V), compute
+    /// <c>scores[v] = Re(Σ_d query[d] · conj(code[v][d]))</c>.
+    /// One kernel without per-query Tensor wrapping — avoids the
+    /// allocation overhead that dominated issue #248's decode path.
+    /// See issue #248 op 4.
+    /// </summary>
+    void NativeComplexPhaseCoherenceDecodeDouble(
+        ReadOnlySpan<double> codesRe, ReadOnlySpan<double> codesIm,
+        ReadOnlySpan<double> queryRe, ReadOnlySpan<double> queryIm,
+        Span<double> scores,
+        int V, int D);
+
+    /// <summary>
+    /// Fused HRR bind + accumulate across N training pairs:
+    /// <c>memory += keyCode[keyIds[n]] · valPermCode[valIds[n]]</c> for
+    /// each n. Replaces N × 6 TensorPrimitives calls; the single hottest
+    /// loop in HRE's memory-build phase. The caller passes
+    /// <paramref name="valPermCodeRe"/> / <paramref name="valPermCodeIm"/>
+    /// pre-permuted so the gather + permute + multiply + accumulate
+    /// collapses into one kernel. See issue #248 op 5.
+    /// </summary>
+    void NativeHRRBindAccumulateDouble(
+        ReadOnlySpan<double> keyCodeRe, ReadOnlySpan<double> keyCodeIm,
+        ReadOnlySpan<double> valPermCodeRe, ReadOnlySpan<double> valPermCodeIm,
+        ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
+        Span<double> memoryRe, Span<double> memoryIm,
+        int D);
+
     /// <summary>
     /// Element-wise conjugate of a Complex&lt;T&gt; tensor: (re, -im) per element.
     /// </summary>

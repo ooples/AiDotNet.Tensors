@@ -55,6 +55,109 @@ public static class SimdComplexKernels
     }
 
     /// <summary>
+    /// SIMD complex pointwise multiply for double precision, with optional
+    /// conjugate-b ("HRR unbind") flag. Computes per element:
+    /// <code>
+    ///     conjugateB = false:  c = a · b                → cR = aR·bR − aI·bI,  cI = aR·bI + aI·bR
+    ///     conjugateB = true:   c = a · conj(b)          → cR = aR·bR + aI·bI,  cI = aI·bR − aR·bI
+    /// </code>
+    ///
+    /// <para>Single kernel that replaces the 6 chained <c>TensorPrimitives</c>
+    /// elementwise calls (Multiply × 4, Subtract, Add) previously required
+    /// for HRR bind / unbind (issue #248). AVX2 + FMA Vector256&lt;double&gt;
+    /// path on NET5+; scalar fallback otherwise. The <paramref name="conjugateB"/>
+    /// branch is constant-folded by the JIT so the SIMD loop has no inner
+    /// conditional — the two variants become two specialized copies of the
+    /// same FMA sequence differing only in add/sub signs.</para>
+    /// </summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexMultiplyDouble(
+        ReadOnlySpan<double> aR, ReadOnlySpan<double> aI,
+        ReadOnlySpan<double> bR, ReadOnlySpan<double> bI,
+        Span<double> cR, Span<double> cI,
+        bool conjugateB = false)
+    {
+        int n = aR.Length;
+        if (aI.Length != n || bR.Length != n || bI.Length != n || cR.Length != n || cI.Length != n)
+            throw new ArgumentException(
+                "All six spans must have identical length for ComplexMultiplyDouble.");
+
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            int simdLen = n & ~3;
+            if (conjugateB)
+            {
+                for (; i < simdLen; i += 4)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+
+                    // c = a · conj(b): cR = aR·bR + aI·bI,  cI = aI·bR − aR·bI
+                    if (Fma.IsSupported)
+                    {
+                        // cR = aR·bR + aI·bI  →  fma(aI, bI, aR*bR)
+                        SimdKernels.WriteVector256(cR, i, Fma.MultiplyAdd(ai, bi, Avx.Multiply(ar, br)));
+                        // cI = aI·bR − aR·bI  →  fma(-aR, bI, aI*bR) = aI*bR - aR*bI
+                        SimdKernels.WriteVector256(cI, i, Fma.MultiplyAddNegated(ar, bi, Avx.Multiply(ai, br)));
+                    }
+                    else
+                    {
+                        SimdKernels.WriteVector256(cR, i, Avx.Add(Avx.Multiply(ar, br), Avx.Multiply(ai, bi)));
+                        SimdKernels.WriteVector256(cI, i, Avx.Subtract(Avx.Multiply(ai, br), Avx.Multiply(ar, bi)));
+                    }
+                }
+            }
+            else
+            {
+                for (; i < simdLen; i += 4)
+                {
+                    var ar = SimdKernels.ReadVector256(aR, i);
+                    var ai = SimdKernels.ReadVector256(aI, i);
+                    var br = SimdKernels.ReadVector256(bR, i);
+                    var bi = SimdKernels.ReadVector256(bI, i);
+
+                    // c = a · b: cR = aR·bR − aI·bI,  cI = aR·bI + aI·bR
+                    if (Fma.IsSupported)
+                    {
+                        SimdKernels.WriteVector256(cR, i, Fma.MultiplyAddNegated(ai, bi, Avx.Multiply(ar, br)));
+                        SimdKernels.WriteVector256(cI, i, Fma.MultiplyAdd(ai, br, Avx.Multiply(ar, bi)));
+                    }
+                    else
+                    {
+                        SimdKernels.WriteVector256(cR, i, Avx.Subtract(Avx.Multiply(ar, br), Avx.Multiply(ai, bi)));
+                        SimdKernels.WriteVector256(cI, i, Avx.Add(Avx.Multiply(ar, bi), Avx.Multiply(ai, br)));
+                    }
+                }
+            }
+        }
+#endif
+
+        if (conjugateB)
+        {
+            for (; i < n; i++)
+            {
+                double ar = aR[i], ai = aI[i], br = bR[i], bi = bI[i];
+                cR[i] = ar * br + ai * bi;
+                cI[i] = ai * br - ar * bi;
+            }
+        }
+        else
+        {
+            for (; i < n; i++)
+            {
+                double ar = aR[i], ai = aI[i], br = bR[i], bi = bI[i];
+                cR[i] = ar * br - ai * bi;
+                cI[i] = ar * bi + ai * br;
+            }
+        }
+    }
+
+    /// <summary>
     /// SIMD complex conjugate: outR = inR, outI = -inI
     /// </summary>
     [MethodImpl(HotInline)]

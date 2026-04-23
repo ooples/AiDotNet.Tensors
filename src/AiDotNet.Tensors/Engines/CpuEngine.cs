@@ -33829,6 +33829,65 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // ─── HRR binding primitives (issue #248) ─────────────────────────
+    // See Simd/SimdHrrKernels.cs for the kernel implementations. The
+    // CpuEngine overrides are thin wrappers — they just forward to the
+    // kernel. No GraphMode recording, no autograd hooks: these are the
+    // eager split-Re/Im path used by the HRE research campaign to avoid
+    // the per-call allocation churn that blocked cycle 12 at scale.
+
+    /// <inheritdoc />
+    public virtual void NativeComplexPointwiseMultiplyDouble(
+        ReadOnlySpan<double> aRe, ReadOnlySpan<double> aIm,
+        ReadOnlySpan<double> bRe, ReadOnlySpan<double> bIm,
+        Span<double> cRe, Span<double> cIm,
+        bool conjugateB = false)
+    {
+        Simd.SimdComplexKernels.ComplexMultiplyDouble(aRe, aIm, bRe, bIm, cRe, cIm, conjugateB);
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeGatherDouble(
+        ReadOnlySpan<double> input,
+        ReadOnlySpan<int> indices,
+        Span<double> output)
+    {
+        Simd.SimdHrrKernels.GatherDouble(input, indices, output);
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeUnitPhaseCodebookDouble(
+        Span<double> outRe, Span<double> outIm,
+        int seed, int V, int D,
+        bool kPsk = false, int k = 0)
+    {
+        Simd.SimdHrrKernels.UnitPhaseCodebookDouble(outRe, outIm, seed, V, D, kPsk, k);
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexPhaseCoherenceDecodeDouble(
+        ReadOnlySpan<double> codesRe, ReadOnlySpan<double> codesIm,
+        ReadOnlySpan<double> queryRe, ReadOnlySpan<double> queryIm,
+        Span<double> scores,
+        int V, int D)
+    {
+        Simd.SimdHrrKernels.PhaseCoherenceDecodeDouble(
+            codesRe, codesIm, queryRe, queryIm, scores, V, D);
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeHRRBindAccumulateDouble(
+        ReadOnlySpan<double> keyCodeRe, ReadOnlySpan<double> keyCodeIm,
+        ReadOnlySpan<double> valPermCodeRe, ReadOnlySpan<double> valPermCodeIm,
+        ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
+        Span<double> memoryRe, Span<double> memoryIm,
+        int D)
+    {
+        Simd.SimdHrrKernels.HRRBindAccumulateDouble(
+            keyCodeRe, keyCodeIm, valPermCodeRe, valPermCodeIm,
+            keyIds, valIds, memoryRe, memoryIm, D);
+    }
+
     /// <inheritdoc />
     public virtual Tensor<Complex<T>> NativeComplexConjugate<T>(Tensor<Complex<T>> a)
     {
