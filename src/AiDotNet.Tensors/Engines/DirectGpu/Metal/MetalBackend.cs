@@ -1784,13 +1784,21 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         int n = (int)total;
+        if (outReal is null || outImag is null)
+            throw new ArgumentNullException(nameof(outReal), "Output buffers must be non-null.");
+        var outR = AsMetal(outReal);
+        var outI = AsMetal(outImag);
+        if (outR.Size < n || outI.Size < n)
+            throw new ArgumentException(
+                $"Output buffers must each hold at least V*D = {n} elements " +
+                $"(got outReal={outR.Size}, outImag={outI.Size}).");
         EnsureComplexLibrary();
         var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_unit_phase_codebook");
         var (tg, tpg) = pipeline.Calculate1DDispatch(n);
         using var enc = _commandQueue.CreateScopedComputeEncoder();
         enc.SetPipelineState(pipeline.Handle);
-        enc.SetBuffer(AsMetal(outReal), 0);
-        enc.SetBuffer(AsMetal(outImag), 1);
+        enc.SetBuffer(outR, 0);
+        enc.SetBuffer(outI, 1);
         enc.SetBytes(seed, 2);
         enc.SetBytes(V, 3);
         enc.SetBytes(D, 4);
@@ -1805,17 +1813,40 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         IGpuBuffer outScores, int V, int D)
     {
         ThrowIfDisposed();
-        if (V <= 0 || D <= 0) return;
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
+        if (codesReal is null || codesImag is null || queryReal is null || queryImag is null || outScores is null)
+            throw new ArgumentNullException(nameof(codesReal),
+                "All five GPU buffers must be non-null for SplitComplexPhaseCoherenceDecode.");
+        long codeCount = (long)V * D;
+        if (codeCount > int.MaxValue) throw new ArgumentException($"V*D = {codeCount} exceeds int.MaxValue.");
+        var cR = AsMetal(codesReal);
+        var cI = AsMetal(codesImag);
+        var qR = AsMetal(queryReal);
+        var qI = AsMetal(queryImag);
+        var os = AsMetal(outScores);
+        if (cR.Size < codeCount || cI.Size < codeCount)
+            throw new ArgumentException(
+                $"codes buffers must each hold at least V*D = {codeCount} elements " +
+                $"(got {cR.Size}, {cI.Size}).");
+        if (qR.Size < D || qI.Size < D)
+            throw new ArgumentException(
+                $"query buffers must each hold at least D = {D} elements " +
+                $"(got {qR.Size}, {qI.Size}).");
+        if (os.Size < V)
+            throw new ArgumentException(
+                $"outScores must hold at least V = {V} elements (got {os.Size}).");
         EnsureComplexLibrary();
         var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_phase_coherence_decode");
         var (tg, tpg) = pipeline.Calculate1DDispatch(V);
         using var enc = _commandQueue.CreateScopedComputeEncoder();
         enc.SetPipelineState(pipeline.Handle);
-        enc.SetBuffer(AsMetal(codesReal), 0);
-        enc.SetBuffer(AsMetal(codesImag), 1);
-        enc.SetBuffer(AsMetal(queryReal), 2);
-        enc.SetBuffer(AsMetal(queryImag), 3);
-        enc.SetBuffer(AsMetal(outScores), 4);
+        enc.SetBuffer(cR, 0);
+        enc.SetBuffer(cI, 1);
+        enc.SetBuffer(qR, 2);
+        enc.SetBuffer(qI, 3);
+        enc.SetBuffer(os, 4);
         enc.SetBytes(V, 5);
         enc.SetBytes(D, 6);
         enc.DispatchThreadgroups(tg, tpg);
@@ -1829,22 +1860,56 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         int N, int D)
     {
         ThrowIfDisposed();
-        if (N <= 0 || D <= 0) return;
+        if (N < 0) throw new ArgumentOutOfRangeException(nameof(N), "N must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (N == 0 || D == 0) return;
+        if (keyCodeReal is null || keyCodeImag is null || valPermCodeReal is null || valPermCodeImag is null
+            || keyIds is null || valIds is null || memoryReal is null || memoryImag is null)
+            throw new ArgumentNullException(nameof(keyCodeReal),
+                "All eight GPU buffers must be non-null for SplitComplexHrrBindAccumulate.");
+        var kR = AsMetal(keyCodeReal);
+        var kI = AsMetal(keyCodeImag);
+        var vR = AsMetal(valPermCodeReal);
+        var vI = AsMetal(valPermCodeImag);
+        var kIds = AsMetal(keyIds);
+        var vIds = AsMetal(valIds);
+        var mR = AsMetal(memoryReal);
+        var mI = AsMetal(memoryImag);
+        if (kIds.Size < N || vIds.Size < N)
+            throw new ArgumentException(
+                $"ID buffers must each hold at least N = {N} elements " +
+                $"(got keyIds={kIds.Size}, valIds={vIds.Size}).");
+        if (mR.Size < D || mI.Size < D)
+            throw new ArgumentException(
+                $"Memory buffers must each hold at least D = {D} elements " +
+                $"(got memoryReal={mR.Size}, memoryImag={mI.Size}).");
+        if (kR.Size < D || kI.Size < D || vR.Size < D || vI.Size < D)
+            throw new ArgumentException(
+                $"Each codebook buffer must hold at least one full row of D = {D} elements.");
+        // Derive vocabulary sizes for in-shader id-bounds checks.
+        long nKeysL = kR.Size / D;
+        long nValsL = vR.Size / D;
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        int nKeys = (int)nKeysL;
+        int nVals = (int)nValsL;
         EnsureComplexLibrary();
         var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_bind_accumulate");
         var (tg, tpg) = pipeline.Calculate1DDispatch(D);
         using var enc = _commandQueue.CreateScopedComputeEncoder();
         enc.SetPipelineState(pipeline.Handle);
-        enc.SetBuffer(AsMetal(keyCodeReal), 0);
-        enc.SetBuffer(AsMetal(keyCodeImag), 1);
-        enc.SetBuffer(AsMetal(valPermCodeReal), 2);
-        enc.SetBuffer(AsMetal(valPermCodeImag), 3);
-        enc.SetBuffer(AsMetal(keyIds), 4);
-        enc.SetBuffer(AsMetal(valIds), 5);
-        enc.SetBuffer(AsMetal(memoryReal), 6);
-        enc.SetBuffer(AsMetal(memoryImag), 7);
+        enc.SetBuffer(kR, 0);
+        enc.SetBuffer(kI, 1);
+        enc.SetBuffer(vR, 2);
+        enc.SetBuffer(vI, 3);
+        enc.SetBuffer(kIds, 4);
+        enc.SetBuffer(vIds, 5);
+        enc.SetBuffer(mR, 6);
+        enc.SetBuffer(mI, 7);
         enc.SetBytes(N, 8);
         enc.SetBytes(D, 9);
+        enc.SetBytes(nKeys, 10);
+        enc.SetBytes(nVals, 11);
         enc.DispatchThreadgroups(tg, tpg);
     }
 }

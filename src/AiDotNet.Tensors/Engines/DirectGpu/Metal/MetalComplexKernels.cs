@@ -228,6 +228,10 @@ kernel void hrr_phase_coherence_decode(
     outScores[v] = acc;
 }
 
+// nKeys / nVals match the CUDA/HIP kernels: codebook row counts
+// passed by the host so out-of-range ids are rejected without OOB
+// reads. See CudaComplexKernels.hrr_bind_accumulate for the full
+// rationale.
 kernel void hrr_bind_accumulate(
     device const float* keyCodeReal [[buffer(0)]],
     device const float* keyCodeImag [[buffer(1)]],
@@ -239,14 +243,21 @@ kernel void hrr_bind_accumulate(
     device float* memoryImag [[buffer(7)]],
     constant int& N [[buffer(8)]],
     constant int& D [[buffer(9)]],
+    constant int& nKeys [[buffer(10)]],
+    constant int& nVals [[buffer(11)]],
     uint d [[thread_position_in_grid]])
 {
     if ((int)d >= D) return;
     float accR = memoryReal[d];
     float accI = memoryImag[d];
     for (int n = 0; n < N; n++) {
-        long kOff = (long)keyIds[n] * D;
-        long vOff = (long)valIds[n] * D;
+        int kId = keyIds[n];
+        int vId = valIds[n];
+        // Unsigned-comparison trick rejects both negative and
+        // too-large indices in one branch.
+        if ((uint)kId >= (uint)nKeys || (uint)vId >= (uint)nVals) continue;
+        long kOff = (long)kId * D;
+        long vOff = (long)vId * D;
         float ar = keyCodeReal[kOff + d];
         float ai = keyCodeImag[kOff + d];
         float br = valPermCodeReal[vOff + d];

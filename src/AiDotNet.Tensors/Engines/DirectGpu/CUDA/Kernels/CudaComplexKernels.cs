@@ -276,12 +276,18 @@ extern ""C"" __global__ void hrr_phase_coherence_decode(
 // own d so no atomics are needed. Coalesced reads within a warp
 // because d varies consecutively and key/val offsets are broadcast
 // (same kId for all threads in a warp at a given n iteration).
+// nKeys / nVals are the vocabulary sizes (codebook row counts); the
+// host passes keyCodeReal.Size / D and valPermCodeReal.Size / D so
+// the kernel can reject out-of-range ids without reading past the
+// codebook. Mirrors the (uint)kId >= (uint)nKeys check in the CPU
+// SIMD implementation and the equivalent guard in the Vulkan/WebGPU
+// shaders.
 extern ""C"" __global__ __launch_bounds__(256) void hrr_bind_accumulate(
     const float* keyCodeReal, const float* keyCodeImag,
     const float* valPermCodeReal, const float* valPermCodeImag,
     const int* keyIds, const int* valIds,
     float* memoryReal, float* memoryImag,
-    int N, int D)
+    int N, int D, int nKeys, int nVals)
 {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -289,8 +295,15 @@ extern ""C"" __global__ __launch_bounds__(256) void hrr_bind_accumulate(
     float accR = memoryReal[d];
     float accI = memoryImag[d];
     for (int n = 0; n < N; n++) {
-        long long kOff = (long long)keyIds[n] * D;
-        long long vOff = (long long)valIds[n] * D;
+        int kId = keyIds[n];
+        int vId = valIds[n];
+        // Unsigned-comparison trick rejects both negative and
+        // too-large indices in one branch; out-of-range pairs
+        // contribute zero (match the CPU path's exception, but
+        // silently — the kernel can't throw).
+        if ((unsigned)kId >= (unsigned)nKeys || (unsigned)vId >= (unsigned)nVals) continue;
+        long long kOff = (long long)kId * D;
+        long long vOff = (long long)vId * D;
         float ar = keyCodeReal[kOff + d];
         float ai = keyCodeImag[kOff + d];
         float br = valPermCodeReal[vOff + d];

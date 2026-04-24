@@ -10347,6 +10347,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
             throw new ArgumentException(
                 $"Each codebook buffer must hold at least one full row of D = {D} elements.");
+        // Derive vocabulary sizes from codebook capacities so the
+        // kernel can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's range check in
+        // NativeHRRBindAccumulate and the guards in Vulkan/WebGPU.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        int nKeys = (int)nKeysL;
+        int nVals = (int)nValsL;
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: hrr_bind_accumulate. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -10355,12 +10368,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         IntPtr pVR = valPermCodeReal.Handle, pVI = valPermCodeImag.Handle;
         IntPtr pKId = keyIds.Handle, pVId = valIds.Handle;
         IntPtr pMR = memoryReal.Handle, pMI = memoryImag.Handle;
-        void** args = stackalloc void*[10];
+        void** args = stackalloc void*[12];
         args[0] = &pKR; args[1] = &pKI;
         args[2] = &pVR; args[3] = &pVI;
         args[4] = &pKId; args[5] = &pVId;
         args[6] = &pMR; args[7] = &pMI;
         args[8] = &N; args[9] = &D;
+        args[10] = &nKeys; args[11] = &nVals;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

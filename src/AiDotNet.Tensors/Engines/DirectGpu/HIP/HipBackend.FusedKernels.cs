@@ -293,6 +293,19 @@ public sealed partial class HipBackend
             || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
             throw new ArgumentException(
                 $"Each codebook buffer must hold at least one full row of D = {D} elements.");
+        // Derive vocabulary sizes from codebook capacities so the
+        // kernel can reject out-of-range ids without OOB reads —
+        // mirrors the CUDA backend's nKeys/nVals guard and the CPU
+        // path's range check in NativeHRRBindAccumulate.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        int nKeys = (int)nKeysL;
+        int nVals = (int)nValsL;
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hrr_bind_accumulate");
         uint grid = (uint)((D + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -300,12 +313,13 @@ public sealed partial class HipBackend
         IntPtr pVR = valPermCodeReal.Handle, pVI = valPermCodeImag.Handle;
         IntPtr pKId = keyIds.Handle, pVId = valIds.Handle;
         IntPtr pMR = memoryReal.Handle, pMI = memoryImag.Handle;
-        void** args = stackalloc void*[10];
+        void** args = stackalloc void*[12];
         args[0] = &pKR; args[1] = &pKI;
         args[2] = &pVR; args[3] = &pVI;
         args[4] = &pKId; args[5] = &pVId;
         args[6] = &pMR; args[7] = &pMI;
         args[8] = &N; args[9] = &D;
+        args[10] = &nKeys; args[11] = &nVals;
         LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
 }

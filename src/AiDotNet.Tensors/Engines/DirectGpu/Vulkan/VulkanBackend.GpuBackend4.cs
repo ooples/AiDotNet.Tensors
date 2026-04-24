@@ -1753,8 +1753,13 @@ public sealed unsafe partial class VulkanBackend
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
     {
+        // Reject negative dims up front — if both are negative, their
+        // product is positive and would slip past "total <= 0", then
+        // the shader would cast to uint and index out of bounds.
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         long total = (long)V * D;
-        if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         int n = (int)total;

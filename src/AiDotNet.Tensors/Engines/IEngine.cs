@@ -8462,14 +8462,27 @@ public interface IEngine
     //
     // These five methods replace the hand-rolled stitching of 6+
     // TensorPrimitives calls per HRR bind/unbind that blocked scaling in
-    // the HRE research campaign's cycle 12 build. All accept split
-    // Re/Im spans generic on T; internally the CPU path dispatches to
-    // AVX2+FMA kernels for float and double, falling back to a scalar
-    // numeric-ops loop for other T. GPU backends override with native
-    // kernels where available; unsupported T falls through to CPU.
-    // No autograd hooks — these are eager kernels; callers that need a
-    // gradient tape must use the Tensor-returning NativeComplexMultiply
-    // family above.
+    // the HRE research campaign's cycle 12 build.
+    //
+    // Type-support matrix:
+    //   - NativeComplexPointwiseMultiply<T>       : any numeric T (CPU
+    //     AVX2+FMA for float/double; scalar INumericOperations<T> loop
+    //     otherwise).
+    //   - NativeGather<T>                         : any unmanaged T —
+    //     no arithmetic, just element copy.
+    //   - NativeComplexPhaseCoherenceDecode<T>    : any numeric T (same
+    //     dispatch as PointwiseMultiply).
+    //   - NativeHRRBindAccumulate<T>              : any numeric T (same
+    //     dispatch).
+    //   - NativeUnitPhaseCodebook<T>              : FLOAT / DOUBLE ONLY.
+    //     The phase-based kernel calls sin/cos — integral T would
+    //     quantize to ±1/0 and silently break |c| = 1. Implementations
+    //     must throw NotSupportedException for non-floating T.
+    //
+    // GPU backends override with native kernels where available;
+    // unsupported T falls through to CPU. No autograd hooks — these
+    // are eager kernels; callers that need a gradient tape must use
+    // the Tensor-returning NativeComplexMultiply family above.
     //
     // ─── Breaking-change note for custom IEngine implementers ──────────
     //
@@ -8584,6 +8597,7 @@ public interface IEngine
     /// <param name="k">K-PSK alphabet size, required &gt;= 1 when <paramref name="kPsk"/> is true.</param>
     /// <exception cref="ArgumentException">Thrown if span lengths don't equal V*D.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown if V/D/k are out of range.</exception>
+    /// <exception cref="NotSupportedException">Thrown when T is not <see cref="float"/> or <see cref="double"/>.</exception>
     void NativeUnitPhaseCodebook<T>(
         Span<T> outRe, Span<T> outIm,
         int seed, int V, int D,
