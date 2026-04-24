@@ -13,6 +13,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation.Codegen;
 
+[Collection("CodegenSharedRegistry")]
 public class CompilationGuardTests : IDisposable
 {
     public CompilationGuardTests()
