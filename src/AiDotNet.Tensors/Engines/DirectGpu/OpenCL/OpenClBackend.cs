@@ -10731,16 +10731,29 @@ KERNEL VARIANTS (A/B testing):
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
 
+    private static void EnsureHrrMinSize(IGpuBuffer buffer, long required, string paramName)
+    {
+        if (buffer is null) throw new ArgumentNullException(paramName);
+        if (buffer.Size < required)
+            throw new ArgumentException(
+                $"{paramName} must contain at least {required} elements (got {buffer.Size}).",
+                paramName);
+    }
+
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
     {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         long total = (long)V * D;
-        if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+        EnsureHrrMinSize(outReal, n, nameof(outReal));
+        EnsureHrrMinSize(outImag, n, nameof(outImag));
         if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
             throw new InvalidOperationException("OpenCL kernel not found: hrr_unit_phase_codebook");
-        int n = (int)total;
         int localSize = CalculateOptimalWorkGroupSize1D(n);
         kernel.SetArg(0u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
@@ -10758,6 +10771,13 @@ KERNEL VARIANTS (A/B testing):
         IGpuBuffer outScores, int V, int D)
     {
         if (V <= 0 || D <= 0) return;
+        long codeElems = (long)V * D;
+        if (codeElems > int.MaxValue) throw new ArgumentException($"V*D = {codeElems} exceeds int.MaxValue.");
+        EnsureHrrMinSize(codesReal, codeElems, nameof(codesReal));
+        EnsureHrrMinSize(codesImag, codeElems, nameof(codesImag));
+        EnsureHrrMinSize(queryReal, D, nameof(queryReal));
+        EnsureHrrMinSize(queryImag, D, nameof(queryImag));
+        EnsureHrrMinSize(outScores, V, nameof(outScores));
         if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
             throw new InvalidOperationException("OpenCL kernel not found: hrr_phase_coherence_decode");
         int localSize = CalculateOptimalWorkGroupSize1D(V);
@@ -10779,6 +10799,14 @@ KERNEL VARIANTS (A/B testing):
         int N, int D)
     {
         if (N <= 0 || D <= 0) return;
+        EnsureHrrMinSize(keyIds, N, nameof(keyIds));
+        EnsureHrrMinSize(valIds, N, nameof(valIds));
+        EnsureHrrMinSize(memoryReal, D, nameof(memoryReal));
+        EnsureHrrMinSize(memoryImag, D, nameof(memoryImag));
+        EnsureHrrMinSize(keyCodeReal, D, nameof(keyCodeReal));
+        EnsureHrrMinSize(keyCodeImag, D, nameof(keyCodeImag));
+        EnsureHrrMinSize(valPermCodeReal, D, nameof(valPermCodeReal));
+        EnsureHrrMinSize(valPermCodeImag, D, nameof(valPermCodeImag));
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
             throw new InvalidOperationException("OpenCL kernel not found: hrr_bind_accumulate");
         int localSize = CalculateOptimalWorkGroupSize1D(D);

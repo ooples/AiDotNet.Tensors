@@ -1793,15 +1793,26 @@ public sealed unsafe partial class VulkanBackend
         int N, int D)
     {
         if (N <= 0 || D <= 0) return;
-        var push = new uint[] { (uint)N, (uint)D };
+        // Derive vocabulary sizes from codebook buffer capacities so
+        // the shader can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's
+        // (uint)kId >= (uint)nKeys check in NativeHRRBindAccumulate.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        var push = new uint[] { (uint)N, (uint)D, (uint)nKeysL, (uint)nValsL };
         // Dispatch one thread per output dimension; each thread loops N.
         // keyIds/valIds stored as Int32BitsToSingle floats — shader reverses
-        // with floatBitsToInt().
+        // with floatBitsToInt() and validates against nKeys / nVals.
         GlslOctOp(
             VulkanHrrKernels.HrrBindAccumulate,
             keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag,
             keyIds, valIds, memoryReal, memoryImag,
-            D, push, 2 * sizeof(uint));
+            D, push, 4 * sizeof(uint));
     }
 
     /// <inheritdoc/>

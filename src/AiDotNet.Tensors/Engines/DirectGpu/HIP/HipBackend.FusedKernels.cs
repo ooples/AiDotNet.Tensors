@@ -207,13 +207,19 @@ public sealed partial class HipBackend
     public unsafe void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
     {
+        // Reject negative dims up front — if both are negative, their
+        // product is positive and would slip past a naive "total <= 0"
+        // check, then launch the kernel with invalid shape.
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         long total = (long)V * D;
-        if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+        ValidateHipSplitBuffers(n, nameof(SplitComplexUnitPhaseCodebook), outReal, outImag);
         if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hrr_unit_phase_codebook");
-        int n = (int)total;
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
         int kPskI = kPsk ? 1 : 0;
@@ -229,13 +235,28 @@ public sealed partial class HipBackend
         IGpuBuffer outScores, int V, int D)
     {
         if (V <= 0 || D <= 0) return;
+        long codeCount = (long)V * D;
+        if (codesReal is null || codesImag is null || queryReal is null || queryImag is null || outScores is null)
+            throw new ArgumentNullException(nameof(codesReal),
+                "All five GPU buffers must be non-null for SplitComplexPhaseCoherenceDecode.");
+        if (codesReal.Size < codeCount || codesImag.Size < codeCount)
+            throw new ArgumentException(
+                $"codes buffers must each hold at least V*D = {codeCount} elements " +
+                $"(got {codesReal.Size}, {codesImag.Size}).");
+        if (queryReal.Size < D || queryImag.Size < D)
+            throw new ArgumentException(
+                $"query buffers must each hold at least D = {D} elements " +
+                $"(got {queryReal.Size}, {queryImag.Size}).");
+        if (outScores.Size < V)
+            throw new ArgumentException(
+                $"outScores must hold at least V = {V} elements (got {outScores.Size}).");
         if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hrr_phase_coherence_decode");
         uint grid = (uint)V;
         int blockSize = 1;
         while (blockSize < D && blockSize < 1024) blockSize <<= 1;
         blockSize = Math.Max(32, blockSize);
-        int sharedMem = blockSize * sizeof(float);
+        uint sharedMem = (uint)blockSize * sizeof(float);
         IntPtr pCR = codesReal.Handle, pCI = codesImag.Handle;
         IntPtr pQR = queryReal.Handle, pQI = queryImag.Handle;
         IntPtr pOS = outScores.Handle;
@@ -243,8 +264,9 @@ public sealed partial class HipBackend
         args[0] = &pCR; args[1] = &pCI;
         args[2] = &pQR; args[3] = &pQI;
         args[4] = &pOS; args[5] = &V; args[6] = &D;
-        HipNativeBindings.hipModuleLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
-            (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        // Route through the shared helper so this runs on _stream with
+        // the same error-surfacing as the rest of the backend.
+        LaunchKernelWithSharedMem(kernel, grid, (uint)blockSize, sharedMem, args);
     }
 
     public unsafe void SplitComplexHrrBindAccumulate(
@@ -255,6 +277,22 @@ public sealed partial class HipBackend
         int N, int D)
     {
         if (N <= 0 || D <= 0) return;
+        if (keyCodeReal is null || keyCodeImag is null || valPermCodeReal is null || valPermCodeImag is null
+            || keyIds is null || valIds is null || memoryReal is null || memoryImag is null)
+            throw new ArgumentNullException(nameof(keyCodeReal),
+                "All eight GPU buffers must be non-null for SplitComplexHrrBindAccumulate.");
+        if (keyIds.Size < N || valIds.Size < N)
+            throw new ArgumentException(
+                $"ID buffers must each hold at least N = {N} elements " +
+                $"(got keyIds={keyIds.Size}, valIds={valIds.Size}).");
+        if (memoryReal.Size < D || memoryImag.Size < D)
+            throw new ArgumentException(
+                $"Memory buffers must each hold at least D = {D} elements " +
+                $"(got memoryReal={memoryReal.Size}, memoryImag={memoryImag.Size}).");
+        if (keyCodeReal.Size < D || keyCodeImag.Size < D
+            || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
+            throw new ArgumentException(
+                $"Each codebook buffer must hold at least one full row of D = {D} elements.");
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hrr_bind_accumulate");
         uint grid = (uint)((D + DefaultBlockSize - 1) / DefaultBlockSize);

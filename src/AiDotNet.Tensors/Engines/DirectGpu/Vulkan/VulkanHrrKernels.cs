@@ -58,7 +58,12 @@ void main() {
     if (gid >= uint(p.total)) return;
 
     float phase = hrr_phase_from_cell(p.seed, gid);
-    if (p.kPsk != 0) {
+    // Defense-in-depth: host validates (kPsk && k <= 0) → throw, so
+    // the shader should never see k <= 0 with kPsk set, but guard
+    // against division-by-zero anyway to avoid NaN propagation if
+    // that invariant is ever broken (e.g., by a future caller that
+    // bypasses the host check).
+    if (p.kPsk != 0 && p.k > 0) {
         float step = 6.28318530717958647692 / float(p.k);
         phase = floor(phase / step + 0.5) * step;
     }
@@ -117,9 +122,16 @@ layout(set = 0, binding = 4) readonly buffer KID { float keyIds[]; };
 layout(set = 0, binding = 5) readonly buffer VID { float valIds[]; };
 layout(set = 0, binding = 6)          buffer MR  { float memoryReal[]; };
 layout(set = 0, binding = 7)          buffer MI  { float memoryImag[]; };
+// nKeys / nVals are the vocabulary sizes (codebook row counts); the
+// host passes keyCodeReal.Size / D and valPermCodeReal.Size / D so
+// the shader can reject out-of-range ids without reading past the
+// codebook (mirrors the (uint)kId >= (uint)nKeys check in the CPU
+// SIMD implementation).
 layout(push_constant) uniform P {
     int N;
     int D;
+    int nKeys;
+    int nVals;
 } p;
 
 void main() {
@@ -131,6 +143,11 @@ void main() {
     for (int n = 0; n < p.N; n++) {
         int kid = floatBitsToInt(keyIds[n]);
         int vid = floatBitsToInt(valIds[n]);
+        // Unsigned-comparison trick rejects both negative and
+        // too-large indices in one branch; out-of-range pairs
+        // contribute zero (match the CPU path's exception, but
+        // silently — the shader can't throw).
+        if (uint(kid) >= uint(p.nKeys) || uint(vid) >= uint(p.nVals)) continue;
         uint kOff = uint(kid) * uint(p.D) + d;
         uint vOff = uint(vid) * uint(p.D) + d;
         float ar = keyCodeReal[kOff];

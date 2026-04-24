@@ -34012,6 +34012,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int seed, int V, int D,
         bool kPsk = false, int k = 0)
     {
+        // Phase-based codebook requires continuous arithmetic — integral
+        // T (int, long, etc.) would quantize sin/cos to ±1/0 and silently
+        // break the unit-phase invariant. Reject up front.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            throw new NotSupportedException(
+                $"NativeUnitPhaseCodebook requires T = float or double (got {typeof(T).Name}). " +
+                "Phase-based kernels cannot preserve |c| = 1 for integral element types.");
+
 #if NET5_0_OR_GREATER
         if (typeof(T) == typeof(double))
         {
@@ -34031,10 +34039,11 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 #endif
 
-        // Generic fallback: generate in double, convert to T at the
-        // boundary — simplest implementation that keeps the numerics
-        // independent of T's precision. Also handles all T on net471
-        // where the span-reinterpret fast path is unavailable.
+        // net471 fallback for float/double — the span-reinterpret fast
+        // path isn't available on net471. Generate in a temporary
+        // double buffer, then copy through INumericOperations.FromDouble
+        // which is lossless for double and a safe narrowing for float.
+        // Safe because the type guard above rejects non-floating T.
         long total = (long)V * D;
         if (total > int.MaxValue)
             throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");

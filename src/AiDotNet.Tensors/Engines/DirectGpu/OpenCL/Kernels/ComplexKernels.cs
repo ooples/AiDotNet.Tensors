@@ -146,14 +146,23 @@ __kernel void softmax_rows(
 }
 
 // ─── HRR binding primitives (issue #248) ────────────────────────────
+// Matches CUDA/HIP/Metal/Vulkan/WebGPU — see CudaComplexKernels.cs for
+// the hash rationale (32-bit Murmur3 fmix chosen for WebGPU
+// compatibility; per-backend GPU determinism preserved, CPU
+// xorshift64* path intentionally divergent for single-thread speed).
+inline uint hrr_hash(uint seed_u, uint cell_u)
+{
+    uint z = seed_u * 0x9E3779B9u + cell_u * 0x85EBCA6Bu;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z =  z ^ (z >> 16);
+    return z;
+}
+
 inline float hrr_phase_from_cell(int seed, long cellIdx)
 {
-    ulong z = (ulong)seed * 0x9E3779B97F4A7C15UL
-            + (ulong)cellIdx * 0xBF58476D1CE4E5B9UL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
-    z =  z ^ (z >> 31);
-    uint top24 = (uint)(z >> 40);
+    uint z = hrr_hash((uint)seed, (uint)cellIdx);
+    uint top24 = z >> 8;
     return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
 }
 

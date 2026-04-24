@@ -8470,6 +8470,21 @@ public interface IEngine
     // No autograd hooks — these are eager kernels; callers that need a
     // gradient tape must use the Tensor-returning NativeComplexMultiply
     // family above.
+    //
+    // ─── Breaking-change note for custom IEngine implementers ──────────
+    //
+    // Adding abstract members to IEngine is a source-breaking change —
+    // net471 and netstandard2.0 have no default-interface-method
+    // fallback. This ships under the 1.0.0-preview umbrella, where
+    // pre-1.0 API evolution is expected; downstream engines implementing
+    // IEngine directly must add these five members. The recommended
+    // migration for custom engines is to delegate to a CpuEngine
+    // instance or inherit from CpuEngine (which provides a working
+    // scalar reference implementation for all numeric T). Engines built
+    // on top of DelegatingGpuBackend or DirectGpuTensorEngine pick up
+    // the GPU overrides automatically. The first post-preview release
+    // (1.0.0) will treat any further additions to this section as a
+    // major-version break.
 
     /// <summary>
     /// Pointwise complex multiply on split Re/Im spans, optionally
@@ -8480,10 +8495,24 @@ public interface IEngine
     /// </list>
     /// Single SIMD kernel; replaces 6 chained TensorPrimitives calls per
     /// HRR bind / unbind. See issue #248 op 1.
+    /// <para><b>Contract:</b> all six spans must share the same length
+    /// <c>L</c>. The output spans <paramref name="cRe"/>/<paramref name="cIm"/>
+    /// may alias any of the input spans (read-then-write is done per
+    /// index); output pairs must not alias each other. Implementations
+    /// throw <see cref="ArgumentException"/> if any span length differs
+    /// from <paramref name="aRe"/>.Length.</para>
     /// </summary>
     /// <typeparam name="T">Element type. float / double have SIMD fast
     /// paths on AVX2+FMA; other numeric T fall back to the generic
     /// scalar loop via <c>INumericOperations&lt;T&gt;</c>.</typeparam>
+    /// <param name="aRe">Real part of operand A, length <c>L</c>.</param>
+    /// <param name="aIm">Imaginary part of operand A, length <c>L</c>.</param>
+    /// <param name="bRe">Real part of operand B, length <c>L</c>.</param>
+    /// <param name="bIm">Imaginary part of operand B, length <c>L</c>.</param>
+    /// <param name="cRe">Output real part, length <c>L</c> (may alias inputs).</param>
+    /// <param name="cIm">Output imaginary part, length <c>L</c> (may alias inputs).</param>
+    /// <param name="conjugateB">If true, multiply by <c>conj(b)</c>.</param>
+    /// <exception cref="ArgumentException">Thrown if span lengths differ.</exception>
     void NativeComplexPointwiseMultiply<T>(
         ReadOnlySpan<T> aRe, ReadOnlySpan<T> aIm,
         ReadOnlySpan<T> bRe, ReadOnlySpan<T> bIm,
@@ -8494,9 +8523,22 @@ public interface IEngine
     /// Indexed gather: <c>output[i] = input[indices[i]]</c>. Standard
     /// permutation-gather primitive for HRR's Plate-style non-commutative
     /// binding. See issue #248 op 2.
+    /// <para><b>Contract:</b> <paramref name="output"/>.Length must equal
+    /// <paramref name="indices"/>.Length. Every <c>indices[i]</c> must be
+    /// in <c>[0, input.Length)</c>. <paramref name="output"/> and
+    /// <paramref name="input"/> must not overlap (the kernel may read
+    /// positions out of order). Implementations throw
+    /// <see cref="ArgumentException"/> on a length mismatch and
+    /// <see cref="ArgumentOutOfRangeException"/> on an out-of-range
+    /// index.</para>
     /// </summary>
     /// <typeparam name="T">Element type; works for any unmanaged T — the
     /// kernel does index-only addressing, no arithmetic on the data.</typeparam>
+    /// <param name="input">Source values.</param>
+    /// <param name="indices">Non-negative indices into <paramref name="input"/>.</param>
+    /// <param name="output">Destination, length == indices.Length.</param>
+    /// <exception cref="ArgumentException">Thrown if lengths mismatch.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if any index is out of range.</exception>
     void NativeGather<T>(
         ReadOnlySpan<T> input,
         ReadOnlySpan<int> indices,
@@ -8506,12 +8548,42 @@ public interface IEngine
     /// Generate a V×D unit-phase complex codebook: every entry is
     /// <c>exp(iθ)</c> for a uniformly random phase, split into
     /// <paramref name="outRe"/> (cos) and <paramref name="outIm"/> (sin)
-    /// flattened row-major. Optional K-PSK quantization snaps phases to
-    /// multiples of <c>2π/k</c>. Deterministic given <paramref name="seed"/>.
+    /// flattened row-major (outer dim = V, inner dim = D). Optional
+    /// K-PSK quantization snaps phases to multiples of <c>2π/k</c>,
+    /// producing a discrete alphabet of <paramref name="k"/> equally
+    /// spaced points on the unit circle. Deterministic given
+    /// <paramref name="seed"/> — same seed + same (V, D) yields the
+    /// same output on a given backend (GPU backends may diverge
+    /// bit-wise from CPU; per-backend determinism is preserved).
     /// See issue #248 op 3.
+    /// <para><b>Contract:</b> <paramref name="outRe"/>.Length and
+    /// <paramref name="outIm"/>.Length must both equal
+    /// <c>V * D</c>. Output spans must not overlap.
+    /// <paramref name="V"/> and <paramref name="D"/> must be &gt;= 0.
+    /// If <paramref name="kPsk"/> is true, <paramref name="k"/> must be
+    /// &gt;= 1. Implementations throw <see cref="ArgumentException"/> on
+    /// a span-length mismatch and
+    /// <see cref="ArgumentOutOfRangeException"/> on invalid
+    /// <c>V</c>/<c>D</c>/<c>k</c>.</para>
+    /// <para><b>Floating-point only:</b> phase semantics require
+    /// continuous arithmetic — integral T (int, long, etc.) would
+    /// quantize <c>sin</c>/<c>cos</c> to ±1/0 and silently produce a
+    /// broken codebook. Implementations must reject non-floating T
+    /// with <see cref="NotSupportedException"/>. Only
+    /// <see cref="float"/> and <see cref="double"/> are supported.</para>
     /// </summary>
-    /// <typeparam name="T">Element type. float / double hit the vectorised
-    /// path; other numeric T go through the generic scalar loop.</typeparam>
+    /// <typeparam name="T">Element type — must be <see cref="float"/>
+    /// or <see cref="double"/>. Non-floating T throws
+    /// <see cref="NotSupportedException"/>.</typeparam>
+    /// <param name="outRe">Output real (cos) part, length <c>V*D</c>, row-major.</param>
+    /// <param name="outIm">Output imaginary (sin) part, length <c>V*D</c>, row-major.</param>
+    /// <param name="seed">PRNG seed; same seed ⇒ same codebook on a given backend.</param>
+    /// <param name="V">Outer (vocabulary) dimension, &gt;= 0.</param>
+    /// <param name="D">Inner (embedding) dimension, &gt;= 0.</param>
+    /// <param name="kPsk">If true, snap phases to a K-PSK lattice.</param>
+    /// <param name="k">K-PSK alphabet size, required &gt;= 1 when <paramref name="kPsk"/> is true.</param>
+    /// <exception cref="ArgumentException">Thrown if span lengths don't equal V*D.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if V/D/k are out of range.</exception>
     void NativeUnitPhaseCodebook<T>(
         Span<T> outRe, Span<T> outIm,
         int seed, int V, int D,
@@ -8520,11 +8592,33 @@ public interface IEngine
     /// <summary>
     /// Full-vocabulary phase-coherence decode: for each candidate
     /// v ∈ [0, V), compute
-    /// <c>scores[v] = Re(Σ_d query[d] · conj(code[v][d]))</c>.
+    /// <c>scores[v] = Re(Σ_d query[d] · conj(code[v][d]))
+    ///            = Σ_d (codesRe[v,d]·queryRe[d] + codesIm[v,d]·queryIm[d])</c>.
     /// One kernel without per-query Tensor wrapping — avoids the
     /// allocation overhead that dominated issue #248's decode path.
     /// See issue #248 op 4.
+    /// <para><b>Contract:</b> <paramref name="codesRe"/>.Length and
+    /// <paramref name="codesIm"/>.Length must both equal <c>V * D</c>,
+    /// flattened row-major (outer = V, inner = D).
+    /// <paramref name="queryRe"/>.Length and <paramref name="queryIm"/>.Length
+    /// must both equal <c>D</c>. <paramref name="scores"/>.Length must equal
+    /// <c>V</c>. All spans must be pairwise non-overlapping.
+    /// <paramref name="V"/> and <paramref name="D"/> must be &gt;= 0.
+    /// Implementations throw <see cref="ArgumentException"/> on any span
+    /// length mismatch and <see cref="ArgumentOutOfRangeException"/> on
+    /// negative <c>V</c>/<c>D</c>.</para>
     /// </summary>
+    /// <typeparam name="T">Element type. float / double hit the vectorised
+    /// path; other numeric T go through the generic scalar loop.</typeparam>
+    /// <param name="codesRe">Codebook real part, length <c>V*D</c>, row-major.</param>
+    /// <param name="codesIm">Codebook imaginary part, length <c>V*D</c>, row-major.</param>
+    /// <param name="queryRe">Query real part, length <c>D</c>.</param>
+    /// <param name="queryIm">Query imaginary part, length <c>D</c>.</param>
+    /// <param name="scores">Output coherence scores, length <c>V</c>.</param>
+    /// <param name="V">Vocabulary size, &gt;= 0.</param>
+    /// <param name="D">Embedding dimension, &gt;= 0.</param>
+    /// <exception cref="ArgumentException">Thrown if any span length disagrees with V/D.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if V or D is negative.</exception>
     void NativeComplexPhaseCoherenceDecode<T>(
         ReadOnlySpan<T> codesRe, ReadOnlySpan<T> codesIm,
         ReadOnlySpan<T> queryRe, ReadOnlySpan<T> queryIm,
@@ -8533,13 +8627,40 @@ public interface IEngine
 
     /// <summary>
     /// Fused HRR bind + accumulate across N training pairs:
-    /// <c>memory += keyCode[keyIds[n]] · valPermCode[valIds[n]]</c> for
-    /// each n. Replaces N × 6 TensorPrimitives calls; the single hottest
-    /// loop in HRE's memory-build phase. The caller passes
+    /// <c>memory += Σ_n keyCode[keyIds[n]] · valPermCode[valIds[n]]</c>
+    /// where <c>·</c> is pointwise complex multiplication. Replaces
+    /// N × 6 TensorPrimitives calls; the single hottest loop in HRE's
+    /// memory-build phase. The caller passes
     /// <paramref name="valPermCodeRe"/> / <paramref name="valPermCodeIm"/>
     /// pre-permuted so the gather + permute + multiply + accumulate
     /// collapses into one kernel. See issue #248 op 5.
+    /// <para><b>Contract:</b> <paramref name="keyIds"/>.Length and
+    /// <paramref name="valIds"/>.Length must both equal <c>N</c>.
+    /// <paramref name="memoryRe"/>.Length and
+    /// <paramref name="memoryIm"/>.Length must both equal <c>D</c>.
+    /// The four codebook spans must each have length equal to the
+    /// vocabulary size × <c>D</c> (row-major), and every
+    /// <c>keyIds[n]</c> / <c>valIds[n]</c> must be a valid row index
+    /// into its respective codebook. <paramref name="D"/> must be
+    /// &gt;= 0. Memory spans are updated in place. Memory spans must
+    /// not overlap each other or any input span.
+    /// Implementations throw <see cref="ArgumentException"/> on span
+    /// length mismatches and <see cref="ArgumentOutOfRangeException"/>
+    /// on negative <c>D</c> or out-of-range ids.</para>
     /// </summary>
+    /// <typeparam name="T">Element type. float / double hit the vectorised
+    /// path; other numeric T go through the generic scalar loop.</typeparam>
+    /// <param name="keyCodeRe">Key codebook real part, row-major.</param>
+    /// <param name="keyCodeIm">Key codebook imaginary part, row-major.</param>
+    /// <param name="valPermCodeRe">Pre-permuted value codebook real part, row-major.</param>
+    /// <param name="valPermCodeIm">Pre-permuted value codebook imaginary part, row-major.</param>
+    /// <param name="keyIds">Row indices into keyCode, length N.</param>
+    /// <param name="valIds">Row indices into valPermCode, length N.</param>
+    /// <param name="memoryRe">In/out memory real part, length D.</param>
+    /// <param name="memoryIm">In/out memory imaginary part, length D.</param>
+    /// <param name="D">Embedding dimension, &gt;= 0.</param>
+    /// <exception cref="ArgumentException">Thrown on span length mismatches.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown on negative D or out-of-range ids.</exception>
     void NativeHRRBindAccumulate<T>(
         ReadOnlySpan<T> keyCodeRe, ReadOnlySpan<T> keyCodeIm,
         ReadOnlySpan<T> valPermCodeRe, ReadOnlySpan<T> valPermCodeIm,

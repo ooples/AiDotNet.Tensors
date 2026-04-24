@@ -1776,8 +1776,11 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
     {
+        ThrowIfDisposed();
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         long total = (long)V * D;
-        if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         int n = (int)total;
@@ -1801,6 +1804,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         IGpuBuffer queryReal, IGpuBuffer queryImag,
         IGpuBuffer outScores, int V, int D)
     {
+        ThrowIfDisposed();
         if (V <= 0 || D <= 0) return;
         EnsureComplexLibrary();
         var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_phase_coherence_decode");
@@ -1824,6 +1828,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         IGpuBuffer memoryReal, IGpuBuffer memoryImag,
         int N, int D)
     {
+        ThrowIfDisposed();
         if (N <= 0 || D <= 0) return;
         EnsureComplexLibrary();
         var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_bind_accumulate");

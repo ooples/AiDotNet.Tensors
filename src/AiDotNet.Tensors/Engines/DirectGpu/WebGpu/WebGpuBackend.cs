@@ -1224,8 +1224,10 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
     {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         long total = (long)V * D;
-        if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         SplitComplexUnitPhaseCodebookAsync(outReal, outImag, seed, (int)total, V, D, kPsk, k).GetAwaiter().GetResult();
@@ -1250,7 +1252,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         IGpuBuffer queryReal, IGpuBuffer queryImag,
         IGpuBuffer outScores, int V, int D)
     {
-        if (V <= 0 || D <= 0) return;
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
         SplitComplexPhaseCoherenceDecodeAsync(codesReal, codesImag, queryReal, queryImag, outScores, V, D).GetAwaiter().GetResult();
     }
 
@@ -1279,7 +1283,29 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         IGpuBuffer memoryReal, IGpuBuffer memoryImag,
         int N, int D)
     {
-        if (N <= 0 || D <= 0) return;
+        if (N < 0) throw new ArgumentOutOfRangeException(nameof(N), "N must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (N == 0 || D == 0) return;
+        // Validate capacities — the WGSL kernel reads keyIds[0..N) and
+        // valIds[0..N) and reads/writes memory[0..D). An undersized
+        // buffer would read/write past the GPU allocation.
+        if (keyIds is null || valIds is null || memoryReal is null || memoryImag is null
+            || keyCodeReal is null || keyCodeImag is null || valPermCodeReal is null || valPermCodeImag is null)
+            throw new ArgumentNullException(nameof(keyIds),
+                "All eight GPU buffers must be non-null for SplitComplexHrrBindAccumulate.");
+        if (keyIds.Size < N || valIds.Size < N)
+            throw new ArgumentException(
+                $"keyIds/valIds must each hold at least N = {N} entries " +
+                $"(got keyIds={keyIds.Size}, valIds={valIds.Size}). " +
+                "Only the first N pairs are accumulated — undersized buffers would read past GPU memory.");
+        if (memoryReal.Size < D || memoryImag.Size < D)
+            throw new ArgumentException(
+                $"Memory buffers must each hold at least D = {D} elements " +
+                $"(got memoryReal={memoryReal.Size}, memoryImag={memoryImag.Size}).");
+        if (keyCodeReal.Size < D || keyCodeImag.Size < D
+            || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
+            throw new ArgumentException(
+                $"Each codebook buffer must hold at least one full row of D = {D} elements.");
         SplitComplexHrrBindAccumulateAsync(
             keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag,
             keyIds, valIds, memoryReal, memoryImag, N, D).GetAwaiter().GetResult();
@@ -1292,10 +1318,21 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         IGpuBuffer memoryReal, IGpuBuffer memoryImag,
         int N, int D)
     {
+        // Derive vocabulary sizes from codebook capacities so the
+        // shader can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's range check in
+        // NativeHRRBindAccumulate and the Vulkan shader guard.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
         var pipe = await GetOrCreatePipelineAsync(
             HrrModuleKey + ":HrrBindAccumulate", WebGpuHrrKernels.HrrBindAccumulate, "main");
         using var uniforms = new WebGpuBuffer(
-            UniformInts(N, D),
+            UniformInts(N, D, (int)nKeysL, (int)nValsL),
             WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bind = new WebGpuBindGroup(pipe,
             AsWgpu(keyCodeReal), AsWgpu(keyCodeImag),

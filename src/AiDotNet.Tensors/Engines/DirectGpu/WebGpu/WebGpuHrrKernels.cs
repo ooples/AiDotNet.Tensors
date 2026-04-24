@@ -112,7 +112,12 @@ struct P { V : i32, D : i32 };
 @group(0) @binding(5) var<storage, read>       valIds          : array<f32>;
 @group(0) @binding(6) var<storage, read_write> memoryReal      : array<f32>;
 @group(0) @binding(7) var<storage, read_write> memoryImag      : array<f32>;
-struct P { N : i32, D : i32 };
+// nKeys / nVals are the vocabulary sizes (codebook row counts); the
+// host passes keyCodeReal.Size / D and valPermCodeReal.Size / D so
+// the shader can reject out-of-range ids without reading past the
+// codebook. Mirrors the (uint)kId >= (uint)nKeys check in the CPU
+// SIMD implementation and the equivalent guard in the Vulkan shader.
+struct P { N : i32, D : i32, nKeys : i32, nVals : i32 };
 @group(0) @binding(8) var<uniform> p : P;
 
 @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
@@ -124,6 +129,11 @@ struct P { N : i32, D : i32 };
     for (var n : i32 = 0; n < p.N; n = n + 1) {
         let kid = bitcast<i32>(keyIds[n]);
         let vid = bitcast<i32>(valIds[n]);
+        // Unsigned-comparison trick rejects both negative and
+        // too-large indices in one branch; out-of-range pairs
+        // contribute zero (match the CPU path's exception, but
+        // silently — the shader can't throw).
+        if (u32(kid) >= u32(p.nKeys) || u32(vid) >= u32(p.nVals)) { continue; }
         let kOff = u32(kid) * u32(p.D) + d;
         let vOff = u32(vid) * u32(p.D) + d;
         let ar = keyCodeReal[kOff];

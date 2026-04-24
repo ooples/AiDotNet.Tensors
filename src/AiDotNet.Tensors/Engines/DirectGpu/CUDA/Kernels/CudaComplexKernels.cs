@@ -188,24 +188,38 @@ extern ""C"" __global__ void softmax_rows(
 
 // ─── HRR binding primitives (issue #248) ────────────────────────────
 //
-// Deterministic per-cell phase via splitmix64 hash of (seed, cell_idx).
-// Each thread generates its own phase independently — no shared state,
-// no cross-thread sync. Same seed → same codebook across runs; same
-// seed + same (V, D) → identical output. Does NOT match the CPU
-// xorshift64* sequence bit-for-bit (GPU phases are a different
-// uniform sample), which is fine — users don't need cross-device
-// bit-identity on random init.
+// Deterministic per-cell phase via 32-bit Murmur3 fmix hash of
+// (seed, cellIdx). Each thread generates its own phase independently
+// — no shared state, no cross-thread sync.
+//
+// This is the SAME hash used by all six GPU backends (CUDA, HIP,
+// OpenCL, Metal, Vulkan, WebGPU); same seed + same (V, D) ⇒ identical
+// codebook on any GPU. The 32-bit Murmur3 variant is used (rather
+// than the 64-bit splitmix64 this kernel previously used) because
+// WebGPU's WGSL lacks native u64 support; keeping all GPU kernels
+// bit-identical is higher value than the small entropy gain of 64-bit.
+//
+// Does NOT bit-match the CPU xorshift64* sequence — the CPU path is
+// intentionally sequential (fastest on a single thread), while the
+// GPU path must be parallel per-cell. Cross-device bit-identity is
+// not part of the contract; per-backend determinism is.
+__device__ __forceinline__ unsigned int hrr_hash(unsigned int seed_u, unsigned int cell_u)
+{
+    // Murmur3 fmix variant — good-quality uniform 32-bit output.
+    unsigned int z = seed_u * 0x9E3779B9u + cell_u * 0x85EBCA6Bu;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z =  z ^ (z >> 16);
+    return z;
+}
+
 __device__ __forceinline__ float hrr_phase_from_cell(int seed, long long cellIdx)
 {
-    unsigned long long z = (unsigned long long)seed * 0x9E3779B97F4A7C15ULL
-                         + (unsigned long long)cellIdx * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z =  z ^ (z >> 31);
+    unsigned int z = hrr_hash((unsigned int)seed, (unsigned int)cellIdx);
     // Upper 24 bits → float in [0, 1). 24 bits is exact-representable
     // in float32 so the distribution has no rounding artefacts at the
     // top of the range.
-    unsigned int top24 = (unsigned int)(z >> 40);
+    unsigned int top24 = z >> 8;
     return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
 }
 

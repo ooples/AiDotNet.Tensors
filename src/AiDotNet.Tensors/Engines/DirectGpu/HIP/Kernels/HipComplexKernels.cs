@@ -159,14 +159,23 @@ extern ""C"" __global__ void softmax_rows(
 }
 
 // ─── HRR binding primitives (issue #248) ────────────────────────────
+// Matches CUDA/OpenCL/Metal/Vulkan/WebGPU — see CudaComplexKernels.cs
+// for the hash rationale (32-bit Murmur3 fmix chosen for WebGPU
+// compatibility; per-backend GPU determinism preserved, CPU
+// xorshift64* path intentionally divergent for single-thread speed).
+__device__ __forceinline__ unsigned int hrr_hash(unsigned int seed_u, unsigned int cell_u)
+{
+    unsigned int z = seed_u * 0x9E3779B9u + cell_u * 0x85EBCA6Bu;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z =  z ^ (z >> 16);
+    return z;
+}
+
 __device__ __forceinline__ float hrr_phase_from_cell(int seed, long long cellIdx)
 {
-    unsigned long long z = (unsigned long long)seed * 0x9E3779B97F4A7C15ULL
-                         + (unsigned long long)cellIdx * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z =  z ^ (z >> 31);
-    unsigned int top24 = (unsigned int)(z >> 40);
+    unsigned int z = hrr_hash((unsigned int)seed, (unsigned int)cellIdx);
+    unsigned int top24 = z >> 8;
     return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
 }
 
