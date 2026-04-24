@@ -10729,6 +10729,72 @@ KERNEL VARIANTS (A/B testing):
         kernel.Execute1D(rows, localSize);
     }
 
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        long total = (long)V * D;
+        if (total <= 0) return;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: hrr_unit_phase_codebook");
+        int n = (int)total;
+        int localSize = CalculateOptimalWorkGroupSize1D(n);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+        kernel.SetArg(2u, seed);
+        kernel.SetArg(3u, V);
+        kernel.SetArg(4u, D);
+        kernel.SetArg(5u, kPsk ? 1 : 0);
+        kernel.SetArg(6u, k);
+        kernel.Execute1D(n, localSize);
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: hrr_phase_coherence_decode");
+        int localSize = CalculateOptimalWorkGroupSize1D(V);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)codesReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)codesImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)queryReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)queryImag).Buffer.Handle);
+        kernel.SetArg(4u, ((DirectOpenClGpuBuffer)outScores).Buffer.Handle);
+        kernel.SetArg(5u, V);
+        kernel.SetArg(6u, D);
+        kernel.Execute1D(V, localSize);
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: hrr_bind_accumulate");
+        int localSize = CalculateOptimalWorkGroupSize1D(D);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)keyCodeReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)keyCodeImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)valPermCodeReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)valPermCodeImag).Buffer.Handle);
+        kernel.SetArg(4u, ((DirectOpenClGpuBuffer)keyIds).Buffer.Handle);
+        kernel.SetArg(5u, ((DirectOpenClGpuBuffer)valIds).Buffer.Handle);
+        kernel.SetArg(6u, ((DirectOpenClGpuBuffer)memoryReal).Buffer.Handle);
+        kernel.SetArg(7u, ((DirectOpenClGpuBuffer)memoryImag).Buffer.Handle);
+        kernel.SetArg(8u, N);
+        kernel.SetArg(9u, D);
+        kernel.Execute1D(D, localSize);
+    }
+
     /// <inheritdoc/>
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)

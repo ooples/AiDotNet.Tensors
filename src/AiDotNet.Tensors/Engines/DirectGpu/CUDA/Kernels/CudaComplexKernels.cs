@@ -12,7 +12,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             "split_complex_phase", "split_complex_from_polar",
             "split_complex_scale", "split_complex_add",
             "split_complex_cross_spectral",
-            "split_complex_topk", "softmax_rows"
+            "split_complex_topk", "softmax_rows",
+            // Issue #248 — HRR binding primitives
+            "hrr_unit_phase_codebook",
+            "hrr_phase_coherence_decode",
+            "hrr_bind_accumulate"
         };
 
         public static string GetSource()
@@ -180,6 +184,108 @@ extern ""C"" __global__ void softmax_rows(
     // Step 3: normalize
     for (int c = tid; c < cols; c += blockDim.x)
         rowOut[c] /= sumExp;
+}
+
+// ─── HRR binding primitives (issue #248) ────────────────────────────
+//
+// Deterministic per-cell phase via splitmix64 hash of (seed, cell_idx).
+// Each thread generates its own phase independently — no shared state,
+// no cross-thread sync. Same seed → same codebook across runs; same
+// seed + same (V, D) → identical output. Does NOT match the CPU
+// xorshift64* sequence bit-for-bit (GPU phases are a different
+// uniform sample), which is fine — users don't need cross-device
+// bit-identity on random init.
+__device__ __forceinline__ float hrr_phase_from_cell(int seed, long long cellIdx)
+{
+    unsigned long long z = (unsigned long long)seed * 0x9E3779B97F4A7C15ULL
+                         + (unsigned long long)cellIdx * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z =  z ^ (z >> 31);
+    // Upper 24 bits → float in [0, 1). 24 bits is exact-representable
+    // in float32 so the distribution has no rounding artefacts at the
+    // top of the range.
+    unsigned int top24 = (unsigned int)(z >> 40);
+    return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void hrr_unit_phase_codebook(
+    float* outReal, float* outImag,
+    int seed, int V, int D, int kPsk, int k)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)V * D;
+    if (idx >= total) return;
+
+    float phase = hrr_phase_from_cell(seed, idx);
+    if (kPsk) {
+        // Snap to nearest multiple of 2π/k.
+        float step = 6.28318530717958647692f / (float)k;
+        phase = floorf(phase / step + 0.5f) * step;
+    }
+    float c, s;
+    sincosf(phase, &s, &c);
+    outReal[idx] = c;
+    outImag[idx] = s;
+}
+
+// Per-row phase-coherence reduction: one block per V, block-level
+// tree sum over D. scores[v] = Σ_d (queryR·codesR[v,d] + queryI·codesI[v,d]).
+extern ""C"" __global__ void hrr_phase_coherence_decode(
+    const float* codesReal, const float* codesImag,
+    const float* queryReal, const float* queryImag,
+    float* outScores, int V, int D)
+{
+    extern __shared__ float sdata[];
+    int v = blockIdx.x;
+    int tid = threadIdx.x;
+    if (v >= V) return;
+
+    const float* cR = codesReal + (long long)v * D;
+    const float* cI = codesImag + (long long)v * D;
+
+    float acc = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        acc += cR[d] * queryReal[d] + cI[d] * queryImag[d];
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) outScores[v] = sdata[0];
+}
+
+// Fused gather + complex multiply + accumulate across N training pairs.
+// One thread per D lane loops all N pairs — each thread writes only its
+// own d so no atomics are needed. Coalesced reads within a warp
+// because d varies consecutively and key/val offsets are broadcast
+// (same kId for all threads in a warp at a given n iteration).
+extern ""C"" __global__ __launch_bounds__(256) void hrr_bind_accumulate(
+    const float* keyCodeReal, const float* keyCodeImag,
+    const float* valPermCodeReal, const float* valPermCodeImag,
+    const int* keyIds, const int* valIds,
+    float* memoryReal, float* memoryImag,
+    int N, int D)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+
+    float accR = memoryReal[d];
+    float accI = memoryImag[d];
+    for (int n = 0; n < N; n++) {
+        long long kOff = (long long)keyIds[n] * D;
+        long long vOff = (long long)valIds[n] * D;
+        float ar = keyCodeReal[kOff + d];
+        float ai = keyCodeImag[kOff + d];
+        float br = valPermCodeReal[vOff + d];
+        float bi = valPermCodeImag[vOff + d];
+        accR += ar * br - ai * bi;
+        accI += ar * bi + ai * br;
+    }
+    memoryReal[d] = accR;
+    memoryImag[d] = accI;
 }
 ";
         }

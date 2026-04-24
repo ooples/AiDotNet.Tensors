@@ -11,7 +11,11 @@ internal static class HipComplexKernels
         "split_complex_multiply", "split_complex_conjugate", "split_complex_magnitude",
         "split_complex_magnitude_squared", "split_complex_phase", "split_complex_from_polar",
         "split_complex_scale", "split_complex_add", "split_complex_cross_spectral",
-        "split_complex_topk", "softmax_rows"
+        "split_complex_topk", "softmax_rows",
+        // Issue #248 — HRR binding primitives
+        "hrr_unit_phase_codebook",
+        "hrr_phase_coherence_decode",
+        "hrr_bind_accumulate"
     };
 
     public static string GetSource()
@@ -152,6 +156,84 @@ extern ""C"" __global__ void softmax_rows(
     for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid+s]; __syncthreads(); }
     sumExp = sdata[0];
     for (int c = tid; c < cols; c += blockDim.x) rowOut[c] /= sumExp;
+}
+
+// ─── HRR binding primitives (issue #248) ────────────────────────────
+__device__ __forceinline__ float hrr_phase_from_cell(int seed, long long cellIdx)
+{
+    unsigned long long z = (unsigned long long)seed * 0x9E3779B97F4A7C15ULL
+                         + (unsigned long long)cellIdx * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z =  z ^ (z >> 31);
+    unsigned int top24 = (unsigned int)(z >> 40);
+    return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
+}
+
+extern ""C"" __global__ void hrr_unit_phase_codebook(
+    float* outReal, float* outImag,
+    int seed, int V, int D, int kPsk, int k)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)V * D;
+    if (idx >= total) return;
+    float phase = hrr_phase_from_cell(seed, idx);
+    if (kPsk) {
+        float step = 6.28318530717958647692f / (float)k;
+        phase = floorf(phase / step + 0.5f) * step;
+    }
+    float c, s;
+    sincosf(phase, &s, &c);
+    outReal[idx] = c;
+    outImag[idx] = s;
+}
+
+extern ""C"" __global__ void hrr_phase_coherence_decode(
+    const float* codesReal, const float* codesImag,
+    const float* queryReal, const float* queryImag,
+    float* outScores, int V, int D)
+{
+    extern __shared__ float sdata[];
+    int v = blockIdx.x;
+    int tid = threadIdx.x;
+    if (v >= V) return;
+    const float* cR = codesReal + (long long)v * D;
+    const float* cI = codesImag + (long long)v * D;
+    float acc = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        acc += cR[d] * queryReal[d] + cI[d] * queryImag[d];
+    }
+    sdata[tid] = acc; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) outScores[v] = sdata[0];
+}
+
+extern ""C"" __global__ void hrr_bind_accumulate(
+    const float* keyCodeReal, const float* keyCodeImag,
+    const float* valPermCodeReal, const float* valPermCodeImag,
+    const int* keyIds, const int* valIds,
+    float* memoryReal, float* memoryImag,
+    int N, int D)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    float accR = memoryReal[d];
+    float accI = memoryImag[d];
+    for (int n = 0; n < N; n++) {
+        long long kOff = (long long)keyIds[n] * D;
+        long long vOff = (long long)valIds[n] * D;
+        float ar = keyCodeReal[kOff + d];
+        float ai = keyCodeImag[kOff + d];
+        float br = valPermCodeReal[vOff + d];
+        float bi = valPermCodeImag[vOff + d];
+        accR += ar * br - ai * bi;
+        accI += ar * bi + ai * br;
+    }
+    memoryReal[d] = accR;
+    memoryImag[d] = accI;
 }
 ";
     }

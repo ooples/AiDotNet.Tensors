@@ -1766,6 +1766,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k) => Inner.SplitComplexTopK(inReal, inImag, outReal, outImag, n, k);
     public virtual void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols) => Inner.SoftmaxRows(input, output, rows, cols);
 
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+    public virtual void SplitComplexUnitPhaseCodebook(IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k) => Inner.SplitComplexUnitPhaseCodebook(outReal, outImag, seed, V, D, kPsk, k);
+    public virtual void SplitComplexPhaseCoherenceDecode(IGpuBuffer codesReal, IGpuBuffer codesImag, IGpuBuffer queryReal, IGpuBuffer queryImag, IGpuBuffer outScores, int V, int D) => Inner.SplitComplexPhaseCoherenceDecode(codesReal, codesImag, queryReal, queryImag, outScores, V, D);
+    public virtual void SplitComplexHrrBindAccumulate(IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag, IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag, IGpuBuffer keyIds, IGpuBuffer valIds, IGpuBuffer memoryReal, IGpuBuffer memoryImag, int N, int D) => Inner.SplitComplexHrrBindAccumulate(keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag, keyIds, valIds, memoryReal, memoryImag, N, D);
+
     /// <inheritdoc/>
     public virtual void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)

@@ -1741,6 +1741,87 @@ public sealed unsafe partial class VulkanBackend
         finally { rb.Dispose(); }
     }
 
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+    //
+    // Vulkan backend runs these through SIMD HRR kernels on CPU, then
+    // uploads the result. Matches the pattern of SoftmaxRows / TopK
+    // above, which also download-compute-upload. A follow-up could add
+    // GLSL compute shaders that keep the work on GPU, but the download
+    // path is correct + deterministic today.
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        long total = (long)V * D;
+        if (total <= 0) return;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+        var outR = new float[n];
+        var outI = new float[n];
+        Simd.SimdHrrKernels.UnitPhaseCodebookFloat(outR, outI, seed, V, D, kPsk, k);
+        var rBuf = AllocateBuffer(outR);
+        var iBuf = AllocateBuffer(outI);
+        try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
+        finally { rBuf.Dispose(); iBuf.Dispose(); }
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        var cR = DownloadBuffer(codesReal);
+        var cI = DownloadBuffer(codesImag);
+        var qR = DownloadBuffer(queryReal);
+        var qI = DownloadBuffer(queryImag);
+        var scores = new float[V];
+        Simd.SimdHrrKernels.PhaseCoherenceDecodeFloat(cR, cI, qR, qI, scores, V, D);
+        var sBuf = AllocateBuffer(scores);
+        try { Copy(sBuf, 0, outScores, 0, V); }
+        finally { sBuf.Dispose(); }
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        var kR = DownloadBuffer(keyCodeReal);
+        var kI = DownloadBuffer(keyCodeImag);
+        var vR = DownloadBuffer(valPermCodeReal);
+        var vI = DownloadBuffer(valPermCodeImag);
+        // Int buffers on Vulkan are stored as float reinterprets (see
+        // AllocateIntBuffer using Int32BitsToSingle). Download as floats
+        // and reinterpret back.
+        var kIds = ReinterpretAsInts(DownloadBuffer(keyIds));
+        var vIds = ReinterpretAsInts(DownloadBuffer(valIds));
+        var mR = DownloadBuffer(memoryReal);
+        var mI = DownloadBuffer(memoryImag);
+        Simd.SimdHrrKernels.HRRBindAccumulateFloat(
+            kR, kI, vR, vI, kIds, vIds, mR, mI, D);
+        var rBuf = AllocateBuffer(mR);
+        var iBuf = AllocateBuffer(mI);
+        try { Copy(rBuf, 0, memoryReal, 0, D); Copy(iBuf, 0, memoryImag, 0, D); }
+        finally { rBuf.Dispose(); iBuf.Dispose(); }
+    }
+
+    // Reverses AllocateIntBuffer's Int32BitsToSingleCompat reinterpret
+    // so the SIMD kernel sees the original int values. Uses the
+    // existing SingleToInt32BitsCompat (defined next to
+    // Int32BitsToSingleCompat elsewhere in the partial class).
+    private static int[] ReinterpretAsInts(float[] floats)
+    {
+        var ints = new int[floats.Length];
+        for (int i = 0; i < floats.Length; i++)
+            ints[i] = SingleToInt32BitsCompat(floats[i]);
+        return ints;
+    }
+
     /// <inheritdoc/>
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)

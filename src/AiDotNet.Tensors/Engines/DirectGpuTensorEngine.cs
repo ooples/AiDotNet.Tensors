@@ -15258,15 +15258,138 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    // Ops 3 (UnitPhaseCodebook), 4 (PhaseCoherenceDecode), 5
-    // (HRRBindAccumulate) don't override here yet — they inherit the CPU
-    // implementation via CpuEngine.virtual dispatch. Adding fused GPU
-    // kernels for these is the natural follow-up if the HRE campaign's
-    // workloads demand it (op 5 especially, being the hottest loop in
-    // memory build). The follow-up would extend IDirectGpuBackend with
-    // UnitPhaseCodebook / PhaseCoherenceDecode / HRRBindAccumulate
-    // primitives and implement them on each of the 6 backends (CUDA,
-    // OpenCL, HIP, Metal, Vulkan, WebGPU).
+    /// <inheritdoc />
+    public override void NativeUnitPhaseCodebook<T>(
+        Span<T> outRe, Span<T> outIm,
+        int seed, int V, int D, bool kPsk = false, int k = 0)
+    {
+        long total = (long)V * D;
+        if (typeof(T) != typeof(float)
+            || total <= 0 || total > int.MaxValue
+            || outRe.Length != total || outIm.Length != total
+            || !TryGetBackend(out var backend))
+        {
+            base.NativeUnitPhaseCodebook(outRe, outIm, seed, V, D, kPsk, k);
+            return;
+        }
+
+        try
+        {
+            int n = (int)total;
+            using var oRBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            using var oIBuf = new OwnedBuffer(backend.AllocateBuffer(n), true);
+            backend.SplitComplexUnitPhaseCodebook(
+                oRBuf.Buffer, oIBuf.Buffer, seed, V, D, kPsk, k);
+            var oRf = backend.DownloadBuffer(oRBuf.Buffer);
+            var oIf = backend.DownloadBuffer(oIBuf.Buffer);
+            HrrFloatArrayToSpan(oRf, outRe, n);
+            HrrFloatArrayToSpan(oIf, outIm, n);
+        }
+        catch
+        {
+            base.NativeUnitPhaseCodebook(outRe, outIm, seed, V, D, kPsk, k);
+        }
+    }
+
+    /// <inheritdoc />
+    public override void NativeComplexPhaseCoherenceDecode<T>(
+        ReadOnlySpan<T> codesRe, ReadOnlySpan<T> codesIm,
+        ReadOnlySpan<T> queryRe, ReadOnlySpan<T> queryIm,
+        Span<T> scores, int V, int D)
+    {
+        long total = (long)V * D;
+        if (typeof(T) != typeof(float)
+            || V <= 0 || D <= 0
+            || codesRe.Length != total || codesIm.Length != total
+            || queryRe.Length != D || queryIm.Length != D
+            || scores.Length != V
+            || !TryGetBackend(out var backend))
+        {
+            base.NativeComplexPhaseCoherenceDecode(codesRe, codesIm, queryRe, queryIm, scores, V, D);
+            return;
+        }
+
+        try
+        {
+            var cRf = HrrToFloatArray(codesRe);
+            var cIf = HrrToFloatArray(codesIm);
+            var qRf = HrrToFloatArray(queryRe);
+            var qIf = HrrToFloatArray(queryIm);
+            using var cRBuf = new OwnedBuffer(backend.AllocateBuffer(cRf), true);
+            using var cIBuf = new OwnedBuffer(backend.AllocateBuffer(cIf), true);
+            using var qRBuf = new OwnedBuffer(backend.AllocateBuffer(qRf), true);
+            using var qIBuf = new OwnedBuffer(backend.AllocateBuffer(qIf), true);
+            using var sBuf = new OwnedBuffer(backend.AllocateBuffer(V), true);
+            backend.SplitComplexPhaseCoherenceDecode(
+                cRBuf.Buffer, cIBuf.Buffer, qRBuf.Buffer, qIBuf.Buffer, sBuf.Buffer,
+                V, D);
+            var sF = backend.DownloadBuffer(sBuf.Buffer);
+            HrrFloatArrayToSpan(sF, scores, V);
+        }
+        catch
+        {
+            base.NativeComplexPhaseCoherenceDecode(codesRe, codesIm, queryRe, queryIm, scores, V, D);
+        }
+    }
+
+    /// <inheritdoc />
+    public override void NativeHRRBindAccumulate<T>(
+        ReadOnlySpan<T> keyCodeRe, ReadOnlySpan<T> keyCodeIm,
+        ReadOnlySpan<T> valPermCodeRe, ReadOnlySpan<T> valPermCodeIm,
+        ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
+        Span<T> memoryRe, Span<T> memoryIm, int D)
+    {
+        int N = keyIds.Length;
+        if (typeof(T) != typeof(float)
+            || D <= 0 || N <= 0
+            || valIds.Length != N
+            || memoryRe.Length != D || memoryIm.Length != D
+            || !TryGetBackend(out var backend))
+        {
+            base.NativeHRRBindAccumulate(
+                keyCodeRe, keyCodeIm, valPermCodeRe, valPermCodeIm,
+                keyIds, valIds, memoryRe, memoryIm, D);
+            return;
+        }
+
+        try
+        {
+            var kRf = HrrToFloatArray(keyCodeRe);
+            var kIf = HrrToFloatArray(keyCodeIm);
+            var vRf = HrrToFloatArray(valPermCodeRe);
+            var vIf = HrrToFloatArray(valPermCodeIm);
+            var kIds = keyIds.ToArray();
+            var vIds = valIds.ToArray();
+            var mRf = HrrToFloatArray((ReadOnlySpan<T>)memoryRe);
+            var mIf = HrrToFloatArray((ReadOnlySpan<T>)memoryIm);
+            using var kRBuf = new OwnedBuffer(backend.AllocateBuffer(kRf), true);
+            using var kIBuf = new OwnedBuffer(backend.AllocateBuffer(kIf), true);
+            using var vRBuf = new OwnedBuffer(backend.AllocateBuffer(vRf), true);
+            using var vIBuf = new OwnedBuffer(backend.AllocateBuffer(vIf), true);
+            using var kIdsBuf = new OwnedBuffer(backend.AllocateIntBuffer(kIds), true);
+            using var vIdsBuf = new OwnedBuffer(backend.AllocateIntBuffer(vIds), true);
+            using var mRBuf = new OwnedBuffer(backend.AllocateBuffer(mRf), true);
+            using var mIBuf = new OwnedBuffer(backend.AllocateBuffer(mIf), true);
+
+            backend.SplitComplexHrrBindAccumulate(
+                kRBuf.Buffer, kIBuf.Buffer,
+                vRBuf.Buffer, vIBuf.Buffer,
+                kIdsBuf.Buffer, vIdsBuf.Buffer,
+                mRBuf.Buffer, mIBuf.Buffer,
+                N, D);
+
+            var mRout = backend.DownloadBuffer(mRBuf.Buffer);
+            var mIout = backend.DownloadBuffer(mIBuf.Buffer);
+            HrrFloatArrayToSpan(mRout, memoryRe, D);
+            HrrFloatArrayToSpan(mIout, memoryIm, D);
+        }
+        catch
+        {
+            base.NativeHRRBindAccumulate(
+                keyCodeRe, keyCodeIm, valPermCodeRe, valPermCodeIm,
+                keyIds, valIds, memoryRe, memoryIm, D);
+        }
+    }
 
     // ── Span marshalling helpers for the HRR GPU overrides ──
     // Allocates a fresh float[] from a ReadOnlySpan<T> where T is known

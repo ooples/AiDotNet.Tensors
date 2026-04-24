@@ -1210,5 +1210,85 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         try { Copy(rb, 0, output, 0, rows * cols); }
         finally { rb.Dispose(); }
     }
+
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+    //
+    // Same download-compute-upload pattern as SoftmaxRows / TopK above.
+    // WGSL compute shaders would be a perf follow-up; the current path
+    // is correct + deterministic.
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        long total = (long)V * D;
+        if (total <= 0) return;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+        var outR = new float[n];
+        var outI = new float[n];
+        Simd.SimdHrrKernels.UnitPhaseCodebookFloat(outR, outI, seed, V, D, kPsk, k);
+        var rBuf = AllocateBuffer(outR);
+        var iBuf = AllocateBuffer(outI);
+        try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
+        finally { rBuf.Dispose(); iBuf.Dispose(); }
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        var cR = DownloadBuffer(codesReal);
+        var cI = DownloadBuffer(codesImag);
+        var qR = DownloadBuffer(queryReal);
+        var qI = DownloadBuffer(queryImag);
+        var scores = new float[V];
+        Simd.SimdHrrKernels.PhaseCoherenceDecodeFloat(cR, cI, qR, qI, scores, V, D);
+        var sBuf = AllocateBuffer(scores);
+        try { Copy(sBuf, 0, outScores, 0, V); }
+        finally { sBuf.Dispose(); }
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        var kR = DownloadBuffer(keyCodeReal);
+        var kI = DownloadBuffer(keyCodeImag);
+        var vR = DownloadBuffer(valPermCodeReal);
+        var vI = DownloadBuffer(valPermCodeImag);
+        var kIds = WebGpuHrrReinterpretAsInts(DownloadBuffer(keyIds));
+        var vIds = WebGpuHrrReinterpretAsInts(DownloadBuffer(valIds));
+        var mR = DownloadBuffer(memoryReal);
+        var mI = DownloadBuffer(memoryImag);
+        Simd.SimdHrrKernels.HRRBindAccumulateFloat(
+            kR, kI, vR, vI, kIds, vIds, mR, mI, D);
+        var rBuf = AllocateBuffer(mR);
+        var iBuf = AllocateBuffer(mI);
+        try { Copy(rBuf, 0, memoryReal, 0, D); Copy(iBuf, 0, memoryImag, 0, D); }
+        finally { rBuf.Dispose(); iBuf.Dispose(); }
+    }
+
+    // AllocateIntBuffer on WebGPU (see its impl) stores ints as float
+    // reinterprets via Int32BitsToSingle; this reverses that.
+    private static int[] WebGpuHrrReinterpretAsInts(float[] floats)
+    {
+        var ints = new int[floats.Length];
+        for (int i = 0; i < floats.Length; i++)
+        {
+#if NET5_0_OR_GREATER
+            ints[i] = BitConverter.SingleToInt32Bits(floats[i]);
+#else
+            unsafe { float v = floats[i]; ints[i] = *(int*)&v; }
+#endif
+        }
+        return ints;
+    }
 }
 #endif

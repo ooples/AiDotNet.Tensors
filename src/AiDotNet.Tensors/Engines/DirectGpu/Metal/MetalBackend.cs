@@ -1770,4 +1770,76 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         enc.SetBytes((uint)cols, (ulong)3);
         enc.DispatchThreadgroups(tg, tpg);
     }
+
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        long total = (long)V * D;
+        if (total <= 0) return;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+        EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_unit_phase_codebook");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(n);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(outReal), 0);
+        enc.SetBuffer(AsMetal(outImag), 1);
+        enc.SetBytes(seed, 2);
+        enc.SetBytes(V, 3);
+        enc.SetBytes(D, 4);
+        enc.SetBytes(kPsk ? 1 : 0, 5);
+        enc.SetBytes(k, 6);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_phase_coherence_decode");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(V);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(codesReal), 0);
+        enc.SetBuffer(AsMetal(codesImag), 1);
+        enc.SetBuffer(AsMetal(queryReal), 2);
+        enc.SetBuffer(AsMetal(queryImag), 3);
+        enc.SetBuffer(AsMetal(outScores), 4);
+        enc.SetBytes(V, 5);
+        enc.SetBytes(D, 6);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        EnsureComplexLibrary();
+        var pipeline = GetPipeline("Complex", _complexLibrary, "hrr_bind_accumulate");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(D);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(keyCodeReal), 0);
+        enc.SetBuffer(AsMetal(keyCodeImag), 1);
+        enc.SetBuffer(AsMetal(valPermCodeReal), 2);
+        enc.SetBuffer(AsMetal(valPermCodeImag), 3);
+        enc.SetBuffer(AsMetal(keyIds), 4);
+        enc.SetBuffer(AsMetal(valIds), 5);
+        enc.SetBuffer(AsMetal(memoryReal), 6);
+        enc.SetBuffer(AsMetal(memoryImag), 7);
+        enc.SetBytes(N, 8);
+        enc.SetBytes(D, 9);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
 }
