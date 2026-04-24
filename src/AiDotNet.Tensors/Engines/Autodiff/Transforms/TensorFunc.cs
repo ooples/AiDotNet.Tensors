@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Autodiff.ForwardAD;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -170,5 +171,82 @@ public static class TensorFunc<T>
         if (fn is null) throw new ArgumentNullException(nameof(fn));
         var lifted = GradAndValue(args => fn(args[0]), 0, createGraph);
         return x => lifted(new[] { x });
+    }
+
+    // ─── Forward-mode AD (Jvp) ────────────────────────────────────────
+
+    /// <summary>
+    /// Jacobian-vector product: runs <paramref name="dualFn"/> in
+    /// forward-mode dual arithmetic. Given primals <c>x</c> and
+    /// tangents <c>v</c>, returns <c>(f(x), ∂f/∂x · v)</c> in a single
+    /// pass without building a Jacobian explicitly.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>How to write <paramref name="dualFn"/>:</b></para>
+    /// <para>
+    /// The user function must operate on <see cref="Dual{T}"/>
+    /// tensors using <see cref="DualOps{T}"/> (e.g.
+    /// <c>DualOps&lt;T&gt;.Add</c>, <c>DualOps&lt;T&gt;.MatMul</c>).
+    /// Only ops that have a registered JVP rule participate in the
+    /// forward-mode computation; using a raw
+    /// <see cref="IEngine"/> op on <c>.Primal</c> inside the function
+    /// would compute the primal correctly but drop the tangent.
+    /// </para>
+    /// <para><b>Why this is useful beyond Grad:</b></para>
+    /// <para>
+    /// Forward-mode computes directional derivatives at
+    /// <c>O(output_dim)</c> cost independent of input dim. For short,
+    /// wide functions (few inputs, many outputs) forward-mode is
+    /// cheaper than reverse-mode and is the foundation of
+    /// <see cref="JacFwd"/> and forward-over-reverse Hessians.
+    /// </para>
+    /// </remarks>
+    /// <param name="engine">Engine used for primal + tangent
+    /// arithmetic. Must be non-null.</param>
+    /// <param name="dualFn">User function running over
+    /// <see cref="Dual{T}"/> tensors via <see cref="DualOps{T}"/>.</param>
+    /// <param name="primals">Primal input tensors.</param>
+    /// <param name="tangents">Tangent (direction) tensors — must
+    /// match <paramref name="primals"/> in count and shape.</param>
+    /// <returns>Tuple <c>(primalOutput, tangentOutput)</c>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if
+    /// <paramref name="engine"/>, <paramref name="dualFn"/>,
+    /// <paramref name="primals"/>, or <paramref name="tangents"/> is null.</exception>
+    /// <exception cref="ArgumentException">Thrown if
+    /// <paramref name="primals"/> and <paramref name="tangents"/> have
+    /// different lengths.</exception>
+    public static (Tensor<T> Primal, Tensor<T> Tangent) Jvp(
+        IEngine engine,
+        Func<Dual<T>[], Dual<T>> dualFn,
+        Tensor<T>[] primals,
+        Tensor<T>[] tangents)
+    {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
+        if (primals is null) throw new ArgumentNullException(nameof(primals));
+        if (tangents is null) throw new ArgumentNullException(nameof(tangents));
+        if (primals.Length != tangents.Length)
+            throw new ArgumentException(
+                $"primals and tangents must have the same length — got {primals.Length} and {tangents.Length}.");
+
+        var duals = new Dual<T>[primals.Length];
+        for (int i = 0; i < duals.Length; i++)
+            duals[i] = new Dual<T>(primals[i], tangents[i]);
+        var result = dualFn(duals);
+        return (result.Primal, result.Tangent);
+    }
+
+    /// <summary>
+    /// Single-input JVP overload.
+    /// </summary>
+    public static (Tensor<T> Primal, Tensor<T> Tangent) Jvp(
+        IEngine engine,
+        Func<Dual<T>, Dual<T>> dualFn,
+        Tensor<T> primal,
+        Tensor<T> tangent)
+    {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
+        return Jvp(engine, duals => dualFn(duals[0]), new[] { primal }, new[] { tangent });
     }
 }
