@@ -1,6 +1,11 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Phase 1 of issue #214: InferenceMode scope, higher-order gradients,
 // TensorFunc.Grad / GradAndValue.
+//
+// Nullable disabled for the ArgumentNullException-testing scenarios
+// — see CLAUDE.md ban on null-forgiving operators in production code.
+
+#nullable disable
 
 using System;
 using AiDotNet.Tensors.Engines;
@@ -210,7 +215,7 @@ public class TorchFuncPhase1Tests
     public void TensorFunc_Grad_ArgumentValidation()
     {
         Assert.Throws<ArgumentNullException>(
-            () => TensorFunc<float>.Grad((Func<Tensor<float>[], Tensor<float>>)null!));
+            () => TensorFunc<float>.Grad((Func<Tensor<float>[], Tensor<float>>)null));
         Assert.Throws<ArgumentOutOfRangeException>(
             () => TensorFunc<float>.Grad(args => args[0], argIndex: -1));
 

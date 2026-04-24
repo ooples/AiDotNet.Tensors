@@ -271,22 +271,25 @@ public static class TensorFunc<T>
         if (fn is null) throw new ArgumentNullException(nameof(fn));
         if (primals is null) throw new ArgumentNullException(nameof(primals));
 
-        var tape = new GradientTape<float>();
-        // We need a fresh tape per invocation; re-run forward each time
-        // the VJP closure is called so the backward walk sees the graph.
-        var fwdOutput = fn(primals);
+        // Run fn once in a NoGrad scope to produce the forward output
+        // the caller wants back — the closure re-runs fn inside a
+        // fresh tape each time VjpFn is invoked, so the outer run does
+        // not need to record.
+        Tensor<T> fwdOutput;
+        using (GradientTape<T>.NoGrad())
+        {
+            fwdOutput = fn(primals);
+        }
 
         Tensor<T>[] VjpClosure(Tensor<T> cotangent)
         {
             if (cotangent is null) throw new ArgumentNullException(nameof(cotangent));
-            using var t = new GradientTape<T>(new GradientTapeOptions { Persistent = true });
+            using var t = new GradientTape<T>();
             var output = fn(primals);
-            // Compute gradients seeded by cotangent. The existing tape
-            // API seeds with ones when loss is scalar and uses the
-            // loss tensor verbatim otherwise; to seed with a custom
-            // cotangent we multiply by cotangent and sum, then the
-            // scalar gradient chain lands the cotangent product on
-            // each primal.
+            // Seed backward with v^T by multiplying output by the
+            // cotangent and summing — the chain rule then deposits
+            // (∂output/∂primal)ᵀ · cotangent on each primal, which is
+            // exactly the VJP.
             var weighted = AiDotNetEngine.Current.TensorMultiply(output, cotangent);
             var scalar = SumToScalarTensor(weighted);
             var grads = t.ComputeGradients(scalar, primals);
@@ -495,6 +498,17 @@ public static class TensorFunc<T>
                     $"Vmap batch dimension has size {batchSize}; must be > 0.",
                     nameof(input));
 
+            // Our stride math below assumes a contiguous row-major
+            // storage at offset 0 — views (transpose, slice) have
+            // non-trivial strides and/or a non-zero storage offset,
+            // so materialize up front. This matches what other
+            // AsSpan()-consuming code paths do (e.g. Tensor.cs TensorAdd
+            // fallback). Skipped for tensors that already satisfy the
+            // invariant to avoid the copy.
+            var workingInput = input;
+            if (!workingInput.IsContiguous || workingInput._storageOffset != 0)
+                workingInput = workingInput.Contiguous();
+
             // Slice the input along inDim and apply fn to each slice.
             var slices = new Tensor<T>[batchSize];
             var unbatchedShape = new int[inShape.Length - 1];
@@ -512,7 +526,7 @@ public static class TensorFunc<T>
             int strideAfter = 1;
             for (int k = normIn + 1; k < inShape.Length; k++) strideAfter *= inShape[k];
 
-            var inData = input.AsSpan();
+            var inData = workingInput.AsSpan();
             for (int b = 0; b < batchSize; b++)
             {
                 var sliceData = new T[innerCount];
@@ -560,7 +574,13 @@ public static class TensorFunc<T>
 
             for (int b = 0; b < batchSize; b++)
             {
-                var sliceData = outs[b].AsSpan();
+                // The user's fn may have returned a view (transpose,
+                // slice) whose flat span does not match its logical
+                // layout. Materialize before reading.
+                var sliceTensor = outs[b];
+                if (!sliceTensor.IsContiguous || sliceTensor._storageOffset != 0)
+                    sliceTensor = sliceTensor.Contiguous();
+                var sliceData = sliceTensor.AsSpan();
                 int sliceIdx = 0;
                 for (int before = 0; before < outStrideBefore; before++)
                 {

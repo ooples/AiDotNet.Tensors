@@ -350,7 +350,11 @@ public class GradientTapeFeatureTests
         // log(0) = -inf, gradient of log at 0 = 1/0 = inf
         var y = _engine.TensorLog(x);
 
-        Assert.Throws<ArithmeticException>(() =>
+        // Anomaly detection throws the dedicated AnomalyDetectedException
+        // (which inherits from ArithmeticException for back-compat).
+        // Use ThrowsAny<> so the test stays green whether callers want
+        // the specific subtype or the base class.
+        Assert.ThrowsAny<ArithmeticException>(() =>
             tape.ComputeGradients(y, sources: new[] { x }));
     }
 

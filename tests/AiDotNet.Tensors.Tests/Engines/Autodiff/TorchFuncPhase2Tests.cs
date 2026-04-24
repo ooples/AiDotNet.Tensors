@@ -1,5 +1,10 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Phase 2 of issue #214: forward-mode AD (Dual<T>, DualOps<T>, Jvp).
+//
+// Nullable disabled for the ArgumentNullException-testing scenarios
+// — see CLAUDE.md ban on null-forgiving operators in production code.
+
+#nullable disable
 
 using System;
 using AiDotNet.Tensors.Engines;
@@ -205,9 +210,9 @@ public class TorchFuncPhase2Tests
     public void Jvp_ArgumentValidation()
     {
         Assert.Throws<ArgumentNullException>(
-            () => TensorFunc<float>.Jvp(null!, (Dual<float>[] _) => default, new Tensor<float>[0], new Tensor<float>[0]));
+            () => TensorFunc<float>.Jvp(null, (Dual<float>[] _) => default, new Tensor<float>[0], new Tensor<float>[0]));
         Assert.Throws<ArgumentNullException>(
-            () => TensorFunc<float>.Jvp(_engine, (Func<Dual<float>[], Dual<float>>)null!, new Tensor<float>[0], new Tensor<float>[0]));
+            () => TensorFunc<float>.Jvp(_engine, (Func<Dual<float>[], Dual<float>>)null, new Tensor<float>[0], new Tensor<float>[0]));
 
         var x = new Tensor<float>(new[] { 1f }, new[] { 1 });
         Assert.Throws<ArgumentException>(

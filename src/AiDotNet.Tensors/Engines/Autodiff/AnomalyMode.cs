@@ -4,7 +4,6 @@
 
 using System;
 using System.Runtime.CompilerServices;
-using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
@@ -45,6 +44,7 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 public sealed class AnomalyModeScope : IDisposable
 {
+    [ThreadStatic]
     private static int _activeCount;
 
     private readonly string? _enteredAt;
@@ -52,19 +52,20 @@ public sealed class AnomalyModeScope : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Gets whether any anomaly-mode scope is currently active on any
-    /// thread. Read by <see cref="GradientTape{T}"/> when deciding
-    /// whether to run the per-step NaN/Inf check.
+    /// Gets whether an anomaly-mode scope is currently active on the
+    /// calling thread. Read by <see cref="GradientTape{T}.ComputeGradients"/>
+    /// when deciding whether to run the per-step NaN/Inf check.
     /// </summary>
     /// <remarks>
-    /// This is a process-wide volatile counter (not thread-local) —
-    /// matching the observable behaviour of PyTorch's
-    /// <c>set_detect_anomaly</c>. Users who need finer-grained
-    /// control can instead set
-    /// <see cref="GradientTape{T}.DetectAnomaly"/> directly on a
-    /// specific tape.
+    /// Thread-local — matches the scoping of
+    /// <see cref="NoGradScope{T}"/> and
+    /// <see cref="InferenceModeScope{T}"/>, so one thread entering
+    /// anomaly mode does not impose the ~cost-per-grad check on other
+    /// threads running unrelated training. Users who want finer-grained
+    /// control can set <see cref="GradientTape{T}.DetectAnomaly"/>
+    /// directly on a specific tape instead.
     /// </remarks>
-    public static bool IsActive => Volatile.Read(ref _activeCount) > 0;
+    public static bool IsActive => _activeCount > 0;
 
     /// <summary>
     /// Gets the source file (<see cref="CallerFilePathAttribute"/>)
@@ -89,7 +90,7 @@ public sealed class AnomalyModeScope : IDisposable
     {
         _enteredAt = enteredAt;
         _enteredAtLine = enteredAtLine;
-        Interlocked.Increment(ref _activeCount);
+        _activeCount++;
     }
 
     /// <inheritdoc/>
@@ -97,7 +98,7 @@ public sealed class AnomalyModeScope : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        Interlocked.Decrement(ref _activeCount);
+        _activeCount--;
     }
 }
 
@@ -108,7 +109,13 @@ public sealed class AnomalyModeScope : IDisposable
 /// the forward op name and — when the op was recorded with
 /// <see cref="CallerFilePathAttribute"/> info — the source site.
 /// </summary>
-public sealed class AnomalyDetectedException : Exception
+/// <remarks>
+/// Derives from <see cref="ArithmeticException"/> so existing catch
+/// clauses written for NaN/Inf arithmetic failures (including the
+/// pre-anomaly-scope tape path that threw <c>ArithmeticException</c>
+/// directly) continue to match.
+/// </remarks>
+public sealed class AnomalyDetectedException : ArithmeticException
 {
     /// <summary>Gets the name of the forward op whose backward
     /// produced a NaN/Inf.</summary>

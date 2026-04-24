@@ -216,7 +216,11 @@ public sealed class GradientTape<T> : IDisposable
         // Graph-based backward: walk GradFn pointers instead of tape.
         // This is faster because it skips tape traversal, dict lookups, and relevance checks.
         // Skip graph path when anomaly detection or hooks are enabled — the tape path handles those.
-        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
+        // The graph path bypasses the NaN/Inf check — force the slower
+        // tape path whenever anomaly detection is on, either via the
+        // per-tape flag or an ambient AnomalyModeScope. Same reasoning
+        // that exists for DetectAnomaly extends to the scope.
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered)
         {
             // Record step pattern BEFORE backward — backward ops get recorded on the tape
             // (since DifferentiableOps always records), which would make the hash nondeterministic.
@@ -315,7 +319,11 @@ public sealed class GradientTape<T> : IDisposable
             bool profileEnabled = ProfileBackward;
 
             // Walk tape in reverse (reverse-mode AD)
-            var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
+            // Anomaly detection fires when EITHER the per-tape flag is set
+            // (local opt-in) OR an AnomalyModeScope is active on this thread
+            // (process-wide opt-in, mirroring torch.autograd.set_detect_anomaly).
+            bool anomalyActive = DetectAnomaly || AnomalyModeScope.IsActive;
+            var numOpsForAnomaly = anomalyActive ? MathHelper.GetNumericOperations<T>() : null;
 
             // Tape backward pruning: when sources are specified, forward-walk to find all tensors
             // downstream of those sources. Skip entries whose output is not reachable.
@@ -399,7 +407,11 @@ public sealed class GradientTape<T> : IDisposable
                     System.Console.WriteLine($"  backward[{entry.OperationName}]");
                 }
 
-                // Anomaly detection (only when explicitly enabled)
+                // Anomaly detection (only when explicitly enabled — either
+                // tape.DetectAnomaly or an AnomalyModeScope). Throws the
+                // dedicated AnomalyDetectedException so callers can catch
+                // autograd anomalies without a broader ArithmeticException
+                // match.
                 if (numOpsForAnomaly is not null)
                 {
                     foreach (var input in inputsArray)
@@ -410,9 +422,7 @@ public sealed class GradientTape<T> : IDisposable
                             {
                                 double val = numOpsForAnomaly.ToDouble(inputGrad[k]);
                                 if (double.IsNaN(val) || double.IsInfinity(val))
-                                    throw new ArithmeticException(
-                                        $"Op '{entry.OperationName}' backward produced {(double.IsNaN(val) ? "NaN" : "Inf")} " +
-                                        $"at input gradient index {k}. Check forward inputs for numerical issues.");
+                                    throw new AnomalyDetectedException(entry.OperationName);
                             }
                         }
                     }
