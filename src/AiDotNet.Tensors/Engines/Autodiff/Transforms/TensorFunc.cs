@@ -249,4 +249,417 @@ public static class TensorFunc<T>
         if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
         return Jvp(engine, duals => dualFn(duals[0]), new[] { primal }, new[] { tangent });
     }
+
+    // ─── Reverse-mode (Vjp) ───────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the forward output of <paramref name="fn"/> along with
+    /// a VJP closure that computes <c>v<sup>T</sup> · J</c> for any
+    /// cotangent <paramref name="fn"/>-output-shaped tensor supplied
+    /// later. Matches <c>torch.func.vjp</c>.
+    /// </summary>
+    /// <remarks>
+    /// The closure reuses the same <see cref="GradientTape{T}"/> that
+    /// recorded the forward pass, so each invocation re-runs backward
+    /// from scratch with a different cotangent seed. For repeated use
+    /// the caller should cache the result of the closure.
+    /// </remarks>
+    public static (Tensor<T> Output, Func<Tensor<T>, Tensor<T>[]> VjpFn) Vjp(
+        Func<Tensor<T>[], Tensor<T>> fn,
+        params Tensor<T>[] primals)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+        if (primals is null) throw new ArgumentNullException(nameof(primals));
+
+        var tape = new GradientTape<float>();
+        // We need a fresh tape per invocation; re-run forward each time
+        // the VJP closure is called so the backward walk sees the graph.
+        var fwdOutput = fn(primals);
+
+        Tensor<T>[] VjpClosure(Tensor<T> cotangent)
+        {
+            if (cotangent is null) throw new ArgumentNullException(nameof(cotangent));
+            using var t = new GradientTape<T>(new GradientTapeOptions { Persistent = true });
+            var output = fn(primals);
+            // Compute gradients seeded by cotangent. The existing tape
+            // API seeds with ones when loss is scalar and uses the
+            // loss tensor verbatim otherwise; to seed with a custom
+            // cotangent we multiply by cotangent and sum, then the
+            // scalar gradient chain lands the cotangent product on
+            // each primal.
+            var weighted = AiDotNetEngine.Current.TensorMultiply(output, cotangent);
+            var scalar = SumToScalarTensor(weighted);
+            var grads = t.ComputeGradients(scalar, primals);
+            var result = new Tensor<T>[primals.Length];
+            for (int i = 0; i < primals.Length; i++)
+                result[i] = grads.TryGetValue(primals[i], out var g) ? g : ZeroLike(primals[i]);
+            return result;
+        }
+
+        return (fwdOutput, VjpClosure);
+    }
+
+    // ─── Jacobians ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Jacobian of <paramref name="fn"/> computed by reverse-mode —
+    /// one backward pass per output element. For <c>f: ℝⁿ → ℝᵐ</c>
+    /// this returns an <c>[m, n]</c> matrix. Preferred over
+    /// <see cref="JacFwd"/> when the output dimension is smaller than
+    /// the input dimension (cost is <c>O(m · backward)</c>).
+    /// </summary>
+    /// <remarks>
+    /// Implementation: seed a unit cotangent on each output element,
+    /// run <see cref="GradientTape{T}.ComputeGradients"/>, stack the
+    /// resulting gradient rows. Matches <c>torch.func.jacrev</c>.
+    /// </remarks>
+    public static Func<Tensor<T>, Tensor<T>> JacRev(Func<Tensor<T>, Tensor<T>> fn)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+
+        return x =>
+        {
+            if (x is null) throw new ArgumentNullException(nameof(x));
+
+            // Probe output shape by running fn once. We do NOT wrap the
+            // probe in NoGrad — if fn's implementation happens to build
+            // its own internal tape (e.g., when JacRev composes with
+            // Grad to form Hessian), NoGrad would suppress that inner
+            // tape too and produce a "no recorded operations" failure.
+            // Any entries the probe adds to an outer tape are harmless:
+            // the loop below creates a fresh tape per iteration.
+            int m;
+            int[] probeShape;
+            {
+                var probe = fn(x);
+                m = probe.Length;
+                probeShape = (int[])probe._shape.Clone();
+            }
+            int n = x.Length;
+
+            var rows = new Tensor<T>[m];
+            var ops = MathHelper.GetNumericOperations<T>();
+            var zero = ops.Zero;
+            var one = ops.One;
+
+            for (int i = 0; i < m; i++)
+            {
+                using var tape = new GradientTape<T>();
+                var output = fn(x);
+                // Seed a unit cotangent at output position i by multiplying
+                // by a selector that's 1 at position i and 0 elsewhere.
+                // ComputeGradients seeds ones-of-loss-shape; zeros in the
+                // selector contribute nothing to the gradient, leaving only
+                // position i's contribution — equivalent to seeding e_i.
+                // Using the tape multiply (not a plain ctor) keeps the
+                // result connected to the computation graph so the backward
+                // walk has an entry to traverse even when fn is the identity.
+                var selectorData = new T[m];
+                for (int k = 0; k < m; k++) selectorData[k] = (k == i) ? one : zero;
+                var selector = new Tensor<T>(selectorData, probeShape);
+                var masked = AiDotNetEngine.Current.TensorMultiply(output, selector);
+                var grads = tape.ComputeGradients(masked, new[] { x });
+                rows[i] = grads.TryGetValue(x, out var g) ? g : ZeroLike(x);
+            }
+
+            // Stack rows into an [m, n] matrix.
+            var data = new T[m * n];
+            for (int i = 0; i < m; i++)
+            {
+                var row = rows[i].AsSpan();
+                for (int j = 0; j < n; j++) data[i * n + j] = row[j];
+            }
+            return new Tensor<T>(data, new[] { m, n });
+        };
+    }
+
+    /// <summary>
+    /// Jacobian of <paramref name="fn"/> computed by forward-mode —
+    /// one JVP pass per input element. Preferred over
+    /// <see cref="JacRev(Func{Tensor{T}, Tensor{T}})"/> when the input
+    /// dimension is smaller than the output dimension (cost is
+    /// <c>O(n · forward)</c>).
+    /// </summary>
+    /// <remarks>
+    /// Requires the user function to be written using
+    /// <see cref="DualOps{T}"/> so the tangent propagates through each
+    /// op. Matches <c>torch.func.jacfwd</c>.
+    /// </remarks>
+    public static Func<Tensor<T>, Tensor<T>> JacFwd(
+        IEngine engine,
+        Func<Dual<T>, Dual<T>> dualFn)
+    {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
+
+        return x =>
+        {
+            if (x is null) throw new ArgumentNullException(nameof(x));
+            int n = x.Length;
+            var ops = MathHelper.GetNumericOperations<T>();
+            var zero = ops.Zero;
+            var one = ops.One;
+
+            // Probe output shape.
+            var zeroData = new T[n];
+            for (int k = 0; k < n; k++) zeroData[k] = zero;
+            var zeroTangent = new Tensor<T>(zeroData, (int[])x._shape.Clone());
+            var probeDual = new Dual<T>(x, zeroTangent);
+            var probeOut = dualFn(probeDual);
+            int m = probeOut.Primal.Length;
+
+            var cols = new Tensor<T>[n];
+            for (int j = 0; j < n; j++)
+            {
+                var tangentData = new T[n];
+                for (int k = 0; k < n; k++) tangentData[k] = (k == j) ? one : zero;
+                var tangent = new Tensor<T>(tangentData, (int[])x._shape.Clone());
+                var result = dualFn(new Dual<T>(x, tangent));
+                cols[j] = result.Tangent;
+            }
+
+            // Stack columns into [m, n] Jacobian.
+            var data = new T[m * n];
+            for (int j = 0; j < n; j++)
+            {
+                var col = cols[j].AsSpan();
+                for (int i = 0; i < m; i++) data[i * n + j] = col[i];
+            }
+            return new Tensor<T>(data, new[] { m, n });
+        };
+    }
+
+    // ─── Hessian ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Hessian of a scalar-valued <paramref name="fn"/> — returns an
+    /// <c>[n, n]</c> matrix of second partial derivatives at the
+    /// input point. Implemented as <c>JacRev(Grad(fn))</c>, requiring
+    /// only reverse-mode AD (no dual-number rewrite of the user fn).
+    /// </summary>
+    /// <remarks>
+    /// Uses <see cref="GradientTape{T}.ComputeGradients"/> with
+    /// <c>createGraph: true</c> under the hood so the gradient itself
+    /// is differentiable. Cost: <c>O(n · backward²)</c>. Matches
+    /// <c>torch.func.hessian</c>.
+    /// </remarks>
+    public static Func<Tensor<T>, Tensor<T>> Hessian(Func<Tensor<T>, Tensor<T>> fn)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+        var gradFn = Grad(fn, createGraph: true);
+        return JacRev(gradFn);
+    }
+
+    // ─── vmap ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Batched function execution — runs <paramref name="fn"/>
+    /// independently for each index along
+    /// <paramref name="inDim"/> of the input, stacking the results
+    /// along <paramref name="outDim"/>. Matches
+    /// <c>torch.func.vmap</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Current implementation:</b> explicit loop over the
+    /// batch dimension. The graph-level fusion optimization
+    /// (vmap-through-<see cref="Compilation.LazyTensorScope"/>) is a
+    /// planned follow-up — this implementation is a correct baseline
+    /// that matches the PyTorch semantics and keeps the rest of the
+    /// torch.func surface usable today.</para>
+    /// <para><b>Shape contract:</b> input must be at least rank-1 and
+    /// have <c>size &gt;= 1</c> along <paramref name="inDim"/>. The
+    /// output is stacked along <paramref name="outDim"/> with size
+    /// equal to the input's size along <paramref name="inDim"/>.</para>
+    /// </remarks>
+    public static Func<Tensor<T>, Tensor<T>> Vmap(
+        Func<Tensor<T>, Tensor<T>> fn,
+        int inDim = 0,
+        int outDim = 0)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+
+        return input =>
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            var inShape = input._shape;
+            if (inShape.Length == 0)
+                throw new ArgumentException("Vmap input must be at least rank-1.", nameof(input));
+            int normIn = inDim < 0 ? inDim + inShape.Length : inDim;
+            if ((uint)normIn >= (uint)inShape.Length)
+                throw new ArgumentOutOfRangeException(nameof(inDim),
+                    $"inDim {inDim} out of range for rank-{inShape.Length} input.");
+
+            int batchSize = inShape[normIn];
+            if (batchSize <= 0)
+                throw new ArgumentException(
+                    $"Vmap batch dimension has size {batchSize}; must be > 0.",
+                    nameof(input));
+
+            // Slice the input along inDim and apply fn to each slice.
+            var slices = new Tensor<T>[batchSize];
+            var unbatchedShape = new int[inShape.Length - 1];
+            int idx = 0;
+            for (int k = 0; k < inShape.Length; k++)
+                if (k != normIn) unbatchedShape[idx++] = inShape[k];
+
+            int innerCount = 1;
+            for (int k = 0; k < unbatchedShape.Length; k++) innerCount *= unbatchedShape[k];
+
+            // Compute stride products for indexing along inDim.
+            int strideBefore = 1;
+            for (int k = 0; k < normIn; k++) strideBefore *= inShape[k];
+            int strideAt = inShape[normIn];
+            int strideAfter = 1;
+            for (int k = normIn + 1; k < inShape.Length; k++) strideAfter *= inShape[k];
+
+            var inData = input.AsSpan();
+            for (int b = 0; b < batchSize; b++)
+            {
+                var sliceData = new T[innerCount];
+                int outIdx = 0;
+                for (int before = 0; before < strideBefore; before++)
+                {
+                    for (int after = 0; after < strideAfter; after++)
+                    {
+                        int srcIdx = (before * strideAt + b) * strideAfter + after;
+                        sliceData[outIdx++] = inData[srcIdx];
+                    }
+                }
+                slices[b] = new Tensor<T>(sliceData, unbatchedShape);
+            }
+
+            // Apply fn to each slice.
+            var outs = new Tensor<T>[batchSize];
+            for (int b = 0; b < batchSize; b++) outs[b] = fn(slices[b]);
+
+            // Stack along outDim.
+            var perOutShape = outs[0]._shape;
+            int outRank = perOutShape.Length + 1;
+            int normOut = outDim < 0 ? outDim + outRank : outDim;
+            if ((uint)normOut >= (uint)outRank)
+                throw new ArgumentOutOfRangeException(nameof(outDim),
+                    $"outDim {outDim} out of range for rank-{outRank} output.");
+
+            var stackedShape = new int[outRank];
+            int psIdx = 0;
+            for (int k = 0; k < outRank; k++)
+            {
+                if (k == normOut) stackedShape[k] = batchSize;
+                else stackedShape[k] = perOutShape[psIdx++];
+            }
+
+            int stackedLen = 1;
+            for (int k = 0; k < outRank; k++) stackedLen *= stackedShape[k];
+            var stackedData = new T[stackedLen];
+
+            int outStrideBefore = 1;
+            for (int k = 0; k < normOut; k++) outStrideBefore *= stackedShape[k];
+            int outStrideAt = batchSize;
+            int outStrideAfter = 1;
+            for (int k = normOut + 1; k < outRank; k++) outStrideAfter *= stackedShape[k];
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                var sliceData = outs[b].AsSpan();
+                int sliceIdx = 0;
+                for (int before = 0; before < outStrideBefore; before++)
+                {
+                    for (int after = 0; after < outStrideAfter; after++)
+                    {
+                        int destIdx = (before * outStrideAt + b) * outStrideAfter + after;
+                        stackedData[destIdx] = sliceData[sliceIdx++];
+                    }
+                }
+            }
+
+            return new Tensor<T>(stackedData, stackedShape);
+        };
+    }
+
+    // ─── functional_call ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Stateless module application — runs <paramref name="fn"/> with
+    /// <paramref name="parameters"/> substituted for the module's own
+    /// parameters via <paramref name="parameterBuffer"/>. The
+    /// parameter buffer's backing storage is overwritten for the
+    /// duration of the call and restored afterwards. Matches
+    /// <c>torch.func.functional_call</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Zero-copy swap:</b> we copy the incoming flat
+    /// parameter vector into the buffer's single contiguous storage
+    /// and snapshot the original values for restore in the finally
+    /// block. PyTorch has to clone the entire state dict; we get to
+    /// reuse the existing buffer and its per-parameter views.</para>
+    /// <para><b>Use case:</b> MAML-style meta-learning, implicit
+    /// layers, weight ensembling — anything that needs to evaluate
+    /// the same model under a different parameter vector without
+    /// constructing a new module.</para>
+    /// </remarks>
+    public static Tensor<T> FunctionalCall(
+        ParameterBuffer<T> parameterBuffer,
+        Vector<T> parameters,
+        Func<Tensor<T>> fn)
+    {
+        if (parameterBuffer is null) throw new ArgumentNullException(nameof(parameterBuffer));
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+
+        // Snapshot current parameters so we can restore them.
+        var saved = parameterBuffer.AsVector();
+        var savedCopy = new Vector<T>(saved.Length);
+        for (int i = 0; i < saved.Length; i++) savedCopy[i] = saved[i];
+        try
+        {
+            parameterBuffer.CopyFrom(parameters);
+            return fn();
+        }
+        finally
+        {
+            parameterBuffer.CopyFrom(savedCopy);
+        }
+    }
+
+    // ─── helpers ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Sums all elements of a tensor and returns a <c>[1]</c>-shaped
+    /// tensor, using engine ops so the result participates in the
+    /// current gradient tape. The plain <c>IEngine.TensorSum</c>
+    /// returns a raw <c>T</c> (not a <see cref="Tensor{T}"/>), so
+    /// wrapping the result in a fresh ctor would sever the graph —
+    /// this helper avoids that by expressing "sum all" as an
+    /// <c>[1, n] · [n, 1]</c> matmul with a ones vector, which does
+    /// record on the tape.
+    /// </summary>
+    /// <remarks>
+    /// Useful when writing scalar-valued functions for
+    /// <see cref="Grad(Func{Tensor{T}, Tensor{T}}, bool)"/>,
+    /// <see cref="Hessian"/>, or any transform that seeds the backward
+    /// pass with a unit cotangent on the output.
+    /// </remarks>
+    public static Tensor<T> SumToScalarTensor(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        var engine = AiDotNetEngine.Current;
+        int n = tensor.Length;
+        var row = engine.Reshape(tensor, new[] { 1, n });
+        var ops = MathHelper.GetNumericOperations<T>();
+        var one = ops.One;
+        var onesData = new T[n];
+        for (int i = 0; i < n; i++) onesData[i] = one;
+        var col = new Tensor<T>(onesData, new[] { n, 1 });
+        var one_by_one = engine.TensorMatMul(row, col);
+        return engine.Reshape(one_by_one, new[] { 1 });
+    }
+
+    private static Tensor<T> ZeroLike(Tensor<T> template)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var zero = ops.Zero;
+        var data = new T[template.Length];
+        for (int i = 0; i < data.Length; i++) data[i] = zero;
+        return new Tensor<T>(data, (int[])template._shape.Clone());
+    }
 }
