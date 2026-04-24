@@ -1213,9 +1213,13 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
     //
-    // Same download-compute-upload pattern as SoftmaxRows / TopK above.
-    // WGSL compute shaders would be a perf follow-up; the current path
-    // is correct + deterministic.
+    // Native WGSL compute shaders — work stays on the GPU end-to-end.
+    // Per-cell phases use a 32-bit Murmur3 fmix; deterministic within
+    // the WebGPU backend (same seed + same (V, D) → identical output)
+    // but does not bit-match the CPU xorshift64* or CUDA splitmix64
+    // sequences. Cross-device bit-identity is not part of the contract.
+
+    private const string HrrModuleKey = "Hrr";
 
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
@@ -1224,14 +1228,21 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         if (total <= 0) return;
         if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
         if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
-        int n = (int)total;
-        var outR = new float[n];
-        var outI = new float[n];
-        Simd.SimdHrrKernels.UnitPhaseCodebookFloat(outR, outI, seed, V, D, kPsk, k);
-        var rBuf = AllocateBuffer(outR);
-        var iBuf = AllocateBuffer(outI);
-        try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
-        finally { rBuf.Dispose(); iBuf.Dispose(); }
+        SplitComplexUnitPhaseCodebookAsync(outReal, outImag, seed, (int)total, V, D, kPsk, k).GetAwaiter().GetResult();
+    }
+
+    private async Task SplitComplexUnitPhaseCodebookAsync(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int total, int V, int D, bool kPsk, int k)
+    {
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":UnitPhaseCodebook", WebGpuHrrKernels.UnitPhaseCodebook, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(seed, V, D, kPsk ? 1 : 0, k, total),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe, AsWgpu(outReal), AsWgpu(outImag));
+        var (wg, _) = _device.CalculateWorkgroups1D(total, 256);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
     public void SplitComplexPhaseCoherenceDecode(
@@ -1240,15 +1251,25 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         IGpuBuffer outScores, int V, int D)
     {
         if (V <= 0 || D <= 0) return;
-        var cR = DownloadBuffer(codesReal);
-        var cI = DownloadBuffer(codesImag);
-        var qR = DownloadBuffer(queryReal);
-        var qI = DownloadBuffer(queryImag);
-        var scores = new float[V];
-        Simd.SimdHrrKernels.PhaseCoherenceDecodeFloat(cR, cI, qR, qI, scores, V, D);
-        var sBuf = AllocateBuffer(scores);
-        try { Copy(sBuf, 0, outScores, 0, V); }
-        finally { sBuf.Dispose(); }
+        SplitComplexPhaseCoherenceDecodeAsync(codesReal, codesImag, queryReal, queryImag, outScores, V, D).GetAwaiter().GetResult();
+    }
+
+    private async Task SplitComplexPhaseCoherenceDecodeAsync(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":PhaseCoherenceDecode", WebGpuHrrKernels.PhaseCoherenceDecode, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(V, D),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(codesReal), AsWgpu(codesImag), AsWgpu(queryReal), AsWgpu(queryImag), AsWgpu(outScores));
+        // Workgroup size in shader is 64 — matches dispatch calc below.
+        var (wg, _) = _device.CalculateWorkgroups1D(V, 64);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
     public void SplitComplexHrrBindAccumulate(
@@ -1259,36 +1280,32 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         int N, int D)
     {
         if (N <= 0 || D <= 0) return;
-        var kR = DownloadBuffer(keyCodeReal);
-        var kI = DownloadBuffer(keyCodeImag);
-        var vR = DownloadBuffer(valPermCodeReal);
-        var vI = DownloadBuffer(valPermCodeImag);
-        var kIds = WebGpuHrrReinterpretAsInts(DownloadBuffer(keyIds));
-        var vIds = WebGpuHrrReinterpretAsInts(DownloadBuffer(valIds));
-        var mR = DownloadBuffer(memoryReal);
-        var mI = DownloadBuffer(memoryImag);
-        Simd.SimdHrrKernels.HRRBindAccumulateFloat(
-            kR, kI, vR, vI, kIds, vIds, mR, mI, D);
-        var rBuf = AllocateBuffer(mR);
-        var iBuf = AllocateBuffer(mI);
-        try { Copy(rBuf, 0, memoryReal, 0, D); Copy(iBuf, 0, memoryImag, 0, D); }
-        finally { rBuf.Dispose(); iBuf.Dispose(); }
+        SplitComplexHrrBindAccumulateAsync(
+            keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag,
+            keyIds, valIds, memoryReal, memoryImag, N, D).GetAwaiter().GetResult();
     }
 
-    // AllocateIntBuffer on WebGPU (see its impl) stores ints as float
-    // reinterprets via Int32BitsToSingle; this reverses that.
-    private static int[] WebGpuHrrReinterpretAsInts(float[] floats)
+    private async Task SplitComplexHrrBindAccumulateAsync(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
     {
-        var ints = new int[floats.Length];
-        for (int i = 0; i < floats.Length; i++)
-        {
-#if NET5_0_OR_GREATER
-            ints[i] = BitConverter.SingleToInt32Bits(floats[i]);
-#else
-            unsafe { float v = floats[i]; ints[i] = *(int*)&v; }
-#endif
-        }
-        return ints;
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":HrrBindAccumulate", WebGpuHrrKernels.HrrBindAccumulate, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(N, D),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(keyCodeReal), AsWgpu(keyCodeImag),
+            AsWgpu(valPermCodeReal), AsWgpu(valPermCodeImag),
+            AsWgpu(keyIds), AsWgpu(valIds),
+            AsWgpu(memoryReal), AsWgpu(memoryImag));
+        // Workgroup size in shader is 64 — one thread per output dimension.
+        var (wg, _) = _device.CalculateWorkgroups1D(D, 64);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 }
 #endif
