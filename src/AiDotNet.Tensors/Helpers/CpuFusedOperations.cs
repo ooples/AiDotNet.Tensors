@@ -294,6 +294,164 @@ public static class CpuFusedOperations
     }
 #endif
 
+    /// <summary>
+    /// Double-precision counterpart of <see cref="ApplyBiasActivationNCHWInPlace(float[], float[], int, int, int, int, FusedActivationType)"/>.
+    /// Same tiling + parallelisation strategy, but SIMD registers hold 4
+    /// doubles (AVX2) or 8 doubles (AVX-512) so the per-lane unroll is
+    /// halved. Closes the issue #251 hot path: ResNet50 double-precision
+    /// training decomposed Conv+Bias into three engine calls + two
+    /// intermediate tensor allocations per conv layer; with this kernel
+    /// the bias broadcast folds into a single in-place SIMD pass over
+    /// the Conv2D output.
+    /// </summary>
+    /// <remarks>
+    /// The NCHW plane layout makes bias broadcast trivial: for each
+    /// (n, c) plane the bias value <c>bias[c]</c> is a scalar that we
+    /// broadcast into a SIMD register once, then add against successive
+    /// vector loads from the <c>H·W</c> output positions. The
+    /// per-plane SIMD helper mirrors <see cref="ApplyNchwPlaneSimd"/>
+    /// but with double register widths and no GELU branch (double GELU
+    /// isn't currently a bottleneck for the workloads that hit this
+    /// path — add it when a concrete request surfaces).
+    /// </remarks>
+    [MethodImpl(Hot)]
+    internal static void ApplyBiasActivationNCHWInPlace(
+        double[] output, double[]? bias,
+        int N, int C, int H, int W, FusedActivationType activation)
+    {
+        bool hasBias = bias != null;
+        bool hasActivation = activation != FusedActivationType.None;
+        if (!hasBias && !hasActivation) return;
+
+        int hw = H * W;
+        int totalPlanes = N * C;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && hw >= 4 &&
+            (activation == FusedActivationType.None
+             || activation == FusedActivationType.ReLU))
+        {
+            if (totalPlanes >= 4)
+            {
+                Parallel.For(0, totalPlanes, p =>
+                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
+            }
+            else
+            {
+                for (int p = 0; p < totalPlanes; p++)
+                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU);
+            }
+            return;
+        }
+#endif
+
+        // Scalar fallback — every T that doesn't hit the SIMD branch
+        // (pre-AVX x86, ARM without vectorisation, net471 runtime).
+        for (int n = 0; n < N; n++)
+        {
+            for (int c = 0; c < C; c++)
+            {
+                double b = hasBias ? bias![c] : 0.0;
+                int offset = (n * C + c) * hw;
+                for (int i = 0; i < hw; i++)
+                {
+                    double val = output[offset + i];
+                    if (hasBias) val += b;
+                    if (activation == FusedActivationType.ReLU && val < 0.0) val = 0.0;
+                    output[offset + i] = val;
+                }
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Per-(n, c) plane kernel for doubles — broadcast bias[c] once,
+    /// add to each HW position via AVX/AVX-512, optional ReLU, in-place
+    /// store. Mirrors <see cref="ApplyNchwPlaneSimd"/> at half the lane
+    /// count (4 doubles per AVX-256 register, 8 per AVX-512).
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ApplyNchwPlaneSimdDouble(
+        double[] output, double[]? bias, int planeIdx, int C, int hw, bool applyRelu)
+    {
+        int c = planeIdx % C;
+        double b = bias is not null ? bias[c] : 0.0;
+        int offset = planeIdx * hw;
+        fixed (double* pOut = &output[offset])
+        {
+            int j = 0;
+            var vZero = Vector256<double>.Zero;
+            var vBias = Vector256.Create(b);
+
+#if NET8_0_OR_GREATER
+            if (CpuFeatures.HasAVX512F)
+            {
+                var vZero512 = Vector512<double>.Zero;
+                var vBias512 = Vector512.Create(b);
+                int simdLen512 = hw & ~15;
+                for (; j < simdLen512; j += 16)
+                {
+                    var v0 = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 8), vBias512);
+                    if (applyRelu)
+                    {
+                        v0 = Avx512F.Max(v0, vZero512);
+                        v1 = Avx512F.Max(v1, vZero512);
+                    }
+                    Avx512F.Store(pOut + j, v0);
+                    Avx512F.Store(pOut + j + 8, v1);
+                }
+                for (; j + 8 <= hw; j += 8)
+                {
+                    var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    Avx512F.Store(pOut + j, v);
+                }
+                for (; j < hw; j++)
+                {
+                    double val = pOut[j] + b;
+                    pOut[j] = applyRelu && val < 0.0 ? 0.0 : val;
+                }
+                return;
+            }
+#endif
+
+            // AVX path — 4 doubles per register, 4× unroll = 16 per block.
+            int simdLen = hw & ~15;
+            for (; j < simdLen; j += 16)
+            {
+                var v0 = Avx.Add(Avx.LoadVector256(pOut + j),      vBias);
+                var v1 = Avx.Add(Avx.LoadVector256(pOut + j + 4),  vBias);
+                var v2 = Avx.Add(Avx.LoadVector256(pOut + j + 8),  vBias);
+                var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 12), vBias);
+                if (applyRelu)
+                {
+                    v0 = Avx.Max(v0, vZero);
+                    v1 = Avx.Max(v1, vZero);
+                    v2 = Avx.Max(v2, vZero);
+                    v3 = Avx.Max(v3, vZero);
+                }
+                Avx.Store(pOut + j,      v0);
+                Avx.Store(pOut + j + 4,  v1);
+                Avx.Store(pOut + j + 8,  v2);
+                Avx.Store(pOut + j + 12, v3);
+            }
+            for (; j + 4 <= hw; j += 4)
+            {
+                var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
+                if (applyRelu) v = Avx.Max(v, vZero);
+                Avx.Store(pOut + j, v);
+            }
+            for (; j < hw; j++)
+            {
+                double val = pOut[j] + b;
+                pOut[j] = applyRelu && val < 0.0 ? 0.0 : val;
+            }
+        }
+    }
+#endif
+
     [MethodImpl(Hot)]
     internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
     {
