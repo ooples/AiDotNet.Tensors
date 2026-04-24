@@ -297,6 +297,14 @@ public sealed class GradientTape<T> : IDisposable
         {
             SetCurrentTape(null);
         }
+        // Signal AccumulateGrad to use out-of-place TensorAdd so the
+        // second backward pass sees a connected graph (see the field
+        // doc on DifferentiableOps._isBackwardCreateGraph).
+        var savedBackwardCreateGraph = DifferentiableOps._isBackwardCreateGraph;
+        if (createGraph)
+        {
+            DifferentiableOps._isBackwardCreateGraph = true;
+        }
 
         try
         {
@@ -434,6 +442,7 @@ public sealed class GradientTape<T> : IDisposable
             {
                 SetCurrentTape(savedCurrent);
             }
+            DifferentiableOps._isBackwardCreateGraph = savedBackwardCreateGraph;
             // Clear indexed gradient array and reset tensor grad indices
             DifferentiableOps.ClearIndexedGrads();
             for (int i = 0; i < _entries.Count; i++)
@@ -719,6 +728,23 @@ public sealed class GradientTape<T> : IDisposable
     /// }
     /// </example>
     public static NoGradScope<T> NoGrad() => new();
+
+    /// <summary>
+    /// Enters an <see cref="InferenceModeScope{T}"/> — strictly stronger than
+    /// <see cref="NoGrad"/>. Inference mode suppresses tape recording AND
+    /// tells the engine that tensor version counters will not be consulted,
+    /// so in-place ops that would normally be blocked by autograd's
+    /// version-check invariant become legal. PyTorch distinguishes
+    /// <c>no_grad</c> from <c>inference_mode</c> for the same reason.
+    /// </summary>
+    /// <example>
+    /// using (GradientTape&lt;float&gt;.InferenceMode())
+    /// {
+    ///     var y = engine.TensorMatMul(x, w);     // NOT recorded
+    ///     engine.TensorAddInPlace(y, bias);      // in-place allowed
+    /// }
+    /// </example>
+    public static InferenceModeScope<T> InferenceMode() => new();
 }
 
 /// <summary>
@@ -754,6 +780,81 @@ public sealed class NoGradScope<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
         _suppressionCount--;
+    }
+
+    /// <summary>
+    /// Increments the suppression counter without allocating a scope.
+    /// Used by <see cref="InferenceModeScope{T}"/> so entering inference
+    /// mode also counts as entering no-grad (since inference mode is
+    /// strictly stronger). Matched exactly once by
+    /// <see cref="DecrementSuppressionCount"/>.
+    /// </summary>
+    internal static void IncrementSuppressionCount() => _suppressionCount++;
+
+    /// <summary>
+    /// Pair to <see cref="IncrementSuppressionCount"/>. Must not be
+    /// called without a matching increment or the counter will go
+    /// negative and <see cref="IsSuppressed"/> will report the wrong
+    /// value.
+    /// </summary>
+    internal static void DecrementSuppressionCount() => _suppressionCount--;
+}
+
+/// <summary>
+/// Strictly stronger than <see cref="NoGradScope{T}"/>: suppresses tape
+/// recording AND marks that tensor version counters will not be consulted
+/// while the scope is active, so in-place ops are legal. Matches PyTorch's
+/// <c>torch.inference_mode()</c>.
+/// </summary>
+/// <remarks>
+/// <para><b>Relationship to <see cref="NoGradScope{T}"/>:</b></para>
+/// <para>
+/// An active inference mode scope counts as "no-grad suppression" for
+/// <see cref="DifferentiableOps.IsRecording{T}"/> so the hot path fast-exits
+/// identically. On top of that, <see cref="IsActive"/> lets engine code
+/// (or in-place op implementations) skip the version-counter bump that
+/// would otherwise fire for tensor mutation, which is the feature that
+/// unlocks in-place arithmetic on inference inputs.
+/// </para>
+/// <para><b>Nesting:</b> multiple scopes may be open simultaneously;
+/// the deepest scope wins and all enclosing scopes remain effective.</para>
+/// <para><b>Thread-local:</b> the flag is <see cref="ThreadStaticAttribute"/>
+/// so one thread entering inference mode does not affect other threads.</para>
+/// </remarks>
+/// <typeparam name="T">The numeric type the tape is generic over.</typeparam>
+public sealed class InferenceModeScope<T> : IDisposable
+{
+    [ThreadStatic]
+    private static int _activeCount;
+
+    private bool _disposed;
+
+    /// <summary>
+    /// Gets whether an inference-mode scope is active on this thread.
+    /// Checked by in-place op implementations to skip version-counter
+    /// bumping and any related autograd bookkeeping.
+    /// </summary>
+    public static bool IsActive => _activeCount > 0;
+
+    /// <summary>
+    /// Creates a new scope. Increments both the NoGrad suppression
+    /// counter (so <see cref="NoGradScope{T}.IsSuppressed"/> reports
+    /// true — InferenceMode is strictly stronger) and the inference-mode
+    /// counter (so <see cref="IsActive"/> reports true).
+    /// </summary>
+    public InferenceModeScope()
+    {
+        NoGradScope<T>.IncrementSuppressionCount();
+        _activeCount++;
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _activeCount--;
+        NoGradScope<T>.DecrementSuppressionCount();
     }
 }
 
