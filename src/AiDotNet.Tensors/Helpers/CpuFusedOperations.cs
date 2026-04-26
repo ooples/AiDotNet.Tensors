@@ -345,8 +345,13 @@ public static class CpuFusedOperations
         }
 #endif
 
-        // Scalar fallback — every T that doesn't hit the SIMD branch
-        // (pre-AVX x86, ARM without vectorisation, net471 runtime).
+        // Scalar fallback — every runtime that doesn't hit the SIMD
+        // branch (pre-AVX x86, ARM without vectorisation, net471).
+        // Resolve the activation delegate once outside the loop so
+        // every supported FusedActivationType value works here, not
+        // only ReLU. Mirrors the float overload's GetFloatActivation
+        // path — same surface, same semantics.
+        Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation) : null;
         for (int n = 0; n < N; n++)
         {
             for (int c = 0; c < C; c++)
@@ -357,7 +362,7 @@ public static class CpuFusedOperations
                 {
                     double val = output[offset + i];
                     if (hasBias) val += b;
-                    if (activation == FusedActivationType.ReLU && val < 0.0) val = 0.0;
+                    if (activationFn != null) val = activationFn(val);
                     output[offset + i] = val;
                 }
             }
