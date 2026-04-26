@@ -396,6 +396,28 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 8 buffers + push constants.
+    /// Used for HRR bind-accumulate (keyR, keyI, valR, valI, keyIds, valIds,
+    /// memR_inout, memI_inout). All modern desktop / mobile Vulkan drivers
+    /// report maxPerStageDescriptorStorageBuffers ≥ 16; 8 is well within that.
+    /// </summary>
+    private void GlslOctOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, IGpuBuffer F, IGpuBuffer G, IGpuBuffer H, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
+        EnsureInitialized();
+        if (dispatchSize <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 8, pushConstantSize);
+        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
+        var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
+        var vbE = AsVulkan(E); var vbF = AsVulkan(F); var vbG = AsVulkan(G); var vbH = AsVulkan(H);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage, vbE.Storage, vbF.Storage, vbG.Storage, vbH.Storage);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
+        }
+    }
+
     // CPU fallback when GLSL pipeline creation fails (shaderc unavailable or compilation error).
     // When GLSL pipeline creation fails (shaderc unavailable or compilation error),
     // throw instead of silently returning wrong results. An identity copy would produce

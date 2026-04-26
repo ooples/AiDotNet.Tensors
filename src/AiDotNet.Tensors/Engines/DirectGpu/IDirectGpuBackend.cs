@@ -2904,6 +2904,81 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Per-row softmax on a 2D buffer: output[r][c] = exp(input[r][c]-max) / sum(exp).</summary>
     void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols);
 
+    // ─── HRR binding primitives (issue #248) ─────────────────────────────
+    // Backend-native kernels for the HRR ops the engine exposes through
+    // NativeUnitPhaseCodebook<T>, NativeComplexPhaseCoherenceDecode<T>,
+    // NativeHRRBindAccumulate<T>. Split Re/Im, fp32 (matches the rest of
+    // the GPU surface). Per-cell deterministic phase generation uses a
+    // splitmix64 hash so different threads produce independent phases
+    // from (seed, v, d) without sharing state — matches the engine's
+    // deterministic-per-seed contract but not the exact CPU phase
+    // sequence (which is fine; random init doesn't need cross-device
+    // bit-identity).
+
+    /// <summary>
+    /// Fill a V×D codebook of unit-phase complex numbers: every entry
+    /// <c>exp(iθ)</c> for a uniformly-random phase derived from
+    /// <paramref name="seed"/> and the cell index. Split into real
+    /// (<paramref name="outReal"/>) and imaginary (<paramref name="outImag"/>)
+    /// GPU buffers, row-major with stride <c>D</c>. Optional K-PSK
+    /// quantization snaps phases to multiples of <c>2π/k</c>.
+    /// </summary>
+    /// <param name="outReal">Output buffer for cos θ, size V·D.</param>
+    /// <param name="outImag">Output buffer for sin θ, size V·D.</param>
+    /// <param name="seed">PRNG seed; same seed → same codebook.</param>
+    /// <param name="V">Vocabulary size.</param>
+    /// <param name="D">Dimensionality.</param>
+    /// <param name="kPsk">When true, quantize to K-PSK lattice.</param>
+    /// <param name="k">Number of PSK lattice points; must be positive when
+    /// <paramref name="kPsk"/> is true.</param>
+    void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag,
+        int seed, int V, int D, bool kPsk, int k);
+
+    /// <summary>
+    /// Full-vocabulary phase-coherence decode: for each candidate
+    /// <c>v ∈ [0, V)</c>, compute
+    /// <c>scores[v] = Σ_d (queryR·codesR[v,d] + queryI·codesI[v,d])</c>.
+    /// Equivalent to <c>Re(Σ_d query · conj(code[v]))</c> on split buffers;
+    /// the per-row reduction uses a block-level tree sum.
+    /// </summary>
+    /// <param name="codesReal">Row-major codebook [V·D] real.</param>
+    /// <param name="codesImag">Row-major codebook [V·D] imag.</param>
+    /// <param name="queryReal">Query [D] real.</param>
+    /// <param name="queryImag">Query [D] imag.</param>
+    /// <param name="outScores">Output [V].</param>
+    /// <param name="V">Number of candidates.</param>
+    /// <param name="D">Dimensionality.</param>
+    void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores,
+        int V, int D);
+
+    /// <summary>
+    /// Fused HRR bind-and-accumulate across N training pairs:
+    /// <c>memory += key[keyIds[n]] · valPerm[valIds[n]]</c> (split
+    /// complex multiply) for each n. One kernel per D lane iterates
+    /// through all N pairs so no atomic operations are needed —
+    /// accumulation is per-thread local.
+    /// </summary>
+    /// <param name="keyCodeReal">Key codebook [nKeys·D] real.</param>
+    /// <param name="keyCodeImag">Key codebook [nKeys·D] imag.</param>
+    /// <param name="valPermCodeReal">Permuted value codebook [nVals·D] real.</param>
+    /// <param name="valPermCodeImag">Permuted value codebook [nVals·D] imag.</param>
+    /// <param name="keyIds">Per-pair key indices, int[N].</param>
+    /// <param name="valIds">Per-pair val indices, int[N].</param>
+    /// <param name="memoryReal">Accumulator [D] real (read-modify-write).</param>
+    /// <param name="memoryImag">Accumulator [D] imag (read-modify-write).</param>
+    /// <param name="N">Number of training pairs.</param>
+    /// <param name="D">Dimensionality.</param>
+    void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D);
+
     /// <summary>
     /// Fused spectral filter: FFT2D → pointwise complex multiply → IFFT2D, entirely GPU-resident.
     /// Input and output are real-valued split buffers. Filter is complex split (real/imag).

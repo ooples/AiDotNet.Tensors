@@ -7445,6 +7445,42 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputSpan = result.Data.Span;
         int inputSliceSize = inChannels * height * width;
 
+        // 1×1 fast path (issue #251): when the kernel is 1×1 with stride=1,
+        // pad=0, dilation=1, Im2Col degenerates to an identity copy of the
+        // input — the "expanded" matrix has the same layout as the input
+        // slice. Skip the Im2Col pass entirely and feed the input directly
+        // to GEMM. ResNet50's BottleneckBlock has two 1×1 convs per block
+        // (32 of 50 conv layers), so eliminating the Im2Col copy for them
+        // is a load-bearing piece of the budget fix.
+        if (kernelHeight == 1 && kernelWidth == 1
+            && stride == 1 && padding == 0 && dilation == 1)
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int inputOffset = b * inputSliceSize;
+                int outputOffset = b * outChannels * colW;
+
+                bool usedBlas = Helpers.BlasProvider.TryGemm(
+                    outChannels, colW, colH,
+                    kernelSpan.Slice(0, outChannels * colH),
+                    colH,
+                    inputSpan.Slice(inputOffset, inputSliceSize),
+                    colW,
+                    outputSpan.Slice(outputOffset, outChannels * colW),
+                    colW);
+
+                if (!usedBlas)
+                {
+                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                        kernelSpan.Slice(0, outChannels * colH),
+                        inputSpan.Slice(inputOffset, inputSliceSize),
+                        outputSpan.Slice(outputOffset, outChannels * colW),
+                        outChannels, colH, colW);
+                }
+            }
+            return;
+        }
+
 #if !NET471
         using var im2colBuffer = new NativeBuffer<double>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
@@ -26987,7 +27023,27 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Generic fallback (non-float, non-NCHW, or unsupported activation).
+        // Double-precision NCHW fast path — same shape/activation gates
+        // as float, exercises the mirrored ApplyBiasActivationNCHWInPlace
+        // double overload. Motivation: issue #251 profile of ResNet50
+        // double-precision training showed Conv+Bias+Identity paths
+        // taking 3 engine calls + 2 intermediate tensor allocations per
+        // conv layer. Folding into a single in-place SIMD bias pass
+        // drops those to 1 alloc and one memory round-trip — closes the
+        // ~120s training-budget overrun in downstream PR #1182.
+        if (typeof(T) == typeof(double) && result.Rank == 4
+            && (bias is null || (bias.Rank == 1 && bias._shape[0] == result._shape[1]))
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU))
+        {
+            int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
+            var outArr = (double[])(object)result.GetDataArray();
+            var biasArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+            CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
+            return result;
+        }
+
+        // Generic fallback (non-float/double, non-NCHW, or unsupported activation).
         // Step 2: Add bias if provided. Right-align broadcast: a rank-1
         // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
         // with the NCHW result's channel axis, not the innermost (W) dim.
@@ -33827,6 +33883,381 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexMultiply", result, eng => eng.NativeComplexMultiply(ca2, cb2)); }
         return result;
+    }
+
+    // ─── HRR binding primitives (issue #248) ─────────────────────────
+    // Generic on T so end users work against a consistent IEngine<T>
+    // surface (same pattern as the rest of the engine). Internal
+    // dispatch uses typeof(T) checks to hit the float / double AVX2+FMA
+    // kernels; non-specialised T drops into a scalar numeric-ops loop.
+    // No GraphMode / autograd hooks — these are eager span-based ops,
+    // so callers that need gradients keep using NativeComplexMultiply
+    // and the rest of the Tensor-returning complex family.
+
+    /// <summary>
+    /// Reinterpret a <c>ReadOnlySpan&lt;T&gt;</c> as a <c>ReadOnlySpan&lt;TTo&gt;</c>.
+    /// Only safe after the caller verifies <c>typeof(T) == typeof(TTo)</c>;
+    /// sizeof(T) must equal sizeof(TTo). The IEngine method signatures don't
+    /// (and shouldn't) declare <c>where T : struct</c>, so this helper sidesteps
+    /// <see cref="System.Runtime.InteropServices.MemoryMarshal.Cast"/>'s struct
+    /// constraint via <see cref="Unsafe.As"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ReadOnlySpan<TTo> ReinterpretAs<TTo>(ReadOnlySpan<TTo> self) where TTo : struct => self;
+
+    private static class HrrSpanReinterpret<T>
+    {
+        // Parameterised helpers keep the generic-method call sites readable
+        // (no long unsafe-dereference chains) while the body compiles to a
+        // direct Span<T> → Span<TTo> reinterpret when the caller has already
+        // guarded on typeof(T) == typeof(TTo). Mirrors the pattern in
+        // NativeComplexFFTSpan: use MemoryMarshal.CreateSpan on NET5+ (zero
+        // alloc), drop to an element-by-element copy on net471 where
+        // CreateSpan isn't available.
+#if NET5_0_OR_GREATER
+        internal static ReadOnlySpan<double> AsDouble(ReadOnlySpan<T> s)
+        {
+            ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s);
+            return System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref Unsafe.As<T, double>(ref head), s.Length);
+        }
+        internal static Span<double> AsDouble(Span<T> s)
+        {
+            ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s);
+            return System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref Unsafe.As<T, double>(ref head), s.Length);
+        }
+        internal static ReadOnlySpan<float> AsFloat(ReadOnlySpan<T> s)
+        {
+            ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s);
+            return System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                ref Unsafe.As<T, float>(ref head), s.Length);
+        }
+        internal static Span<float> AsFloat(Span<T> s)
+        {
+            ref T head = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s);
+            return System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref Unsafe.As<T, float>(ref head), s.Length);
+        }
+#else
+        // net471: no CreateSpan — the caller must fall through to the
+        // generic scalar path. These stubs should never be hit at runtime
+        // because the typeof(T) guard above keeps the fast path out of
+        // reach on net471.
+        internal static ReadOnlySpan<double> AsDouble(ReadOnlySpan<T> s)
+            => throw new PlatformNotSupportedException("net471 cannot zero-copy reinterpret spans.");
+        internal static Span<double> AsDouble(Span<T> s)
+            => throw new PlatformNotSupportedException("net471 cannot zero-copy reinterpret spans.");
+        internal static ReadOnlySpan<float> AsFloat(ReadOnlySpan<T> s)
+            => throw new PlatformNotSupportedException("net471 cannot zero-copy reinterpret spans.");
+        internal static Span<float> AsFloat(Span<T> s)
+            => throw new PlatformNotSupportedException("net471 cannot zero-copy reinterpret spans.");
+#endif
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexPointwiseMultiply<T>(
+        ReadOnlySpan<T> aRe, ReadOnlySpan<T> aIm,
+        ReadOnlySpan<T> bRe, ReadOnlySpan<T> bIm,
+        Span<T> cRe, Span<T> cIm,
+        bool conjugateB = false)
+    {
+        int n = aRe.Length;
+        if (aIm.Length != n || bRe.Length != n || bIm.Length != n || cRe.Length != n || cIm.Length != n)
+            throw new ArgumentException(
+                "All six spans must have identical length for NativeComplexPointwiseMultiply.");
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            Simd.SimdComplexKernels.ComplexMultiplyDouble(
+                HrrSpanReinterpret<T>.AsDouble(aRe),
+                HrrSpanReinterpret<T>.AsDouble(aIm),
+                HrrSpanReinterpret<T>.AsDouble(bRe),
+                HrrSpanReinterpret<T>.AsDouble(bIm),
+                HrrSpanReinterpret<T>.AsDouble(cRe),
+                HrrSpanReinterpret<T>.AsDouble(cIm),
+                conjugateB);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            Simd.SimdComplexKernels.ComplexMultiplyFloatConjugatable(
+                HrrSpanReinterpret<T>.AsFloat(aRe),
+                HrrSpanReinterpret<T>.AsFloat(aIm),
+                HrrSpanReinterpret<T>.AsFloat(bRe),
+                HrrSpanReinterpret<T>.AsFloat(bIm),
+                HrrSpanReinterpret<T>.AsFloat(cRe),
+                HrrSpanReinterpret<T>.AsFloat(cIm),
+                conjugateB);
+            return;
+        }
+#endif
+
+        // Generic scalar fallback for non-float/double T (Half, BFloat16,
+        // custom numeric types). Also hit on net471 where the span-reinterpret
+        // fast path is unavailable. Uses INumericOperations so any
+        // user-defined numeric type is supported.
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (conjugateB)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                T ar = aRe[i], ai = aIm[i], br = bRe[i], bi = bIm[i];
+                cRe[i] = ops.Add(ops.Multiply(ar, br), ops.Multiply(ai, bi));
+                cIm[i] = ops.Subtract(ops.Multiply(ai, br), ops.Multiply(ar, bi));
+            }
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                T ar = aRe[i], ai = aIm[i], br = bRe[i], bi = bIm[i];
+                cRe[i] = ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi));
+                cIm[i] = ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br));
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeGather<T>(
+        ReadOnlySpan<T> input,
+        ReadOnlySpan<int> indices,
+        Span<T> output)
+    {
+        // Gather does no arithmetic on the data so it's truly generic —
+        // one implementation handles every T. The kernel already bounds-
+        // checks indices and enforces length consistency.
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            Simd.SimdHrrKernels.GatherDouble(
+                HrrSpanReinterpret<T>.AsDouble(input),
+                indices,
+                HrrSpanReinterpret<T>.AsDouble(output));
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            Simd.SimdHrrKernels.GatherFloat(
+                HrrSpanReinterpret<T>.AsFloat(input),
+                indices,
+                HrrSpanReinterpret<T>.AsFloat(output));
+            return;
+        }
+#endif
+
+        int n = indices.Length;
+        if (output.Length != n)
+            throw new ArgumentException(
+                $"Output length ({output.Length}) must equal indices length ({indices.Length}).");
+        int inputLen = input.Length;
+        for (int i = 0; i < n; i++)
+        {
+            int idx = indices[i];
+            if ((uint)idx >= (uint)inputLen)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {idx} at position {i} is outside input range [0, {inputLen}).");
+            output[i] = input[idx];
+        }
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeUnitPhaseCodebook<T>(
+        Span<T> outRe, Span<T> outIm,
+        int seed, int V, int D,
+        bool kPsk = false, int k = 0)
+    {
+        // Phase-based codebook requires continuous arithmetic — integral
+        // T (int, long, etc.) would quantize sin/cos to ±1/0 and silently
+        // break the unit-phase invariant. Reject up front.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            throw new NotSupportedException(
+                $"NativeUnitPhaseCodebook requires T = float or double (got {typeof(T).Name}). " +
+                "Phase-based kernels cannot preserve |c| = 1 for integral element types.");
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            Simd.SimdHrrKernels.UnitPhaseCodebookDouble(
+                HrrSpanReinterpret<T>.AsDouble(outRe),
+                HrrSpanReinterpret<T>.AsDouble(outIm),
+                seed, V, D, kPsk, k);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            Simd.SimdHrrKernels.UnitPhaseCodebookFloat(
+                HrrSpanReinterpret<T>.AsFloat(outRe),
+                HrrSpanReinterpret<T>.AsFloat(outIm),
+                seed, V, D, kPsk, k);
+            return;
+        }
+#endif
+
+        // net471 fallback for float/double — the span-reinterpret fast
+        // path isn't available on net471. Generate in a temporary
+        // double buffer, then copy through INumericOperations.FromDouble
+        // which is lossless for double and a safe narrowing for float.
+        // Safe because the type guard above rejects non-floating T.
+        long total = (long)V * D;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        int n = (int)total;
+        if (outRe.Length != n || outIm.Length != n)
+            throw new ArgumentException(
+                $"outRe ({outRe.Length}) and outIm ({outIm.Length}) must both have length V*D = {n}.");
+        var tempR = new double[n];
+        var tempI = new double[n];
+        Simd.SimdHrrKernels.UnitPhaseCodebookDouble(tempR, tempI, seed, V, D, kPsk, k);
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+        {
+            outRe[i] = ops.FromDouble(tempR[i]);
+            outIm[i] = ops.FromDouble(tempI[i]);
+        }
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeComplexPhaseCoherenceDecode<T>(
+        ReadOnlySpan<T> codesRe, ReadOnlySpan<T> codesIm,
+        ReadOnlySpan<T> queryRe, ReadOnlySpan<T> queryIm,
+        Span<T> scores,
+        int V, int D)
+    {
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            Simd.SimdHrrKernels.PhaseCoherenceDecodeDouble(
+                HrrSpanReinterpret<T>.AsDouble(codesRe),
+                HrrSpanReinterpret<T>.AsDouble(codesIm),
+                HrrSpanReinterpret<T>.AsDouble(queryRe),
+                HrrSpanReinterpret<T>.AsDouble(queryIm),
+                HrrSpanReinterpret<T>.AsDouble(scores),
+                V, D);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            Simd.SimdHrrKernels.PhaseCoherenceDecodeFloat(
+                HrrSpanReinterpret<T>.AsFloat(codesRe),
+                HrrSpanReinterpret<T>.AsFloat(codesIm),
+                HrrSpanReinterpret<T>.AsFloat(queryRe),
+                HrrSpanReinterpret<T>.AsFloat(queryIm),
+                HrrSpanReinterpret<T>.AsFloat(scores),
+                V, D);
+            return;
+        }
+#endif
+
+        // Generic scalar fallback (also handles all T on net471).
+        long total = (long)V * D;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        int nCodes = (int)total;
+        if (codesRe.Length != nCodes || codesIm.Length != nCodes)
+            throw new ArgumentException(
+                $"codesRe ({codesRe.Length}) and codesIm ({codesIm.Length}) must both have length V*D = {nCodes}.");
+        if (queryRe.Length != D || queryIm.Length != D)
+            throw new ArgumentException(
+                $"queryRe ({queryRe.Length}) and queryIm ({queryIm.Length}) must both have length D = {D}.");
+        if (scores.Length != V)
+            throw new ArgumentException($"scores length ({scores.Length}) must equal V = {V}.");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int v = 0; v < V; v++)
+        {
+            int rowOff = v * D;
+            T acc = ops.Zero;
+            for (int d = 0; d < D; d++)
+            {
+                acc = ops.Add(acc, ops.Add(
+                    ops.Multiply(codesRe[rowOff + d], queryRe[d]),
+                    ops.Multiply(codesIm[rowOff + d], queryIm[d])));
+            }
+            scores[v] = acc;
+        }
+    }
+
+    /// <inheritdoc />
+    public virtual void NativeHRRBindAccumulate<T>(
+        ReadOnlySpan<T> keyCodeRe, ReadOnlySpan<T> keyCodeIm,
+        ReadOnlySpan<T> valPermCodeRe, ReadOnlySpan<T> valPermCodeIm,
+        ReadOnlySpan<int> keyIds, ReadOnlySpan<int> valIds,
+        Span<T> memoryRe, Span<T> memoryIm,
+        int D)
+    {
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(double))
+        {
+            Simd.SimdHrrKernels.HRRBindAccumulateDouble(
+                HrrSpanReinterpret<T>.AsDouble(keyCodeRe),
+                HrrSpanReinterpret<T>.AsDouble(keyCodeIm),
+                HrrSpanReinterpret<T>.AsDouble(valPermCodeRe),
+                HrrSpanReinterpret<T>.AsDouble(valPermCodeIm),
+                keyIds, valIds,
+                HrrSpanReinterpret<T>.AsDouble(memoryRe),
+                HrrSpanReinterpret<T>.AsDouble(memoryIm),
+                D);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            Simd.SimdHrrKernels.HRRBindAccumulateFloat(
+                HrrSpanReinterpret<T>.AsFloat(keyCodeRe),
+                HrrSpanReinterpret<T>.AsFloat(keyCodeIm),
+                HrrSpanReinterpret<T>.AsFloat(valPermCodeRe),
+                HrrSpanReinterpret<T>.AsFloat(valPermCodeIm),
+                keyIds, valIds,
+                HrrSpanReinterpret<T>.AsFloat(memoryRe),
+                HrrSpanReinterpret<T>.AsFloat(memoryIm),
+                D);
+            return;
+        }
+#endif
+
+        // Generic scalar fallback (also handles all T on net471).
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D));
+        if (memoryRe.Length != D || memoryIm.Length != D)
+            throw new ArgumentException(
+                $"memoryRe ({memoryRe.Length}) and memoryIm ({memoryIm.Length}) must both have length D = {D}.");
+        if (keyCodeRe.Length != keyCodeIm.Length)
+            throw new ArgumentException("keyCodeRe and keyCodeIm must have matching length.");
+        if (valPermCodeRe.Length != valPermCodeIm.Length)
+            throw new ArgumentException("valPermCodeRe and valPermCodeIm must have matching length.");
+        if (keyIds.Length != valIds.Length)
+            throw new ArgumentException(
+                $"keyIds ({keyIds.Length}) and valIds ({valIds.Length}) must have matching length.");
+        if (keyCodeRe.Length % D != 0)
+            throw new ArgumentException(
+                $"keyCode length ({keyCodeRe.Length}) must be divisible by D = {D}.");
+        if (valPermCodeRe.Length % D != 0)
+            throw new ArgumentException(
+                $"valPermCode length ({valPermCodeRe.Length}) must be divisible by D = {D}.");
+
+        int nKeys = keyCodeRe.Length / D;
+        int nVals = valPermCodeRe.Length / D;
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int nn = 0; nn < keyIds.Length; nn++)
+        {
+            int kId = keyIds[nn]; int vId = valIds[nn];
+            if ((uint)kId >= (uint)nKeys)
+                throw new ArgumentOutOfRangeException(nameof(keyIds),
+                    $"keyIds[{nn}] = {kId} is outside [0, {nKeys}).");
+            if ((uint)vId >= (uint)nVals)
+                throw new ArgumentOutOfRangeException(nameof(valIds),
+                    $"valIds[{nn}] = {vId} is outside [0, {nVals}).");
+            int kOff = kId * D, vOff = vId * D;
+            for (int d = 0; d < D; d++)
+            {
+                T ar = keyCodeRe[kOff + d], ai = keyCodeIm[kOff + d];
+                T br = valPermCodeRe[vOff + d], bi = valPermCodeIm[vOff + d];
+                memoryRe[d] = ops.Add(memoryRe[d],
+                    ops.Subtract(ops.Multiply(ar, br), ops.Multiply(ai, bi)));
+                memoryIm[d] = ops.Add(memoryIm[d],
+                    ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
+            }
+        }
     }
 
     /// <inheritdoc />

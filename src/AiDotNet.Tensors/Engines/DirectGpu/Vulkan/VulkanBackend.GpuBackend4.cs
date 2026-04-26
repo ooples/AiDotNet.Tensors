@@ -1741,6 +1741,85 @@ public sealed unsafe partial class VulkanBackend
         finally { rb.Dispose(); }
     }
 
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+    //
+    // Native GLSL compute shaders — work stays on the GPU end-to-end.
+    // Per-cell phases use a 32-bit Murmur3 fmix; deterministic within
+    // the Vulkan backend (same seed + same (V, D) → identical output)
+    // but does not bit-match the CPU xorshift64* or CUDA splitmix64
+    // sequences. This is acceptable — cross-device bit-identity on
+    // random initialization is not part of the contract.
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        // Reject negative dims up front — if both are negative, their
+        // product is positive and would slip past "total <= 0", then
+        // the shader would cast to uint and index out of bounds.
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
+        long total = (long)V * D;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        int n = (int)total;
+
+        // Push constants: { seed, V, D, kPsk, k, total } — 24 bytes.
+        var push = new uint[]
+        {
+            unchecked((uint)seed),
+            (uint)V,
+            (uint)D,
+            (uint)(kPsk ? 1 : 0),
+            (uint)k,
+            (uint)n,
+        };
+        GlslUnaryOp(VulkanHrrKernels.UnitPhaseCodebook, outReal, outImag, n, push, 6 * sizeof(uint));
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        var push = new uint[] { (uint)V, (uint)D };
+        GlslQuintOp(
+            VulkanHrrKernels.PhaseCoherenceDecode,
+            codesReal, codesImag, queryReal, queryImag, outScores,
+            V, push, 2 * sizeof(uint));
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        // Derive vocabulary sizes from codebook buffer capacities so
+        // the shader can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's
+        // (uint)kId >= (uint)nKeys check in NativeHRRBindAccumulate.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        var push = new uint[] { (uint)N, (uint)D, (uint)nKeysL, (uint)nValsL };
+        // Dispatch one thread per output dimension; each thread loops N.
+        // keyIds/valIds stored as Int32BitsToSingle floats — shader reverses
+        // with floatBitsToInt() and validates against nKeys / nVals.
+        GlslOctOp(
+            VulkanHrrKernels.HrrBindAccumulate,
+            keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag,
+            keyIds, valIds, memoryReal, memoryImag,
+            D, push, 4 * sizeof(uint));
+    }
+
     /// <inheritdoc/>
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)

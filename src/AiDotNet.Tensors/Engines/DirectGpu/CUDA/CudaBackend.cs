@@ -10252,6 +10252,142 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
     }
 
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+
+    /// <inheritdoc/>
+    public unsafe void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag,
+        int seed, int V, int D, bool kPsk, int k)
+    {
+        long total = (long)V * D;
+        if (total <= 0) return;
+        if (total > int.MaxValue)
+            throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0)
+            throw new ArgumentOutOfRangeException(nameof(k),
+                "k must be positive when kPsk is true.");
+        int n = (int)total;
+        ValidateSplitBuffers(n, nameof(SplitComplexUnitPhaseCodebook), outReal, outImag);
+        if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: hrr_unit_phase_codebook. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
+        int kPskI = kPsk ? 1 : 0;
+        void** args = stackalloc void*[7];
+        args[0] = &pOR; args[1] = &pOI; args[2] = &seed;
+        args[3] = &V; args[4] = &D; args[5] = &kPskI; args[6] = &k;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores,
+        int V, int D)
+    {
+        if (V <= 0 || D <= 0) return;
+        long codeCount = (long)V * D;
+        if (codesReal is null || codesImag is null || queryReal is null || queryImag is null || outScores is null)
+            throw new ArgumentNullException(nameof(codesReal),
+                "All five GPU buffers (codesReal/codesImag/queryReal/queryImag/outScores) must be non-null.");
+        if (codesReal.Size < codeCount || codesImag.Size < codeCount)
+            throw new ArgumentException(
+                $"codes buffers must each hold at least V*D = {codeCount} elements " +
+                $"(got {codesReal.Size}, {codesImag.Size}).");
+        if (queryReal.Size < D || queryImag.Size < D)
+            throw new ArgumentException(
+                $"query buffers must each hold at least D = {D} elements " +
+                $"(got {queryReal.Size}, {queryImag.Size}).");
+        if (outScores.Size < V)
+            throw new ArgumentException(
+                $"outScores must hold at least V = {V} elements (got {outScores.Size}).");
+        if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: hrr_phase_coherence_decode. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)V;
+        int blockSize = Math.Min(DefaultBlockSize, NextPowerOfTwoForReduction(D));
+        uint sharedMem = (uint)blockSize * sizeof(float);
+        IntPtr pCR = codesReal.Handle, pCI = codesImag.Handle;
+        IntPtr pQR = queryReal.Handle, pQI = queryImag.Handle;
+        IntPtr pOS = outScores.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pCR; args[1] = &pCI;
+        args[2] = &pQR; args[3] = &pQI;
+        args[4] = &pOS; args[5] = &V; args[6] = &D;
+        // Route through the shared launch helper so this runs on _stream
+        // and cuLaunchKernel failures are surfaced by CheckCudaResult,
+        // matching the rest of the backend.
+        LaunchKernelWithSharedMem(kernel, grid, (uint)blockSize, sharedMem, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N <= 0 || D <= 0) return;
+        if (keyCodeReal is null || keyCodeImag is null || valPermCodeReal is null || valPermCodeImag is null
+            || keyIds is null || valIds is null || memoryReal is null || memoryImag is null)
+            throw new ArgumentNullException(nameof(keyCodeReal),
+                "All eight GPU buffers must be non-null for SplitComplexHrrBindAccumulate.");
+        if (keyIds.Size < N || valIds.Size < N)
+            throw new ArgumentException(
+                $"ID buffers must each hold at least N = {N} elements " +
+                $"(got keyIds={keyIds.Size}, valIds={valIds.Size}).");
+        if (memoryReal.Size < D || memoryImag.Size < D)
+            throw new ArgumentException(
+                $"Memory buffers must each hold at least D = {D} elements " +
+                $"(got memoryReal={memoryReal.Size}, memoryImag={memoryImag.Size}).");
+        if (keyCodeReal.Size < D || keyCodeImag.Size < D
+            || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
+            throw new ArgumentException(
+                $"Each codebook buffer must hold at least one full row of D = {D} elements.");
+        // Derive vocabulary sizes from codebook capacities so the
+        // kernel can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's range check in
+        // NativeHRRBindAccumulate and the guards in Vulkan/WebGPU.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        int nKeys = (int)nKeysL;
+        int nVals = (int)nValsL;
+        if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: hrr_bind_accumulate. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((D + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pKR = keyCodeReal.Handle, pKI = keyCodeImag.Handle;
+        IntPtr pVR = valPermCodeReal.Handle, pVI = valPermCodeImag.Handle;
+        IntPtr pKId = keyIds.Handle, pVId = valIds.Handle;
+        IntPtr pMR = memoryReal.Handle, pMI = memoryImag.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pKR; args[1] = &pKI;
+        args[2] = &pVR; args[3] = &pVI;
+        args[4] = &pKId; args[5] = &pVId;
+        args[6] = &pMR; args[7] = &pMI;
+        args[8] = &N; args[9] = &D;
+        args[10] = &nKeys; args[11] = &nVals;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    // Round D up to the next power of two, capped at 1024 (max CUDA
+    // block size). Used by the phase-coherence reduce to size the
+    // block-level tree sum.
+    private static int NextPowerOfTwoForReduction(int D)
+    {
+        int bs = 1;
+        while (bs < D && bs < 1024) bs <<= 1;
+        return Math.Max(32, bs);
+    }
+
     /// <inheritdoc/>
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)

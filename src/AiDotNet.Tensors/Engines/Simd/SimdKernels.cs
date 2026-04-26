@@ -5818,6 +5818,25 @@ namespace AiDotNet.Tensors.Engines.Simd
             Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref element), value);
         }
 
+        // Double-precision overloads: Vector256<double> holds 4 lanes.
+        // Used by the HRR / complex-double kernels that feed the issue #248
+        // Native*Double engine methods.
+        [MethodImpl(HotInline)]
+        internal static Vector256<double> ReadVector256(ReadOnlySpan<double> data, int offset)
+        {
+            ref double start = ref MemoryMarshal.GetReference(data);
+            ref double element = ref Unsafe.Add(ref start, offset);
+            return Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref element));
+        }
+
+        [MethodImpl(HotInline)]
+        internal static void WriteVector256(Span<double> data, int offset, Vector256<double> value)
+        {
+            ref double start = ref MemoryMarshal.GetReference(data);
+            ref double element = ref Unsafe.Add(ref start, offset);
+            Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref element), value);
+        }
+
         [MethodImpl(HotInline)]
         private static Vector128<float> ReadVector128(ReadOnlySpan<float> data, int offset)
         {

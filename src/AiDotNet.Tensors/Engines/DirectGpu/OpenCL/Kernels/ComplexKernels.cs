@@ -12,7 +12,11 @@ public static class ComplexKernels
         "split_complex_phase", "split_complex_from_polar",
         "split_complex_scale", "split_complex_add",
         "split_complex_cross_spectral",
-        "split_complex_topk", "softmax_rows"
+        "split_complex_topk", "softmax_rows",
+        // Issue #248 — HRR binding primitives
+        "hrr_unit_phase_codebook",
+        "hrr_phase_coherence_decode",
+        "hrr_bind_accumulate"
     };
 
     public static string GetSource() => @"
@@ -139,6 +143,91 @@ __kernel void softmax_rows(
     float sumExp = 0.0f;
     for (int c = 0; c < cols; c++) { float e = exp(input[offset + c] - maxVal); output[offset + c] = e; sumExp += e; }
     for (int c = 0; c < cols; c++) output[offset + c] /= sumExp;
+}
+
+// ─── HRR binding primitives (issue #248) ────────────────────────────
+// Matches CUDA/HIP/Metal/Vulkan/WebGPU — see CudaComplexKernels.cs for
+// the hash rationale (32-bit Murmur3 fmix chosen for WebGPU
+// compatibility; per-backend GPU determinism preserved, CPU
+// xorshift64* path intentionally divergent for single-thread speed).
+inline uint hrr_hash(uint seed_u, uint cell_u)
+{
+    uint z = seed_u * 0x9E3779B9u + cell_u * 0x85EBCA6Bu;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z =  z ^ (z >> 16);
+    return z;
+}
+
+inline float hrr_phase_from_cell(int seed, long cellIdx)
+{
+    uint z = hrr_hash((uint)seed, (uint)cellIdx);
+    uint top24 = z >> 8;
+    return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
+}
+
+__kernel void hrr_unit_phase_codebook(
+    __global float* outReal, __global float* outImag,
+    const int seed, const int V, const int D,
+    const int kPsk, const int k)
+{
+    long idx = get_global_id(0);
+    long total = (long)V * D;
+    if (idx >= total) return;
+    float phase = hrr_phase_from_cell(seed, idx);
+    if (kPsk != 0) {
+        float step = 6.28318530717958647692f / (float)k;
+        phase = floor(phase / step + 0.5f) * step;
+    }
+    outReal[idx] = cos(phase);
+    outImag[idx] = sin(phase);
+}
+
+// One work-item per V row. Each work-item iterates all D entries of
+// its row and produces one score. Simpler than a tree reduction (no
+// local memory needed), and V is usually small enough (≤ 1024) that
+// the parallelism across V covers any GPU's wavefront size — same
+// tradeoff as softmax_rows above.
+__kernel void hrr_phase_coherence_decode(
+    __global const float* codesReal, __global const float* codesImag,
+    __global const float* queryReal, __global const float* queryImag,
+    __global float* outScores,
+    const int V, const int D)
+{
+    int v = get_global_id(0);
+    if (v >= V) return;
+    __global const float* cR = codesReal + (long)v * D;
+    __global const float* cI = codesImag + (long)v * D;
+    float acc = 0.0f;
+    for (int d = 0; d < D; d++) {
+        acc += cR[d] * queryReal[d] + cI[d] * queryImag[d];
+    }
+    outScores[v] = acc;
+}
+
+__kernel void hrr_bind_accumulate(
+    __global const float* keyCodeReal, __global const float* keyCodeImag,
+    __global const float* valPermCodeReal, __global const float* valPermCodeImag,
+    __global const int* keyIds, __global const int* valIds,
+    __global float* memoryReal, __global float* memoryImag,
+    const int N, const int D)
+{
+    int d = get_global_id(0);
+    if (d >= D) return;
+    float accR = memoryReal[d];
+    float accI = memoryImag[d];
+    for (int n = 0; n < N; n++) {
+        long kOff = (long)keyIds[n] * D;
+        long vOff = (long)valIds[n] * D;
+        float ar = keyCodeReal[kOff + d];
+        float ai = keyCodeImag[kOff + d];
+        float br = valPermCodeReal[vOff + d];
+        float bi = valPermCodeImag[vOff + d];
+        accR += ar * br - ai * bi;
+        accI += ar * bi + ai * br;
+    }
+    memoryReal[d] = accR;
+    memoryImag[d] = accI;
 }
 ";
 }
