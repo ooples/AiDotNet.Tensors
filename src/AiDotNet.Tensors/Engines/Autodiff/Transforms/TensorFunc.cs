@@ -626,6 +626,88 @@ public static class TensorFunc<T>
         };
     }
 
+    /// <summary>
+    /// Compile-mode-aware vmap. When the caller's <paramref name="fn"/>
+    /// is naturally batched (every op inside fn already broadcasts
+    /// over the batch dimension), this overload bypasses the
+    /// per-sample slice/stack and runs <paramref name="fn"/> on the
+    /// full batched tensor exactly once. Recording cost drops from
+    /// <c>O(batchSize × ops)</c> to <c>O(ops)</c>, and the resulting
+    /// graph is the one the compile pipeline (LazyTensorScope,
+    /// CodegenDispatcher, fusion passes) needs to fuse end-to-end.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Contract on <paramref name="fn"/>:</b> must accept a
+    /// tensor with the batch axis at <paramref name="inDim"/> and
+    /// produce one whose batch axis sits at <paramref name="outDim"/>.
+    /// Unlike <see cref="Vmap"/>, fn is NOT called per-slice — it
+    /// sees the full batched tensor.</para>
+    /// <para><b>Why a separate method:</b> the slice/stack
+    /// <see cref="Vmap"/> is the conservative default that handles
+    /// every fn whether it's broadcast-friendly or not (e.g. fn that
+    /// uses ops not yet supporting a leading batch axis). The
+    /// batched-fast-path overload is opt-in so callers explicitly
+    /// confirm fn meets the contract — silently swapping
+    /// implementations would break correctness for non-broadcast
+    /// fns.</para>
+    /// </remarks>
+    public static Func<Tensor<T>, Tensor<T>> VmapBatched(
+        Func<Tensor<T>, Tensor<T>> fn,
+        int inDim = 0,
+        int outDim = 0)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+
+        return input =>
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            var inShape = input._shape;
+            if (inShape.Length == 0)
+                throw new ArgumentException("VmapBatched input must be at least rank-1.", nameof(input));
+            int normIn = inDim < 0 ? inDim + inShape.Length : inDim;
+            if ((uint)normIn >= (uint)inShape.Length)
+                throw new ArgumentOutOfRangeException(nameof(inDim),
+                    $"inDim {inDim} out of range for rank-{inShape.Length} input.");
+
+            // Reshape the batch axis into position 0 if it isn't already
+            // there — most engine ops expect leading-batch layout. If
+            // inDim != 0 we use a permute. outDim asymmetry is handled
+            // by a final permute on the result.
+            var engine = AiDotNetEngine.Current;
+            Tensor<T> shaped = input;
+            if (normIn != 0)
+            {
+                var perm = new int[inShape.Length];
+                perm[0] = normIn;
+                int next = 1;
+                for (int i = 0; i < inShape.Length; i++)
+                    if (i != normIn) perm[next++] = i;
+                shaped = engine.TensorPermute(shaped, perm);
+            }
+
+            var output = fn(shaped);
+
+            // If outDim != 0, permute the result so the batch axis
+            // ends up at the requested position.
+            int outRank = output._shape.Length;
+            int normOut = outDim < 0 ? outDim + outRank : outDim;
+            if ((uint)normOut >= (uint)outRank)
+                throw new ArgumentOutOfRangeException(nameof(outDim),
+                    $"outDim {outDim} out of range for rank-{outRank} output.");
+            if (normOut == 0) return output;
+
+            var outPerm = new int[outRank];
+            int p = 0;
+            for (int i = 1; i < outRank; i++)
+            {
+                if (p == normOut) p++;
+                outPerm[p++] = i;
+            }
+            outPerm[normOut] = 0;
+            return engine.TensorPermute(output, outPerm);
+        };
+    }
+
     // ─── functional_call ──────────────────────────────────────────────
 
     /// <summary>

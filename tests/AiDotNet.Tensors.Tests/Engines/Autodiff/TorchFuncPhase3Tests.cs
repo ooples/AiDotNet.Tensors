@@ -372,6 +372,66 @@ public class TorchFuncPhase3Tests
             Assert.Equal(hv[i], vh[i], precision: 4);
     }
 
+    // ─── VmapBatched (compile-mode fast path) ─────────────────────────
+
+    [Fact]
+    public void VmapBatched_BroadcastFriendlyFn_MatchesPerSampleVmap()
+    {
+        // fn = x → x · x is broadcast-friendly (TensorMultiply broadcasts
+        // over any leading dim). Both forms must produce the same
+        // numerical result.
+        Func<Tensor<float>, Tensor<float>> fn = x => _engine.TensorMultiply(x, x);
+
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 3, 2 });
+        var perSample = TensorFunc<float>.Vmap(fn)(input);
+        var batched = TensorFunc<float>.VmapBatched(fn)(input);
+
+        Assert.Equal(perSample._shape, batched._shape);
+        for (int i = 0; i < perSample.Length; i++)
+            Assert.Equal(perSample.AsSpan()[i], batched.AsSpan()[i]);
+    }
+
+    [Fact]
+    public void VmapBatched_RecordsFewerTapeEntriesThanPerSampleVmap()
+    {
+        // The whole point of the fast path: O(ops) tape entries vs
+        // O(batch × ops) for the slice-and-stack form. Use a tape and
+        // count entries.
+        Func<Tensor<float>, Tensor<float>> fn = x =>
+        {
+            var sq = _engine.TensorMultiply(x, x);
+            return _engine.TensorAdd(sq, x);
+        };
+
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 4, 2 });
+
+        int CountEntries(Action body)
+        {
+            using var tape = new GradientTape<float>();
+            body();
+            return tape.EntryCount;
+        }
+
+        int perSample = CountEntries(() => { TensorFunc<float>.Vmap(fn)(input); });
+        int batched = CountEntries(() => { TensorFunc<float>.VmapBatched(fn)(input); });
+
+        Assert.True(batched < perSample,
+            $"VmapBatched should record fewer entries than per-sample Vmap: " +
+            $"batched={batched} perSample={perSample}.");
+    }
+
+    [Fact]
+    public void VmapBatched_ArgumentValidation()
+    {
+        Assert.Throws<ArgumentNullException>(
+            () => TensorFunc<float>.VmapBatched(null));
+        var fn = TensorFunc<float>.VmapBatched((Tensor<float> x) => x);
+        Assert.Throws<ArgumentNullException>(() => fn(null));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => TensorFunc<float>.VmapBatched((Tensor<float> x) => x, inDim: 99)
+                (new Tensor<float>(new[] { 1f }, new[] { 1 })));
+    }
+
     [Fact]
     public void Hvp_ArgumentValidation()
     {
