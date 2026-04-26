@@ -847,15 +847,20 @@ public sealed class InferenceModeScope<T> : IDisposable
     public static bool IsActive => _activeCount > 0;
 
     /// <summary>
-    /// Creates a new scope. Increments both the NoGrad suppression
-    /// counter (so <see cref="NoGradScope{T}.IsSuppressed"/> reports
-    /// true — InferenceMode is strictly stronger) and the inference-mode
-    /// counter (so <see cref="IsActive"/> reports true).
+    /// Creates a new scope. Increments three counters: the NoGrad
+    /// suppression counter (InferenceMode is strictly stronger so
+    /// <see cref="NoGradScope{T}.IsSuppressed"/> reports true while
+    /// active), the typed inference-mode counter (so
+    /// <see cref="IsActive"/> reports true), and the type-erased
+    /// counter consulted by non-generic <see cref="LinearAlgebra.TensorBase"/>
+    /// in-place mutators that don't know <typeparamref name="T"/> at
+    /// the call site.
     /// </summary>
     public InferenceModeScope()
     {
         NoGradScope<T>.IncrementSuppressionCount();
         _activeCount++;
+        InferenceModeFlag.Enter();
     }
 
     /// <inheritdoc/>
@@ -864,8 +869,46 @@ public sealed class InferenceModeScope<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
         _activeCount--;
+        InferenceModeFlag.Exit();
         NoGradScope<T>.DecrementSuppressionCount();
     }
+}
+
+/// <summary>
+/// Type-erased thread-local counter shared by every
+/// <see cref="InferenceModeScope{T}"/>, regardless of <c>T</c>.
+/// Read by non-generic in-place op implementations
+/// (<see cref="LinearAlgebra.TensorBase.IncrementVersion"/>,
+/// <see cref="TapeEntry{T}.ValidateInputVersions"/>) that need to
+/// know whether <i>any</i> inference scope is active without
+/// knowing the element type at the call site.
+/// </summary>
+/// <remarks>
+/// Maintained as a sibling to <see cref="InferenceModeScope{T}"/>
+/// rather than replacing the typed counter — typed callers can
+/// still query the <c>T</c>-specific scope when they need to
+/// distinguish (e.g. to apply a dtype-specific optimisation) and
+/// the type-erased flag covers the cross-cutting in-place-mutation
+/// hot path.
+/// </remarks>
+public static class InferenceModeFlag
+{
+    [ThreadStatic]
+    private static int _activeCount;
+
+    /// <summary>
+    /// True when at least one <see cref="InferenceModeScope{T}"/> is
+    /// active on the calling thread for any <c>T</c>. Read by
+    /// in-place tensor mutation paths to skip version-counter bumps
+    /// (mutation is legal under inference mode) and tape-entry
+    /// version validation (no autograd recording took place, so
+    /// nothing to validate).
+    /// </summary>
+    public static bool IsActive => _activeCount > 0;
+
+    internal static void Enter() => _activeCount++;
+
+    internal static void Exit() => _activeCount--;
 }
 
 /// <summary>

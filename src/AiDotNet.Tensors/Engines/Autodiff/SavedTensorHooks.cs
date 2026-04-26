@@ -51,11 +51,16 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 public static class SavedTensorHooks
 {
+    // Each frame carries its element type so a hook pushed for one T
+    // doesn't get cast to Func<Tensor<U>, object> by an unrelated op
+    // running on the same thread. A SaveQuantizedInt8 recipe (float-
+    // only) coexists with a SaveOnCpu<double> on the same stack —
+    // each TryApplyPack<T> walks down past frames whose ElementType
+    // != typeof(T) and only applies the first matching one.
     [ThreadStatic]
-    private static Stack<(Delegate Pack, Delegate Unpack)>? _stack;
+    private static Stack<HookFrame>? _stack;
 
-    private static Stack<(Delegate Pack, Delegate Unpack)> Stack
-        => _stack ??= new Stack<(Delegate, Delegate)>();
+    private static Stack<HookFrame> Stack => _stack ??= new Stack<HookFrame>();
 
     /// <summary>
     /// Returns true if at least one hook pair is active on this thread.
@@ -83,7 +88,7 @@ public static class SavedTensorHooks
     {
         if (pack is null) throw new ArgumentNullException(nameof(pack));
         if (unpack is null) throw new ArgumentNullException(nameof(unpack));
-        Stack.Push(((Delegate)pack, (Delegate)unpack));
+        Stack.Push(new HookFrame(typeof(T), pack, unpack));
         return new PopOnDispose();
     }
 
@@ -104,24 +109,39 @@ public static class SavedTensorHooks
     }
 
     /// <summary>
-    /// Applies the innermost <c>pack</c> hook to
-    /// <paramref name="tensor"/> if any is registered. Op authors
-    /// opting into saved-tensor hook integration call this on each
-    /// activation they were about to save raw into
+    /// Applies the innermost <c>pack</c> hook whose element type
+    /// matches <typeparamref name="T"/>, if any is registered. Op
+    /// authors opting into saved-tensor hook integration call this
+    /// on each activation they were about to save raw into
     /// <see cref="TapeEntry{T}.SavedState"/>.
     /// </summary>
     /// <typeparam name="T">The tensor element type.</typeparam>
     /// <param name="tensor">Activation tensor to save.</param>
     /// <param name="packed">Receives the opaque packed representation
-    /// when a hook is active; otherwise set to null.</param>
-    /// <returns>True if a hook packed the tensor; false if the op
-    /// should save the tensor directly.</returns>
+    /// when a matching hook is active; otherwise set to null.</param>
+    /// <returns>True if a hook packed the tensor; false if no
+    /// type-matching hook is on the stack.</returns>
     public static bool TryApplyPack<T>(Tensor<T> tensor, out object? packed)
     {
         if (_stack is null || _stack.Count == 0) { packed = null; return false; }
-        var (pack, _) = _stack.Peek();
-        packed = ((Func<Tensor<T>, object>)pack)(tensor);
-        return true;
+        // Walk the stack from innermost out; apply the first frame whose
+        // element type matches T. Frames for other Ts are transparent —
+        // their delegates are never cast to a wrong-type signature.
+        // The packed object carries its own unpack delegate so a later
+        // ApplyUnpack still finds the right pair even after the
+        // originating scope has been disposed or replaced by a nested
+        // scope of a different shape.
+        foreach (var frame in _stack)
+        {
+            if (frame.ElementType == typeof(T))
+            {
+                var payload = ((Func<Tensor<T>, object>)frame.Pack)(tensor);
+                packed = new PackedSavedTensor(payload, frame.Unpack);
+                return true;
+            }
+        }
+        packed = null;
+        return false;
     }
 
     /// <summary>
@@ -139,11 +159,73 @@ public static class SavedTensorHooks
     /// without a matching unpack.</exception>
     public static Tensor<T> ApplyUnpack<T>(object packed)
     {
+        if (packed is null) throw new ArgumentNullException(nameof(packed));
+        // The packed object carries its matching unpack delegate
+        // (captured at TryApplyPack time), so the call is independent
+        // of which hook scope is currently on the stack — the
+        // backward pass that consumes a saved tensor packed earlier
+        // recovers it correctly even after the originating scope is
+        // disposed.
+        if (packed is PackedSavedTensor saved)
+        {
+            return ((Func<object, Tensor<T>>)saved.Unpack)(saved.Payload);
+        }
+        // Backward-compat: if a caller hand-built a packed value
+        // without going through TryApplyPack (rare — not encouraged),
+        // fall back to the active-stack lookup for the matching
+        // element type.
         if (_stack is null || _stack.Count == 0)
             throw new InvalidOperationException(
-                "SavedTensorHooks.ApplyUnpack called with no active hook pair.");
-        var (_, unpack) = _stack.Peek();
-        return ((Func<object, Tensor<T>>)unpack)(packed);
+                "SavedTensorHooks.ApplyUnpack received a payload not produced by TryApplyPack "
+              + "and no hook is currently active. The payload should be wrapped in a PackedSavedTensor "
+              + "or the call should run inside an active hook scope.");
+        foreach (var frame in _stack)
+        {
+            if (frame.ElementType == typeof(T))
+                return ((Func<object, Tensor<T>>)frame.Unpack)(packed);
+        }
+        throw new InvalidOperationException(
+            $"SavedTensorHooks.ApplyUnpack<{typeof(T).Name}> called but no hook for that "
+          + "element type is on the stack — the packed value was produced by a different recipe.");
+    }
+
+    /// <summary>
+    /// One frame on the hook stack — the element type is captured at
+    /// push time so cross-type pollution can't trip an
+    /// <see cref="InvalidCastException"/> at apply time.
+    /// </summary>
+    private readonly struct HookFrame
+    {
+        public Type ElementType { get; }
+        public Delegate Pack { get; }
+        public Delegate Unpack { get; }
+        public HookFrame(Type elementType, Delegate pack, Delegate unpack)
+        {
+            ElementType = elementType;
+            Pack = pack;
+            Unpack = unpack;
+        }
+    }
+
+    /// <summary>
+    /// Wraps the recipe-specific packed payload alongside the unpack
+    /// delegate that produced it — read by <see cref="ApplyUnpack{T}"/>
+    /// without any reference to the currently-active hook stack.
+    /// Pinning the unpack at pack time is what lets a saved activation
+    /// survive scope nesting / disposal: the backward pass invoked by
+    /// <see cref="GradientTape{T}"/> sees the same delegate the
+    /// forward pass used regardless of how the stack has shifted in
+    /// between.
+    /// </summary>
+    private sealed class PackedSavedTensor
+    {
+        public object Payload { get; }
+        public Delegate Unpack { get; }
+        public PackedSavedTensor(object payload, Delegate unpack)
+        {
+            Payload = payload;
+            Unpack = unpack;
+        }
     }
 
     private sealed class PopOnDispose : IDisposable

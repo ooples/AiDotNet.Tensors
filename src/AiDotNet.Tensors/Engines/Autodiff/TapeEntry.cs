@@ -113,8 +113,20 @@ public struct TapeEntry<T>
     /// Validates that no input tensor has been mutated since this entry was recorded.
     /// Throws if any input's version counter has changed.
     /// </summary>
+    /// <remarks>
+    /// Skipped when an <see cref="InferenceModeScope{T}"/> is active —
+    /// inference mode does not record tape entries that need to be
+    /// replayed, and even if a stale entry remains from before the
+    /// scope opened, in-place mutations during the scope deliberately
+    /// don't bump the version counter (see
+    /// <see cref="LinearAlgebra.TensorBase.IncrementVersion"/>), so
+    /// running validation here would still pass — the early-out is
+    /// purely a hot-path optimisation.
+    /// </remarks>
     public void ValidateInputVersions()
     {
+        if (InferenceModeFlag.IsActive) return;
+
         if (InputsOverflow is not null)
         {
             // Overflow path uses InputVersionsOverflow if available

@@ -92,6 +92,55 @@ public class TorchFuncPhase1Tests
         Assert.False(NoGradScope<float>.IsSuppressed);
     }
 
+    [Fact]
+    public void InferenceMode_SkipsVersionCounterBump_OnInPlaceMutation()
+    {
+        // The defining behaviour difference between InferenceMode and
+        // NoGrad: in-place ops inside InferenceMode must NOT bump the
+        // tensor's version counter, so safe in-place arithmetic on
+        // inference inputs is legal.
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var y = new Tensor<float>(new float[] { 0.5f, 0.5f, 0.5f, 0.5f }, new[] { 4 });
+
+        // Outside scope: bump expected.
+        int versionBefore = x.Version;
+        _engine.TensorAddInPlace(x, y);
+        Assert.True(x.Version > versionBefore,
+            $"In-place add outside InferenceMode should bump the version "
+          + $"(got {versionBefore} → {x.Version}).");
+
+        // Inside scope: no bump.
+        int versionAtScopeEntry = x.Version;
+        using (GradientTape<float>.InferenceMode())
+        {
+            _engine.TensorAddInPlace(x, y);
+        }
+        Assert.Equal(versionAtScopeEntry, x.Version);
+
+        // Outside scope again: bumps resume.
+        _engine.TensorAddInPlace(x, y);
+        Assert.True(x.Version > versionAtScopeEntry);
+    }
+
+    [Fact]
+    public void InferenceModeFlag_TypeErased_TracksAnyTypeScope()
+    {
+        // The cross-cutting flag must reflect any-T scope, not just
+        // float — TensorBase.IncrementVersion / TapeEntry.ValidateInputVersions
+        // can't see T at the call site so they consult the erased flag.
+        Assert.False(InferenceModeFlag.IsActive);
+        using (GradientTape<double>.InferenceMode())
+        {
+            Assert.True(InferenceModeFlag.IsActive);
+            using (GradientTape<float>.InferenceMode())
+            {
+                Assert.True(InferenceModeFlag.IsActive);
+            }
+            Assert.True(InferenceModeFlag.IsActive);
+        }
+        Assert.False(InferenceModeFlag.IsActive);
+    }
+
     // ─── Higher-order grad via createGraph ───────────────────────────
 
     [Fact]

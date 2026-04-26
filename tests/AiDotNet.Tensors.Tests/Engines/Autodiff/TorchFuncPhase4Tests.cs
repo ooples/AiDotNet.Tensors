@@ -77,28 +77,71 @@ public class TorchFuncPhase4Tests
     public void SavedTensorHooks_SaveQuantizedInt8_ReducesBytes4x()
     {
         // 256 floats = 1024 bytes primal. Quantized sbyte = 256 bytes.
-        // Round-trip introduces quantization error bounded by scale/128.
+        // Round-trip introduces quantization error bounded by scale/2.
         var data = new float[256];
         for (int i = 0; i < 256; i++) data[i] = (i - 128) * 0.1f; // [-12.8, 12.7]
         var original = new Tensor<float>(data, new[] { 256 });
 
         using var _ = SavedTensorRecipes.SaveQuantizedInt8();
         Assert.True(SavedTensorHooks.TryApplyPack(original, out var packed));
+        Assert.NotNull(packed);
+
+        // Verify the actual compressed payload — the packed wrapper
+        // exposes its sbyte[] body via reflection (PackedSavedTensor
+        // is internal). 256 sbytes = 256 bytes vs 1024 float bytes →
+        // exact 4× reduction. Without this assertion a regression
+        // that stored the full-precision payload would still pass
+        // the round-trip-error check below.
+        var payloadField = packed.GetType().GetProperty("Payload",
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(payloadField);
+        var quantizedPayload = payloadField.GetValue(packed);
+        Assert.NotNull(quantizedPayload);
+        // The recipe's QuantizedSaved holds an sbyte[] Data field +
+        // a float Scale + an int[] Shape. Locate the sbyte[] via
+        // reflection so the test stays robust against renames.
+        var dataMember = FindByteArrayField(quantizedPayload);
+        Assert.NotNull(dataMember);
+        var quantBytes = (sbyte[])dataMember!;
+        Assert.Equal(256, quantBytes.Length); // 256 sbytes = 1/4 of 1024 float bytes.
 
         var recovered = SavedTensorHooks.ApplyUnpack<float>(packed);
         Assert.Equal(256, recovered.Length);
 
-        // Every element within one quantization step of the original.
+        // Every element within roughly half a quantization step of
+        // the original. absMax ≈ 12.8 → scale = 12.8/127 ≈ 0.1008 →
+        // max per-element error ≈ 0.5·scale ≈ 0.0504. Tightened from
+        // the previous loose bound so a regression to nearly-a-full-
+        // step error is caught.
         float maxErr = 0f;
         for (int i = 0; i < 256; i++)
         {
             var err = Math.Abs(recovered[i] - original[i]);
             if (err > maxErr) maxErr = err;
         }
-        // absMax ≈ 12.8, scale = 12.8/127 ≈ 0.1008. Max per-element
-        // error ≈ 0.5·scale ≈ 0.05.
-        Assert.True(maxErr < 0.1f,
-            $"Quantization round-trip error {maxErr} exceeds half-scale tolerance.");
+        Assert.True(maxErr < 0.06f,
+            $"Quantization round-trip error {maxErr} exceeds half-scale tolerance (~0.05).");
+    }
+
+    private static object? FindByteArrayField(object packed)
+    {
+        var t = packed.GetType();
+        // Look for any sbyte[] property or field — the recipe's
+        // private storage shape can evolve; the test just needs to
+        // confirm an sbyte[] exists with the expected length.
+        foreach (var prop in t.GetProperties(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
+          | System.Reflection.BindingFlags.Instance))
+        {
+            if (prop.PropertyType == typeof(sbyte[])) return prop.GetValue(packed);
+        }
+        foreach (var fld in t.GetFields(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
+          | System.Reflection.BindingFlags.Instance))
+        {
+            if (fld.FieldType == typeof(sbyte[])) return fld.GetValue(packed);
+        }
+        return null;
     }
 
     [Fact]

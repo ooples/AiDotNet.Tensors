@@ -298,8 +298,27 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
+    /// <remarks>
+    /// When an <see cref="Engines.Autodiff.InferenceModeScope{T}"/> is
+    /// active on the calling thread, the bump is skipped — mutation
+    /// is legal in inference mode and skipping the bump avoids
+    /// false-positive version-mismatch errors in code paths that
+    /// captured the version before entering the scope. The
+    /// type-erased <c>InferenceModeFlag.IsActive</c> check is a
+    /// single boolean read so the cost on the non-inference hot
+    /// path is one branch.
+    /// </remarks>
     internal void IncrementVersion()
     {
+        if (Engines.Autodiff.InferenceModeFlag.IsActive)
+        {
+            // Inference mode: in-place mutation is legal and the
+            // version counter must not advance, otherwise outer code
+            // that recorded a Version snapshot before the scope
+            // entered would observe a phantom mutation.
+            UniformFillValue = null;
+            return;
+        }
         System.Threading.Interlocked.Increment(ref _version);
         UniformFillValue = null; // Invalidate: tensor data no longer uniform after mutation
     }

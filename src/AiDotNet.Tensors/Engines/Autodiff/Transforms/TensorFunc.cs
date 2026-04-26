@@ -271,15 +271,17 @@ public static class TensorFunc<T>
         if (fn is null) throw new ArgumentNullException(nameof(fn));
         if (primals is null) throw new ArgumentNullException(nameof(primals));
 
-        // Run fn once in a NoGrad scope to produce the forward output
-        // the caller wants back — the closure re-runs fn inside a
-        // fresh tape each time VjpFn is invoked, so the outer run does
-        // not need to record.
-        Tensor<T> fwdOutput;
-        using (GradientTape<T>.NoGrad())
-        {
-            fwdOutput = fn(primals);
-        }
+        // Run fn once in the ambient context to produce the forward
+        // output the caller wants back. We deliberately do NOT wrap
+        // this in NoGrad: NoGradScope<T>.IsSuppressed gates all nested
+        // RecordIfActive calls, so wrapping here would break
+        // composition with transforms like Vjp(Grad(...)) where fn
+        // itself opens its own tape (Grad's closure expects to record).
+        // Any side-effect on an ambient outer tape is accepted — the
+        // closure below re-runs fn under a fresh dedicated tape, so
+        // ambient pollution from this initial run is harmless to the
+        // VJP semantic.
+        Tensor<T> fwdOutput = fn(primals);
 
         Tensor<T>[] VjpClosure(Tensor<T> cotangent)
         {
@@ -498,101 +500,35 @@ public static class TensorFunc<T>
                     $"Vmap batch dimension has size {batchSize}; must be > 0.",
                     nameof(input));
 
-            // Our stride math below assumes a contiguous row-major
-            // storage at offset 0 — views (transpose, slice) have
-            // non-trivial strides and/or a non-zero storage offset,
-            // so materialize up front. This matches what other
-            // AsSpan()-consuming code paths do (e.g. Tensor.cs TensorAdd
-            // fallback). Skipped for tensors that already satisfy the
-            // invariant to avoid the copy.
-            var workingInput = input;
-            if (!workingInput.IsContiguous || workingInput._storageOffset != 0)
-                workingInput = workingInput.Contiguous();
-
-            // Slice the input along inDim and apply fn to each slice.
+            // Slice via the engine's TensorSliceAxis op so each slice
+            // stays connected to `input` on the active gradient tape.
+            // The previous implementation copied raw element data into
+            // new Tensor<T>(...) instances, which severed the graph
+            // and made Grad(Vmap(fn)) / JacRev(Vmap(fn)) return zero
+            // gradients for the input — a user-visible composition
+            // break for a torch.func-style transform.
+            var engine = AiDotNetEngine.Current;
             var slices = new Tensor<T>[batchSize];
-            var unbatchedShape = new int[inShape.Length - 1];
-            int idx = 0;
-            for (int k = 0; k < inShape.Length; k++)
-                if (k != normIn) unbatchedShape[idx++] = inShape[k];
-
-            int innerCount = 1;
-            for (int k = 0; k < unbatchedShape.Length; k++) innerCount *= unbatchedShape[k];
-
-            // Compute stride products for indexing along inDim.
-            int strideBefore = 1;
-            for (int k = 0; k < normIn; k++) strideBefore *= inShape[k];
-            int strideAt = inShape[normIn];
-            int strideAfter = 1;
-            for (int k = normIn + 1; k < inShape.Length; k++) strideAfter *= inShape[k];
-
-            var inData = workingInput.AsSpan();
             for (int b = 0; b < batchSize; b++)
-            {
-                var sliceData = new T[innerCount];
-                int outIdx = 0;
-                for (int before = 0; before < strideBefore; before++)
-                {
-                    for (int after = 0; after < strideAfter; after++)
-                    {
-                        int srcIdx = (before * strideAt + b) * strideAfter + after;
-                        sliceData[outIdx++] = inData[srcIdx];
-                    }
-                }
-                slices[b] = new Tensor<T>(sliceData, unbatchedShape);
-            }
+                slices[b] = engine.TensorSliceAxis(input, normIn, b);
 
             // Apply fn to each slice.
             var outs = new Tensor<T>[batchSize];
             for (int b = 0; b < batchSize; b++) outs[b] = fn(slices[b]);
 
-            // Stack along outDim.
-            var perOutShape = outs[0]._shape;
-            int outRank = perOutShape.Length + 1;
+            // Validate outDim before delegating to TensorStack so the
+            // failure message stays in Vmap's argument-validation
+            // surface rather than inside the engine.
+            int outRank = outs[0]._shape.Length + 1;
             int normOut = outDim < 0 ? outDim + outRank : outDim;
             if ((uint)normOut >= (uint)outRank)
                 throw new ArgumentOutOfRangeException(nameof(outDim),
                     $"outDim {outDim} out of range for rank-{outRank} output.");
 
-            var stackedShape = new int[outRank];
-            int psIdx = 0;
-            for (int k = 0; k < outRank; k++)
-            {
-                if (k == normOut) stackedShape[k] = batchSize;
-                else stackedShape[k] = perOutShape[psIdx++];
-            }
-
-            int stackedLen = 1;
-            for (int k = 0; k < outRank; k++) stackedLen *= stackedShape[k];
-            var stackedData = new T[stackedLen];
-
-            int outStrideBefore = 1;
-            for (int k = 0; k < normOut; k++) outStrideBefore *= stackedShape[k];
-            int outStrideAt = batchSize;
-            int outStrideAfter = 1;
-            for (int k = normOut + 1; k < outRank; k++) outStrideAfter *= stackedShape[k];
-
-            for (int b = 0; b < batchSize; b++)
-            {
-                // The user's fn may have returned a view (transpose,
-                // slice) whose flat span does not match its logical
-                // layout. Materialize before reading.
-                var sliceTensor = outs[b];
-                if (!sliceTensor.IsContiguous || sliceTensor._storageOffset != 0)
-                    sliceTensor = sliceTensor.Contiguous();
-                var sliceData = sliceTensor.AsSpan();
-                int sliceIdx = 0;
-                for (int before = 0; before < outStrideBefore; before++)
-                {
-                    for (int after = 0; after < outStrideAfter; after++)
-                    {
-                        int destIdx = (before * outStrideAt + b) * outStrideAfter + after;
-                        stackedData[destIdx] = sliceData[sliceIdx++];
-                    }
-                }
-            }
-
-            return new Tensor<T>(stackedData, stackedShape);
+            // Stack along outDim — TensorStack records on the tape so
+            // gradients flow from the assembled output back through
+            // every slice to the original input.
+            return engine.TensorStack(outs, normOut);
         };
     }
 
