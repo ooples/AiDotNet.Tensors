@@ -141,7 +141,7 @@ public class TorchFuncPhase2Tests
         var xPrimal = new Tensor<float>(new[] { 2f }, new[] { 1 });
         var xTangent = new Tensor<float>(new[] { 1f }, new[] { 1 });
 
-        var (primal, tangent) = TensorFunc<float>.Jvp(_engine, dualFn, xPrimal, xTangent);
+        var (primal, tangent) = TensorFunc<float>.Jvp(dualFn, xPrimal, xTangent);
         Assert.Equal(12f, primal[0], precision: 3);
         Assert.Equal(16f, tangent[0], precision: 3);
 
@@ -169,7 +169,7 @@ public class TorchFuncPhase2Tests
 
         var xPrimal = new Tensor<float>(new[] { 0.5f }, new[] { 1 });
         var xTangent = new Tensor<float>(new[] { 1f }, new[] { 1 });
-        var (_, tangent) = TensorFunc<float>.Jvp(_engine, dualFn, xPrimal, xTangent);
+        var (_, tangent) = TensorFunc<float>.Jvp(dualFn, xPrimal, xTangent);
 
         var grad = TensorFunc<float>.Grad(x =>
             _engine.TensorExp(_engine.TensorSin(x)))(xPrimal);
@@ -189,7 +189,7 @@ public class TorchFuncPhase2Tests
         Func<Dual<float>[], Dual<float>> fn = duals =>
             DualOps<float>.MatMul(_engine, duals[0], duals[1]);
 
-        var (primal, tangent) = TensorFunc<float>.Jvp(_engine, fn,
+        var (primal, tangent) = TensorFunc<float>.Jvp(fn,
             new[] { A, B }, new[] { dA, dB });
 
         // Primal A·B at entries: (1,1)=19, (1,2)=22, (2,1)=43, (2,2)=50.
@@ -210,12 +210,10 @@ public class TorchFuncPhase2Tests
     public void Jvp_ArgumentValidation()
     {
         Assert.Throws<ArgumentNullException>(
-            () => TensorFunc<float>.Jvp(null, (Dual<float>[] _) => default, new Tensor<float>[0], new Tensor<float>[0]));
-        Assert.Throws<ArgumentNullException>(
-            () => TensorFunc<float>.Jvp(_engine, (Func<Dual<float>[], Dual<float>>)null, new Tensor<float>[0], new Tensor<float>[0]));
+            () => TensorFunc<float>.Jvp((Func<Dual<float>[], Dual<float>>)null, new Tensor<float>[0], new Tensor<float>[0]));
 
         var x = new Tensor<float>(new[] { 1f }, new[] { 1 });
         Assert.Throws<ArgumentException>(
-            () => TensorFunc<float>.Jvp(_engine, duals => duals[0], new[] { x }, new Tensor<float>[0]));
+            () => TensorFunc<float>.Jvp(duals => duals[0], new[] { x }, new Tensor<float>[0]));
     }
 }

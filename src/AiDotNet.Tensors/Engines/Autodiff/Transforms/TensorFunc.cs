@@ -201,27 +201,31 @@ public static class TensorFunc<T>
     /// <see cref="JacFwd"/> and forward-over-reverse Hessians.
     /// </para>
     /// </remarks>
-    /// <param name="engine">Engine used for primal + tangent
-    /// arithmetic. Must be non-null.</param>
     /// <param name="dualFn">User function running over
     /// <see cref="Dual{T}"/> tensors via <see cref="DualOps{T}"/>.</param>
     /// <param name="primals">Primal input tensors.</param>
     /// <param name="tangents">Tangent (direction) tensors — must
     /// match <paramref name="primals"/> in count and shape.</param>
     /// <returns>Tuple <c>(primalOutput, tangentOutput)</c>.</returns>
+    /// <remarks>
+    /// The engine driving primal + tangent arithmetic is whatever
+    /// <see cref="DualOps{T}"/> resolves at call time (currently
+    /// <see cref="AiDotNetEngine.Current"/>). Earlier revisions of this
+    /// API took an explicit <c>IEngine</c> parameter, but it was never
+    /// threaded into the dual-number ops — we removed it so the call
+    /// contract reflects what actually runs.
+    /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown if
-    /// <paramref name="engine"/>, <paramref name="dualFn"/>,
-    /// <paramref name="primals"/>, or <paramref name="tangents"/> is null.</exception>
+    /// <paramref name="dualFn"/>, <paramref name="primals"/>, or
+    /// <paramref name="tangents"/> is null.</exception>
     /// <exception cref="ArgumentException">Thrown if
     /// <paramref name="primals"/> and <paramref name="tangents"/> have
     /// different lengths.</exception>
     public static (Tensor<T> Primal, Tensor<T> Tangent) Jvp(
-        IEngine engine,
         Func<Dual<T>[], Dual<T>> dualFn,
         Tensor<T>[] primals,
         Tensor<T>[] tangents)
     {
-        if (engine is null) throw new ArgumentNullException(nameof(engine));
         if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
         if (primals is null) throw new ArgumentNullException(nameof(primals));
         if (tangents is null) throw new ArgumentNullException(nameof(tangents));
@@ -240,14 +244,12 @@ public static class TensorFunc<T>
     /// Single-input JVP overload.
     /// </summary>
     public static (Tensor<T> Primal, Tensor<T> Tangent) Jvp(
-        IEngine engine,
         Func<Dual<T>, Dual<T>> dualFn,
         Tensor<T> primal,
         Tensor<T> tangent)
     {
-        if (engine is null) throw new ArgumentNullException(nameof(engine));
         if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
-        return Jvp(engine, duals => dualFn(duals[0]), new[] { primal }, new[] { tangent });
+        return Jvp(duals => dualFn(duals[0]), new[] { primal }, new[] { tangent });
     }
 
     // ─── Reverse-mode (Vjp) ───────────────────────────────────────────
@@ -271,14 +273,19 @@ public static class TensorFunc<T>
         if (fn is null) throw new ArgumentNullException(nameof(fn));
         if (primals is null) throw new ArgumentNullException(nameof(primals));
 
-        // Snapshot the primals array so the closure below operates on
-        // an immutable copy. The caller's array could otherwise be
-        // mutated between Vjp(...) returning and VjpFn(cotangent)
-        // running — that would have the closure compute gradients
-        // for different inputs than the eager Output we just returned,
-        // a subtle aliasing bug torch.func doesn't expose because
-        // PyTorch tensors are pinned by the closure's tape capture.
-        var primalsSnapshot = (Tensor<T>[])primals.Clone();
+        // Freeze the primal *values* — not just the array shell — so
+        // VjpClosure differentiates the same point in input space we
+        // returned Output for. A shallow Array.Clone would still let a
+        // caller mutate any primal's data buffer between Vjp() returning
+        // and VjpFn() running; both the eager Output (already computed)
+        // and the re-run inside VjpClosure would silently track those
+        // post-hoc mutations, producing gradients that no longer match
+        // the returned Output. PyTorch hides this by having the tape
+        // pin tensor data — we make the contract explicit by deep
+        // copying every primal up front.
+        var primalsSnapshot = new Tensor<T>[primals.Length];
+        for (int i = 0; i < primals.Length; i++)
+            primalsSnapshot[i] = primals[i].Clone();
 
         // Run fn once in the ambient context to produce the forward
         // output the caller wants back. We deliberately do NOT wrap
@@ -399,11 +406,15 @@ public static class TensorFunc<T>
     /// <see cref="DualOps{T}"/> so the tangent propagates through each
     /// op. Matches <c>torch.func.jacfwd</c>.
     /// </remarks>
+    /// <remarks>
+    /// As with <see cref="Jvp(Func{Dual{T}[], Dual{T}}, Tensor{T}[], Tensor{T}[])"/>,
+    /// the engine driving primal + tangent arithmetic is the one resolved
+    /// by <see cref="DualOps{T}"/> at call time — there is no
+    /// per-invocation engine override.
+    /// </remarks>
     public static Func<Tensor<T>, Tensor<T>> JacFwd(
-        IEngine engine,
         Func<Dual<T>, Dual<T>> dualFn)
     {
-        if (engine is null) throw new ArgumentNullException(nameof(engine));
         if (dualFn is null) throw new ArgumentNullException(nameof(dualFn));
 
         return x =>
@@ -571,18 +582,28 @@ public static class TensorFunc<T>
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (fn is null) throw new ArgumentNullException(nameof(fn));
 
-        // Snapshot current parameters so we can restore them.
-        var saved = parameterBuffer.AsVector();
-        var savedCopy = new Vector<T>(saved.Length);
-        for (int i = 0; i < saved.Length; i++) savedCopy[i] = saved[i];
-        try
+        // Hold the buffer's swap lock for the entire snapshot/swap/call/
+        // restore sequence. Without this, two threads invoking
+        // FunctionalCall on the same buffer can interleave their writes
+        // and observe each other's temporary parameters — and the
+        // restore order can leave the buffer holding the wrong "saved"
+        // snapshot once both calls return. The lock makes the swap
+        // atomic with respect to other FunctionalCall invocations on
+        // the same buffer; cross-buffer parallelism is unaffected.
+        lock (parameterBuffer.SwapLock)
         {
-            parameterBuffer.CopyFrom(parameters);
-            return fn();
-        }
-        finally
-        {
-            parameterBuffer.CopyFrom(savedCopy);
+            var saved = parameterBuffer.AsVector();
+            var savedCopy = new Vector<T>(saved.Length);
+            for (int i = 0; i < saved.Length; i++) savedCopy[i] = saved[i];
+            try
+            {
+                parameterBuffer.CopyFrom(parameters);
+                return fn();
+            }
+            finally
+            {
+                parameterBuffer.CopyFrom(savedCopy);
+            }
         }
     }
 

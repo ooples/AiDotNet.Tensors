@@ -63,6 +63,21 @@ public sealed class ParameterBuffer<T>
     private readonly int[][] _shapes;
     private readonly int _totalSize;
 
+    // Held by callers that need to atomically swap, observe, and restore
+    // the buffer's contents — most importantly TensorFunc.FunctionalCall.
+    // Public so the `using (buffer.AcquireSwapLock())` form composes with
+    // user-side synchronisation; not meant for hot-path coordination.
+    private readonly object _swapLock = new();
+
+    /// <summary>
+    /// Synchronisation root for atomic multi-step operations against
+    /// this buffer's contents (swap, call, restore). Held by
+    /// <see cref="Transforms.TensorFunc{T}.FunctionalCall"/> for the
+    /// full call so concurrent invocations on the same buffer cannot
+    /// observe each other's intermediate state.
+    /// </summary>
+    internal object SwapLock => _swapLock;
+
     /// <summary>
     /// Creates a new parameter buffer sized to hold all parameter tensors with the given shapes.
     /// </summary>

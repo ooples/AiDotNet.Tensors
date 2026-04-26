@@ -60,6 +60,15 @@ public static class SavedTensorHooks
     [ThreadStatic]
     private static Stack<HookFrame>? _stack;
 
+    // Monotonic frame-id counter, per thread. Each Push() takes the next
+    // value; PopOnDispose remembers it and asserts the stack top still
+    // matches at dispose time. Out-of-order disposal — e.g. an outer
+    // scope disposing before an inner one — would otherwise silently
+    // remove the wrong frame and leave hooks active for code that
+    // wasn't supposed to see them.
+    [ThreadStatic]
+    private static long _nextFrameId;
+
     private static Stack<HookFrame> Stack => _stack ??= new Stack<HookFrame>();
 
     /// <summary>
@@ -88,8 +97,9 @@ public static class SavedTensorHooks
     {
         if (pack is null) throw new ArgumentNullException(nameof(pack));
         if (unpack is null) throw new ArgumentNullException(nameof(unpack));
-        Stack.Push(new HookFrame(typeof(T), pack, unpack));
-        return new PopOnDispose();
+        long id = ++_nextFrameId;
+        Stack.Push(new HookFrame(id, typeof(T), pack, unpack));
+        return new PopOnDispose(id);
     }
 
     /// <summary>
@@ -207,11 +217,13 @@ public static class SavedTensorHooks
     /// </summary>
     private readonly struct HookFrame
     {
+        public long Id { get; }
         public Type ElementType { get; }
         public Delegate Pack { get; }
         public Delegate Unpack { get; }
-        public HookFrame(Type elementType, Delegate pack, Delegate unpack)
+        public HookFrame(long id, Type elementType, Delegate pack, Delegate unpack)
         {
+            Id = id;
             ElementType = elementType;
             Pack = pack;
             Unpack = unpack;
@@ -243,12 +255,31 @@ public static class SavedTensorHooks
 
     private sealed class PopOnDispose : IDisposable
     {
+        private readonly long _frameId;
         private bool _disposed;
+        public PopOnDispose(long frameId) { _frameId = frameId; }
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            Pop();
+            // Bound to a specific frame, not just "the top". If a caller
+            // disposes scopes out of LIFO order — e.g. by leaking the
+            // disposable across an `await` boundary — popping the top
+            // would silently remove the wrong frame. Instead we assert
+            // the top still belongs to us and throw otherwise so the
+            // mistake surfaces immediately rather than later as
+            // mysteriously-changed hook semantics.
+            if (_stack is null || _stack.Count == 0)
+                throw new InvalidOperationException(
+                    "SavedTensorHooks: hook scope disposed but the stack is empty — " +
+                    "the stack was already cleared (likely by an unbalanced manual Pop call).");
+            if (_stack.Peek().Id != _frameId)
+                throw new InvalidOperationException(
+                    "SavedTensorHooks: out-of-order scope disposal. The disposable returned " +
+                    "by Push must be disposed in LIFO order (innermost first). A disposable " +
+                    "for an outer scope was disposed while an inner scope is still on the stack — " +
+                    "popping it would silently corrupt the hook frame for the inner scope.");
+            _stack.Pop();
         }
     }
 }

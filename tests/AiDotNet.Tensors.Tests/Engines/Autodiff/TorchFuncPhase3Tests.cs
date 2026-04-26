@@ -70,7 +70,7 @@ public class TorchFuncPhase3Tests
             _engine.TensorMultiply(x, x);
 
         var input = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 3 });
-        var jFwd = TensorFunc<float>.JacFwd(_engine, dualFn)(input);
+        var jFwd = TensorFunc<float>.JacFwd(dualFn)(input);
         var jRev = TensorFunc<float>.JacRev(reverseFn)(input);
 
         Assert.Equal(jRev._shape, jFwd._shape);
