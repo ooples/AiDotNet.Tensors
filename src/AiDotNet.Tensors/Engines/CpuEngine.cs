@@ -7445,6 +7445,42 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputSpan = result.Data.Span;
         int inputSliceSize = inChannels * height * width;
 
+        // 1×1 fast path (issue #251): when the kernel is 1×1 with stride=1,
+        // pad=0, dilation=1, Im2Col degenerates to an identity copy of the
+        // input — the "expanded" matrix has the same layout as the input
+        // slice. Skip the Im2Col pass entirely and feed the input directly
+        // to GEMM. ResNet50's BottleneckBlock has two 1×1 convs per block
+        // (32 of 50 conv layers), so eliminating the Im2Col copy for them
+        // is a load-bearing piece of the budget fix.
+        if (kernelHeight == 1 && kernelWidth == 1
+            && stride == 1 && padding == 0 && dilation == 1)
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int inputOffset = b * inputSliceSize;
+                int outputOffset = b * outChannels * colW;
+
+                bool usedBlas = Helpers.BlasProvider.TryGemm(
+                    outChannels, colW, colH,
+                    kernelSpan.Slice(0, outChannels * colH),
+                    colH,
+                    inputSpan.Slice(inputOffset, inputSliceSize),
+                    colW,
+                    outputSpan.Slice(outputOffset, outChannels * colW),
+                    colW);
+
+                if (!usedBlas)
+                {
+                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                        kernelSpan.Slice(0, outChannels * colH),
+                        inputSpan.Slice(inputOffset, inputSliceSize),
+                        outputSpan.Slice(outputOffset, outChannels * colW),
+                        outChannels, colH, colW);
+                }
+            }
+            return;
+        }
+
 #if !NET471
         using var im2colBuffer = new NativeBuffer<double>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
@@ -26987,7 +27023,27 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Generic fallback (non-float, non-NCHW, or unsupported activation).
+        // Double-precision NCHW fast path — same shape/activation gates
+        // as float, exercises the mirrored ApplyBiasActivationNCHWInPlace
+        // double overload. Motivation: issue #251 profile of ResNet50
+        // double-precision training showed Conv+Bias+Identity paths
+        // taking 3 engine calls + 2 intermediate tensor allocations per
+        // conv layer. Folding into a single in-place SIMD bias pass
+        // drops those to 1 alloc and one memory round-trip — closes the
+        // ~120s training-budget overrun in downstream PR #1182.
+        if (typeof(T) == typeof(double) && result.Rank == 4
+            && (bias is null || (bias.Rank == 1 && bias._shape[0] == result._shape[1]))
+            && (activation == FusedActivationType.None
+                || activation == FusedActivationType.ReLU))
+        {
+            int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
+            var outArr = (double[])(object)result.GetDataArray();
+            var biasArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+            CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
+            return result;
+        }
+
+        // Generic fallback (non-float/double, non-NCHW, or unsupported activation).
         // Step 2: Add bias if provided. Right-align broadcast: a rank-1
         // bias of length C must be reshaped to [1, C, 1, 1] so it aligns
         // with the NCHW result's channel axis, not the innermost (W) dim.

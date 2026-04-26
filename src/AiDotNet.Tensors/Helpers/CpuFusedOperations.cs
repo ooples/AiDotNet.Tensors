@@ -209,6 +209,53 @@ public static class CpuFusedOperations
     }
 
 #if NET5_0_OR_GREATER
+    // ──────────────────────────────────────────────────────────────────────
+    // NaN-preserving ReLU primitives.
+    //
+    // x86 MAXPS / MAXPD / VMAXPS / VMAXPD all return SRC2 when SRC1 is NaN
+    // (Intel SDM Vol.2, MAXPD pseudocode). So `Avx.Max(v, vZero)` silently
+    // turns every NaN lane into +0.0 — divergent from the scalar fallback
+    // `val < 0 ? 0 : val`, where `NaN < 0` is false (ordered) so NaN is
+    // preserved. That divergence makes numerical results depend on which
+    // CPU SIMD level is active and silently masks invalid activations
+    // during training.
+    //
+    // The compare-and-AndNot form below mirrors the scalar semantics on
+    // every SIMD path: build a mask of the strict-negative lanes (NaN
+    // gives ordered-false → mask 0), then `(NOT mask) AND v` keeps the
+    // bit pattern of v where v >= 0 OR v is NaN, and zeroes lanes where
+    // v < 0. NaN bit patterns survive identically.
+    // ──────────────────────────────────────────────────────────────────────
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> ReluNaNSafeAvx(Vector256<float> v, Vector256<float> vZero)
+    {
+        var ltZero = Avx.Compare(v, vZero, FloatComparisonMode.OrderedLessThanNonSignaling);
+        return Avx.AndNot(ltZero, v);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<double> ReluNaNSafeAvx(Vector256<double> v, Vector256<double> vZero)
+    {
+        var ltZero = Avx.Compare(v, vZero, FloatComparisonMode.OrderedLessThanNonSignaling);
+        return Avx.AndNot(ltZero, v);
+    }
+
+#if NET8_0_OR_GREATER
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<float> ReluNaNSafeAvx512(Vector512<float> v, Vector512<float> vZero)
+    {
+        var ltZero = Avx512F.CompareLessThan(v, vZero);
+        return Avx512F.AndNot(ltZero.AsUInt32(), v.AsUInt32()).AsSingle();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<double> ReluNaNSafeAvx512(Vector512<double> v, Vector512<double> vZero)
+    {
+        var ltZero = Avx512F.CompareLessThan(v, vZero);
+        return Avx512F.AndNot(ltZero.AsUInt64(), v.AsUInt64()).AsDouble();
+    }
+#endif
+
     /// <summary>
     /// SIMD per-(n, c) plane kernel: scalar bias[c] broadcast to vector,
     /// added to each HW position, optional ReLU, in-place store. 32-float
@@ -239,8 +286,8 @@ public static class CpuFusedOperations
                     var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), vBias512);
                     if (applyRelu)
                     {
-                        v0 = Avx512F.Max(v0, vZero512);
-                        v1 = Avx512F.Max(v1, vZero512);
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
                     Avx512F.Store(pOut + j, v0);
                     Avx512F.Store(pOut + j + 16, v1);
@@ -248,7 +295,7 @@ public static class CpuFusedOperations
                 for (; j + 16 <= hw; j += 16)
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
-                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < hw; j++)
@@ -269,10 +316,10 @@ public static class CpuFusedOperations
                 var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), vBias);
                 if (applyRelu)
                 {
-                    v0 = Avx.Max(v0, vZero);
-                    v1 = Avx.Max(v1, vZero);
-                    v2 = Avx.Max(v2, vZero);
-                    v3 = Avx.Max(v3, vZero);
+                    v0 = ReluNaNSafeAvx(v0, vZero);
+                    v1 = ReluNaNSafeAvx(v1, vZero);
+                    v2 = ReluNaNSafeAvx(v2, vZero);
+                    v3 = ReluNaNSafeAvx(v3, vZero);
                 }
                 Avx.Store(pOut + j,      v0);
                 Avx.Store(pOut + j + 8,  v1);
@@ -282,13 +329,176 @@ public static class CpuFusedOperations
             for (; j + 8 <= hw; j += 8)
             {
                 var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
-                if (applyRelu) v = Avx.Max(v, vZero);
+                if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
                 Avx.Store(pOut + j, v);
             }
             for (; j < hw; j++)
             {
                 float val = pOut[j] + b;
                 pOut[j] = applyRelu && val < 0f ? 0f : val;
+            }
+        }
+    }
+#endif
+
+    /// <summary>
+    /// Double-precision counterpart of <see cref="ApplyBiasActivationNCHWInPlace(float[], float[], int, int, int, int, FusedActivationType)"/>.
+    /// Same tiling + parallelisation strategy, but SIMD registers hold 4
+    /// doubles (AVX2) or 8 doubles (AVX-512) so the per-lane unroll is
+    /// halved. Closes the issue #251 hot path: ResNet50 double-precision
+    /// training decomposed Conv+Bias into three engine calls + two
+    /// intermediate tensor allocations per conv layer; with this kernel
+    /// the bias broadcast folds into a single in-place SIMD pass over
+    /// the Conv2D output.
+    /// </summary>
+    /// <remarks>
+    /// The NCHW plane layout makes bias broadcast trivial: for each
+    /// (n, c) plane the bias value <c>bias[c]</c> is a scalar that we
+    /// broadcast into a SIMD register once, then add against successive
+    /// vector loads from the <c>H·W</c> output positions. The
+    /// per-plane SIMD helper mirrors <see cref="ApplyNchwPlaneSimd"/>
+    /// but with double register widths and no GELU branch (double GELU
+    /// isn't currently a bottleneck for the workloads that hit this
+    /// path — add it when a concrete request surfaces).
+    /// </remarks>
+    [MethodImpl(Hot)]
+    internal static void ApplyBiasActivationNCHWInPlace(
+        double[] output, double[]? bias,
+        int N, int C, int H, int W, FusedActivationType activation)
+    {
+        bool hasBias = bias != null;
+        bool hasActivation = activation != FusedActivationType.None;
+        if (!hasBias && !hasActivation) return;
+
+        int hw = H * W;
+        int totalPlanes = N * C;
+
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && hw >= 4 &&
+            (activation == FusedActivationType.None
+             || activation == FusedActivationType.ReLU))
+        {
+            if (totalPlanes >= 4)
+            {
+                Parallel.For(0, totalPlanes, p =>
+                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
+            }
+            else
+            {
+                for (int p = 0; p < totalPlanes; p++)
+                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU);
+            }
+            return;
+        }
+#endif
+
+        // Scalar fallback — every runtime that doesn't hit the SIMD
+        // branch (pre-AVX x86, ARM without vectorisation, net471).
+        // Resolve the activation delegate once outside the loop so
+        // every supported FusedActivationType value works here, not
+        // only ReLU. Mirrors the float overload's GetFloatActivation
+        // path — same surface, same semantics.
+        Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation) : null;
+        for (int n = 0; n < N; n++)
+        {
+            for (int c = 0; c < C; c++)
+            {
+                double b = hasBias ? bias![c] : 0.0;
+                int offset = (n * C + c) * hw;
+                for (int i = 0; i < hw; i++)
+                {
+                    double val = output[offset + i];
+                    if (hasBias) val += b;
+                    if (activationFn != null) val = activationFn(val);
+                    output[offset + i] = val;
+                }
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Per-(n, c) plane kernel for doubles — broadcast bias[c] once,
+    /// add to each HW position via AVX/AVX-512, optional ReLU, in-place
+    /// store. Mirrors <see cref="ApplyNchwPlaneSimd"/> at half the lane
+    /// count (4 doubles per AVX-256 register, 8 per AVX-512).
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ApplyNchwPlaneSimdDouble(
+        double[] output, double[]? bias, int planeIdx, int C, int hw, bool applyRelu)
+    {
+        int c = planeIdx % C;
+        double b = bias is not null ? bias[c] : 0.0;
+        int offset = planeIdx * hw;
+        fixed (double* pOut = &output[offset])
+        {
+            int j = 0;
+            var vZero = Vector256<double>.Zero;
+            var vBias = Vector256.Create(b);
+
+#if NET8_0_OR_GREATER
+            if (CpuFeatures.HasAVX512F)
+            {
+                var vZero512 = Vector512<double>.Zero;
+                var vBias512 = Vector512.Create(b);
+                int simdLen512 = hw & ~15;
+                for (; j < simdLen512; j += 16)
+                {
+                    var v0 = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 8), vBias512);
+                    if (applyRelu)
+                    {
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
+                    }
+                    Avx512F.Store(pOut + j, v0);
+                    Avx512F.Store(pOut + j + 8, v1);
+                }
+                for (; j + 8 <= hw; j += 8)
+                {
+                    var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
+                    Avx512F.Store(pOut + j, v);
+                }
+                for (; j < hw; j++)
+                {
+                    double val = pOut[j] + b;
+                    pOut[j] = applyRelu && val < 0.0 ? 0.0 : val;
+                }
+                return;
+            }
+#endif
+
+            // AVX path — 4 doubles per register, 4× unroll = 16 per block.
+            int simdLen = hw & ~15;
+            for (; j < simdLen; j += 16)
+            {
+                var v0 = Avx.Add(Avx.LoadVector256(pOut + j),      vBias);
+                var v1 = Avx.Add(Avx.LoadVector256(pOut + j + 4),  vBias);
+                var v2 = Avx.Add(Avx.LoadVector256(pOut + j + 8),  vBias);
+                var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 12), vBias);
+                if (applyRelu)
+                {
+                    v0 = ReluNaNSafeAvx(v0, vZero);
+                    v1 = ReluNaNSafeAvx(v1, vZero);
+                    v2 = ReluNaNSafeAvx(v2, vZero);
+                    v3 = ReluNaNSafeAvx(v3, vZero);
+                }
+                Avx.Store(pOut + j,      v0);
+                Avx.Store(pOut + j + 4,  v1);
+                Avx.Store(pOut + j + 8,  v2);
+                Avx.Store(pOut + j + 12, v3);
+            }
+            for (; j + 4 <= hw; j += 4)
+            {
+                var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
+                if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
+                Avx.Store(pOut + j, v);
+            }
+            for (; j < hw; j++)
+            {
+                double val = pOut[j] + b;
+                pOut[j] = applyRelu && val < 0.0 ? 0.0 : val;
             }
         }
     }
@@ -507,8 +717,8 @@ public static class CpuFusedOperations
                     var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), Avx512F.LoadVector512(pBias + j + 16));
                     if (applyRelu)
                     {
-                        v0 = Avx512F.Max(v0, vZero512);
-                        v1 = Avx512F.Max(v1, vZero512);
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
                     Avx512F.Store(pOut + j,      v0);
                     Avx512F.Store(pOut + j + 16, v1);
@@ -516,7 +726,7 @@ public static class CpuFusedOperations
                 for (; j + 16 <= N; j += 16)
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), Avx512F.LoadVector512(pBias + j));
-                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < N; j++)
@@ -541,10 +751,10 @@ public static class CpuFusedOperations
                     var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), Avx.LoadVector256(pBias + j + 24));
                     if (applyRelu)
                     {
-                        v0 = Avx.Max(v0, vZero);
-                        v1 = Avx.Max(v1, vZero);
-                        v2 = Avx.Max(v2, vZero);
-                        v3 = Avx.Max(v3, vZero);
+                        v0 = ReluNaNSafeAvx(v0, vZero);
+                        v1 = ReluNaNSafeAvx(v1, vZero);
+                        v2 = ReluNaNSafeAvx(v2, vZero);
+                        v3 = ReluNaNSafeAvx(v3, vZero);
                     }
                     Avx.Store(pOut + j,      v0);
                     Avx.Store(pOut + j + 8,  v1);
@@ -554,7 +764,7 @@ public static class CpuFusedOperations
                 for (; j + 8 <= N; j += 8)
                 {
                     var v = Avx.Add(Avx.LoadVector256(pOut + j), Avx.LoadVector256(pBias + j));
-                    if (applyRelu) v = Avx.Max(v, vZero);
+                    if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
                     Avx.Store(pOut + j, v);
                 }
                 for (; j < N; j++)
@@ -568,13 +778,13 @@ public static class CpuFusedOperations
                 int simdLen = N & ~31;
                 for (; j < simdLen; j += 32)
                 {
-                    Avx.Store(pOut + j,      Avx.Max(Avx.LoadVector256(pOut + j),      vZero));
-                    Avx.Store(pOut + j + 8,  Avx.Max(Avx.LoadVector256(pOut + j + 8),  vZero));
-                    Avx.Store(pOut + j + 16, Avx.Max(Avx.LoadVector256(pOut + j + 16), vZero));
-                    Avx.Store(pOut + j + 24, Avx.Max(Avx.LoadVector256(pOut + j + 24), vZero));
+                    Avx.Store(pOut + j,      ReluNaNSafeAvx(Avx.LoadVector256(pOut + j),      vZero));
+                    Avx.Store(pOut + j + 8,  ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 8),  vZero));
+                    Avx.Store(pOut + j + 16, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 16), vZero));
+                    Avx.Store(pOut + j + 24, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 24), vZero));
                 }
                 for (; j + 8 <= N; j += 8)
-                    Avx.Store(pOut + j, Avx.Max(Avx.LoadVector256(pOut + j), vZero));
+                    Avx.Store(pOut + j, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j), vZero));
                 for (; j < N; j++)
                     if (pOut[j] < 0f) pOut[j] = 0f;
             }
@@ -896,7 +1106,10 @@ public static class CpuFusedOperations
     private static readonly Dictionary<FusedActivationType, Func<float, float>> _floatActivations = new()
     {
         { FusedActivationType.None, x => x },
-        { FusedActivationType.ReLU, x => x > 0f ? x : 0f },
+        // NaN-preserving: `x < 0 ? 0 : x` — when x is NaN, `x < 0` is false (ordered),
+        // so NaN survives. The seemingly equivalent `x > 0 ? x : 0` would convert
+        // NaN to 0, masking invalid activations during training.
+        { FusedActivationType.ReLU, x => x < 0f ? 0f : x },
         { FusedActivationType.GELU, ApplyGelu },
         { FusedActivationType.Sigmoid, x => 1f / (1f + MathF.Exp(-x)) },
         { FusedActivationType.Tanh, MathF.Tanh },
@@ -1007,7 +1220,8 @@ public static class CpuFusedOperations
     private static readonly Dictionary<FusedActivationType, Func<double, double>> _doubleActivations = new()
     {
         { FusedActivationType.None, x => x },
-        { FusedActivationType.ReLU, x => x > 0.0 ? x : 0.0 },
+        // NaN-preserving: see _floatActivations comment above.
+        { FusedActivationType.ReLU, x => x < 0.0 ? 0.0 : x },
         { FusedActivationType.GELU, ApplyGeluDouble },
         { FusedActivationType.Sigmoid, x => 1.0 / (1.0 + Math.Exp(-x)) },
         { FusedActivationType.Tanh, Math.Tanh },
