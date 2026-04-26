@@ -271,6 +271,15 @@ public static class TensorFunc<T>
         if (fn is null) throw new ArgumentNullException(nameof(fn));
         if (primals is null) throw new ArgumentNullException(nameof(primals));
 
+        // Snapshot the primals array so the closure below operates on
+        // an immutable copy. The caller's array could otherwise be
+        // mutated between Vjp(...) returning and VjpFn(cotangent)
+        // running — that would have the closure compute gradients
+        // for different inputs than the eager Output we just returned,
+        // a subtle aliasing bug torch.func doesn't expose because
+        // PyTorch tensors are pinned by the closure's tape capture.
+        var primalsSnapshot = (Tensor<T>[])primals.Clone();
+
         // Run fn once in the ambient context to produce the forward
         // output the caller wants back. We deliberately do NOT wrap
         // this in NoGrad: NoGradScope<T>.IsSuppressed gates all nested
@@ -281,23 +290,23 @@ public static class TensorFunc<T>
         // closure below re-runs fn under a fresh dedicated tape, so
         // ambient pollution from this initial run is harmless to the
         // VJP semantic.
-        Tensor<T> fwdOutput = fn(primals);
+        Tensor<T> fwdOutput = fn(primalsSnapshot);
 
         Tensor<T>[] VjpClosure(Tensor<T> cotangent)
         {
             if (cotangent is null) throw new ArgumentNullException(nameof(cotangent));
             using var t = new GradientTape<T>();
-            var output = fn(primals);
+            var output = fn(primalsSnapshot);
             // Seed backward with v^T by multiplying output by the
             // cotangent and summing — the chain rule then deposits
             // (∂output/∂primal)ᵀ · cotangent on each primal, which is
             // exactly the VJP.
             var weighted = AiDotNetEngine.Current.TensorMultiply(output, cotangent);
             var scalar = SumToScalarTensor(weighted);
-            var grads = t.ComputeGradients(scalar, primals);
-            var result = new Tensor<T>[primals.Length];
-            for (int i = 0; i < primals.Length; i++)
-                result[i] = grads.TryGetValue(primals[i], out var g) ? g : ZeroLike(primals[i]);
+            var grads = t.ComputeGradients(scalar, primalsSnapshot);
+            var result = new Tensor<T>[primalsSnapshot.Length];
+            for (int i = 0; i < primalsSnapshot.Length; i++)
+                result[i] = grads.TryGetValue(primalsSnapshot[i], out var g) ? g : ZeroLike(primalsSnapshot[i]);
             return result;
         }
 

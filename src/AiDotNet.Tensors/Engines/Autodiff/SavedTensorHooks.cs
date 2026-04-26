@@ -136,7 +136,7 @@ public static class SavedTensorHooks
             if (frame.ElementType == typeof(T))
             {
                 var payload = ((Func<Tensor<T>, object>)frame.Pack)(tensor);
-                packed = new PackedSavedTensor(payload, frame.Unpack);
+                packed = new PackedSavedTensor(typeof(T), payload, frame.Unpack);
                 return true;
             }
         }
@@ -168,6 +168,17 @@ public static class SavedTensorHooks
         // disposed.
         if (packed is PackedSavedTensor saved)
         {
+            // Validate the requested T matches the type the payload
+            // was packed under. Without this check, a wrong-T call
+            // (e.g. ApplyUnpack<double> on a float-packed payload)
+            // would throw InvalidCastException from the delegate
+            // cast — a less informative failure mode than the
+            // explicit element-type mismatch surfaced here.
+            if (saved.ElementType != typeof(T))
+                throw new InvalidOperationException(
+                    $"SavedTensorHooks.ApplyUnpack<{typeof(T).Name}> received a payload packed for "
+                  + $"{saved.ElementType.Name}. The element type that produced the pack must match the "
+                  + "type used to unpack.");
             return ((Func<object, Tensor<T>>)saved.Unpack)(saved.Payload);
         }
         // Backward-compat: if a caller hand-built a packed value
@@ -219,10 +230,12 @@ public static class SavedTensorHooks
     /// </summary>
     private sealed class PackedSavedTensor
     {
+        public Type ElementType { get; }
         public object Payload { get; }
         public Delegate Unpack { get; }
-        public PackedSavedTensor(object payload, Delegate unpack)
+        public PackedSavedTensor(Type elementType, object payload, Delegate unpack)
         {
+            ElementType = elementType;
             Payload = payload;
             Unpack = unpack;
         }
