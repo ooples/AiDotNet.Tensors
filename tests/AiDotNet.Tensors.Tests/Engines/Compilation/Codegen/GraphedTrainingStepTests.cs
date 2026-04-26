@@ -31,15 +31,15 @@ public class GraphedTrainingStepTests
             new GraphedTrainingStep(null, (IntPtr)0x1, () => { }));
     }
 
-    [Fact]
+    [Fact(Skip = "Requires non-null IDirectGpuBackend to isolate the null-step path; "
+                + "the complementary Ctor_NullBackend_Throws test exercises the ctor-null branch, "
+                + "and the full IDirectGpuBackend stubbing surface (~40 members) doesn't earn its "
+                + "weight here. Phase F's CUDA integration harness covers the permutation.")]
     public void Ctor_NullStep_Throws()
     {
-        // Passing a real backend here would still throw on the step
-        // param first — null propagates before backend validation.
-        // For the argument-order contract we need a non-null backend,
-        // which requires a CUDA setup we don't have in CI. Skipping
-        // this specific permutation; the complementary null-backend
-        // test above covers the ctor-null path.
+        // Intentionally empty — guarded by the [Fact(Skip = ...)]
+        // attribute above. An empty body without a Skip would silently
+        // pass and provide false confidence.
     }
 
     // ─── Options ─────────────────────────────────────────────────────

@@ -98,10 +98,37 @@ public class CodegenTelemetryTests : System.IDisposable
         CodegenTelemetry.RecordEmitOutcome(CodegenTarget.CpuDotNetJit, succeeded: false, "unsupported op");
         CodegenTelemetry.RecordEmitOutcome(CodegenTarget.Triton, succeeded: true);
 
+        // Decline reasons are normalised into a fixed taxonomy so the
+        // emit-outcomes dictionary stays bounded — see
+        // CodegenTelemetry.NormalizeDeclineReason.
         var outcomes = CodegenTelemetry.GetEmitOutcomes();
         Assert.Equal(2, outcomes[(CodegenTarget.CpuDotNetJit, "Succeeded")]);
-        Assert.Equal(1, outcomes[(CodegenTarget.CpuDotNetJit, "unsupported op")]);
+        Assert.Equal(1, outcomes[(CodegenTarget.CpuDotNetJit, "UnsupportedOp")]);
         Assert.Equal(1, outcomes[(CodegenTarget.Triton, "Succeeded")]);
+    }
+
+    [Fact]
+    public void RecordEmitOutcome_NormalizesFreeFormReasons_BoundedCardinality()
+    {
+        // Distinct free-form prose strings should fold into a small
+        // fixed taxonomy so a long-running process can't accumulate
+        // millions of decline buckets.
+        CodegenTelemetry.RecordEmitOutcome(CodegenTarget.Triton, false,
+            "Phase B CPU emitter does not yet handle Reduction ops (found ReduceSum)");
+        CodegenTelemetry.RecordEmitOutcome(CodegenTarget.Triton, false,
+            "Phase B CPU emitter does not yet handle Reduction ops (found Softmax)");
+        CodegenTelemetry.RecordEmitOutcome(CodegenTarget.Hip, false,
+            "Dtype Float64 not supported by this emitter.");
+        CodegenTelemetry.RecordEmitOutcome(CodegenTarget.Wgsl, false,
+            "Phase C pointwise emitter requires uniform element count across nodes; found 16 vs 24 at op Add");
+
+        var outcomes = CodegenTelemetry.GetEmitOutcomes();
+        // Two distinct UnsupportedOp prose strings → one bucket.
+        Assert.Equal(2, outcomes[(CodegenTarget.Triton, "UnsupportedOp")]);
+        // Dtype mention → UnsupportedDType bucket.
+        Assert.Equal(1, outcomes[(CodegenTarget.Hip, "UnsupportedDType")]);
+        // "element count" wording → ShapeMismatch.
+        Assert.Equal(1, outcomes[(CodegenTarget.Wgsl, "ShapeMismatch")]);
     }
 
     [Fact]

@@ -131,10 +131,20 @@ public sealed class GraphedTrainingStep : IDisposable
         {
             _scope.Dispose();
             _scope = null;
-            throw new InvalidOperationException(
-                "CUDA Graph is not supported by this backend or driver version. " +
-                "Falls back to the non-graphed training step — the user should catch this " +
-                "exception and revert to calling their trainingStep directly.");
+            // Honour the option: throw loudly by default, silent
+            // no-op when the caller explicitly opted in to fallback
+            // semantics. HasGraph stays false, so a subsequent
+            // Replay() will throw with its existing
+            // "Replay called before Capture" message — the contract
+            // documented on GraphedTrainingStepOptions.ThrowOnUnsupported.
+            if (_options.ThrowOnUnsupported)
+            {
+                throw new InvalidOperationException(
+                    "CUDA Graph is not supported by this backend or driver version. " +
+                    "Falls back to the non-graphed training step — the user should catch this " +
+                    "exception and revert to calling their trainingStep directly.");
+            }
+            return;
         }
 
         _scope.BeginCapture();
@@ -150,12 +160,21 @@ public sealed class GraphedTrainingStep : IDisposable
     }
 
     /// <summary>
-    /// Replays the captured graph. No-op if <see cref="Capture"/>
-    /// hasn't been called — the caller must check
-    /// <see cref="HasGraph"/> first. Returns the replay index
-    /// (starting at 0) so the caller can thread it into an RNG
-    /// offset if needed.
+    /// Replays the captured graph. Throws
+    /// <see cref="InvalidOperationException"/> if <see cref="Capture"/>
+    /// has not been called successfully — the caller should check
+    /// <see cref="HasGraph"/> first when running on a host where
+    /// CUDA Graph may be unavailable (e.g. when
+    /// <see cref="GraphedTrainingStepOptions.ThrowOnUnsupported"/>
+    /// is <c>false</c> and capture silently no-op'd). Returns the
+    /// replay index (starting at 0) so the caller can thread it
+    /// into an RNG offset if needed.
     /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown if
+    /// <see cref="Capture"/> has not been called or did not produce
+    /// a graph.</exception>
+    /// <exception cref="ObjectDisposedException">Thrown if the
+    /// instance has been disposed.</exception>
     public int Replay()
     {
         ThrowIfDisposed();

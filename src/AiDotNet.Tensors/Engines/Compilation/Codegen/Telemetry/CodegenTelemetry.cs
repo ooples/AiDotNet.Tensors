@@ -96,15 +96,71 @@ public static class CodegenTelemetry
         = new();
 
     /// <summary>
-    /// Records an emitter outcome — either "succeeded" or a specific
+    /// Records an emitter outcome — either "succeeded" or a normalised
     /// decline reason. Exposed as aggregated counts via
     /// <see cref="GetEmitOutcomes"/>.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Cardinality control:</b></para>
+    /// <para>
+    /// The raw <paramref name="declineReason"/> string is free-form
+    /// (emitters often inline op names, dtypes, or shape values for
+    /// developer-facing context), so storing it directly as a
+    /// dictionary key would let <c>_emitOutcomes</c> grow unboundedly
+    /// in long-lived processes — every distinct ResNet shape would
+    /// carve out its own bucket. We normalise to a fixed-size
+    /// taxonomy via <see cref="NormalizeDeclineReason"/> so the
+    /// bucket count stays bounded regardless of how detailed the
+    /// underlying reason strings get.
+    /// </para>
+    /// </remarks>
     public static void RecordEmitOutcome(CodegenTarget target, bool succeeded, string? declineReason = null)
     {
         if (!_enabled) return;
-        string key = succeeded ? "Succeeded" : declineReason ?? "DeclinedUnspecified";
+        string key = succeeded ? "Succeeded" : NormalizeDeclineReason(declineReason);
         _emitOutcomes.AddOrUpdate((target, key), 1, (_, c) => c + 1);
+    }
+
+    /// <summary>
+    /// Maps a free-form decline-reason string into a small fixed
+    /// taxonomy — <c>UnsupportedOp</c>, <c>UnsupportedDType</c>,
+    /// <c>UnsupportedTarget</c>, <c>ShapeMismatch</c>,
+    /// <c>OtherDecline</c>, or <c>DeclinedUnspecified</c>. Substring
+    /// matching keeps the classification stable across emitters'
+    /// developer-facing prose (e.g. "Phase B CPU emitter does not yet
+    /// handle Reduction ops" → <c>UnsupportedOp</c>).
+    /// </summary>
+    public static string NormalizeDeclineReason(string? declineReason)
+    {
+        if (string.IsNullOrWhiteSpace(declineReason)) return "DeclinedUnspecified";
+        var s = declineReason!;
+
+        // Order matters — most-specific first. Each branch's prose
+        // patterns are chosen to match the actual decline strings the
+        // emitters in this PR produce; new emitters should extend
+        // this taxonomy rather than emit unique strings that would
+        // silently fall through to OtherDecline.
+        if (s.IndexOf("element count", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("shape", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "ShapeMismatch";
+
+        if (s.IndexOf("dtype", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("element type", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("UnsupportedDType", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "UnsupportedDType";
+
+        if (s.IndexOf("does not yet handle", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("pointwise emitter", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("not implemented", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("unsupported op", StringComparison.OrdinalIgnoreCase) >= 0
+         || s.IndexOf("UnsupportedOp", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "UnsupportedOp";
+
+        if (s.IndexOf("target", StringComparison.OrdinalIgnoreCase) >= 0
+         && s.IndexOf("not", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "UnsupportedTarget";
+
+        return "OtherDecline";
     }
 
     /// <summary>
