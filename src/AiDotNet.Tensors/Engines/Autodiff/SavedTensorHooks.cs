@@ -308,7 +308,7 @@ public static class SavedTensorRecipes
             {
                 var data = new T[tensor.Length];
                 tensor.AsSpan().CopyTo(data);
-                return new CpuSaved<T>(data, (int[])tensor._shape.Clone());
+                return new CpuSaved<T>(data, tensor.Shape.ToArray());
             },
             unpack: packed =>
             {
@@ -349,7 +349,7 @@ public static class SavedTensorRecipes
                     if (q > 127f) q = 127f; else if (q < -127f) q = -127f;
                     quant[i] = (sbyte)(q >= 0 ? q + 0.5f : q - 0.5f);
                 }
-                return new QuantizedSaved(quant, scale, (int[])tensor._shape.Clone());
+                return new QuantizedSaved(quant, scale, tensor.Shape.ToArray());
             },
             unpack: packed =>
             {
@@ -392,7 +392,7 @@ public static class SavedTensorRecipes
                     ds.Write(bytes, 0, bytes.Length);
                 }
                 return new CompressedSaved(
-                    ms.ToArray(), src.Length, (int[])tensor._shape.Clone());
+                    ms.ToArray(), src.Length, tensor.Shape.ToArray());
             },
             unpack: packed =>
             {
@@ -484,7 +484,7 @@ public static class SavedTensorRecipes
                 prev[key] = bytes;
                 return new DeltaSaved(
                     payload, isDelta,
-                    referenceForUnpack, (int[])tensor._shape.Clone());
+                    referenceForUnpack, tensor.Shape.ToArray());
             },
             unpack: packed =>
             {

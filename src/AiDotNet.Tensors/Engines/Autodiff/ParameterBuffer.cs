@@ -65,8 +65,9 @@ public sealed class ParameterBuffer<T>
 
     // Held by callers that need to atomically swap, observe, and restore
     // the buffer's contents — most importantly TensorFunc.FunctionalCall.
-    // Public so the `using (buffer.AcquireSwapLock())` form composes with
-    // user-side synchronisation; not meant for hot-path coordination.
+    // Internal so TensorFunc can `lock (buffer.SwapLock)` for the full
+    // swap/call/restore sequence without exposing the lock object on
+    // the public surface; not meant for hot-path coordination.
     private readonly object _swapLock = new();
 
     /// <summary>
