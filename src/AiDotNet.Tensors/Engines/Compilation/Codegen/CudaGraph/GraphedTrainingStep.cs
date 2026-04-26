@@ -90,6 +90,17 @@ public sealed class GraphedTrainingStep : IDisposable
         _stream = stream;
         _trainingStep = trainingStep ?? throw new ArgumentNullException(nameof(trainingStep));
         _options = options ?? GraphedTrainingStepOptions.Default;
+
+        // A negative WarmupIterations would let Prepare() skip its loop
+        // entirely while still flipping _warmedUp, after which Capture()
+        // would proceed against an unwarmed arena — the very condition
+        // the warmup is meant to prevent. Reject at construction time so
+        // the misuse surfaces before any training work starts.
+        if (_options.WarmupIterations < 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                _options.WarmupIterations,
+                "GraphedTrainingStepOptions.WarmupIterations must be non-negative.");
     }
 
     /// <summary>
@@ -126,11 +137,20 @@ public sealed class GraphedTrainingStep : IDisposable
             "is warm and kernel-launch sequences have stabilised.");
         if (_captured) return;
 
-        _scope = new CudaGraphScope(_backend, _stream);
-        if (!_scope.IsSupported)
+        // Tear down any abandoned scope from a prior Capture attempt
+        // that threw partway through — without this, the previous
+        // native graph allocation leaks and the new BeginCapture below
+        // would run against stale state.
+        if (_scope is not null)
         {
             _scope.Dispose();
             _scope = null;
+        }
+
+        var scope = new CudaGraphScope(_backend, _stream);
+        if (!scope.IsSupported)
+        {
+            scope.Dispose();
             // Honour the option: throw loudly by default, silent
             // no-op when the caller explicitly opted in to fallback
             // semantics. HasGraph stays false, so a subsequent
@@ -147,16 +167,30 @@ public sealed class GraphedTrainingStep : IDisposable
             return;
         }
 
-        _scope.BeginCapture();
+        // Only publish the scope to the field after capture has fully
+        // succeeded. If BeginCapture / _trainingStep / EndCapture
+        // throws, we dispose the local and leave _scope null + _captured
+        // false, so a retry sees a clean slate rather than inheriting a
+        // half-instantiated graph.
         try
         {
-            _trainingStep();
+            scope.BeginCapture();
+            try
+            {
+                _trainingStep();
+            }
+            finally
+            {
+                scope.EndCapture();
+            }
+            _scope = scope;
+            _captured = true;
         }
-        finally
+        catch
         {
-            _scope.EndCapture();
+            scope.Dispose();
+            throw;
         }
-        _captured = true;
     }
 
     /// <summary>

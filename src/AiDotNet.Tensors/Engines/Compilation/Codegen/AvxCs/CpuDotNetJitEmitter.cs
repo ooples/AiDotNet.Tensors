@@ -60,6 +60,13 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
     {
         if (graph is null) throw new ArgumentNullException(nameof(graph));
 
+        // Reject empty graphs up front — the shape-uniformity check
+        // below indexes Nodes[0] and would otherwise throw an
+        // IndexOutOfRangeException, which is a noisier failure mode
+        // than the structured Decline path callers already handle.
+        if (graph.Count == 0)
+            return CodegenEmitResult.Decline("CpuDotNetJitEmitter received an empty graph.");
+
         // Reject element types we don't implement yet. Keeping this
         // restrictive until Phase D exercises the full CodegenElementType
         // set — silently succeeding on an unsupported dtype would
@@ -95,6 +102,17 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
                     $"Phase B CPU emitter requires all graph nodes to share element count; "
                   + $"first={elementCount}, mismatch at op {node.Op}={nc}.");
         }
+
+        // The compiled kernel currently passes elementCount as int (the
+        // Expression-tree loop counter is int — moving to long would
+        // make every array index a long-to-int conversion). Reject
+        // graphs that exceed int.MaxValue elements so the (int) cast
+        // below at the CompiledCpuKernel ctor cannot silently truncate
+        // and produce wrong results.
+        if (elementCount > int.MaxValue)
+            return CodegenEmitResult.Decline(
+                $"CpuDotNetJitEmitter cannot emit kernels for graphs with element count "
+              + $"{elementCount} (exceeds int.MaxValue = {int.MaxValue}); the loop counter is int.");
 
         return dtype switch
         {
