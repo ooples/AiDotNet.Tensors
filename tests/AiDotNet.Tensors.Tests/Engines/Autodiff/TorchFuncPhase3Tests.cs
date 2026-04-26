@@ -295,4 +295,98 @@ public class TorchFuncPhase3Tests
         Assert.Throws<ArgumentNullException>(
             () => TensorFunc<float>.FunctionalCall(pb, v, null));
     }
+
+    // ─── Hvp / Vhp ────────────────────────────────────────────────────
+
+    [Fact]
+    public void Hvp_QuadraticForm_GivesAv()
+    {
+        // f(x) = ½ xᵀ A x with A = [[2,1],[1,3]] is convex quadratic;
+        // its Hessian is exactly A, so Hvp(f, x, v) = A·v for any x.
+        Func<Tensor<float>, Tensor<float>> fn = x =>
+        {
+            // ½ * (2 x0² + 2 x0 x1 + 3 x1²) = x0² + x0 x1 + 1.5 x1²
+            float c0 = 1f, c1 = 1f, c2 = 1.5f;
+            var x0 = x[0];
+            var x1 = x[1];
+            float s = c0 * x0 * x0 + c1 * x0 * x1 + c2 * x1 * x1;
+            return new Tensor<float>(new[] { s }, new[] { 1 });
+        };
+
+        // The above is not tape-recording (uses scalar ops). Use
+        // engine ops instead so the gradient is reachable.
+        Func<Tensor<float>, Tensor<float>> fnTaped = x =>
+        {
+            // ½ xᵀ A x via engine ops on tensors of shape [2].
+            var Atensor = new Tensor<float>(new[] { 2f, 1f, 1f, 3f }, new[] { 2, 2 });
+            var xRow = _engine.Reshape(x, new[] { 1, 2 });
+            var xCol = _engine.Reshape(x, new[] { 2, 1 });
+            var Ax = _engine.TensorMatMul(Atensor, xCol);   // [2, 1]
+            var quad = _engine.TensorMatMul(xRow, Ax);       // [1, 1]
+            var half = new Tensor<float>(new[] { 0.5f }, new[] { 1, 1 });
+            var halved = _engine.TensorMultiply(quad, half);
+            return _engine.Reshape(halved, new[] { 1 });
+        };
+
+        var x = new Tensor<float>(new[] { 0.7f, -1.2f }, new[] { 2 });
+        var v = new Tensor<float>(new[] { 1f, 0f }, new[] { 2 });
+
+        var hv = TensorFunc<float>.Hvp(fnTaped, x, v);
+        // A · [1, 0]ᵀ = [2, 1]
+        Assert.Equal(2f, hv[0], precision: 3);
+        Assert.Equal(1f, hv[1], precision: 3);
+
+        var v2 = new Tensor<float>(new[] { 0f, 1f }, new[] { 2 });
+        var hv2 = TensorFunc<float>.Hvp(fnTaped, x, v2);
+        // A · [0, 1]ᵀ = [1, 3]
+        Assert.Equal(1f, hv2[0], precision: 3);
+        Assert.Equal(3f, hv2[1], precision: 3);
+    }
+
+    [Fact]
+    public void Hvp_MatchesHessianTimesVec()
+    {
+        // Cross-validate Hvp against Hessian materialised then matmul.
+        Func<Tensor<float>, Tensor<float>> fn = x =>
+        {
+            // f(x) = sum(x²·x) = sum(x³). Hessian is diag(6x).
+            var sq = _engine.TensorMultiply(x, x);
+            var cu = _engine.TensorMultiply(sq, x);
+            return TensorFunc<float>.SumToScalarTensor(cu);
+        };
+
+        var x = new Tensor<float>(new[] { 1f, -2f, 3f }, new[] { 3 });
+        var v = new Tensor<float>(new[] { 0.5f, 1.5f, -0.25f }, new[] { 3 });
+
+        var hv = TensorFunc<float>.Hvp(fn, x, v);
+
+        // Reference: Hessian * v. Hessian is diag(6, -12, 18).
+        // diag(6,-12,18) · [0.5, 1.5, -0.25] = [3, -18, -4.5].
+        Assert.Equal(3f, hv[0], precision: 2);
+        Assert.Equal(-18f, hv[1], precision: 2);
+        Assert.Equal(-4.5f, hv[2], precision: 2);
+
+        // Vhp on a symmetric Hessian must agree with Hvp.
+        var vh = TensorFunc<float>.Vhp(fn, x, v);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(hv[i], vh[i], precision: 4);
+    }
+
+    [Fact]
+    public void Hvp_ArgumentValidation()
+    {
+        var x = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        var v = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        var vMismatch = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        Func<Tensor<float>, Tensor<float>> fn = a => a;
+
+        Assert.Throws<ArgumentNullException>(
+            () => TensorFunc<float>.Hvp(null, x, v));
+        Assert.Throws<ArgumentNullException>(
+            () => TensorFunc<float>.Hvp(fn, null, v));
+        Assert.Throws<ArgumentNullException>(
+            () => TensorFunc<float>.Hvp(fn, x, null));
+        Assert.Throws<ArgumentException>(
+            () => TensorFunc<float>.Hvp(fn, x, vMismatch));
+    }
 }

@@ -144,6 +144,17 @@ public enum CodegenTarget
     /// the Roslyn/external-toolchain dependency of Phase C emitters.
     /// </summary>
     CpuDotNetJit,
+    /// <summary>
+    /// Hand-emitted AVX-512 intrinsic kernel — uses
+    /// <see cref="System.Runtime.Intrinsics.X86.Avx512F"/> directly via
+    /// Expression trees rather than relying on RyuJIT auto-vectorization.
+    /// Produces a 16-wide loop on Float32 (8-wide on Float64) with a
+    /// scalar tail. Selected over <see cref="CpuDotNetJit"/> by the
+    /// fusion pass when AVX-512F is available and the graph is
+    /// pointwise — gives a deterministic vectorisation guarantee that
+    /// the generic JIT path doesn't.
+    /// </summary>
+    CpuAvx512,
     /// <summary>OpenAI Triton (CUDA).</summary>
     Triton,
     /// <summary>HIP kernel source (AMD ROCm).</summary>

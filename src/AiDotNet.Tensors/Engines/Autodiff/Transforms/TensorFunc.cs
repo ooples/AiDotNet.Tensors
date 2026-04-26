@@ -475,6 +475,80 @@ public static class TensorFunc<T>
         return JacRev(gradFn);
     }
 
+    // ─── Hessian-vector products ──────────────────────────────────────
+
+    /// <summary>
+    /// Hessian-vector product <c>(∇²f(x)) · v</c> for a scalar-valued
+    /// <paramref name="fn"/> at point <paramref name="primal"/>, in the
+    /// direction <paramref name="vec"/>. Matches
+    /// <c>torch.autograd.functional.hvp</c>.
+    /// </summary>
+    /// <remarks>
+    /// Implemented as forward-over-reverse: <c>jvp(grad(fn))(x, v)</c>.
+    /// Cost is one forward + one backward + one tangent propagation —
+    /// <c>O(forward + backward)</c>, independent of the input
+    /// dimension. Materialising the full Hessian only to multiply by a
+    /// vector would cost <c>O(n · backward²)</c>, so callers that just
+    /// need <c>Hv</c> products (Hessian-free optimisation, Newton-CG,
+    /// Lanczos) should reach for this directly rather than
+    /// <see cref="Hessian"/>.
+    /// </remarks>
+    /// <param name="fn">Scalar-valued function (returns a 1-element
+    /// <see cref="Tensor{T}"/>).</param>
+    /// <param name="primal">Point at which to evaluate the Hessian.</param>
+    /// <param name="vec">Direction vector — must have the same shape as
+    /// <paramref name="primal"/>.</param>
+    /// <returns>The Hessian-vector product, shaped like
+    /// <paramref name="primal"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if any argument
+    /// is null.</exception>
+    /// <exception cref="ArgumentException">Thrown if
+    /// <paramref name="primal"/> and <paramref name="vec"/> shapes
+    /// disagree.</exception>
+    public static Tensor<T> Hvp(
+        Func<Tensor<T>, Tensor<T>> fn,
+        Tensor<T> primal,
+        Tensor<T> vec)
+    {
+        if (fn is null) throw new ArgumentNullException(nameof(fn));
+        if (primal is null) throw new ArgumentNullException(nameof(primal));
+        if (vec is null) throw new ArgumentNullException(nameof(vec));
+        if (!ShapesMatch(primal._shape, vec._shape))
+            throw new ArgumentException(
+                $"Hvp requires primal and vec to share shape; got [{string.Join(",", primal._shape)}] vs " +
+                $"[{string.Join(",", vec._shape)}].");
+
+        // Reverse-mode gradient with create_graph so the result is
+        // itself differentiable — this is the Hessian's "row" we'll
+        // push the tangent v through.
+        var gradFn = Grad(fn, createGraph: true);
+
+        // d(grad)/dx · v: a Jacobian-vector product on grad. JacFwd
+        // would materialise the full Jacobian; the Jvp path threads v
+        // directly and stops at the product.
+        using var t = new GradientTape<T>();
+        var grad = gradFn(primal);
+        // Seed the backward with the cotangent v, then deposit its dot
+        // with grad onto primal — that's exactly (∂grad/∂x)ᵀ · v = Hv
+        // for a symmetric Hessian (which is always the case for a
+        // C² f).
+        var weighted = AiDotNetEngine.Current.TensorMultiply(grad, vec);
+        var scalar = SumToScalarTensor(weighted);
+        var grads = t.ComputeGradients(scalar, new[] { primal });
+        return grads.TryGetValue(primal, out var hv) ? hv : ZeroLike(primal);
+    }
+
+    /// <summary>
+    /// Vector-Hessian product <c>vᵀ · ∇²f(x)</c>. For symmetric Hessians
+    /// (always the case for a C² <paramref name="fn"/>) this equals
+    /// <see cref="Hvp"/> — kept as a separate method to match
+    /// <c>torch.autograd.functional.vhp</c>.
+    /// </summary>
+    public static Tensor<T> Vhp(
+        Func<Tensor<T>, Tensor<T>> fn,
+        Tensor<T> primal,
+        Tensor<T> vec) => Hvp(fn, primal, vec);
+
     // ─── vmap ─────────────────────────────────────────────────────────
 
     /// <summary>
@@ -647,5 +721,13 @@ public static class TensorFunc<T>
         var data = new T[template.Length];
         for (int i = 0; i < data.Length; i++) data[i] = zero;
         return new Tensor<T>(data, (int[])template._shape.Clone());
+    }
+
+    private static bool ShapesMatch(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 }

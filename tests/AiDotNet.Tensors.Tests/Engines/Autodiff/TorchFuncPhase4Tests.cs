@@ -282,4 +282,137 @@ public class TorchFuncPhase4Tests
         var grads = tape.ComputeGradients(y, new[] { x });
         Assert.Equal(3f, grads[x][0], precision: 3);
     }
+
+    // ─── SaveCompressed / SaveDelta ───────────────────────────────────
+
+    [Fact]
+    public void SavedTensorHooks_SaveCompressed_RoundTripIsBitExact()
+    {
+        using var _ = SavedTensorRecipes.SaveCompressed();
+        var x = new Tensor<float>(new[] { 1.5f, -2.25f, 3.125f, 0f }, new[] { 4 });
+        Assert.True(SavedTensorHooks.TryApplyPack(x, out var packed));
+        var roundTrip = SavedTensorHooks.ApplyUnpack<float>(packed);
+        Assert.Equal(x._shape, roundTrip._shape);
+        for (int i = 0; i < x.Length; i++)
+            Assert.Equal(x[i], roundTrip[i]);
+    }
+
+    [Fact]
+    public void SavedTensorHooks_SaveCompressed_ProducesSmallerPayloadOnRedundantData()
+    {
+        // Redundant input — same value repeated — compresses well.
+        var data = new float[1024];
+        for (int i = 0; i < data.Length; i++) data[i] = 0.5f;
+        var x = new Tensor<float>(data, new[] { data.Length });
+
+        using var _ = SavedTensorRecipes.SaveCompressed();
+        Assert.True(SavedTensorHooks.TryApplyPack(x, out var packed));
+
+        // Reflect into the wrapping PackedSavedTensor → CompressedSaved.Data
+        var packedSaved = packed!;
+        var payloadProp = packedSaved.GetType().GetProperty("Payload");
+        var compressed = payloadProp!.GetValue(packedSaved);
+        var dataProp = compressed!.GetType().GetProperty("Data");
+        var compressedBytes = (byte[])dataProp!.GetValue(compressed)!;
+
+        // Raw byte size is 1024 * 4 = 4096; deflate of all-equal floats
+        // should land well under that — say at most 1000 bytes (very loose).
+        Assert.True(compressedBytes.Length < 1000,
+            $"Expected redundant input to compress under 1000 bytes; got {compressedBytes.Length}.");
+    }
+
+    [Fact]
+    public void SavedTensorHooks_SaveDelta_RoundTripsWhenChained()
+    {
+        using var _ = SavedTensorRecipes.SaveDelta();
+
+        // First save establishes the reference (no delta yet).
+        var x1 = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        Assert.True(SavedTensorHooks.TryApplyPack(x1, out var packed1));
+        var rt1 = SavedTensorHooks.ApplyUnpack<float>(packed1);
+        for (int i = 0; i < 4; i++) Assert.Equal(x1[i], rt1[i]);
+
+        // Second save uses delta encoding against the first.
+        var x2 = new Tensor<float>(new[] { 1f, 2.1f, 3f, 4.05f }, new[] { 4 });
+        Assert.True(SavedTensorHooks.TryApplyPack(x2, out var packed2));
+        var rt2 = SavedTensorHooks.ApplyUnpack<float>(packed2);
+        for (int i = 0; i < 4; i++) Assert.Equal(x2[i], rt2[i]);
+
+        // Third save also delta-encodes — chains across multiple steps.
+        var x3 = new Tensor<float>(new[] { 1.05f, 2f, 3.01f, 4f }, new[] { 4 });
+        Assert.True(SavedTensorHooks.TryApplyPack(x3, out var packed3));
+        var rt3 = SavedTensorHooks.ApplyUnpack<float>(packed3);
+        for (int i = 0; i < 4; i++) Assert.Equal(x3[i], rt3[i]);
+    }
+
+    [Fact]
+    public void GradientTape_RegisterNodeHook_FiresOnMatchingOpName()
+    {
+        // y = x², op name = "Multiply" (the recorded entry). Register a
+        // node hook on "Multiply" that halves the gradient — the
+        // resulting input gradient on x should be half of dy/dx (= 2x),
+        // i.e. 0.5 * 2 * 3 = 3 at x = 3.
+        using var tape = new GradientTape<float>(new GradientTapeOptions { EnableHooks = true });
+        var x = new Tensor<float>(new[] { 3f }, new[] { 1 });
+        var y = _engine.TensorMultiply(x, x);
+
+        tape.RegisterNodeHook("TensorMultiply",
+            g => _engine.TensorMultiplyScalar(g, 0.5f));
+
+        var grads = tape.ComputeGradients(y, new[] { x });
+        Assert.Equal(3f, grads[x][0], precision: 3);
+    }
+
+    [Fact]
+    public void GradientTape_RegisterNodeHook_PredicateForm_FiresWhenMatchTrue()
+    {
+        // Predicate fires only on entries whose Input0 is the leaf
+        // tensor x — verifies that the predicate is consulted with the
+        // tape entry as its argument.
+        using var tape = new GradientTape<float>(new GradientTapeOptions { EnableHooks = true });
+        var x = new Tensor<float>(new[] { 4f }, new[] { 1 });
+        var y = _engine.TensorMultiply(x, x);
+
+        int firedCount = 0;
+        tape.RegisterNodeHook(
+            entry => ReferenceEquals(entry.Input0, x),
+            g => { firedCount++; return _engine.TensorMultiplyScalar(g, 1f); });
+
+        tape.ComputeGradients(y, new[] { x });
+        Assert.True(firedCount > 0, "Predicate-based node hook never fired.");
+    }
+
+    [Fact]
+    public void GradientTape_RegisterNodeHook_ThrowsWhenHooksDisabled()
+    {
+        using var tape = new GradientTape<float>();
+        Assert.Throws<InvalidOperationException>(
+            () => tape.RegisterNodeHook("Multiply", g => g));
+    }
+
+    [Fact]
+    public void GradientTape_RegisterNodeHook_NullArgsRejected()
+    {
+        using var tape = new GradientTape<float>(new GradientTapeOptions { EnableHooks = true });
+        Assert.Throws<ArgumentNullException>(
+            () => tape.RegisterNodeHook((string)null!, g => g));
+        Assert.Throws<ArgumentNullException>(
+            () => tape.RegisterNodeHook("Multiply", (Func<Tensor<float>, Tensor<float>>)null!));
+    }
+
+    [Fact]
+    public void SavedTensorHooks_SaveDelta_HandlesShapeChanges()
+    {
+        // Different shapes must each track their own reference — the
+        // delta cache is keyed by shape.
+        using var _ = SavedTensorRecipes.SaveDelta();
+        var a = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var b = new Tensor<float>(new[] { 5f, 6f, 7f }, new[] { 3 });
+        Assert.True(SavedTensorHooks.TryApplyPack(a, out var pa));
+        Assert.True(SavedTensorHooks.TryApplyPack(b, out var pb));
+        var ra = SavedTensorHooks.ApplyUnpack<float>(pa);
+        var rb = SavedTensorHooks.ApplyUnpack<float>(pb);
+        Assert.Equal(1f, ra[0]); Assert.Equal(2f, ra[1]);
+        Assert.Equal(5f, rb[0]); Assert.Equal(6f, rb[1]); Assert.Equal(7f, rb[2]);
+    }
 }

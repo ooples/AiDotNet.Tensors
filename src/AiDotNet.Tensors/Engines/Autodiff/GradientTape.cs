@@ -203,7 +203,13 @@ public sealed class GradientTape<T> : IDisposable
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
         // (GradFn is always set), so the graph path would always win otherwise.
-        bool hasHooksRegistered = _hooks is not null && _hooks.Count > 0;
+        // Tensor- or node-level hooks both rewrite gradients during the
+        // tape walk; either kind forces the slower tape path because
+        // ComputeGradientsViaGraph (the fast path below) doesn't visit
+        // tape entries and would silently bypass our hook calls.
+        bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
+            || (_nodeHooks is not null && _nodeHooks.Count > 0)
+            || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
         if (_options.Persistent && !createGraph)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
@@ -390,6 +396,28 @@ public sealed class GradientTape<T> : IDisposable
                 {
                     foreach (var hook in hookList)
                         gradOutput = hook(gradOutput);
+                    grads[entry.Output] = gradOutput;
+                }
+
+                // Apply graph-node hooks: name-keyed and predicate-based.
+                // These fire after tensor hooks so a user can chain
+                // tensor → node modifications. Each set is lazily
+                // populated; the null checks below short-circuit the
+                // common no-hook case at the cost of one branch.
+                if (_nodeHooks is not null
+                    && _nodeHooks.TryGetValue(entry.OperationName, out var nodeHookList))
+                {
+                    foreach (var hook in nodeHookList)
+                        gradOutput = hook(gradOutput);
+                    grads[entry.Output] = gradOutput;
+                }
+                if (_nodePredicateHooks is not null)
+                {
+                    foreach (var (match, hook) in _nodePredicateHooks)
+                    {
+                        if (match(entry))
+                            gradOutput = hook(gradOutput);
+                    }
                     grads[entry.Output] = gradOutput;
                 }
 
@@ -625,6 +653,21 @@ public sealed class GradientTape<T> : IDisposable
     private readonly HashSet<Tensor<T>>? _retainGrad;
 
     /// <summary>
+    /// Hooks keyed by op name — fired during backward for every tape
+    /// entry whose OperationName matches. Lazily allocated on first
+    /// RegisterNodeHook call so tapes that don't use node hooks pay
+    /// nothing.
+    /// </summary>
+    private Dictionary<string, List<Func<Tensor<T>, Tensor<T>>>>? _nodeHooks;
+
+    /// <summary>
+    /// Predicate-based node hooks. Each (match, hook) pair fires for
+    /// every entry where match returns true. Linear scan during
+    /// backward — keep predicates cheap.
+    /// </summary>
+    private List<(Func<TapeEntry<T>, bool> Match, Func<Tensor<T>, Tensor<T>> Hook)>? _nodePredicateHooks;
+
+    /// <summary>
     /// Registers a hook on a tensor that will be called with its gradient during backward.
     /// The hook can modify the gradient by returning a new tensor.
     /// </summary>
@@ -641,6 +684,63 @@ public sealed class GradientTape<T> : IDisposable
             hooks[tensor] = list;
         }
         list.Add(hook);
+    }
+
+    /// <summary>
+    /// Registers a hook against a graph node identified by the
+    /// recorded operation name. Fires during backward for every tape
+    /// entry whose <see cref="TapeEntry{T}.OperationName"/> matches
+    /// <paramref name="opName"/>, with the gradient flowing into that
+    /// entry's output. Matches the spirit of
+    /// <c>torch.autograd.graph.Node.register_hook</c> and survives
+    /// fusion better than tensor-keyed hooks because the user
+    /// registers against the op identity, not a specific
+    /// <see cref="Tensor{T}"/> reference that may be eliminated by
+    /// graph rewrites.
+    /// </summary>
+    /// <param name="opName">The operation name to match (case
+    /// sensitive) — typically the value passed to
+    /// <see cref="DifferentiableOps.RecordIfActive"/>.</param>
+    /// <param name="hook">Function receiving the gradient flowing
+    /// into the node's output, returning a (possibly modified) one.</param>
+    /// <exception cref="ObjectDisposedException">Tape was disposed.</exception>
+    /// <exception cref="InvalidOperationException">Hooks are not
+    /// enabled on the tape options.</exception>
+    /// <exception cref="ArgumentNullException">Either argument is null.</exception>
+    public void RegisterNodeHook(string opName, Func<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (opName is null) throw new ArgumentNullException(nameof(opName));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        if (_hooks is null) throw new InvalidOperationException(
+            "Hooks require GradientTapeOptions with EnableHooks=true");
+        _nodeHooks ??= new Dictionary<string, List<Func<Tensor<T>, Tensor<T>>>>(StringComparer.Ordinal);
+        if (!_nodeHooks.TryGetValue(opName, out var list))
+        {
+            list = new List<Func<Tensor<T>, Tensor<T>>>();
+            _nodeHooks[opName] = list;
+        }
+        list.Add(hook);
+    }
+
+    /// <summary>
+    /// Predicate-based variant of <see cref="RegisterNodeHook(string, Func{Tensor{T}, Tensor{T}})"/>.
+    /// Fires for every entry where <paramref name="match"/> returns
+    /// <c>true</c>. Lets callers attach to fused replacements whose
+    /// op name they don't know up front (e.g. "any entry whose
+    /// inputs include this Linear weight").
+    /// </summary>
+    public void RegisterNodeHook(
+        Func<TapeEntry<T>, bool> match,
+        Func<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (match is null) throw new ArgumentNullException(nameof(match));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        if (_hooks is null) throw new InvalidOperationException(
+            "Hooks require GradientTapeOptions with EnableHooks=true");
+        _nodePredicateHooks ??= new List<(Func<TapeEntry<T>, bool>, Func<Tensor<T>, Tensor<T>>)>();
+        _nodePredicateHooks.Add((match, hook));
     }
 
     /// <summary>
