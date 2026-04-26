@@ -1210,5 +1210,139 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         try { Copy(rb, 0, output, 0, rows * cols); }
         finally { rb.Dispose(); }
     }
+
+    // ─── HRR binding primitives (issue #248) ────────────────────────
+    //
+    // Native WGSL compute shaders — work stays on the GPU end-to-end.
+    // Per-cell phases use a 32-bit Murmur3 fmix; deterministic within
+    // the WebGPU backend (same seed + same (V, D) → identical output)
+    // but does not bit-match the CPU xorshift64* or CUDA splitmix64
+    // sequences. Cross-device bit-identity is not part of the contract.
+
+    private const string HrrModuleKey = "Hrr";
+
+    public void SplitComplexUnitPhaseCodebook(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)
+    {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
+        long total = (long)V * D;
+        if (total > int.MaxValue) throw new ArgumentException($"V*D = {total} exceeds int.MaxValue.");
+        if (kPsk && k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        SplitComplexUnitPhaseCodebookAsync(outReal, outImag, seed, (int)total, V, D, kPsk, k).GetAwaiter().GetResult();
+    }
+
+    private async Task SplitComplexUnitPhaseCodebookAsync(
+        IGpuBuffer outReal, IGpuBuffer outImag, int seed, int total, int V, int D, bool kPsk, int k)
+    {
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":UnitPhaseCodebook", WebGpuHrrKernels.UnitPhaseCodebook, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(seed, V, D, kPsk ? 1 : 0, k, total),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe, AsWgpu(outReal), AsWgpu(outImag));
+        var (wg, _) = _device.CalculateWorkgroups1D(total, 256);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public void SplitComplexPhaseCoherenceDecode(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        if (V < 0) throw new ArgumentOutOfRangeException(nameof(V), "V must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (V == 0 || D == 0) return;
+        SplitComplexPhaseCoherenceDecodeAsync(codesReal, codesImag, queryReal, queryImag, outScores, V, D).GetAwaiter().GetResult();
+    }
+
+    private async Task SplitComplexPhaseCoherenceDecodeAsync(
+        IGpuBuffer codesReal, IGpuBuffer codesImag,
+        IGpuBuffer queryReal, IGpuBuffer queryImag,
+        IGpuBuffer outScores, int V, int D)
+    {
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":PhaseCoherenceDecode", WebGpuHrrKernels.PhaseCoherenceDecode, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(V, D),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(codesReal), AsWgpu(codesImag), AsWgpu(queryReal), AsWgpu(queryImag), AsWgpu(outScores));
+        // Workgroup size in shader is 64 — matches dispatch calc below.
+        var (wg, _) = _device.CalculateWorkgroups1D(V, 64);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public void SplitComplexHrrBindAccumulate(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        if (N < 0) throw new ArgumentOutOfRangeException(nameof(N), "N must be >= 0.");
+        if (D < 0) throw new ArgumentOutOfRangeException(nameof(D), "D must be >= 0.");
+        if (N == 0 || D == 0) return;
+        // Validate capacities — the WGSL kernel reads keyIds[0..N) and
+        // valIds[0..N) and reads/writes memory[0..D). An undersized
+        // buffer would read/write past the GPU allocation.
+        if (keyIds is null || valIds is null || memoryReal is null || memoryImag is null
+            || keyCodeReal is null || keyCodeImag is null || valPermCodeReal is null || valPermCodeImag is null)
+            throw new ArgumentNullException(nameof(keyIds),
+                "All eight GPU buffers must be non-null for SplitComplexHrrBindAccumulate.");
+        if (keyIds.Size < N || valIds.Size < N)
+            throw new ArgumentException(
+                $"keyIds/valIds must each hold at least N = {N} entries " +
+                $"(got keyIds={keyIds.Size}, valIds={valIds.Size}). " +
+                "Only the first N pairs are accumulated — undersized buffers would read past GPU memory.");
+        if (memoryReal.Size < D || memoryImag.Size < D)
+            throw new ArgumentException(
+                $"Memory buffers must each hold at least D = {D} elements " +
+                $"(got memoryReal={memoryReal.Size}, memoryImag={memoryImag.Size}).");
+        if (keyCodeReal.Size < D || keyCodeImag.Size < D
+            || valPermCodeReal.Size < D || valPermCodeImag.Size < D)
+            throw new ArgumentException(
+                $"Each codebook buffer must hold at least one full row of D = {D} elements.");
+        SplitComplexHrrBindAccumulateAsync(
+            keyCodeReal, keyCodeImag, valPermCodeReal, valPermCodeImag,
+            keyIds, valIds, memoryReal, memoryImag, N, D).GetAwaiter().GetResult();
+    }
+
+    private async Task SplitComplexHrrBindAccumulateAsync(
+        IGpuBuffer keyCodeReal, IGpuBuffer keyCodeImag,
+        IGpuBuffer valPermCodeReal, IGpuBuffer valPermCodeImag,
+        IGpuBuffer keyIds, IGpuBuffer valIds,
+        IGpuBuffer memoryReal, IGpuBuffer memoryImag,
+        int N, int D)
+    {
+        // Derive vocabulary sizes from codebook capacities so the
+        // shader can reject out-of-range ids without reading past
+        // allocated memory — mirrors the CPU path's range check in
+        // NativeHRRBindAccumulate and the Vulkan shader guard.
+        long nKeysL = keyCodeReal.Size / D;
+        long nValsL = valPermCodeReal.Size / D;
+        if (nKeysL <= 0 || nValsL <= 0)
+            throw new ArgumentException(
+                $"Codebook buffers must hold at least one full row of D = {D} elements.");
+        if (nKeysL > int.MaxValue || nValsL > int.MaxValue)
+            throw new ArgumentException("Codebook vocabulary size exceeds int.MaxValue.");
+        var pipe = await GetOrCreatePipelineAsync(
+            HrrModuleKey + ":HrrBindAccumulate", WebGpuHrrKernels.HrrBindAccumulate, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(N, D, (int)nKeysL, (int)nValsL),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(keyCodeReal), AsWgpu(keyCodeImag),
+            AsWgpu(valPermCodeReal), AsWgpu(valPermCodeImag),
+            AsWgpu(keyIds), AsWgpu(valIds),
+            AsWgpu(memoryReal), AsWgpu(memoryImag));
+        // Workgroup size in shader is 64 — one thread per output dimension.
+        var (wg, _) = _device.CalculateWorkgroups1D(D, 64);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
 }
 #endif
