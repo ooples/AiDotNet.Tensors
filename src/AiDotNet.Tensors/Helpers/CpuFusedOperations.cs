@@ -209,6 +209,53 @@ public static class CpuFusedOperations
     }
 
 #if NET5_0_OR_GREATER
+    // ──────────────────────────────────────────────────────────────────────
+    // NaN-preserving ReLU primitives.
+    //
+    // x86 MAXPS / MAXPD / VMAXPS / VMAXPD all return SRC2 when SRC1 is NaN
+    // (Intel SDM Vol.2, MAXPD pseudocode). So `Avx.Max(v, vZero)` silently
+    // turns every NaN lane into +0.0 — divergent from the scalar fallback
+    // `val < 0 ? 0 : val`, where `NaN < 0` is false (ordered) so NaN is
+    // preserved. That divergence makes numerical results depend on which
+    // CPU SIMD level is active and silently masks invalid activations
+    // during training.
+    //
+    // The compare-and-AndNot form below mirrors the scalar semantics on
+    // every SIMD path: build a mask of the strict-negative lanes (NaN
+    // gives ordered-false → mask 0), then `(NOT mask) AND v` keeps the
+    // bit pattern of v where v >= 0 OR v is NaN, and zeroes lanes where
+    // v < 0. NaN bit patterns survive identically.
+    // ──────────────────────────────────────────────────────────────────────
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> ReluNaNSafeAvx(Vector256<float> v, Vector256<float> vZero)
+    {
+        var ltZero = Avx.Compare(v, vZero, FloatComparisonMode.OrderedLessThanNonSignaling);
+        return Avx.AndNot(ltZero, v);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<double> ReluNaNSafeAvx(Vector256<double> v, Vector256<double> vZero)
+    {
+        var ltZero = Avx.Compare(v, vZero, FloatComparisonMode.OrderedLessThanNonSignaling);
+        return Avx.AndNot(ltZero, v);
+    }
+
+#if NET8_0_OR_GREATER
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<float> ReluNaNSafeAvx512(Vector512<float> v, Vector512<float> vZero)
+    {
+        var ltZero = Avx512F.CompareLessThan(v, vZero);
+        return Avx512F.AndNot(ltZero.AsUInt32(), v.AsUInt32()).AsSingle();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<double> ReluNaNSafeAvx512(Vector512<double> v, Vector512<double> vZero)
+    {
+        var ltZero = Avx512F.CompareLessThan(v, vZero);
+        return Avx512F.AndNot(ltZero.AsUInt64(), v.AsUInt64()).AsDouble();
+    }
+#endif
+
     /// <summary>
     /// SIMD per-(n, c) plane kernel: scalar bias[c] broadcast to vector,
     /// added to each HW position, optional ReLU, in-place store. 32-float
@@ -239,8 +286,8 @@ public static class CpuFusedOperations
                     var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), vBias512);
                     if (applyRelu)
                     {
-                        v0 = Avx512F.Max(v0, vZero512);
-                        v1 = Avx512F.Max(v1, vZero512);
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
                     Avx512F.Store(pOut + j, v0);
                     Avx512F.Store(pOut + j + 16, v1);
@@ -248,7 +295,7 @@ public static class CpuFusedOperations
                 for (; j + 16 <= hw; j += 16)
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
-                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < hw; j++)
@@ -269,10 +316,10 @@ public static class CpuFusedOperations
                 var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), vBias);
                 if (applyRelu)
                 {
-                    v0 = Avx.Max(v0, vZero);
-                    v1 = Avx.Max(v1, vZero);
-                    v2 = Avx.Max(v2, vZero);
-                    v3 = Avx.Max(v3, vZero);
+                    v0 = ReluNaNSafeAvx(v0, vZero);
+                    v1 = ReluNaNSafeAvx(v1, vZero);
+                    v2 = ReluNaNSafeAvx(v2, vZero);
+                    v3 = ReluNaNSafeAvx(v3, vZero);
                 }
                 Avx.Store(pOut + j,      v0);
                 Avx.Store(pOut + j + 8,  v1);
@@ -282,7 +329,7 @@ public static class CpuFusedOperations
             for (; j + 8 <= hw; j += 8)
             {
                 var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
-                if (applyRelu) v = Avx.Max(v, vZero);
+                if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
                 Avx.Store(pOut + j, v);
             }
             for (; j < hw; j++)
@@ -401,8 +448,8 @@ public static class CpuFusedOperations
                     var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 8), vBias512);
                     if (applyRelu)
                     {
-                        v0 = Avx512F.Max(v0, vZero512);
-                        v1 = Avx512F.Max(v1, vZero512);
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
                     Avx512F.Store(pOut + j, v0);
                     Avx512F.Store(pOut + j + 8, v1);
@@ -410,7 +457,7 @@ public static class CpuFusedOperations
                 for (; j + 8 <= hw; j += 8)
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
-                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < hw; j++)
@@ -432,10 +479,10 @@ public static class CpuFusedOperations
                 var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 12), vBias);
                 if (applyRelu)
                 {
-                    v0 = Avx.Max(v0, vZero);
-                    v1 = Avx.Max(v1, vZero);
-                    v2 = Avx.Max(v2, vZero);
-                    v3 = Avx.Max(v3, vZero);
+                    v0 = ReluNaNSafeAvx(v0, vZero);
+                    v1 = ReluNaNSafeAvx(v1, vZero);
+                    v2 = ReluNaNSafeAvx(v2, vZero);
+                    v3 = ReluNaNSafeAvx(v3, vZero);
                 }
                 Avx.Store(pOut + j,      v0);
                 Avx.Store(pOut + j + 4,  v1);
@@ -445,7 +492,7 @@ public static class CpuFusedOperations
             for (; j + 4 <= hw; j += 4)
             {
                 var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
-                if (applyRelu) v = Avx.Max(v, vZero);
+                if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
                 Avx.Store(pOut + j, v);
             }
             for (; j < hw; j++)
@@ -670,8 +717,8 @@ public static class CpuFusedOperations
                     var v1 = Avx512F.Add(Avx512F.LoadVector512(pOut + j + 16), Avx512F.LoadVector512(pBias + j + 16));
                     if (applyRelu)
                     {
-                        v0 = Avx512F.Max(v0, vZero512);
-                        v1 = Avx512F.Max(v1, vZero512);
+                        v0 = ReluNaNSafeAvx512(v0, vZero512);
+                        v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
                     Avx512F.Store(pOut + j,      v0);
                     Avx512F.Store(pOut + j + 16, v1);
@@ -679,7 +726,7 @@ public static class CpuFusedOperations
                 for (; j + 16 <= N; j += 16)
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), Avx512F.LoadVector512(pBias + j));
-                    if (applyRelu) v = Avx512F.Max(v, vZero512);
+                    if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < N; j++)
@@ -704,10 +751,10 @@ public static class CpuFusedOperations
                     var v3 = Avx.Add(Avx.LoadVector256(pOut + j + 24), Avx.LoadVector256(pBias + j + 24));
                     if (applyRelu)
                     {
-                        v0 = Avx.Max(v0, vZero);
-                        v1 = Avx.Max(v1, vZero);
-                        v2 = Avx.Max(v2, vZero);
-                        v3 = Avx.Max(v3, vZero);
+                        v0 = ReluNaNSafeAvx(v0, vZero);
+                        v1 = ReluNaNSafeAvx(v1, vZero);
+                        v2 = ReluNaNSafeAvx(v2, vZero);
+                        v3 = ReluNaNSafeAvx(v3, vZero);
                     }
                     Avx.Store(pOut + j,      v0);
                     Avx.Store(pOut + j + 8,  v1);
@@ -717,7 +764,7 @@ public static class CpuFusedOperations
                 for (; j + 8 <= N; j += 8)
                 {
                     var v = Avx.Add(Avx.LoadVector256(pOut + j), Avx.LoadVector256(pBias + j));
-                    if (applyRelu) v = Avx.Max(v, vZero);
+                    if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
                     Avx.Store(pOut + j, v);
                 }
                 for (; j < N; j++)
@@ -731,13 +778,13 @@ public static class CpuFusedOperations
                 int simdLen = N & ~31;
                 for (; j < simdLen; j += 32)
                 {
-                    Avx.Store(pOut + j,      Avx.Max(Avx.LoadVector256(pOut + j),      vZero));
-                    Avx.Store(pOut + j + 8,  Avx.Max(Avx.LoadVector256(pOut + j + 8),  vZero));
-                    Avx.Store(pOut + j + 16, Avx.Max(Avx.LoadVector256(pOut + j + 16), vZero));
-                    Avx.Store(pOut + j + 24, Avx.Max(Avx.LoadVector256(pOut + j + 24), vZero));
+                    Avx.Store(pOut + j,      ReluNaNSafeAvx(Avx.LoadVector256(pOut + j),      vZero));
+                    Avx.Store(pOut + j + 8,  ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 8),  vZero));
+                    Avx.Store(pOut + j + 16, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 16), vZero));
+                    Avx.Store(pOut + j + 24, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j + 24), vZero));
                 }
                 for (; j + 8 <= N; j += 8)
-                    Avx.Store(pOut + j, Avx.Max(Avx.LoadVector256(pOut + j), vZero));
+                    Avx.Store(pOut + j, ReluNaNSafeAvx(Avx.LoadVector256(pOut + j), vZero));
                 for (; j < N; j++)
                     if (pOut[j] < 0f) pOut[j] = 0f;
             }
@@ -1059,7 +1106,10 @@ public static class CpuFusedOperations
     private static readonly Dictionary<FusedActivationType, Func<float, float>> _floatActivations = new()
     {
         { FusedActivationType.None, x => x },
-        { FusedActivationType.ReLU, x => x > 0f ? x : 0f },
+        // NaN-preserving: `x < 0 ? 0 : x` — when x is NaN, `x < 0` is false (ordered),
+        // so NaN survives. The seemingly equivalent `x > 0 ? x : 0` would convert
+        // NaN to 0, masking invalid activations during training.
+        { FusedActivationType.ReLU, x => x < 0f ? 0f : x },
         { FusedActivationType.GELU, ApplyGelu },
         { FusedActivationType.Sigmoid, x => 1f / (1f + MathF.Exp(-x)) },
         { FusedActivationType.Tanh, MathF.Tanh },
@@ -1170,7 +1220,8 @@ public static class CpuFusedOperations
     private static readonly Dictionary<FusedActivationType, Func<double, double>> _doubleActivations = new()
     {
         { FusedActivationType.None, x => x },
-        { FusedActivationType.ReLU, x => x > 0.0 ? x : 0.0 },
+        // NaN-preserving: see _floatActivations comment above.
+        { FusedActivationType.ReLU, x => x < 0.0 ? 0.0 : x },
         { FusedActivationType.GELU, ApplyGeluDouble },
         { FusedActivationType.Sigmoid, x => 1.0 / (1.0 + Math.Exp(-x)) },
         { FusedActivationType.Tanh, Math.Tanh },

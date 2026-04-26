@@ -158,6 +158,112 @@ public class FusedConv2DDoublePerfTests
         }
     }
 
+    // ─── NaN-preservation guards ──────────────────────────────────────
+    //
+    // x86 MAXPS/MAXPD return SRC2 when SRC1 is NaN, so a naive SIMD
+    // ReLU built on Avx.Max would silently zero NaN lanes — diverging
+    // from the scalar `val < 0 ? 0 : val` form (where NaN < 0 is false
+    // and NaN survives). The kernels in CpuFusedOperations use a
+    // compare-and-AndNot form that mirrors the scalar semantics; these
+    // tests are the regression guard.
+
+    [Fact]
+    public void FusedConv2D_Double_ReLU_PreservesNaNFromBias()
+    {
+        // Bias contains NaN in one channel — after Conv+Bias the entire
+        // plane for that channel is NaN, and ReLU must leave it as NaN
+        // (not silently turn it into +0.0). Size is large enough to
+        // exercise the SIMD bias+ReLU path (HW = 32×32 = 1024 doubles).
+        int batch = 1, inC = 4, H = 32, W = 32, outC = 8;
+        var input = MakeTensor<double>(new[] { batch, inC, H, W }, 0.05, 0.1);
+        var kernel = MakeTensor<double>(new[] { outC, inC, 1, 1 }, 0.1, -0.2);
+        var biasData = new double[outC];
+        for (int k = 0; k < outC; k++) biasData[k] = 0.1 * (k - outC / 2.0);
+        biasData[3] = double.NaN;
+        var bias = new Tensor<double>(biasData, new[] { outC });
+
+        var fused = _engine.FusedConv2D(input, kernel, bias,
+            strideH: 1, strideW: 1, padH: 0, padW: 0,
+            dilationH: 1, dilationW: 1,
+            activation: FusedActivationType.ReLU);
+
+        // Channel 3 must remain entirely NaN; other channels must not
+        // contain NaN (sanity guard against accidental propagation).
+        for (int n = 0; n < batch; n++)
+        for (int k = 0; k < outC; k++)
+        for (int h = 0; h < H; h++)
+        for (int w = 0; w < W; w++)
+        {
+            double v = fused[n, k, h, w];
+            if (k == 3)
+            {
+                Assert.True(double.IsNaN(v),
+                    $"Expected NaN at channel 3 [{n},{k},{h},{w}] but got {v} — SIMD ReLU silently zeroed NaN.");
+            }
+            else
+            {
+                Assert.False(double.IsNaN(v),
+                    $"Unexpected NaN propagated to channel {k} at [{n},{k},{h},{w}].");
+            }
+        }
+    }
+
+    [Fact]
+    public void FusedConv2D_Float_ReLU_PreservesNaNFromBias()
+    {
+        // Single-precision counterpart — exercises the Avx512F.Max /
+        // Avx.Max paths in ApplyNchwPlaneSimd (float).
+        int batch = 1, inC = 4, H = 32, W = 32, outC = 8;
+        var input = MakeTensor<float>(new[] { batch, inC, H, W }, 0.05, 0.1);
+        var kernel = MakeTensor<float>(new[] { outC, inC, 1, 1 }, 0.1, -0.2);
+        var biasData = new float[outC];
+        for (int k = 0; k < outC; k++) biasData[k] = 0.1f * (k - outC / 2.0f);
+        biasData[5] = float.NaN;
+        var bias = new Tensor<float>(biasData, new[] { outC });
+
+        var fused = _engine.FusedConv2D(input, kernel, bias,
+            strideH: 1, strideW: 1, padH: 0, padW: 0,
+            dilationH: 1, dilationW: 1,
+            activation: FusedActivationType.ReLU);
+
+        for (int n = 0; n < batch; n++)
+        for (int k = 0; k < outC; k++)
+        for (int h = 0; h < H; h++)
+        for (int w = 0; w < W; w++)
+        {
+            float v = fused[n, k, h, w];
+            if (k == 5)
+                Assert.True(float.IsNaN(v),
+                    $"Expected NaN at channel 5 [{n},{k},{h},{w}] but got {v}.");
+            else
+                Assert.False(float.IsNaN(v),
+                    $"Unexpected NaN at channel {k} [{n},{k},{h},{w}].");
+        }
+    }
+
+    [Fact]
+    public void GetDoubleActivation_ReLU_PreservesNaN()
+    {
+        // The dispatch-table delegate path (used when the SIMD scalar
+        // tail handles a few residual elements) must agree with the
+        // scalar fallback inside the SIMD kernels.
+        var fn = AiDotNet.Tensors.Helpers.CpuFusedOperations.GetDoubleActivation(FusedActivationType.ReLU);
+        Assert.NotNull(fn);
+        Assert.True(double.IsNaN(fn!(double.NaN)));
+        Assert.Equal(0.0, fn(-1.0));
+        Assert.Equal(2.5, fn(2.5));
+    }
+
+    [Fact]
+    public void GetFloatActivation_ReLU_PreservesNaN()
+    {
+        var fn = AiDotNet.Tensors.Helpers.CpuFusedOperations.GetFloatActivation(FusedActivationType.ReLU);
+        Assert.NotNull(fn);
+        Assert.True(float.IsNaN(fn!(float.NaN)));
+        Assert.Equal(0f, fn(-1f));
+        Assert.Equal(2.5f, fn(2.5f));
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────
 
     private static Tensor<T> MakeTensor<T>(int[] shape, double scale, double offset)
