@@ -41,6 +41,30 @@ internal static class DifferentiableOps
     internal static void ClearIndexedGrads() => _indexedGrads = null;
 
     /// <summary>
+    /// True when a backward pass is running with <c>createGraph=true</c> —
+    /// backward ops are themselves recorded on the tape for higher-order
+    /// differentiation. While this flag is set, <see cref="AccumulateGrad{T}"/>
+    /// uses out-of-place <c>TensorAdd</c> instead of <c>TensorAddInPlace</c>
+    /// so the gradient tensor identity stays connected to its producing
+    /// op through the graph. In-place mutation records an entry keyed on
+    /// a <c>savedA.Clone()</c> input, which severs the double-backward
+    /// graph — the second <see cref="GradientTape{T}.ComputeGradients"/>
+    /// call would observe a disconnected gradient tensor and return an
+    /// incomplete result.
+    /// </summary>
+    /// <remarks>
+    /// ThreadStatic — a nested inner tape running backward with
+    /// <c>createGraph=false</c> while an outer pass has the flag set
+    /// should still see the flag, because the thread is the same. This
+    /// is correct: if we're in a backward that records, we're generating
+    /// tape entries for the outer higher-order pass and in-place on a
+    /// fresh gradient tensor would still sever that graph. The flag is
+    /// only cleared in the <c>finally</c> block of the top-level call.
+    /// </remarks>
+    [ThreadStatic]
+    internal static bool _isBackwardCreateGraph;
+
+    /// <summary>
     /// Returns true if a gradient tape is active and not suppressed.
     /// Use this to guard savedState allocation: only create new object[]
     /// when IsRecording is true, avoiding unnecessary GC pressure during inference.
@@ -185,6 +209,14 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
+        // Higher-order AD: in-place add records a "TensorAddInPlace"
+        // entry whose saved input is a *clone* of the existing gradient,
+        // which severs the graph the second backward pass needs to
+        // walk. Use out-of-place add so the new gradient tensor is
+        // produced by a "TensorAdd" entry whose inputs ARE the original
+        // tensor references — the graph stays connected.
+        bool needsOutOfPlace = _isBackwardCreateGraph;
+
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
         int idx = tensor._gradIndex;
         if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)
@@ -192,8 +224,18 @@ internal static class DifferentiableOps
             var existing = (Tensor<T>?)_indexedGrads[idx];
             if (existing != null)
             {
-                engine.TensorAddInPlace(existing, grad);
-                tensor.Grad = existing;
+                Tensor<T> accumulated;
+                if (needsOutOfPlace)
+                {
+                    accumulated = engine.TensorAdd(existing, grad);
+                }
+                else
+                {
+                    engine.TensorAddInPlace(existing, grad);
+                    accumulated = existing;
+                }
+                _indexedGrads[idx] = accumulated;
+                tensor.Grad = accumulated;
             }
             else
             {
@@ -207,8 +249,17 @@ internal static class DifferentiableOps
         // Fallback: dictionary path (for ops outside tape or during non-indexed backward)
         if (grads.TryGetValue(tensor, out var existingDict))
         {
-            engine.TensorAddInPlace(existingDict, grad);
-            tensor.Grad = existingDict;
+            if (needsOutOfPlace)
+            {
+                var accumulated = engine.TensorAdd(existingDict, grad);
+                grads[tensor] = accumulated;
+                tensor.Grad = accumulated;
+            }
+            else
+            {
+                engine.TensorAddInPlace(existingDict, grad);
+                tensor.Grad = existingDict;
+            }
         }
         else
         {

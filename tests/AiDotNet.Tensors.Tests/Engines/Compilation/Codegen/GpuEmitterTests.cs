@@ -237,4 +237,101 @@ public class GpuEmitterTests
                 () => r.Kernel.Execute<float>(new[] { new float[4] }, new[] { new float[4] }));
         }
     }
+
+    // ─── Sub-byte LoadInput paths (Triton) ────────────────────────────
+
+    [Fact]
+    public void Triton_NF4Input_EmitsLookupTableUnpack()
+    {
+        // Build a graph: NF4 input → Negate → float32 output.
+        // The Triton emitter must produce a NF4_LUT_* tensor and a
+        // gather-based dequantisation prologue before Negate.
+        var g = new CodegenGraph();
+        int packed = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.NF4, new[] { 64 }, 0));
+        int neg = g.AddNode(new CodegenNode(CodegenOpKind.Negate, new[] { packed },
+            CodegenElementType.Float32, new[] { 64 }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { neg },
+            CodegenElementType.Float32, new[] { 64 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.False(r.Declined);
+        Assert.Contains("NF4_LUT_", r.Source);
+        Assert.Contains("tl.gather", r.Source);
+        Assert.Contains("packed_off_", r.Source);
+    }
+
+    [Fact]
+    public void Triton_FP4Input_EmitsCanonicalLut()
+    {
+        var g = new CodegenGraph();
+        int packed = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.FP4, new[] { 64 }, 0));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { packed },
+            CodegenElementType.Float32, new[] { 64 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.False(r.Declined);
+        Assert.Contains("FP4_LUT_", r.Source);
+    }
+
+    [Fact]
+    public void Triton_Int1Input_EmitsBitNetConvention()
+    {
+        // BitNet 1-bit weights: 0 → -1, 1 → +1.
+        var g = new CodegenGraph();
+        int packed = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Int1, new[] { 256 }, 0));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { packed },
+            CodegenElementType.Float32, new[] { 256 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.False(r.Declined);
+        Assert.Contains("offsets // 8", r.Source);
+        Assert.Contains("* 2.0 - 1.0", r.Source);
+    }
+
+    [Fact]
+    public void Triton_Int2Input_PacksFourPerByte()
+    {
+        var g = new CodegenGraph();
+        int packed = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Int2, new[] { 128 }, 0));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { packed },
+            CodegenElementType.Float32, new[] { 128 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.False(r.Declined);
+        Assert.Contains("offsets // 4", r.Source);
+        Assert.Contains("0x3", r.Source);
+    }
+
+    [Fact]
+    public void Triton_Int3Input_NibbleLayoutWithSlackBit()
+    {
+        var g = new CodegenGraph();
+        int packed = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Int3, new[] { 64 }, 0));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { packed },
+            CodegenElementType.Float32, new[] { 64 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.False(r.Declined);
+        Assert.Contains("0x7", r.Source);
+    }
+
+    [Fact]
+    public void Triton_DeclinesSubByteOutput()
+    {
+        // Sub-byte StoreOutput requires atomic byte updates — out of scope.
+        var g = new CodegenGraph();
+        int x = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, new[] { 64 }, 0));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { x },
+            CodegenElementType.NF4, new[] { 64 }, 0));
+
+        var r = new TritonEmitter().Emit(g, CodegenElementType.Float32);
+        Assert.True(r.Declined);
+        Assert.Contains("StoreOutput", r.DeclineReason);
+    }
 }

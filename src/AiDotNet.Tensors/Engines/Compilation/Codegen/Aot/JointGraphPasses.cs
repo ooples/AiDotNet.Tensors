@@ -136,6 +136,162 @@ public static class JointGraphPasses
         return result;
     }
 
+    /// <summary>
+    /// Min-cut activation partitioner backed by Edmonds-Karp
+    /// (BFS-based Ford-Fulkerson). Models the save-vs-recompute
+    /// decision as a flow network:
+    /// <list type="bullet">
+    ///   <item><c>source → node</c> with capacity = node's recompute
+    ///         cost (FLOPs to re-run forward).</item>
+    ///   <item><c>node → sink</c> with capacity = node's memory cost
+    ///         (elements to retain).</item>
+    ///   <item><c>v → u</c> with capacity = ∞ for every edge
+    ///         <c>u → v</c> in the original DAG, so the min-cut
+    ///         respects dependency constraints — recomputing
+    ///         <c>v</c> forces its producers <c>u</c> to also be
+    ///         available (either retained or recomputed).</item>
+    /// </list>
+    /// The minimum cut partitions forward nodes into two sets:
+    /// nodes on the source side are <b>retained</b>, nodes on the
+    /// sink side are <b>recomputed</b>. This is the same model
+    /// PyTorch's AOTAutograd uses (see
+    /// <c>torch._functorch.partitioners.min_cut_rematerialization_partition</c>).
+    /// </summary>
+    /// <param name="graph">The joint forward+backward graph.</param>
+    /// <param name="recomputeCost">Per-node recompute cost (FLOPs).
+    /// Indexed by forward-node id; 0 for non-forward nodes.</param>
+    /// <returns>Partition decision: source-reachable = retained,
+    /// sink-reachable = recomputed.</returns>
+    public static PartitionDecision MinCutPartitionActivations(
+        JointGraph graph,
+        Func<int, long>? recomputeCost = null)
+    {
+        if (graph is null) throw new ArgumentNullException(nameof(graph));
+        recomputeCost ??= _ => 1L;  // unit cost — defers entirely to memory size
+
+        var candidates = CollectBackwardDependencies(graph);
+        if (candidates.Count == 0)
+            return new PartitionDecision(new HashSet<int>(), new HashSet<int>(), 0);
+
+        // Build the flow network. Vertex layout:
+        //   0 = source
+        //   1 = sink
+        //   2 + i = i-th candidate (mapped via candidateOf array)
+        var candidateList = new List<int>(candidates);
+        int v = candidateList.Count + 2;
+        // capacity[i, j] — adjacency-matrix flow. n^2 memory but the
+        // candidate count is bounded by the joint graph's forward width
+        // which is typically <= a few hundred per training step.
+        const long Infinity = long.MaxValue / 4; // headroom so Inf+Inf stays representable
+        var capacity = new long[v, v];
+        var nodeIdToVertex = new Dictionary<int, int>();
+        for (int i = 0; i < candidateList.Count; i++)
+            nodeIdToVertex[candidateList[i]] = i + 2;
+
+        // source → candidate with recompute cost; candidate → sink with memory cost.
+        for (int i = 0; i < candidateList.Count; i++)
+        {
+            int nodeId = candidateList[i];
+            int vert = i + 2;
+            long memCost = graph.ElementCountAt(nodeId);
+            long compCost = Math.Max(1, recomputeCost(nodeId));
+            capacity[0, vert] = compCost;
+            capacity[vert, 1] = memCost;
+        }
+        // For every dependency u → v in the candidate set, add v → u
+        // with infinite capacity. Forces the cut to respect topo order.
+        foreach (int v_id in candidateList)
+        {
+            var node = graph.Nodes[v_id];
+            foreach (int u_id in node.Inputs)
+            {
+                if (nodeIdToVertex.TryGetValue(u_id, out int uVert))
+                {
+                    int vVert = nodeIdToVertex[v_id];
+                    capacity[vVert, uVert] = Infinity;
+                }
+            }
+        }
+
+        // Edmonds-Karp: repeatedly BFS from source for augmenting paths.
+        var parent = new int[v];
+        long maxFlow = 0;
+        while (BfsAugment(capacity, 0, 1, parent, v))
+        {
+            // bottleneck along the path
+            long bottleneck = long.MaxValue;
+            for (int t = 1; t != 0; t = parent[t])
+                bottleneck = Math.Min(bottleneck, capacity[parent[t], t]);
+            for (int t = 1; t != 0; t = parent[t])
+            {
+                capacity[parent[t], t] -= bottleneck;
+                capacity[t, parent[t]] += bottleneck;
+            }
+            maxFlow += bottleneck;
+        }
+
+        // BFS from source on residual graph: source-reachable = retain side.
+        var sourceSide = new bool[v];
+        var queue = new Queue<int>();
+        sourceSide[0] = true;
+        queue.Enqueue(0);
+        while (queue.Count > 0)
+        {
+            int x = queue.Dequeue();
+            for (int y = 0; y < v; y++)
+            {
+                if (!sourceSide[y] && capacity[x, y] > 0)
+                {
+                    sourceSide[y] = true;
+                    queue.Enqueue(y);
+                }
+            }
+        }
+
+        var retained = new HashSet<int>();
+        var recomputed = new HashSet<int>();
+        long retainedElements = 0;
+        for (int i = 0; i < candidateList.Count; i++)
+        {
+            int nodeId = candidateList[i];
+            int vert = i + 2;
+            if (sourceSide[vert])
+            {
+                retained.Add(nodeId);
+                retainedElements += graph.ElementCountAt(nodeId);
+            }
+            else
+            {
+                recomputed.Add(nodeId);
+            }
+        }
+        return new PartitionDecision(retained, recomputed, retainedElements);
+    }
+
+    private static bool BfsAugment(long[,] capacity, int source, int sink, int[] parent, int v)
+    {
+        var visited = new bool[v];
+        var queue = new Queue<int>();
+        queue.Enqueue(source);
+        visited[source] = true;
+        parent[source] = -1;
+        while (queue.Count > 0)
+        {
+            int u = queue.Dequeue();
+            for (int x = 0; x < v; x++)
+            {
+                if (!visited[x] && capacity[u, x] > 0)
+                {
+                    parent[x] = u;
+                    visited[x] = true;
+                    if (x == sink) return true;
+                    queue.Enqueue(x);
+                }
+            }
+        }
+        return false;
+    }
+
     // ─── In-place-op reinsertion ─────────────────────────────────────
 
     /// <summary>

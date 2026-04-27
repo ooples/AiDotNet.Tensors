@@ -203,7 +203,13 @@ public sealed class GradientTape<T> : IDisposable
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
         // (GradFn is always set), so the graph path would always win otherwise.
-        bool hasHooksRegistered = _hooks is not null && _hooks.Count > 0;
+        // Tensor- or node-level hooks both rewrite gradients during the
+        // tape walk; either kind forces the slower tape path because
+        // ComputeGradientsViaGraph (the fast path below) doesn't visit
+        // tape entries and would silently bypass our hook calls.
+        bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
+            || (_nodeHooks is not null && _nodeHooks.Count > 0)
+            || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
         if (_options.Persistent && !createGraph)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
@@ -216,7 +222,11 @@ public sealed class GradientTape<T> : IDisposable
         // Graph-based backward: walk GradFn pointers instead of tape.
         // This is faster because it skips tape traversal, dict lookups, and relevance checks.
         // Skip graph path when anomaly detection or hooks are enabled — the tape path handles those.
-        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
+        // The graph path bypasses the NaN/Inf check — force the slower
+        // tape path whenever anomaly detection is on, either via the
+        // per-tape flag or an ambient AnomalyModeScope. Same reasoning
+        // that exists for DetectAnomaly extends to the scope.
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered)
         {
             // Record step pattern BEFORE backward — backward ops get recorded on the tape
             // (since DifferentiableOps always records), which would make the hash nondeterministic.
@@ -297,6 +307,14 @@ public sealed class GradientTape<T> : IDisposable
         {
             SetCurrentTape(null);
         }
+        // Signal AccumulateGrad to use out-of-place TensorAdd so the
+        // second backward pass sees a connected graph (see the field
+        // doc on DifferentiableOps._isBackwardCreateGraph).
+        var savedBackwardCreateGraph = DifferentiableOps._isBackwardCreateGraph;
+        if (createGraph)
+        {
+            DifferentiableOps._isBackwardCreateGraph = true;
+        }
 
         try
         {
@@ -307,7 +325,11 @@ public sealed class GradientTape<T> : IDisposable
             bool profileEnabled = ProfileBackward;
 
             // Walk tape in reverse (reverse-mode AD)
-            var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
+            // Anomaly detection fires when EITHER the per-tape flag is set
+            // (local opt-in) OR an AnomalyModeScope is active on this thread
+            // (process-wide opt-in, mirroring torch.autograd.set_detect_anomaly).
+            bool anomalyActive = DetectAnomaly || AnomalyModeScope.IsActive;
+            var numOpsForAnomaly = anomalyActive ? MathHelper.GetNumericOperations<T>() : null;
 
             // Tape backward pruning: when sources are specified, forward-walk to find all tensors
             // downstream of those sources. Skip entries whose output is not reachable.
@@ -377,6 +399,28 @@ public sealed class GradientTape<T> : IDisposable
                     grads[entry.Output] = gradOutput;
                 }
 
+                // Apply graph-node hooks: name-keyed and predicate-based.
+                // These fire after tensor hooks so a user can chain
+                // tensor → node modifications. Each set is lazily
+                // populated; the null checks below short-circuit the
+                // common no-hook case at the cost of one branch.
+                if (_nodeHooks is not null
+                    && _nodeHooks.TryGetValue(entry.OperationName, out var nodeHookList))
+                {
+                    foreach (var hook in nodeHookList)
+                        gradOutput = hook(gradOutput);
+                    grads[entry.Output] = gradOutput;
+                }
+                if (_nodePredicateHooks is not null)
+                {
+                    foreach (var (match, hook) in _nodePredicateHooks)
+                    {
+                        if (match(entry))
+                            gradOutput = hook(gradOutput);
+                    }
+                    grads[entry.Output] = gradOutput;
+                }
+
                 // Validate that no input tensor was mutated after recording
                 entry.ValidateInputVersions();
 
@@ -391,7 +435,11 @@ public sealed class GradientTape<T> : IDisposable
                     System.Console.WriteLine($"  backward[{entry.OperationName}]");
                 }
 
-                // Anomaly detection (only when explicitly enabled)
+                // Anomaly detection (only when explicitly enabled — either
+                // tape.DetectAnomaly or an AnomalyModeScope). Throws the
+                // dedicated AnomalyDetectedException so callers can catch
+                // autograd anomalies without a broader ArithmeticException
+                // match.
                 if (numOpsForAnomaly is not null)
                 {
                     foreach (var input in inputsArray)
@@ -402,9 +450,7 @@ public sealed class GradientTape<T> : IDisposable
                             {
                                 double val = numOpsForAnomaly.ToDouble(inputGrad[k]);
                                 if (double.IsNaN(val) || double.IsInfinity(val))
-                                    throw new ArithmeticException(
-                                        $"Op '{entry.OperationName}' backward produced {(double.IsNaN(val) ? "NaN" : "Inf")} " +
-                                        $"at input gradient index {k}. Check forward inputs for numerical issues.");
+                                    throw new AnomalyDetectedException(entry.OperationName);
                             }
                         }
                     }
@@ -434,6 +480,7 @@ public sealed class GradientTape<T> : IDisposable
             {
                 SetCurrentTape(savedCurrent);
             }
+            DifferentiableOps._isBackwardCreateGraph = savedBackwardCreateGraph;
             // Clear indexed gradient array and reset tensor grad indices
             DifferentiableOps.ClearIndexedGrads();
             for (int i = 0; i < _entries.Count; i++)
@@ -606,6 +653,21 @@ public sealed class GradientTape<T> : IDisposable
     private readonly HashSet<Tensor<T>>? _retainGrad;
 
     /// <summary>
+    /// Hooks keyed by op name — fired during backward for every tape
+    /// entry whose OperationName matches. Lazily allocated on first
+    /// RegisterNodeHook call so tapes that don't use node hooks pay
+    /// nothing.
+    /// </summary>
+    private Dictionary<string, List<Func<Tensor<T>, Tensor<T>>>>? _nodeHooks;
+
+    /// <summary>
+    /// Predicate-based node hooks. Each (match, hook) pair fires for
+    /// every entry where match returns true. Linear scan during
+    /// backward — keep predicates cheap.
+    /// </summary>
+    private List<(Func<TapeEntry<T>, bool> Match, Func<Tensor<T>, Tensor<T>> Hook)>? _nodePredicateHooks;
+
+    /// <summary>
     /// Registers a hook on a tensor that will be called with its gradient during backward.
     /// The hook can modify the gradient by returning a new tensor.
     /// </summary>
@@ -622,6 +684,63 @@ public sealed class GradientTape<T> : IDisposable
             hooks[tensor] = list;
         }
         list.Add(hook);
+    }
+
+    /// <summary>
+    /// Registers a hook against a graph node identified by the
+    /// recorded operation name. Fires during backward for every tape
+    /// entry whose <see cref="TapeEntry{T}.OperationName"/> matches
+    /// <paramref name="opName"/>, with the gradient flowing into that
+    /// entry's output. Matches the spirit of
+    /// <c>torch.autograd.graph.Node.register_hook</c> and survives
+    /// fusion better than tensor-keyed hooks because the user
+    /// registers against the op identity, not a specific
+    /// <see cref="Tensor{T}"/> reference that may be eliminated by
+    /// graph rewrites.
+    /// </summary>
+    /// <param name="opName">The operation name to match (case
+    /// sensitive) — typically the value passed to
+    /// <see cref="DifferentiableOps.RecordIfActive"/>.</param>
+    /// <param name="hook">Function receiving the gradient flowing
+    /// into the node's output, returning a (possibly modified) one.</param>
+    /// <exception cref="ObjectDisposedException">Tape was disposed.</exception>
+    /// <exception cref="InvalidOperationException">Hooks are not
+    /// enabled on the tape options.</exception>
+    /// <exception cref="ArgumentNullException">Either argument is null.</exception>
+    public void RegisterNodeHook(string opName, Func<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (opName is null) throw new ArgumentNullException(nameof(opName));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        if (_hooks is null) throw new InvalidOperationException(
+            "Hooks require GradientTapeOptions with EnableHooks=true");
+        _nodeHooks ??= new Dictionary<string, List<Func<Tensor<T>, Tensor<T>>>>(StringComparer.Ordinal);
+        if (!_nodeHooks.TryGetValue(opName, out var list))
+        {
+            list = new List<Func<Tensor<T>, Tensor<T>>>();
+            _nodeHooks[opName] = list;
+        }
+        list.Add(hook);
+    }
+
+    /// <summary>
+    /// Predicate-based variant of <see cref="RegisterNodeHook(string, Func{Tensor{T}, Tensor{T}})"/>.
+    /// Fires for every entry where <paramref name="match"/> returns
+    /// <c>true</c>. Lets callers attach to fused replacements whose
+    /// op name they don't know up front (e.g. "any entry whose
+    /// inputs include this Linear weight").
+    /// </summary>
+    public void RegisterNodeHook(
+        Func<TapeEntry<T>, bool> match,
+        Func<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (match is null) throw new ArgumentNullException(nameof(match));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        if (_hooks is null) throw new InvalidOperationException(
+            "Hooks require GradientTapeOptions with EnableHooks=true");
+        _nodePredicateHooks ??= new List<(Func<TapeEntry<T>, bool>, Func<Tensor<T>, Tensor<T>>)>();
+        _nodePredicateHooks.Add((match, hook));
     }
 
     /// <summary>
@@ -719,6 +838,23 @@ public sealed class GradientTape<T> : IDisposable
     /// }
     /// </example>
     public static NoGradScope<T> NoGrad() => new();
+
+    /// <summary>
+    /// Enters an <see cref="InferenceModeScope{T}"/> — strictly stronger than
+    /// <see cref="NoGrad"/>. Inference mode suppresses tape recording AND
+    /// tells the engine that tensor version counters will not be consulted,
+    /// so in-place ops that would normally be blocked by autograd's
+    /// version-check invariant become legal. PyTorch distinguishes
+    /// <c>no_grad</c> from <c>inference_mode</c> for the same reason.
+    /// </summary>
+    /// <example>
+    /// using (GradientTape&lt;float&gt;.InferenceMode())
+    /// {
+    ///     var y = engine.TensorMatMul(x, w);     // NOT recorded
+    ///     engine.TensorAddInPlace(y, bias);      // in-place allowed
+    /// }
+    /// </example>
+    public static InferenceModeScope<T> InferenceMode() => new();
 }
 
 /// <summary>
@@ -755,6 +891,124 @@ public sealed class NoGradScope<T> : IDisposable
         _disposed = true;
         _suppressionCount--;
     }
+
+    /// <summary>
+    /// Increments the suppression counter without allocating a scope.
+    /// Used by <see cref="InferenceModeScope{T}"/> so entering inference
+    /// mode also counts as entering no-grad (since inference mode is
+    /// strictly stronger). Matched exactly once by
+    /// <see cref="DecrementSuppressionCount"/>.
+    /// </summary>
+    internal static void IncrementSuppressionCount() => _suppressionCount++;
+
+    /// <summary>
+    /// Pair to <see cref="IncrementSuppressionCount"/>. Must not be
+    /// called without a matching increment or the counter will go
+    /// negative and <see cref="IsSuppressed"/> will report the wrong
+    /// value.
+    /// </summary>
+    internal static void DecrementSuppressionCount() => _suppressionCount--;
+}
+
+/// <summary>
+/// Strictly stronger than <see cref="NoGradScope{T}"/>: suppresses tape
+/// recording AND marks that tensor version counters will not be consulted
+/// while the scope is active, so in-place ops are legal. Matches PyTorch's
+/// <c>torch.inference_mode()</c>.
+/// </summary>
+/// <remarks>
+/// <para><b>Relationship to <see cref="NoGradScope{T}"/>:</b></para>
+/// <para>
+/// An active inference mode scope counts as "no-grad suppression" for
+/// <see cref="DifferentiableOps.IsRecording{T}"/> so the hot path fast-exits
+/// identically. On top of that, <see cref="IsActive"/> lets engine code
+/// (or in-place op implementations) skip the version-counter bump that
+/// would otherwise fire for tensor mutation, which is the feature that
+/// unlocks in-place arithmetic on inference inputs.
+/// </para>
+/// <para><b>Nesting:</b> multiple scopes may be open simultaneously;
+/// the deepest scope wins and all enclosing scopes remain effective.</para>
+/// <para><b>Thread-local:</b> the flag is <see cref="ThreadStaticAttribute"/>
+/// so one thread entering inference mode does not affect other threads.</para>
+/// </remarks>
+/// <typeparam name="T">The numeric type the tape is generic over.</typeparam>
+public sealed class InferenceModeScope<T> : IDisposable
+{
+    [ThreadStatic]
+    private static int _activeCount;
+
+    private bool _disposed;
+
+    /// <summary>
+    /// Gets whether an inference-mode scope is active on this thread.
+    /// Checked by in-place op implementations to skip version-counter
+    /// bumping and any related autograd bookkeeping.
+    /// </summary>
+    public static bool IsActive => _activeCount > 0;
+
+    /// <summary>
+    /// Creates a new scope. Increments three counters: the NoGrad
+    /// suppression counter (InferenceMode is strictly stronger so
+    /// <see cref="NoGradScope{T}.IsSuppressed"/> reports true while
+    /// active), the typed inference-mode counter (so
+    /// <see cref="IsActive"/> reports true), and the type-erased
+    /// counter consulted by non-generic <see cref="LinearAlgebra.TensorBase"/>
+    /// in-place mutators that don't know <typeparamref name="T"/> at
+    /// the call site.
+    /// </summary>
+    public InferenceModeScope()
+    {
+        NoGradScope<T>.IncrementSuppressionCount();
+        _activeCount++;
+        InferenceModeFlag.Enter();
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _activeCount--;
+        InferenceModeFlag.Exit();
+        NoGradScope<T>.DecrementSuppressionCount();
+    }
+}
+
+/// <summary>
+/// Type-erased thread-local counter shared by every
+/// <see cref="InferenceModeScope{T}"/>, regardless of <c>T</c>.
+/// Read by non-generic in-place op implementations
+/// (<see cref="LinearAlgebra.TensorBase.IncrementVersion"/>,
+/// <see cref="TapeEntry{T}.ValidateInputVersions"/>) that need to
+/// know whether <i>any</i> inference scope is active without
+/// knowing the element type at the call site.
+/// </summary>
+/// <remarks>
+/// Maintained as a sibling to <see cref="InferenceModeScope{T}"/>
+/// rather than replacing the typed counter — typed callers can
+/// still query the <c>T</c>-specific scope when they need to
+/// distinguish (e.g. to apply a dtype-specific optimisation) and
+/// the type-erased flag covers the cross-cutting in-place-mutation
+/// hot path.
+/// </remarks>
+public static class InferenceModeFlag
+{
+    [ThreadStatic]
+    private static int _activeCount;
+
+    /// <summary>
+    /// True when at least one <see cref="InferenceModeScope{T}"/> is
+    /// active on the calling thread for any <c>T</c>. Read by
+    /// in-place tensor mutation paths to skip version-counter bumps
+    /// (mutation is legal under inference mode) and tape-entry
+    /// version validation (no autograd recording took place, so
+    /// nothing to validate).
+    /// </summary>
+    public static bool IsActive => _activeCount > 0;
+
+    internal static void Enter() => _activeCount++;
+
+    internal static void Exit() => _activeCount--;
 }
 
 /// <summary>
