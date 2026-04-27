@@ -737,6 +737,24 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>
+    /// TensorEmbeddingLookup backward: scatter-add gradOutput rows back into the
+    /// embedding table at the saved index positions. Generic on TIndex so the
+    /// long-indexed path used by 50K-vocab LLMs works the same as the int path.
+    /// </summary>
+    internal static void TensorEmbeddingLookupBackward<TIndex>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+        where TIndex : unmanaged
+    {
+        var indices = (Tensor<TIndex>)savedState[0];
+        var vocabSize = (int)savedState[1];
+        var embeddingDim = (int)savedState[2];
+
+        var grad = engine.TensorEmbeddingLookupBackward<T, TIndex>(gradOutput, indices, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Reduction operations
     // ──────────────────────────────────────────────────────────────

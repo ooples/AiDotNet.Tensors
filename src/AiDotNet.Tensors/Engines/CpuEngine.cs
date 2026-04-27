@@ -10765,7 +10765,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
+        // Tape registration — without it, dL/dInput silently dropped on this overload (#255 audit).
+        DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
+            new object[] { poolSize, stride });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -22990,6 +22994,15 @@ public partial class CpuEngine : ITensorLevelEngine
             Array.Copy(embData, srcOffset, resultData, dstOffset, embeddingDim);
         }
 
+        // Tape registration. Without this, dL/dE was silently dropped — see #255.
+        // Indices are non-trainable; only the embedding table receives gradient.
+        DifferentiableOps.RecordUnary(
+            "TensorEmbeddingLookup",
+            result,
+            embeddings,
+            BackwardFunctions<TValue>.TensorEmbeddingLookupBackward<TIndex>,
+            new object[] { indices, vocabSize, embeddingDim });
+
         return result;
     }
 
@@ -25876,6 +25889,10 @@ public partial class CpuEngine : ITensorLevelEngine
             rData[i] = condData[i] ? xData[i] : yData[i];
         });
 
+        // Tape registration — condition is non-trainable; gradient routes
+        // through x where condition is true and through y otherwise (#255 audit).
+        DifferentiableOps.RecordBinary("TensorWhere", result, x, y,
+            BackwardFunctions<T>.WhereBackward, new object[] { (bool[])condData.Clone() });
         return result;
     }
 
@@ -25902,6 +25919,12 @@ public partial class CpuEngine : ITensorLevelEngine
             rData[i] = (bool)condData[i] ? xData[i] : yData[i];
         });
 
+        // Tape registration — see Tensor<bool> overload above. Convert Bit to
+        // bool[] for the saved state so WhereBackward can route gradients.
+        var condBoolArr = new bool[condData.Length];
+        for (int i = 0; i < condData.Length; i++) condBoolArr[i] = (bool)condData[i];
+        DifferentiableOps.RecordBinary("TensorWhere", result, x, y,
+            BackwardFunctions<T>.WhereBackward, new object[] { condBoolArr });
         return result;
     }
 
@@ -26549,6 +26572,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Tape registration — without it, neither input nor values received
+        // their gradient (#255 audit). The 3-arg ScatterAdd at L20078 already
+        // records; this 4-arg overload was the silent sibling.
+        DifferentiableOps.RecordBinary("ScatterAdd", result, input, values,
+            BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis });
         return result;
     }
 
