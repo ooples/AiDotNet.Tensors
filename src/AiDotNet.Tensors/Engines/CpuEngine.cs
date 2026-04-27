@@ -8897,7 +8897,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("GeGLU", result, input, BackwardFunctions<T>.GeGLUBackward,
+            new object[] { actualDim });
+        return result;
     }
 
     /// <summary>
@@ -9024,7 +9027,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("SwiGLU", result, input, BackwardFunctions<T>.SwiGLUBackward,
+            new object[] { actualDim });
+        return result;
     }
 
     /// <summary>
@@ -9143,7 +9149,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ReGLU", result, input, BackwardFunctions<T>.ReGLUBackward,
+            new object[] { actualDim });
+        return result;
     }
 
     /// <summary>
@@ -11700,6 +11709,16 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
+        // Tape registration — only DCN v1 (mask null) for now. DCN v2 with
+        // modulation mask isn't yet wired; users would need to call the
+        // engine's *BackwardMask kernel manually.
+        if (mask is null)
+        {
+            DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                new[] { input, kernel, offset },
+                BackwardFunctions<T>.DeformableConv2DBackward,
+                new object[] { stride, padding, dilation });
+        }
         return result;
     }
 
@@ -13185,6 +13204,16 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.MaxPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
             }
+        }
+
+        // Tape-aware path: dispatch through MaxPool3DWithIndices, which
+        // already records on the tape with MaxPool3DBackward. Costs an
+        // int[,,,,,] index array (one int per output element) but unlocks
+        // gradient flow through 3D max-pool — without this, dL/dInput was
+        // silently zero after MaxPool3D in any tape-tracked model.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            return MaxPool3DWithIndices(input, poolSize, stride, out _);
         }
 
         return MaxPool3DCore(input, poolSize, stride, padding);
@@ -14826,12 +14855,23 @@ public partial class CpuEngine : ITensorLevelEngine
             perturbedData[i] = numOps.Divide(val, numOps.FromDouble(temperature));
         }
 
-        // Apply softmax
-        var perturbedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(perturbedData));
-        var softResult = Softmax(perturbedTensor, axis);
+        // Apply softmax — wrap in NoGradScope so the inner Softmax doesn't
+        // record on the tape. We record the whole GumbelSoftmax as a single
+        // unary op below so dL/d(input) flows correctly through the noise
+        // injection (the perturbed→softmax bridge above breaks tape chain).
+        Tensor<T> softResult;
+        using (new NoGradScope<T>())
+        {
+            var perturbedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(perturbedData));
+            softResult = Softmax(perturbedTensor, axis);
+        }
 
         if (!hard)
+        {
+            DifferentiableOps.RecordUnary("GumbelSoftmax", softResult, input,
+                BackwardFunctions<T>.GumbelSoftmaxBackward, new object[] { temperature, axis });
             return softResult;
+        }
 
         // Hard mode: create one-hot and use straight-through estimator
         var softData = softResult.GetDataArray();
@@ -14866,7 +14906,16 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(hardData));
+        // Hard mode straight-through estimator: forward returns the one-hot,
+        // backward routes gradient as if forward returned the soft sample.
+        // We pass `softResult` (the soft sample) to GumbelSoftmaxBackward via
+        // savedState — the engine kernel uses it for the softmax-Jacobian
+        // step. inputs[0]=input is what gradient accumulates into.
+        var hardResult = TensorAllocator.Rent<T>(shape, new Vector<T>(hardData));
+        DifferentiableOps.RecordUnary("GumbelSoftmax", hardResult, input,
+            BackwardFunctions<T>.GumbelSoftmaxStraightThroughBackward,
+            new object[] { temperature, axis, softResult });
+        return hardResult;
     }
 
     /// <inheritdoc/>
@@ -15238,9 +15287,20 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        // Apply softmax to normalized data
-        var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
-        return Softmax(normalizedTensor, axis);
+        // Apply softmax to normalized data — wrap in NoGradScope so the
+        // inner Softmax doesn't record a (normalized → output) edge that
+        // doesn't extend back to `input`. The all-in-one
+        // SphericalSoftmaxBackward kernel handles both the L2-normalization
+        // Jacobian and the softmax Jacobian as a single composed step.
+        Tensor<T> sphResult;
+        using (new NoGradScope<T>())
+        {
+            var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
+            sphResult = Softmax(normalizedTensor, axis);
+        }
+        DifferentiableOps.RecordUnary("SphericalSoftmax", sphResult, input,
+            BackwardFunctions<T>.SphericalSoftmaxBackward, new object[] { axis });
+        return sphResult;
     }
 
     /// <inheritdoc/>
@@ -17576,7 +17636,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 batch, heads, seqQ, d_k, seqK, d_v,
                 out var weightsF);
             attentionWeights = (Tensor<T>)(object)weightsF;
-            return (Tensor<T>)(object)resultF;
+            var resultFCast = (Tensor<T>)(object)resultF;
+            DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultFCast,
+                new[] { query, key, value },
+                BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+                new object[] { attentionWeights, scaleVal });
+            return resultFCast;
         }
 
         // Double-precision fast path mirrors the float version. Uses
@@ -17597,7 +17662,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 batch, heads, seqQ, d_k, seqK, d_v,
                 out var weightsD);
             attentionWeights = (Tensor<T>)(object)weightsD;
-            return (Tensor<T>)(object)resultD;
+            var resultDCast = (Tensor<T>)(object)resultD;
+            DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultDCast,
+                new[] { query, key, value },
+                BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+                new object[] { attentionWeights, scaleVal });
+            return resultDCast;
         }
 
         T scaleFactor = numOps.FromDouble(scaleVal);
@@ -17701,7 +17771,12 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultGen,
+            new[] { query, key, value },
+            BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+            new object[] { attentionWeights, scaleVal });
+        return resultGen;
     }
 
     /// <summary>
@@ -18602,7 +18677,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 batch, heads, seqQ, headDim, seqK,
                 out var statsF);
             softmaxStats = (Tensor<T>)(object)statsF;
-            return (Tensor<T>)(object)resultF;
+            var resultFCast = (Tensor<T>)(object)resultF;
+            // attentionBias is nullable; pass through as object so the savedState
+            // entry round-trips to the (Tensor<T>?) cast in FlashAttentionBackward.
+            object biasBox = (object?)attentionBias ?? DBNull.Value;
+            DifferentiableOps.RecordIfActive("FlashAttention", resultFCast,
+                new[] { query, key, value },
+                BackwardFunctions<T>.FlashAttentionBackward,
+                new object[] { softmaxStats, scaleValF, isCausal, biasBox });
+            return resultFCast;
         }
 
         // Extract bias data for the scalar path (shape already validated above).
@@ -18760,7 +18843,15 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], new Vector<T>(statsData));
-        return TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
+        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
+        // Tape registration — see float fast-path above for savedState packing.
+        double scaleValGen = scale ?? 1.0 / Math.Sqrt(headDim);
+        object biasBoxGen = (object?)attentionBias ?? DBNull.Value;
+        DifferentiableOps.RecordIfActive("FlashAttention", resultGen,
+            new[] { query, key, value },
+            BackwardFunctions<T>.FlashAttentionBackward,
+            new object[] { softmaxStats, scaleValGen, isCausal, biasBoxGen });
+        return resultGen;
     }
 
     /// <summary>
@@ -19491,7 +19582,13 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         attentionWeights = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, seqK], new Vector<T>(weightsData));
-        return TensorAllocator.Rent<T>([batch, numQHeads, seqQ, headDim], new Vector<T>(outputData));
+        var gqaResult = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, headDim], new Vector<T>(outputData));
+        double gqaScale = scale ?? (1.0 / Math.Sqrt(headDim));
+        DifferentiableOps.RecordIfActive("GroupedQueryAttention", gqaResult,
+            new[] { query, key, value },
+            BackwardFunctions<T>.GroupedQueryAttentionBackward,
+            new object[] { attentionWeights, numQueriesPerKV, gqaScale });
+        return gqaResult;
     }
 
     /// <summary>
@@ -19767,7 +19864,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
-        return TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
+        var gatResult = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("GraphAttention", gatResult,
+            new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
+            BackwardFunctions<T>.GraphAttentionBackward,
+            new object[] { edgeSourceIndices, edgeTargetIndices, attentionCoeffs, leakyReluAlpha });
+        return gatResult;
     }
 
     /// <summary>
@@ -21186,6 +21288,16 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Tape-aware path: take the slow path that explicitly allocates a
+        // `mean` Tensor<T> we can save in savedState for backward. The fast
+        // paths below inline the mean and would need extra alloc + bookkeeping
+        // to expose it, so they're bypassed when a tape is active. This only
+        // hits during training; inference goes through the fast paths.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            return ReduceVarianceTapeAware(input, axes, keepDims);
+        }
+
         // Stride-aware: compute mean then variance with stride math
         if (!input.IsContiguous && axes.Length == 1)
         {
@@ -21345,6 +21457,77 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+    }
+
+    /// <summary>
+    /// Tape-aware ReduceVariance: forces the slow path so we can capture
+    /// the intermediate mean tensor for backward, then records the op.
+    /// Backward = engine.ReduceVarianceBackward(gradOutput, input, mean, axes).
+    /// </summary>
+    private Tensor<T> ReduceVarianceTapeAware<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var inputData = input.GetFlattenedData();
+        var inputShape = input._shape;
+
+        var mean = ReduceMean(input, axes, keepDims: true);
+        var meanData = mean.GetDataArray();
+        var meanShape = mean._shape;
+        var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
+
+        var outputShapeList = new List<int>();
+        for (int d = 0; d < inputShape.Length; d++)
+        {
+            if (normalizedAxes.Contains(d)) { if (keepDims) outputShapeList.Add(1); }
+            else outputShapeList.Add(inputShape[d]);
+        }
+        if (outputShapeList.Count == 0) outputShapeList.Add(1);
+        var outputShape = outputShapeList.ToArray();
+        int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
+        var outputData = new T[outputSize];
+
+        int reduceCount = 1;
+        foreach (var ax in normalizedAxes) reduceCount *= inputShape[ax];
+        T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
+
+        var inputStrides = ComputeStrides(inputShape);
+        var outputStrides = ComputeStrides(outputShape);
+        var meanStrides = ComputeStrides(meanShape);
+
+        int inputSize = input.Length;
+        for (int i = 0; i < inputSize; i++)
+        {
+            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
+            var outputMultiIndex = new List<int>();
+            for (int d = 0; d < inputShape.Length; d++)
+            {
+                if (normalizedAxes.Contains(d)) { if (keepDims) outputMultiIndex.Add(0); }
+                else outputMultiIndex.Add(multiIndex[d]);
+            }
+            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
+            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
+
+            var meanMultiIndex = new List<int>();
+            for (int d = 0; d < inputShape.Length; d++)
+            {
+                if (normalizedAxes.Contains(d)) meanMultiIndex.Add(0);
+                else meanMultiIndex.Add(multiIndex[d]);
+            }
+            int meanIdx = MultiToFlatIndex([.. meanMultiIndex], meanShape, meanStrides);
+
+            T diff = numOps.Subtract(inputData[i], meanData[meanIdx]);
+            outputData[outputIdx] = numOps.Add(outputData[outputIdx], numOps.Multiply(diff, diff));
+        }
+        for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Multiply(outputData[i], scale);
+
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        // savedState order matches existing BackwardFunctions<T>.ReduceVarianceBackward: [axes, mean].
+        DifferentiableOps.RecordUnary("ReduceVariance", result, input,
+            BackwardFunctions<T>.ReduceVarianceBackward, new object[] { axes, mean });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -27031,6 +27214,28 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
+        // Tape-aware path: the in-place ApplyBiasActivationNCHWInPlace fast
+        // paths below mutate Conv2D's recorded output buffer, leaving the
+        // tape with a GradFn pointing at pre-activation Conv2D values that
+        // no longer match the actual tensor data — backward then computes
+        // garbage gradients for input/kernel. Take the recorded sequence
+        // (Conv2D → BroadcastAdd → ApplyActivationRecorded) when a tape is
+        // active so each step's GradFn matches the actual values.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            var convResult = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
+            if (bias != null)
+            {
+                var biasView = bias;
+                if (bias.Rank == 1 && convResult.Rank == 4 && bias._shape[0] == convResult._shape[1])
+                {
+                    biasView = Reshape(bias, new[] { 1, bias._shape[0], 1, 1 });
+                }
+                convResult = TensorBroadcastAdd(convResult, biasView);
+            }
+            return ApplyActivationRecorded(convResult, activation);
+        }
+
         // Step 1: Conv2D
         var result = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
 
@@ -27112,9 +27317,13 @@ public partial class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation in-place (result is a fresh tensor)
+        // Activation: use the recorded variant when a tape is active so dL
+        // routes through the activation step. The in-place variant mutates
+        // tape-recorded tensor data and would silently produce wrong
+        // gradients for the conv kernel/input.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+            return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
-
         return result;
     }
 
@@ -27142,9 +27351,10 @@ public partial class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation in-place (result is a fresh tensor)
+        // Activation — see FusedConv3D note above.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+            return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
-
         return result;
     }
 
@@ -27173,9 +27383,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // This CPU implementation just does the batch normalization
         var result = BatchNorm(input, gamma, beta, epsilon, out saveMean, out saveVar);
 
-        // Step 2: Apply activation in-place (result is a fresh tensor)
+        // Activation: tape-aware path uses the recorded variant so the
+        // activation step is wired into autograd. In-place mutation here
+        // would silently corrupt BatchNorm's recorded output values.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+            return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
-
         return result;
     }
 

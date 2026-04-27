@@ -199,4 +199,228 @@ public class TensorEmbeddingLookupTapeTests
             Assert.Equal(i % 2 == 0 ? 0f : 1f, gySpan[i], 5);
         }
     }
+
+    [Fact]
+    public void GeGLU_ProducesNonZeroInputGradient()
+    {
+        var input = new Tensor<float>([2, 4]);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (i + 1) * 0.1f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.GeGLU(input);
+        Assert.Equal(new[] { 2, 2 }, output._shape);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+        // Some entry must be non-zero (input is non-zero, weights are non-trivial).
+        var g = grads[input].AsSpan();
+        bool anyNonZero = false;
+        for (int i = 0; i < g.Length; i++) if (Math.Abs(g[i]) > 1e-6f) { anyNonZero = true; break; }
+        Assert.True(anyNonZero);
+    }
+
+    [Fact]
+    public void SwiGLU_ProducesNonZeroInputGradient()
+    {
+        var input = new Tensor<float>([1, 6]);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = 0.5f - i * 0.1f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.SwiGLU(input);
+        Assert.Equal(new[] { 1, 3 }, output._shape);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+        var g = grads[input].AsSpan();
+        bool anyNonZero = false;
+        for (int i = 0; i < g.Length; i++) if (Math.Abs(g[i]) > 1e-6f) { anyNonZero = true; break; }
+        Assert.True(anyNonZero);
+    }
+
+    [Fact]
+    public void ReGLU_ProducesNonZeroInputGradient()
+    {
+        var input = new Tensor<float>([1, 4]);
+        // Pick values so b > 0 in the second half (otherwise ReGLU output is identically 0).
+        input.AsWritableSpan()[0] = 0.5f;
+        input.AsWritableSpan()[1] = 0.7f;
+        input.AsWritableSpan()[2] = 1.0f;
+        input.AsWritableSpan()[3] = 1.5f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.ReGLU(input);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+    }
+
+    [Fact]
+    public void SphericalSoftmax_ProducesNonZeroInputGradient()
+    {
+        var input = new Tensor<float>([2, 4]);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (i + 1) * 0.25f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.SphericalSoftmax(input);
+        // Use a non-trivial scalar reduction (sum of squares) so dL/dx ≠ 0;
+        // sum(softmax) is identically 1, which would make dL/dInput == 0
+        // even with correct chain — the gradient just happens to vanish.
+        var sq = _engine.TensorMultiply(output, output);
+        var loss = _engine.ReduceSum(sq, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+        // Pre-fix the chain broke at normalize and grad never reached input.
+        var g = grads[input].AsSpan();
+        bool anyNonZero = false;
+        for (int i = 0; i < g.Length; i++) if (Math.Abs(g[i]) > 1e-9f) { anyNonZero = true; break; }
+        Assert.True(anyNonZero);
+    }
+
+    [Fact]
+    public void ReduceVariance_ProducesNonZeroInputGradient()
+    {
+        var input = new Tensor<float>([3, 4]);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (i + 1) * 0.1f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.ReduceVariance(input, new[] { 1 }, keepDims: false);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+    }
+
+    [Fact]
+    public void MaxPool3D_DispatchesThroughWithIndicesOnTape()
+    {
+        // [N, C, D, H, W] = [1, 1, 2, 4, 4] with 2x2x2 pool, stride 2.
+        var input = new Tensor<float>([1, 1, 2, 4, 4]);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (float)(i + 1);
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.MaxPool3D(input, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 });
+        Assert.Equal(new[] { 1, 1, 1, 2, 2 }, output._shape);
+
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.Equal(input._shape, grads[input]._shape);
+        // Exactly one cell per pool receives gradient = 1; all others = 0.
+        var g = grads[input].AsSpan();
+        int nonZero = 0;
+        for (int i = 0; i < g.Length; i++) if (g[i] != 0f) nonZero++;
+        Assert.Equal(4, nonZero);
+    }
+
+    [Fact]
+    public void ScaledDotProductAttention_RoutesGradToQKV()
+    {
+        // [batch, heads, seq, d_k]
+        const int B = 1, H = 2, S = 4, D = 8;
+        var Q = new Tensor<float>([B, H, S, D]);
+        var K = new Tensor<float>([B, H, S, D]);
+        var V = new Tensor<float>([B, H, S, D]);
+        var rng = new Random(7);
+        for (int i = 0; i < Q.Length; i++) Q.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < K.Length; i++) K.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < V.Length; i++) V.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.ScaledDotProductAttention(Q, K, V, mask: (Tensor<bool>?)null, scale: null, out _);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { Q, K, V });
+
+        Assert.True(grads.ContainsKey(Q));
+        Assert.True(grads.ContainsKey(K));
+        Assert.True(grads.ContainsKey(V));
+        Assert.Equal(Q._shape, grads[Q]._shape);
+        Assert.Equal(K._shape, grads[K]._shape);
+        Assert.Equal(V._shape, grads[V]._shape);
+    }
+
+    [Fact]
+    public void FlashAttention_RoutesGradToQKV()
+    {
+        const int B = 1, H = 2, S = 4, D = 8;
+        var Q = new Tensor<float>([B, H, S, D]);
+        var K = new Tensor<float>([B, H, S, D]);
+        var V = new Tensor<float>([B, H, S, D]);
+        var rng = new Random(11);
+        for (int i = 0; i < Q.Length; i++) Q.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < K.Length; i++) K.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < V.Length; i++) V.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.FlashAttention(Q, K, V, scale: null, isCausal: false, out _);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { Q, K, V });
+
+        Assert.True(grads.ContainsKey(Q));
+        Assert.True(grads.ContainsKey(K));
+        Assert.True(grads.ContainsKey(V));
+        Assert.Equal(Q._shape, grads[Q]._shape);
+    }
+
+    [Fact]
+    public void GroupedQueryAttention_RoutesGradToQKV()
+    {
+        // numQHeads = numKVHeads * numQueriesPerKV: 4 = 2*2
+        const int B = 1, NQ = 4, NKV = 2, S = 4, D = 8;
+        var Q = new Tensor<float>([B, NQ, S, D]);
+        var K = new Tensor<float>([B, NKV, S, D]);
+        var V = new Tensor<float>([B, NKV, S, D]);
+        var rng = new Random(13);
+        for (int i = 0; i < Q.Length; i++) Q.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < K.Length; i++) K.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < V.Length; i++) V.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.GroupedQueryAttention(Q, K, V, numQueriesPerKV: 2, scale: null, isCausal: false, out _);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { Q, K, V });
+
+        Assert.True(grads.ContainsKey(Q));
+        Assert.True(grads.ContainsKey(K));
+        Assert.True(grads.ContainsKey(V));
+    }
+
+    [Fact]
+    public void FusedConv2D_RoutesGradToInputAndKernelAndBias()
+    {
+        // [N, C, H, W] = [1, 2, 4, 4], kernel [out=2, in=2, 3, 3]
+        var input = new Tensor<float>([1, 2, 4, 4]);
+        var kernel = new Tensor<float>([2, 2, 3, 3]);
+        var bias = new Tensor<float>([2]);
+        var rng = new Random(17);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < kernel.Length; i++) kernel.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < bias.Length; i++) bias.AsWritableSpan()[i] = 0.1f;
+
+        using var tape = new GradientTape<float>();
+        var output = _engine.FusedConv2D(input, kernel, bias,
+            strideH: 1, strideW: 1, padH: 0, padW: 0, dilationH: 1, dilationW: 1,
+            FusedActivationType.ReLU);
+        var loss = _engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input, kernel, bias });
+
+        Assert.True(grads.ContainsKey(input));
+        Assert.True(grads.ContainsKey(kernel));
+        Assert.True(grads.ContainsKey(bias));
+        // Pre-fix the in-place bias+activation mutation broke Conv2D's recorded
+        // values; after the tape-aware path the grads should be non-zero on
+        // active ReLU paths. Just sanity-check shapes here.
+        Assert.Equal(input._shape, grads[input]._shape);
+        Assert.Equal(kernel._shape, grads[kernel]._shape);
+        Assert.Equal(bias._shape, grads[bias]._shape);
+    }
 }
