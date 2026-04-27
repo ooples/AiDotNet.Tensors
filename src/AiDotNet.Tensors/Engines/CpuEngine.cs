@@ -18688,13 +18688,18 @@ public partial class CpuEngine : ITensorLevelEngine
                 out var statsF);
             softmaxStats = (Tensor<T>)(object)statsF;
             var resultFCast = (Tensor<T>)(object)resultF;
-            // attentionBias is nullable; pass through as object so the savedState
-            // entry round-trips to the (Tensor<T>?) cast in FlashAttentionBackward.
-            object biasBox = (object?)attentionBias ?? DBNull.Value;
+            // attentionBias is nullable; encode as variable-length savedState
+            // (3 entries when null, 4 when present). The SavedStateSerializer's
+            // default branch throws NotSupportedException for unknown types, so
+            // we can't pack DBNull.Value or any other sentinel — only a missing
+            // entry is portable across the tape's checkpoint/replay surface.
+            var savedF = attentionBias is null
+                ? new object[] { softmaxStats, scaleValF, isCausal }
+                : new object[] { softmaxStats, scaleValF, isCausal, attentionBias };
             DifferentiableOps.RecordIfActive("FlashAttention", resultFCast,
                 new[] { query, key, value },
                 BackwardFunctions<T>.FlashAttentionBackward,
-                new object[] { softmaxStats, scaleValF, isCausal, biasBox });
+                savedF);
             return resultFCast;
         }
 
@@ -18854,13 +18859,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
         softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], new Vector<T>(statsData));
         var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
-        // Tape registration — see float fast-path above for savedState packing.
+        // Tape registration — variable-length savedState encodes optional
+        // attentionBias (3 entries when null, 4 when present). See
+        // FlashAttentionBackward and SavedStateSerializer for why DBNull /
+        // null entries can't be used in their place.
         double scaleValGen = scale ?? 1.0 / Math.Sqrt(headDim);
-        object biasBoxGen = (object?)attentionBias ?? DBNull.Value;
+        var savedGen = attentionBias is null
+            ? new object[] { softmaxStats, scaleValGen, isCausal }
+            : new object[] { softmaxStats, scaleValGen, isCausal, attentionBias };
         DifferentiableOps.RecordIfActive("FlashAttention", resultGen,
             new[] { query, key, value },
             BackwardFunctions<T>.FlashAttentionBackward,
-            new object[] { softmaxStats, scaleValGen, isCausal, biasBoxGen });
+            savedGen);
         return resultGen;
     }
 
@@ -19875,18 +19885,26 @@ public partial class CpuEngine : ITensorLevelEngine
 
         attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
         var gatResult = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
-        // Snapshot the edge-index tensors so caller mutation between forward
-        // and backward can't change the graph topology under autograd.
-        // attentionCoeffs is already a freshly-allocated tensor — safe to
-        // share. leakyReluAlpha is a value type. Only edge indices need cloning.
+        // Snapshot the edge-index tensors as portable int[] data + int[] shape
+        // pairs so the savedState round-trips through SavedStateSerializer.
+        // Saving Tensor<int> directly would throw at checkpoint time when the
+        // tape's T is float/double — the serializer only matches Tensor<T>
+        // for the tape's own T. attentionCoeffs is a freshly-allocated
+        // Tensor<T> — safe to share. leakyReluAlpha is a value type.
         if (DifferentiableOps.IsTapeActiveForThread<T>())
         {
-            var edgeSrcSnap = edgeSourceIndices.Clone();
-            var edgeTgtSnap = edgeTargetIndices.Clone();
+            var srcArr = edgeSourceIndices.GetFlattenedData();
+            var tgtArr = edgeTargetIndices.GetFlattenedData();
+            var srcSnap = new int[srcArr.Length];
+            var tgtSnap = new int[tgtArr.Length];
+            Array.Copy(srcArr, srcSnap, srcArr.Length);
+            Array.Copy(tgtArr, tgtSnap, tgtArr.Length);
+            var srcShape = (int[])edgeSourceIndices._shape.Clone();
+            var tgtShape = (int[])edgeTargetIndices._shape.Clone();
             DifferentiableOps.RecordIfActive("GraphAttention", gatResult,
                 new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
                 BackwardFunctions<T>.GraphAttentionBackward,
-                new object[] { edgeSrcSnap, edgeTgtSnap, attentionCoeffs, leakyReluAlpha });
+                new object[] { srcSnap, srcShape, tgtSnap, tgtShape, attentionCoeffs, leakyReluAlpha });
         }
         return gatResult;
     }
@@ -23204,12 +23222,22 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Tape registration. Without this, dL/dE was silently dropped — see #255.
         // Indices are non-trainable; only the embedding table receives gradient.
-        DifferentiableOps.RecordUnary(
-            "TensorEmbeddingLookup",
-            result,
-            embeddings,
-            BackwardFunctions<TValue>.TensorEmbeddingLookupBackward<TIndex>,
-            new object[] { indices, vocabSize, embeddingDim });
+        // Snapshot the indices as a portable int[] (widening from long if
+        // necessary) so the savedState round-trips through SavedStateSerializer:
+        // it supports null/int/int[]/double/float/bool/string/byte[]/Tensor<T>/Enum,
+        // but not Tensor<TIndex> for TIndex != T.
+        if (DifferentiableOps.IsTapeActiveForThread<TValue>())
+        {
+            var indicesSnap = new int[numIndices];
+            for (int i = 0; i < numIndices; i++) indicesSnap[i] = Convert.ToInt32(idxData[i]);
+            var indicesShapeSnap = (int[])indices._shape.Clone();
+            DifferentiableOps.RecordUnary(
+                "TensorEmbeddingLookup",
+                result,
+                embeddings,
+                BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
+                new object[] { indicesSnap, indicesShapeSnap, vocabSize, embeddingDim });
+        }
 
         return result;
     }
@@ -26099,8 +26127,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Tape registration — condition is non-trainable; gradient routes
         // through x where condition is true and through y otherwise (#255 audit).
+        // Save the mask as byte[] (0/1-encoded) rather than bool[] because
+        // SavedStateSerializer doesn't support bool[] — would throw on
+        // checkpointing. byte[] is supported and is the same wire size.
+        var condBytes = new byte[condData.Length];
+        for (int i = 0; i < condData.Length; i++) condBytes[i] = condData[i] ? (byte)1 : (byte)0;
         DifferentiableOps.RecordBinary("TensorWhere", result, x, y,
-            BackwardFunctions<T>.WhereBackward, new object[] { (bool[])condData.Clone() });
+            BackwardFunctions<T>.WhereBackward, new object[] { condBytes });
         return result;
     }
 
@@ -26127,12 +26160,13 @@ public partial class CpuEngine : ITensorLevelEngine
             rData[i] = (bool)condData[i] ? xData[i] : yData[i];
         });
 
-        // Tape registration — see Tensor<bool> overload above. Convert Bit to
-        // bool[] for the saved state so WhereBackward can route gradients.
-        var condBoolArr = new bool[condData.Length];
-        for (int i = 0; i < condData.Length; i++) condBoolArr[i] = (bool)condData[i];
+        // Tape registration — see Tensor<bool> overload above. Save as byte[]
+        // for SavedStateSerializer compatibility (bool[] would throw on
+        // checkpointing).
+        var condBytesBit = new byte[condData.Length];
+        for (int i = 0; i < condData.Length; i++) condBytesBit[i] = (bool)condData[i] ? (byte)1 : (byte)0;
         DifferentiableOps.RecordBinary("TensorWhere", result, x, y,
-            BackwardFunctions<T>.WhereBackward, new object[] { condBoolArr });
+            BackwardFunctions<T>.WhereBackward, new object[] { condBytesBit });
         return result;
     }
 

@@ -738,20 +738,25 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// TensorEmbeddingLookup backward: scatter-add gradOutput rows back into the
-    /// embedding table at the saved index positions. Generic on TIndex so the
-    /// long-indexed path used by 50K-vocab LLMs works the same as the int path.
+    /// TensorEmbeddingLookup backward: scatter-add gradOutput rows back into
+    /// the embedding table at the saved index positions. The forward stores
+    /// indices as a snapshotted int[] + the original index shape so the
+    /// savedState array sticks to types the SavedStateSerializer supports
+    /// (Tensor&lt;TIndex&gt; for non-T would throw on serialization). long
+    /// indices are widened to int at save time, since the engine's
+    /// EmbeddingBackward path indexes by int internally.
     /// </summary>
-    internal static void TensorEmbeddingLookupBackward<TIndex>(
+    internal static void TensorEmbeddingLookupBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
-        where TIndex : unmanaged
     {
-        var indices = (Tensor<TIndex>)savedState[0];
-        var vocabSize = (int)savedState[1];
-        var embeddingDim = (int)savedState[2];
+        var indicesData = (int[])savedState[0];
+        var indicesShape = (int[])savedState[1];
+        var vocabSize = (int)savedState[2];
+        var embeddingDim = (int)savedState[3];
 
-        var grad = engine.TensorEmbeddingLookupBackward<T, TIndex>(gradOutput, indices, vocabSize, embeddingDim);
+        var indices = new Tensor<int>(indicesData, indicesShape);
+        var grad = engine.TensorEmbeddingLookupBackward<T, int>(gradOutput, indices, vocabSize, embeddingDim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -862,16 +867,23 @@ internal static class BackwardFunctions<T>
     /// <summary>
     /// GraphAttention backward: dL flows to nodeFeatures + the two attention
     /// weight vectors. Edge index tensors are non-trainable and live in
-    /// savedState alongside attentionCoeffs + leakyReluAlpha.
+    /// savedState as portable int[] data + int[] shape pairs (so the tape
+    /// round-trips through SavedStateSerializer — Tensor&lt;int&gt; would
+    /// throw on checkpointing when the tape's T is float/double).
+    /// savedState layout: [srcData, srcShape, tgtData, tgtShape, attnCoeffs, alpha].
     /// </summary>
     internal static void GraphAttentionBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var edgeSrc = (Tensor<int>)savedState[0];
-        var edgeTgt = (Tensor<int>)savedState[1];
-        var attentionCoeffs = (Tensor<T>)savedState[2];
-        var leakyReluAlpha = (double)savedState[3];
+        var srcData = (int[])savedState[0];
+        var srcShape = (int[])savedState[1];
+        var tgtData = (int[])savedState[2];
+        var tgtShape = (int[])savedState[3];
+        var attentionCoeffs = (Tensor<T>)savedState[4];
+        var leakyReluAlpha = (double)savedState[5];
+        var edgeSrc = new Tensor<int>(srcData, srcShape);
+        var edgeTgt = new Tensor<int>(tgtData, tgtShape);
         // inputs[0]=nodeFeatures, inputs[1]=attnWeightSource, inputs[2]=attnWeightTarget
         engine.GraphAttentionBackward(
             gradOutput, inputs[0], edgeSrc, edgeTgt, inputs[1], inputs[2], attentionCoeffs, leakyReluAlpha,
@@ -900,7 +912,11 @@ internal static class BackwardFunctions<T>
     /// <summary>
     /// FlashAttention backward: engine kernel uses softmaxStats (LSE per row)
     /// saved from forward to recompute attention probabilities incrementally.
-    /// Output tensor is also passed through to the kernel.
+    /// Output tensor is also passed through to the kernel. The optional
+    /// attentionBias is encoded as a variable-length savedState (length 3
+    /// when no bias, length 4 when present) — DBNull/null sentinels would
+    /// throw on tape serialization, so a missing trailing entry is the
+    /// portable encoding.
     /// </summary>
     internal static void FlashAttentionBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -909,9 +925,7 @@ internal static class BackwardFunctions<T>
         var softmaxStats = (Tensor<T>)savedState[0];
         var scale = (double)savedState[1];
         var isCausal = (bool)savedState[2];
-        // attentionBias was packed as either the Tensor<T> or DBNull.Value to
-        // round-trip through object[] without using the null-forgiving operator.
-        Tensor<T>? attentionBias = savedState[3] is Tensor<T> b ? b : null;
+        Tensor<T>? attentionBias = savedState.Length > 3 && savedState[3] is Tensor<T> b ? b : null;
         engine.FlashAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], output, softmaxStats, scale, isCausal,
             out var gradQ, out var gradK, out var gradV, attentionBias);
@@ -1933,37 +1947,50 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
-    /// <summary>Where backward: gradient flows through the selected branch</summary>
+    /// <summary>Where backward: gradient flows through the selected branch.
+    /// Accepts the condition mask as a Tensor&lt;T&gt;, a bool[] (legacy
+    /// in-process callers), or a byte[] (0/1-encoded — the only of the three
+    /// that round-trips through SavedStateSerializer for tape checkpointing).
+    /// </summary>
     internal static void WhereBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        // Convert bool[] condition to float tensor for GPU dispatch
         if (savedState[0] is Tensor<T> condTensor)
         {
-            // Already a tensor — use engine multiply for routing
             var gradX = engine.TensorMultiply(gradOutput, condTensor);
             var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(condTensor, numOps.Zero), numOps.One);
             var invCond = engine.TensorSubtract(ones, condTensor);
             var gradY = engine.TensorMultiply(gradOutput, invCond);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+            return;
+        }
+
+        // Materialize the condition as a Tensor<T> mask (1 where true, 0 otherwise)
+        // from either bool[] (in-process) or byte[] (post-serialization).
+        T[] condData;
+        if (savedState[0] is byte[] condBytes)
+        {
+            condData = new T[condBytes.Length];
+            for (int i = 0; i < condBytes.Length; i++)
+                condData[i] = condBytes[i] != 0 ? numOps.One : numOps.Zero;
         }
         else
         {
             var condition = (bool[])savedState[0];
-            var condData = new T[condition.Length];
+            condData = new T[condition.Length];
             for (int i = 0; i < condition.Length; i++)
                 condData[i] = condition[i] ? numOps.One : numOps.Zero;
-            var condT = new Tensor<T>(condData, inputs[0]._shape);
-            var gradX = engine.TensorMultiply(gradOutput, condT);
-            var invCond = engine.TensorSubtract(
-                engine.TensorAddScalar(engine.TensorMultiplyScalar(condT, numOps.Zero), numOps.One), condT);
-            var gradY = engine.TensorMultiply(gradOutput, invCond);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
-            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
         }
+        var condT = new Tensor<T>(condData, inputs[0]._shape);
+        var gradX2 = engine.TensorMultiply(gradOutput, condT);
+        var invCond2 = engine.TensorSubtract(
+            engine.TensorAddScalar(engine.TensorMultiplyScalar(condT, numOps.Zero), numOps.One), condT);
+        var gradY2 = engine.TensorMultiply(gradOutput, invCond2);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX2, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY2, engine);
     }
 
     /// <summary>MaskedFill backward: zero gradient where mask is true</summary>
