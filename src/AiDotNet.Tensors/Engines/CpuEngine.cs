@@ -10776,8 +10776,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
         // Tape registration — without it, dL/dInput silently dropped on this overload (#255 audit).
+        // Snapshot poolSize/stride: callers can reuse + mutate the int[] they passed in, which would
+        // make backward replay with parameters that no longer match the forward result.
         DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
-            new object[] { poolSize, stride });
+            new object[] { (int[])poolSize.Clone(), (int[])stride.Clone() });
         return result;
     }
 
@@ -11710,14 +11712,22 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         // Tape registration — only DCN v1 (mask null) for now. DCN v2 with
-        // modulation mask isn't yet wired; users would need to call the
-        // engine's *BackwardMask kernel manually.
+        // modulation mask isn't yet wired; rather than silently drop dL on
+        // training paths that pass a mask, fail fast so the caller knows to
+        // either disable autograd for this op or wait for v2 wiring.
         if (mask is null)
         {
             DifferentiableOps.RecordIfActive("DeformableConv2D", result,
                 new[] { input, kernel, offset },
                 BackwardFunctions<T>.DeformableConv2DBackward,
-                new object[] { stride, padding, dilation });
+                new object[] { (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone() });
+        }
+        else if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            throw new NotSupportedException(
+                "DeformableConv2D autograd with a modulation mask (DCN v2) is not yet wired. " +
+                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
+                "of autograd for this op.");
         }
         return result;
     }
@@ -19865,10 +19875,19 @@ public partial class CpuEngine : ITensorLevelEngine
 
         attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
         var gatResult = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
-        DifferentiableOps.RecordIfActive("GraphAttention", gatResult,
-            new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
-            BackwardFunctions<T>.GraphAttentionBackward,
-            new object[] { edgeSourceIndices, edgeTargetIndices, attentionCoeffs, leakyReluAlpha });
+        // Snapshot the edge-index tensors so caller mutation between forward
+        // and backward can't change the graph topology under autograd.
+        // attentionCoeffs is already a freshly-allocated tensor — safe to
+        // share. leakyReluAlpha is a value type. Only edge indices need cloning.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            var edgeSrcSnap = edgeSourceIndices.Clone();
+            var edgeTgtSnap = edgeTargetIndices.Clone();
+            DifferentiableOps.RecordIfActive("GraphAttention", gatResult,
+                new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
+                BackwardFunctions<T>.GraphAttentionBackward,
+                new object[] { edgeSrcSnap, edgeTgtSnap, attentionCoeffs, leakyReluAlpha });
+        }
         return gatResult;
     }
 
@@ -21468,6 +21487,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         var numOps = MathHelper.GetNumericOperations<T>();
+        // Preserve the caller's original tensor reference so the recorded
+        // GradFn keys to the tensor the caller will look up gradients for.
+        // The contiguous copy below is for the math kernels only.
+        var originalInput = input;
         if (!input.IsContiguous) input = input.Contiguous();
 
         var inputData = input.GetFlattenedData();
@@ -21525,8 +21548,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
         // savedState order matches existing BackwardFunctions<T>.ReduceVarianceBackward: [axes, mean].
-        DifferentiableOps.RecordUnary("ReduceVariance", result, input,
-            BackwardFunctions<T>.ReduceVarianceBackward, new object[] { axes, mean });
+        // Snapshot axes (caller-owned int[]) and key the recorded op against the
+        // ORIGINAL input reference, not the contiguous copy used by the math.
+        DifferentiableOps.RecordUnary("ReduceVariance", result, originalInput,
+            BackwardFunctions<T>.ReduceVarianceBackward, new object[] { (int[])axes.Clone(), mean });
         return result;
     }
 

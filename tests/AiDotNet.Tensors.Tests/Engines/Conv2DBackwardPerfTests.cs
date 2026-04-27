@@ -209,7 +209,7 @@ public class Conv2DBackwardPerfTests
 #else
         const double minSpeedup = 5.0;
 #endif
-        Assert.True(speedup > minSpeedup,
+        Assert.True(speedup >= minSpeedup,
             $"Expected at least {minSpeedup}x speedup from im2col+GEMM but got {speedup:F1}x " +
             $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
@@ -277,7 +277,7 @@ public class Conv2DBackwardPerfTests
 #else
         const double minSpeedup = 5.0;
 #endif
-        Assert.True(speedup > minSpeedup,
+        Assert.True(speedup >= minSpeedup,
             $"Expected at least {minSpeedup}x speedup from im2col+GEMM but got {speedup:F1}x " +
             $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
