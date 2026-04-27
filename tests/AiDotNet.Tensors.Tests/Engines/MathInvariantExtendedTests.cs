@@ -118,6 +118,15 @@ public class MathInvariantExtendedTests
     [Fact]
     public void Copy_RentedSource_TightlySizedDestination_DoesNotOverrun()
     {
+        // TensorAllocator.Rent only routes through ArrayPool on NET5+. On
+        // net471 the function falls through to `new Tensor<T>(shape)` which
+        // returns an exactly-sized array — the bug this test guards (over-
+        // allocated backing array overrunning a tightly-sized destination)
+        // structurally cannot occur there. Skip the test silently on net471
+        // rather than fail its own precondition.
+#if !NET5_0_OR_GREATER
+        return;
+#else
         // TensorAllocator.Rent only routes through ArrayPool at or above
         // ArrayPoolThresholdValue elements. Below that, Rent returns an
         // exactly-sized backing array and the test passes even on the
@@ -155,6 +164,7 @@ public class MathInvariantExtendedTests
         {
             TensorAllocator.Return(src);
         }
+#endif
     }
     [Fact] public void Fill_AllSameValue() { var t = new Tensor<float>(new float[64], [64]); E.TensorFill(t, 3.14f); var d = t.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.Equal(3.14f, d[i], Tol); }
 

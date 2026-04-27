@@ -200,8 +200,17 @@ public class Conv2DBackwardPerfTests
         _output.WriteLine($"  Float naive loops: {naiveMs:F2}ms");
         _output.WriteLine($"  Speedup: {speedup:F1}x");
 
-        Assert.True(speedup > 10.0,
-            $"Expected at least 10x speedup from im2col+GEMM but got {speedup:F1}x " +
+        // The 10× threshold relies on AVX2 intrinsics under
+        // System.Runtime.Intrinsics.X86, available only on .NET Core 3.0+.
+        // On net471 the GEMM path falls back to Vector<T> / scalar, where
+        // 5–8× over the naive nested-loop baseline is the realistic ceiling.
+#if NET5_0_OR_GREATER
+        const double minSpeedup = 10.0;
+#else
+        const double minSpeedup = 5.0;
+#endif
+        Assert.True(speedup >= minSpeedup,
+            $"Expected at least {minSpeedup}x speedup from im2col+GEMM but got {speedup:F1}x " +
             $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
 
@@ -259,8 +268,17 @@ public class Conv2DBackwardPerfTests
         _output.WriteLine($"  Float naive loops: {naiveMs:F2}ms");
         _output.WriteLine($"  Speedup: {speedup:F1}x");
 
-        Assert.True(speedup > 10.0,
-            $"Expected at least 10x speedup from im2col+GEMM but got {speedup:F1}x " +
+        // The 10× threshold relies on AVX2 intrinsics under
+        // System.Runtime.Intrinsics.X86, available only on .NET Core 3.0+.
+        // On net471 the GEMM path falls back to Vector<T> / scalar, where
+        // 5–8× over the naive nested-loop baseline is the realistic ceiling.
+#if NET5_0_OR_GREATER
+        const double minSpeedup = 10.0;
+#else
+        const double minSpeedup = 5.0;
+#endif
+        Assert.True(speedup >= minSpeedup,
+            $"Expected at least {minSpeedup}x speedup from im2col+GEMM but got {speedup:F1}x " +
             $"(gemm={gemmMs:F2}ms, naive={naiveMs:F2}ms)");
     }
 

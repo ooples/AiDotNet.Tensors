@@ -28,6 +28,20 @@ internal static class DifferentiableOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool AnyTapeActive() => _anyTapeActive != 0;
 
+    /// <summary>
+    /// Thread-local check: is a tape active on the calling thread for the
+    /// given numeric T? Use this when an op needs to switch dispatch paths
+    /// (e.g. take a slower tape-aware branch) — using the cross-thread
+    /// <see cref="AnyTapeActive"/> would incorrectly trigger the slow path
+    /// for a thread that has no tape but happens to share a process with
+    /// a thread that does.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsTapeActiveForThread<T>()
+        => _anyTapeActive != 0
+           && GradientTape<T>.Current is not null
+           && !NoGradScope<T>.IsSuppressed;
+
     // Indexed gradient array: set by ComputeGradients before backward walk,
     // read by AccumulateGrad for O(1) access instead of dictionary hash lookup.
     // ThreadStatic because backward is single-threaded per tape.
