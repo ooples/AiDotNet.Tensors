@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text;
+using AiDotNet.Tensors.Licensing;
 
 namespace AiDotNet.Tensors.NumericOperations;
 
@@ -35,8 +36,23 @@ public static class GgufReader
     /// <summary>Parse the full header, metadata, and tensor index from
     /// <paramref name="stream"/>. Leaves the stream positioned at the
     /// first byte of tensor data.</summary>
+    /// <exception cref="LicenseRequiredException">
+    /// Thrown when no license is configured AND the free-trial budget
+    /// is exhausted, OR when the configured license does not include
+    /// the <c>tensors:load</c> capability. See
+    /// <see cref="PersistenceGuard"/> for resolution paths.
+    /// </exception>
     public static GgufFile Read(Stream stream)
     {
+        // Gate every public read entry point through the persistence
+        // guard so the licensing check fires uniformly across every
+        // tensor-format reader (GGUF today, Safetensors / pickle / .pt
+        // / sharded checkpoints in #218). Upstream AiDotNet wraps its
+        // own load call in PersistenceGuard.InternalOperation() so
+        // this enforce is suppressed when the upstream guard has
+        // already counted the operation.
+        PersistenceGuard.EnforceBeforeLoad();
+
         if (stream is null) throw new ArgumentNullException(nameof(stream));
         if (!stream.CanRead) throw new ArgumentException("Stream must be readable.", nameof(stream));
 
