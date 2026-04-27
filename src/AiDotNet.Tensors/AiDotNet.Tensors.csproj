@@ -81,6 +81,11 @@
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
+    <!-- ZipArchive (System.IO.Compression) ships in mscorlib on .NET 5+ but
+         needs an explicit reference on net471 — used by PtReader to parse
+         the modern zip-format PyTorch checkpoint. -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 
   <!--
