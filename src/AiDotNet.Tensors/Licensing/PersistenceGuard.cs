@@ -123,7 +123,14 @@ public static class PersistenceGuard
     /// developer's <c>~/.aidotnet/tensors-trial.json</c>. Pass
     /// <c>null</c> to clear an existing override.
     /// </summary>
-    public static IDisposable SetTestTrialFilePathOverride(string? path)
+    /// <remarks>
+    /// <c>internal</c> on purpose — exposed only via the test project's
+    /// <c>InternalsVisibleTo</c> entry. Making this <c>public</c> would
+    /// hand every consumer a one-line trial-tracking bypass: redirect
+    /// the override to a fresh temp file before each operation and the
+    /// counter never accumulates against the real trial.json.
+    /// </remarks>
+    internal static IDisposable SetTestTrialFilePathOverride(string? path)
     {
         var prev = _trialFilePathOverride.Value;
         _trialFilePathOverride.Value = path;
@@ -148,6 +155,33 @@ public static class PersistenceGuard
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LicenseValidator> _validators = new();
     private static LicenseValidator GetValidator(AiDotNetTensorsLicenseKey key)
         => _validators.GetOrAdd(key.Key, _ => new LicenseValidator(key));
+
+    // Per-key "pending allowance consumed" set. The first
+    // ValidationPending result for a key is allowed (lets users on a
+    // flaky network bootstrap into the offline-grace window), but
+    // subsequent pending results are rejected — the validator caches
+    // a pending result for the full grace period, so without this cap
+    // a user with persistent network failure would get unlimited free
+    // operations for the entire grace window.
+    //
+    // Cleared whenever validation transitions to Active, so a transient
+    // network blip followed by a successful re-check restores the
+    // single-allowance budget for the next outage.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _pendingConsumed = new();
+
+    // Single-process gate around the trial state's read-check-increment-
+    // write sequence. Without this, two concurrent EnforceCore calls can
+    // each load the same on-disk operationsConsumed value, both see the
+    // pre-tick count, both write back count+1, and the second write
+    // silently overwrites the first — losing increments and letting
+    // users exceed the operation cap.
+    //
+    // This is process-local. Multi-process safety would need
+    // OS-level file locking inside TrialState.Load/Save; persistence
+    // I/O is intentionally low-frequency (Save / Load / Serialize /
+    // Deserialize entry points) so a per-process lock is the right
+    // grain — matches upstream's ModelPersistenceGuard pattern.
+    private static readonly object _trialStateGate = new();
 
     // ─── Enforcement entry points ──────────────────────────────────
 
@@ -191,7 +225,14 @@ public static class PersistenceGuard
             var result = validator.Validate();
 
             if (result.Status == LicenseKeyStatus.Active && result.HasCapability(requiredCapability))
+            {
+                // Active validation clears any prior pending-consumed
+                // marker for this key — a transient outage that
+                // recovers should restore the single-pending allowance
+                // for the next outage.
+                _pendingConsumed.TryRemove(key.Key, out _);
                 return;
+            }
             if (result.Status == LicenseKeyStatus.Active && !result.HasCapability(requiredCapability))
                 throw new LicenseRequiredException(
                     $"License is active but does not include the '{requiredCapability}' capability " +
@@ -201,13 +242,28 @@ public static class PersistenceGuard
                     keyStatus: LicenseKeyStatus.CapabilityMissing,
                     requiredCapability: requiredCapability);
 
-            // Pending (transport failure on first call) → allow within
-            // the offline grace window. The validator already returned
-            // ValidationPending, which means we have no cached prior;
-            // accept it once so users on flaky networks aren't blocked
-            // on every call.
             if (result.Status == LicenseKeyStatus.ValidationPending)
-                return;
+            {
+                // First pending result per key is allowed (bootstraps
+                // users on a flaky network). Subsequent pending
+                // results — which the validator returns from its
+                // cached pending throughout the offline grace window
+                // — are rejected, so a user with persistent network
+                // failure can't loop through unlimited operations.
+                // TryAdd returns false if the key was already
+                // present, i.e. we've already consumed the allowance.
+                if (_pendingConsumed.TryAdd(key.Key, 0))
+                    return;
+
+                throw new LicenseRequiredException(
+                    "License server unreachable and the one-call validation-pending allowance " +
+                    "has already been consumed for this key. Restore network connectivity to " +
+                    "re-validate, or fall back to upstream AiDotNet for offline HMAC verification.",
+                    trialDaysElapsed: null,
+                    operationsPerformed: null,
+                    keyStatus: LicenseKeyStatus.ValidationPending,
+                    requiredCapability: requiredCapability);
+            }
 
             // Anything else (Expired / Revoked / Invalid / SeatLimit) → throw.
             throw new LicenseRequiredException(
@@ -218,25 +274,31 @@ public static class PersistenceGuard
                 requiredCapability: requiredCapability);
         }
 
-        // No key configured → consult the trial state.
+        // No key configured → consult the trial state. The
+        // load → IsExpired → increment → save sequence runs under
+        // _trialStateGate so concurrent EnforceCore calls can't race
+        // and lose increments; see _trialStateGate's comment.
         string trialPath = _trialFilePathOverride.Value ?? TrialState.DefaultPath;
-        var trial = TrialState.Load(trialPath);
-        var now = DateTimeOffset.UtcNow;
-        if (trial.IsExpired(now))
+        lock (_trialStateGate)
         {
-            int daysElapsed = (int)(now - trial.StartedAt).TotalDays;
-            throw new LicenseRequiredException(
-                $"Free trial for AiDotNet.Tensors has expired ({trial.OperationsConsumed} operations / {daysElapsed} days). " +
-                "Set AIDOTNET_LICENSE_KEY or call PersistenceGuard.SetActiveLicenseKey to continue.",
-                trialDaysElapsed: daysElapsed,
-                operationsPerformed: trial.OperationsConsumed,
-                keyStatus: null,
-                requiredCapability: requiredCapability);
-        }
+            var trial = TrialState.Load(trialPath);
+            var now = DateTimeOffset.UtcNow;
+            if (trial.IsExpired(now))
+            {
+                int daysElapsed = (int)(now - trial.StartedAt).TotalDays;
+                throw new LicenseRequiredException(
+                    $"Free trial for AiDotNet.Tensors has expired ({trial.OperationsConsumed} operations / {daysElapsed} days). " +
+                    "Set AIDOTNET_LICENSE_KEY or call PersistenceGuard.SetActiveLicenseKey to continue.",
+                    trialDaysElapsed: daysElapsed,
+                    operationsPerformed: trial.OperationsConsumed,
+                    keyStatus: null,
+                    requiredCapability: requiredCapability);
+            }
 
-        // Tick the counter and persist.
-        trial.OperationsConsumed++;
-        trial.Save(trialPath);
+            // Tick the counter and persist.
+            trial.OperationsConsumed++;
+            trial.Save(trialPath);
+        }
     }
 
     private static AiDotNetTensorsLicenseKey? ResolveActiveKey()
@@ -271,9 +333,15 @@ public static class PersistenceGuard
     }
 
     /// <summary>
-    /// Test hook — clears the validator cache so a test can configure
-    /// a new key and have the next call hit the validator fresh
-    /// rather than seeing the previous test's cached result.
+    /// Test hook — clears the validator cache and per-key
+    /// pending-consumed markers so a test can configure a new key
+    /// and have the next call hit the validator fresh rather than
+    /// seeing the previous test's cached result or its consumed
+    /// pending allowance.
     /// </summary>
-    internal static void ClearValidatorCacheForTesting() => _validators.Clear();
+    internal static void ClearValidatorCacheForTesting()
+    {
+        _validators.Clear();
+        _pendingConsumed.Clear();
+    }
 }

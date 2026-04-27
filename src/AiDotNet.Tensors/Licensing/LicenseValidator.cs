@@ -196,7 +196,20 @@ public sealed class LicenseValidator
             return false;
         for (int i = 0; i < parts[1].Length; i++)
             if (!char.IsLetterOrDigit(parts[1][i])) return false;
-        // Signature is base64url — accept '+', '/', '-', '_', '=' too.
+        // Signature is base64url — letters, digits, plus the URL-safe
+        // sigil set ('-', '_') and the legacy non-URL-safe ('+', '/')
+        // pair, plus any '=' padding chars at the end. Reject anything
+        // outside that set so a malformed key fails offline rather than
+        // round-tripping to the server.
+        for (int i = 0; i < parts[2].Length; i++)
+        {
+            char c = parts[2][i];
+            bool ok = char.IsLetterOrDigit(c)
+                   || c == '-' || c == '_'
+                   || c == '+' || c == '/'
+                   || c == '=';
+            if (!ok) return false;
+        }
         return true;
     }
 

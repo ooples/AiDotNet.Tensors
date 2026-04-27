@@ -210,6 +210,72 @@ public class PersistenceGuardTests
     }
 
     [Fact]
+    public void TrialCounter_ConcurrentCallsDontLoseIncrements()
+    {
+        // Without a lock, a read-check-increment-write race can let
+        // N concurrent calls all read the same baseline and write
+        // back baseline+1, losing N-1 increments. Hammer the guard
+        // from 16 threads doing 4 ops each — the on-disk counter
+        // must end up at exactly 64.
+        using var trial = IsolatedTrial(out var path);
+
+        // Total ops must stay under TrialState.DefaultMaxOperations
+        // (50) — the test asserts the counter is exact, but if the
+        // total exceeds the cap the guard throws midway.
+        const int threads = 12;
+        const int opsPerThread = 4;
+        var barrier = new System.Threading.Barrier(threads);
+        var tasks = new System.Threading.Tasks.Task[threads];
+        for (int t = 0; t < threads; t++)
+        {
+            tasks[t] = System.Threading.Tasks.Task.Run(() =>
+            {
+                barrier.SignalAndWait();
+                for (int i = 0; i < opsPerThread; i++)
+                    PersistenceGuard.EnforceBeforeLoad();
+            });
+        }
+        System.Threading.Tasks.Task.WaitAll(tasks);
+
+        var state = TrialState.Load(path);
+        Assert.Equal(threads * opsPerThread, state.OperationsConsumed);
+    }
+
+    [Fact]
+    public void ValidationPending_FirstCall_Allowed_SubsequentCalls_Throw()
+    {
+        // The validator caches a ValidationPending result for the full
+        // offline-grace window. Without a per-key cap the guard would
+        // accept every pending call → unlimited operations on a key
+        // that never validated. The cap allows ONE pending call per
+        // key, then rejects.
+        PersistenceGuard.ClearValidatorCacheForTesting();
+        // Use a syntactically-valid key whose server URL is unreachable
+        // → the validator's online attempt fails with no cache → first
+        // result is ValidationPending.
+        var unreachableKey = new AiDotNetTensorsLicenseKey("aidn.test123.signaturePARTabc")
+        {
+            // Pointing at a dead host forces the network attempt to
+            // fail, which flows into the ValidationPending branch.
+            ServerUrl = "https://0.0.0.0:1/never-resolves",
+            OfflineGracePeriod = TimeSpan.FromMinutes(5),
+        };
+
+        using (PersistenceGuard.SetActiveLicenseKey(unreachableKey))
+        {
+            // First call: pending allowance consumed, no throw.
+            PersistenceGuard.EnforceBeforeLoad();
+
+            // Second call within the grace window: cached pending
+            // returns again, but the per-key cap rejects it.
+            var ex = Assert.Throws<LicenseRequiredException>(
+                () => PersistenceGuard.EnforceBeforeLoad());
+            Assert.Equal(LicenseKeyStatus.ValidationPending, ex.KeyStatus);
+        }
+        PersistenceGuard.ClearValidatorCacheForTesting();
+    }
+
+    [Fact]
     public void Capabilities_TensorsLoad_AcceptedBy_HasCapability()
     {
         // Direct test of the capability convention — server returns
