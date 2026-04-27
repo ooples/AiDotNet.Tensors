@@ -2905,6 +2905,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original references for tape recording (#257) — the
+        // .Contiguous() rebind below would otherwise replace a user's
+        // GradFn-bearing strided view with a fresh tensor, breaking the
+        // topo-walk back to upstream parameters. Math kernels still consume
+        // the contiguous copies for performance.
+        var aOrig = a;
+        var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -2925,14 +2932,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 int off = t * bTileSize;
                 numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
-            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, a, b, BackwardFunctions<T>.BroadcastAddBackward);
+            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
             { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb)); }
             return res;
         }
 
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
         var result = a.BroadcastAdd(b);
-        DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, a, b, BackwardFunctions<T>.BroadcastAddBackward);
+        DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorBroadcastAdd(ca, cb)); }
         return result;
     }
@@ -2961,6 +2968,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original references for tape recording (#257) — see
+        // TensorBroadcastAdd for the rationale.
+        var aOrig = a;
+        var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -2981,14 +2992,14 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int c = 0; c < cols; c++)
                         rf[off + c] = af[off + c] - bf[c];
                 }
-                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, a, b, BackwardFunctions<T>.BroadcastSubtractBackward);
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
                 return res;
             }
         }
 
         var result = a.BroadcastSubtract(b);
-        DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, a, b, BackwardFunctions<T>.BroadcastSubtractBackward);
+        DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", result, eng => eng.TensorBroadcastSubtract(ca, cb)); }
         return result;
     }
@@ -3016,11 +3027,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original references for tape recording (#257).
+        var aOrig = a;
+        var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
         var result = a.BroadcastDivide(b);
-        DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, a, b, BackwardFunctions<T>.BroadcastDivideBackward);
+        DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorBroadcastDivide(ca, cb)); }
         return result;
     }
@@ -3053,6 +3067,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original references for tape recording (#257).
+        var aOrig = a;
+        var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -3081,13 +3098,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 int off = t * bTileSize;
                 numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
-            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
             { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
             return res;
         }
 
         var result = a.BroadcastMultiply(b);
-        DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+        DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorBroadcastMultiply(ca, cb)); }
         return result;
     }
@@ -9780,6 +9797,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        // Preserve original input ref for tape recording (#257) — see TensorMatMul.
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4) throw new ArgumentException($"Conv2D requires 4D input tensor. Got rank {input.Rank}.", nameof(input));
         if (kernel.Rank != 4) throw new ArgumentException($"Conv2D requires 4D kernel tensor. Got rank {kernel.Rank}.", nameof(kernel));
@@ -9878,7 +9897,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW);
             result.Layout = LinearAlgebra.TensorLayout.Nchwc16;
-            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
             AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
@@ -9909,7 +9928,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW);
             result.Layout = LinearAlgebra.TensorLayout.Nchwc8;
-            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
             AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
@@ -9990,7 +10009,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+        DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
             new object[] { stride, padding, dilation });
         AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
@@ -15442,6 +15461,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original input ref for tape recording (#257) — Contiguous()
+        // returns a fresh tensor with no GradFn, breaking the chain back to the
+        // upstream parameter when input is a strided view (e.g. from Permute).
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15456,7 +15479,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var result4D = BatchNorm4D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
             var r4 = was1D ? result4D.Reshape([result4D._shape[1]]) : result4D;
-            DifferentiableOps.RecordIfActive("BatchNorm", r4, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            DifferentiableOps.RecordIfActive("BatchNorm", r4, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
             AutoTracer.RecordOp("BatchNorm", r4, eng => r4);
             return r4;
         }
@@ -15465,7 +15488,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var result3D = BatchNorm3D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
             var r3 = was1D ? result3D.Reshape([result3D.Length]) : result3D;
-            DifferentiableOps.RecordIfActive("BatchNorm", r3, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            DifferentiableOps.RecordIfActive("BatchNorm", r3, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
             return r3;
         }
 
@@ -15522,7 +15545,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Return with original shape (restore 1D if input was 1D)
         var result = TensorAllocator.Rent<T>(workingInput._shape, new Vector<T>(outputData));
         var bnResult = was1D ? result.Reshape([features]) : result;
-        DifferentiableOps.RecordIfActive("BatchNorm", bnResult, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+        DifferentiableOps.RecordIfActive("BatchNorm", bnResult, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
         return bnResult;
     }
 
@@ -16923,6 +16946,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original input ref for tape recording (#257).
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
         if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
 
@@ -16971,7 +16996,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 variance = TensorAllocator.Rent<T>(new[] { batch, numGroups },
                     new Vector<T>((T[])(object)varArr));
             }
-            DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { input, gamma, beta },
+            DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { inputOrig, gamma, beta },
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
             AutoTracer.RecordOp("GroupNorm", result, eng => result);
             return result;
@@ -17040,7 +17065,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(meanData));
         variance = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(varData));
-        DifferentiableOps.RecordIfActive("GroupNorm", output, new[] { input, gamma, beta },
+        DifferentiableOps.RecordIfActive("GroupNorm", output, new[] { inputOrig, gamma, beta },
             BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
         return output;
     }
@@ -17371,6 +17396,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original input ref for tape recording (#257).
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -17427,7 +17454,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         rms = TensorAllocator.Rent<T>(batchShape, new Vector<T>(rmsData));
         var rmsResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
-        DifferentiableOps.RecordIfActive("RMSNorm", rmsResult, new[] { input, gamma },
+        DifferentiableOps.RecordIfActive("RMSNorm", rmsResult, new[] { inputOrig, gamma },
             BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
         AutoTracer.RecordOp("RMSNorm", rmsResult, eng => rmsResult);
         return rmsResult;
@@ -17608,6 +17635,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (value == null)
             throw new ArgumentNullException(nameof(value));
 
+        // Preserve original Q/K/V refs for tape recording (#257). The
+        // .Contiguous() rebinds below would otherwise replace the strided
+        // views (typical post-Permute / post-Reshape) with fresh tensors
+        // that have no GradFn — backward could no longer chain back to
+        // the upstream parameters.
+        var queryOrig = query;
+        var keyOrig = key;
+        var valueOrig = value;
         // Stride-aware: attention QKV often come from reshape+transpose views
         if (!value.IsContiguous) value = value.Contiguous();
         if (!query.IsContiguous) query = query.Contiguous();
@@ -17661,7 +17696,7 @@ public partial class CpuEngine : ITensorLevelEngine
             attentionWeights = (Tensor<T>)(object)weightsF;
             var resultFCast = (Tensor<T>)(object)resultF;
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultFCast,
-                new[] { query, key, value },
+                new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
                 new object[] { attentionWeights, scaleVal });
             return resultFCast;
@@ -17687,7 +17722,7 @@ public partial class CpuEngine : ITensorLevelEngine
             attentionWeights = (Tensor<T>)(object)weightsD;
             var resultDCast = (Tensor<T>)(object)resultD;
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultDCast,
-                new[] { query, key, value },
+                new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
                 new object[] { attentionWeights, scaleVal });
             return resultDCast;
@@ -17796,7 +17831,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
         DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultGen,
-            new[] { query, key, value },
+            new[] { queryOrig, keyOrig, valueOrig },
             BackwardFunctions<T>.ScaledDotProductAttentionBackward,
             new object[] { attentionWeights, scaleVal });
         return resultGen;

@@ -241,6 +241,70 @@ public class Issue257TapeRefIdentityTests
     /// the parent #257 reproducer uses (NeuralNetworkBase.TrainWithTape
     /// calls allGrads = tape.ComputeGradients(lossTensor, sources: null)).
     /// </summary>
+    /// <summary>
+    /// Structural canary covering broadcast/normalization ops downstream of
+    /// a Permute (where they previously lost the chain via .Contiguous()
+    /// rebind). Each op in turn: input → Permute → op(input, weight) →
+    /// loss; weight must show up in grads.
+    /// </summary>
+    [Theory]
+    [InlineData("BroadcastAdd")]
+    [InlineData("BroadcastSubtract")]
+    [InlineData("BroadcastMultiply")]
+    [InlineData("BroadcastDivide")]
+    public void BroadcastOps_AfterPermute_RouteGradToWeight(string opName)
+    {
+        const int B = 2, S = 4, D = 8;
+        var x = new Tensor<float>([B, S, D]);
+        var w = new Tensor<float>([D]);
+        var rng = new Random(31);
+        for (int i = 0; i < x.Length; i++) x.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < w.Length; i++) w.AsWritableSpan()[i] = 0.5f + (float)rng.NextDouble();
+
+        using var tape = new GradientTape<float>();
+        // Permute then back so x becomes a strided view (non-contiguous).
+        var xP = _engine.TensorPermute(x, new[] { 1, 0, 2 });   // [S, B, D]
+        Tensor<float> y = opName switch
+        {
+            "BroadcastAdd"      => _engine.TensorBroadcastAdd(xP, w),
+            "BroadcastSubtract" => _engine.TensorBroadcastSubtract(xP, w),
+            "BroadcastMultiply" => _engine.TensorBroadcastMultiply(xP, w),
+            "BroadcastDivide"   => _engine.TensorBroadcastDivide(xP, w),
+            _ => throw new ArgumentException(opName)
+        };
+        var loss = _engine.ReduceSum(y, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x, w });
+
+        Assert.True(grads.ContainsKey(x), $"x grad missing for {opName} (post-Permute strided input).");
+        Assert.True(grads.ContainsKey(w), $"w grad missing for {opName}.");
+    }
+
+    /// <summary>
+    /// Conv2D after a Permute that produces a non-contiguous input — same
+    /// .Contiguous()-rebind defect as MatMul. Gradient must flow back to
+    /// the upstream parameter that produced the permuted tensor.
+    /// </summary>
+    [Fact]
+    public void Conv2D_AfterPermute_RoutesGradToInput()
+    {
+        // [N, C, H, W] = [1, 4, 8, 8]; permute to [N, H, W, C], back to [N, C, H, W].
+        var input = new Tensor<float>([1, 4, 8, 8]);
+        var kernel = new Tensor<float>([4, 4, 3, 3]);
+        var rng = new Random(41);
+        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < kernel.Length; i++) kernel.AsWritableSpan()[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var tape = new GradientTape<float>();
+        var xPerm = _engine.TensorPermute(input, new[] { 0, 2, 3, 1 });   // [N, H, W, C]
+        var xBack = _engine.TensorPermute(xPerm, new[] { 0, 3, 1, 2 });   // [N, C, H, W] strided
+        var y = _engine.Conv2D(xBack, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+        var loss = _engine.ReduceSum(y, null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { input, kernel });
+
+        Assert.True(grads.ContainsKey(input), "Conv2D dropped input gradient — same defect as #257 in TensorMatMul.");
+        Assert.True(grads.ContainsKey(kernel));
+    }
+
     [Fact]
     public void FullMHAFlow_NullSources_AllParamsAppearInDictByReference()
     {
