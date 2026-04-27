@@ -2366,6 +2366,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve original references for tape recording (#257). The
+        // .Contiguous() rebind below would otherwise replace the user's
+        // GradFn-bearing view with a fresh tensor, breaking the topo-walk
+        // chain back to the upstream parameter — same defect as the
+        // TensorMatMul fix above.
+        var aOrig = a;
+        var bOrig = b;
         // For ND (N>=3) batch matmul, materialize non-contiguous views.
         // 2D stride-aware GEMM is handled below with transA/transB flags.
         if (a.Rank >= 3 && !a.IsContiguous) a = a.Contiguous();
@@ -2455,7 +2462,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var cFloat = new Span<float>((float[])(object)rArr);
 
                 Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
-                DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
+                DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
             }
@@ -2465,7 +2472,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
                 {
-                    DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
+                    DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
                     { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                     return result;
                 }
@@ -2493,7 +2500,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     rDataArr[i * n + j] = sum;
                 }
             });
-            DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+            DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
                 BackwardFunctions<T>.BatchMatMulBackward);
             { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
             return result;
@@ -2583,7 +2590,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         batchDone:
 
-        DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+        DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
@@ -9307,8 +9314,14 @@ public partial class CpuEngine : ITensorLevelEngine
           var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorMatMul", matMulOutShape);
           if (autoCompiled is not null) return autoCompiled.Execute(); }
 
-        // Materialize non-contiguous views so downstream paths can use .Data safely.
-        // BatchMatMul already does this for rank >= 3; TensorMatMul2D did not.
+        // Preserve the caller's original tensor references for tape recording.
+        // Permute returns a strided view; the .Contiguous() rebind below would
+        // otherwise replace the user's GradFn-bearing reference with a fresh
+        // tensor that has no GradFn — breaking the topo-walk chain back to the
+        // upstream parameter (#257). Math kernels still consume the contiguous
+        // copies; only the recorded inputs change.
+        var aOrig = a;
+        var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -9337,7 +9350,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Unsupported TensorMatMul combination: ranks {a.Rank} and {b.Rank}. Supported: 2Dx2D, NDx2D, NDxND (same rank).");
         }
 
-        DifferentiableOps.RecordBinary("TensorMatMul", result, a, b, BackwardFunctions<T>.MatMulBackward);
+        DifferentiableOps.RecordBinary("TensorMatMul", result, aOrig, bOrig, BackwardFunctions<T>.MatMulBackward);
 
         // Auto-tracer: record this op for future compilation
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMatMul", result, eng => eng.TensorMatMul(ca, cb)); }
@@ -25451,16 +25464,22 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
+        // Preserve the caller's references for tape recording (#257) — see
+        // TensorMatMul note. .Contiguous() returns a fresh tensor without the
+        // user's GradFn chain, breaking topo walk back to the parameter.
+        var aOrig = a;
+        var bOrig = b;
         // Stride-aware: only materialize views that aren't simple transposes
         // Simple transposes can be handled by GEMM transA/transB flags (zero-copy)
         if (!a.IsContiguous && !a.IsSimpleTranspose) a = a.Contiguous();
         if (!b.IsContiguous && !b.IsSimpleTranspose) b = b.Contiguous();
 
-        // If both tensors are 3D, delegate to BatchMatMul
+        // If both tensors are 3D, delegate to BatchMatMul (which records under
+        // its own name). Pass the originals so its tape recording also keys
+        // against the caller's references rather than the contiguous copies.
         if (a.Rank == 3 && b.Rank == 3)
         {
-            // Delegate to BatchMatMul which already records to the tape — do NOT record again
-            return BatchMatMul(a, b);
+            return BatchMatMul(aOrig, bOrig);
         }
 
         // Handle broadcasting case where b is 2D [K, N]
@@ -25510,7 +25529,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+        DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
