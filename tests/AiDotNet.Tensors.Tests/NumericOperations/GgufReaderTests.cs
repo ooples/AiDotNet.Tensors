@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text;
+using AiDotNet.Tensors.Licensing;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
 
@@ -8,12 +9,40 @@ namespace AiDotNet.Tensors.Tests.NumericOperations;
 /// <summary>
 /// Tests for issue #207 B1 — <see cref="GgufReader"/>. Builds synthetic
 /// GGUF v3 byte streams and verifies structural + metadata parsing.
+///
+/// <para>Each test uses an isolated trial file so the global
+/// <c>~/.aidotnet/tensors-trial.json</c> counter cannot be exhausted by
+/// prior runs. Without this, repeated CI invocations on the same machine
+/// burn through the 50-operation free-trial budget and every GGUF read
+/// throws <see cref="LicenseRequiredException"/> regardless of test
+/// validity. PersistenceGuardTests uses the same pattern.</para>
 /// </summary>
+[Collection("PersistenceGuard")]
 public class GgufReaderTests
 {
+    private static IDisposable IsolatedTrial()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "aidotnet-test-trial-" + Guid.NewGuid().ToString("N") + ".json");
+        var override_ = PersistenceGuard.SetTestTrialFilePathOverride(path);
+        return new TrialPathCleanup(override_, path);
+    }
+
+    private sealed class TrialPathCleanup : IDisposable
+    {
+        private readonly IDisposable _scope;
+        private readonly string _path;
+        public TrialPathCleanup(IDisposable scope, string path) { _scope = scope; _path = path; }
+        public void Dispose()
+        {
+            _scope.Dispose();
+            try { if (File.Exists(_path)) File.Delete(_path); } catch { }
+        }
+    }
+
     [Fact]
     public void Read_BadMagic_Throws()
     {
+        using var trial = IsolatedTrial();
         var bytes = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0 };
         Assert.Throws<InvalidDataException>(() => GgufReader.Read(new MemoryStream(bytes)));
     }
@@ -21,6 +50,7 @@ public class GgufReaderTests
     [Fact]
     public void Read_UnsupportedVersion_Throws()
     {
+        using var trial = IsolatedTrial();
         var ms = new MemoryStream();
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
@@ -36,6 +66,7 @@ public class GgufReaderTests
     [Fact]
     public void Read_HeaderOnly_ParsesCountsCorrectly()
     {
+        using var trial = IsolatedTrial();
         var ms = BuildMinimalGguf(
             version: 3,
             tensors: Array.Empty<(string, GgufType, long[])>(),
@@ -49,6 +80,7 @@ public class GgufReaderTests
     [Fact]
     public void Read_SingleTensor_CapturesNameTypeShape()
     {
+        using var trial = IsolatedTrial();
         var ms = BuildMinimalGguf(
             version: 3,
             tensors: new[] { ("weights.0", GgufType.Q4_0, new long[] { 32, 128 }) },
@@ -64,6 +96,7 @@ public class GgufReaderTests
     [Fact]
     public void Read_Metadata_TypedValuesDecoded()
     {
+        using var trial = IsolatedTrial();
         var meta = new Dictionary<string, object>
         {
             ["general.architecture"] = "llama",
@@ -84,6 +117,7 @@ public class GgufReaderTests
     [Fact]
     public void Read_NullStream_Throws()
     {
+        using var trial = IsolatedTrial();
         Assert.Throws<ArgumentNullException>(() => GgufReader.Read(null!));
     }
 

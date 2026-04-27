@@ -2773,6 +2773,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Stride-aware: in-place requires contiguous target; materialize source if needed
         if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -2794,7 +2795,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryAdd(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
+                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
                     return;
                 }
             }
@@ -2804,7 +2805,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
-                if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
+                if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
                 return;
             }
 
@@ -2829,14 +2830,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
+            DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
     }
 
     /// <summary>
@@ -2850,7 +2851,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
@@ -3186,7 +3189,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3258,8 +3263,11 @@ public partial class CpuEngine : ITensorLevelEngine
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var gammaOrig = gamma;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        var betaOrig = beta;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!beta.IsContiguous) beta = beta.Contiguous();
         // GroupNorm writes normalized values into pre-allocated output.
         // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
@@ -3272,8 +3280,11 @@ public partial class CpuEngine : ITensorLevelEngine
     public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var gammaOrig = gamma;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        var betaOrig = beta;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!beta.IsContiguous) beta = beta.Contiguous();
         // Step 1: GroupNorm into output (single computation)
         GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
@@ -3287,9 +3298,13 @@ public partial class CpuEngine : ITensorLevelEngine
     public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
+        var gammaOrig = gamma;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        var betaOrig = beta;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!beta.IsContiguous) beta = beta.Contiguous();
         // output = GroupNorm(a + b)
         // Step 1: Add a + b directly into output (zero alloc)
@@ -3302,6 +3317,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void SwishInPlace<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
@@ -3312,6 +3328,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3336,6 +3353,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInPlace<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
@@ -3347,6 +3365,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (destination.Length < input.Length)
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
@@ -3368,6 +3387,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TanhInPlace<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
@@ -3377,6 +3397,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (destination.Length < input.Length)
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
@@ -3400,6 +3421,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInPlace<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
@@ -3409,6 +3431,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void MishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3426,6 +3449,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
@@ -3437,6 +3461,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (destination.Length < input.Length)
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
@@ -3462,7 +3487,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -3512,6 +3539,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (axes == null || axes.Length == 0 ||
             (input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0))
@@ -3565,6 +3593,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         int rank = input.Rank;
@@ -3602,6 +3631,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var result = TensorLogSoftmax(input, axis);
         try
@@ -3621,7 +3651,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -3646,7 +3678,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -3671,6 +3705,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3689,6 +3724,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3707,6 +3743,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3725,6 +3762,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3743,6 +3781,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorSinInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -3766,6 +3805,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void TensorCosInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -4046,6 +4086,7 @@ public partial class CpuEngine : ITensorLevelEngine
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -4068,7 +4109,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
+                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
                     return;
                 }
             }
@@ -4077,7 +4118,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
-                if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
+                if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
                 return;
             }
 
@@ -4101,14 +4142,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
+            DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
     }
 
     /// <summary>
@@ -4122,7 +4163,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
@@ -4172,6 +4215,7 @@ public partial class CpuEngine : ITensorLevelEngine
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -4189,7 +4233,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
-                if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
+                if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
                 return;
             }
 
@@ -4213,14 +4257,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
             }
-            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
+            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedASub is not null)
-            DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
+            DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
     }
 
     /// <summary>
@@ -4310,6 +4354,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         if (destination.Length < a.Length)
             throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
@@ -4562,6 +4607,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4580,7 +4626,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
@@ -4604,6 +4652,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4622,7 +4671,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
@@ -4647,7 +4698,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
@@ -4671,6 +4724,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4689,7 +4743,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
@@ -4713,6 +4769,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorLessThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4754,6 +4811,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorLog", tensor._shape);
         if (autoCompiled is not null) return autoCompiled.Execute();
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4775,7 +4833,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("TensorLog", result, tensor, BackwardFunctions<T>.LogBackward);
+        DifferentiableOps.RecordUnary("TensorLog", result, tensorOrig, BackwardFunctions<T>.LogBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorLog", result, eng => eng.TensorLog(c)); }
         return result;
     }
@@ -4805,6 +4863,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorExp", tensor._shape);
         if (autoCompiled is not null) return autoCompiled.Execute();
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4838,7 +4897,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("TensorExp", result, tensor, BackwardFunctions<T>.ExpBackward);
+        DifferentiableOps.RecordUnary("TensorExp", result, tensorOrig, BackwardFunctions<T>.ExpBackward);
 
         // Auto-tracer: record this op for future compilation
         { var c = tensor; AutoTracer.RecordOp("TensorExp", result, eng => eng.TensorExp(c)); }
@@ -4869,6 +4928,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4890,7 +4950,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("TensorSqrt", result, tensor, BackwardFunctions<T>.SqrtBackward);
+        DifferentiableOps.RecordUnary("TensorSqrt", result, tensorOrig, BackwardFunctions<T>.SqrtBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorSqrt", result, eng => eng.TensorSqrt(c)); }
         return result;
     }
@@ -4918,6 +4978,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4939,7 +5000,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("TensorAbs", result, tensor, BackwardFunctions<T>.AbsBackward);
+        DifferentiableOps.RecordUnary("TensorAbs", result, tensorOrig, BackwardFunctions<T>.AbsBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorAbs", result, eng => eng.TensorAbs(c)); }
         return result;
     }
@@ -4965,13 +5026,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorNegate", tensor._shape);
         if (autoCompiled is not null) return autoCompiled.Execute();
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
-        DifferentiableOps.RecordUnary("TensorNegate", result, tensor, BackwardFunctions<T>.NegateBackward);
+        DifferentiableOps.RecordUnary("TensorNegate", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorNegate", result, eng => eng.TensorNegate(c)); }
         return result;
     }
@@ -4980,6 +5042,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Copy data to a new tensor with no tape connection.
@@ -5008,6 +5071,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5026,7 +5090,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
                 if (exponent is not null)
-                    DifferentiableOps.RecordUnary("TensorPower", result, tensor, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                    DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
                 { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
                 return result;
             }
@@ -5039,7 +5103,7 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.Power(src[i], exponent);
 
         if (exponent is not null)
-            DifferentiableOps.RecordUnary("TensorPower", result, tensor, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+            DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
         { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
         return result;
     }
@@ -5051,7 +5115,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PowerTensorBackward); } }
 
+        var basesOrig = bases;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!bases.IsContiguous) bases = bases.Contiguous();
+        var exponentsOrig = exponents;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!exponents.IsContiguous) exponents = exponents.Contiguous();
         if (!bases._shape.SequenceEqual(exponents._shape))
             throw new ArgumentException("Tensors must have the same shape for element-wise power.");
@@ -5065,7 +5131,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < srcB.Length; i++)
             dest[i] = numOps.Power(srcB[i], srcE[i]);
 
-        DifferentiableOps.RecordBinary("TensorPowerTensor", result, bases, exponents,
+        DifferentiableOps.RecordBinary("TensorPowerTensor", result, basesOrig, exponentsOrig,
             BackwardFunctions<T>.PowerTensorBackward);
         return result;
     }
@@ -5077,6 +5143,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Floor", tensor._shape); if (ac is not null) return ac.Execute(); }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -5100,7 +5167,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = numOps.Floor(src[i]);
         }
 
-        DifferentiableOps.RecordUnary("Floor", result, tensor,
+        DifferentiableOps.RecordUnary("Floor", result, tensorOrig,
             BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Floor", result, eng => eng.TensorFloor(c)); }
         return result;
@@ -5148,6 +5215,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Round", tensor._shape); if (ac is not null) return ac.Execute(); }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
@@ -5169,7 +5237,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
         }
-        DifferentiableOps.RecordUnary("Round", result, tensor,
+        DifferentiableOps.RecordUnary("Round", result, tensorOrig,
             BackwardFunctions<T>.StraightThroughBackward);
         { var c = tensor; AutoTracer.RecordOp("Round", result, eng => eng.TensorRound(c)); }
         return result;
@@ -5182,6 +5250,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FracBackward); } }
 
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5192,7 +5261,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Frac(src[i]);
 
-        DifferentiableOps.RecordUnary("TensorFrac", result, tensor, BackwardFunctions<T>.FracBackward);
+        DifferentiableOps.RecordUnary("TensorFrac", result, tensorOrig, BackwardFunctions<T>.FracBackward);
         { var ct = tensor; AutoTracer.RecordOp("TensorFrac", result, eng => eng.TensorFrac(ct)); }
         return result;
     }
@@ -5220,6 +5289,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -5245,7 +5315,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("Sin", result, tensor,
+        DifferentiableOps.RecordUnary("Sin", result, tensorOrig,
             BackwardFunctions<T>.SinBackward);
         { var c = tensor; AutoTracer.RecordOp("Sin", result, eng => ((CpuEngine)eng).TensorSin(c)); }
         return result;
@@ -5274,6 +5344,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -5299,7 +5370,7 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        DifferentiableOps.RecordUnary("Cos", result, tensor,
+        DifferentiableOps.RecordUnary("Cos", result, tensorOrig,
             BackwardFunctions<T>.CosBackward);
         { var c = tensor; AutoTracer.RecordOp("Cos", result, eng => ((CpuEngine)eng).TensorCos(c)); }
         return result;
@@ -5513,6 +5584,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5524,7 +5596,7 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.Power(src[i], exponent);
 
         object boxedExponent = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
-        DifferentiableOps.RecordUnary("TensorPow", result, tensor, BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExponent });
+        DifferentiableOps.RecordUnary("TensorPow", result, tensorOrig, BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExponent });
         AutoTracer.RecordOp("TensorPow", result, eng => result);
         return result;
     }
@@ -5550,7 +5622,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
@@ -5580,7 +5654,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = numOps.GreaterThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
 
-        DifferentiableOps.RecordBinary("TensorMax", result, a, b, BackwardFunctions<T>.MaxBackward);
+        DifferentiableOps.RecordBinary("TensorMax", result, aOrig, bOrig, BackwardFunctions<T>.MaxBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMax", result, eng => eng.TensorMax(ca, cb)); }
         return result;
     }
@@ -5589,6 +5663,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorMax<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5626,7 +5701,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
@@ -5651,7 +5728,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = numOps.LessThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
 
-        DifferentiableOps.RecordBinary("TensorMin", result, a, b, BackwardFunctions<T>.MinBackward);
+        DifferentiableOps.RecordBinary("TensorMin", result, aOrig, bOrig, BackwardFunctions<T>.MinBackward);
         AutoTracer.RecordOp("TensorMin", result, eng => result);
         return result;
     }
@@ -5660,6 +5737,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorMin<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5698,6 +5776,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5729,7 +5808,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Clamp", result, tensor,
+        DifferentiableOps.RecordUnary("Clamp", result, tensorOrig,
             BackwardFunctions<T>.ClampBackward,
             savedState: new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
         AutoTracer.RecordOp("Clamp", result, eng => result);
@@ -5896,6 +5975,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // For multi-axis or full reductions, materialize if needed
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Full reduction - sum all elements
@@ -5918,7 +5998,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
             }
-            DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+            DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                 new object[] { allAxes, keepDims });
             return fullResult;
         }
@@ -5946,7 +6026,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int c = 0; c < cols; c++)
                         rArr[c] += srcArr[offset + c];
                 }
-                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
             }
@@ -5964,7 +6044,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         sum += srcArr[offset + c];
                     rArr[r] = sum;
                 }
-                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
             }
@@ -6001,7 +6081,7 @@ public partial class CpuEngine : ITensorLevelEngine
             reduceSumResult = summed;
         }
 
-        DifferentiableOps.RecordUnary("ReduceSum", reduceSumResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+        DifferentiableOps.RecordUnary("ReduceSum", reduceSumResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
             new object[] { normalizedAxes.ToArray(), keepDims });
         return reduceSumResult;
     }
@@ -6032,6 +6112,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe T TensorMinValue<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
 
@@ -6424,6 +6505,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4)
         {
@@ -6495,7 +6577,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tape is not null)
         {
             var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
-            DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, input, BackwardFunctions<T>.MaxPool2DBackward,
+            DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, inputOrig, BackwardFunctions<T>.MaxPool2DBackward,
                 new object[] { maxIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
             AutoTracer.RecordOp("MaxPool2D", resultWithIdx, eng => resultWithIdx);
             return resultWithIdx;
@@ -6578,6 +6660,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (stride == 0) stride = poolSize;
 
@@ -6655,6 +6738,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (stride == 0) stride = poolSize;
 
@@ -6778,6 +6862,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("AvgPool2D", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4)
         {
@@ -6871,7 +6956,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Parallel.For(0, bc, poolKernel);
             else
                 for (int idx = 0; idx < bc; idx++) poolKernel(idx);
-            DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
+            DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
                 new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             AutoTracer.RecordOp("AvgPool2D", result, eng => result);
             return result;
@@ -6913,7 +6998,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
+        DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
             new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
         AutoTracer.RecordOp("AvgPool2D", result, eng => result);
         return result;
@@ -6993,6 +7078,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4)
         {
@@ -7071,7 +7157,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
-            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
@@ -7088,7 +7174,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
-            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
@@ -7101,7 +7187,7 @@ public partial class CpuEngine : ITensorLevelEngine
             stride, padding, dilation,
             outputHeight, outputWidth);
 
-        DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+        DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
             BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
         AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
@@ -7947,6 +8033,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         Tensor<T>? savedInput = null;
@@ -7967,7 +8054,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     if (OneDnnProvider.TrySigmoid(ptr, tensor.Length))
                     {
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
+                        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
                         return;
                     }
                 }
@@ -7975,13 +8062,14 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         SigmoidParallel(tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
     public virtual void SigmoidInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         Tensor<T>? savedInput = null;
@@ -7992,7 +8080,7 @@ public partial class CpuEngine : ITensorLevelEngine
         tensor.IncrementVersion();
 
         SigmoidParallel(tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #endif
 
@@ -8089,6 +8177,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (!ShapesMatch(destination._shape, input._shape))
         {
@@ -8214,6 +8303,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         Tensor<T>? savedInput = null;
@@ -8234,7 +8324,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     if (OneDnnProvider.TryReLU(ptr, tensor.Length))
                     {
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
+                        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
                         return;
                     }
                 }
@@ -8242,13 +8332,14 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         ReLUParallel(tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
     public virtual void ReLUInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         Tensor<T>? savedInput = null;
@@ -8259,7 +8350,7 @@ public partial class CpuEngine : ITensorLevelEngine
         tensor.IncrementVersion();
 
         ReLUParallel(tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #endif
 
@@ -8291,6 +8382,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (!ShapesMatch(destination._shape, input._shape))
         {
@@ -8624,6 +8716,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public unsafe void ELUInto<T>(Tensor<T> destination, Tensor<T> input, double alpha = 1.0)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
@@ -8814,6 +8907,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -8936,6 +9030,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -9066,6 +9161,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -9188,6 +9284,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -9403,7 +9500,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
     internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
     {
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         var aArr = a.GetDataArray();
@@ -10303,7 +10402,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, inChannels, height, width]", nameof(inputShape));
         if (gradOutput.Rank != 4) throw new ArgumentException($"Conv2DBackwardInput requires 4D gradOutput tensor. Got rank {gradOutput.Rank}.", nameof(gradOutput));
@@ -10437,7 +10538,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (kernelShape == null || kernelShape.Length != 4) throw new ArgumentException("kernelShape must be array of 4 elements [outChannels, inChannels, kernelHeight, kernelWidth]", nameof(kernelShape));
         if (gradOutput.Rank != 4) throw new ArgumentException($"Conv2DBackwardKernel requires 4D gradOutput tensor. Got rank {gradOutput.Rank}.", nameof(gradOutput));
@@ -11075,6 +11178,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -11144,6 +11248,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -11216,7 +11321,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input.Rank != 4) throw new ArgumentException($"ConvTranspose2D requires 4D input tensor. Got rank {input.Rank}.", nameof(input));
         if (kernel.Rank != 4) throw new ArgumentException($"ConvTranspose2D requires 4D kernel tensor. Got rank {kernel.Rank}.", nameof(kernel));
@@ -11422,7 +11529,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
-        DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, input, kernel,
+        DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, inputOrig, kernelOrig,
             BackwardFunctions<T>.ConvTranspose2DBackward,
             savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
         AutoTracer.RecordOp("ConvTranspose2D", convTransResult, eng => convTransResult);
@@ -12536,7 +12643,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var gridOrig = grid;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!grid.IsContiguous) grid = grid.Contiguous();
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, height, width, channels].", nameof(inputShape));
 
@@ -12609,8 +12718,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
+        var gridOrig = grid;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!grid.IsContiguous) grid = grid.Contiguous();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         // Validate tensor ranks for NHWC layout
@@ -13505,6 +13617,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool3D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (stride == 0) stride = poolSize;
         return AvgPool3D(input, [poolSize, poolSize, poolSize], [stride, stride, stride], [padding, padding, padding]);
@@ -13542,6 +13655,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
             }
         }
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
@@ -13640,7 +13754,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("AvgPool3D", result, input, BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
+        DifferentiableOps.RecordUnary("AvgPool3D", result, inputOrig, BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
         AutoTracer.RecordOp("AvgPool3D", result, eng => result);
         return result;
     }
@@ -13875,7 +13989,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input.Rank != 5) throw new ArgumentException($"ConvTranspose3D input requires 5D tensor [batch, in_channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (kernel.Rank != 5) throw new ArgumentException($"ConvTranspose3D kernel requires 5D tensor [in_channels, out_channels, kD, kH, kW]. Got rank {kernel.Rank}.", nameof(kernel));
@@ -13995,7 +14111,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
         var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
-        DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, input, kernel, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
+        DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, inputOrig, kernelOrig, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
         { var ca = input; var cb = kernel; var cs2 = stride; var cp2 = padding; var cop2 = outputPadding; AutoTracer.RecordOp("ConvTranspose3D", ct3dResult, eng => eng.ConvTranspose3D(ca, cb, cs2, cp2, cop2)); }
         return ct3dResult;
     }
@@ -14005,7 +14121,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements.", nameof(inputShape));
 
@@ -14116,7 +14234,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var weightsOrig = weights;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!weights.IsContiguous) weights = weights.Contiguous();
         if (input.Rank != 4) throw new ArgumentException($"LocallyConnectedConv2D input requires a 4D tensor [batch, in_channels, height, width]. Got rank {input.Rank}.");
         // weights shape: [output_height, output_width, out_channels, in_channels, kernel_height, kernel_width]
@@ -14215,7 +14335,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordBinary("LocallyConnectedConv2D", result, input, weights, BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { stride });
+        DifferentiableOps.RecordBinary("LocallyConnectedConv2D", result, inputOrig, weightsOrig, BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { stride });
         { var ca = input; var cb = weights; var cc = bias; var cs = stride; AutoTracer.RecordOp("LocallyConnectedConv2D", result, eng => eng.LocallyConnectedConv2D(ca, cb, cc, cs)); }
         return result;
     }
@@ -14290,6 +14410,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (weightsShape == null || weightsShape.Length != 6) throw new ArgumentException("weightsShape must be array of 6 elements", nameof(weightsShape));
         if (gradOutput.Rank != 4) throw new ArgumentException($"LocallyConnectedConv2DBackwardWeights gradOutput requires 4D tensor. Got rank {gradOutput.Rank}.");
@@ -14965,6 +15086,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (temperature <= 0)
@@ -15077,6 +15199,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15352,7 +15475,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -18951,8 +19076,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int bhCount = batch * heads;
         int d_v = headDim; // FlashAttention takes headDim for both Q/K and V
 
+        var queryOrig = query;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!query.IsContiguous) query = query.Contiguous();
+        var keyOrig = key;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!key.IsContiguous) key = key.Contiguous();
+        var valueOrig = value;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!value.IsContiguous) value = value.Contiguous();
 
         var qf = query.GetFlattenedData();
@@ -18962,6 +19090,7 @@ public partial class CpuEngine : ITensorLevelEngine
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
         {
+            var attentionBiasOrig = attentionBias;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
             if (!attentionBias.IsContiguous) attentionBias = attentionBias.Contiguous();
             biasData = attentionBias.GetDataArray();
             biasBroadcastBatch = attentionBias.Rank == 3;
@@ -20345,6 +20474,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -20572,6 +20702,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(indices));
         if (counts == null)
             throw new ArgumentNullException(nameof(counts));
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -21557,6 +21688,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // GradFn keys to the tensor the caller will look up gradients for.
         // The contiguous copy below is for the math kernels only.
         var originalInput = input;
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var inputData = input.GetFlattenedData();
@@ -21679,6 +21811,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -21701,7 +21834,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             mean = ReduceMean(input, axes, keepDims);
         }
-        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, input, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
+        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
         { var ci = input; var ca = axes; var ck = keepDims; var ce = epsilon; AutoTracer.RecordOp("ReduceLogVariance", logVarResult, eng => eng.ReduceLogVariance(ci, ca, ck, ce)); }
         return logVarResult;
     }
@@ -21717,7 +21850,9 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(mean));
         if (variance == null)
             throw new ArgumentNullException(nameof(variance));
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -22490,6 +22625,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Save original input for tape before potential Contiguous() replacement
         var originalUnfoldInput = input;
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -22583,6 +22719,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative.", nameof(padding));
 
         var originalFoldInput = input;
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -22884,6 +23021,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length < 2) throw new ArgumentException("PadInto expects at least 2D tensor");
@@ -22949,6 +23087,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length < 2)
@@ -22989,7 +23128,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var padResult = TensorAllocator.Rent<T>(newShape);
         PadInto(padResult, input, padTop, padBottom, padLeft, padRight, padValue);
-        DifferentiableOps.RecordUnary("Pad", padResult, input, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
+        DifferentiableOps.RecordUnary("Pad", padResult, inputOrig, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
         { var ci = input; var cpt = padTop; var cpb = padBottom; var cpl = padLeft; var cpr = padRight; var cpv = padValue; AutoTracer.RecordOp("Pad", padResult, eng => eng.Pad(ci, cpt, cpb, cpl, cpr, cpv)); }
         return padResult;
     }
@@ -23553,6 +23692,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (multiples == null) throw new ArgumentNullException(nameof(multiples));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (multiples.Length != tensor._shape.Length)
             throw new ArgumentException($"Multiples length ({multiples.Length}) must match tensor dimensions ({tensor._shape.Length})");
@@ -23620,7 +23760,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        DifferentiableOps.RecordUnary("Tile", result, tensor,
+        DifferentiableOps.RecordUnary("Tile", result, tensorOrig,
             BackwardFunctions<T>.TileBackward);
         AutoTracer.RecordOp("Tile", result, eng => result);
         return result;
@@ -23757,8 +23897,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
         if (y == null) throw new ArgumentNullException(nameof(y));
+        var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!y.IsContiguous) y = y.Contiguous();
+        var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
+        var conditionOrig = condition;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!condition.IsContiguous) condition = condition.Contiguous();
 
         // All tensors must have the same shape (or be broadcastable, but we'll require same shape for simplicity)
@@ -23790,6 +23933,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
+        var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!source.IsContiguous) source = source.Contiguous();
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (source.Length != destination.Length)
@@ -23812,6 +23956,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public void TensorFill<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         tensor.Fill(value);
     }
@@ -24067,6 +24212,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
         int normalizedAxis = axis < 0 ? source._shape.Length + axis : axis;
@@ -24110,7 +24256,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             });
 
-            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, normalizedAxis });
+            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indicesOrig, normalizedAxis });
             { var cs = source; var ci = indices; var ca = normalizedAxis; AutoTracer.RecordOp("TensorGather", result, eng => eng.TensorGather(cs, ci, ca)); }
             return result;
         }
@@ -24145,7 +24291,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             var result = TensorAllocator.Rent<T>(outShape, new Vector<T>(resultData));
-            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, normalizedAxis });
+            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indicesOrig, normalizedAxis });
             { var cs = source; var ci = indices; var ca = normalizedAxis; AutoTracer.RecordOp("TensorGather", result, eng => eng.TensorGather(cs, ci, ca)); }
             return result;
         }
@@ -24182,6 +24328,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
@@ -24204,7 +24351,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var src = (float[])(object)tensor.GetDataArray();
             var dst = (float[])(object)result.GetDataArray();
             Simd.ScanKernels.PrefixSumFloat(src, dst);
-            DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
             AutoTracer.RecordOp("TensorCumSum", result, eng => result);
             return result;
         }
@@ -24221,7 +24368,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new ReadOnlySpan<float>(src, start, axisSize),
                     new Span<float>(dst, start, axisSize));
             }
-            DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
             AutoTracer.RecordOp("TensorCumSum", result, eng => result);
             return result;
         }
@@ -24256,7 +24403,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+        DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
         AutoTracer.RecordOp("TensorCumSum", result, eng => result);
         return result;
     }
@@ -24473,6 +24620,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.NegateBackward); } }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -24483,7 +24631,7 @@ public partial class CpuEngine : ITensorLevelEngine
         numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
 
         // d(scalar - x)/dx = -1, so gradient is negated
-        DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensor, BackwardFunctions<T>.NegateBackward);
+        DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
         { var cs = scalar; var ct = tensor; AutoTracer.RecordOp("ScalarMinusTensor", result, eng => eng.ScalarMinusTensor(cs, ct)); }
         return result;
     }
@@ -24737,6 +24885,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TanhDerivative<T>(Tensor<T> tanhOutput)
     {
         if (tanhOutput == null) throw new ArgumentNullException(nameof(tanhOutput));
+        var tanhOutputOrig = tanhOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tanhOutput.IsContiguous) tanhOutput = tanhOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -24757,6 +24906,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> SigmoidDerivative<T>(Tensor<T> sigmoidOutput)
     {
         if (sigmoidOutput == null) throw new ArgumentNullException(nameof(sigmoidOutput));
+        var sigmoidOutputOrig = sigmoidOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!sigmoidOutput.IsContiguous) sigmoidOutput = sigmoidOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -24777,6 +24927,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> ReLUDerivative<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -24971,6 +25122,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         return TensorClamp(tensor, minValue, maxValue);
     }
@@ -25222,6 +25374,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<int> TensorArgMin<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -25288,7 +25441,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -25321,7 +25476,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(oneMinusT, log1MinusP)));
         }
 
-        DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictions, targets, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
+        DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictionsOrig, targetsOrig, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
         { var cp = predictions; var ct = targets; var ce = epsilon; AutoTracer.RecordOp("TensorBinaryCrossEntropy", result, eng => eng.TensorBinaryCrossEntropy(cp, ct, ce)); }
         return result;
     }
@@ -25331,7 +25486,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
+        var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -25428,6 +25585,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Save original for autodiff — Contiguous() creates a clone for non-contiguous views
         var originalTensor = tensor;
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var tensorData = tensor.GetDataArray();
 
@@ -25581,6 +25739,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
+        var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!source.IsContiguous) source = source.Contiguous();
 
         var dstData = destination.GetDataArray();
@@ -25621,6 +25780,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // Delegate to Softmax which has the same functionality
         return Softmax(tensor, axis);
@@ -25629,7 +25789,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> outputGradient, int axis)
     {
+        var softmaxOutputOrig = softmaxOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!softmaxOutput.IsContiguous) softmaxOutput = softmaxOutput.Contiguous();
+        var outputGradientOrig = outputGradient;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!outputGradient.IsContiguous) outputGradient = outputGradient.Contiguous();
         // Delegate to SoftmaxBackward with reordered parameters (grad first, then output)
         return SoftmaxBackward(outputGradient, softmaxOutput, axis);
@@ -26078,6 +26240,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = tensor.Clone();
@@ -26090,7 +26253,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
-        DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensor,
+        DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensorOrig,
             BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
         AutoTracer.RecordOp("TensorMaskedFill", result, eng => result);
         return result;
@@ -26101,6 +26264,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
@@ -26197,8 +26361,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
+        var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!y.IsContiguous) y = y.Contiguous();
+        var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
+        var conditionOrig = condition;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!condition.IsContiguous) condition = condition.Contiguous();
         if (x.Length != y.Length || x.Length != condition.Length)
             throw new ArgumentException("All tensors must have the same length.");
@@ -26219,7 +26386,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // checkpointing).
         var condBytesBit = new byte[condData.Length];
         for (int i = 0; i < condData.Length; i++) condBytesBit[i] = (bool)condData[i] ? (byte)1 : (byte)0;
-        DifferentiableOps.RecordBinary("TensorWhere", result, x, y,
+        DifferentiableOps.RecordBinary("TensorWhere", result, xOrig, yOrig,
             BackwardFunctions<T>.WhereBackward, new object[] { condBytesBit });
         return result;
     }
@@ -26594,7 +26761,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PairwiseDistance<T>(Tensor<T> x, Tensor<T> y)
     {
+        var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
+        var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!y.IsContiguous) y = y.Contiguous();
         var distSq = PairwiseDistanceSquared(x, y);
         return TensorSqrt(distSq);
@@ -26717,6 +26886,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
@@ -26773,7 +26943,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Gather", result, input, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
+        DifferentiableOps.RecordUnary("Gather", result, inputOrig, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
         AutoTracer.RecordOp("Gather", result, eng => result);
         return result;
     }
@@ -26785,6 +26955,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Scatter", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
@@ -26819,7 +26990,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis });
+        DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indicesOrig, axis });
         { var ca2 = input; var ci2 = indices; var cv2 = values; var cx2 = axis; AutoTracer.RecordOp("Scatter", result, eng => eng.Scatter(ca2, ci2, cv2, cx2)); }
         return result;
     }
@@ -26827,8 +26998,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScatterAdd<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
+        var valuesOrig = values;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!values.IsContiguous) values = values.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
@@ -26871,8 +27045,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Tape registration — without it, neither input nor values received
         // their gradient (#255 audit). The 3-arg ScatterAdd at L20078 already
         // records; this 4-arg overload was the silent sibling.
-        DifferentiableOps.RecordBinary("ScatterAdd", result, input, values,
-            BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis });
+        DifferentiableOps.RecordBinary("ScatterAdd", result, inputOrig, valuesOrig,
+            BackwardFunctions<T>.ScatterAddBackward, new object[] { indicesOrig, axis });
         return result;
     }
 
@@ -26893,6 +27067,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
@@ -26917,7 +27092,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dstSpan[i] = numOps.FromDouble(Math.Cosh(numOps.ToDouble(srcSpan[i])));
         }
 
-        DifferentiableOps.RecordUnary("TensorCosh", result, tensor, BackwardFunctions<T>.CoshBackward);
+        DifferentiableOps.RecordUnary("TensorCosh", result, tensorOrig, BackwardFunctions<T>.CoshBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorCosh", result, eng => eng.TensorCosh(c)); }
         return result;
     }
@@ -26939,6 +27114,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
@@ -26963,7 +27139,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dstSpan[i] = numOps.FromDouble(Math.Sinh(numOps.ToDouble(srcSpan[i])));
         }
 
-        DifferentiableOps.RecordUnary("TensorSinh", result, tensor, BackwardFunctions<T>.SinhBackward);
+        DifferentiableOps.RecordUnary("TensorSinh", result, tensorOrig, BackwardFunctions<T>.SinhBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorSinh", result, eng => eng.TensorSinh(c)); }
         return result;
     }
@@ -27073,7 +27249,9 @@ public partial class CpuEngine : ITensorLevelEngine
             return fusedResult;
         }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var weightsOrig = weights;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!weights.IsContiguous) weights = weights.Contiguous();
 
         // For 2D inputs (batch x features), use optimized fused GEMM for float/double
@@ -27639,6 +27817,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // No-op on CPU
     }
@@ -27649,6 +27828,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // No-op on CPU
     }
@@ -27723,6 +27903,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -27772,7 +27953,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("IRFFT", result, input, static (gradOutput, inputs, output, savedState, engine, grads) =>
+        DifferentiableOps.RecordUnary("IRFFT", result, inputOrig, static (gradOutput, inputs, output, savedState, engine, grads) =>
         {
             // IRFFT backward is RFFT
             var grad = engine.RFFT(gradOutput);
@@ -27832,7 +28013,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        var inputRealOrig = inputReal;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        var inputImagOrig = inputImag;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (!inputReal._shape.SequenceEqual(inputImag._shape))
             throw new ArgumentException("Input real and imaginary parts must have the same shape");
@@ -27881,7 +28064,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        var inputRealOrig = inputReal;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        var inputImagOrig = inputImag;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (inputReal._shape.Length < 2)
             throw new ArgumentException("Input must be at least 2D");
@@ -28663,6 +28848,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var softplusResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
         int length = input.Length;
@@ -28690,7 +28876,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Softplus", softplusResult, input,
+        DifferentiableOps.RecordUnary("Softplus", softplusResult, inputOrig,
             BackwardFunctions<T>.SoftplusBackward);
         { var c = input; AutoTracer.RecordOp("Softplus", softplusResult, eng => eng.Softplus(c)); }
         return softplusResult;
@@ -28713,6 +28899,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var hardSwishResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
         int length = input.Length;
@@ -28741,7 +28928,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("HardSwish", hardSwishResult, input,
+        DifferentiableOps.RecordUnary("HardSwish", hardSwishResult, inputOrig,
             BackwardFunctions<T>.HardSwishBackward);
         { var c = input; AutoTracer.RecordOp("HardSwish", hardSwishResult, eng => eng.HardSwish(c)); }
         return hardSwishResult;
@@ -28756,6 +28943,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
 
         var numOps = MathHelper.GetNumericOperations<T>();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         int length = input.Length;
 
@@ -28773,6 +28961,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return resultTensor;
         }
 
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         // Allocating path: new output buffer
@@ -28824,7 +29013,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetFlattenedData();
         var outData = output.GetDataArray();
         int length = gradOutput.Length;
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var outputOrig = output;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!output.IsContiguous) output = output.Contiguous();
 
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
@@ -28910,7 +29101,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetFlattenedData();
         var outData = output.GetDataArray();
         int length = gradOutput.Length;
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var outputOrig = output;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!output.IsContiguous) output = output.Contiguous();
 
         // Float fast path: SIMD grad * (1 - tanh^2)
@@ -28998,7 +29191,9 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
 
         var numOps = MathHelper.GetNumericOperations<T>();
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         int length = gradOutput.Length;
 
@@ -29047,7 +29242,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var result = new T[gradOutput.Length];
         int length = gradOutput.Length;
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
@@ -29423,6 +29620,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> InstanceNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
@@ -29513,6 +29711,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var dropResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
         mask = AutoTensorCache.RentOrAllocate<T>(input._shape);
@@ -29575,7 +29774,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
-        DifferentiableOps.RecordUnary("Dropout", dropResult, input, BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
+        DifferentiableOps.RecordUnary("Dropout", dropResult, inputOrig, BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
         AutoTracer.RecordOp("Dropout", dropResult, eng => dropResult);
         return dropResult;
     }
@@ -29613,7 +29812,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Embedding", indices._shape); if (ac is not null) return ac.Execute(); }
 
+        var embeddingTableOrig = embeddingTable;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!embeddingTable.IsContiguous) embeddingTable = embeddingTable.Contiguous();
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
         int vocabSize = embeddingTable._shape[0];
         int embeddingDim = embeddingTable._shape[^1];
@@ -29640,8 +29841,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             Array.Copy(tableData, idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
         }
-        DifferentiableOps.RecordUnary("Embedding", embResult, embeddingTable, BackwardFunctions<T>.EmbeddingBackward,
-            new object[] { indices, vocabSize, embeddingDim });
+        DifferentiableOps.RecordUnary("Embedding", embResult, embeddingTableOrig, BackwardFunctions<T>.EmbeddingBackward,
+            new object[] { indicesOrig, vocabSize, embeddingDim });
         AutoTracer.RecordOp("Embedding", embResult, eng => embResult);
         return embResult;
     }
@@ -29649,7 +29850,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> EmbeddingBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
+        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
@@ -29753,7 +29956,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = predictions._shape[0];
@@ -29824,7 +30029,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T MseLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -29840,7 +30047,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -29904,6 +30113,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GlobalMaxPool2D<T>(Tensor<T> input)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
@@ -29949,6 +30159,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -30067,6 +30278,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
         if (GraphMode.IsActive)
@@ -30131,7 +30343,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, input,
+        DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, inputOrig,
             BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
             savedState: new object[] { outputHeight, outputWidth });
         AutoTracer.RecordOp("AdaptiveAvgPool2D", result, eng => result);
@@ -30308,6 +30520,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.TensorLayerNorm(ci, cg, cb, ce); r.AsSpan().CopyTo(output.AsWritableSpan()); });
             }
         }
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         return LayerNorm(input, gamma, beta, epsilon, out _, out _);
     }
@@ -30356,7 +30569,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
@@ -30432,6 +30647,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
+        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         return Conv2D(input, kernel, stride, padding, dilation);
     }
@@ -30679,7 +30895,9 @@ public partial class CpuEngine : ITensorLevelEngine
         bool sparse = targets.Rank == 1;
 
         // Hoist data arrays outside loop — GetFlattenedData() copies the entire array
+        var logitsOrig = logits;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!logits.IsContiguous) logits = logits.Contiguous();
+        var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var logitData = logits.GetDataArray();
         var targetData = targets.GetDataArray();
@@ -30691,7 +30909,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         T mean = numOps.Divide(totalLoss, numOps.FromDouble(batchSize));
         var result = new Tensor<T>(new[] { mean }, [1]);
-        DifferentiableOps.RecordBinary("CrossEntropyLoss", result, logits, targets,
+        DifferentiableOps.RecordBinary("CrossEntropyLoss", result, logitsOrig, targetsOrig,
             BackwardFunctions<T>.CrossEntropyLossBackward);
         AutoTracer.RecordOp("CrossEntropyLoss", result, eng => result);
         return result;
@@ -30816,6 +31034,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
@@ -30843,7 +31062,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dstSpan[i] = numOps.FromDouble(val);
             }
         }
-        DifferentiableOps.RecordUnary("SELU", result, tensor, BackwardFunctions<T>.SELUBackward);
+        DifferentiableOps.RecordUnary("SELU", result, tensorOrig, BackwardFunctions<T>.SELUBackward);
         { var c = tensor; AutoTracer.RecordOp("SELU", result, eng => ((CpuEngine)eng).TensorSELU(c)); }
         return result;
     }
@@ -30865,6 +31084,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
@@ -30877,7 +31097,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 SimdKernels.HardSigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
-            DifferentiableOps.RecordUnary("HardSigmoid", result, tensor, BackwardFunctions<T>.HardSigmoidBackward);
+            DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
             return result;
         }
@@ -30888,7 +31108,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double val = Math.Max(0, Math.Min(1, x / 6.0 + 0.5));
             result[i] = numOps.FromDouble(val);
         }
-        DifferentiableOps.RecordUnary("HardSigmoid", result, tensor, BackwardFunctions<T>.HardSigmoidBackward);
+        DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
         { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
         return result;
     }
@@ -30910,6 +31130,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
@@ -30931,7 +31152,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dstSpan[i] = numOps.FromDouble(Math.Max(0, Math.Min(6, x)));
             }
         }
-        DifferentiableOps.RecordUnary("ReLU6", result, tensor, BackwardFunctions<T>.ReLU6Backward);
+        DifferentiableOps.RecordUnary("ReLU6", result, tensorOrig, BackwardFunctions<T>.ReLU6Backward);
         AutoTracer.RecordOp("ReLU6", result, eng => result);
         return result;
     }
@@ -30956,7 +31177,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var alphaOrig = alpha;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!alpha.IsContiguous) alpha = alpha.Contiguous();
         int channels = alpha.Length;
         int spatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
@@ -30996,7 +31219,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dstSpan[i] = numOps.FromDouble(x >= 0 ? x : a * x);
             }
         }
-        DifferentiableOps.RecordBinary("PReLU", result, tensor, alpha,
+        DifferentiableOps.RecordBinary("PReLU", result, tensorOrig, alphaOrig,
             BackwardFunctions<T>.PReLUBackward,
             savedState: new object[] { channels, spatialSize });
         AutoTracer.RecordOp("PReLU", result, eng => result);
@@ -31087,6 +31310,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
@@ -31108,7 +31332,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < src.Length; i++)
                 dst[i] = numOps.Divide(numOps.One, src[i]);
         }
-        DifferentiableOps.RecordUnary("Reciprocal", result, tensor, BackwardFunctions<T>.ReciprocalBackward);
+        DifferentiableOps.RecordUnary("Reciprocal", result, tensorOrig, BackwardFunctions<T>.ReciprocalBackward);
         { var c = tensor; AutoTracer.RecordOp("Reciprocal", result, eng => ((CpuEngine)eng).TensorReciprocal(c)); }
         return result;
     }
@@ -31130,6 +31354,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
@@ -31151,7 +31376,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < src.Length; i++)
                 dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
         }
-        DifferentiableOps.RecordUnary("Sign", result, tensor, BackwardFunctions<T>.SignBackward);
+        DifferentiableOps.RecordUnary("Sign", result, tensorOrig, BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Sign", result, eng => ((CpuEngine)eng).TensorSign(c)); }
         return result;
     }
