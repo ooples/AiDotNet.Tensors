@@ -559,6 +559,191 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>AVX2 RAdam: Rectified Adam (Liu et al., 2020).
+    /// Variance-rectification: when ρ_t > 4, use the corrected adaptive term;
+    /// otherwise fall back to plain SGD-like momentum step.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void RAdamUpdateSimd(
+        float* param, float* grad, float* m, float* v, int length,
+        float lr, float beta1, float beta2, float eps, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float rhoInf = 2f / (1f - beta2) - 1f;
+        float rhoT = rhoInf - 2f * step * MathF.Pow(beta2, step) / bc2;
+        bool rectified = rhoT > 4f;
+        float rt = rectified
+            ? MathF.Sqrt(((rhoT - 4f) * (rhoT - 2f) * rhoInf) /
+                        ((rhoInf - 4f) * (rhoInf - 2f) * rhoT))
+            : 0f;
+
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1f - beta2);
+            var vBc1Inv = Vector256.Create(1f / bc1);
+            int simdLen = length & ~7;
+
+            if (rectified)
+            {
+                var vBc2Inv = Vector256.Create(1f / bc2);
+                var vEps = Vector256.Create(eps);
+                var vLr = Vector256.Create(-lr * rt);
+                for (; i < simdLen; i += 8)
+                {
+                    var g = Avx.LoadVector256(grad + i);
+                    var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                    Avx.Store(m + i, mNew);
+                    var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                    Avx.Store(v + i, vNew);
+                    var mHat = Avx.Multiply(mNew, vBc1Inv);
+                    var vHat = Avx.Multiply(vNew, vBc2Inv);
+                    var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                    Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.Divide(mHat, denom), Avx.LoadVector256(param + i)));
+                }
+            }
+            else
+            {
+                var vLr = Vector256.Create(-lr);
+                for (; i < simdLen; i += 8)
+                {
+                    var g = Avx.LoadVector256(grad + i);
+                    var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                    Avx.Store(m + i, mNew);
+                    var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                    Avx.Store(v + i, vNew);
+                    var mHat = Avx.Multiply(mNew, vBc1Inv);
+                    Avx.Store(param + i, Fma.MultiplyAdd(vLr, mHat, Avx.LoadVector256(param + i)));
+                }
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
+            float mHat = m[i] / bc1;
+            if (rectified)
+            {
+                float vHat = v[i] / bc2;
+                param[i] -= lr * rt * mHat / (MathF.Sqrt(vHat) + eps);
+            }
+            else
+            {
+                param[i] -= lr * mHat;
+            }
+        }
+    }
+
+    /// <summary>SparseAdam: Adam restricted to indices with non-zero gradients.
+    /// Caller supplies <paramref name="indices"/> (compact view) of length <paramref name="nnz"/>;
+    /// <paramref name="values"/> are the corresponding gradient values. Only those
+    /// (param, m, v) entries are updated; bias correction uses <paramref name="step"/>.</summary>
+    internal static unsafe void SparseAdamUpdate(
+        float* param, int* indices, float* values, float* m, float* v, int nnz,
+        float lr, float beta1, float beta2, float eps, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float lrAdj = lr / bc1;
+        float bc2Inv = 1f / bc2;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
+            m[idx] = mNew;
+            v[idx] = vNew;
+            float vHat = vNew * bc2Inv;
+            param[idx] -= lrAdj * mNew / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    /// <summary>AVX2 ASGD: Averaged SGD (Polyak/Ruppert).
+    /// Step decay <c>η_t = lr / (1 + λ·lr·t)^α</c>, weight decay applied to gradient,
+    /// and exponential moving average of params written to <paramref name="ax"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void ASGDUpdateSimd(
+        float* param, float* grad, float* ax, int length,
+        float lr, float lambd, float alpha, float weightDecay, float mu)
+    {
+        // Effective learning rate uses the per-call lr (decayed externally).
+        // mu controls how fast the running average ax is pulled toward param.
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vLr = Vector256.Create(-lr);
+            var vWd = Vector256.Create(weightDecay);
+            var vLambd = Vector256.Create(lr * lambd);
+            var vMu = Vector256.Create(mu);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var p = Avx.LoadVector256(param + i);
+                var g = Avx.LoadVector256(grad + i);
+                if (weightDecay != 0f)
+                    g = Fma.MultiplyAdd(vWd, p, g);
+                // p ← p · (1 − lr·λ) − lr · g
+                var decayed = Fma.MultiplyAddNegated(vLambd, p, p);
+                var pNew = Fma.MultiplyAdd(vLr, g, decayed);
+                Avx.Store(param + i, pNew);
+                var axOld = Avx.LoadVector256(ax + i);
+                // ax += mu * (p − ax)
+                var axNew = Fma.MultiplyAdd(vMu, Avx.Subtract(pNew, axOld), axOld);
+                Avx.Store(ax + i, axNew);
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float g = grad[i] + weightDecay * param[i];
+            param[i] = param[i] * (1f - lr * lambd) - lr * g;
+            ax[i] += mu * (param[i] - ax[i]);
+        }
+        _ = alpha; // alpha is consumed by external schedule when lr is computed
+    }
+
+    /// <summary>Rprop: Resilient backpropagation.
+    /// Per-element step sizes adapt based on sign-changes of consecutive gradients.
+    /// Reference: Riedmiller &amp; Braun, 1993.</summary>
+    internal static unsafe void RpropUpdate(
+        float* param, float* grad, float* prevGrad, float* stepSize, int length,
+        float etaPlus, float etaMinus, float stepMin, float stepMax)
+    {
+        for (int i = 0; i < length; i++)
+        {
+            float gPrev = prevGrad[i];
+            float g = grad[i];
+            float sgnChange = gPrev * g;
+            float step = stepSize[i];
+            if (sgnChange > 0f)
+            {
+                step = MathF.Min(step * etaPlus, stepMax);
+                stepSize[i] = step;
+                param[i] -= MathF.Sign(g) * step;
+                prevGrad[i] = g;
+            }
+            else if (sgnChange < 0f)
+            {
+                step = MathF.Max(step * etaMinus, stepMin);
+                stepSize[i] = step;
+                // Skip this update; reset gradient memory so next step is treated as a fresh sign.
+                prevGrad[i] = 0f;
+            }
+            else
+            {
+                param[i] -= MathF.Sign(g) * step;
+                prevGrad[i] = g;
+            }
+        }
+    }
+
     /// <summary>AVX2 FTRL: Follow The Regularized Leader.
     /// Partial vectorization: n accumulation and z update use FMA,
     /// soft-thresholding uses SIMD compare+blend for branchless L1 proximal.</summary>
@@ -680,5 +865,15 @@ public enum OptimizerType
     /// <summary>LAMB: Layer-wise Adaptive Moments</summary>
     LAMB = 12,
     /// <summary>FTRL: Follow The Regularized Leader</summary>
-    FTRL = 13
+    FTRL = 13,
+    /// <summary>RAdam: Rectified Adam (Liu et al., 2020)</summary>
+    RAdam = 14,
+    /// <summary>SparseAdam: Adam variant for sparse gradients</summary>
+    SparseAdam = 15,
+    /// <summary>ASGD: Averaged Stochastic Gradient Descent (Polyak/Ruppert)</summary>
+    ASGD = 16,
+    /// <summary>Rprop: Resilient back-propagation (Riedmiller, 1993)</summary>
+    Rprop = 17,
+    /// <summary>LBFGS: Limited-memory BFGS (closure-based, see <c>LBFGSOptimizer</c>)</summary>
+    LBFGS = 18
 }
