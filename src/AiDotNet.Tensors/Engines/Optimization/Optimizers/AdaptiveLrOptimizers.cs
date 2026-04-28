@@ -36,12 +36,41 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
     public double[] CurrentD { get; private set; } = Array.Empty<double>();
 
     /// <inheritdoc />
+    protected override Dictionary<string, OptimizerStateValue> GetGroupExtraState(int groupIndex)
+    {
+        var dict = new Dictionary<string, OptimizerStateValue>();
+        if (groupIndex < CurrentD.Length)
+            dict["current_d"] = OptimizerStateValue.FromFloat((float)CurrentD[groupIndex]);
+        return dict;
+    }
+
+    /// <inheritdoc />
+    protected override void SetGroupExtraState(int groupIndex, Dictionary<string, OptimizerStateValue> extraState)
+    {
+        if (CurrentD.Length <= groupIndex)
+        {
+            var grown = new double[groupIndex + 1];
+            Array.Copy(CurrentD, grown, CurrentD.Length);
+            for (int i = CurrentD.Length; i < grown.Length; i++)
+                grown[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            CurrentD = grown;
+        }
+        if (extraState.TryGetValue("current_d", out var d) && d.FloatValue.HasValue)
+            CurrentD[groupIndex] = d.FloatValue.Value;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        if (CurrentD.Length != ParamGroups.Count)
+        // Grow the per-group d-array incrementally — adding a new param group mid-training
+        // must not wipe the adapted d_t values that already exist for prior groups.
+        if (CurrentD.Length < ParamGroups.Count)
         {
-            CurrentD = new double[ParamGroups.Count];
-            for (int i = 0; i < CurrentD.Length; i++) CurrentD[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            int oldLen = CurrentD.Length;
+            var grown = new double[ParamGroups.Count];
+            Array.Copy(CurrentD, grown, oldLen);
+            for (int i = oldLen; i < grown.Length; i++) grown[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            CurrentD = grown;
         }
 
         for (int gi = 0; gi < ParamGroups.Count; gi++)
@@ -138,13 +167,53 @@ public sealed class ProdigyOptimizer : OptimizerBase
     public double[] DNumerator { get; private set; } = Array.Empty<double>();
 
     /// <inheritdoc />
+    protected override Dictionary<string, OptimizerStateValue> GetGroupExtraState(int groupIndex)
+    {
+        var dict = new Dictionary<string, OptimizerStateValue>();
+        if (groupIndex < CurrentD.Length)
+        {
+            dict["current_d"]    = OptimizerStateValue.FromFloat((float)CurrentD[groupIndex]);
+            dict["d_numerator"]  = OptimizerStateValue.FromFloat((float)DNumerator[groupIndex]);
+        }
+        return dict;
+    }
+
+    /// <inheritdoc />
+    protected override void SetGroupExtraState(int groupIndex, Dictionary<string, OptimizerStateValue> extraState)
+    {
+        if (CurrentD.Length <= groupIndex)
+        {
+            int newLen = groupIndex + 1;
+            var grownD = new double[newLen];
+            var grownN = new double[newLen];
+            Array.Copy(CurrentD,   grownD, CurrentD.Length);
+            Array.Copy(DNumerator, grownN, DNumerator.Length);
+            for (int i = CurrentD.Length; i < grownD.Length; i++)
+                grownD[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            CurrentD = grownD;
+            DNumerator = grownN;
+        }
+        if (extraState.TryGetValue("current_d", out var d) && d.FloatValue.HasValue)
+            CurrentD[groupIndex] = d.FloatValue.Value;
+        if (extraState.TryGetValue("d_numerator", out var n) && n.FloatValue.HasValue)
+            DNumerator[groupIndex] = n.FloatValue.Value;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        if (CurrentD.Length != ParamGroups.Count)
+        // Grow CurrentD / DNumerator incrementally so groups added mid-training keep their
+        // adapted state instead of being silently reset on the next Step().
+        if (CurrentD.Length < ParamGroups.Count)
         {
-            CurrentD = new double[ParamGroups.Count];
-            DNumerator = new double[ParamGroups.Count];
-            for (int i = 0; i < CurrentD.Length; i++) CurrentD[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            int oldLen = CurrentD.Length;
+            var grownD = new double[ParamGroups.Count];
+            var grownN = new double[ParamGroups.Count];
+            Array.Copy(CurrentD,   grownD, oldLen);
+            Array.Copy(DNumerator, grownN, oldLen);
+            for (int i = oldLen; i < grownD.Length; i++) grownD[i] = ParamGroups[i].GetOption("d0", 1e-6);
+            CurrentD = grownD;
+            DNumerator = grownN;
         }
 
         for (int gi = 0; gi < ParamGroups.Count; gi++)

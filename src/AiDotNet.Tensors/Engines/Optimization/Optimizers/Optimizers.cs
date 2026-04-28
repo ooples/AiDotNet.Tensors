@@ -792,6 +792,31 @@ public sealed class SparseAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
+    // Per-(gi, pi) scratch buffers reused across steps to avoid the per-step int[] / float[]
+    // allocation that previously dominated GC pressure on large sparse tensors. Buffers grow
+    // monotonically to fit the largest nnz seen so far.
+    private readonly Dictionary<(int gi, int pi), (int[] idx, float[] val)> _scratch = new();
+
+    /// <summary>Pre-supply sparse indices and values for a parameter, skipping the dense
+    /// gradient scan altogether. Caller is responsible for ensuring <paramref name="indices"/>
+    /// is sorted and <paramref name="values"/> is the same length. Subsequent <see cref="Step"/>
+    /// calls will use this snapshot until <see cref="ClearSparseGradient"/> is invoked or new
+    /// indices/values are supplied.</summary>
+    public void SetSparseGradient(int paramGroupIndex, int paramIndex, int[] indices, float[] values)
+    {
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (values == null) throw new ArgumentNullException(nameof(values));
+        if (indices.Length != values.Length)
+            throw new ArgumentException("indices and values must be the same length.");
+        _explicit[(paramGroupIndex, paramIndex)] = (indices, values);
+    }
+
+    /// <summary>Clear an explicit sparse gradient previously set by <see cref="SetSparseGradient"/>.</summary>
+    public void ClearSparseGradient(int paramGroupIndex, int paramIndex) =>
+        _explicit.Remove((paramGroupIndex, paramIndex));
+
+    private readonly Dictionary<(int gi, int pi), (int[] idx, float[] val)> _explicit = new();
+
     /// <inheritdoc />
     public override void Step()
     {
@@ -811,16 +836,49 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
 
-                int nnz = 0;
-                for (int i = 0; i < grad.Length; i++) if (grad[i] != 0f) nnz++;
-                if (nnz == 0) continue;
-                var idx = new int[nnz];
-                var val = new float[nnz];
-                int k = 0;
-                for (int i = 0; i < grad.Length; i++)
+                int nnz;
+                int[] idx;
+                float[] val;
+                if (_explicit.TryGetValue((gi, pi), out var explicitPair))
                 {
-                    if (grad[i] != 0f) { idx[k] = i; val[k] = grad[i]; k++; }
+                    // User supplied sparse indices+values directly — zero scans, zero allocations.
+                    idx = explicitPair.idx;
+                    val = explicitPair.val;
+                    nnz = idx.Length;
                 }
+                else
+                {
+                    // Build the sparse view in a single pass over the dense gradient, growing
+                    // the per-parameter scratch buffers in place rather than allocating each step.
+                    if (!_scratch.TryGetValue((gi, pi), out var pair))
+                    {
+                        pair = (new int[Math.Min(p.Length, 16)], new float[Math.Min(p.Length, 16)]);
+                        _scratch[(gi, pi)] = pair;
+                    }
+                    int cap = pair.idx.Length;
+                    int k = 0;
+                    for (int i = 0; i < grad.Length; i++)
+                    {
+                        if (grad[i] == 0f) continue;
+                        if (k == cap)
+                        {
+                            // Geometric growth — amortised O(1) per insertion.
+                            int newCap = Math.Min(cap * 2, p.Length);
+                            Array.Resize(ref pair.idx, newCap);
+                            Array.Resize(ref pair.val, newCap);
+                            cap = newCap;
+                        }
+                        pair.idx[k] = i;
+                        pair.val[k] = grad[i];
+                        k++;
+                    }
+                    _scratch[(gi, pi)] = pair;
+                    if (k == 0) continue;
+                    idx = pair.idx;
+                    val = pair.val;
+                    nnz = k;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (int* pi2 = idx) fixed (float* pv2 = val)

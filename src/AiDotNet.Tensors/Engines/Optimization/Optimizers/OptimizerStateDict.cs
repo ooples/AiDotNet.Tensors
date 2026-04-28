@@ -25,6 +25,15 @@ public sealed class OptimizerGroupState
 
     /// <summary>Param-id list (indices into <see cref="OptimizerStateDict.State"/>).</summary>
     public List<int> ParamIds { get; } = new List<int>();
+
+    /// <summary>
+    /// Optimizer-level state that lives at the group granularity rather than per parameter
+    /// (e.g. D-Adaptation's <c>CurrentD</c>, Prodigy's <c>DNumerator</c>). Populated by
+    /// <see cref="OptimizerBase.GetGroupExtraState(int)"/> on save and restored by
+    /// <see cref="OptimizerBase.SetGroupExtraState(int, Dictionary{string, OptimizerStateValue})"/>
+    /// on load. Empty by default.
+    /// </summary>
+    public Dictionary<string, OptimizerStateValue> ExtraState { get; } = new Dictionary<string, OptimizerStateValue>();
 }
 
 /// <summary>

@@ -134,8 +134,10 @@ public sealed class ShampooOptimizer : OptimizerBase
         for (int i = 0; i < p.Length; i++)
         {
             acc[i] += grad[i] * grad[i];
-            // Inverse 4th root of a scalar: 1/sqrt(sqrt(acc)) — stable for any acc≥0.
-            float invRoot = 1f / MathF.Sqrt(MathF.Sqrt(acc[i]) + eps);
+            // Inverse 4th root of a scalar: (acc + eps)^(-1/4) = 1 / sqrt(sqrt(acc + eps)).
+            // Adding eps INSIDE both roots keeps the diagonal fallback's first-step magnitude
+            // consistent with the full-matrix path's regularised eigendecomposition.
+            float invRoot = 1f / MathF.Sqrt(MathF.Sqrt(acc[i] + eps));
             float pre = grad[i] * invRoot;
             mb[i] = momentum * mb[i] + pre;
             p[i] -= lr * mb[i];

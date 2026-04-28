@@ -110,6 +110,10 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
         var gradSnapshots = new List<(float[] target, float[] saved)>();
         // Snapshot non-local optimizer state (deep clone of the OptimizerStateValue dictionary).
         var stateSnapshots = new List<(int gi, int pi, Dictionary<string, OptimizerStateValue> saved)>();
+        // Track non-local (gi, pi) keys that had no state before the step. If _inner.Step()
+        // lazily creates state for them, we delete those entries during restoration so the
+        // ZeRO-1 contract holds even when the inner optimizer materialises state on first use.
+        var missingState = new List<(int gi, int pi)>();
 
         int globalId = 0;
         for (int gi = 0; gi < _inner.ParamGroups.Count; gi++)
@@ -124,16 +128,25 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
                 gradSnapshots.Add((g, (float[])g.Clone()));
                 if (_inner.StateInternal.TryGetValue((gi, pi), out var slots))
                     stateSnapshots.Add((gi, pi, CloneSlots(slots)));
+                else
+                    missingState.Add((gi, pi));
             }
         }
 
-        _inner.Step();
-
-        // Restore non-local params + state.
-        foreach (var (target, saved) in paramSnapshots) System.Array.Copy(saved, target, target.Length);
-        foreach (var (target, saved) in gradSnapshots)  System.Array.Copy(saved, target, target.Length);
-        foreach (var (gi, pi, saved) in stateSnapshots)
-            _inner.StateInternal[(gi, pi)] = saved;
+        // Use try/finally so an exception inside _inner.Step() still rolls back every
+        // non-local mutation and removes any lazy state created during the failed call.
+        try
+        {
+            _inner.Step();
+        }
+        finally
+        {
+            foreach (var (target, saved) in paramSnapshots) System.Array.Copy(saved, target, target.Length);
+            foreach (var (target, saved) in gradSnapshots)  System.Array.Copy(saved, target, target.Length);
+            foreach (var key in missingState)               _inner.StateInternal.Remove(key);
+            foreach (var (gi, pi, saved) in stateSnapshots)
+                _inner.StateInternal[(gi, pi)] = saved;
+        }
     }
 
     private static Dictionary<string, OptimizerStateValue> CloneSlots(Dictionary<string, OptimizerStateValue> src)

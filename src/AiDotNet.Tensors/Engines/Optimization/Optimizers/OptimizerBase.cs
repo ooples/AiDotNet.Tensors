@@ -125,6 +125,17 @@ public abstract class OptimizerBase : IOptimizer
         }
     }
 
+    /// <summary>
+    /// Hook for subclasses to publish optimizer-level per-group state into the saved dict
+    /// (e.g. D-Adaptation's <c>CurrentD</c>, Prodigy's <c>DNumerator</c>). Default: empty.
+    /// Mirror this on the load side via <see cref="SetGroupExtraState"/>.
+    /// </summary>
+    protected virtual Dictionary<string, OptimizerStateValue> GetGroupExtraState(int groupIndex) =>
+        new Dictionary<string, OptimizerStateValue>();
+
+    /// <summary>Restore the per-group state captured by <see cref="GetGroupExtraState"/>.</summary>
+    protected virtual void SetGroupExtraState(int groupIndex, Dictionary<string, OptimizerStateValue> extraState) { }
+
     /// <inheritdoc />
     public OptimizerStateDict StateDict()
     {
@@ -135,6 +146,17 @@ public abstract class OptimizerBase : IOptimizer
             var group = _groups[gi];
             var groupState = new OptimizerGroupState();
             foreach (var kv in group.Options) groupState.Options[kv.Key] = kv.Value;
+            // Subclass-level state lives in ExtraState so save/load round-trips it.
+            foreach (var kv in GetGroupExtraState(gi))
+            {
+                var v = kv.Value;
+                groupState.ExtraState[kv.Key] = new OptimizerStateValue
+                {
+                    IntValue = v.IntValue,
+                    FloatValue = v.FloatValue,
+                    Tensor = v.Tensor == null ? null : (float[])v.Tensor.Clone(),
+                };
+            }
             for (int pi = 0; pi < group.Parameters.Count; pi++)
             {
                 int id = paramCounter++;
@@ -173,6 +195,24 @@ public abstract class OptimizerBase : IOptimizer
             var group = _groups[gi];
             var gs = state.ParamGroups[gi];
             foreach (var kv in gs.Options) group.Options[kv.Key] = kv.Value;
+            // Restore subclass-level per-group state before per-parameter slots so a
+            // freshly-loaded optimizer's first Step() observes the saved values rather than
+            // recomputing from defaults.
+            if (gs.ExtraState.Count > 0)
+            {
+                var clone = new Dictionary<string, OptimizerStateValue>();
+                foreach (var kv in gs.ExtraState)
+                {
+                    var v = kv.Value;
+                    clone[kv.Key] = new OptimizerStateValue
+                    {
+                        IntValue = v.IntValue,
+                        FloatValue = v.FloatValue,
+                        Tensor = v.Tensor == null ? null : (float[])v.Tensor.Clone(),
+                    };
+                }
+                SetGroupExtraState(gi, clone);
+            }
             if (gs.ParamIds.Count != group.Parameters.Count)
                 throw new InvalidOperationException(
                     $"group {gi} has {group.Parameters.Count} params; state-dict has {gs.ParamIds.Count}.");
