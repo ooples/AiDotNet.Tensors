@@ -177,6 +177,28 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>RMSprop with centered variant. Tracks a running mean of gradients g_avg
+    /// and uses the variance estimate v − g_avg² in the denominator (Graves, 2013):
+    ///   g_avg = ρ·g_avg + (1−ρ)·g
+    ///   v     = ρ·v + (1−ρ)·g²
+    ///   denom = sqrt(v − g_avg²) + eps
+    /// Falls back to plain RMSprop when <paramref name="gradAvg"/> is <c>null</c>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void RMSpropCenteredUpdate(
+        float* param, float* grad, float* v, float* gradAvg, int length,
+        float lr, float rho, float eps)
+    {
+        for (int i = 0; i < length; i++)
+        {
+            v[i] = rho * v[i] + (1f - rho) * grad[i] * grad[i];
+            gradAvg[i] = rho * gradAvg[i] + (1f - rho) * grad[i];
+            float variance = v[i] - gradAvg[i] * gradAvg[i];
+            // Numerical safety: variance can be slightly negative due to FP error.
+            if (variance < 0f) variance = 0f;
+            param[i] -= lr * grad[i] / (MathF.Sqrt(variance) + eps);
+        }
+    }
+
     /// <summary>AVX2 RMSprop: v = rho*v + (1-rho)*g^2; param -= lr*g/(sqrt(v)+eps)</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void RMSpropUpdateSimd(

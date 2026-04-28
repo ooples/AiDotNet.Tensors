@@ -71,6 +71,42 @@ public abstract class OptimizerBase : IOptimizer
                 Array.Clear(g.Gradients[i], 0, g.Gradients[i].Length);
     }
 
+    /// <summary>If a group's <c>"maximize"</c> option is true, flip the sign of each gradient
+    /// in-place so the downstream descent kernel performs an ascent step. Gradients are written
+    /// back to their original sign at the end of <see cref="Step"/> via <see cref="UnflipMaximize"/>.</summary>
+    /// <returns>True if any group had maximize active (caller must call <see cref="UnflipMaximize"/>).</returns>
+    protected bool ApplyMaximize()
+    {
+        bool any = false;
+        for (int gi = 0; gi < _groups.Count; gi++)
+        {
+            var g = _groups[gi];
+            if (g.GetOption("maximize", 0.0) == 0.0) continue;
+            any = true;
+            for (int pi = 0; pi < g.Gradients.Count; pi++)
+            {
+                var grad = g.Gradients[pi];
+                for (int i = 0; i < grad.Length; i++) grad[i] = -grad[i];
+            }
+        }
+        return any;
+    }
+
+    /// <summary>Restore the original sign of gradients flipped by <see cref="ApplyMaximize"/>.</summary>
+    protected void UnflipMaximize()
+    {
+        for (int gi = 0; gi < _groups.Count; gi++)
+        {
+            var g = _groups[gi];
+            if (g.GetOption("maximize", 0.0) == 0.0) continue;
+            for (int pi = 0; pi < g.Gradients.Count; pi++)
+            {
+                var grad = g.Gradients[pi];
+                for (int i = 0; i < grad.Length; i++) grad[i] = -grad[i];
+            }
+        }
+    }
+
     /// <inheritdoc />
     public OptimizerStateDict StateDict()
     {

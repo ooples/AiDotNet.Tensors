@@ -4,7 +4,7 @@ using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
-/// <summary>SGD with optional momentum, dampening, weight-decay, Nesterov.</summary>
+/// <summary>SGD with optional momentum, dampening, weight-decay, Nesterov, maximize.</summary>
 public sealed class SgdOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -14,6 +14,7 @@ public sealed class SgdOptimizer : OptimizerBase
         ["dampening"] = 0.0,
         ["weight_decay"] = 0.0,
         ["nesterov"] = 0.0,
+        ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "momentum_buffer" };
     /// <inheritdoc />
@@ -24,6 +25,8 @@ public sealed class SgdOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -75,16 +78,17 @@ public sealed class SgdOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
-/// <summary>Adam (Kingma &amp; Ba, 2015), with optional AMSGrad.</summary>
+/// <summary>Adam (Kingma &amp; Ba, 2015), with optional AMSGrad and maximize.</summary>
 public sealed class AdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
-        ["weight_decay"] = 0.0, ["amsgrad"] = 0.0,
+        ["weight_decay"] = 0.0, ["amsgrad"] = 0.0, ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq" };
     /// <inheritdoc />
@@ -95,6 +99,8 @@ public sealed class AdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -133,6 +139,7 @@ public sealed class AdamOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
@@ -141,7 +148,8 @@ public sealed class AdamWOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
-        ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8, ["weight_decay"] = 1e-2,
+        ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
+        ["weight_decay"] = 1e-2, ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_avg_sq" };
     /// <inheritdoc />
@@ -152,6 +160,8 @@ public sealed class AdamWOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -175,6 +185,7 @@ public sealed class AdamWOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
@@ -183,7 +194,8 @@ public sealed class RAdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
-        ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8, ["weight_decay"] = 0.0,
+        ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
+        ["weight_decay"] = 0.0, ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_avg_sq" };
     /// <inheritdoc />
@@ -194,6 +206,8 @@ public sealed class RAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -219,6 +233,7 @@ public sealed class RAdamOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
@@ -227,7 +242,8 @@ public sealed class NAdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
-        ["lr"] = 2e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8, ["weight_decay"] = 0.0,
+        ["lr"] = 2e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
+        ["weight_decay"] = 0.0, ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_avg_sq" };
     /// <inheritdoc />
@@ -238,6 +254,8 @@ public sealed class NAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -263,6 +281,7 @@ public sealed class NAdamOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
@@ -348,14 +367,17 @@ public sealed class AdagradOptimizer : OptimizerBase
     }
 }
 
-/// <summary>RMSprop (Hinton lecture): running average of squared gradients.</summary>
+/// <summary>RMSprop (Hinton lecture): running average of squared gradients.
+/// Supports the centered variant (Graves, 2013) and Polyak momentum, matching
+/// <c>torch.optim.RMSprop(centered=, momentum=)</c>.</summary>
 public sealed class RmsPropOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1e-2, ["alpha"] = 0.99, ["eps"] = 1e-8, ["weight_decay"] = 0.0,
+        ["momentum"] = 0.0, ["centered"] = 0.0,
     };
-    private static readonly string[] _stateNames = new[] { "square_avg" };
+    private static readonly string[] _stateNames = new[] { "square_avg", "grad_avg", "momentum_buffer" };
     /// <inheritdoc />
     protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
     /// <inheritdoc />
@@ -371,6 +393,8 @@ public sealed class RmsPropOptimizer : OptimizerBase
             float rho = (float)g.GetOption("alpha", 0.99);
             float eps = (float)g.GetOption("eps", 1e-8);
             float wd = (float)g.GetOption("weight_decay", 0.0);
+            float mom = (float)g.GetOption("momentum", 0.0);
+            bool centered = g.GetOption("centered", 0.0) != 0.0;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
@@ -378,10 +402,52 @@ public sealed class RmsPropOptimizer : OptimizerBase
                     for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["square_avg"].Tensor!;
-                unsafe
+
+                if (centered)
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
-                        FusedOptimizer.RMSpropUpdateSimd(pp, pg, pv, p.Length, lr, rho, eps);
+                    var gAvg = slot["grad_avg"].Tensor!;
+                    if (mom == 0f)
+                    {
+                        unsafe
+                        {
+                            fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v) fixed (float* pga = gAvg)
+                                FusedOptimizer.RMSpropCenteredUpdate(pp, pg, pv, pga, p.Length, lr, rho, eps);
+                        }
+                    }
+                    else
+                    {
+                        // Centered + Polyak momentum: maintain mom_buf = mom·mom_buf + g/(sqrt(var)+eps); p -= lr·mom_buf
+                        var mb = slot["momentum_buffer"].Tensor!;
+                        for (int i = 0; i < p.Length; i++)
+                        {
+                            v[i] = rho * v[i] + (1f - rho) * grad[i] * grad[i];
+                            gAvg[i] = rho * gAvg[i] + (1f - rho) * grad[i];
+                            float variance = v[i] - gAvg[i] * gAvg[i];
+                            if (variance < 0f) variance = 0f;
+                            float scaled = grad[i] / (MathF.Sqrt(variance) + eps);
+                            mb[i] = mom * mb[i] + scaled;
+                            p[i] -= lr * mb[i];
+                        }
+                    }
+                }
+                else if (mom != 0f)
+                {
+                    var mb = slot["momentum_buffer"].Tensor!;
+                    for (int i = 0; i < p.Length; i++)
+                    {
+                        v[i] = rho * v[i] + (1f - rho) * grad[i] * grad[i];
+                        float scaled = grad[i] / (MathF.Sqrt(v[i]) + eps);
+                        mb[i] = mom * mb[i] + scaled;
+                        p[i] -= lr * mb[i];
+                    }
+                }
+                else
+                {
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
+                            FusedOptimizer.RMSpropUpdateSimd(pp, pg, pv, p.Length, lr, rho, eps);
+                    }
                 }
             }
         }
@@ -559,6 +625,131 @@ public sealed class RpropOptimizer : OptimizerBase
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ppr = prev) fixed (float* pss = ss)
                         FusedOptimizer.RpropUpdate(pp, pg, ppr, pss, p.Length, etaP, etaM, sMin, sMax);
+                }
+            }
+        }
+    }
+}
+
+/// <summary>LAMB (You et al., 2020): layer-wise Adaptive Moments for Batch training.
+/// Adam-style moments + per-layer trust-ratio scaling for very large batch sizes.</summary>
+public sealed class LambOptimizer : OptimizerBase
+{
+    private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
+    {
+        ["lr"] = 1e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-6, ["weight_decay"] = 0.0,
+    };
+    private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_avg_sq" };
+    /// <inheritdoc />
+    protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
+    /// <inheritdoc />
+    protected override IReadOnlyList<string> StateNames => _stateNames;
+
+    /// <inheritdoc />
+    public override void Step()
+    {
+        for (int gi = 0; gi < ParamGroups.Count; gi++)
+        {
+            var g = ParamGroups[gi];
+            float lr = (float)g.LearningRate;
+            float b1 = (float)g.GetOption("beta1", 0.9);
+            float b2 = (float)g.GetOption("beta2", 0.999);
+            float eps = (float)g.GetOption("eps", 1e-6);
+            float wd = (float)g.GetOption("weight_decay", 0.0);
+            for (int pi = 0; pi < g.Parameters.Count; pi++)
+            {
+                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                var slot = GetOrCreateState(gi, pi, p.Length);
+                int step = (slot["step"].IntValue ?? 0) + 1;
+                slot["step"].IntValue = step;
+                var m = slot["exp_avg"].Tensor!;
+                var v = slot["exp_avg_sq"].Tensor!;
+                unsafe
+                {
+                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
+                        FusedOptimizer.LAMBUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, wd, step);
+                }
+            }
+        }
+    }
+}
+
+/// <summary>LARS (You et al., 2017): Layer-wise Adaptive Rate Scaling.
+/// SGD+momentum with a layer-local trust ratio that scales LR by ‖p‖/‖g‖.</summary>
+public sealed class LarsOptimizer : OptimizerBase
+{
+    private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
+    {
+        ["lr"] = 1e-2, ["momentum"] = 0.9, ["weight_decay"] = 0.0, ["trust_coeff"] = 1e-3,
+    };
+    private static readonly string[] _stateNames = new[] { "momentum_buffer" };
+    /// <inheritdoc />
+    protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
+    /// <inheritdoc />
+    protected override IReadOnlyList<string> StateNames => _stateNames;
+
+    /// <inheritdoc />
+    public override void Step()
+    {
+        for (int gi = 0; gi < ParamGroups.Count; gi++)
+        {
+            var g = ParamGroups[gi];
+            float lr = (float)g.LearningRate;
+            float mom = (float)g.GetOption("momentum", 0.9);
+            float wd = (float)g.GetOption("weight_decay", 0.0);
+            float tc = (float)g.GetOption("trust_coeff", 1e-3);
+            for (int pi = 0; pi < g.Parameters.Count; pi++)
+            {
+                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                var slot = GetOrCreateState(gi, pi, p.Length);
+                var v = slot["momentum_buffer"].Tensor!;
+                unsafe
+                {
+                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
+                        FusedOptimizer.LARSUpdateSimd(pp, pg, pv, p.Length, lr, mom, wd, tc);
+                }
+            }
+        }
+    }
+}
+
+/// <summary>FTRL (McMahan, 2013): Follow-The-Regularized-Leader with L1+L2 regularisation.
+/// Per-feature accumulators z and n; exact L1 soft-thresholding produces sparse weights.</summary>
+public sealed class FtrlOptimizer : OptimizerBase
+{
+    private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
+    {
+        ["lr"] = 1e-2, ["l1_reg"] = 0.0, ["l2_reg"] = 0.0, ["lr_power"] = -0.5,
+    };
+    private static readonly string[] _stateNames = new[] { "z", "n" };
+    /// <inheritdoc />
+    protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
+    /// <inheritdoc />
+    protected override IReadOnlyList<string> StateNames => _stateNames;
+
+    /// <inheritdoc />
+    public override void Step()
+    {
+        for (int gi = 0; gi < ParamGroups.Count; gi++)
+        {
+            var g = ParamGroups[gi];
+            float lr = (float)g.LearningRate;
+            float l1 = (float)g.GetOption("l1_reg", 0.0);
+            float l2 = (float)g.GetOption("l2_reg", 0.0);
+            // FTRL paper convention: lr_power = −0.5 yields the sqrt(n) schedule.
+            // The fused kernel computes n^(-lrPower), so we pass lr_power directly
+            // (not negated) — feeding −0.5 produces n^(0.5) = sqrt(n) inside.
+            float lrPow = (float)g.GetOption("lr_power", -0.5);
+            for (int pi = 0; pi < g.Parameters.Count; pi++)
+            {
+                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                var slot = GetOrCreateState(gi, pi, p.Length);
+                var z = slot["z"].Tensor!;
+                var n = slot["n"].Tensor!;
+                unsafe
+                {
+                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pz = z) fixed (float* pn = n)
+                        FusedOptimizer.FTRLUpdateSimd(pp, pg, pz, pn, p.Length, lr, l1, l2, lrPow);
                 }
             }
         }
