@@ -232,6 +232,137 @@ public sealed class TensorBoardSummaryWriter : IDisposable
     }
 
     /// <summary>
+    /// Logs a single PNG-encoded image under <paramref name="tag"/>.
+    /// TensorBoard's Image dashboard accepts encoded PNG / JPEG bytes
+    /// directly — the caller is responsible for the encoding step
+    /// (<see cref="System.Drawing"/> isn't a portable .NET dependency,
+    /// and we don't want to ship a per-platform image-codec pin).
+    /// </summary>
+    /// <param name="tag">Tag under which the image appears in the dashboard.</param>
+    /// <param name="encodedImage">PNG or JPEG byte payload.</param>
+    /// <param name="width">Image width in pixels (for the protobuf metadata).</param>
+    /// <param name="height">Image height in pixels.</param>
+    /// <param name="colorspace">3 = RGB, 4 = RGBA, 1 = grayscale, 2 = grayscale+alpha. Defaults to 3.</param>
+    /// <param name="step">Training step the image was captured at.</param>
+    public void AddImage(string tag, byte[] encodedImage, int width, int height, long step, int colorspace = 3)
+    {
+        ThrowIfDisposed();
+        if (tag is null) throw new ArgumentNullException(nameof(tag));
+        if (encodedImage is null) throw new ArgumentNullException(nameof(encodedImage));
+        if (encodedImage.Length == 0) throw new ArgumentException("Encoded image cannot be empty.", nameof(encodedImage));
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+        if (colorspace < 1 || colorspace > 4) throw new ArgumentOutOfRangeException(nameof(colorspace));
+
+        var ev = new EventBuilder
+        {
+            WallTime = UnixSeconds(),
+            Step = step,
+            ImageTag = tag,
+            ImageBytes = encodedImage,
+            ImageWidth = width,
+            ImageHeight = height,
+            ImageColorspace = colorspace,
+        }.ToBytes();
+        WriteRecord(ev);
+    }
+
+    /// <summary>
+    /// Logs an embedding projector record. TensorBoard's Projector
+    /// dashboard reads <c>tensors.tsv</c> + <c>metadata.tsv</c> from
+    /// disk via a <c>projector_config.pbtxt</c>; this helper materialises
+    /// those files in <paramref name="logDir"/> alongside the events
+    /// stream so the dashboard picks them up automatically.
+    /// </summary>
+    /// <param name="logDir">Directory where the events file lives. Required because
+    /// projector files are written next to the events file, not into the events stream.</param>
+    /// <param name="tag">Sub-folder name under <c>logDir/</c> that holds this projection.</param>
+    /// <param name="embeddings">2D array — rows × dim. Each row is one point in the projection.</param>
+    /// <param name="metadataLabels">Optional per-row labels written to <c>metadata.tsv</c>.</param>
+    public void AddEmbedding(string logDir, string tag, float[,] embeddings, string[]? metadataLabels = null)
+    {
+        ThrowIfDisposed();
+        if (logDir is null) throw new ArgumentNullException(nameof(logDir));
+        if (tag is null) throw new ArgumentNullException(nameof(tag));
+        if (embeddings is null) throw new ArgumentNullException(nameof(embeddings));
+        int rows = embeddings.GetLength(0);
+        int dim = embeddings.GetLength(1);
+        if (rows == 0 || dim == 0)
+            throw new ArgumentException("Embeddings must be non-empty (rows > 0, dim > 0).", nameof(embeddings));
+        if (metadataLabels is not null && metadataLabels.Length != rows)
+            throw new ArgumentException(
+                $"metadataLabels.Length ({metadataLabels.Length}) must equal embeddings rows ({rows}).",
+                nameof(metadataLabels));
+
+        // Write tag-specific subdir with tensors.tsv + metadata.tsv.
+        string subDir = Path.Combine(logDir, tag);
+        if (!Directory.Exists(subDir)) Directory.CreateDirectory(subDir);
+        string tensorsPath = Path.Combine(subDir, "tensors.tsv");
+        string metadataPath = Path.Combine(subDir, "metadata.tsv");
+
+        // tensors.tsv — tab-separated floats per row, one row per
+        // embedding point. TensorBoard's projector reads this format.
+        using (var w = new StreamWriter(tensorsPath))
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                for (int c = 0; c < dim; c++)
+                {
+                    if (c > 0) w.Write('\t');
+                    w.Write(embeddings[r, c].ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                w.WriteLine();
+            }
+        }
+
+        if (metadataLabels is not null)
+        {
+            using var w = new StreamWriter(metadataPath);
+            foreach (var label in metadataLabels) w.WriteLine(label ?? string.Empty);
+        }
+
+        // projector_config.pbtxt — text-format protobuf the dashboard
+        // reads. We append rather than overwrite so multiple
+        // AddEmbedding calls can coexist in the same logDir.
+        string configPath = Path.Combine(logDir, "projector_config.pbtxt");
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("embeddings {");
+        sb.AppendLine($"  tensor_name: \"{tag}\"");
+        sb.AppendLine($"  tensor_path: \"{tag}/tensors.tsv\"");
+        if (metadataLabels is not null)
+            sb.AppendLine($"  metadata_path: \"{tag}/metadata.tsv\"");
+        sb.AppendLine("}");
+        File.AppendAllText(configPath, sb.ToString());
+    }
+
+    /// <summary>
+    /// Logs a model-graph summary — the GraphDef bytes that
+    /// TensorBoard's Graphs dashboard renders. The caller supplies
+    /// already-serialised <c>tensorflow.GraphDef</c> protobuf bytes;
+    /// AiDotNet doesn't ship a native TF graph emitter (we'd need
+    /// the entire <c>tensorflow</c> package's protobuf surface), so
+    /// this method exists to let callers who have a GraphDef from a
+    /// different source (e.g. an exported ONNX → TF transform) pipe
+    /// it through.
+    /// </summary>
+    /// <param name="graphDefBytes">Serialised tensorflow.GraphDef protobuf.</param>
+    public void AddGraph(byte[] graphDefBytes)
+    {
+        ThrowIfDisposed();
+        if (graphDefBytes is null) throw new ArgumentNullException(nameof(graphDefBytes));
+        if (graphDefBytes.Length == 0)
+            throw new ArgumentException("GraphDef bytes cannot be empty.", nameof(graphDefBytes));
+        // Event.graph_def = field 4, length-delimited.
+        var ev = new EventBuilder
+        {
+            WallTime = UnixSeconds(),
+            Step = 0,
+            GraphDefBytes = graphDefBytes,
+        }.ToBytes();
+        WriteRecord(ev);
+    }
+
+    /// <summary>
     /// Logs a numeric hyperparameter value as an ordinary scalar
     /// summary under tag <c>hparams/{name}</c>. Visible in
     /// TensorBoard's <b>Scalars</b> dashboard alongside other tagged
@@ -289,6 +420,13 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         ThrowIfDisposed();
         _stream.Flush();
     }
+
+    /// <summary>
+    /// Seconds since Unix epoch as a double — what the TFEvents
+    /// <c>Event.wall_time</c> field expects.
+    /// </summary>
+    private static double UnixSeconds()
+        => (DateTimeOffset.UtcNow - new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero)).TotalSeconds;
 
     private void WriteRecord(byte[] payload)
     {
@@ -411,6 +549,12 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         public double HistogramSumSq;
         public double[]? HistogramBucketLimits;
         public double[]? HistogramBucketCounts;
+        public string? ImageTag;
+        public byte[]? ImageBytes;
+        public int ImageWidth;
+        public int ImageHeight;
+        public int ImageColorspace;
+        public byte[]? GraphDefBytes;
 
         public byte[] ToBytes()
         {
@@ -447,8 +591,62 @@ public sealed class TensorBoardSummaryWriter : IDisposable
                 WriteVarintU64(ms, (ulong)summaryBytes.Length);
                 ms.Write(summaryBytes, 0, summaryBytes.Length);
             }
+            else if (ImageTag is not null && ImageBytes is not null)
+            {
+                var summaryBytes = BuildImageSummary(
+                    ImageTag, ImageBytes, ImageWidth, ImageHeight, ImageColorspace);
+                WriteTag(ms, fieldNumber: 5, wireType: 2);
+                WriteVarintU64(ms, (ulong)summaryBytes.Length);
+                ms.Write(summaryBytes, 0, summaryBytes.Length);
+            }
+            else if (GraphDefBytes is not null)
+            {
+                // graph_def = 4 (length-delimited bytes)
+                WriteTag(ms, fieldNumber: 4, wireType: 2);
+                WriteVarintU64(ms, (ulong)GraphDefBytes.Length);
+                ms.Write(GraphDefBytes, 0, GraphDefBytes.Length);
+            }
 
             return ms.ToArray();
+        }
+
+        // Summary.Image protobuf:
+        //   message Image {
+        //     int32 height = 1;
+        //     int32 width = 2;
+        //     int32 colorspace = 3;
+        //     bytes encoded_image_string = 4;
+        //   }
+        // Wrapped in Summary.Value with field 4 (image) of type Image.
+        private static byte[] BuildImageSummary(
+            string tag, byte[] encoded, int width, int height, int colorspace)
+        {
+            using var imgStream = new MemoryStream();
+            WriteTag(imgStream, 1, 0); WriteVarintI64(imgStream, height);
+            WriteTag(imgStream, 2, 0); WriteVarintI64(imgStream, width);
+            WriteTag(imgStream, 3, 0); WriteVarintI64(imgStream, colorspace);
+            WriteTag(imgStream, 4, 2);
+            WriteVarintU64(imgStream, (ulong)encoded.Length);
+            imgStream.Write(encoded, 0, encoded.Length);
+            var imgBytes = imgStream.ToArray();
+
+            using var valueStream = new MemoryStream();
+            // Value.tag = 1
+            WriteTag(valueStream, 1, 2);
+            var tagBytes = Encoding.UTF8.GetBytes(tag);
+            WriteVarintU64(valueStream, (ulong)tagBytes.Length);
+            valueStream.Write(tagBytes, 0, tagBytes.Length);
+            // Value.image = 4 (Image, length-delimited)
+            WriteTag(valueStream, 4, 2);
+            WriteVarintU64(valueStream, (ulong)imgBytes.Length);
+            valueStream.Write(imgBytes, 0, imgBytes.Length);
+            var valueBytes = valueStream.ToArray();
+
+            using var summaryStream = new MemoryStream();
+            WriteTag(summaryStream, 1, 2);
+            WriteVarintU64(summaryStream, (ulong)valueBytes.Length);
+            summaryStream.Write(valueBytes, 0, valueBytes.Length);
+            return summaryStream.ToArray();
         }
 
         private static byte[] BuildScalarSummary(string tag, float value)

@@ -60,9 +60,16 @@ internal static class Program
         Console.WriteLine("  ai-tensors inspect <path>");
         Console.WriteLine();
         Console.WriteLine("FORMATS:");
-        Console.WriteLine("  pt          PyTorch .pt / .pth (zip-format or legacy pickle)");
-        Console.WriteLine("  safetensors safetensors single-file");
+        Console.WriteLine("  pt                    PyTorch .pt / .pth (zip-format or legacy pickle)");
+        Console.WriteLine("  safetensors           safetensors single-file");
         Console.WriteLine("  safetensors-sharded   sharded safetensors directory + index.json");
+        Console.WriteLine("  gguf                  llama.cpp / ggml container");
+        Console.WriteLine();
+        Console.WriteLine("QUANTISATION (--quant for *→gguf, defaults to F32):");
+        Console.WriteLine("  F32     full precision (bytes copy verbatim from F32 sources)");
+        Console.WriteLine("  Q8_0    32-element block, FP16 scale + 32×int8 (~1.06 bytes/elem)");
+        Console.WriteLine("  Q4_0    32-element block, FP16 scale + 16×nibble (~0.56 bytes/elem)");
+        Console.WriteLine("  Q4_K_M  256-element super-block, ~4.5 bits/elem (canonical llama.cpp)");
         Console.WriteLine();
         Console.WriteLine("EXAMPLES:");
         Console.WriteLine("  ai-tensors convert --from pt --to safetensors \\");
@@ -72,12 +79,15 @@ internal static class Program
         Console.WriteLine("    --input model.safetensors --output checkpoints/sharded \\");
         Console.WriteLine("    --shard-size 5GB");
         Console.WriteLine();
+        Console.WriteLine("  ai-tensors convert --from safetensors --to gguf \\");
+        Console.WriteLine("    --input model.safetensors --output model.gguf --quant Q4_K_M");
+        Console.WriteLine();
         Console.WriteLine("  ai-tensors inspect model.safetensors");
     }
 
     private static int RunConvert(string[] args)
     {
-        var parsed = ParseFlags(args, "from", "to", "input", "output", "shard-size");
+        var parsed = ParseFlags(args, "from", "to", "input", "output", "shard-size", "quant");
         // Format names are case-insensitive — `--from PT` or `--from
         // SafeTensors` should hit the same dispatch as the lower-case
         // versions documented in --help. Normalise once at the entry.
@@ -88,6 +98,7 @@ internal static class Program
         long shardSize = parsed.TryGetValue("shard-size", out var ss)
             ? ParseSize(ss)
             : ShardedSafetensorsWriter.DefaultShardSizeBytes;
+        string quant = parsed.TryGetValue("quant", out var qq) ? qq.ToUpperInvariant() : "F32";
 
         Console.WriteLine($"convert {from} → {to}");
         Console.WriteLine($"  in : {input}");
@@ -106,6 +117,12 @@ internal static class Program
                 break;
             case "safetensors-sharded->safetensors-sharded":
                 ConvertReshard(input, output, shardSize);
+                break;
+            case "safetensors->gguf":
+                ConvertSafetensorsToGguf(input, output, quant);
+                break;
+            case "pt->gguf":
+                ConvertPtToGguf(input, output, quant);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -409,6 +426,150 @@ internal static class Program
         int n = w.Save();
         Console.WriteLine($"  resharded {r.Entries.Count} tensor(s) into {n} shard(s)");
     }
+
+    private static void ConvertSafetensorsToGguf(string input, string output, string quant)
+    {
+        using var r = SafetensorsReader.Open(input);
+        using var w = AiDotNet.Tensors.NumericOperations.GgufWriter.Create(output);
+        w.Metadata["general.name"] = Path.GetFileNameWithoutExtension(input);
+        w.Metadata["general.architecture"] = "unknown";
+
+        int count = 0;
+        foreach (var kv in r.Entries)
+        {
+            var entry = kv.Value;
+            int[] intShape = new int[entry.Shape.Length];
+            long[] longShape = new long[entry.Shape.Length];
+            for (int i = 0; i < entry.Shape.Length; i++)
+            {
+                if (entry.Shape[i] > int.MaxValue)
+                    throw new InvalidOperationException($"Tensor {kv.Key} dim too large for GGUF writer.");
+                intShape[i] = (int)entry.Shape[i];
+                longShape[i] = entry.Shape[i];
+            }
+            // Quantisation only applies to F32 source tensors.
+            if (entry.Dtype == AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F32 && quant != "F32")
+            {
+                var floats = r.ReadTensor<float>(kv.Key).AsSpan();
+                switch (quant)
+                {
+                    case "Q4_0":
+                        if (floats.Length % 32 != 0)
+                        {
+                            Console.Error.WriteLine($"warn: skipping {kv.Key} — Q4_0 needs 32-divisible elements; got {floats.Length}.");
+                            continue;
+                        }
+                        w.AddQ4_0(kv.Key, longShape, floats);
+                        break;
+                    case "Q8_0":
+                        if (floats.Length % 32 != 0)
+                        {
+                            Console.Error.WriteLine($"warn: skipping {kv.Key} — Q8_0 needs 32-divisible elements; got {floats.Length}.");
+                            continue;
+                        }
+                        w.AddQ8_0(kv.Key, longShape, floats);
+                        break;
+                    case "Q4_K":
+                    case "Q4_K_M":
+                        if (floats.Length % 256 != 0)
+                        {
+                            Console.Error.WriteLine($"warn: skipping {kv.Key} — Q4_K needs 256-divisible elements; got {floats.Length}.");
+                            continue;
+                        }
+                        w.AddQ4_K(kv.Key, longShape, floats);
+                        break;
+                    default:
+                        throw new ArgumentException(
+                            $"Unsupported quant tier '{quant}'. Supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q4_K_M.");
+                }
+            }
+            else
+            {
+                // Pass-through: write the byte payload verbatim.
+                var bytes = r.ReadRawBytes(kv.Key);
+                var ggufType = MapSafetensorsToGgufType(entry.Dtype);
+                w.AddRaw(kv.Key, ggufType, longShape, bytes);
+            }
+            count++;
+        }
+        w.Save();
+        Console.WriteLine($"  wrote {count} tensor(s) ({quant})");
+    }
+
+    private static void ConvertPtToGguf(string input, string output, string quant)
+    {
+        // Two-step: read .pt, convert each tensor through the same
+        // GGUF pipeline used for safetensors. F16 / BF16 storages
+        // pass through verbatim; F32 storages get quantised per the
+        // requested tier.
+        var pt = AiDotNet.Tensors.Serialization.Pickle.PtReader.Open(input);
+        using var w = AiDotNet.Tensors.NumericOperations.GgufWriter.Create(output);
+        w.Metadata["general.name"] = Path.GetFileNameWithoutExtension(input);
+        w.Metadata["general.architecture"] = "unknown";
+
+        int count = 0;
+        foreach (var kv in pt.Tensors)
+        {
+            var t = kv.Value;
+            long[] longShape = new long[t.Shape.Length];
+            for (int i = 0; i < t.Shape.Length; i++) longShape[i] = t.Shape[i];
+
+            switch (t.DtypeStorage)
+            {
+                case "FloatStorage":
+                    var floats = AiDotNet.Tensors.Serialization.Pickle.PtReader.ToTensor<float>(t).AsSpan();
+                    switch (quant)
+                    {
+                        case "F32":
+                            w.AddF32(kv.Key, longShape, floats);
+                            break;
+                        case "Q4_0":
+                            if (floats.Length % 32 != 0) { Console.Error.WriteLine($"warn: skipping {kv.Key}"); continue; }
+                            w.AddQ4_0(kv.Key, longShape, floats);
+                            break;
+                        case "Q8_0":
+                            if (floats.Length % 32 != 0) { Console.Error.WriteLine($"warn: skipping {kv.Key}"); continue; }
+                            w.AddQ8_0(kv.Key, longShape, floats);
+                            break;
+                        case "Q4_K":
+                        case "Q4_K_M":
+                            if (floats.Length % 256 != 0) { Console.Error.WriteLine($"warn: skipping {kv.Key}"); continue; }
+                            w.AddQ4_K(kv.Key, longShape, floats);
+                            break;
+                        default:
+                            throw new ArgumentException($"Unsupported quant tier '{quant}'.");
+                    }
+                    break;
+                case "HalfStorage":
+                    w.AddF16(kv.Key, longShape, ExtractContiguousBytes(t));
+                    break;
+                case "BFloat16Storage":
+                    w.AddBF16(kv.Key, longShape, ExtractContiguousBytes(t));
+                    break;
+                default:
+                    Console.Error.WriteLine(
+                        $"warn: skipping {kv.Key} — pt→gguf doesn't yet handle {t.DtypeStorage}.");
+                    continue;
+            }
+            count++;
+        }
+        w.Save();
+        Console.WriteLine($"  wrote {count} tensor(s) ({quant})");
+    }
+
+    private static AiDotNet.Tensors.NumericOperations.GgufType MapSafetensorsToGgufType(AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype dtype) => dtype switch
+    {
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F32 => AiDotNet.Tensors.NumericOperations.GgufType.F32,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F64 => AiDotNet.Tensors.NumericOperations.GgufType.F64,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F16 => AiDotNet.Tensors.NumericOperations.GgufType.F16,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.BF16 => AiDotNet.Tensors.NumericOperations.GgufType.BF16,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.I8 => AiDotNet.Tensors.NumericOperations.GgufType.I8,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.I16 => AiDotNet.Tensors.NumericOperations.GgufType.I16,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.I32 => AiDotNet.Tensors.NumericOperations.GgufType.I32,
+        AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.I64 => AiDotNet.Tensors.NumericOperations.GgufType.I64,
+        _ => throw new InvalidOperationException(
+            $"Cannot map safetensors dtype {dtype} to a GGUF type — sub-byte and U8/BOOL aren't directly representable in GGUF v3."),
+    };
 
     private static long ParseSize(string s)
     {

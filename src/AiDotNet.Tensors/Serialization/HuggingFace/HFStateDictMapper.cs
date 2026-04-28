@@ -178,6 +178,206 @@ public static class HFStateDictMapper
                 new HFRule(@"\.output\.dense\.", ".mlp.fc2."),
             });
 
+        // GPT-Neo — `transformer.h.{i}` like GPT-2, but with two
+        // attention-type alternation per layer (`local` / `global`).
+        // Naming uses `attention.attention.{q,k,v,out}_proj` (note the
+        // double-`attention` prefix that distinguishes from GPT-2).
+        d["GPT_NEO"] = new HFNamingPreset(
+            "GPT_NEO",
+            new[]
+            {
+                new HFRule(@"^transformer\.h\.(\d+)\.", "blocks[$1]."),
+                new HFRule(@"^transformer\.wte\.", "embedding.token."),
+                new HFRule(@"^transformer\.wpe\.", "embedding.pos."),
+                new HFRule(@"^transformer\.ln_f\.", "final_norm."),
+                new HFRule(@"\.attn\.attention\.q_proj\.", ".attention.q."),
+                new HFRule(@"\.attn\.attention\.k_proj\.", ".attention.k."),
+                new HFRule(@"\.attn\.attention\.v_proj\.", ".attention.v."),
+                new HFRule(@"\.attn\.attention\.out_proj\.", ".attention.out."),
+                new HFRule(@"\.ln_1\.", ".norm1."),
+                new HFRule(@"\.ln_2\.", ".norm2."),
+                new HFRule(@"\.mlp\.c_fc\.", ".mlp.fc1."),
+                new HFRule(@"\.mlp\.c_proj\.", ".mlp.fc2."),
+            });
+
+        // CLIP — vision-text dual encoder (text_model + vision_model
+        // sub-towers). Used by HF ViT-CLIP, OpenAI CLIP, SigLIP, etc.
+        d["CLIP"] = new HFNamingPreset(
+            "CLIP",
+            new[]
+            {
+                new HFRule(@"^text_model\.encoder\.layers\.(\d+)\.", "text.encoder.layers[$1]."),
+                new HFRule(@"^text_model\.embeddings\.token_embedding\.", "text.embedding.token."),
+                new HFRule(@"^text_model\.embeddings\.position_embedding\.", "text.embedding.pos."),
+                new HFRule(@"^text_model\.final_layer_norm\.", "text.final_norm."),
+                new HFRule(@"^vision_model\.encoder\.layers\.(\d+)\.", "vision.encoder.layers[$1]."),
+                new HFRule(@"^vision_model\.embeddings\.patch_embedding\.", "vision.patch_embed."),
+                new HFRule(@"^vision_model\.embeddings\.position_embedding\.", "vision.pos_embed."),
+                new HFRule(@"^vision_model\.embeddings\.class_embedding$", "vision.cls_token"),
+                new HFRule(@"^vision_model\.pre_layrnorm\.", "vision.pre_norm."),
+                new HFRule(@"^vision_model\.post_layernorm\.", "vision.final_norm."),
+                new HFRule(@"\.self_attn\.q_proj\.", ".attention.q."),
+                new HFRule(@"\.self_attn\.k_proj\.", ".attention.k."),
+                new HFRule(@"\.self_attn\.v_proj\.", ".attention.v."),
+                new HFRule(@"\.self_attn\.out_proj\.", ".attention.out."),
+                new HFRule(@"\.layer_norm1\.", ".norm1."),
+                new HFRule(@"\.layer_norm2\.", ".norm2."),
+                new HFRule(@"\.mlp\.fc1\.", ".mlp.fc1."),
+                new HFRule(@"\.mlp\.fc2\.", ".mlp.fc2."),
+                new HFRule(@"^text_projection\.", "text.projection."),
+                new HFRule(@"^visual_projection\.", "vision.projection."),
+            });
+
+        // T5 — encoder-decoder with relative position bias. The HF
+        // naming uses `block.{i}.layer.{j}` where j=0 is self-attn,
+        // j=1 is cross-attn (decoder only), j=last is FFN.
+        d["T5"] = new HFNamingPreset(
+            "T5",
+            new[]
+            {
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.q\.", "encoder.layers[$1].attention.q."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.k\.", "encoder.layers[$1].attention.k."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.v\.", "encoder.layers[$1].attention.v."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.o\.", "encoder.layers[$1].attention.out."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.relative_attention_bias\.", "encoder.layers[$1].attention.rel_pos."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.0\.layer_norm\.", "encoder.layers[$1].norm1."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.1\.DenseReluDense\.wi\.", "encoder.layers[$1].mlp.fc1."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.1\.DenseReluDense\.wo\.", "encoder.layers[$1].mlp.fc2."),
+                new HFRule(@"^encoder\.block\.(\d+)\.layer\.1\.layer_norm\.", "encoder.layers[$1].norm2."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.0\.SelfAttention\.q\.", "decoder.layers[$1].self_attn.q."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.0\.SelfAttention\.k\.", "decoder.layers[$1].self_attn.k."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.0\.SelfAttention\.v\.", "decoder.layers[$1].self_attn.v."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.0\.SelfAttention\.o\.", "decoder.layers[$1].self_attn.out."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.1\.EncDecAttention\.q\.", "decoder.layers[$1].cross_attn.q."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.1\.EncDecAttention\.k\.", "decoder.layers[$1].cross_attn.k."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.1\.EncDecAttention\.v\.", "decoder.layers[$1].cross_attn.v."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.1\.EncDecAttention\.o\.", "decoder.layers[$1].cross_attn.out."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.2\.DenseReluDense\.wi\.", "decoder.layers[$1].mlp.fc1."),
+                new HFRule(@"^decoder\.block\.(\d+)\.layer\.2\.DenseReluDense\.wo\.", "decoder.layers[$1].mlp.fc2."),
+                new HFRule(@"^encoder\.final_layer_norm\.", "encoder.final_norm."),
+                new HFRule(@"^decoder\.final_layer_norm\.", "decoder.final_norm."),
+                new HFRule(@"^shared\.", "embedding."),
+                new HFRule(@"^lm_head\.", "lm_head."),
+            });
+
+        // Whisper — encoder-decoder with conv-stem + sinusoidal pos
+        // for the encoder side. Decoder uses BART-style attention
+        // (separate self_attn + encoder_attn).
+        d["WHISPER"] = new HFNamingPreset(
+            "WHISPER",
+            new[]
+            {
+                new HFRule(@"^model\.encoder\.layers\.(\d+)\.", "encoder.layers[$1]."),
+                new HFRule(@"^model\.decoder\.layers\.(\d+)\.", "decoder.layers[$1]."),
+                new HFRule(@"^model\.encoder\.conv1\.", "encoder.conv1."),
+                new HFRule(@"^model\.encoder\.conv2\.", "encoder.conv2."),
+                new HFRule(@"^model\.encoder\.embed_positions\.", "encoder.pos_embed."),
+                new HFRule(@"^model\.encoder\.layer_norm\.", "encoder.final_norm."),
+                new HFRule(@"^model\.decoder\.embed_tokens\.", "decoder.embedding."),
+                new HFRule(@"^model\.decoder\.embed_positions\.", "decoder.pos_embed."),
+                new HFRule(@"^model\.decoder\.layer_norm\.", "decoder.final_norm."),
+                new HFRule(@"\.self_attn\.q_proj\.", ".attention.q."),
+                new HFRule(@"\.self_attn\.k_proj\.", ".attention.k."),
+                new HFRule(@"\.self_attn\.v_proj\.", ".attention.v."),
+                new HFRule(@"\.self_attn\.out_proj\.", ".attention.out."),
+                new HFRule(@"\.encoder_attn\.q_proj\.", ".cross_attn.q."),
+                new HFRule(@"\.encoder_attn\.k_proj\.", ".cross_attn.k."),
+                new HFRule(@"\.encoder_attn\.v_proj\.", ".cross_attn.v."),
+                new HFRule(@"\.encoder_attn\.out_proj\.", ".cross_attn.out."),
+                new HFRule(@"\.self_attn_layer_norm\.", ".norm1."),
+                new HFRule(@"\.encoder_attn_layer_norm\.", ".cross_attn_norm."),
+                new HFRule(@"\.final_layer_norm\.", ".norm2."),
+                new HFRule(@"\.fc1\.", ".mlp.fc1."),
+                new HFRule(@"\.fc2\.", ".mlp.fc2."),
+                new HFRule(@"^proj_out\.", "lm_head."),
+            });
+
+        // Stable Diffusion U-Net (SD 1.x / SD 2.x). Down/up blocks,
+        // ResNet + Cross-Attention sub-blocks, time-embedding.
+        // Pattern: `down_blocks.{i}.{type}.{j}.{path}` where type is
+        // resnets / attentions / downsamplers, etc.
+        d["SD_UNET"] = new HFNamingPreset(
+            "SD_UNET",
+            new[]
+            {
+                new HFRule(@"^down_blocks\.(\d+)\.resnets\.(\d+)\.", "down[$1].res[$2]."),
+                new HFRule(@"^down_blocks\.(\d+)\.attentions\.(\d+)\.", "down[$1].attn[$2]."),
+                new HFRule(@"^down_blocks\.(\d+)\.downsamplers\.0\.", "down[$1].downsample."),
+                new HFRule(@"^up_blocks\.(\d+)\.resnets\.(\d+)\.", "up[$1].res[$2]."),
+                new HFRule(@"^up_blocks\.(\d+)\.attentions\.(\d+)\.", "up[$1].attn[$2]."),
+                new HFRule(@"^up_blocks\.(\d+)\.upsamplers\.0\.", "up[$1].upsample."),
+                new HFRule(@"^mid_block\.resnets\.(\d+)\.", "mid.res[$1]."),
+                new HFRule(@"^mid_block\.attentions\.(\d+)\.", "mid.attn[$1]."),
+                new HFRule(@"^time_embedding\.linear_1\.", "time_embed.fc1."),
+                new HFRule(@"^time_embedding\.linear_2\.", "time_embed.fc2."),
+                new HFRule(@"^conv_in\.", "conv_in."),
+                new HFRule(@"^conv_out\.", "conv_out."),
+                new HFRule(@"^conv_norm_out\.", "norm_out."),
+                // ResNet sub-block paths.
+                new HFRule(@"\.norm1\.", ".norm1."),
+                new HFRule(@"\.norm2\.", ".norm2."),
+                new HFRule(@"\.conv1\.", ".conv1."),
+                new HFRule(@"\.conv2\.", ".conv2."),
+                new HFRule(@"\.time_emb_proj\.", ".time_proj."),
+                // Cross-attention sub-block paths (transformer_blocks.0
+                // is the standard SD layout).
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_q\.", ".tblocks[$1].attn1.q."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_k\.", ".tblocks[$1].attn1.k."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_v\.", ".tblocks[$1].attn1.v."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_out\.0\.", ".tblocks[$1].attn1.out."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_q\.", ".tblocks[$1].attn2.q."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_k\.", ".tblocks[$1].attn2.k."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_v\.", ".tblocks[$1].attn2.v."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_out\.0\.", ".tblocks[$1].attn2.out."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.", ".tblocks[$1].ff.fc1."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.ff\.net\.2\.", ".tblocks[$1].ff.fc2."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm1\.", ".tblocks[$1].norm1."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm2\.", ".tblocks[$1].norm2."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm3\.", ".tblocks[$1].norm3."),
+                new HFRule(@"\.proj_in\.", ".proj_in."),
+                new HFRule(@"\.proj_out\.", ".proj_out."),
+            });
+
+        // SDXL U-Net — extends SD_UNET with `add_embedding.{linear_1,
+        // linear_2}` (the additional aesthetic-condition embedding)
+        // and `text_embeds`. Inherits all the SD_UNET rules and
+        // overrides nothing — just adds the new prefixes.
+        d["SDXL_UNET"] = new HFNamingPreset(
+            "SDXL_UNET",
+            new[]
+            {
+                // SDXL-specific additions.
+                new HFRule(@"^add_embedding\.linear_1\.", "add_embed.fc1."),
+                new HFRule(@"^add_embedding\.linear_2\.", "add_embed.fc2."),
+                // ↓ all rules from SD_UNET below ↓
+                new HFRule(@"^down_blocks\.(\d+)\.resnets\.(\d+)\.", "down[$1].res[$2]."),
+                new HFRule(@"^down_blocks\.(\d+)\.attentions\.(\d+)\.", "down[$1].attn[$2]."),
+                new HFRule(@"^down_blocks\.(\d+)\.downsamplers\.0\.", "down[$1].downsample."),
+                new HFRule(@"^up_blocks\.(\d+)\.resnets\.(\d+)\.", "up[$1].res[$2]."),
+                new HFRule(@"^up_blocks\.(\d+)\.attentions\.(\d+)\.", "up[$1].attn[$2]."),
+                new HFRule(@"^up_blocks\.(\d+)\.upsamplers\.0\.", "up[$1].upsample."),
+                new HFRule(@"^mid_block\.resnets\.(\d+)\.", "mid.res[$1]."),
+                new HFRule(@"^mid_block\.attentions\.(\d+)\.", "mid.attn[$1]."),
+                new HFRule(@"^time_embedding\.linear_1\.", "time_embed.fc1."),
+                new HFRule(@"^time_embedding\.linear_2\.", "time_embed.fc2."),
+                new HFRule(@"^conv_in\.", "conv_in."),
+                new HFRule(@"^conv_out\.", "conv_out."),
+                new HFRule(@"^conv_norm_out\.", "norm_out."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_q\.", ".tblocks[$1].attn1.q."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_k\.", ".tblocks[$1].attn1.k."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_v\.", ".tblocks[$1].attn1.v."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn1\.to_out\.0\.", ".tblocks[$1].attn1.out."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_q\.", ".tblocks[$1].attn2.q."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_k\.", ".tblocks[$1].attn2.k."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_v\.", ".tblocks[$1].attn2.v."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.attn2\.to_out\.0\.", ".tblocks[$1].attn2.out."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.", ".tblocks[$1].ff.fc1."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.ff\.net\.2\.", ".tblocks[$1].ff.fc2."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm1\.", ".tblocks[$1].norm1."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm2\.", ".tblocks[$1].norm2."),
+                new HFRule(@"\.transformer_blocks\.(\d+)\.norm3\.", ".tblocks[$1].norm3."),
+            });
+
         return d;
     }
 }
