@@ -109,6 +109,12 @@ public sealed class OneCycleLr : LrScheduler
     {
         if (totalSteps <= 0) throw new ArgumentOutOfRangeException(nameof(totalSteps));
         if (pctStart <= 0 || pctStart >= 1) throw new ArgumentOutOfRangeException(nameof(pctStart));
+        if (divFactor <= 0)
+            throw new ArgumentOutOfRangeException(nameof(divFactor),
+                "divFactor must be > 0 (initial_lr = max_lr / divFactor).");
+        if (finalDivFactor <= 0)
+            throw new ArgumentOutOfRangeException(nameof(finalDivFactor),
+                "finalDivFactor must be > 0 (final_lr = initial_lr / finalDivFactor).");
         MaxLr = maxLr; TotalSteps = totalSteps;
         PctStart = pctStart; UseCosineAnnealing = cosineAnneal;
         DivFactor = divFactor; FinalDivFactor = finalDivFactor;
@@ -193,7 +199,19 @@ public sealed class ReduceLrOnPlateau
         if (mode != "min" && mode != "max") throw new ArgumentException("mode must be 'min' or 'max'.", nameof(mode));
         if (thresholdMode != "rel" && thresholdMode != "abs")
             throw new ArgumentException("thresholdMode must be 'rel' or 'abs'.", nameof(thresholdMode));
-        if (factor >= 1.0) throw new ArgumentOutOfRangeException(nameof(factor), "factor must be < 1.");
+        if (factor <= 0.0 || factor >= 1.0)
+            throw new ArgumentOutOfRangeException(nameof(factor),
+                "factor must satisfy 0 < factor < 1 (it is a multiplicative LR reduction).");
+        if (patience < 0)
+            throw new ArgumentOutOfRangeException(nameof(patience), "patience must be >= 0.");
+        if (cooldown < 0)
+            throw new ArgumentOutOfRangeException(nameof(cooldown), "cooldown must be >= 0.");
+        if (threshold < 0.0)
+            throw new ArgumentOutOfRangeException(nameof(threshold), "threshold must be >= 0.");
+        if (minLr < 0.0)
+            throw new ArgumentOutOfRangeException(nameof(minLr), "minLr must be >= 0.");
+        if (eps < 0.0)
+            throw new ArgumentOutOfRangeException(nameof(eps), "eps must be >= 0.");
         Optimizer = optimizer ?? throw new ArgumentNullException(nameof(optimizer));
         Mode = mode; Factor = factor; Patience = patience;
         Threshold = threshold; ThresholdMode = thresholdMode;
@@ -292,17 +310,30 @@ public sealed class SequentialLr : LrScheduler
         return Schedulers[idx].GetLastLr();
     }
 
-    /// <summary>Advance the active scheduler.</summary>
+    /// <summary>Advance the active scheduler. If <paramref name="epoch"/> is supplied,
+    /// the active child is driven to its corresponding LOCAL epoch
+    /// (<c>epoch − milestone-of-prev-segment</c>) so resume-from-checkpoint lands on
+    /// the correct LR even if it falls past several milestones.</summary>
     public override void Step(int? epoch = null)
     {
         LastEpoch = epoch ?? LastEpoch + 1;
         int idx = ActiveIndex();
-        // Each child scheduler has already applied its epoch-0 LR in its constructor.
-        // On the very step we cross a milestone, the new scheduler should apply that
-        // already-prepared epoch-0 LR (via Step(0)) instead of advancing to its epoch 1.
-        bool justSwitched = idx > 0 && LastEpoch == Milestones[idx - 1];
-        if (justSwitched) Schedulers[idx].Step(0);
-        else Schedulers[idx].Step();
+        // Local epoch within the active child's segment.
+        int localEpoch = idx == 0 ? LastEpoch : LastEpoch - Milestones[idx - 1];
+        if (epoch.HasValue)
+        {
+            // Explicit epoch — drive the child directly to its local epoch.
+            Schedulers[idx].Step(localEpoch);
+        }
+        else
+        {
+            // Each child scheduler has already applied its epoch-0 LR in its constructor.
+            // On the very step we cross a milestone, the new scheduler should apply that
+            // already-prepared epoch-0 LR (via Step(0)) instead of advancing to its epoch 1.
+            bool justSwitched = idx > 0 && LastEpoch == Milestones[idx - 1];
+            if (justSwitched) Schedulers[idx].Step(0);
+            else Schedulers[idx].Step();
+        }
         // Mirror the active child's last LRs into our own buffer for GetLastLr().
         var lr = Schedulers[idx].GetLastLr();
         for (int i = 0; i < _lastLrs.Length; i++) _lastLrs[i] = lr[i];

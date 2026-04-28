@@ -296,7 +296,8 @@ public sealed class AdamaxOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
-        ["lr"] = 2e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["weight_decay"] = 0.0,
+        ["lr"] = 2e-3, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
+        ["weight_decay"] = 0.0, ["maximize"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "exp_avg", "exp_inf" };
     /// <inheritdoc />
@@ -307,12 +308,15 @@ public sealed class AdamaxOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        bool maximized = ApplyMaximize();
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
             float lr = (float)g.LearningRate;
             float b1 = (float)g.GetOption("beta1", 0.9);
             float b2 = (float)g.GetOption("beta2", 0.999);
+            float eps = (float)g.GetOption("eps", 1e-8);
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
@@ -327,10 +331,11 @@ public sealed class AdamaxOptimizer : OptimizerBase
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pu = u)
-                        FusedOptimizer.AdaMaxUpdateSimd(pp, pg, pm, pu, p.Length, lr, b1, b2, step);
+                        FusedOptimizer.AdaMaxUpdateSimd(pp, pg, pm, pu, p.Length, lr, b1, b2, eps, step);
                 }
             }
         }
+        } finally { if (maximized) UnflipMaximize(); }
     }
 }
 
@@ -552,10 +557,13 @@ public sealed class AsgdOptimizer : OptimizerBase
         ["lr"] = 1e-2, ["lambd"] = 1e-4, ["alpha"] = 0.75, ["t0"] = 1e6, ["weight_decay"] = 0.0,
     };
     private static readonly string[] _stateNames = new[] { "step", "eta", "mu", "ax" };
+    private static readonly string[] _scalarNames = new[] { "step", "eta", "mu" };
     /// <inheritdoc />
     protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
     /// <inheritdoc />
     protected override IReadOnlyList<string> StateNames => _stateNames;
+    /// <inheritdoc />
+    protected override IReadOnlyList<string> ScalarStateNames => _scalarNames;
 
     /// <inheritdoc />
     public override void Step()

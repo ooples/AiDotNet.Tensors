@@ -53,6 +53,8 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
         if (parameter == null) throw new ArgumentNullException(nameof(parameter));
         if (gradient == null) throw new ArgumentNullException(nameof(gradient));
         if (patternNibbles == null) throw new ArgumentNullException(nameof(patternNibbles));
+        if (parameter.Length == 0)
+            throw new ArgumentException("parameter must not be empty.", nameof(parameter));
         if (parameter.Length % 4 != 0)
             throw new ArgumentException("2:4 sparsity requires parameter length to be a multiple of 4.");
         int blocks = parameter.Length / 4;
@@ -61,9 +63,30 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
             throw new ArgumentException(
                 $"patternNibbles length {patternNibbles.Length} != expected {expectedPatternBytes}.");
 
+        // Validate every block's nibble: the two 2-bit indices must be distinct (2:4 sparsity
+        // demands TWO live positions per block of four). A repeated index would silently degrade
+        // to 1:4 sparsity.
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            byte b = patternNibbles[blk >> 1];
+            byte nib = (blk & 1) == 0 ? (byte)(b & 0x0F) : (byte)((b >> 4) & 0x0F);
+            int idx0 = nib & 0x3;
+            int idx1 = (nib >> 2) & 0x3;
+            if (idx0 == idx1)
+                throw new ArgumentException(
+                    $"block {blk}: nibble 0x{nib:X1} encodes a repeated live index ({idx0}); " +
+                    "2:4 sparsity requires two distinct positions per block.",
+                    nameof(patternNibbles));
+        }
+
+        // Defensive copy — the caller may reuse / mutate their pattern buffer; the optimizer
+        // assumes the pattern is immutable for the lifetime of the parameter.
+        var patternCopy = new byte[patternNibbles.Length];
+        Array.Copy(patternNibbles, patternCopy, patternNibbles.Length);
+
         var grp = AddParamGroup(overrides);
         grp.AddParameter(parameter, gradient);
-        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternNibbles;
+        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
         return grp;
     }
 

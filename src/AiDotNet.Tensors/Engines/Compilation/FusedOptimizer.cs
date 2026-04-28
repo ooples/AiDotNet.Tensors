@@ -277,11 +277,12 @@ internal static class FusedOptimizer
         }
     }
 
-    /// <summary>AVX2 AdaMax: Adam variant with infinity norm (max instead of L2)</summary>
+    /// <summary>AVX2 AdaMax: Adam variant with infinity norm (max instead of L2).
+    /// Caller-supplied <paramref name="eps"/> matches PyTorch <c>torch.optim.Adamax(eps=)</c>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AdaMaxUpdateSimd(
         float* param, float* grad, float* m, float* u, int length,
-        float lr, float beta1, float beta2, int step)
+        float lr, float beta1, float beta2, float eps, int step)
     {
         float bc1 = 1f - MathF.Pow(beta1, step);
         float lrAdj = lr / bc1;
@@ -293,7 +294,7 @@ internal static class FusedOptimizer
             var v1mB1 = Vector256.Create(1f - beta1);
             var vB2 = Vector256.Create(beta2);
             var vLr = Vector256.Create(-lrAdj);
-            var vEps = Vector256.Create(1e-8f);
+            var vEps = Vector256.Create(eps);
             var signMask = Vector256.Create(0x7FFFFFFFu).AsSingle(); // abs mask
             int simdLen = length & ~7;
             for (; i < simdLen; i += 8)
@@ -315,7 +316,7 @@ internal static class FusedOptimizer
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             u[i] = MathF.Max(beta2 * u[i], MathF.Abs(grad[i]));
             float mHat = m[i] / bc1;
-            param[i] -= lr * mHat / (u[i] + 1e-8f);
+            param[i] -= lr * mHat / (u[i] + eps);
         }
     }
 

@@ -126,7 +126,9 @@ public sealed class LBFGSOptimizer
 
         StepCount++;
         // Per-PyTorch semantics, MaxEval is a budget for THIS Step() call, not cumulative.
+        // Stash the snapshot on the instance so StrongWolfe/Zoom helpers can also honor it.
         int funcEvalsAtStepStart = FuncEvals;
+        _funcEvalsAtStepStart = funcEvalsAtStepStart;
         float loss = closure();
         FuncEvals++;
         float[] flatGrad = FlattenGradient();
@@ -136,7 +138,10 @@ public sealed class LBFGSOptimizer
         float[] d = new float[_flatLen]; // search direction (negative two-loop result)
         int nIter = 0;
         float t = LearningRate;
-        bool firstIter = _prevFlatGrad == null;
+        // Treat the iteration as a fresh start whenever EITHER prev-grad or prev-direction
+        // is missing. Without the _prevD check, a previous Step() that exited early after
+        // setting _prevFlatGrad but before assigning _prevD would null-deref _prevD! below.
+        bool firstIter = _prevFlatGrad == null || _prevD == null;
 
         while (nIter < MaxIter)
         {
@@ -237,6 +242,12 @@ public sealed class LBFGSOptimizer
     private float[]? _prevD;
     private float _prevT;
 
+    // Set at the top of each Step() so the line-search helpers can short-circuit when
+    // the per-call MaxEval budget is exhausted, instead of consuming arbitrary additional
+    // closure evaluations and only honoring the budget after the line search returns.
+    private int _funcEvalsAtStepStart;
+    private bool BudgetExhausted => FuncEvals - _funcEvalsAtStepStart >= MaxEval;
+
     private void TwoLoopRecursion(float[] grad, float[] d)
     {
         // Two-loop recursion (Nocedal & Wright Algorithm 7.4):
@@ -285,7 +296,7 @@ public sealed class LBFGSOptimizer
         float[]? gPrev = null;
         bool done = false;
         int ls = 0;
-        while (!done && ls < maxLs)
+        while (!done && ls < maxLs && !BudgetExhausted)
         {
             ls++;
             if (fNew > fInit + c1 * t * gtd || (ls > 1 && fNew >= fPrev))
@@ -321,6 +332,7 @@ public sealed class LBFGSOptimizer
         float fNew = fLo; float[] gNew = gLoOpt ?? new float[_flatLen]; float t = lo;
         for (int it = 0; it < 25; it++)
         {
+            if (BudgetExhausted) break;
             t = 0.5f * (lo + hi);
             if (Math.Abs(hi - lo) < xtol) break;
             SetParamsFrom(xInit, d, t);

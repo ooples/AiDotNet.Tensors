@@ -67,7 +67,15 @@ public sealed class ShampooOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             float eps = (float)g.GetOption("eps", 1e-12);
             int preFreq = (int)g.GetOption("precondition_freq", 10.0);
-            int maxDim  = (int)g.GetOption("max_precondition_dim", 1024.0);
+            if (preFreq <= 0)
+                throw new ArgumentOutOfRangeException(
+                    nameof(preFreq),
+                    $"precondition_freq must be > 0 to avoid division-by-zero in step-modulo math; got {preFreq}.");
+            int maxDim = (int)g.GetOption("max_precondition_dim", 1024.0);
+            if (maxDim <= 0)
+                throw new ArgumentOutOfRangeException(
+                    nameof(maxDim),
+                    $"max_precondition_dim must be > 0; got {maxDim}.");
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {

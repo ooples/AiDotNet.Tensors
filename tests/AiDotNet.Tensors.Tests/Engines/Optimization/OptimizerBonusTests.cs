@@ -342,15 +342,23 @@ public class OptimizerBonusTests
 
 internal static class RandomGaussianExtensions
 {
-    private static double _saved; private static bool _haveSaved;
+    // Per-Random Box-Muller cache. The previous implementation used static fields, which
+    // shared the second-Gaussian cache across every Random instance and even across threads.
+    // This conditional table associates each Random with its own (saved, haveSaved) pair.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Random, BoxMullerCache> _caches
+        = new System.Runtime.CompilerServices.ConditionalWeakTable<Random, BoxMullerCache>();
+
+    private sealed class BoxMullerCache { public double Saved; public bool HaveSaved; }
+
     public static double NextGaussian(this Random rng)
     {
-        if (_haveSaved) { _haveSaved = false; return _saved; }
+        var cache = _caches.GetValue(rng, _ => new BoxMullerCache());
+        if (cache.HaveSaved) { cache.HaveSaved = false; return cache.Saved; }
         double u1 = rng.NextDouble(); double u2 = rng.NextDouble();
         if (u1 < 1e-12) u1 = 1e-12;
         double z0 = Math.Sqrt(-2 * Math.Log(u1)) * Math.Cos(2 * Math.PI * u2);
         double z1 = Math.Sqrt(-2 * Math.Log(u1)) * Math.Sin(2 * Math.PI * u2);
-        _saved = z1; _haveSaved = true;
+        cache.Saved = z1; cache.HaveSaved = true;
         return z0;
     }
 }

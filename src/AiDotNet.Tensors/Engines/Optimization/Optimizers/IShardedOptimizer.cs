@@ -54,8 +54,15 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
     public int Rank { get; }
     /// <inheritdoc />
     public int WorldSize { get; }
+
     /// <inheritdoc />
-    public IReadOnlyList<int> LocalParamIds { get; }
+    /// <remarks>
+    /// Recomputed every read so additions to <see cref="ParamGroups"/> after the
+    /// shard is constructed are reflected in the live partition. Returning a frozen
+    /// snapshot would silently desync the view from <see cref="LocalStateDict"/>
+    /// after any <see cref="ParamGroup.AddParameter"/> call.
+    /// </remarks>
+    public IReadOnlyList<int> LocalParamIds => ComputeLocalIds(_inner, Rank, WorldSize);
 
     /// <summary>Build a sharded optimizer view of <paramref name="inner"/>.</summary>
     public ZeroShardedOptimizer(OptimizerBase inner, int rank, int worldSize)
@@ -65,7 +72,6 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
         if (rank < 0 || rank >= worldSize) throw new System.ArgumentOutOfRangeException(nameof(rank));
         _inner = inner;
         Rank = rank; WorldSize = worldSize;
-        LocalParamIds = ComputeLocalIds(inner, rank, worldSize);
     }
 
     private static IReadOnlyList<int> ComputeLocalIds(OptimizerBase inner, int rank, int worldSize)
@@ -86,7 +92,62 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
         => _inner.AddParamGroup(overrides);
 
     /// <inheritdoc />
-    public void Step() => _inner.Step();
+    /// <remarks>
+    /// ZeRO-1 contract: each rank steps only its local parameters; non-local parameters
+    /// (and their state) must not change on this rank — they are owned and updated by
+    /// other ranks, then communicated back via all-gather.
+    ///
+    /// We achieve that without touching every concrete optimizer by snapshotting the
+    /// non-local parameters and their state before delegating to <c>_inner.Step()</c>,
+    /// then restoring them afterwards. Local params + state are updated normally.
+    /// </remarks>
+    public void Step()
+    {
+        var localSet = new HashSet<int>(LocalParamIds);
+
+        // Snapshot non-local params + their gradient (so the inner Step's writes are reversible).
+        var paramSnapshots = new List<(float[] target, float[] saved)>();
+        var gradSnapshots = new List<(float[] target, float[] saved)>();
+        // Snapshot non-local optimizer state (deep clone of the OptimizerStateValue dictionary).
+        var stateSnapshots = new List<(int gi, int pi, Dictionary<string, OptimizerStateValue> saved)>();
+
+        int globalId = 0;
+        for (int gi = 0; gi < _inner.ParamGroups.Count; gi++)
+        {
+            var grp = _inner.ParamGroups[gi];
+            for (int pi = 0; pi < grp.Parameters.Count; pi++, globalId++)
+            {
+                if (localSet.Contains(globalId)) continue;
+                var p = grp.Parameters[pi];
+                var g = grp.Gradients[pi];
+                paramSnapshots.Add((p, (float[])p.Clone()));
+                gradSnapshots.Add((g, (float[])g.Clone()));
+                if (_inner.StateInternal.TryGetValue((gi, pi), out var slots))
+                    stateSnapshots.Add((gi, pi, CloneSlots(slots)));
+            }
+        }
+
+        _inner.Step();
+
+        // Restore non-local params + state.
+        foreach (var (target, saved) in paramSnapshots) System.Array.Copy(saved, target, target.Length);
+        foreach (var (target, saved) in gradSnapshots)  System.Array.Copy(saved, target, target.Length);
+        foreach (var (gi, pi, saved) in stateSnapshots)
+            _inner.StateInternal[(gi, pi)] = saved;
+    }
+
+    private static Dictionary<string, OptimizerStateValue> CloneSlots(Dictionary<string, OptimizerStateValue> src)
+    {
+        var dst = new Dictionary<string, OptimizerStateValue>(src.Count);
+        foreach (var kv in src)
+            dst[kv.Key] = new OptimizerStateValue
+            {
+                IntValue = kv.Value.IntValue,
+                FloatValue = kv.Value.FloatValue,
+                Tensor = kv.Value.Tensor == null ? null : (float[])kv.Value.Tensor.Clone(),
+            };
+        return dst;
+    }
 
     /// <inheritdoc />
     public void ZeroGrad() => _inner.ZeroGrad();

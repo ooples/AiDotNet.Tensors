@@ -17,6 +17,10 @@ public abstract class OptimizerBase : IOptimizer
     protected readonly Dictionary<(int g, int p), Dictionary<string, OptimizerStateValue>> _state =
         new Dictionary<(int, int), Dictionary<string, OptimizerStateValue>>();
 
+    /// <summary>Access to the state map for sharded-optimizer wrappers that need to snapshot
+    /// and restore non-local parameter state across <see cref="Step"/> calls.</summary>
+    internal Dictionary<(int g, int p), Dictionary<string, OptimizerStateValue>> StateInternal => _state;
+
     /// <inheritdoc />
     public IReadOnlyList<ParamGroup> ParamGroups => _groups;
 
@@ -25,6 +29,15 @@ public abstract class OptimizerBase : IOptimizer
 
     /// <summary>Names of the per-parameter state slots required by this optimizer.</summary>
     protected abstract IReadOnlyList<string> StateNames { get; }
+
+    /// <summary>
+    /// Names of state slots that hold a single scalar per parameter (e.g. <c>"step"</c>,
+    /// <c>"eta"</c>, <c>"mu"</c>) rather than a length-N tensor. <see cref="GetOrCreateState"/>
+    /// allocates these as zero-initialised <see cref="OptimizerStateValue"/> placeholders
+    /// instead of full tensor buffers, eliminating wasted memory on every parameter.
+    /// Default: only <c>"step"</c> is treated as a scalar.
+    /// </summary>
+    protected virtual IReadOnlyList<string> ScalarStateNames { get; } = new[] { "step" };
 
     /// <inheritdoc />
     public abstract void Step();
@@ -54,10 +67,15 @@ public abstract class OptimizerBase : IOptimizer
         var key = (gi, pi);
         if (_state.TryGetValue(key, out var dict)) return dict;
         dict = new Dictionary<string, OptimizerStateValue>();
+        var scalarSet = new HashSet<string>(ScalarStateNames, StringComparer.Ordinal);
         foreach (var name in StateNames)
         {
-            if (name == "step") dict[name] = OptimizerStateValue.FromInt(0);
-            else dict[name] = OptimizerStateValue.FromTensor(new float[paramLen]);
+            if (name == "step")
+                dict[name] = OptimizerStateValue.FromInt(0);
+            else if (scalarSet.Contains(name))
+                dict[name] = OptimizerStateValue.FromFloat(0f);
+            else
+                dict[name] = OptimizerStateValue.FromTensor(new float[paramLen]);
         }
         _state[key] = dict;
         return dict;
@@ -150,7 +168,6 @@ public abstract class OptimizerBase : IOptimizer
             throw new InvalidOperationException(
                 $"state-dict has {state.ParamGroups.Count} groups but optimizer has {_groups.Count}.");
 
-        int paramCounter = 0;
         for (int gi = 0; gi < _groups.Count; gi++)
         {
             var group = _groups[gi];
@@ -161,7 +178,11 @@ public abstract class OptimizerBase : IOptimizer
                     $"group {gi} has {group.Parameters.Count} params; state-dict has {gs.ParamIds.Count}.");
             for (int pi = 0; pi < group.Parameters.Count; pi++)
             {
-                int id = paramCounter++;
+                // Use the serialized param id (from the state-dict's ParamIds list) rather than
+                // a fresh counter. This makes load symmetric with save (both sides honor the
+                // explicit id mapping) and works with non-contiguous IDs that arise from
+                // sharded / partial state-dict loads.
+                int id = gs.ParamIds[pi];
                 if (!state.State.TryGetValue(id, out var slots)) continue;
                 var dst = GetOrCreateState(gi, pi, group.Parameters[pi].Length);
                 foreach (var kv in slots)

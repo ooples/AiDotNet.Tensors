@@ -100,6 +100,9 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
             {
                 double dHat = numerator / ((1.0 - b2) * sk_l1);
                 double growthCap = g.GetOption("growth_rate", double.PositiveInfinity);
+                if (growthCap < 1.0 || double.IsNaN(growthCap))
+                    throw new InvalidOperationException(
+                        $"growth_rate must be ≥ 1.0 (d can only grow); got {growthCap}.");
                 double newD = Math.Min(Math.Max(d, dHat), d * growthCap);
                 CurrentD[gi] = newD;
             }
@@ -207,6 +210,9 @@ public sealed class ProdigyOptimizer : OptimizerBase
             {
                 double dHat = DNumerator[gi] / ((1.0 - b3) * sk_l1);
                 double growthCap = g.GetOption("growth_rate", double.PositiveInfinity);
+                if (growthCap < 1.0 || double.IsNaN(growthCap))
+                    throw new InvalidOperationException(
+                        $"growth_rate must be ≥ 1.0 (d can only grow); got {growthCap}.");
                 double newD = Math.Min(Math.Max(d, dHat), d * growthCap);
                 CurrentD[gi] = newD;
             }
