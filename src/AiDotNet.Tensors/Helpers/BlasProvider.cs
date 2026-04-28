@@ -158,6 +158,20 @@ internal static class BlasProvider
     /// </param>
     public static void SetThreadLocalDeterministicMode(bool? value) => _threadLocalDeterministicOverride = value;
 
+    /// <summary>
+    /// Reads the current thread-local determinism override without falling back to
+    /// the process-wide setting. Returns <c>null</c> when no override is installed
+    /// on the calling thread (the default — <see cref="IsDeterministicMode"/> is
+    /// then driven entirely by the process-wide field).
+    /// <para>Used by tests to capture-and-restore the override across cases that
+    /// also touch the process-wide setting; without this, capture/restore can only
+    /// observe the merged value from <see cref="IsDeterministicMode"/>, which
+    /// loses the distinction between "no override" and "override = process-wide
+    /// value" — the two are observationally identical at the merged read but
+    /// behave differently when the process-wide value flips.</para>
+    /// </summary>
+    public static bool? GetThreadLocalDeterministicMode() => _threadLocalDeterministicOverride;
+
     public static void SetDeterministicMode(bool deterministic)
     {
         _deterministicMode = deterministic;

@@ -85,9 +85,24 @@ public class DeterministicByDefaultTests
         // Plan compiled under deterministic=true must not be served on a subsequent
         // call under deterministic=false (and vice versa). The cache key mixes in
         // the current determinism state so the second call misses and recompiles.
-        bool original = AiDotNetEngine.DeterministicMode;
+        //
+        // BlasProvider.IsDeterministicMode resolves as
+        //   `_threadLocalDeterministicOverride ?? _deterministicMode`.
+        // SetDeterministicMode only writes the process-wide field. If a prior
+        // test in this collection (or upstream framework code) installed a
+        // thread-local override on the xUnit worker thread and the override
+        // is still pinned, both `Set(true)` and `Set(false)` calls in this
+        // test will be ignored by the override-first read — both compiles
+        // see the same key and the cache hands back the same plan instance.
+        // Capture and restore BOTH layers, and explicitly clear the
+        // thread-local override at the top so the process-wide toggle is
+        // observable for the duration of the test.
+        bool originalProcess = AiDotNetEngine.DeterministicMode;
+        bool? originalThreadLocal = BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
+            BlasProvider.SetThreadLocalDeterministicMode(null);
+
             var engine = new CpuEngine();
             var input = Tensor<float>.CreateRandom([4, 3]);
             var weight = Tensor<float>.CreateRandom([3, 2]);
@@ -95,6 +110,8 @@ public class DeterministicByDefaultTests
             using var cache = new CompiledModelCache<float>();
 
             AiDotNetEngine.SetDeterministicMode(true);
+            Assert.True(BlasProvider.IsDeterministicMode,
+                "Pre-condition: with thread-local cleared, process-wide=true must show true.");
             var planDeterministic = cache.GetOrCompileInference(
                 input._shape,
                 () =>
@@ -104,6 +121,8 @@ public class DeterministicByDefaultTests
                 });
 
             AiDotNetEngine.SetDeterministicMode(false);
+            Assert.False(BlasProvider.IsDeterministicMode,
+                "Pre-condition: with thread-local cleared, process-wide=false must show false.");
             var planNonDeterministic = cache.GetOrCompileInference(
                 input._shape,
                 () =>
@@ -120,7 +139,8 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(original);
+            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocal);
+            AiDotNetEngine.SetDeterministicMode(originalProcess);
         }
     }
 
