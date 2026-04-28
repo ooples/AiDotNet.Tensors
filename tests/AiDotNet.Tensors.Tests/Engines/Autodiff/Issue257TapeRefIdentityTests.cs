@@ -235,13 +235,6 @@ public class Issue257TapeRefIdentityTests
     }
 
     /// <summary>
-    /// Same as above but without explicit sources — the caller asks for ALL
-    /// gradients via <c>ComputeGradients(loss, sources: null)</c> and then
-    /// looks each parameter up by reference. This is the actual code path
-    /// the parent #257 reproducer uses (NeuralNetworkBase.TrainWithTape
-    /// calls allGrads = tape.ComputeGradients(lossTensor, sources: null)).
-    /// </summary>
-    /// <summary>
     /// Structural canary covering broadcast/normalization ops downstream of
     /// a Permute (where they previously lost the chain via .Contiguous()
     /// rebind). Each op in turn: input → Permute → op(input, weight) →
@@ -305,6 +298,14 @@ public class Issue257TapeRefIdentityTests
         Assert.True(grads.ContainsKey(kernel));
     }
 
+    /// <summary>
+    /// Same as <see cref="FullMHAFlow_TwoIterations_AllParamsGetGradientsBothTimes"/>
+    /// but without explicit sources — the caller asks for ALL gradients via
+    /// <c>ComputeGradients(loss, sources: null)</c> and then looks each
+    /// parameter up by reference. This is the actual code path the parent
+    /// #257 reproducer uses (NeuralNetworkBase.TrainWithTape calls
+    /// <c>allGrads = tape.ComputeGradients(lossTensor, sources: null)</c>).
+    /// </summary>
     [Fact]
     public void FullMHAFlow_NullSources_AllParamsAppearInDictByReference()
     {

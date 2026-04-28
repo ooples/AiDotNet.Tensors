@@ -97,12 +97,17 @@ public class DeterministicByDefaultTests
         // Capture and restore BOTH layers, and explicitly clear the
         // thread-local override at the top so the process-wide toggle is
         // observable for the duration of the test.
-        bool originalProcess = AiDotNetEngine.DeterministicMode;
+        // Order matters: capture the thread-local override first, then
+        // CLEAR it before reading the process-wide flag. AiDotNetEngine
+        // .DeterministicMode returns the *merged effective* state (override
+        // wins), so reading it before the clear can stash the wrong value
+        // and the finally-block restore would then leak that override into
+        // the global flag.
         bool? originalThreadLocal = BlasProvider.GetThreadLocalDeterministicMode();
+        BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool originalProcess = AiDotNetEngine.DeterministicMode;
         try
         {
-            BlasProvider.SetThreadLocalDeterministicMode(null);
-
             var engine = new CpuEngine();
             var input = Tensor<float>.CreateRandom([4, 3]);
             var weight = Tensor<float>.CreateRandom([3, 2]);
@@ -139,8 +144,13 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocal);
+            // Restore in REVERSE order: process-wide first, then the
+            // thread-local override (which was cleared at the top). This
+            // mirrors the capture order so the original layered state is
+            // recovered even if a third party watches the merged effective
+            // state mid-finally.
             AiDotNetEngine.SetDeterministicMode(originalProcess);
+            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocal);
         }
     }
 
