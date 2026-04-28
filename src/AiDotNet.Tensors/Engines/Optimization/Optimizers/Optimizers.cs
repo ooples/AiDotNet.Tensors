@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines.Compilation;
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
 /// <summary>SGD with optional momentum, dampening, weight-decay, Nesterov, maximize.</summary>
+[CudaGraphSafe]
 public sealed class SgdOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -83,6 +84,7 @@ public sealed class SgdOptimizer : OptimizerBase
 }
 
 /// <summary>Adam (Kingma &amp; Ba, 2015), with optional AMSGrad and maximize.</summary>
+[CudaGraphSafe]
 public sealed class AdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -144,6 +146,7 @@ public sealed class AdamOptimizer : OptimizerBase
 }
 
 /// <summary>AdamW (Loshchilov &amp; Hutter, 2019): Adam with decoupled weight decay.</summary>
+[CudaGraphSafe]
 public sealed class AdamWOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -190,6 +193,7 @@ public sealed class AdamWOptimizer : OptimizerBase
 }
 
 /// <summary>RAdam (Liu et al., 2020): rectified Adam.</summary>
+[CudaGraphSafe(Note = "rectification branch depends only on the step counter, not tensor values")]
 public sealed class RAdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -238,6 +242,7 @@ public sealed class RAdamOptimizer : OptimizerBase
 }
 
 /// <summary>NAdam: Adam with Nesterov-look-ahead.</summary>
+[CudaGraphSafe]
 public sealed class NAdamOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -286,6 +291,7 @@ public sealed class NAdamOptimizer : OptimizerBase
 }
 
 /// <summary>Adamax: Adam with infinity norm.</summary>
+[CudaGraphSafe]
 public sealed class AdamaxOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -329,6 +335,7 @@ public sealed class AdamaxOptimizer : OptimizerBase
 }
 
 /// <summary>Adagrad: accumulated squared gradients.</summary>
+[CudaGraphSafe]
 public sealed class AdagradOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -370,6 +377,7 @@ public sealed class AdagradOptimizer : OptimizerBase
 /// <summary>RMSprop (Hinton lecture): running average of squared gradients.
 /// Supports the centered variant (Graves, 2013) and Polyak momentum, matching
 /// <c>torch.optim.RMSprop(centered=, momentum=)</c>.</summary>
+[CudaGraphSafe(Note = "centered/momentum branches selected at construction; the variance<0 clamp is a value clamp, not control flow")]
 public sealed class RmsPropOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -455,6 +463,7 @@ public sealed class RmsPropOptimizer : OptimizerBase
 }
 
 /// <summary>AdaDelta: adaptive learning rate without a global lr.</summary>
+[CudaGraphSafe]
 public sealed class AdaDeltaOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -496,6 +505,7 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
 }
 
 /// <summary>Lion (Chen et al., 2023): sign-based optimizer with EMA.</summary>
+[CudaGraphSafe]
 public sealed class LionOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -534,6 +544,7 @@ public sealed class LionOptimizer : OptimizerBase
 }
 
 /// <summary>ASGD: Averaged SGD (Polyak/Ruppert).</summary>
+[CudaGraphSafe]
 public sealed class AsgdOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -633,6 +644,7 @@ public sealed class RpropOptimizer : OptimizerBase
 
 /// <summary>LAMB (You et al., 2020): layer-wise Adaptive Moments for Batch training.
 /// Adam-style moments + per-layer trust-ratio scaling for very large batch sizes.</summary>
+[CudaGraphSafe(Note = "trust-ratio branch selects between two value paths; no host-side control flow change")]
 public sealed class LambOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
@@ -676,6 +688,7 @@ public sealed class LambOptimizer : OptimizerBase
 
 /// <summary>LARS (You et al., 2017): Layer-wise Adaptive Rate Scaling.
 /// SGD+momentum with a layer-local trust ratio that scales LR by ‖p‖/‖g‖.</summary>
+[CudaGraphSafe]
 public sealed class LarsOptimizer : OptimizerBase
 {
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
