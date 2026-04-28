@@ -35,6 +35,7 @@ namespace AiDotNet.Tensors.Serialization.Pickle;
 public sealed class PtReader
 {
     private readonly Dictionary<string, PtTensorRef> _tensors = new(StringComparer.Ordinal);
+    private object? _root;
 
     /// <summary>
     /// All tensors recovered from the file, indexed by their key in
@@ -45,6 +46,15 @@ public sealed class PtReader
 
     /// <summary>Names of every recovered tensor.</summary>
     public IEnumerable<string> Names => _tensors.Keys;
+
+    /// <summary>
+    /// Raw pickled root object — typically an <see cref="System.Collections.IDictionary"/>
+    /// for a state-dict, or a list of dicts for an optimizer state-dict
+    /// (<c>{"state": {0: {...}, 1: {...}}, "param_groups": [{...}]}</c>).
+    /// Exposed so loaders that need more than just tensors (e.g. optimizer hyper-params,
+    /// integer-keyed state IDs) can navigate the structure directly.
+    /// </summary>
+    public object? RawRoot => _root;
 
     /// <summary>Loads from disk. Counts as one EnforceBeforeLoad.</summary>
     public static PtReader Open(string path)
@@ -145,6 +155,7 @@ public sealed class PtReader
                 return new RawStorage(arr[1]?.ToString() ?? "FloatStorage", ms.ToArray());
             });
         var result = interp.Load();
+        reader._root = result;
         reader.Extract(result);
         return reader;
     }
@@ -239,6 +250,7 @@ public sealed class PtReader
         // REDUCE deferred would never materialise and Extract would
         // see only the placeholders (which it doesn't recognise).
         result = MaterialiseDeferred(result);
+        reader._root = result;
         reader.Extract(result);
         return reader;
     }
