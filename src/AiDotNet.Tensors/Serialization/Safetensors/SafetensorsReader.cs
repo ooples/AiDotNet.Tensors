@@ -52,6 +52,10 @@ public sealed class SafetensorsReader : IDisposable
     private readonly long _dataBlockStart;
     private readonly Dictionary<string, SafetensorsTensorEntry> _entries;
     private readonly Dictionary<string, string> _metadata;
+    // Serialises Seek+Read against the shared stream — without it, two
+    // concurrent ReadRawBytes calls can interleave the seek/read pair
+    // and return bytes from the wrong tensor.
+    private readonly object _streamLock = new();
     private bool _disposed;
 
     /// <summary>The tensor entries from the header, indexed by name.</summary>
@@ -197,16 +201,22 @@ public sealed class SafetensorsReader : IDisposable
                 $"Tensor '{name}' is {byteLen} bytes — cannot fit in a single byte[]. " +
                 $"Use the streaming overload (TODO) or split the load into chunks.");
 
-        _stream.Seek(_dataBlockStart + entry.DataOffsetStart, SeekOrigin.Begin);
         var buf = new byte[byteLen];
-        int off = 0;
-        while (off < buf.Length)
+        // Lock around the seek+read pair so two concurrent reads on
+        // the same SafetensorsReader can't interleave their stream
+        // positions and return bytes from the wrong tensor's slice.
+        lock (_streamLock)
         {
-            int n = _stream.Read(buf, off, buf.Length - off);
-            if (n == 0)
-                throw new EndOfStreamException(
-                    $"Unexpected EOF while reading tensor '{name}' — got {off} of {buf.Length} bytes.");
-            off += n;
+            _stream.Seek(_dataBlockStart + entry.DataOffsetStart, SeekOrigin.Begin);
+            int off = 0;
+            while (off < buf.Length)
+            {
+                int n = _stream.Read(buf, off, buf.Length - off);
+                if (n == 0)
+                    throw new EndOfStreamException(
+                        $"Unexpected EOF while reading tensor '{name}' — got {off} of {buf.Length} bytes.");
+                off += n;
+            }
         }
         return buf;
     }

@@ -78,8 +78,11 @@ internal static class Program
     private static int RunConvert(string[] args)
     {
         var parsed = ParseFlags(args, "from", "to", "input", "output", "shard-size");
-        string from = Require(parsed, "from");
-        string to = Require(parsed, "to");
+        // Format names are case-insensitive — `--from PT` or `--from
+        // SafeTensors` should hit the same dispatch as the lower-case
+        // versions documented in --help. Normalise once at the entry.
+        string from = Require(parsed, "from").ToLowerInvariant();
+        string to = Require(parsed, "to").ToLowerInvariant();
         string input = Require(parsed, "input");
         string output = Require(parsed, "output");
         long shardSize = parsed.TryGetValue("shard-size", out var ss)
@@ -139,8 +142,12 @@ internal static class Program
             foreach (var kv in r.Tensors)
                 Console.WriteLine($"    {kv.Key}  {kv.Value.DtypeStorage,-15}  [{string.Join(",", kv.Value.Shape)}]");
         }
-        else if (path.EndsWith(".index.json", StringComparison.OrdinalIgnoreCase))
+        else if (path.EndsWith(".safetensors.index.json", StringComparison.OrdinalIgnoreCase))
         {
+            // Restrict to the canonical HF sharded-index suffix so an
+            // unrelated *.index.json (HF model card index, dataset
+            // index, etc.) doesn't get misclassified as a sharded
+            // safetensors checkpoint and confuse the reader.
             using var r = ShardedSafetensorsReader.Open(path);
             Console.WriteLine($"safetensors-sharded  {path}");
             Console.WriteLine($"  tensors: {r.Entries.Count}");
@@ -255,7 +262,18 @@ internal static class Program
         else if (s.EndsWith("B", StringComparison.OrdinalIgnoreCase)) { num = s[..^1]; }
         if (!double.TryParse(num, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double n))
             throw new ArgumentException($"Could not parse size '{s}'.");
-        return (long)(n * mult);
+        if (double.IsNaN(n) || double.IsInfinity(n) || n <= 0)
+            throw new ArgumentException(
+                $"Shard size '{s}' must be a positive finite number; got {n}.");
+        // Multiply at double precision and bounds-check before the long
+        // cast — `(long)(n * mult)` was silently truncating overflow
+        // results to a wrap-around long, so '8000PB' parsed to a small
+        // positive number that downstream consumers happily accepted.
+        double bytes = n * mult;
+        if (bytes <= 0 || bytes > long.MaxValue)
+            throw new ArgumentException(
+                $"Shard size '{s}' is out of range (parsed {bytes} bytes; must be in (0, {long.MaxValue}]).");
+        return (long)bytes;
     }
 
     private static Dictionary<string, string> ParseFlags(string[] args, params string[] knownFlags)

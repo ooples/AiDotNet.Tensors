@@ -83,7 +83,7 @@ internal sealed class PickleInterpreter
             byte opcode = (byte)op;
             switch (opcode)
             {
-                case PickleOpcode.PROTO: _stream.ReadByte(); break;            // protocol number — informational
+                case PickleOpcode.PROTO: ReadByteChecked(); break;             // protocol number — informational
                 case PickleOpcode.FRAME: ReadBytes(8); break;                  // frame length — informational
                 case PickleOpcode.STOP: return _stack.Count > 0 ? _stack.Pop() : null;
 
@@ -102,11 +102,11 @@ internal sealed class PickleInterpreter
                 case PickleOpcode.EMPTY_SET: _stack.Push(new HashSet<object>()); break;
 
                 case PickleOpcode.BININT: _stack.Push((long)System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(ReadBytes(4))); break;
-                case PickleOpcode.BININT1: _stack.Push((long)_stream.ReadByte()); break;
+                case PickleOpcode.BININT1: _stack.Push((long)ReadByteChecked()); break;
                 case PickleOpcode.BININT2: _stack.Push((long)System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(ReadBytes(2))); break;
                 case PickleOpcode.LONG1:
                 {
-                    int len = _stream.ReadByte();
+                    int len = ReadByteChecked();
                     _stack.Push(ReadLong(len));
                     break;
                 }
@@ -127,26 +127,36 @@ internal sealed class PickleInterpreter
 
                 case PickleOpcode.SHORT_BINSTRING:
                 {
-                    int len = _stream.ReadByte();
+                    int len = ReadByteChecked();
                     _stack.Push(Encoding.ASCII.GetString(ReadBytes(len)));
                     break;
                 }
                 case PickleOpcode.BINUNICODE:
                 {
-                    int len = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(4));
-                    _stack.Push(Encoding.UTF8.GetString(ReadBytes(len)));
+                    uint ulen = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(4));
+                    if (ulen > int.MaxValue)
+                        throw new InvalidDataException(
+                            $"BINUNICODE length {ulen} exceeds int.MaxValue.");
+                    _stack.Push(Encoding.UTF8.GetString(ReadBytes((int)ulen)));
                     break;
                 }
                 case PickleOpcode.SHORT_BINUNICODE:
                 {
-                    int len = _stream.ReadByte();
+                    int len = ReadByteChecked();
                     _stack.Push(Encoding.UTF8.GetString(ReadBytes(len)));
                     break;
                 }
                 case PickleOpcode.BINUNICODE8:
                 {
-                    long len = (long)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(ReadBytes(8));
-                    _stack.Push(Encoding.UTF8.GetString(ReadBytes((int)len)));
+                    ulong ulen = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(ReadBytes(8));
+                    // Reject lengths that would overflow int — both
+                    // because allocations are int-sized and because a
+                    // forged 64-bit length would otherwise wrap and
+                    // succeed with the wrong data.
+                    if (ulen > int.MaxValue)
+                        throw new InvalidDataException(
+                            $"BINUNICODE8 length {ulen} exceeds int.MaxValue; refusing to allocate.");
+                    _stack.Push(Encoding.UTF8.GetString(ReadBytes((int)ulen)));
                     break;
                 }
 
@@ -213,11 +223,11 @@ internal sealed class PickleInterpreter
                     break;
                 }
 
-                case PickleOpcode.BINGET: _stack.Push(_memo[_stream.ReadByte()]); break;
+                case PickleOpcode.BINGET: _stack.Push(_memo[ReadByteChecked()]); break;
                 case PickleOpcode.LONG_BINGET: _stack.Push(_memo[(int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(4))]); break;
                 case PickleOpcode.BINPUT:
                 {
-                    int idx = _stream.ReadByte();
+                    int idx = ReadByteChecked();
                     while (_memo.Count <= idx) _memo.Add(null);
                     _memo[idx] = _stack.Peek();
                     break;
@@ -314,6 +324,14 @@ internal sealed class PickleInterpreter
     {
         // pickle.LONG1/LONG4 store little-endian two's-complement.
         if (len == 0) return 0;
+        // We materialise into a long, so any width above 8 bytes can't
+        // be represented faithfully. Worse, the shift below would
+        // wrap because C# shift counts are mod 64 on long, so a
+        // 9-byte input would shift by 72 = 8 mod 64 and silently
+        // alias the wrong byte. Reject up front.
+        if (len < 0 || len > 8)
+            throw new InvalidDataException(
+                $"Pickle LONG opcode width {len} cannot fit in a 64-bit integer; refusing to decode.");
         var b = ReadBytes(len);
         long v = 0;
         for (int i = 0; i < len; i++) v |= ((long)b[i]) << (8 * i);
@@ -321,6 +339,22 @@ internal sealed class PickleInterpreter
         if ((b[len - 1] & 0x80) != 0 && len < 8)
             v |= -1L << (8 * len);
         return v;
+    }
+
+    /// <summary>
+    /// Reads exactly one byte from the stream. Throws
+    /// <see cref="EndOfStreamException"/> on EOF instead of silently
+    /// returning <c>-1</c> the way the raw <see cref="Stream.ReadByte"/>
+    /// does — opcode handlers that pass the result through to a
+    /// <c>byte[]</c> indexer or a stack push otherwise propagate the
+    /// invalid <c>-1</c> as data and produce non-deterministic decode
+    /// errors much later.
+    /// </summary>
+    private byte ReadByteChecked()
+    {
+        int b = _stream.ReadByte();
+        if (b < 0) throw new EndOfStreamException("Unexpected EOF in pickle stream — needed one more byte.");
+        return (byte)b;
     }
 
     private string ReadLine()

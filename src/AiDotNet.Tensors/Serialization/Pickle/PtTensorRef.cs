@@ -42,12 +42,35 @@ public sealed class PtTensorRef
     }
 
     /// <summary>Constructs a reference.</summary>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="shape"/> and
+    /// <paramref name="strides"/> have different ranks (would break
+    /// <see cref="IsContiguous"/>'s rank-walk and the strided
+    /// materialisation in <c>PtReader.MaterialiseStrided</c>), or when
+    /// <paramref name="storageOffset"/> is negative.
+    /// </exception>
     public PtTensorRef(string dtypeStorage, long[] shape, long storageOffset, long[] strides, byte[] bytes)
     {
-        DtypeStorage = dtypeStorage ?? throw new ArgumentNullException(nameof(dtypeStorage));
-        Shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        if (dtypeStorage is null) throw new ArgumentNullException(nameof(dtypeStorage));
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (strides is null) throw new ArgumentNullException(nameof(strides));
+        if (bytes is null) throw new ArgumentNullException(nameof(bytes));
+        if (shape.Length != strides.Length)
+            throw new ArgumentException(
+                $"Shape rank ({shape.Length}) must equal strides rank ({strides.Length}).",
+                nameof(strides));
+        if (storageOffset < 0)
+            throw new ArgumentException(
+                $"StorageOffset ({storageOffset}) is negative.", nameof(storageOffset));
+
+        DtypeStorage = dtypeStorage;
+        // Defensive copies of the mutable arrays — without them, a
+        // caller who retains the original arrays could mutate the
+        // ref's observed shape/strides/payload after construction
+        // and break the IsContiguous invariant the rank walk depends on.
+        Shape = (long[])shape.Clone();
+        Strides = (long[])strides.Clone();
+        Bytes = (byte[])bytes.Clone();
         StorageOffset = storageOffset;
-        Strides = strides ?? throw new ArgumentNullException(nameof(strides));
-        Bytes = bytes ?? throw new ArgumentNullException(nameof(bytes));
     }
 }

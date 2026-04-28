@@ -161,9 +161,15 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         const int Buckets = 30;
         double width = (max - min) / Buckets;
         if (width == 0) width = 1; // all values equal — single bucket
-        var bucketEdges = new double[Buckets + 1];
+        // HistogramProto's bucket_limit is parallel to bucket — both
+        // arrays must have the same length, and bucket_limit[i] is
+        // the *upper* edge of bucket i (not the lower). Allocating
+        // Buckets+1 lower edges produced (a) a length mismatch that
+        // broke the rendering and (b) wrong bucket-edge semantics.
+        // Now: emit Buckets upper edges where bucket_limit[i] = min + (i+1) * width.
+        var bucketEdges = new double[Buckets];
         var bucketCounts = new double[Buckets];
-        for (int i = 0; i <= Buckets; i++) bucketEdges[i] = min + i * width;
+        for (int i = 0; i < Buckets; i++) bucketEdges[i] = min + (i + 1) * width;
         for (int i = 0; i < values.Length; i++)
         {
             int idx = (int)((values[i] - min) / width);

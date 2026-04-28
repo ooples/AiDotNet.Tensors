@@ -147,8 +147,57 @@ public sealed class SafetensorsWriter : IDisposable
         for (int i = 0; i < _tensors.Count; i++)
             if (_tensors[i].Name == name)
                 throw new ArgumentException($"Tensor name '{name}' already added.", nameof(name));
+
+        // Validate shape entries and the payload length up front so a
+        // malformed AddRaw produces a clear error AT THE CALL SITE
+        // rather than corrupting the safetensors header that a future
+        // reader trips over. Reject negative dims, overflow on the
+        // element-count product, and any payload whose byte count
+        // doesn't match the dtype's natural per-element size.
+        long elemCount = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentException(
+                    $"Shape dimension {i} = {shape[i]} is negative.", nameof(shape));
+            try { elemCount = checked(elemCount * shape[i]); }
+            catch (OverflowException ex)
+            {
+                throw new ArgumentException(
+                    $"Shape product overflows long for tensor '{name}'.", nameof(shape), ex);
+            }
+        }
+        long expectedBytes;
+        try { expectedBytes = checked(elemCount * dtype.ElementByteSize()); }
+        catch (OverflowException ex)
+        {
+            throw new ArgumentException(
+                $"Element count × element size overflows long for tensor '{name}'.", nameof(shape), ex);
+        }
+        // Sub-byte dtypes pack multiple elements per byte; the header
+        // declares element-byte-size = 1 for them, so the payload's
+        // byte count is the packed-byte count which is shape-product
+        // divided by lanes-per-byte. We can only assert the typed-
+        // dtype invariant — sub-byte payloads are caller-responsibility.
+        if (!IsSubBytePackedDtype(dtype) && payload.Length != expectedBytes)
+            throw new ArgumentException(
+                $"Payload length {payload.Length} does not match expected " +
+                $"element count {elemCount} × element size {dtype.ElementByteSize()} = {expectedBytes} " +
+                $"for tensor '{name}' dtype {dtype}.", nameof(payload));
+
         _tensors.Add(new PlannedTensor(name, dtype, (long[])shape.Clone(), (byte[])payload.Clone()));
     }
+
+    private static bool IsSubBytePackedDtype(SafetensorsDtype dtype) => dtype switch
+    {
+        SafetensorsDtype.AIDN_NF4 => true,
+        SafetensorsDtype.AIDN_FP4 => true,
+        SafetensorsDtype.AIDN_INT4 => true,
+        SafetensorsDtype.AIDN_INT3 => true,
+        SafetensorsDtype.AIDN_INT2 => true,
+        SafetensorsDtype.AIDN_INT1 => true,
+        _ => false,
+    };
 
     /// <summary>
     /// Finalises the file: builds the header JSON, computes byte
@@ -161,6 +210,14 @@ public sealed class SafetensorsWriter : IDisposable
         ThrowIfDisposed();
         if (_saved)
             throw new InvalidOperationException("Save already called.");
+
+        // Reset to byte 0 + truncate so a wrapped stream that already
+        // had content (a reused MemoryStream / FileStream) doesn't
+        // prepend garbage to our header or leave stale trailing bytes
+        // beyond our last byte. Create()'s FileMode.Create already
+        // handles new files; this protects ToStream() callers.
+        _stream.Seek(0, SeekOrigin.Begin);
+        _stream.SetLength(0);
 
         // Compute offsets first so the header can include them.
         long cursor = 0;
@@ -263,14 +320,18 @@ public sealed class SafetensorsWriter : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        // Auto-save on dispose if the caller forgot — common .NET
-        // pattern (StreamWriter does this), and dropping the file
-        // half-written is rarely what the caller wanted.
+        // Auto-save BEFORE flipping _disposed: Save() calls
+        // ThrowIfDisposed() at its top, so the previous order
+        // (`_disposed = true` first) made Save() immediately throw
+        // ObjectDisposedException — the catch swallowed it and the
+        // file was never written. Run Save() while the writer is
+        // still considered "alive" so the planning + offset logic
+        // actually executes.
         if (!_saved)
         {
             try { Save(); } catch { /* swallow on disposal — caller already dropped */ }
         }
+        _disposed = true;
         if (_ownsStream) _stream.Dispose();
     }
 

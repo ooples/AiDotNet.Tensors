@@ -137,14 +137,22 @@ public sealed class HfConfig
             archs = list;
         }
 
+        int? numAttentionHeads = GetInt("num_attention_heads", "n_head", "num_heads");
+        // NumKeyValueHeads defaults to NumAttentionHeads when the
+        // config doesn't declare GQA — matches the documented
+        // fallback on the property and matches HF's transformers
+        // library behaviour (config_class.num_key_value_heads is
+        // num_attention_heads if not overridden).
+        int? numKeyValueHeads = GetInt("num_key_value_heads") ?? numAttentionHeads;
+
         return new HfConfig
         {
             ModelType = GetString("model_type"),
             Architectures = archs,
             HiddenSize = GetInt("hidden_size", "d_model", "n_embd"),
             NumHiddenLayers = GetInt("num_hidden_layers", "n_layer", "num_layers"),
-            NumAttentionHeads = GetInt("num_attention_heads", "n_head", "num_heads"),
-            NumKeyValueHeads = GetInt("num_key_value_heads"),
+            NumAttentionHeads = numAttentionHeads,
+            NumKeyValueHeads = numKeyValueHeads,
             VocabSize = GetInt("vocab_size"),
             IntermediateSize = GetInt("intermediate_size", "n_inner", "ffn_dim"),
             MaxPositionEmbeddings = GetInt("max_position_embeddings", "n_ctx", "max_sequence_length"),

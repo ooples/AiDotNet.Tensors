@@ -1,5 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
@@ -35,7 +36,14 @@ namespace AiDotNet.Tensors.Serialization.HuggingFace;
 /// </remarks>
 public static class HFStateDictMapper
 {
-    private static readonly Dictionary<string, HFNamingPreset> _presets = BuildPresets();
+    // ConcurrentDictionary so Register-from-one-thread + Get/AvailablePresets-
+    // from-another doesn't trip the underlying Dictionary<,>'s
+    // resize/insert race. The registry is read frequently (once per
+    // tensor on a state-dict load, ~100s of times for a real HF model)
+    // and written rarely (custom Register calls at app startup), so
+    // ConcurrentDictionary's lock-free read path is the right tradeoff.
+    private static readonly ConcurrentDictionary<string, HFNamingPreset> _presets =
+        new(BuildPresets(), StringComparer.OrdinalIgnoreCase);
 
     /// <summary>The names of every shipped preset.</summary>
     public static IEnumerable<string> AvailablePresets => _presets.Keys;
@@ -265,6 +273,18 @@ public sealed class HFNamingPreset
             string invPattern = Regex.Escape(r.AiDotNetReplacement)
                 .Replace(@"\$1", @"(\d+)")
                 .Replace(@"\$\{1\}", @"(\d+)");
+            // Preserve forward-rule anchors on the inverse pattern.
+            // Without this, an exact-match forward rule like
+            //   ^vit\.embeddings\.position_embeddings$ -> pos_embed
+            // would invert to a substring match on "pos_embed" — every
+            // tensor whose AiDotNet name happens to contain "pos_embed"
+            // (or "cls_token", or any other non-anchored capture) would
+            // be rewritten to the HF form, including names that should
+            // pass through unchanged.
+            if (r.HfPattern.StartsWith("^", StringComparison.Ordinal))
+                invPattern = "^" + invPattern;
+            if (r.HfPattern.EndsWith("$", StringComparison.Ordinal))
+                invPattern += "$";
             string invReplacement = r.HfPattern
                 .Replace(@"(\d+)", "$1")
                 // Strip regex anchors that are valid in the forward

@@ -80,13 +80,34 @@ public sealed class ShardedSafetensorsReader : IDisposable
         var distinctShards = new HashSet<string>(weightMap.Values, StringComparer.Ordinal);
         _shards = new Dictionary<string, SafetensorsReader>(StringComparer.Ordinal);
         var aggregateEntries = new Dictionary<string, SafetensorsTensorEntry>(StringComparer.Ordinal);
+
+        // Resolve indexDir to a canonical absolute path so the
+        // path-traversal check below operates on normalised input.
+        // Trailing-separator normalisation matters: Path.GetFullPath
+        // doesn't append one, so we prepend it manually before the
+        // StartsWith check.
+        string canonicalIndexDir = Path.GetFullPath(indexDir);
+        if (!canonicalIndexDir.EndsWith(Path.DirectorySeparatorChar.ToString()))
+            canonicalIndexDir += Path.DirectorySeparatorChar;
+
         try
         {
             using (PersistenceGuard.InternalOperation())
             {
                 foreach (var shardName in distinctShards)
                 {
-                    var shardPath = Path.Combine(indexDir, shardName);
+                    // Guard against path traversal: the shard name
+                    // comes from external JSON (the index file). A
+                    // malicious index can supply '../../etc/passwd'
+                    // or a rooted path that escapes indexDir entirely.
+                    // Resolve the combined path and reject anything
+                    // that doesn't sit inside canonicalIndexDir.
+                    var shardPath = Path.GetFullPath(Path.Combine(indexDir, shardName));
+                    if (!shardPath.StartsWith(canonicalIndexDir, StringComparison.Ordinal))
+                        throw new InvalidDataException(
+                            $"Sharded index entry '{shardName}' resolves to '{shardPath}' which is " +
+                            $"outside the index directory '{canonicalIndexDir}'. Refusing to open.");
+
                     var shard = SafetensorsReader.Open(shardPath);
                     _shards[shardName] = shard;
                     foreach (var entry in shard.Entries)
@@ -107,6 +128,20 @@ public sealed class ShardedSafetensorsReader : IDisposable
                             _metadata[meta.Key] = meta.Value;
                     }
                 }
+            }
+
+            // Cross-check: every weight_map entry must map to a tensor
+            // that actually exists in its target shard. Catching the
+            // mismatch at Open time means a broken index surfaces
+            // immediately rather than as a confusing runtime error
+            // on a later ReadTensor call.
+            foreach (var kv in weightMap)
+            {
+                if (!aggregateEntries.ContainsKey(kv.Key))
+                    throw new InvalidDataException(
+                        $"Sharded index claims '{kv.Key}' lives in shard '{kv.Value}', but that " +
+                        $"shard's header does not contain that tensor name. Index is inconsistent " +
+                        $"with the shards on disk.");
             }
         }
         catch

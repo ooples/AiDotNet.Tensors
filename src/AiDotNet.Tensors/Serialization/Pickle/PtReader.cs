@@ -127,7 +127,17 @@ public sealed class PtReader
                 ZipArchiveEntry? storageEntry = null;
                 foreach (var e in zip.Entries)
                     if (e.FullName == entryPath) { storageEntry = e; break; }
-                if (storageEntry is null) return null;
+                if (storageEntry is null)
+                    // Don't return null — the pickle stream's
+                    // persistent ID promised a storage; if the zip
+                    // doesn't have it, the checkpoint is corrupt and
+                    // every downstream tensor that referenced it
+                    // would silently come back as null. Throw
+                    // explicitly so the failure points at the missing
+                    // entry, not at a "tensor was null" further along.
+                    throw new InvalidDataException(
+                        $".pt file references storage '{entryPath}' but the zip archive doesn't " +
+                        $"contain that entry. Checkpoint is corrupt.");
 
                 using var es = storageEntry.Open();
                 using var ms = new MemoryStream();
@@ -181,7 +191,27 @@ public sealed class PtReader
             if (got < 8) break;
             long count = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(lenBytes);
             int eltSize = StorageElementSize(rs.StorageType);
-            byte[] data = new byte[count * eltSize];
+            // Reject negative counts and counts that would overflow
+            // when multiplied by eltSize. Without these guards a
+            // crafted legacy file could either pass a negative count
+            // through `new byte[count * eltSize]` (triggering
+            // OverflowException with no diagnostic context) or wrap
+            // around to a small positive size that allocates and then
+            // Read silently fails to fill, producing the wrong tensor.
+            if (count < 0)
+                throw new InvalidDataException(
+                    $"Legacy .pt storage trailer reports negative element count {count}; refusing.");
+            long byteLen;
+            try { byteLen = checked(count * eltSize); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Legacy .pt storage trailer overflow: count {count} × element size {eltSize}.", ex);
+            }
+            if (byteLen > int.MaxValue)
+                throw new InvalidDataException(
+                    $"Legacy .pt storage trailer requests {byteLen} bytes > int.MaxValue; cannot allocate.");
+            byte[] data = new byte[byteLen];
             int dread = 0;
             while (dread < data.Length)
             {
@@ -339,6 +369,17 @@ public sealed class PtReader
             long src = r.StorageOffset;
             for (int d = 0; d < r.Shape.Length; d++) src += idx[d] * r.Strides[d];
             long srcByte = src * eltSize;
+            // Bounds-check before slicing — a malformed tensor can
+            // produce a negative or out-of-range source byte from an
+            // arbitrary Shape × Strides × StorageOffset combination.
+            // Without this guard, the (int) cast or the Span<>.Slice
+            // call below throws the wrong exception (overflow /
+            // ArgumentOutOfRange with no diagnostic context).
+            if (srcByte < 0 || srcByte + eltSize > r.Bytes.Length)
+                throw new InvalidDataException(
+                    $"Strided materialisation read out of bounds at flat index {flat}: " +
+                    $"srcByte={srcByte}, eltSize={eltSize}, storage bytes={r.Bytes.Length}. " +
+                    $"Tensor shape/strides/offset are inconsistent with the storage.");
             new ReadOnlySpan<byte>(r.Bytes, (int)srcByte, eltSize)
                 .CopyTo(dst.Slice((int)(flat * eltSize), eltSize));
 
@@ -381,7 +422,15 @@ public sealed class PtReader
         "ShortStorage" => 2,
         "CharStorage" or "ByteStorage" or "BoolStorage" => 1,
         "HalfStorage" or "BFloat16Storage" => 2,
-        _ => 4,
+        // Unknown storages used to silently default to 4 bytes,
+        // which means a checkpoint with an unrecognised storage type
+        // (FP8 storage, complex storage, future PyTorch additions)
+        // would corrupt the byte-counting math and produce bogus
+        // tensor data without any diagnostic. Fail closed instead.
+        _ => throw new InvalidDataException(
+            $"Unknown PyTorch storage type '{storage}'. PtReader supports the standard scalar " +
+            "storages (Float / Double / Long / Int / Short / Char / Byte / Bool / Half / BFloat16); " +
+            "checkpoints saved with unsupported storages can't be read."),
     };
 
     /// <summary>Marker for global names recovered from the pickle stream.</summary>

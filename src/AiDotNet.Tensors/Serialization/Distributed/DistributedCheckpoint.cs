@@ -63,10 +63,16 @@ public static class DistributedCheckpoint
         if (numShards <= 0) throw new ArgumentOutOfRangeException(nameof(numShards));
 
         // Compute total byte count to target a shard size of
-        // ceil(total / numShards).
+        // ceil(total / numShards). The previous formula
+        // (total / numShards + 1) overshoots by 1 when total is a
+        // multiple of numShards, producing larger-than-requested
+        // shards on evenly divisible inputs. The (total + n - 1) / n
+        // form is the standard ceil-div, with a 1-byte floor for
+        // total == 0 to avoid feeding ShardedSafetensorsWriter a
+        // zero shard size.
         long total = 0;
         foreach (var kv in stateDict) total += kv.Value.ByteCount;
-        long shardSize = total / numShards + 1;
+        long shardSize = total <= 0 ? 1 : (total + numShards - 1) / numShards;
 
         var w = new ShardedSafetensorsWriter(outputDir, "model", shardSize);
         foreach (var kv in stateDict)
@@ -112,7 +118,8 @@ public static class DistributedCheckpoint
 
         long total = 0;
         foreach (var kv in src.Entries) total += kv.Value.ByteLength;
-        long shardSize = total / newShardCount + 1;
+        // ceil(total / newShardCount), 1-byte floor for total == 0.
+        long shardSize = total <= 0 ? 1 : (total + newShardCount - 1) / newShardCount;
 
         var w = new ShardedSafetensorsWriter(dstDir, "model", shardSize);
         foreach (var kv in src.Entries)

@@ -77,6 +77,29 @@ public sealed class ShardedSafetensorsWriter
         if (filenamePrefix is null) throw new ArgumentNullException(nameof(filenamePrefix));
         if (string.IsNullOrEmpty(filenamePrefix))
             throw new ArgumentException("Filename prefix cannot be empty.", nameof(filenamePrefix));
+        // Reject any directory-separator or invalid filename character
+        // — without this, a prefix like "../escape" or "subdir/file"
+        // would be interpolated into the shard filename and cause
+        // Path.Combine(outputDir, ...) to escape outputDir entirely.
+        // Path.GetInvalidFileNameChars covers OS-specific cases ('/'
+        // on POSIX, '\' on Windows, plus control characters etc.)
+        char[] invalid = Path.GetInvalidFileNameChars();
+        for (int i = 0; i < filenamePrefix.Length; i++)
+        {
+            char c = filenamePrefix[i];
+            if (Array.IndexOf(invalid, c) >= 0
+                || c == Path.DirectorySeparatorChar
+                || c == Path.AltDirectorySeparatorChar)
+                throw new ArgumentException(
+                    $"Filename prefix '{filenamePrefix}' contains invalid character '{c}' " +
+                    $"(directory separators / control chars / OS-reserved chars are rejected to " +
+                    $"prevent path-traversal in the emitted shard filenames).",
+                    nameof(filenamePrefix));
+        }
+        if (filenamePrefix == "." || filenamePrefix == "..")
+            throw new ArgumentException(
+                $"Filename prefix '{filenamePrefix}' is a path-relative segment.",
+                nameof(filenamePrefix));
         if (shardSizeBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(shardSizeBytes), "Shard size must be > 0 bytes.");
         _outputDir = outputDir;
@@ -124,6 +147,48 @@ public sealed class ShardedSafetensorsWriter
         for (int i = 0; i < _pending.Count; i++)
             if (_pending[i].Name == name)
                 throw new ArgumentException($"Tensor name '{name}' already added.", nameof(name));
+
+        // Validate shape entries and the payload length up front so
+        // a malformed AddRaw produces a clear error AT THE CALL SITE
+        // rather than corrupting a downstream shard's header. Sub-byte
+        // packed dtypes are exempt from the strict byte-count check
+        // because the on-disk byte count is shape-product / lanes-per-byte
+        // rather than shape-product × sizeof(dtype).
+        long elemCount = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentException(
+                    $"Shape dimension {i} = {shape[i]} is negative.", nameof(shape));
+            try { elemCount = checked(elemCount * shape[i]); }
+            catch (OverflowException ex)
+            {
+                throw new ArgumentException(
+                    $"Shape product overflows long for tensor '{name}'.", nameof(shape), ex);
+            }
+        }
+        bool isSubByte = dtype == SafetensorsDtype.AIDN_NF4
+            || dtype == SafetensorsDtype.AIDN_FP4
+            || dtype == SafetensorsDtype.AIDN_INT4
+            || dtype == SafetensorsDtype.AIDN_INT3
+            || dtype == SafetensorsDtype.AIDN_INT2
+            || dtype == SafetensorsDtype.AIDN_INT1;
+        if (!isSubByte)
+        {
+            long expectedBytes;
+            try { expectedBytes = checked(elemCount * dtype.ElementByteSize()); }
+            catch (OverflowException ex)
+            {
+                throw new ArgumentException(
+                    $"Element count × element size overflows long for tensor '{name}'.", nameof(shape), ex);
+            }
+            if (payload.Length != expectedBytes)
+                throw new ArgumentException(
+                    $"Payload length {payload.Length} does not match expected " +
+                    $"element count {elemCount} × element size {dtype.ElementByteSize()} = {expectedBytes} " +
+                    $"for tensor '{name}' dtype {dtype}.", nameof(payload));
+        }
+
         _pending.Add(new PendingTensor(name, dtype, (long[])shape.Clone(), (byte[])payload.Clone()));
     }
 
