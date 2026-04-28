@@ -85,7 +85,27 @@ public class DeterministicByDefaultTests
         // Plan compiled under deterministic=true must not be served on a subsequent
         // call under deterministic=false (and vice versa). The cache key mixes in
         // the current determinism state so the second call misses and recompiles.
-        bool original = AiDotNetEngine.DeterministicMode;
+        //
+        // BlasProvider.IsDeterministicMode resolves as
+        //   `_threadLocalDeterministicOverride ?? _deterministicMode`.
+        // SetDeterministicMode only writes the process-wide field. If a prior
+        // test in this collection (or upstream framework code) installed a
+        // thread-local override on the xUnit worker thread and the override
+        // is still pinned, both `Set(true)` and `Set(false)` calls in this
+        // test will be ignored by the override-first read — both compiles
+        // see the same key and the cache hands back the same plan instance.
+        // Capture and restore BOTH layers, and explicitly clear the
+        // thread-local override at the top so the process-wide toggle is
+        // observable for the duration of the test.
+        // Order matters: capture the thread-local override first, then
+        // CLEAR it before reading the process-wide flag. AiDotNetEngine
+        // .DeterministicMode returns the *merged effective* state (override
+        // wins), so reading it before the clear can stash the wrong value
+        // and the finally-block restore would then leak that override into
+        // the global flag.
+        bool? originalThreadLocal = BlasProvider.GetThreadLocalDeterministicMode();
+        BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool originalProcess = AiDotNetEngine.DeterministicMode;
         try
         {
             var engine = new CpuEngine();
@@ -95,6 +115,8 @@ public class DeterministicByDefaultTests
             using var cache = new CompiledModelCache<float>();
 
             AiDotNetEngine.SetDeterministicMode(true);
+            Assert.True(BlasProvider.IsDeterministicMode,
+                "Pre-condition: with thread-local cleared, process-wide=true must show true.");
             var planDeterministic = cache.GetOrCompileInference(
                 input._shape,
                 () =>
@@ -104,6 +126,8 @@ public class DeterministicByDefaultTests
                 });
 
             AiDotNetEngine.SetDeterministicMode(false);
+            Assert.False(BlasProvider.IsDeterministicMode,
+                "Pre-condition: with thread-local cleared, process-wide=false must show false.");
             var planNonDeterministic = cache.GetOrCompileInference(
                 input._shape,
                 () =>
@@ -120,7 +144,13 @@ public class DeterministicByDefaultTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(original);
+            // Restore in REVERSE order: process-wide first, then the
+            // thread-local override (which was cleared at the top). This
+            // mirrors the capture order so the original layered state is
+            // recovered even if a third party watches the merged effective
+            // state mid-finally.
+            AiDotNetEngine.SetDeterministicMode(originalProcess);
+            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocal);
         }
     }
 
