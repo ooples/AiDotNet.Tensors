@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -46,21 +48,32 @@ public class Issue257TapeRefIdentityTests
         var qResh = _engine.Reshape(qFlat, new[] { B, S, H, Dh });
         var qPerm = _engine.TensorPermute(qResh, new[] { 0, 2, 1, 3 });
 
-        // Use Q_perm in a downstream batched matmul (mimics attention scoring).
-        // For simplicity, take its sum-of-squares — not the attention math, but
-        // it exercises the same gradient chain back through Permute → Reshape →
-        // MatMul → weight that the issue reproducer hits.
-        var sq = _engine.TensorMultiply(qPerm, qPerm);
-        var loss = _engine.ReduceSum(sq, null);
+        // Send qPerm — the non-contiguous Permute output — back
+        // through TensorMatMul. This is the exact path #257 broke:
+        // the .Contiguous() rebind at the top of the matmul kernel
+        // replaces qPerm with a fresh contiguous tensor whose
+        // identity differs from the recorded tape input. Earlier
+        // versions of this test used TensorMultiply + ReduceSum,
+        // which exercises the chain back to weight but never sends
+        // the strided view through matmul, so a regression in the
+        // matmul rebind path could pass the test silently. Routing
+        // qPerm through a second matmul keeps the assertion tied to
+        // the path the PR is fixing.
+        // qPerm shape: [B, H, S, Dh] = [1, 2, 4, 8]. Pair it with
+        // its own transpose for a Q·Q^T-shaped matmul.
+        var qPermT = _engine.TensorPermute(qPerm, new[] { 0, 1, 3, 2 });   // [B, H, Dh, S]
+        var qq = _engine.TensorMatMul(qPerm, qPermT);                     // [B, H, S, S]
+        var loss = _engine.ReduceSum(qq, null);
 
         var grads = tape.ComputeGradients(loss, sources: new[] { weight });
         Assert.True(grads.ContainsKey(weight),
             "Pre-fix: weight gradient was silently dropped because the recorded MatMul " +
             "input ref didn't match the user-facing parameter after the Reshape→Permute chain.");
+        Assert.NotNull(grads[weight]);
         Assert.Equal(weight._shape, grads[weight]._shape);
 
-        // dL/dweight = 2 * input^T @ Q_flat (since loss = sum(Q_flat^2) is the same
-        // function as sum(Q_perm^2) — just permutes elements). Verify non-zero.
+        // Verify non-zero — sum(Q·Q^T) is a quartic in weight, so the
+        // gradient must be non-trivial.
         var g = grads[weight].AsSpan();
         bool anyNonZero = false;
         for (int i = 0; i < g.Length; i++) if (Math.Abs(g[i]) > 1e-6f) { anyNonZero = true; break; }
@@ -143,10 +156,38 @@ public class Issue257TapeRefIdentityTests
 
         var grads = tape.ComputeGradients(loss, sources: new[] { Wq, Wk, Wv, Wo });
 
-        Assert.True(grads.ContainsKey(Wq), "Wq grad was dropped — same defect as #257.");
-        Assert.True(grads.ContainsKey(Wk), "Wk grad was dropped — same defect as #257.");
-        Assert.True(grads.ContainsKey(Wv), "Wv grad was dropped — same defect as #257.");
-        Assert.True(grads.ContainsKey(Wo), "Wo grad was dropped — same defect as #257.");
+        // Tighter assertions than ContainsKey: a null entry would
+        // satisfy ContainsKey but still represent a dropped gradient.
+        // Validate non-null + shape on every parameter, and verify
+        // the values aren't all-zero (a zero-tensor entry would
+        // structurally satisfy the dictionary contract but
+        // semantically still represent a missing gradient).
+        AssertGradMaterialised(grads, Wq, nameof(Wq));
+        AssertGradMaterialised(grads, Wk, nameof(Wk));
+        AssertGradMaterialised(grads, Wv, nameof(Wv));
+        AssertGradMaterialised(grads, Wo, nameof(Wo));
+    }
+
+    /// <summary>
+    /// Asserts that <paramref name="param"/> appears in
+    /// <paramref name="grads"/> with a non-null tensor whose shape
+    /// matches <paramref name="param"/> and whose values are not
+    /// uniformly zero. Tightens the issue #257 acceptance — a null
+    /// or all-zero entry that ContainsKey would have accepted still
+    /// represents a regressed gradient.
+    /// </summary>
+    private static void AssertGradMaterialised(
+        Dictionary<Tensor<float>, Tensor<float>> grads, Tensor<float> param, string name)
+    {
+        Assert.True(grads.ContainsKey(param), $"{name} grad was dropped — same defect as #257.");
+        var g = grads[param];
+        Assert.NotNull(g);
+        Assert.Equal(param._shape, g._shape);
+        var span = g.AsSpan();
+        bool anyNonZero = false;
+        for (int i = 0; i < span.Length; i++)
+            if (Math.Abs(span[i]) > 1e-12f) { anyNonZero = true; break; }
+        Assert.True(anyNonZero, $"{name} gradient is uniformly zero — same effective defect as a missing key.");
     }
 
     /// <summary>
