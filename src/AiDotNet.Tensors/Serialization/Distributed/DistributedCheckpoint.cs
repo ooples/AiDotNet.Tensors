@@ -165,7 +165,12 @@ public sealed class PersistableTensor<T> : IPersistableTensor where T : struct
     }
 
     /// <inheritdoc />
-    public long ByteCount => _t.Length * MarshalSize();
+    // Widen Length to long BEFORE the multiply — Tensor<T>.Length is
+    // int and MarshalSize() returns int, so int × int overflows for
+    // any tensor of more than ~2 GB / sizeof(T). The previous form
+    // wrapped that overflow into a negative long, badly skewing the
+    // sharded writer's bin-packing.
+    public long ByteCount => (long)_t.Length * MarshalSize();
 
     /// <inheritdoc />
     public void AddTo(ShardedSafetensorsWriter writer, string name) => writer.Add(name, _t);

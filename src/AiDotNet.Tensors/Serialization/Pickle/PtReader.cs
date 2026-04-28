@@ -222,8 +222,44 @@ public sealed class PtReader
             rs.Bytes = data;
         }
 
+        // Trailer is fully read — every RawStorage now holds its
+        // bytes. Walk the pickle result and replace each
+        // DeferredLegacyTensor placeholder with a concrete
+        // PtTensorRef. Without this pass, the legacy tensors that
+        // REDUCE deferred would never materialise and Extract would
+        // see only the placeholders (which it doesn't recognise).
+        result = MaterialiseDeferred(result);
         reader.Extract(result);
         return reader;
+    }
+
+    /// <summary>
+    /// Recursively walks <paramref name="value"/> replacing each
+    /// <see cref="DeferredLegacyTensor"/> with the concrete
+    /// <see cref="PtTensorRef"/> built from its now-populated
+    /// <see cref="RawStorage.Bytes"/>. Containers (List / Dictionary)
+    /// are walked in place.
+    /// </summary>
+    private static object? MaterialiseDeferred(object? value)
+    {
+        if (value is null) return null;
+        if (value is DeferredLegacyTensor dl) return dl.Materialise();
+        if (value is IDictionary dict)
+        {
+            var keys = new object[dict.Count];
+            int idx = 0;
+            foreach (var k in dict.Keys) keys[idx++] = k;
+            foreach (var k in keys)
+                dict[k] = MaterialiseDeferred(dict[k]);
+            return dict;
+        }
+        if (value is IList list)
+        {
+            for (int i = 0; i < list.Count; i++)
+                list[i] = MaterialiseDeferred(list[i]);
+            return list;
+        }
+        return value;
     }
 
     private static void WireDispatch(PickleInterpreter interp, Func<object, object?> persistentIdResolver)
@@ -255,7 +291,17 @@ public sealed class PtReader
                 for (int i = 0; i < shape.Length; i++) shape[i] = ToLong(sizeTuple[i]);
                 var strides = new long[strideTuple.Length];
                 for (int i = 0; i < strides.Length; i++) strides[i] = ToLong(strideTuple[i]);
-                return new PtTensorRef(storage.StorageType, shape, storageOffset, strides, storage.Bytes ?? Array.Empty<byte>());
+
+                // Modern (zip) format: persistent-id resolver loaded
+                // bytes eagerly, so storage.Bytes is non-null already.
+                // Legacy format: storage.Bytes is null at this point —
+                // the trailer is read AFTER pickle interp finishes.
+                // Capture the RawStorage reference instead of its
+                // (currently empty) Bytes so the post-trailer pass can
+                // realise the concrete PtTensorRef once bytes arrive.
+                if (storage.Bytes is not null)
+                    return new PtTensorRef(storage.StorageType, shape, storageOffset, strides, storage.Bytes);
+                return new DeferredLegacyTensor(storage, shape, storageOffset, strides);
             }
 
             // OrderedDict — argArr can be empty (default ctor) or a
@@ -451,6 +497,39 @@ public sealed class PtReader
         {
             StorageType = storageType;
             Bytes = bytes;
+        }
+    }
+
+    /// <summary>
+    /// Placeholder emitted by REDUCE during legacy-format pickle
+    /// interpretation, when the storage payload hasn't been read yet.
+    /// Captures the <see cref="RawStorage"/> *reference* (not its
+    /// transient empty <c>Bytes</c>) so a post-trailer materialise
+    /// pass can construct the real <see cref="PtTensorRef"/> with the
+    /// freshly-filled bytes. Without this indirection, every legacy
+    /// tensor would permanently hold an empty payload because
+    /// REDUCE ran before the trailer.
+    /// </summary>
+    private sealed class DeferredLegacyTensor
+    {
+        public RawStorage Storage { get; }
+        public long[] Shape { get; }
+        public long StorageOffset { get; }
+        public long[] Strides { get; }
+
+        public DeferredLegacyTensor(RawStorage storage, long[] shape, long storageOffset, long[] strides)
+        {
+            Storage = storage;
+            Shape = shape;
+            StorageOffset = storageOffset;
+            Strides = strides;
+        }
+
+        public PtTensorRef Materialise()
+        {
+            return new PtTensorRef(
+                Storage.StorageType, Shape, StorageOffset, Strides,
+                Storage.Bytes ?? Array.Empty<byte>());
         }
     }
 }

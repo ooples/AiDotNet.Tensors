@@ -120,6 +120,18 @@ public sealed class ShardedSafetensorsWriter
         if (_saved) throw new InvalidOperationException("Cannot Add after Save.");
         if (name is null) throw new ArgumentNullException(nameof(name));
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        // Mirror SafetensorsWriter's name validation so a malformed
+        // name is rejected up front rather than buffering OK and
+        // throwing inside Save() after some shard files were already
+        // written. SafetensorsWriter (which the per-shard emit goes
+        // through) refuses both empty names and the reserved
+        // "__metadata__" key, so the same checks have to fire here.
+        if (string.IsNullOrEmpty(name))
+            throw new ArgumentException("Tensor name cannot be empty.", nameof(name));
+        if (name == "__metadata__")
+            throw new ArgumentException(
+                "'__metadata__' is reserved for the metadata dict — use Metadata[\"...\"] = \"...\" instead.",
+                nameof(name));
         for (int i = 0; i < _pending.Count; i++)
             if (_pending[i].Name == name)
                 throw new ArgumentException($"Tensor name '{name}' already added.", nameof(name));
@@ -144,6 +156,13 @@ public sealed class ShardedSafetensorsWriter
         if (name is null) throw new ArgumentNullException(nameof(name));
         if (shape is null) throw new ArgumentNullException(nameof(shape));
         if (payload is null) throw new ArgumentNullException(nameof(payload));
+        // Same name-validation contract as Add<T> — see comment there.
+        if (string.IsNullOrEmpty(name))
+            throw new ArgumentException("Tensor name cannot be empty.", nameof(name));
+        if (name == "__metadata__")
+            throw new ArgumentException(
+                "'__metadata__' is reserved for the metadata dict — use Metadata[\"...\"] = \"...\" instead.",
+                nameof(name));
         for (int i = 0; i < _pending.Count; i++)
             if (_pending[i].Name == name)
                 throw new ArgumentException($"Tensor name '{name}' already added.", nameof(name));

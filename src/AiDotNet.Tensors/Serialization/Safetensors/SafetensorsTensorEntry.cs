@@ -17,8 +17,16 @@ public sealed class SafetensorsTensorEntry
     /// <summary>Element type tag.</summary>
     public SafetensorsDtype Dtype { get; }
 
-    /// <summary>Shape — a copy of the parsed array, safe to mutate.</summary>
-    public long[] Shape { get; }
+    /// <summary>
+    /// Shape — returns a fresh copy on every access so caller-side
+    /// mutation can't leave the entry internally inconsistent
+    /// (<see cref="ElementCount"/> is cached at construction; mutating
+    /// the exposed array would diverge it from the count and skew any
+    /// downstream byte-length calculation that re-derived from Shape).
+    /// </summary>
+    public long[] Shape => (long[])_shape.Clone();
+
+    private readonly long[] _shape;
 
     /// <summary>
     /// Start offset of this tensor's payload in the data block (0-based;
@@ -85,7 +93,7 @@ public sealed class SafetensorsTensorEntry
 
         Name = name;
         Dtype = dtype;
-        Shape = (long[])shape.Clone();
+        _shape = (long[])shape.Clone();
         DataOffsetStart = dataOffsetStart;
         DataOffsetEnd = dataOffsetEnd;
         ElementCount = elemCount;

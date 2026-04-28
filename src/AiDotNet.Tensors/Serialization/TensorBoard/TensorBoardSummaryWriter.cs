@@ -59,11 +59,38 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         if (logDir is null) throw new ArgumentNullException(nameof(logDir));
         if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
 
+        // Use FileMode.CreateNew + a uniqueness suffix loop so two
+        // writers opened in the same second on the same host don't
+        // truncate each other's logs. The unix-seconds-based filename
+        // matches TensorFlow's writer convention (TensorBoard's
+        // EventAccumulator scans logDir by that prefix); appending an
+        // extra `.{counter}` suffix on collision is a benign extension
+        // — TensorBoard still picks both files up.
         long unixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         string host = Environment.MachineName;
-        string filename = $"events.out.tfevents.{unixSeconds}.{host}";
-        string path = Path.Combine(logDir, filename);
-        var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        string baseFilename = $"events.out.tfevents.{unixSeconds}.{host}";
+        string path = Path.Combine(logDir, baseFilename);
+        FileStream fs;
+        int suffix = 0;
+        while (true)
+        {
+            try
+            {
+                fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+                break;
+            }
+            catch (IOException) when (File.Exists(path))
+            {
+                suffix++;
+                path = Path.Combine(logDir, $"{baseFilename}.{suffix}");
+                if (suffix > 1000)
+                    // Shouldn't happen in practice — 1000 collisions in
+                    // one second is pathological. Surface clearly.
+                    throw new IOException(
+                        $"Could not allocate a unique TensorBoard events filename in {logDir} after " +
+                        $"1000 collisions on '{baseFilename}'.");
+            }
+        }
         try
         {
             var w = new TensorBoardSummaryWriter(fs, ownsStream: true);
@@ -158,24 +185,34 @@ public sealed class TensorBoardSummaryWriter : IDisposable
             sum += v;
             sumSq += v * v;
         }
-        const int Buckets = 30;
-        double width = (max - min) / Buckets;
-        if (width == 0) width = 1; // all values equal — single bucket
         // HistogramProto's bucket_limit is parallel to bucket — both
         // arrays must have the same length, and bucket_limit[i] is
-        // the *upper* edge of bucket i (not the lower). Allocating
-        // Buckets+1 lower edges produced (a) a length mismatch that
-        // broke the rendering and (b) wrong bucket-edge semantics.
-        // Now: emit Buckets upper edges where bucket_limit[i] = min + (i+1) * width.
-        var bucketEdges = new double[Buckets];
-        var bucketCounts = new double[Buckets];
-        for (int i = 0; i < Buckets; i++) bucketEdges[i] = min + (i + 1) * width;
-        for (int i = 0; i < values.Length; i++)
+        // the *upper* edge of bucket i (not the lower).
+        double[] bucketEdges;
+        double[] bucketCounts;
+        if (max == min)
         {
-            int idx = (int)((values[i] - min) / width);
-            if (idx >= Buckets) idx = Buckets - 1;
-            if (idx < 0) idx = 0;
-            bucketCounts[idx]++;
+            // Constant-value distribution: a single bucket whose upper
+            // limit is the value itself. Inventing a fake range would
+            // make TensorBoard render a spread-out histogram for what
+            // is structurally a delta function.
+            bucketEdges = new double[] { max };
+            bucketCounts = new double[] { values.Length };
+        }
+        else
+        {
+            const int Buckets = 30;
+            double width = (max - min) / Buckets;
+            bucketEdges = new double[Buckets];
+            bucketCounts = new double[Buckets];
+            for (int i = 0; i < Buckets; i++) bucketEdges[i] = min + (i + 1) * width;
+            for (int i = 0; i < values.Length; i++)
+            {
+                int idx = (int)((values[i] - min) / width);
+                if (idx >= Buckets) idx = Buckets - 1;
+                if (idx < 0) idx = 0;
+                bucketCounts[idx]++;
+            }
         }
 
         var ev = new EventBuilder
@@ -195,26 +232,47 @@ public sealed class TensorBoardSummaryWriter : IDisposable
     }
 
     /// <summary>
-    /// Logs an arbitrary numeric hyperparameter value under
-    /// <paramref name="name"/> — surfaces in TensorBoard's HParams
-    /// dashboard as a column. Use <see cref="LogHParams"/> for the
-    /// canonical "log all HPs as one record at start of run" call.
+    /// Logs a numeric hyperparameter value as an ordinary scalar
+    /// summary under tag <c>hparams/{name}</c>. Visible in
+    /// TensorBoard's <b>Scalars</b> dashboard alongside other tagged
+    /// scalars; <b>not</b> automatically displayed in TensorBoard's
+    /// dedicated <b>HParams</b> dashboard.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Why this is a plain scalar, not a real HParams record:</b></para>
+    /// <para>
+    /// TensorBoard's HParams plugin requires dedicated session-metadata
+    /// summaries (<c>session_start_info</c> / <c>session_end_info</c>
+    /// + an experiment configuration) — it doesn't recognise
+    /// arbitrary <c>hparams/*</c>-prefixed scalars. Implementing the
+    /// metadata-summaries surface adds a meaningful amount of
+    /// protobuf shape we'd need to vend; until that lands, this
+    /// method ships as a "scalar log under a conventional prefix"
+    /// helper, with the docs being explicit about the limitation
+    /// rather than misleading callers into thinking the dashboard
+    /// will pick it up.
+    /// </para>
+    /// </remarks>
     public void AddHParam(string name, double value)
     {
-        // HParams round-trip via the same scalar opcode under a
-        // hardcoded "hparams/{name}" tag that the HParams dashboard
-        // recognises.
+        ThrowIfDisposed();
         AddScalar("hparams/" + name, value, step: 0);
     }
 
     /// <summary>
     /// Logs every entry of <paramref name="hparams"/> as a scalar
-    /// under <c>hparams/{key}</c>. Convenience for the standard "log
-    /// hyperparameters once at start of training" pattern.
+    /// under <c>hparams/{key}</c>. Convenience for "log all
+    /// hyperparameters once at start of training". See
+    /// <see cref="AddHParam"/> for the relationship to TensorBoard's
+    /// HParams dashboard (these are scalar logs, not HParams plugin
+    /// records).
     /// </summary>
     public void LogHParams(IReadOnlyDictionary<string, double> hparams)
     {
+        // Guard up front: an empty dictionary used to silently succeed
+        // on a disposed writer because the per-entry AddHParam call
+        // never ran. Now ThrowIfDisposed fires before any work.
+        ThrowIfDisposed();
         if (hparams is null) throw new ArgumentNullException(nameof(hparams));
         foreach (var kv in hparams) AddHParam(kv.Key, kv.Value);
     }

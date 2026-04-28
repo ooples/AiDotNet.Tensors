@@ -195,6 +195,33 @@ internal static class Program
                 case "BoolStorage":
                     w.Add(kv.Key, PtReader.ToTensor<bool>(t));
                     break;
+                // FP16 / BF16 — PyTorch's HalfStorage / BFloat16Storage
+                // don't have a CLR mapping that PtReader.ToTensor<T> can
+                // satisfy (System.Half and BFloat16 are .NET 5+/9+ types
+                // with awkward cross-tfm support), so route the raw byte
+                // payload through the writer's AddRaw using the matching
+                // safetensors dtype tag. Most public HuggingFace
+                // checkpoints (Llama / Mistral / Whisper / Stable
+                // Diffusion / etc.) are F16 or BF16; without this branch
+                // a `convert pt → safetensors` of those checkpoints
+                // would drop almost every weight with a "skipping"
+                // warning. Now: lossless byte-for-byte transfer.
+                case "HalfStorage":
+                {
+                    var shape = new long[t.Shape.Length];
+                    for (int i = 0; i < shape.Length; i++) shape[i] = t.Shape[i];
+                    w.AddRaw(kv.Key, AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F16,
+                        shape, ExtractContiguousBytes(t));
+                    break;
+                }
+                case "BFloat16Storage":
+                {
+                    var shape = new long[t.Shape.Length];
+                    for (int i = 0; i < shape.Length; i++) shape[i] = t.Shape[i];
+                    w.AddRaw(kv.Key, AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.BF16,
+                        shape, ExtractContiguousBytes(t));
+                    break;
+                }
                 default:
                     Console.Error.WriteLine(
                         $"warn: skipping {kv.Key} — unsupported PyTorch storage type {t.DtypeStorage}.");
@@ -204,6 +231,66 @@ internal static class Program
         }
         w.Save();
         Console.WriteLine($"  wrote {count} tensor(s)");
+    }
+
+    /// <summary>
+    /// Returns the contiguous byte payload of <paramref name="t"/>
+    /// suitable for direct emission to a safetensors writer's AddRaw.
+    /// For row-major-contiguous tensors this is the raw storage at the
+    /// declared StorageOffset; for non-contiguous (strided) tensors it
+    /// gathers via stride walk into a fresh contiguous buffer so the
+    /// emitted file always represents the tensor's logical shape, not
+    /// its on-disk layout.
+    /// </summary>
+    private static byte[] ExtractContiguousBytes(AiDotNet.Tensors.Serialization.Pickle.PtTensorRef t)
+    {
+        long elemCount = 1;
+        for (int i = 0; i < t.Shape.Length; i++) elemCount *= t.Shape[i];
+        // Inline the size lookup rather than calling
+        // PtReader.StorageElementSize (which is `internal` for test-
+        // project access only). Mirror the same set the reader knows.
+        int eltSize = t.DtypeStorage switch
+        {
+            "FloatStorage" => 4,
+            "DoubleStorage" => 8,
+            "LongStorage" => 8,
+            "IntStorage" => 4,
+            "ShortStorage" => 2,
+            "CharStorage" or "ByteStorage" or "BoolStorage" => 1,
+            "HalfStorage" or "BFloat16Storage" => 2,
+            _ => throw new InvalidOperationException(
+                $"Unknown PyTorch storage type '{t.DtypeStorage}'."),
+        };
+        long byteCount = elemCount * eltSize;
+        if (byteCount > int.MaxValue)
+            throw new InvalidOperationException(
+                $"Tensor {byteCount} bytes — exceeds int.MaxValue and cannot fit in a single byte[].");
+
+        if (t.IsContiguous)
+        {
+            var span = new ReadOnlySpan<byte>(t.Bytes, (int)(t.StorageOffset * eltSize), (int)byteCount);
+            return span.ToArray();
+        }
+
+        // Strided gather — walk the multi-index, copy element-by-element
+        // into a fresh row-major buffer.
+        var buf = new byte[byteCount];
+        var idx = new long[t.Shape.Length];
+        for (long flat = 0; flat < elemCount; flat++)
+        {
+            long src = t.StorageOffset;
+            for (int d = 0; d < t.Shape.Length; d++) src += idx[d] * t.Strides[d];
+            long srcByte = src * eltSize;
+            new ReadOnlySpan<byte>(t.Bytes, (int)srcByte, eltSize)
+                .CopyTo(new Span<byte>(buf, (int)(flat * eltSize), eltSize));
+            for (int d = t.Shape.Length - 1; d >= 0; d--)
+            {
+                idx[d]++;
+                if (idx[d] < t.Shape[d]) break;
+                idx[d] = 0;
+            }
+        }
+        return buf;
     }
 
     private static void ConvertSafetensorsToSharded(string input, string output, long shardSize)
