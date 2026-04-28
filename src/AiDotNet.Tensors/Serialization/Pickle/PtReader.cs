@@ -179,7 +179,13 @@ public sealed class PtReader
         // modern zip format is what 99% of public checkpoints use.
         foreach (var rs in storageOrder)
         {
-            // Read one int64 length prefix.
+            // Read one int64 length prefix. A truncated read here means
+            // the trailer is shorter than the pickle stream's storage
+            // count promised — every storage that follows would be
+            // unresolved and downstream tensors would silently end up
+            // pointing at empty bytes. Throw rather than break-and-
+            // continue so the caller sees the corrupt-checkpoint
+            // condition instead of getting partially-zeroed tensors.
             byte[] lenBytes = new byte[8];
             int got = 0;
             while (got < 8)
@@ -188,7 +194,11 @@ public sealed class PtReader
                 if (n == 0) break;
                 got += n;
             }
-            if (got < 8) break;
+            if (got < 8)
+                throw new EndOfStreamException(
+                    $"Legacy .pt trailer truncated: expected 8-byte length prefix for storage " +
+                    $"'{rs.StorageType}' but got {got} bytes. Checkpoint is corrupt — " +
+                    $"the pickle stream declared more storages than the trailer contains.");
             long count = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(lenBytes);
             int eltSize = StorageElementSize(rs.StorageType);
             // Reject negative counts and counts that would overflow
@@ -379,19 +389,47 @@ public sealed class PtReader
             return MaterialiseStrided<T>(reference);
         }
 
+        // All arithmetic in checked blocks so a malformed checkpoint
+        // surfaces as InvalidDataException rather than wrapping the
+        // bounds-check or producing a downstream Span.Slice with a
+        // misleading ArgumentOutOfRangeException.
         long n = 1;
-        for (int i = 0; i < reference.Shape.Length; i++) n *= reference.Shape[i];
+        for (int i = 0; i < reference.Shape.Length; i++)
+        {
+            if (reference.Shape[i] < 0)
+                throw new InvalidDataException(
+                    $"Tensor shape dim {i} = {reference.Shape[i]} is negative.");
+            try { n = checked(n * reference.Shape[i]); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Tensor shape product overflows long.", ex);
+            }
+        }
         if (n > int.MaxValue)
             throw new InvalidOperationException($"Tensor too large: {n} elements > int.MaxValue.");
 
         int eltSize = StorageElementSize(reference.DtypeStorage);
         var data = new T[n];
         var dst = MemoryMarshal.AsBytes(data.AsSpan());
-        long startByte = reference.StorageOffset * eltSize;
-        long byteCount = n * eltSize;
-        if (startByte + byteCount > reference.Bytes.Length)
+        long startByte;
+        long byteCount;
+        long endByte;
+        try
+        {
+            startByte = checked(reference.StorageOffset * eltSize);
+            byteCount = checked(n * eltSize);
+            endByte = checked(startByte + byteCount);
+        }
+        catch (OverflowException ex)
+        {
             throw new InvalidDataException(
-                $"Storage too short: needs {startByte + byteCount} bytes, has {reference.Bytes.Length}.");
+                $"Tensor byte-range computation overflows long " +
+                $"(StorageOffset={reference.StorageOffset}, eltSize={eltSize}, n={n}).", ex);
+        }
+        if (startByte < 0 || endByte > reference.Bytes.Length)
+            throw new InvalidDataException(
+                $"Tensor storage range [{startByte}, {endByte}) is outside the {reference.Bytes.Length}-byte storage.");
         new ReadOnlySpan<byte>(reference.Bytes, (int)startByte, (int)byteCount).CopyTo(dst);
 
         var intShape = new int[reference.Shape.Length];

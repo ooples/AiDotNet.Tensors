@@ -256,6 +256,12 @@ public sealed class TensorBoardSummaryWriter : IDisposable
     public void AddHParam(string name, double value)
     {
         ThrowIfDisposed();
+        if (name is null) throw new ArgumentNullException(nameof(name));
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException(
+                "HParam name must be a non-empty, non-whitespace string. A blank name " +
+                "would degrade into an unnameable 'hparams/' tag that's hard to detect downstream.",
+                nameof(name));
         AddScalar("hparams/" + name, value, step: 0);
     }
 

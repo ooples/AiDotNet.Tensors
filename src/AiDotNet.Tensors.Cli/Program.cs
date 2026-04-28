@@ -244,8 +244,26 @@ internal static class Program
     /// </summary>
     private static byte[] ExtractContiguousBytes(AiDotNet.Tensors.Serialization.Pickle.PtTensorRef t)
     {
+        // All arithmetic is in `checked` blocks so a malformed
+        // checkpoint with absurd shape / strides / offset surfaces as
+        // an OverflowException-wrapped InvalidDataException instead of
+        // a downstream out-of-range Span.Slice or wrapped negative
+        // size. Shape entries are also validated as non-negative
+        // since PtTensorRef accepts them as long but downstream code
+        // assumes a positive product.
         long elemCount = 1;
-        for (int i = 0; i < t.Shape.Length; i++) elemCount *= t.Shape[i];
+        for (int i = 0; i < t.Shape.Length; i++)
+        {
+            if (t.Shape[i] < 0)
+                throw new InvalidDataException(
+                    $"Tensor shape dim {i} = {t.Shape[i]} is negative; refusing to materialise.");
+            try { elemCount = checked(elemCount * t.Shape[i]); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Tensor shape product overflows long for storage '{t.DtypeStorage}'.", ex);
+            }
+        }
         // Inline the size lookup rather than calling
         // PtReader.StorageElementSize (which is `internal` for test-
         // project access only). Mirror the same set the reader knows.
@@ -261,26 +279,81 @@ internal static class Program
             _ => throw new InvalidOperationException(
                 $"Unknown PyTorch storage type '{t.DtypeStorage}'."),
         };
-        long byteCount = elemCount * eltSize;
+        long byteCount;
+        try { byteCount = checked(elemCount * eltSize); }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException(
+                $"Tensor element count × element size overflows long.", ex);
+        }
         if (byteCount > int.MaxValue)
             throw new InvalidOperationException(
                 $"Tensor {byteCount} bytes — exceeds int.MaxValue and cannot fit in a single byte[].");
 
         if (t.IsContiguous)
         {
-            var span = new ReadOnlySpan<byte>(t.Bytes, (int)(t.StorageOffset * eltSize), (int)byteCount);
+            // StorageOffset and the resulting byte range must fit
+            // inside the storage. Without these guards a negative
+            // StorageOffset would pass to ReadOnlySpan and throw
+            // ArgumentOutOfRangeException with no diagnostic context.
+            long startByte;
+            try { startByte = checked(t.StorageOffset * eltSize); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Tensor storage-offset × element-size overflows long.", ex);
+            }
+            long endByte;
+            try { endByte = checked(startByte + byteCount); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Tensor storage range overflows long.", ex);
+            }
+            if (startByte < 0 || endByte > t.Bytes.Length)
+                throw new InvalidDataException(
+                    $"Tensor storage range [{startByte}, {endByte}) is outside the {t.Bytes.Length}-byte storage.");
+            var span = new ReadOnlySpan<byte>(t.Bytes, (int)startByte, (int)byteCount);
             return span.ToArray();
         }
 
-        // Strided gather — walk the multi-index, copy element-by-element
-        // into a fresh row-major buffer.
+        // Strided gather — walk the multi-index, copy element-by-
+        // element into a fresh row-major buffer with bounds-checks
+        // on every source-byte computation. Strides come from
+        // checkpoint metadata so a malicious file could otherwise
+        // wrap the multiply or land outside Bytes.Length.
         var buf = new byte[byteCount];
         var idx = new long[t.Shape.Length];
         for (long flat = 0; flat < elemCount; flat++)
         {
             long src = t.StorageOffset;
-            for (int d = 0; d < t.Shape.Length; d++) src += idx[d] * t.Strides[d];
-            long srcByte = src * eltSize;
+            for (int d = 0; d < t.Shape.Length; d++)
+            {
+                long step;
+                try { step = checked(idx[d] * t.Strides[d]); }
+                catch (OverflowException ex)
+                {
+                    throw new InvalidDataException(
+                        $"Stride × index overflows at flat={flat}, dim={d}.", ex);
+                }
+                try { src = checked(src + step); }
+                catch (OverflowException ex)
+                {
+                    throw new InvalidDataException(
+                        $"Source-element accumulation overflows at flat={flat}, dim={d}.", ex);
+                }
+            }
+            long srcByte;
+            try { srcByte = checked(src * eltSize); }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Source-byte computation overflows at flat={flat}.", ex);
+            }
+            if (srcByte < 0 || srcByte + eltSize > t.Bytes.Length)
+                throw new InvalidDataException(
+                    $"Strided read out of bounds at flat={flat}: srcByte={srcByte}, eltSize={eltSize}, " +
+                    $"storage bytes={t.Bytes.Length}.");
             new ReadOnlySpan<byte>(t.Bytes, (int)srcByte, eltSize)
                 .CopyTo(new Span<byte>(buf, (int)(flat * eltSize), eltSize));
             for (int d = t.Shape.Length - 1; d >= 0; d--)
