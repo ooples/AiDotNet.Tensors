@@ -407,6 +407,7 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
+            float lr = (float)g.LearningRate;
             float rho = (float)g.GetOption("rho", 0.9);
             float eps = (float)g.GetOption("eps", 1e-6);
             float wd = (float)g.GetOption("weight_decay", 0.0);
@@ -421,7 +422,7 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* psq = sq) fixed (float* pad = ad)
-                        FusedOptimizer.AdaDeltaUpdateSimd(pp, pg, psq, pad, p.Length, rho, eps);
+                        FusedOptimizer.AdaDeltaUpdateSimd(pp, pg, psq, pad, p.Length, lr, rho, eps);
                 }
             }
         }

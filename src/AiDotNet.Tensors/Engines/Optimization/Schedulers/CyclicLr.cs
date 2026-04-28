@@ -41,6 +41,8 @@ public sealed class CyclicLr : LrScheduler
         : base(optimizer, lastEpoch)
     {
         if (stepSizeUp <= 0) throw new ArgumentOutOfRangeException(nameof(stepSizeUp));
+        if (stepSizeDown.HasValue && stepSizeDown.Value <= 0)
+            throw new ArgumentOutOfRangeException(nameof(stepSizeDown));
         BaseLr = baseLr; MaxLr = maxLr;
         StepSizeUp = stepSizeUp;
         StepSizeDown = stepSizeDown ?? stepSizeUp;
@@ -253,19 +255,18 @@ public sealed class ReduceLrOnPlateau
 }
 
 /// <summary>SequentialLr: dispatch to a list of schedulers based on milestone epochs.</summary>
-public sealed class SequentialLr
+public sealed class SequentialLr : LrScheduler
 {
     /// <summary>Sub-schedulers, applied in order.</summary>
     public IReadOnlyList<LrScheduler> Schedulers { get; }
     /// <summary>Milestone epochs at which to switch from scheduler i to i+1.</summary>
     public IReadOnlyList<int> Milestones { get; }
-    /// <summary>The optimizer being controlled.</summary>
-    public IOptimizer Optimizer { get; }
-
-    private int _lastEpoch;
 
     /// <summary>Build a SequentialLr scheduler.</summary>
     public SequentialLr(IOptimizer optimizer, IReadOnlyList<LrScheduler> schedulers, IReadOnlyList<int> milestones)
+        // lastEpoch starts at 0 because the very first child has already applied its
+        // epoch-0 LR to the optimizer in its own constructor; we should not double-apply.
+        : base(optimizer, lastEpoch: 0)
     {
         if (schedulers == null) throw new ArgumentNullException(nameof(schedulers));
         if (milestones == null) throw new ArgumentNullException(nameof(milestones));
@@ -274,30 +275,59 @@ public sealed class SequentialLr
         for (int i = 1; i < milestones.Count; i++)
             if (milestones[i] <= milestones[i - 1])
                 throw new ArgumentException("milestones must be strictly increasing.");
-        Optimizer = optimizer ?? throw new ArgumentNullException(nameof(optimizer));
+        foreach (var s in schedulers)
+            if (!ReferenceEquals(s.Optimizer, optimizer))
+                throw new ArgumentException("all sub-schedulers must share the same optimizer.");
         Schedulers = schedulers; Milestones = milestones;
-        _lastEpoch = -1;
+        // Pull the active child's LR through to our _lastLrs so GetLastLr() is consistent
+        // before any explicit Step() call.
+        var first = schedulers[0].GetLastLr();
+        for (int i = 0; i < _lastLrs.Length; i++) _lastLrs[i] = first[i];
+    }
+
+    /// <inheritdoc />
+    protected override IReadOnlyList<double> GetLr()
+    {
+        int idx = ActiveIndex();
+        return Schedulers[idx].GetLastLr();
     }
 
     /// <summary>Advance the active scheduler.</summary>
-    public void Step()
+    public override void Step(int? epoch = null)
     {
-        _lastEpoch++;
-        int idx = 0;
-        for (int i = 0; i < Milestones.Count; i++) if (_lastEpoch >= Milestones[i]) idx = i + 1;
-        Schedulers[idx].Step();
+        LastEpoch = epoch ?? LastEpoch + 1;
+        int idx = ActiveIndex();
+        // Each child scheduler has already applied its epoch-0 LR in its constructor.
+        // On the very step we cross a milestone, the new scheduler should apply that
+        // already-prepared epoch-0 LR (via Step(0)) instead of advancing to its epoch 1.
+        bool justSwitched = idx > 0 && LastEpoch == Milestones[idx - 1];
+        if (justSwitched) Schedulers[idx].Step(0);
+        else Schedulers[idx].Step();
+        // Mirror the active child's last LRs into our own buffer for GetLastLr().
+        var lr = Schedulers[idx].GetLastLr();
+        for (int i = 0; i < _lastLrs.Length; i++) _lastLrs[i] = lr[i];
     }
 
-    /// <summary>Last LRs applied across all groups.</summary>
-    public IReadOnlyList<double> GetLastLr()
+    private int ActiveIndex()
     {
         int idx = 0;
-        for (int i = 0; i < Milestones.Count; i++) if (_lastEpoch >= Milestones[i]) idx = i + 1;
-        return Schedulers[idx].GetLastLr();
+        for (int i = 0; i < Milestones.Count; i++) if (LastEpoch >= Milestones[i]) idx = i + 1;
+        return idx;
     }
 }
 
-/// <summary>ChainedScheduler: apply every scheduler at every step (composition by multiplication).</summary>
+/// <summary>ChainedScheduler: compose every sub-scheduler multiplicatively at every step.
+///
+/// PyTorch parity (<c>torch.optim.lr_scheduler.ChainedScheduler</c>): each child computes
+/// an absolute LR from its own <c>BaseLrs</c>, but the chained schedule should compound
+/// effects — e.g. <c>ConstantLr(0.5) ∘ ExponentialLr(γ=0.9)</c> at epoch <c>e</c> yields
+/// <c>base_lr · 0.5 · 0.9^e</c>, not just <c>base_lr · 0.9^e</c>.
+///
+/// We achieve composition by stepping each child (which advances its internal state and
+/// transiently writes its absolute LR into the optimizer), reading its per-group factor
+/// <c>last_lr / base_lr</c>, multiplying those factors together against the shared base
+/// LRs, and finally overwriting the optimizer's LR with the composed result.
+/// </summary>
 public sealed class ChainedScheduler
 {
     /// <summary>Sub-schedulers — all stepped together.</summary>
@@ -305,23 +335,56 @@ public sealed class ChainedScheduler
     /// <summary>Optimizer they all share.</summary>
     public IOptimizer Optimizer { get; }
 
+    private readonly double[] _composedLrs;
+    private readonly double[] _baseLrs;
+
     /// <summary>Build a ChainedScheduler.</summary>
     public ChainedScheduler(IOptimizer optimizer, IReadOnlyList<LrScheduler> schedulers)
     {
         Optimizer = optimizer ?? throw new ArgumentNullException(nameof(optimizer));
         Schedulers = schedulers ?? throw new ArgumentNullException(nameof(schedulers));
+        if (schedulers.Count == 0)
+            throw new ArgumentException("at least one sub-scheduler is required.", nameof(schedulers));
         foreach (var s in schedulers)
             if (!ReferenceEquals(s.Optimizer, optimizer))
                 throw new ArgumentException("all sub-schedulers must share the same optimizer.");
+        // Snapshot the shared base LRs (every child captured the same values at construction).
+        _baseLrs = (double[])Schedulers[0].BaseLrs.Clone();
+        _composedLrs = (double[])_baseLrs.Clone();
+
+        // Each child's constructor already applied its own absolute epoch-0 LR to the optimizer.
+        // Compose those factors so the optimizer reflects the multiplicative starting state.
+        ApplyComposedFactors();
     }
 
-    /// <summary>Step every sub-scheduler.</summary>
+    /// <summary>Step every sub-scheduler and write the composed (multiplicative) LR to the optimizer.</summary>
     public void Step()
     {
         foreach (var s in Schedulers) s.Step();
+        ApplyComposedFactors();
     }
 
-    /// <summary>The LRs from the last sub-scheduler stepped (the one that last wrote into param_groups).</summary>
-    public IReadOnlyList<double> GetLastLr() =>
-        Schedulers.Count == 0 ? Array.Empty<double>() : Schedulers[Schedulers.Count - 1].GetLastLr();
+    private void ApplyComposedFactors()
+    {
+        int n = Optimizer.ParamGroups.Count;
+        for (int i = 0; i < n; i++) _composedLrs[i] = _baseLrs[i];
+        foreach (var s in Schedulers)
+        {
+            var lastLr = s.GetLastLr();
+            for (int i = 0; i < n; i++)
+            {
+                double sBase = s.BaseLrs[i];
+                double factor = sBase != 0.0 ? lastLr[i] / sBase : 1.0;
+                _composedLrs[i] *= factor;
+            }
+        }
+        for (int i = 0; i < n; i++)
+        {
+            Optimizer.ParamGroups[i].LearningRate = _composedLrs[i];
+            Optimizer.ParamGroups[i].LastLearningRate = _composedLrs[i];
+        }
+    }
+
+    /// <summary>Final composed LRs after the last <see cref="Step"/>.</summary>
+    public IReadOnlyList<double> GetLastLr() => _composedLrs;
 }

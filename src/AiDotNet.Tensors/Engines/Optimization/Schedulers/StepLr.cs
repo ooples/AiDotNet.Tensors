@@ -176,8 +176,18 @@ public sealed class CosineAnnealingWarmRestarts : LrScheduler
         if (t0 <= 0) throw new ArgumentOutOfRangeException(nameof(t0));
         if (tMult < 1) throw new ArgumentOutOfRangeException(nameof(tMult));
         T0 = t0; TMult = tMult; EtaMin = etaMin;
-        _tCur = lastEpoch == -1 ? 0 : lastEpoch;
-        _ti = t0;
+        // Walk through whole restart segments so resume-from-checkpoint lands in the
+        // correct (_tCur, _ti) window. With T_mult=1, _ti stays at T_0 and _tCur =
+        // lastEpoch mod T_0; with T_mult>1, period grows by T_mult per completed cycle.
+        int ti = t0;
+        int remaining = lastEpoch == -1 ? 0 : lastEpoch;
+        while (remaining >= ti)
+        {
+            remaining -= ti;
+            ti *= TMult;
+        }
+        _ti = ti;
+        _tCur = remaining;
         ApplyInitialLrs();
     }
 

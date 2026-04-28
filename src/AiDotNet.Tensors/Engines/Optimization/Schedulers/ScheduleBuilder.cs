@@ -79,14 +79,26 @@ public sealed class ScheduleBuilder
     }
 
     /// <summary>Build the composed scheduler. Returns a <see cref="SequentialLr"/> if there are 2+ stages,
-    /// or the single underlying scheduler if only one stage was configured.</summary>
-    public object Build()
+    /// or the single underlying scheduler if only one stage was configured. Both branches return
+    /// an <see cref="LrScheduler"/> so callers can step the result directly without casting.
+    ///
+    /// The optimizer's per-group LR is snapshotted before any sub-scheduler is constructed and
+    /// restored before each sub-scheduler factory runs, so every child captures the same base LR
+    /// (rather than seeing the prior child's epoch-0 output as its BaseLr).</summary>
+    public LrScheduler Build()
     {
         if (_stages.Count == 0) throw new InvalidOperationException("no stages configured.");
+        var originalLrs = new double[_opt.ParamGroups.Count];
+        for (int i = 0; i < originalLrs.Length; i++) originalLrs[i] = _opt.ParamGroups[i].LearningRate;
+
         if (_stages.Count == 1) return _stages[0].factory(_opt);
 
         var schedulers = new LrScheduler[_stages.Count];
-        for (int i = 0; i < _stages.Count; i++) schedulers[i] = _stages[i].factory(_opt);
+        for (int i = 0; i < _stages.Count; i++)
+        {
+            for (int j = 0; j < originalLrs.Length; j++) _opt.ParamGroups[j].LearningRate = originalLrs[j];
+            schedulers[i] = _stages[i].factory(_opt);
+        }
 
         var milestones = new int[_stages.Count - 1];
         int acc = 0;

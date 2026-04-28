@@ -125,6 +125,8 @@ public sealed class LBFGSOptimizer
         if (closure == null) throw new ArgumentNullException(nameof(closure));
 
         StepCount++;
+        // Per-PyTorch semantics, MaxEval is a budget for THIS Step() call, not cumulative.
+        int funcEvalsAtStepStart = FuncEvals;
         float loss = closure();
         FuncEvals++;
         float[] flatGrad = FlattenGradient();
@@ -216,7 +218,7 @@ public sealed class LBFGSOptimizer
             flatGrad = gradNew;
             gMax = MaxAbs(flatGrad);
             if (gMax <= ToleranceGrad) break;
-            if (FuncEvals >= MaxEval) break;
+            if (FuncEvals - funcEvalsAtStepStart >= MaxEval) break;
         }
 
         return loss;

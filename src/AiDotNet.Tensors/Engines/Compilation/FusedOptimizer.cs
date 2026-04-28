@@ -393,11 +393,18 @@ internal static class FusedOptimizer
         }
     }
 
-    /// <summary>AVX2 AdaDelta: adaptive learning rate without global lr</summary>
+    /// <summary>AVX2 AdaDelta. Matches torch.optim.Adadelta:
+    ///   v_t = ρ·v_{t-1} + (1-ρ)·g²
+    ///   Δx  = √(u_{t-1}+eps) / √(v_t+eps) · g          (scale-free magnitude)
+    ///   u_t = ρ·u_{t-1} + (1-ρ)·Δx²                     (accumulator tracks unscaled Δx)
+    ///   p   ← p - lr · Δx
+    /// The lr scaling is applied only on the final parameter write so that the
+    /// running-RMS-of-updates accumulator remains scale-invariant. This makes
+    /// param-group LR overrides and LR schedulers actually take effect.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AdaDeltaUpdateSimd(
         float* param, float* grad, float* accumGrad, float* accumUpdate, int length,
-        float rho, float eps)
+        float lr, float rho, float eps)
     {
         int i = 0;
 #if NET5_0_OR_GREATER
@@ -406,6 +413,7 @@ internal static class FusedOptimizer
             var vRho = Vector256.Create(rho);
             var v1mRho = Vector256.Create(1f - rho);
             var vEps = Vector256.Create(eps);
+            var vLr = Vector256.Create(lr);
             int simdLen = length & ~7;
             for (; i < simdLen; i += 8)
             {
@@ -414,10 +422,12 @@ internal static class FusedOptimizer
                 Avx.Store(accumGrad + i, ag);
                 var rmsGrad = Avx.Sqrt(Avx.Add(ag, vEps));
                 var rmsUpd = Avx.Sqrt(Avx.Add(Avx.LoadVector256(accumUpdate + i), vEps));
-                var update = Avx.Subtract(Vector256<float>.Zero, Avx.Multiply(Avx.Divide(rmsUpd, rmsGrad), g));
-                var au = Fma.MultiplyAdd(vRho, Avx.LoadVector256(accumUpdate + i), Avx.Multiply(v1mRho, Avx.Multiply(update, update)));
+                // Δx magnitude (unscaled by lr); negative because we descend.
+                var deltaX = Avx.Subtract(Vector256<float>.Zero, Avx.Multiply(Avx.Divide(rmsUpd, rmsGrad), g));
+                var au = Fma.MultiplyAdd(vRho, Avx.LoadVector256(accumUpdate + i), Avx.Multiply(v1mRho, Avx.Multiply(deltaX, deltaX)));
                 Avx.Store(accumUpdate + i, au);
-                Avx.Store(param + i, Avx.Add(Avx.LoadVector256(param + i), update));
+                // Apply lr scaling only on the parameter write.
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, deltaX, Avx.LoadVector256(param + i)));
             }
         }
 #endif
@@ -426,9 +436,9 @@ internal static class FusedOptimizer
             accumGrad[i] = rho * accumGrad[i] + (1f - rho) * grad[i] * grad[i];
             float rmsGrad = MathF.Sqrt(accumGrad[i] + eps);
             float rmsUpdate = MathF.Sqrt(accumUpdate[i] + eps);
-            float update = -(rmsUpdate / rmsGrad) * grad[i];
-            accumUpdate[i] = rho * accumUpdate[i] + (1f - rho) * update * update;
-            param[i] += update;
+            float deltaX = -(rmsUpdate / rmsGrad) * grad[i];
+            accumUpdate[i] = rho * accumUpdate[i] + (1f - rho) * deltaX * deltaX;
+            param[i] += lr * deltaX;
         }
     }
 

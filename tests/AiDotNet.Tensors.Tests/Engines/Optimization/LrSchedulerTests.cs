@@ -208,19 +208,25 @@ public class LrSchedulerTests
     [Fact]
     public void SequentialLr_DispatchesByMilestones()
     {
+        // PyTorch idiom: every sub-scheduler captures BaseLrs from opt.LR at its construction
+        // time, so we reset opt.LR between sub-schedulers to give each child the same base.
         var opt = MakeOpt(1.0);
         var warmup = new LinearLr(opt, startFactor: 0.1, endFactor: 1.0, totalIters: 3);
+        opt.ParamGroups[0].LearningRate = 1.0;
         var decay  = new ExponentialLr(opt, gamma: 0.5);
         var seq    = new SequentialLr(opt, new LrScheduler[] { warmup, decay }, new[] { 3 });
 
-        // We expect the warmup to run for 3 epochs, then exponential decay takes over.
-        Assert.Equal(0.1, warmup.GetLastLr()[0], precision: 8);
-        seq.Step(); // epoch 0 → warmup epoch 1
-        seq.Step(); // epoch 1 → warmup epoch 2
-        seq.Step(); // epoch 2 → warmup epoch 3 (= 1.0)
-        Assert.True(opt.ParamGroups[0].LearningRate > 0.5);
-        seq.Step(); // epoch 3 → decay scheduler kicks in
-        Assert.True(opt.ParamGroups[0].LearningRate <= 1.0);
+        // After construction, decay last wrote 1.0 (its epoch-0 LR) into opt.
+        Assert.Equal(1.0, opt.ParamGroups[0].LearningRate, precision: 8);
+
+        seq.Step();  // last_epoch=1: warmup → m = 0.1 + 0.9·(1/3) = 0.4
+        Assert.Equal(0.4, opt.ParamGroups[0].LearningRate, precision: 6);
+        seq.Step();  // last_epoch=2: warmup → m = 0.1 + 0.9·(2/3) = 0.7
+        Assert.Equal(0.7, opt.ParamGroups[0].LearningRate, precision: 6);
+        seq.Step();  // last_epoch=3: cross milestone → decay.Step(0) → 1.0·0.5^0 = 1.0
+        Assert.Equal(1.0, opt.ParamGroups[0].LearningRate, precision: 6);
+        seq.Step();  // last_epoch=4: decay → 1.0·0.5 = 0.5
+        Assert.Equal(0.5, opt.ParamGroups[0].LearningRate, precision: 6);
     }
 
     [Fact]
