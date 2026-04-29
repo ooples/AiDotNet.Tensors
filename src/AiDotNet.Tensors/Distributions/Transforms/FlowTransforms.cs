@@ -7,6 +7,14 @@ namespace AiDotNet.Tensors.Distributions.Transforms;
 /// Planar flow (Rezende &amp; Mohamed, 2015): y = x + u · h(wᵀx + b) where h = tanh.
 /// Per-flow parameters u, w ∈ ℝᴰ, b ∈ ℝ. Element-wise log|det J| = log|1 + u'·w·h'(wᵀx+b)|
 /// where u' is u corrected to enforce invertibility.
+///
+/// <para><b>Limitation:</b> the analytical inverse of a planar flow has no closed form,
+/// so wrapping this transform in a <see cref="TransformedDistribution"/> and calling
+/// <c>LogProb(y)</c> on it will throw — the score path needs to invert through every
+/// transform. The expected usage pattern is the variational-flow workflow where you draw
+/// <c>z ∼ base</c>, apply <c>y = T(z)</c>, and compute
+/// <c>log p_y(y) = log p_z(z) − log|det J|</c> directly while you still hold <c>z</c>:
+/// no inverse needed. <see cref="ScoreFromBase"/> bundles that pattern.</para>
 /// </summary>
 public sealed class PlanarFlowTransform : ITransform
 {
@@ -32,6 +40,8 @@ public sealed class PlanarFlowTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     private float[] CorrectedU()
     {
@@ -47,6 +57,10 @@ public sealed class PlanarFlowTransform : ITransform
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException(
+                $"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         var u = CorrectedU();
         var y = new float[x.Length];
@@ -67,6 +81,10 @@ public sealed class PlanarFlowTransform : ITransform
     /// <inheritdoc />
     public float[] LogAbsDetJacobian(float[] x, float[] y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException(
+                $"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         var u = CorrectedU();
         var ldj = new float[x.Length];
@@ -82,10 +100,40 @@ public sealed class PlanarFlowTransform : ITransform
         }
         return ldj;
     }
+
+    /// <summary>
+    /// Score the transformed sample <c>y = Forward(z)</c> using the base log-density
+    /// <paramref name="logProbBase"/> at the pre-image <paramref name="z"/>:
+    /// <c>log p_y(y) = log p_z(z) − Σ log|det J(z)|</c>. Avoids needing the inverse,
+    /// which has no closed form for planar flows. Length = batch.
+    /// </summary>
+    public float[] ScoreFromBase(float[] z, float[] logProbBase)
+    {
+        if (z == null) throw new ArgumentNullException(nameof(z));
+        if (logProbBase == null) throw new ArgumentNullException(nameof(logProbBase));
+        if (z.Length % D != 0)
+            throw new ArgumentException($"z.Length ({z.Length}) must be a multiple of D ({D}).", nameof(z));
+        int batch = z.Length / D;
+        if (logProbBase.Length != batch)
+            throw new ArgumentException($"logProbBase.Length ({logProbBase.Length}) must equal batch ({batch}).", nameof(logProbBase));
+        var y = Forward(z);
+        var ldj = LogAbsDetJacobian(z, y);
+        var lp = new float[batch];
+        for (int b = 0; b < batch; b++)
+        {
+            float acc = logProbBase[b];
+            for (int i = 0; i < D; i++) acc -= ldj[b * D + i];
+            lp[b] = acc;
+        }
+        return lp;
+    }
 }
 
 /// <summary>
 /// Radial flow (Rezende &amp; Mohamed, 2015): y = x + β · h(α, r) · (x − x₀) with r = ‖x − x₀‖.
+/// <para><b>Limitation:</b> like <see cref="PlanarFlowTransform"/>, the inverse requires a 1-D
+/// root solve and is not bundled. Score samples via the variational pattern
+/// <see cref="ScoreFromBase"/> instead of <c>TransformedDistribution.LogProb</c>.</para>
 /// </summary>
 public sealed class RadialFlowTransform : ITransform
 {
@@ -111,6 +159,8 @@ public sealed class RadialFlowTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     private float CorrectedBeta()
     {
@@ -121,6 +171,9 @@ public sealed class RadialFlowTransform : ITransform
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException($"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         float beta = CorrectedBeta();
         var y = new float[x.Length];
@@ -142,6 +195,9 @@ public sealed class RadialFlowTransform : ITransform
     /// <inheritdoc />
     public float[] LogAbsDetJacobian(float[] x, float[] y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException($"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         float beta = CorrectedBeta();
         var ldj = new float[x.Length];
@@ -156,6 +212,28 @@ public sealed class RadialFlowTransform : ITransform
             for (int i = 0; i < D; i++) ldj[b * D + i] = perBatch / D;
         }
         return ldj;
+    }
+
+    /// <summary>Same forward-only score helper as <see cref="PlanarFlowTransform.ScoreFromBase"/>.</summary>
+    public float[] ScoreFromBase(float[] z, float[] logProbBase)
+    {
+        if (z == null) throw new ArgumentNullException(nameof(z));
+        if (logProbBase == null) throw new ArgumentNullException(nameof(logProbBase));
+        if (z.Length % D != 0)
+            throw new ArgumentException($"z.Length ({z.Length}) must be a multiple of D ({D}).", nameof(z));
+        int batch = z.Length / D;
+        if (logProbBase.Length != batch)
+            throw new ArgumentException($"logProbBase.Length ({logProbBase.Length}) must equal batch ({batch}).", nameof(logProbBase));
+        var y = Forward(z);
+        var ldj = LogAbsDetJacobian(z, y);
+        var lp = new float[batch];
+        for (int b = 0; b < batch; b++)
+        {
+            float acc = logProbBase[b];
+            for (int i = 0; i < D; i++) acc -= ldj[b * D + i];
+            lp[b] = acc;
+        }
+        return lp;
     }
 }
 
@@ -195,6 +273,8 @@ public sealed class RealNvpCouplingTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     /// <inheritdoc />
     public float[] Forward(float[] x)

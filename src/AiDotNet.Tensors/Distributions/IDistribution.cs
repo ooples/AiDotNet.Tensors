@@ -35,7 +35,9 @@ public interface IDistribution
     /// <summary>Draw a single (batch of) reparameterised samples. Throws when <see cref="HasRSample"/> is false.</summary>
     float[] RSample(Random rng);
 
-    /// <summary>Log probability mass / density at the supplied values. Length = <c>BatchSize · EventSize</c>.</summary>
+    /// <summary>Log probability mass / density at the supplied values, reduced over event dimensions.
+    /// Length = <c>BatchSize</c>. The <paramref name="value"/> input has length
+    /// <c>BatchSize · EventSize</c> (flattened row-major).</summary>
     float[] LogProb(float[] value);
 
     /// <summary>Differential entropy (continuous) or Shannon entropy (discrete), per batch element. Length = <c>BatchSize</c>.</summary>

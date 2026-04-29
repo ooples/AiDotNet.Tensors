@@ -36,7 +36,7 @@ public sealed class MultivariateNormalDistribution : DistributionBase
         if (loc.Length % d != 0) throw new ArgumentException("loc.Length must be a multiple of D.");
         int batch = loc.Length / d;
         if (covariance.Length != batch * d * d) throw new ArgumentException("covariance shape mismatch.");
-        Loc = loc; Covariance = covariance; D = d;
+        Loc = (float[])loc.Clone(); Covariance = (float[])covariance.Clone(); D = d;
         CholeskyL = new float[batch * d * d];
         for (int b = 0; b < batch; b++) Cholesky(covariance, b * d * d, CholeskyL, b * d * d, d);
     }
@@ -167,7 +167,7 @@ public sealed class DiagonalMultivariateNormalDistribution : DistributionBase
         if (loc.Length != scale.Length) throw new ArgumentException();
         if (loc.Length % d != 0) throw new ArgumentException("D must divide loc.Length.");
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Loc = loc; Scale = scale; D = d;
+        Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone(); D = d;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -249,7 +249,7 @@ public sealed class DirichletDistribution : DistributionBase
         if (k <= 0) throw new ArgumentException("K > 0.");
         if (concentration.Length % k != 0) throw new ArgumentException("concentration.Length % K != 0.");
         for (int i = 0; i < concentration.Length; i++) if (!(concentration[i] > 0f)) throw new ArgumentException("α > 0.");
-        Concentration = concentration; K = k;
+        Concentration = (float[])concentration.Clone(); K = k;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);

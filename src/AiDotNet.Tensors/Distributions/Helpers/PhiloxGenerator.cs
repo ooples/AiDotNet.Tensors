@@ -57,19 +57,32 @@ public sealed class PhiloxGenerator : Random
     }
 
     /// <inheritdoc />
-    public override int Next() => (int)(NextUInt32() & 0x7FFFFFFFu);
+    public override int Next()
+    {
+        // System.Random.Next() returns a value in [0, int.MaxValue) — note: int.MaxValue
+        // is excluded. Loop until we get one outside the boundary so the contract holds.
+        while (true)
+        {
+            int v = (int)(NextUInt32() & 0x7FFFFFFFu);
+            if (v != int.MaxValue) return v;
+        }
+    }
 
     /// <inheritdoc />
     public override int Next(int maxValue)
     {
-        if (maxValue <= 0) throw new ArgumentOutOfRangeException(nameof(maxValue));
+        // System.Random.Next(maxValue) — throws on negative, returns 0 when maxValue == 0.
+        if (maxValue < 0) throw new ArgumentOutOfRangeException(nameof(maxValue));
+        if (maxValue == 0) return 0;
         return (int)(NextUInt32() % (uint)maxValue);
     }
 
     /// <inheritdoc />
     public override int Next(int minValue, int maxValue)
     {
-        if (minValue >= maxValue) throw new ArgumentOutOfRangeException(nameof(minValue));
+        // System.Random semantics: throws when min > max; returns min when min == max.
+        if (minValue > maxValue) throw new ArgumentOutOfRangeException(nameof(minValue));
+        if (minValue == maxValue) return minValue;
         long range = (long)maxValue - minValue;
         return (int)(minValue + (long)(NextUInt32() % (uint)range));
     }
@@ -87,6 +100,7 @@ public sealed class PhiloxGenerator : Random
     /// <inheritdoc />
     public override void NextBytes(byte[] buffer)
     {
+        if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         for (int i = 0; i < buffer.Length; i++) buffer[i] = (byte)NextUInt32();
     }
 

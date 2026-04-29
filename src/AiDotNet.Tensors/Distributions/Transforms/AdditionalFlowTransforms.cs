@@ -5,31 +5,34 @@ namespace AiDotNet.Tensors.Distributions.Transforms;
 
 /// <summary>
 /// Masked Autoregressive Flow (MAF) transform (Papamakarios et al., 2017).
-/// Forward map (analytic, fast for log_prob; inverse is sequential and slow):
-///   y_i = (x_i − μ_i(x_{1:i-1})) · exp(−s_i(x_{1:i-1}))
-/// where μ_i, s_i are autoregressive functions of the preceding inputs. We expose a
-/// configurable affine-conditioner variant — the canonical formulation — by accepting
-/// per-dim parameter arrays <paramref name="Mu"/>, <paramref name="LogScale"/> that
-/// the caller updates as a function of x_{1:i-1}.
 ///
-/// The transform is bijective, log_abs_det = −Σ s_i, and forward is parallel-friendly
-/// across batch elements (the autoregressive constraint is on the event dim only).
+/// True autoregressive flow: μ_i and s_i are computed at evaluation time from the
+/// already-known prefix x_{1:i-1} via a user-supplied <see cref="Conditioner"/>
+/// callback, so the same transform handles arbitrary inputs (not just the one its
+/// parameters happened to be precomputed from).
+///
+/// Forward (analytic, parallel across event dim):
+///   y_i = (x_i − μ_i(x_{1:i-1})) · exp(−s_i(x_{1:i-1}))
+/// Inverse (sequential — the cost MAF accepts to make log_prob fast):
+///   x_i = y_i · exp(s_i(x_{1:i-1})) + μ_i(x_{1:i-1})
+/// log|det J| = −Σ s_i.
 /// </summary>
 public sealed class MaskedAutoregressiveFlowTransform : ITransform
 {
-    /// <summary>Per-dim shifts μ_i. Layout <c>[batch, D]</c>.</summary>
-    public float[] Mu { get; }
-    /// <summary>Per-dim log-scales s_i. Layout <c>[batch, D]</c>.</summary>
-    public float[] LogScale { get; }
+    /// <summary>Conditioner: given the dim index <c>i</c> and the already-known prefix
+    /// <c>x_{0..i-1}</c> (length <c>i</c>), returns <c>(μ_i, s_i)</c>. Same callback is
+    /// invoked during forward, inverse, and log|det J| evaluation so the autoregressive
+    /// contract holds for arbitrary inputs.</summary>
+    public Func<int, float[], (float Mu, float LogScale)> Conditioner { get; }
     /// <summary>Event dimension D.</summary>
     public int D { get; }
 
-    /// <summary>Build a MAF affine-conditioner transform.</summary>
-    public MaskedAutoregressiveFlowTransform(float[] mu, float[] logScale, int d)
+    /// <summary>Build a MAF transform with a per-dim conditioner.</summary>
+    public MaskedAutoregressiveFlowTransform(int d, Func<int, float[], (float Mu, float LogScale)> conditioner)
     {
-        if (mu.Length != logScale.Length) throw new ArgumentException();
-        if (mu.Length % d != 0) throw new ArgumentException();
-        Mu = mu; LogScale = logScale; D = d;
+        if (d <= 0) throw new ArgumentOutOfRangeException(nameof(d));
+        Conditioner = conditioner ?? throw new ArgumentNullException(nameof(conditioner));
+        D = d;
     }
     /// <inheritdoc />
     public IConstraint Domain => RealConstraint.Instance;
@@ -37,42 +40,70 @@ public sealed class MaskedAutoregressiveFlowTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
-        if (x.Length != Mu.Length) throw new ArgumentException();
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0) throw new ArgumentException($"x.Length must be a multiple of D={D}.");
         int batch = x.Length / D;
         var y = new float[x.Length];
+        var prefix = new float[D];
         for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < D; i++) prefix[i] = x[b * D + i];
             for (int i = 0; i < D; i++)
             {
-                float invScale = MathF.Exp(-LogScale[b * D + i]);
-                y[b * D + i] = (x[b * D + i] - Mu[b * D + i]) * invScale;
+                var slice = new float[i];
+                Array.Copy(prefix, 0, slice, 0, i);
+                var (mu, s) = Conditioner(i, slice);
+                y[b * D + i] = (prefix[i] - mu) * MathF.Exp(-s);
             }
+        }
         return y;
     }
     /// <inheritdoc />
     public float[] Inverse(float[] y)
     {
-        if (y.Length != Mu.Length) throw new ArgumentException();
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (y.Length % D != 0) throw new ArgumentException($"y.Length must be a multiple of D={D}.");
         int batch = y.Length / D;
         var x = new float[y.Length];
+        var prefix = new float[D];
         for (int b = 0; b < batch; b++)
+        {
             for (int i = 0; i < D; i++)
-                x[b * D + i] = y[b * D + i] * MathF.Exp(LogScale[b * D + i]) + Mu[b * D + i];
+            {
+                var slice = new float[i];
+                Array.Copy(prefix, 0, slice, 0, i);
+                var (mu, s) = Conditioner(i, slice);
+                prefix[i] = y[b * D + i] * MathF.Exp(s) + mu;
+                x[b * D + i] = prefix[i];
+            }
+        }
         return x;
     }
     /// <inheritdoc />
     public float[] LogAbsDetJacobian(float[] x, float[] y)
     {
-        // log|det J| = −Σ s_i (forward direction).
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0) throw new ArgumentException();
         var ldj = new float[x.Length];
         int batch = x.Length / D;
+        var prefix = new float[D];
         for (int b = 0; b < batch; b++)
         {
+            for (int i = 0; i < D; i++) prefix[i] = x[b * D + i];
             float per = 0f;
-            for (int i = 0; i < D; i++) per -= LogScale[b * D + i];
+            for (int i = 0; i < D; i++)
+            {
+                var slice = new float[i];
+                Array.Copy(prefix, 0, slice, 0, i);
+                var (_, s) = Conditioner(i, slice);
+                per -= s;
+            }
             for (int i = 0; i < D; i++) ldj[b * D + i] = per / D;
         }
         return ldj;
@@ -122,6 +153,8 @@ public sealed class NeuralSplineFlowTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     /// <inheritdoc />
     public float[] Forward(float[] x)

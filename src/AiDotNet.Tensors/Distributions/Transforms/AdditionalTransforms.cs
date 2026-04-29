@@ -26,6 +26,8 @@ public sealed class SoftmaxTransform : ITransform
     public IConstraint Codomain => new SimplexConstraint(K);
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
 
     /// <inheritdoc />
     public float[] Forward(float[] x)
@@ -96,6 +98,8 @@ public sealed class StickBreakingTransform : ITransform
     public IConstraint Codomain => new SimplexConstraint(K);
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => false; // K-1 → K
 
     /// <inheritdoc />
     public float[] Forward(float[] x)
@@ -178,6 +182,8 @@ public sealed class AbsTransform : ITransform
     /// <inheritdoc />
     public bool ConstantJacobian => true;
     /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
+    /// <inheritdoc />
     public float[] Forward(float[] x)
     {
         var y = new float[x.Length];
@@ -220,6 +226,8 @@ public sealed class IndependentTransform : ITransform
     /// <inheritdoc />
     public bool ConstantJacobian => Base.ConstantJacobian;
     /// <inheritdoc />
+    public bool IsDimensionPreserving => Base.IsDimensionPreserving;
+    /// <inheritdoc />
     public float[] Forward(float[] x) => Base.Forward(x);
     /// <inheritdoc />
     public float[] Inverse(float[] y) => Base.Inverse(y);
@@ -250,6 +258,8 @@ public sealed class CumulativeDistributionTransform : ITransform
     /// <inheritdoc />
     public bool ConstantJacobian => false;
     /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
+    /// <inheritdoc />
     public float[] Forward(float[] x) => Distribution.Cdf(x);
     /// <inheritdoc />
     public float[] Inverse(float[] y) => Distribution.Icdf(y);
@@ -279,6 +289,8 @@ public sealed class LowerCholeskyTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
@@ -353,6 +365,8 @@ public sealed class CorrCholeskyTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => false; // N(N-1)/2 → N²
 
     /// <inheritdoc />
     public float[] Forward(float[] x)

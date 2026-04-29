@@ -20,7 +20,7 @@ public sealed class BernoulliDistribution : DistributionBase
     {
         for (int i = 0; i < probs.Length; i++)
             if (probs[i] < 0f || probs[i] > 1f) throw new ArgumentException("probs ∈ [0, 1].");
-        Probs = probs;
+        Probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -94,7 +94,7 @@ public sealed class BinomialDistribution : DistributionBase
             if (totalCount[i] < 0) throw new ArgumentException("totalCount >= 0.");
             if (probs[i] < 0f || probs[i] > 1f) throw new ArgumentException("probs ∈ [0, 1].");
         }
-        TotalCount = totalCount; Probs = probs;
+        TotalCount = (int[])totalCount.Clone(); Probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -192,7 +192,7 @@ public sealed class CategoricalDistribution : DistributionBase
             }
             if (MathF.Abs(sum - 1f) > 1e-3f) throw new ArgumentException($"probs row {b} must sum to 1 (got {sum}).");
         }
-        Probs = probs; K = k;
+        Probs = (float[])probs.Clone(); K = k;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -360,7 +360,7 @@ public sealed class GeometricDistribution : DistributionBase
     {
         for (int i = 0; i < probs.Length; i++)
             if (!(probs[i] > 0f && probs[i] <= 1f)) throw new ArgumentException("probs ∈ (0, 1].");
-        Probs = probs;
+        Probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -421,7 +421,7 @@ public sealed class PoissonDistribution : DistributionBase
     public PoissonDistribution(float[] rate)
     {
         for (int i = 0; i < rate.Length; i++) if (!(rate[i] >= 0f)) throw new ArgumentException("rate >= 0.");
-        Rate = rate;
+        Rate = (float[])rate.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -439,6 +439,9 @@ public sealed class PoissonDistribution : DistributionBase
         {
             float k = value[i];
             if (k < 0 || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
+            // Degenerate Poisson(λ=0): the distribution is a point mass at 0.
+            // log p(0|0) = 0; log p(k>0|0) = -∞. Avoids log(0) = -∞ contaminating k=0.
+            if (Rate[i] == 0f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
             lp[i] = k * MathF.Log(Rate[i]) - Rate[i] - SpecialFunctions.Lgamma(k + 1f);
         }
         return lp;
@@ -520,7 +523,7 @@ public sealed class NegativeBinomialDistribution : DistributionBase
             if (!(totalCount[i] > 0f)) throw new ArgumentException("totalCount > 0.");
             if (!(probs[i] >= 0f && probs[i] < 1f)) throw new ArgumentException("probs ∈ [0, 1).");
         }
-        TotalCount = totalCount; Probs = probs;
+        TotalCount = (float[])totalCount.Clone(); Probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -584,7 +587,22 @@ public sealed class MultinomialDistribution : DistributionBase
     {
         if (k <= 0) throw new ArgumentException("K > 0.");
         if (probs.Length != totalCount.Length * k) throw new ArgumentException("probs length mismatch.");
-        TotalCount = totalCount; Probs = probs; K = k;
+        // Each row of probs must be a valid probability vector (non-negative, sum to 1).
+        // Same validation surface as CategoricalDistribution.
+        int batch = totalCount.Length;
+        for (int b = 0; b < batch; b++)
+        {
+            float sum = 0f;
+            for (int i = 0; i < k; i++)
+            {
+                if (probs[b * k + i] < 0f) throw new ArgumentException($"probs[{b}, {i}] = {probs[b * k + i]} must be ≥ 0.");
+                sum += probs[b * k + i];
+            }
+            if (MathF.Abs(sum - 1f) > 1e-3f)
+                throw new ArgumentException($"probs row {b} must sum to 1 (got {sum}).");
+            if (totalCount[b] < 0) throw new ArgumentException($"totalCount[{b}] = {totalCount[b]} must be >= 0.");
+        }
+        TotalCount = (int[])totalCount.Clone(); Probs = (float[])probs.Clone(); K = k;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)

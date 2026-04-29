@@ -49,9 +49,32 @@ public sealed class ExpandingDistribution : DistributionBase
     }
 
     /// <inheritdoc />
-    public override float[] Sample(Random rng) => Replicate(Base.Sample(rng));
+    public override float[] Sample(Random rng)
+    {
+        // PyTorch parity: expand SHARES parameters but draws fresh samples for each
+        // expanded block. Replicating the same draw across the expanded batch would
+        // break Monte-Carlo estimators that rely on independent samples.
+        int blockLen = Base.BatchSize * Base.EventSize;
+        var dst = new float[BatchSize * EventSize];
+        for (int r = 0; r < RepeatFactor; r++)
+        {
+            var sample = Base.Sample(rng);
+            Array.Copy(sample, 0, dst, r * blockLen, blockLen);
+        }
+        return dst;
+    }
     /// <inheritdoc />
-    public override float[] RSample(Random rng) => Replicate(Base.RSample(rng));
+    public override float[] RSample(Random rng)
+    {
+        int blockLen = Base.BatchSize * Base.EventSize;
+        var dst = new float[BatchSize * EventSize];
+        for (int r = 0; r < RepeatFactor; r++)
+        {
+            var sample = Base.RSample(rng);
+            Array.Copy(sample, 0, dst, r * blockLen, blockLen);
+        }
+        return dst;
+    }
 
     /// <inheritdoc />
     public override float[] LogProb(float[] value)

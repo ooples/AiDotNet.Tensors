@@ -117,6 +117,19 @@ public sealed class TransformedDistribution : DistributionBase
     /// <inheritdoc />
     public override float[] LogProb(float[] value)
     {
+        // The reverse-walk-and-accumulate strategy below assumes every transform preserves
+        // event size — otherwise the LDJ array sizes change between stages and the running
+        // accumulator goes out of bounds. Reject dim-changing transforms with a clear
+        // message; users that want score functions through StickBreaking / CorrCholesky
+        // need to compose them into a custom pipeline.
+        foreach (var t in Transforms)
+        {
+            if (!t.IsDimensionPreserving)
+                throw new NotSupportedException(
+                    $"TransformedDistribution.LogProb requires every transform to be dimension-preserving; " +
+                    $"{t.GetType().Name} changes event size. Use the dimension-preserving forward score path " +
+                    "(e.g. base.Sample → transform → log_prob = base.LogProb − Σ log|det J|) instead.");
+        }
         // Walk transforms in reverse to get pre-image and accumulate log|det J|.
         float[] y = value;
         var ldj = new float[value.Length];
@@ -317,7 +330,7 @@ public sealed class RelaxedBernoulliDistribution : DistributionBase
     {
         if (logits.Length != temperature.Length) throw new ArgumentException();
         for (int i = 0; i < temperature.Length; i++) if (!(temperature[i] > 0f)) throw new ArgumentException("τ > 0.");
-        Logits = logits; Temperature = temperature;
+        Logits = (float[])logits.Clone(); Temperature = (float[])temperature.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -397,7 +410,7 @@ public sealed class RelaxedOneHotCategoricalDistribution : DistributionBase
         if (k <= 0) throw new ArgumentException();
         if (logits.Length != temperature.Length * k) throw new ArgumentException();
         for (int i = 0; i < temperature.Length; i++) if (!(temperature[i] > 0f)) throw new ArgumentException("τ > 0.");
-        Logits = logits; Temperature = temperature; K = k;
+        Logits = (float[])logits.Clone(); Temperature = (float[])temperature.Clone(); K = k;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);

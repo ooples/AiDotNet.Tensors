@@ -17,6 +17,12 @@ public interface ITransform
     /// <summary>True if the Jacobian determinant is constant in <c>x</c>.</summary>
     bool ConstantJacobian { get; }
 
+    /// <summary>True iff <c>Forward(x)</c> produces an output of the same length as <c>x</c>.
+    /// Dimension-changing transforms (e.g. <c>StickBreakingTransform</c>: K-1 → K, or
+    /// <c>CorrCholeskyTransform</c>: N(N-1)/2 → N²) report <c>false</c>; <c>TransformedDistribution</c>
+    /// uses this to refuse to score samples through chains it cannot index correctly.</summary>
+    bool IsDimensionPreserving { get; }
+
     /// <summary>Forward map y = f(x).</summary>
     float[] Forward(float[] x);
     /// <summary>Inverse map x = f⁻¹(y).</summary>
@@ -44,6 +50,8 @@ public sealed class AffineTransform : ITransform
     public IConstraint Codomain => RealConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => true;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
@@ -80,6 +88,8 @@ public sealed class ExpTransform : ITransform
     /// <inheritdoc />
     public bool ConstantJacobian => false;
     /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
+    /// <inheritdoc />
     public float[] Forward(float[] x)
     {
         var y = new float[x.Length];
@@ -114,6 +124,8 @@ public sealed class SigmoidTransform : ITransform
     public IConstraint Codomain => UnitIntervalConstraint.Instance;
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
@@ -155,6 +167,8 @@ public sealed class TanhTransform : ITransform
     public IConstraint Codomain => new IntervalConstraint(-1f, 1f);
     /// <inheritdoc />
     public bool ConstantJacobian => false;
+    /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
@@ -204,6 +218,8 @@ public sealed class PowerTransform : ITransform
     /// <inheritdoc />
     public bool ConstantJacobian => false;
     /// <inheritdoc />
+    public bool IsDimensionPreserving => true;
+    /// <inheritdoc />
     public float[] Forward(float[] x)
     {
         var y = new float[x.Length];
@@ -248,6 +264,11 @@ public sealed class ComposeTransform : ITransform
     public bool ConstantJacobian
     {
         get { foreach (var p in Parts) if (!p.ConstantJacobian) return false; return true; }
+    }
+    /// <inheritdoc />
+    public bool IsDimensionPreserving
+    {
+        get { foreach (var p in Parts) if (!p.IsDimensionPreserving) return false; return true; }
     }
     /// <inheritdoc />
     public float[] Forward(float[] x)

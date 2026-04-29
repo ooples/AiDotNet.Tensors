@@ -35,7 +35,7 @@ public sealed class GammaDistribution : DistributionBase
             if (!(concentration[i] > 0f)) throw new ArgumentException("concentration > 0.");
             if (!(rate[i] > 0f)) throw new ArgumentException("rate > 0.");
         }
-        Concentration = concentration; Rate = rate;
+        Concentration = (float[])concentration.Clone(); Rate = (float[])rate.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -137,7 +137,7 @@ public sealed class InverseGammaDistribution : DistributionBase
             if (!(concentration[i] > 0f)) throw new ArgumentException("concentration > 0.");
             if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
         }
-        Concentration = concentration; Scale = scale;
+        Concentration = (float[])concentration.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -221,7 +221,7 @@ public sealed class Chi2Distribution : DistributionBase
     public Chi2Distribution(float[] df)
     {
         for (int i = 0; i < df.Length; i++) if (!(df[i] > 0f)) throw new ArgumentException("df > 0.");
-        Df = df;
+        Df = (float[])df.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -289,7 +289,7 @@ public sealed class BetaDistribution : DistributionBase
             if (!(concentration1[i] > 0f)) throw new ArgumentException("α > 0.");
             if (!(concentration0[i] > 0f)) throw new ArgumentException("β > 0.");
         }
-        Concentration1 = concentration1; Concentration0 = concentration0;
+        Concentration1 = (float[])concentration1.Clone(); Concentration0 = (float[])concentration0.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -395,7 +395,7 @@ public sealed class StudentTDistribution : DistributionBase
             if (!(df[i] > 0f)) throw new ArgumentException("df > 0.");
             if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
         }
-        Df = df; Loc = loc; Scale = scale;
+        Df = (float[])df.Clone(); Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -501,7 +501,7 @@ public sealed class ParetoDistribution : DistributionBase
             if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
             if (!(alpha[i] > 0f)) throw new ArgumentException("alpha > 0.");
         }
-        Scale = scale; Alpha = alpha;
+        Scale = (float[])scale.Clone(); Alpha = (float[])alpha.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -588,7 +588,7 @@ public sealed class WeibullDistribution : DistributionBase
             if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
             if (!(concentration[i] > 0f)) throw new ArgumentException("concentration > 0.");
         }
-        Scale = scale; Concentration = concentration;
+        Scale = (float[])scale.Clone(); Concentration = (float[])concentration.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -613,6 +613,17 @@ public sealed class WeibullDistribution : DistributionBase
         {
             if (value[i] < 0) { lp[i] = float.NegativeInfinity; continue; }
             float k = Concentration[i]; float l = Scale[i];
+            // x = 0 edge case: density value depends on the shape k.
+            // k > 1: density is 0 at x=0 ⇒ log p = -∞.
+            // k = 1: exponential, density at 0 is 1/λ ⇒ log p = -log(l).
+            // k < 1: density diverges to +∞ at x=0; report +∞ rather than NaN from log(0).
+            if (value[i] == 0f)
+            {
+                lp[i] = k > 1f ? float.NegativeInfinity
+                      : k == 1f ? -MathF.Log(l)
+                      : float.PositiveInfinity;
+                continue;
+            }
             float zk = MathF.Pow(value[i] / l, k);
             lp[i] = MathF.Log(k) - MathF.Log(l) + (k - 1f) * MathF.Log(value[i] / l) - zk;
         }

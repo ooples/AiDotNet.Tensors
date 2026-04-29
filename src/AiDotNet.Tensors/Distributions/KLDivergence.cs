@@ -37,20 +37,59 @@ public static class KLDivergence
         _registry[(typeof(TP), typeof(TQ))] = (p, q) => fn((TP)p, (TQ)q);
     }
 
+    /// <summary>Remove a previously-registered (P, Q) handler. Returns true if a handler was
+    /// removed. Tests that register custom handlers should call this in a <c>finally</c> block
+    /// so their changes do not leak into other tests in a parallel collection.</summary>
+    public static bool Unregister<TP, TQ>()
+        where TP : IDistribution
+        where TQ : IDistribution
+        => _registry.TryRemove((typeof(TP), typeof(TQ)), out _);
+
     /// <summary>
     /// Compute KL(p || q) using a registered analytical formula if one exists, otherwise
     /// throw with a helpful message. (Monte-Carlo fallback is the user's responsibility:
     /// drawing N samples and computing <c>p.LogProb(x) - q.LogProb(x)</c>.)
+    ///
+    /// Lookup is polymorphic: if no exact-type entry exists, the registry is searched for
+    /// the most-specific registered (P, Q) pair where <c>P.IsAssignableFrom(p)</c> and
+    /// <c>Q.IsAssignableFrom(q)</c>. This matches PyTorch's <c>kl_divergence</c> dispatch
+    /// and lets users register handlers against base classes / interfaces.
     /// </summary>
     public static float[] Compute(IDistribution p, IDistribution q)
     {
         if (p == null) throw new ArgumentNullException(nameof(p));
         if (q == null) throw new ArgumentNullException(nameof(q));
-        if (_registry.TryGetValue((p.GetType(), q.GetType()), out var fn))
+        var pt = p.GetType();
+        var qt = q.GetType();
+        if (_registry.TryGetValue((pt, qt), out var fn))
             return fn(p, q);
+
+        // Polymorphic fallback: pick the most-specific (P, Q) entry whose types are
+        // assignable from p / q. "Most specific" = sum of inheritance distances minimised.
+        Func<IDistribution, IDistribution, float[]>? bestFn = null;
+        int bestScore = int.MaxValue;
+        foreach (var kv in _registry)
+        {
+            if (!kv.Key.p.IsAssignableFrom(pt) || !kv.Key.q.IsAssignableFrom(qt)) continue;
+            int score = InheritanceDistance(pt, kv.Key.p) + InheritanceDistance(qt, kv.Key.q);
+            if (score < bestScore) { bestScore = score; bestFn = kv.Value; }
+        }
+        if (bestFn != null) return bestFn(p, q);
+
         throw new NotSupportedException(
             $"No analytical KL divergence registered for ({p.GetType().Name}, {q.GetType().Name}). " +
             "Register one via KLDivergence.Register or use Monte-Carlo estimation.");
+    }
+
+    private static int InheritanceDistance(Type derived, Type baseType)
+    {
+        if (derived == baseType) return 0;
+        int d = 0;
+        var t = derived;
+        while (t != null && t != baseType) { t = t.BaseType; d++; }
+        if (t == baseType) return d;
+        // Interface match — assign a fixed positive distance so concrete-type matches win.
+        return baseType.IsInterface ? 1000 : int.MaxValue;
     }
 
     /// <summary>True iff an analytical formula is registered for the given type pair.</summary>
@@ -97,7 +136,12 @@ public static class KLDivergence
             for (int k = 0; k < p.K; k++)
             {
                 float pk = p.Probs[b * p.K + k]; float qk = q.Probs[b * q.K + k];
-                if (pk > 0f) s += pk * (MathF.Log(pk) - MathF.Log(MathF.Max(qk, 1e-30f)));
+                // KL(p || q) = +∞ whenever p has support where q does not (q absolutely
+                // continuous w.r.t. p is required). Without this guard a q_k=0 paired
+                // with p_k>0 would silently clamp via the 1e-30 floor and report a
+                // large-but-finite value, hiding a model misspecification.
+                if (pk > 0f && qk == 0f) { s = float.PositiveInfinity; break; }
+                if (pk > 0f) s += pk * (MathF.Log(pk) - MathF.Log(qk));
             }
             kl[b] = s;
         }

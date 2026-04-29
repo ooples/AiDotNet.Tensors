@@ -33,7 +33,10 @@ public sealed class NormalDistribution : DistributionBase
             throw new ArgumentException("loc and scale must have the same length.");
         for (int i = 0; i < scale.Length; i++)
             if (!(scale[i] > 0f)) throw new ArgumentException("scale must be > 0.");
-        Loc = loc; Scale = scale;
+        // Defensive copies so external mutation cannot break the distribution's invariants
+        // (validated scale > 0, fixed batch size) after construction.
+        Loc = (float[])loc.Clone();
+        Scale = (float[])scale.Clone();
     }
 
     /// <summary>Build a scalar (single-element batch) normal.</summary>

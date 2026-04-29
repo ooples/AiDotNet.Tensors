@@ -343,18 +343,27 @@ public class AdditionalDistributionTests
     public void KL_RegistrySupportsCustomTypes()
     {
         // Register a NEW pair (Normal -> Uniform) that has no built-in formula. Avoids polluting
-        // the registry's default entries that other tests rely on.
+        // the registry's default entries that other tests rely on, and uses try/finally to
+        // unregister the sentinel handler before returning so parallel-running tests can't
+        // observe the test's transient state.
         bool used = false;
         KLDivergence.Register<NormalDistribution, UniformDistribution>((a, b) =>
         {
             used = true;
             return new[] { 42f };  // sentinel
         });
-        var p = new NormalDistribution(0f, 1f);
-        var q = new UniformDistribution(new[] { -1f }, new[] { 1f });
-        var kl = KLDivergence.Compute(p, q)[0];
-        Assert.True(used);
-        Assert.Equal(42f, kl);
+        try
+        {
+            var p = new NormalDistribution(0f, 1f);
+            var q = new UniformDistribution(new[] { -1f }, new[] { 1f });
+            var kl = KLDivergence.Compute(p, q)[0];
+            Assert.True(used);
+            Assert.Equal(42f, kl);
+        }
+        finally
+        {
+            KLDivergence.Unregister<NormalDistribution, UniformDistribution>();
+        }
     }
 
     // -------------------- Reference-value log_prob spot checks --------------------

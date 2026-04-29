@@ -25,7 +25,7 @@ public sealed class LogNormalDistribution : DistributionBase
     {
         if (loc.Length != scale.Length) throw new ArgumentException("loc and scale must match.");
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Loc = loc; Scale = scale;
+        Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -45,6 +45,9 @@ public sealed class LogNormalDistribution : DistributionBase
         const float LogTwoPi = 1.83787706641f;
         for (int i = 0; i < BatchSize; i++)
         {
+            // LogNormal support is (0, ∞). At x ≤ 0 the density is 0; report -∞ to avoid
+            // log(0) = -∞ → NaN propagation when squaring z.
+            if (value[i] <= 0f) { lp[i] = float.NegativeInfinity; continue; }
             float lnX = MathF.Log(value[i]);
             float z = (lnX - Loc[i]) / Scale[i];
             lp[i] = -0.5f * (z * z + LogTwoPi) - MathF.Log(Scale[i]) - lnX;
@@ -104,7 +107,7 @@ public sealed class HalfNormalDistribution : DistributionBase
     public HalfNormalDistribution(float[] scale)
     {
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Scale = scale;
+        Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -183,7 +186,7 @@ public sealed class CauchyDistribution : DistributionBase
     {
         if (loc.Length != scale.Length) throw new ArgumentException();
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Loc = loc; Scale = scale;
+        Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -268,7 +271,7 @@ public sealed class HalfCauchyDistribution : DistributionBase
     public HalfCauchyDistribution(float[] scale)
     {
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Scale = scale;
+        Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -332,7 +335,7 @@ public sealed class LaplaceDistribution : DistributionBase
     {
         if (loc.Length != scale.Length) throw new ArgumentException();
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Loc = loc; Scale = scale;
+        Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -411,7 +414,7 @@ public sealed class UniformDistribution : DistributionBase
         if (low.Length != high.Length) throw new ArgumentException();
         for (int i = 0; i < low.Length; i++)
             if (!(high[i] > low[i])) throw new ArgumentException("high > low.");
-        Low = low; High = high;
+        Low = (float[])low.Clone(); High = (float[])high.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -492,7 +495,7 @@ public sealed class ExponentialDistribution : DistributionBase
     public ExponentialDistribution(float[] rate)
     {
         for (int i = 0; i < rate.Length; i++) if (!(rate[i] > 0f)) throw new ArgumentException("rate > 0.");
-        Rate = rate;
+        Rate = (float[])rate.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);
@@ -569,7 +572,7 @@ public sealed class GumbelDistribution : DistributionBase
     {
         if (loc.Length != scale.Length) throw new ArgumentException();
         for (int i = 0; i < scale.Length; i++) if (!(scale[i] > 0f)) throw new ArgumentException("scale > 0.");
-        Loc = loc; Scale = scale;
+        Loc = (float[])loc.Clone(); Scale = (float[])scale.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng) => RSample(rng);

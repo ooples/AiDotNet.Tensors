@@ -32,7 +32,7 @@ public sealed class FisherSnedecorDistribution : DistributionBase
             if (!(df1[i] > 0f)) throw new ArgumentException("df1 > 0.");
             if (!(df2[i] > 0f)) throw new ArgumentException("df2 > 0.");
         }
-        Df1 = df1; Df2 = df2;
+        Df1 = (float[])df1.Clone(); Df2 = (float[])df2.Clone();
     }
 
     /// <inheritdoc />
@@ -137,7 +137,7 @@ public sealed class KumaraswamyDistribution : DistributionBase
             if (!(concentration1[i] > 0f)) throw new ArgumentException("α > 0.");
             if (!(concentration0[i] > 0f)) throw new ArgumentException("β > 0.");
         }
-        Concentration1 = concentration1; Concentration0 = concentration0;
+        Concentration1 = (float[])concentration1.Clone(); Concentration0 = (float[])concentration0.Clone();
     }
 
     /// <inheritdoc />
@@ -272,7 +272,7 @@ public sealed class VonMisesDistribution : DistributionBase
         if (loc.Length != concentration.Length) throw new ArgumentException();
         for (int i = 0; i < concentration.Length; i++)
             if (!(concentration[i] >= 0f)) throw new ArgumentException("κ ≥ 0.");
-        Loc = loc; Concentration = concentration;
+        Loc = (float[])loc.Clone(); Concentration = (float[])concentration.Clone();
     }
 
     /// <inheritdoc />
@@ -302,9 +302,14 @@ public sealed class VonMisesDistribution : DistributionBase
             {
                 double sign = rng.NextDouble() < 0.5 ? -1.0 : 1.0;
                 double theta = sign * Math.Acos(f) + mu;
-                // Reduce to (-π, π].
-                theta = (theta + Math.PI) % (2.0 * Math.PI) - Math.PI;
-                return (float)theta;
+                // Wrap to (-π, π]. Use a *positive* modulo: `% (2π)` in C# follows
+                // the sign of the dividend, so a negative theta would yield a value
+                // outside the canonical range. Add 2π and re-mod to force positivity
+                // before the −π shift.
+                const double TwoPi = 2.0 * Math.PI;
+                double shifted = theta + Math.PI;
+                shifted = (shifted % TwoPi + TwoPi) % TwoPi;
+                return (float)(shifted - Math.PI);
             }
         }
     }
@@ -424,7 +429,7 @@ public sealed class ContinuousBernoulliDistribution : DistributionBase
     {
         for (int i = 0; i < probs.Length; i++)
             if (!(probs[i] > 0f && probs[i] < 1f)) throw new ArgumentException("λ ∈ (0, 1).");
-        Probs = probs;
+        Probs = (float[])probs.Clone();
     }
 
     /// <inheritdoc />
@@ -559,7 +564,7 @@ public sealed class LowRankMultivariateNormalDistribution : DistributionBase
         if (covDiag.Length != batch * d) throw new ArgumentException();
         if (covFactor.Length != batch * d * k) throw new ArgumentException();
         for (int i = 0; i < covDiag.Length; i++) if (!(covDiag[i] > 0f)) throw new ArgumentException("covDiag > 0.");
-        Loc = loc; CovDiag = covDiag; CovFactor = covFactor; D = d; K = k;
+        Loc = (float[])loc.Clone(); CovDiag = (float[])covDiag.Clone(); CovFactor = (float[])covFactor.Clone(); D = d; K = k;
     }
 
     /// <inheritdoc />
