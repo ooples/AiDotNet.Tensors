@@ -168,18 +168,31 @@ public class QuantisedRelaxedCategoricalTests
     }
 
     [Fact]
-    public void Fp4_DequantizeReturnsValuesFromCodeTable()
+    public void Fp4_DequantizeReturnsSimplexPoints()
     {
+        // After Round 3 the FP4 Dequantize applies the same simplex
+        // floor + per-row renormalise that the int4 path uses, so
+        // raw FP4 table values are no longer guaranteed at the
+        // output (a cell at table value 0 gets clamped to the floor
+        // 1e-4, then normalised). The output IS guaranteed to be a
+        // valid simplex point, which is what the distribution's
+        // SimplexConstraint(K) advertises.
         var (logits, temp) = MakeBatch(batch: 2, k: 8, seed: 6);
         var d = new RelaxedOneHotCategoricalFp4Distribution(logits, temp, 8);
         var packed = d.SampleFp4(new Random(7));
         var dense = d.Dequantize(packed);
         Assert.Equal(16, dense.Length);
-        // Every dequantised value must be one of the 16 FP4 codes.
-        var table = new System.Collections.Generic.HashSet<float>(
-            AiDotNet.Tensors.NumericOperations.Fp4E2M1.Table.ToArray());
-        for (int i = 0; i < dense.Length; i++)
-            Assert.Contains(dense[i], table);
+        // Every cell ≥ 0; rows sum to 1 within numeric tolerance.
+        for (int b = 0; b < 2; b++)
+        {
+            float rowSum = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                Assert.True(dense[b * 8 + i] >= 0f, $"cell {b},{i} = {dense[b * 8 + i]} negative");
+                rowSum += dense[b * 8 + i];
+            }
+            Assert.Equal(1.0f, rowSum, 4);
+        }
     }
 
     [Fact]
