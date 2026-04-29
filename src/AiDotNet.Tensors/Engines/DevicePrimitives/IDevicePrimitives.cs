@@ -23,8 +23,12 @@ namespace AiDotNet.Tensors.Engines.DevicePrimitives;
 /// </summary>
 public interface IDevicePrimitives
 {
-    /// <summary>Sums <paramref name="input"/> along the given <paramref name="axis"/>
-    /// (or all elements if <paramref name="axis"/> is <c>-1</c>).</summary>
+    /// <summary>Reduces <paramref name="input"/> along the given
+    /// <paramref name="axis"/> (or every element if <paramref name="axis"/>
+    /// is <c>-1</c>) using the operator selected by <paramref name="kind"/>
+    /// — Sum, Min, Max, or Product. The default is
+    /// <see cref="ReductionKind.Sum"/>, matching <c>torch.sum</c>'s
+    /// shape-preserving semantics; pass other kinds for min/max/product.</summary>
     Tensor<T> Reduce<T>(Tensor<T> input, int axis = -1, ReductionKind kind = ReductionKind.Sum);
 
     /// <summary>Cumulative reduction (prefix sum / prefix max / etc.) along

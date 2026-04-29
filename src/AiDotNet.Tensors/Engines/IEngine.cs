@@ -64,8 +64,12 @@ public interface IEngine
     /// parallel <c>IDevicePrimitives</c> probe interface that would
     /// duplicate the engine-discovery path.
     /// </remarks>
-    AiDotNet.Tensors.Engines.DevicePrimitives.IDevicePrimitives DevicePrimitives
-        => AiDotNet.Tensors.Engines.DevicePrimitives.Cpu.CpuDevicePrimitivesSingleton.Instance;
+    // Abstract member rather than a default-interface implementation
+    // because the project still targets net471, which doesn't support
+    // C# default interface methods (CS8701). Concrete IEngine
+    // implementers (CpuEngine, etc.) provide the body; subclasses
+    // (DirectGpuTensorEngine, GpuEngine) inherit it.
+    AiDotNet.Tensors.Engines.DevicePrimitives.IDevicePrimitives DevicePrimitives { get; }
 
     #region Vector Operations
 

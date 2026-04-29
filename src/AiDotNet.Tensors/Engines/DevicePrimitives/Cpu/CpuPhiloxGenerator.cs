@@ -211,9 +211,13 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     private static void BoxMullerPair(uint u0, uint u1, out float n0, out float n1)
     {
         const float Inv2_32 = 1.0f / 4294967296.0f;
-        // Avoid log(0) — the spec cuRAND uses adds 1 to avoid the lowest
-        // bin entirely. Same nudge here.
-        float u = MathF.Max(1e-30f, u0 * Inv2_32);
+        // cuRAND-style (x + 0.5) / 2^32 maps the 32-bit input to (0, 1]
+        // — strictly positive (avoids log(0)) and preserves the proper
+        // tail behaviour for CPU/CUDA parity. The previous Max(1e-30, …)
+        // clamp distorted the low end of the uniform distribution and
+        // produced a different normal sequence than cuRAND's Philox4_32_10
+        // for the same seed/offset.
+        float u = (u0 + 0.5f) * Inv2_32;
         float v = u1 * Inv2_32;
         float r = MathF.Sqrt(-2f * MathF.Log(u));
         float theta = 2f * MathF.PI * v;
@@ -224,7 +228,9 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     private static void BoxMullerPair53(ulong u0, ulong u1, out double n0, out double n1)
     {
         const double Inv2_53 = 1.0 / 9007199254740992.0;
-        double u = Math.Max(1e-300, u0 * Inv2_53);
+        // Same (x + 0.5) / 2^53 mapping as BoxMullerPair above — avoids
+        // log(0) without distorting the uniform distribution.
+        double u = (u0 + 0.5) * Inv2_53;
         double v = u1 * Inv2_53;
         double r = Math.Sqrt(-2.0 * Math.Log(u));
         double theta = 2.0 * Math.PI * v;
