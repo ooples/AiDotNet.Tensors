@@ -1,10 +1,13 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.IO;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.LinearAlgebra.Sparse;
+using AiDotNet.Tensors.Licensing;
+using AiDotNet.Tensors.Serialization.Safetensors;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.LinearAlgebra.Sparse;
@@ -421,5 +424,236 @@ public class SparseCompletenessTests
         Assert.Equal(expected._shape, actual._shape);
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected.AsSpan()[i], actual.AsSpan()[i], 3);
+    }
+
+    [Fact]
+    public void SparseAutograd_SparseSum_GradientBroadcastsToInputShape()
+    {
+        var a = SmallA();
+        using var tape = new GradientTape<float>();
+        var aDense = a.ToDense();
+        var sum = SparseAutograd.SparseSumRecord(a, aDense);
+        var grads = tape.ComputeGradients(sum, new[] { aDense });
+        // d/dx of sum is 1 for every entry — full ones broadcast.
+        Assert.True(grads.ContainsKey(aDense));
+        var g = grads[aDense];
+        for (int i = 0; i < g.Length; i++) Assert.Equal(1f, g.AsSpan()[i], 3);
+    }
+
+    [Fact]
+    public void SparseAutograd_SparseMean_GradientScaledByDivisor()
+    {
+        var a = SmallA();
+        using var tape = new GradientTape<float>();
+        var aDense = a.ToDense();
+        var mean = SparseAutograd.SparseMeanRecord(a, aDense);
+        var grads = tape.ComputeGradients(mean, new[] { aDense });
+        // Grad through mean is 1/(rows·cols) per entry.
+        var g = grads[aDense];
+        float expected = 1f / (a.Rows * a.Columns);
+        for (int i = 0; i < g.Length; i++) Assert.Equal(expected, g.AsSpan()[i], 4);
+    }
+
+    [Fact]
+    public void SparseAutograd_SparseSoftmax_GradientPreservesPattern()
+    {
+        var a = SmallA();
+        using var tape = new GradientTape<float>();
+        var aDense = a.ToDense();
+        var sm = SparseAutograd.SparseSoftmaxRecord(a, aDense);
+        var loss = _engine.ReduceSum(sm, null);
+        var grads = tape.ComputeGradients(loss, new[] { aDense });
+        // grad_x = (1 − sum(1·y)) · y on each row's stored positions.
+        // sum(1·y) over a row = 1 (softmax sum) ⇒ grad ≡ 0 at stored positions.
+        // At structural-zero positions the backward writes 0 too. Either way,
+        // every entry should be ~0.
+        var g = grads[aDense];
+        for (int i = 0; i < g.Length; i++)
+            Assert.Equal(0f, g.AsSpan()[i], 4);
+    }
+
+    [Fact]
+    public void SparseAutograd_SparseLogSoftmax_GradientFiniteAtStoredPositions()
+    {
+        var a = SmallA();
+        using var tape = new GradientTape<float>();
+        var aDense = a.ToDense();
+        var lsm = SparseAutograd.SparseLogSoftmaxRecord(a, aDense);
+        var loss = _engine.ReduceSum(lsm, null);
+        var grads = tape.ComputeGradients(loss, new[] { aDense });
+        var g = grads[aDense];
+        // grad through log-softmax with sum loss: dx = 1 − k·y where
+        // k = stored-non-zeros-per-row. Finite at every stored position.
+        // At structural zeros: grad is 0 (we don't write there).
+        for (int i = 0; i < g.Length; i++)
+        {
+            float v = g.AsSpan()[i];
+            Assert.False(float.IsNaN(v) || float.IsInfinity(v),
+                $"log-softmax grad has non-finite entry at {i}: {v}");
+        }
+    }
+
+    [Fact]
+    public void SparseAutograd_SparseSpGeMM_GradientMatchesDenseMatMulRule()
+    {
+        var a = SmallA();
+        var b = SparseTensor<float>.FromDense(MakeDense(new float[,]
+        {
+            { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 },
+        }));
+        using var tape = new GradientTape<float>();
+        var aDense = a.ToDense();
+        var bDense = b.ToDense();
+        var prod = SparseAutograd.SparseSpGeMMRecord(a, b, aDense, bDense);
+        var loss = _engine.ReduceSum(prod, null);
+        var grads = tape.ComputeGradients(loss, new[] { aDense, bDense });
+
+        // Analytic: grad_a = ones · B^T,  grad_b = A^T · ones.
+        var ones = new Tensor<float>(new[] { a.Rows, b.Columns });
+        for (int i = 0; i < ones.Length; i++) ones.AsWritableSpan()[i] = 1f;
+        var bT = _engine.TensorTranspose(bDense);
+        var aT = _engine.TensorTranspose(aDense);
+        var expectedGradA = _engine.TensorMatMul(ones, bT);
+        var expectedGradB = _engine.TensorMatMul(aT, ones);
+
+        AssertDenseEqual(expectedGradA, grads[aDense]);
+        AssertDenseEqual(expectedGradB, grads[bDense]);
+    }
+
+    [Fact]
+    public void SimdCsrDenseMultiply_MatchesScalarReferenceForFloat()
+    {
+        const int rows = 8, cols = 16, k = 12;
+        var rng = new Random(1234);
+        // Build a 50%-density CSR matrix.
+        var rowPtr = new int[rows + 1];
+        var colList = new System.Collections.Generic.List<int>();
+        var valList = new System.Collections.Generic.List<float>();
+        for (int r = 0; r < rows; r++)
+        {
+            rowPtr[r] = colList.Count;
+            for (int c = 0; c < k; c++)
+            {
+                if (rng.NextDouble() < 0.5)
+                {
+                    colList.Add(c);
+                    valList.Add((float)rng.NextDouble() * 2 - 1);
+                }
+            }
+        }
+        rowPtr[rows] = colList.Count;
+        var colIdx = colList.ToArray();
+        var values = valList.ToArray();
+
+        var b = new float[k * cols];
+        for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
+
+        var simdOut = new float[rows * cols];
+        AiDotNet.Tensors.Engines.Simd.Sparse.CsrDenseSimd.Multiply(
+            rowPtr, colIdx, values, b, simdOut, rows, cols);
+
+        // Scalar reference.
+        var refOut = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++)
+            {
+                float v = values[p];
+                int bRow = colIdx[p] * cols;
+                for (int j = 0; j < cols; j++)
+                    refOut[r * cols + j] += v * b[bRow + j];
+            }
+        }
+
+        for (int i = 0; i < refOut.Length; i++)
+            Assert.Equal(refOut[i], simdOut[i], 3);
+    }
+
+    [Fact]
+    public void Autotune_RegistersSparseMmKernel()
+    {
+        AiDotNet.Tensors.Helpers.Autotune.BuiltInCatalog.EnsureRegistered();
+        AiDotNet.Tensors.Helpers.Autotune.AutotuneCatalogEntry? entry = null;
+        foreach (var e in AiDotNet.Tensors.Helpers.Autotune.AutotuneKernelCatalog.Entries)
+        {
+            if (e.Id == AiDotNet.Tensors.Helpers.Autotune.BuiltInCatalog.SPARSE_MM)
+            {
+                entry = e;
+                break;
+            }
+        }
+        Assert.NotNull(entry);
+        var variants = new System.Collections.Generic.HashSet<string>(
+            entry!.Variants(new AiDotNet.Tensors.Helpers.Autotune.ShapeProfile(64, 64, 64, 100)));
+        Assert.Contains("csr", variants);
+        Assert.Contains("dense", variants);
+    }
+
+    [Fact]
+    public void Safetensors_RoundtripSparseTensor_PreservesValues()
+    {
+        using var trial = IsolateTrial();
+        var a = SmallA(); // CSR-form COO; round-trip through CSR for storage compactness.
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var w = SafetensorsWriter.Create(path))
+            {
+                w.AddSparse("weight", a.ToCsr());
+                w.Save();
+            }
+            using var r = SafetensorsReader.Open(path);
+            var roundtrip = r.ReadSparse<float>("weight");
+            AssertDenseEqual(a.ToDense(), roundtrip.ToDense());
+            Assert.Equal(SparseStorageFormat.Csr, roundtrip.Format);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Safetensors_RoundtripBsrTensor_PreservesBlockShape()
+    {
+        using var trial = IsolateTrial();
+        var a = SmallA().ToBsr(2, 2);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var w = SafetensorsWriter.Create(path))
+            {
+                w.AddSparse("blocked", a);
+                w.Save();
+            }
+            using var r = SafetensorsReader.Open(path);
+            var roundtrip = r.ReadSparse<float>("blocked");
+            Assert.Equal(SparseStorageFormat.Bsr, roundtrip.Format);
+            Assert.Equal(2, roundtrip.BlockRowSize);
+            Assert.Equal(2, roundtrip.BlockColSize);
+            AssertDenseEqual(a.ToDense(), roundtrip.ToDense());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static System.IDisposable IsolateTrial()
+    {
+        var trialPath = Path.Combine(Path.GetTempPath(), "aidotnet-test-trial-" + System.Guid.NewGuid().ToString("N") + ".json");
+        var scope = PersistenceGuard.SetTestTrialFilePathOverride(trialPath);
+        return new ActionDisposable(() =>
+        {
+            scope.Dispose();
+            try { if (File.Exists(trialPath)) File.Delete(trialPath); } catch { }
+        });
+    }
+
+    private sealed class ActionDisposable : System.IDisposable
+    {
+        private readonly System.Action _onDispose;
+        public ActionDisposable(System.Action onDispose) { _onDispose = onDispose; }
+        public void Dispose() => _onDispose();
     }
 }

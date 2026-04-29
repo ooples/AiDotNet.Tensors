@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.LinearAlgebra.Sparse;
 
@@ -181,6 +182,238 @@ public static class SparseAutograd
         var gradB = engine.TensorMatMul(aT, alphaGrad);
         AccumulateGrad(b, gradB, gradAccumulator, engine);
         _ = output;
+    }
+
+    /// <summary>Tape-aware <c>sum</c> over a sparse tensor's stored
+    /// non-zeros. Returns a dense result so downstream tape ops can
+    /// compose; gradient is keyed on <paramref name="aDense"/> (caller
+    /// supplies the dense view it wants gradients on, since
+    /// <see cref="SparseTensor{T}"/> doesn't accumulate gradients in
+    /// its sparse storage form). The dense view is what the rest of
+    /// autograd hooks against.</summary>
+    public static Tensor<T> SparseSumRecord<T>(SparseTensor<T> a, Tensor<T> aDense, int? axis = null)
+    {
+        var output = SparseOps.SparseSum(a, axis);
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        var savedState = new object[] { axis as object ?? -1 };
+        DifferentiableOps.RecordIfActive(
+            "SparseSum",
+            output,
+            new[] { aDense },
+            SparseSumBackward<T>,
+            savedState);
+        return output;
+    }
+
+    /// <summary>Tape-aware <c>mean</c> companion of <see cref="SparseSumRecord{T}"/>.
+    /// Divisor matches PyTorch's <c>torch.sparse.mean</c> (dense element
+    /// count along the reduction axis, including structural zeros).</summary>
+    public static Tensor<T> SparseMeanRecord<T>(SparseTensor<T> a, Tensor<T> aDense, int? axis = null)
+    {
+        var output = SparseOps.SparseMean(a, axis);
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        var savedState = new object[] { axis as object ?? -1, a.Rows, a.Columns };
+        DifferentiableOps.RecordIfActive(
+            "SparseMean",
+            output,
+            new[] { aDense },
+            SparseMeanBackward<T>,
+            savedState);
+        return output;
+    }
+
+    /// <summary>Tape-aware sparse softmax. Output is dense (same shape as
+    /// the densified sparse input), pattern preserved through backward
+    /// via the standard softmax-Jacobian
+    /// <c>dx = (dy − sum(dy ⊙ y)) ⊙ y</c>, applied per-row over the stored
+    /// non-zeros. Gradient is keyed on <paramref name="aDense"/>.</summary>
+    public static Tensor<T> SparseSoftmaxRecord<T>(SparseTensor<T> a, Tensor<T> aDense)
+    {
+        var sparseOut = SparseOps.SparseSoftmax(a);
+        var output = sparseOut.ToDense();
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        var savedState = new object[] { sparseOut, false /* takeLog */ };
+        DifferentiableOps.RecordIfActive(
+            "SparseSoftmax",
+            output,
+            new[] { aDense },
+            SparseSoftmaxBackward<T>,
+            savedState);
+        return output;
+    }
+
+    /// <summary>Tape-aware sparse log-softmax. Same pattern as
+    /// <see cref="SparseSoftmaxRecord{T}"/>; the backward uses
+    /// <c>dx = dy − sum(dy) · y</c> where <c>y = softmax(x)</c>.</summary>
+    public static Tensor<T> SparseLogSoftmaxRecord<T>(SparseTensor<T> a, Tensor<T> aDense)
+    {
+        var sparseLog = SparseOps.SparseLogSoftmax(a);
+        var output = sparseLog.ToDense();
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        // Backward needs softmax (not log-softmax) values.
+        var sparseSoftmax = SparseOps.SparseSoftmax(a);
+        var savedState = new object[] { sparseSoftmax, true /* takeLog */ };
+        DifferentiableOps.RecordIfActive(
+            "SparseLogSoftmax",
+            output,
+            new[] { aDense },
+            SparseSoftmaxBackward<T>,
+            savedState);
+        return output;
+    }
+
+    /// <summary>Tape-aware sparse · sparse matmul. Returns the dense
+    /// materialisation of the CSR product so downstream tape ops compose;
+    /// backward routes through the dense matmul Jacobian and is keyed on
+    /// the dense views supplied by the caller.</summary>
+    public static Tensor<T> SparseSpGeMMRecord<T>(SparseTensor<T> a, SparseTensor<T> b,
+        Tensor<T> aDense, Tensor<T> bDense)
+    {
+        var sparseOut = SparseOps.SparseSpGeMM(a, b);
+        var output = sparseOut.ToDense();
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        DifferentiableOps.RecordBinary(
+            "SparseSpGeMM",
+            output,
+            aDense,
+            bDense,
+            SpGeMMBackward<T>,
+            savedState: null);
+        return output;
+    }
+
+    private static void SparseSumBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        var aDense = inputs[0];
+        int axis = (int)savedState[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        // Broadcast grad_output back over the reduction axis.
+        var gradA = new Tensor<T>((int[])aDense._shape.Clone());
+        var gradSpan = gradA.AsWritableSpan();
+        var gradOutSpan = gradOutput.AsSpan();
+        int rows = aDense._shape[0], cols = aDense._shape[1];
+        if (axis < 0)
+        {
+            T fill = gradOutSpan[0];
+            for (int i = 0; i < gradSpan.Length; i++) gradSpan[i] = fill;
+        }
+        else if (axis == 0)
+        {
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < cols; c++)
+                    gradSpan[r * cols + c] = gradOutSpan[c];
+        }
+        else // axis == 1
+        {
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < cols; c++)
+                    gradSpan[r * cols + c] = gradOutSpan[r];
+        }
+        AccumulateGrad(aDense, gradA, gradAccumulator, engine);
+        _ = output; _ = ops;
+    }
+
+    private static void SparseMeanBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        var aDense = inputs[0];
+        int axis = (int)savedState[0];
+        int rows = (int)savedState[1], cols = (int)savedState[2];
+        var ops = MathHelper.GetNumericOperations<T>();
+        int divisor = axis < 0 ? rows * cols : axis == 0 ? rows : cols;
+        T scale = ops.Divide(ops.One, ops.FromDouble(divisor));
+        var scaledGrad = engine.TensorMultiplyScalar(gradOutput, scale);
+        // Reuse the sum-broadcast logic.
+        var fakeSum = new Tensor<T>[] { aDense };
+        SparseSumBackward<T>(scaledGrad, fakeSum, output, savedState, engine, gradAccumulator);
+    }
+
+    private static void SparseSoftmaxBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        var aDense = inputs[0];
+        var softmax = (SparseTensor<T>)savedState[0];
+        bool takeLog = (bool)savedState[1];
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        // Per-row softmax Jacobian on the stored pattern only.
+        var csr = softmax.Format == SparseStorageFormat.Csr ? softmax : softmax.ToCsr();
+        var rowPtr = csr.RowPointers;
+        var colIdx = csr.ColumnIndices;
+        var smVals = csr.DataVector;
+        var gradOutSpan = gradOutput.AsSpan();
+        int n = aDense._shape[1];
+        var gradA = new Tensor<T>((int[])aDense._shape.Clone());
+        var gradASpan = gradA.AsWritableSpan();
+
+        for (int r = 0; r < aDense._shape[0]; r++)
+        {
+            int rs = rowPtr[r], re = rowPtr[r + 1];
+            if (re == rs) continue;
+            T weighted = ops.Zero;
+            for (int p = rs; p < re; p++)
+            {
+                int col = colIdx[p];
+                if (takeLog)
+                    weighted = ops.Add(weighted, gradOutSpan[r * n + col]);
+                else
+                    weighted = ops.Add(weighted, ops.Multiply(gradOutSpan[r * n + col], smVals[p]));
+            }
+            for (int p = rs; p < re; p++)
+            {
+                int col = colIdx[p];
+                T dy = gradOutSpan[r * n + col];
+                T y = smVals[p];
+                T dx = takeLog
+                    ? ops.Subtract(dy, ops.Multiply(weighted, y))
+                    : ops.Multiply(y, ops.Subtract(dy, weighted));
+                gradASpan[r * n + col] = dx;
+            }
+        }
+        AccumulateGrad(aDense, gradA, gradAccumulator, engine);
+        _ = output;
+    }
+
+    private static void SpGeMMBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        // dA = grad · B^T,  dB = A^T · grad  — same Jacobian as dense matmul.
+        var aDense = inputs[0];
+        var bDense = inputs[1];
+        var bT = engine.TensorTranspose(bDense);
+        var gradA = engine.TensorMatMul(gradOutput, bT);
+        AccumulateGrad(aDense, gradA, gradAccumulator, engine);
+
+        var aT = engine.TensorTranspose(aDense);
+        var gradB = engine.TensorMatMul(aT, gradOutput);
+        AccumulateGrad(bDense, gradB, gradAccumulator, engine);
+        _ = output; _ = savedState;
     }
 
     private static void AccumulateGrad<T>(

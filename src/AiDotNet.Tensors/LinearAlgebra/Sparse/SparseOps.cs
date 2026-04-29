@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Engines.Simd.Sparse;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.LinearAlgebra.Sparse;
@@ -40,10 +41,38 @@ public static class SparseOps
         var csr = a.Format == SparseStorageFormat.Csr ? a : a.ToCsr();
         var rowPtr = csr.RowPointers;
         var colIdx = csr.ColumnIndices;
-        var vals = csr.DataVector;
+
+        // SIMD fast path for the common float / double cases — the inner
+        // column loop vectorises 4–16 wide depending on hardware. Scalar
+        // tier still serves the full generic surface (other numeric T).
+        if (typeof(T) == typeof(float) && CsrDenseSimd.IsHardwareAccelerated)
+        {
+            // SparseTensor stores rowPtr/colIdx as int[] directly — no
+            // marshaling step needed for the SIMD entry point.
+            var valsArr = (float[])(object)csr.DataVector.ToArray();
+            var bArr = (float[])(object)b.ToArray();
+            var outArr = new float[rows * n];
+            CsrDenseSimd.Multiply(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
+            var outSpanFloat = output.AsWritableSpan();
+            for (int i = 0; i < outSpanFloat.Length; i++) outSpanFloat[i] = (T)(object)outArr[i];
+            _ = k;
+            return output;
+        }
+        if (typeof(T) == typeof(double) && System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            var valsArr = (double[])(object)csr.DataVector.ToArray();
+            var bArr = (double[])(object)b.ToArray();
+            var outArr = new double[rows * n];
+            CsrDenseSimd.MultiplyDouble(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
+            var outSpanDouble = output.AsWritableSpan();
+            for (int i = 0; i < outSpanDouble.Length; i++) outSpanDouble[i] = (T)(object)outArr[i];
+            _ = k;
+            return output;
+        }
+
+        var valsT = csr.DataVector;
         var bSpan = b.AsSpan();
         var outSpan = output.AsWritableSpan();
-
         for (int r = 0; r < rows; r++)
         {
             int rs = rowPtr[r], re = rowPtr[r + 1];
@@ -51,7 +80,7 @@ public static class SparseOps
             {
                 T acc = ops.Zero;
                 for (int p = rs; p < re; p++)
-                    acc = ops.Add(acc, ops.Multiply(vals[p], bSpan[colIdx[p] * n + j]));
+                    acc = ops.Add(acc, ops.Multiply(valsT[p], bSpan[colIdx[p] * n + j]));
                 outSpan[r * n + j] = acc;
             }
         }
