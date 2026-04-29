@@ -371,6 +371,13 @@ public class DistributedTrainingTests
                 Assert.Equal(6f, result.AsSpan()[0]);
                 Assert.Equal(8f, result.AsSpan()[1]);
             }
+            // Second barrier prevents rank 1 from falling through the
+            // `using var rpc = …` scope (which calls Dispose →
+            // UnregisterRank) before rank 0's RpcSync completes. Without
+            // this, the test races: rank 1's Dispose can drop its
+            // 'add_one' registration before rank 0 looks it up,
+            // surfacing as "No RPC handler registered on rank 1".
+            group.Barrier();
         });
     }
 
