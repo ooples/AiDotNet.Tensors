@@ -204,8 +204,13 @@ public sealed class ElasticLauncher
         int generation = 0;
         while (true)
         {
-            using var generationCts = new System.Threading.CancellationTokenSource();
             // Clean up any stale state at the start of each generation.
+            // Cooperative cancellation across the worker delegates would
+            // need an API change (the worker takes RendezvousAssignment,
+            // no token); when the first task throws, Task.WhenAll
+            // surfaces the exception and the catch below restarts the
+            // whole generation. Surviving ranks complete naturally on
+            // their next collective failure or natural end of work.
             CleanupRendezvous();
 
             var tasks = new Task[_options.WorldSize];

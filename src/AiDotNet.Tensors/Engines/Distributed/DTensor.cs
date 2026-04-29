@@ -34,7 +34,8 @@ public sealed class DeviceMesh
     public DeviceMesh(IProcessGroup world, int[] shape)
     {
         _world = world ?? throw new ArgumentNullException(nameof(world));
-        _shape = (int[])shape.Clone() ?? throw new ArgumentNullException(nameof(shape));
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        _shape = (int[])shape.Clone();
         long total = 1;
         foreach (var d in shape)
         {
