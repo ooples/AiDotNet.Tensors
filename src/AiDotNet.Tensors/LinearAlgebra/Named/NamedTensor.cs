@@ -55,10 +55,20 @@ public sealed class NamedTensor<T>
     public NamedTensor(Tensor<T> tensor, params string?[] names)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (names is null) names = new string?[tensor.Rank];
+        // `params` supplies an empty array when no names are passed —
+        // treat that as "all axes unnamed" (length-rank null array)
+        // instead of throwing on the length mismatch.
+        if (names is null || names.Length == 0) names = new string?[tensor.Rank];
         if (names.Length != tensor.Rank)
             throw new ArgumentException(
                 $"Names length {names.Length} doesn't match tensor rank {tensor.Rank}.", nameof(names));
+        // Reject empty strings — AlignTo / AlignAs treat "" as
+        // invalid, so accepting it here would let inconsistent state
+        // through the constructor.
+        for (int i = 0; i < names.Length; i++)
+            if (names[i] is not null && names[i]!.Length == 0)
+                throw new ArgumentException(
+                    $"Axis name at index {i} must be non-empty or null.", nameof(names));
         EnsureNoDuplicateNames(names);
 
         Tensor = tensor;
@@ -207,6 +217,13 @@ public sealed class NamedTensor<T>
         int firstIdx = Array.IndexOf(Names, names[0]);
         if (firstIdx < 0)
             throw new InvalidOperationException($"Flatten: axis '{names[0]}' not found.");
+        // Bounds-check before walking — without this, a target name
+        // list longer than the remaining rank past firstIdx would
+        // index past Names and throw IndexOutOfRangeException
+        // instead of the API-level error.
+        if (firstIdx + names.Length > Rank)
+            throw new InvalidOperationException(
+                "Flatten: source axes must be contiguous in tensor order.");
         for (int i = 0; i < names.Length; i++)
         {
             if (Names[firstIdx + i] != names[i])

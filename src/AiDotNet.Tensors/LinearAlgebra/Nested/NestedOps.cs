@@ -238,9 +238,27 @@ public static class NestedOps
     public static NestedTensor<T> MultiHeadAttention<T>(
         NestedTensor<T> q, NestedTensor<T> k, NestedTensor<T> v, int numHeads)
     {
+        if (q is null) throw new ArgumentNullException(nameof(q));
+        if (k is null) throw new ArgumentNullException(nameof(k));
+        if (v is null) throw new ArgumentNullException(nameof(v));
         if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        // Same Q/K/V compatibility checks SDPA does — without these,
+        // mismatched batch / feature / row lengths would silently
+        // index past spans and produce wrong attention.
+        if (q.BatchSize != k.BatchSize || q.BatchSize != v.BatchSize)
+            throw new ArgumentException("Q, K, V must share the same batch size.");
+        if (q.FeatureSize == 0 || k.FeatureSize == 0 || v.FeatureSize == 0)
+            throw new InvalidOperationException("MultiHeadAttention requires a non-zero feature axis.");
+        if (q.FeatureSize != k.FeatureSize || q.FeatureSize != v.FeatureSize)
+            throw new ArgumentException("Q, K, V must share the same feature size.");
         if (q.FeatureSize % numHeads != 0)
             throw new ArgumentException($"FeatureSize {q.FeatureSize} must be divisible by numHeads {numHeads}.");
+        for (int i = 0; i < q.BatchSize; i++)
+        {
+            if (q.RowLength(i) != k.RowLength(i) || q.RowLength(i) != v.RowLength(i))
+                throw new ArgumentException(
+                    $"Row {i} length mismatch between Q/K/V (Q={q.RowLength(i)}, K={k.RowLength(i)}, V={v.RowLength(i)}).");
+        }
 
         // Walk per row: reshape each row's [seqLen, embed] into
         // [numHeads, seqLen, headDim] then run SDPA on the head axis.
