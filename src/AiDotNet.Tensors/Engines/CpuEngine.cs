@@ -2328,6 +2328,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("BatchMatMul");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -2888,6 +2889,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorBroadcastAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -5895,6 +5897,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("ReduceSum");
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         // Lazy graph mode: record and return placeholder
@@ -6504,6 +6507,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     public virtual Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("MaxPool2D");
         if (input == null) throw new ArgumentNullException(nameof(input));
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
@@ -9383,6 +9387,8 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public virtual Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
+        // OpScope is no-op + zero-alloc when no profiler is active (#220).
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorMatMul");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (a.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {a.Rank} for first tensor.");
@@ -9884,6 +9890,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("Conv2D");
         return Conv2DIntoImpl<T>(input, kernel, stride, padding, dilation, preAllocatedOutput: null);
     }
 
@@ -14522,6 +14529,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Softmax<T>(Tensor<T> input, int axis = -1)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("Softmax");
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         int rank = input.Rank;
@@ -15559,6 +15567,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("BatchNorm");
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
@@ -16390,6 +16399,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("LayerNorm");
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
@@ -17753,6 +17763,7 @@ public partial class CpuEngine : ITensorLevelEngine
         double? scale,
         out Tensor<T> attentionWeights)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("ScaledDotProductAttention");
         if (query == null)
             throw new ArgumentNullException(nameof(query));
         if (key == null)

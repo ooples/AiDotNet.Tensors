@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AiDotNet.Tensors.Bottleneck</RootNamespace>
+    <AssemblyName>aidotnet-tensors-bottleneck</AssemblyName>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>aidotnet-tensors-bottleneck</ToolCommandName>
+    <PackageId>AiDotNet.Tensors.Bottleneck</PackageId>
+    <Description>One-shot performance summary tool for AiDotNet.Tensors workloads — captures chrome-trace + memory snapshot + autotune-miss list + dispatch-tier counters in a single pass. Modelled on torch.utils.bottleneck.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
+  </ItemGroup>
+
+</Project>
