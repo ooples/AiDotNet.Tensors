@@ -138,14 +138,46 @@ public sealed class NeuralSplineFlowTransform : ITransform
         float lower, float upper, int bins,
         float[] widths, float[] heights, float[] derivatives, int d)
     {
-        if (upper <= lower) throw new ArgumentException();
-        if (bins < 1) throw new ArgumentException();
-        if (widths.Length != heights.Length) throw new ArgumentException();
+        if (widths == null) throw new ArgumentNullException(nameof(widths));
+        if (heights == null) throw new ArgumentNullException(nameof(heights));
+        if (derivatives == null) throw new ArgumentNullException(nameof(derivatives));
+        if (d <= 0) throw new ArgumentOutOfRangeException(nameof(d), "d > 0.");
+        if (upper <= lower) throw new ArgumentException("upper must be > lower.");
+        if (bins < 1) throw new ArgumentException("bins >= 1.");
+        if (widths.Length != heights.Length) throw new ArgumentException("widths and heights must be the same length.");
         if (widths.Length % bins != 0) throw new ArgumentException("widths.Length must be a multiple of bins.");
         int batch = widths.Length / bins;
-        if (derivatives.Length != batch * (bins + 1)) throw new ArgumentException();
-        for (int i = 0; i < derivatives.Length; i++) if (!(derivatives[i] > 0f)) throw new ArgumentException("derivatives > 0.");
-        Lower = lower; Upper = upper; Bins = bins; Widths = widths; Heights = heights; Derivatives = derivatives; D = d;
+        if (derivatives.Length != batch * (bins + 1))
+            throw new ArgumentException(
+                $"derivatives.Length ({derivatives.Length}) must equal batch · (bins + 1) = {batch * (bins + 1)}.");
+        // Defensive copies + per-batch validation: knot widths/heights must be positive
+        // and sum to (upper - lower) per batch row, otherwise the spline overshoots/
+        // undershoots its support and inverse fails.
+        float span = upper - lower;
+        for (int b = 0; b < batch; b++)
+        {
+            float wSum = 0f, hSum = 0f;
+            for (int k = 0; k < bins; k++)
+            {
+                float wk = widths[b * bins + k];
+                float hk = heights[b * bins + k];
+                if (!(wk > 0f)) throw new ArgumentException($"widths[{b},{k}] must be > 0.", nameof(widths));
+                if (!(hk > 0f)) throw new ArgumentException($"heights[{b},{k}] must be > 0.", nameof(heights));
+                wSum += wk; hSum += hk;
+            }
+            if (MathF.Abs(wSum - span) > 1e-3f * span)
+                throw new ArgumentException(
+                    $"widths row {b} sums to {wSum} but should equal upper-lower = {span}.", nameof(widths));
+            if (MathF.Abs(hSum - span) > 1e-3f * span)
+                throw new ArgumentException(
+                    $"heights row {b} sums to {hSum} but should equal upper-lower = {span}.", nameof(heights));
+        }
+        for (int i = 0; i < derivatives.Length; i++)
+            if (!(derivatives[i] > 0f)) throw new ArgumentException("derivatives > 0.");
+        Lower = lower; Upper = upper; Bins = bins; D = d;
+        Widths = (float[])widths.Clone();
+        Heights = (float[])heights.Clone();
+        Derivatives = (float[])derivatives.Clone();
     }
     /// <inheritdoc />
     public IConstraint Domain => RealConstraint.Instance;
@@ -156,13 +188,32 @@ public sealed class NeuralSplineFlowTransform : ITransform
     /// <inheritdoc />
     public bool IsDimensionPreserving => true;
 
+    /// <summary>
+    /// Validate input length and resolve the per-element spline batch index. Caller-supplied
+    /// arrays are flat <c>[N · D]</c> where <c>N</c> is the number of batches the parameter
+    /// arrays were sized for (<c>Widths.Length / Bins</c>); other input lengths are rejected
+    /// rather than silently wrapped via modulo, which previously hid a shape-mismatch.
+    /// </summary>
+    private int ResolveBatchIndex(int elementIndex, int totalLength, string argName)
+    {
+        int paramBatch = Widths.Length / Bins;
+        int expectedLen = paramBatch * D;
+        if (totalLength != expectedLen)
+            throw new ArgumentException(
+                $"{argName}.Length ({totalLength}) must equal paramBatch · D = {expectedLen} " +
+                $"(paramBatch={paramBatch} from Widths/Bins, D={D}). Modulo wrapping is rejected.",
+                argName);
+        return elementIndex / D;
+    }
+
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
         var y = new float[x.Length];
         for (int i = 0; i < x.Length; i++)
         {
-            int batchIdx = (i / D) % (Widths.Length / Bins);  // share params across event dims
+            int batchIdx = ResolveBatchIndex(i, x.Length, nameof(x));
             y[i] = ApplySpline(x[i], batchIdx, forward: true, out _);
         }
         return y;
@@ -170,10 +221,11 @@ public sealed class NeuralSplineFlowTransform : ITransform
     /// <inheritdoc />
     public float[] Inverse(float[] y)
     {
+        if (y == null) throw new ArgumentNullException(nameof(y));
         var x = new float[y.Length];
         for (int i = 0; i < y.Length; i++)
         {
-            int batchIdx = (i / D) % (Widths.Length / Bins);
+            int batchIdx = ResolveBatchIndex(i, y.Length, nameof(y));
             x[i] = ApplySpline(y[i], batchIdx, forward: false, out _);
         }
         return x;
@@ -181,10 +233,11 @@ public sealed class NeuralSplineFlowTransform : ITransform
     /// <inheritdoc />
     public float[] LogAbsDetJacobian(float[] x, float[] y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
         var ldj = new float[x.Length];
         for (int i = 0; i < x.Length; i++)
         {
-            int batchIdx = (i / D) % (Widths.Length / Bins);
+            int batchIdx = ResolveBatchIndex(i, x.Length, nameof(x));
             ApplySpline(x[i], batchIdx, forward: true, out float dlog);
             ldj[i] = dlog;
         }

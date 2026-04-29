@@ -8,8 +8,10 @@ namespace AiDotNet.Tensors.Distributions;
 /// Useful when a single set of parameters needs to be reused across many simulations.
 /// Mirrors PyTorch <c>Distribution.expand(batch_shape)</c>.
 ///
-/// Sampling and log_prob simply replicate the base distribution's outputs along the
-/// expanded axis, so per-batch parameters remain shared.
+/// Parameters are SHARED across the expanded batch but each repeated block draws
+/// independently — calling <see cref="Sample"/> / <see cref="RSample"/> invokes the
+/// underlying base sampler once per repeat factor so Monte-Carlo estimators see fresh
+/// (i.i.d.) samples rather than copies of a single draw.
 /// </summary>
 public sealed class ExpandingDistribution : DistributionBase
 {

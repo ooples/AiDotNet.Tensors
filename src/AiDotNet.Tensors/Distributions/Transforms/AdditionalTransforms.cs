@@ -202,9 +202,15 @@ public sealed class AbsTransform : ITransform
     }
 }
 
-/// <summary>Lifts a 1-D base transform to apply to each <c>EventSize</c>-element block
-/// independently, summing log|det J| over the event dim. Mirrors
-/// <c>torch.distributions.transforms.IndependentTransform</c>.</summary>
+/// <summary>Lifts a 1-D base transform to apply to each <c>ReinterpretedDims</c>-element
+/// block as a single event, summing the per-element log|det J| within each block. Mirrors
+/// <c>torch.distributions.transforms.IndependentTransform</c>.
+///
+/// Forward / Inverse delegate straight to <see cref="Base"/> (the values are unchanged
+/// — this transform only affects how the Jacobian is reduced). LogAbsDetJacobian
+/// pre-aggregates the base LDJ across each block of <see cref="ReinterpretedDims"/>
+/// elements so that when <c>TransformedDistribution</c> later reduces over event dims
+/// the result is summed correctly within each independent block.</summary>
 public sealed class IndependentTransform : ITransform
 {
     /// <summary>Wrapped base transform.</summary>
@@ -232,7 +238,28 @@ public sealed class IndependentTransform : ITransform
     /// <inheritdoc />
     public float[] Inverse(float[] y) => Base.Inverse(y);
     /// <inheritdoc />
-    public float[] LogAbsDetJacobian(float[] x, float[] y) => Base.LogAbsDetJacobian(x, y);
+    public float[] LogAbsDetJacobian(float[] x, float[] y)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        var raw = Base.LogAbsDetJacobian(x, y);
+        if (raw.Length % ReinterpretedDims != 0)
+            throw new ArgumentException(
+                $"base LDJ length ({raw.Length}) must be a multiple of ReinterpretedDims ({ReinterpretedDims}).");
+        // Sum LDJ within each block, then write the aggregated value uniformly across the
+        // block so the downstream TransformedDistribution reducer (which sums across the
+        // entire flat output) recovers the per-event sum exactly. Each entry in the block
+        // contributes (block_sum / block_size) so the total is `block_sum`.
+        int blocks = raw.Length / ReinterpretedDims;
+        var ldj = new float[raw.Length];
+        for (int b = 0; b < blocks; b++)
+        {
+            float sum = 0f;
+            for (int i = 0; i < ReinterpretedDims; i++) sum += raw[b * ReinterpretedDims + i];
+            float share = sum / ReinterpretedDims;
+            for (int i = 0; i < ReinterpretedDims; i++) ldj[b * ReinterpretedDims + i] = share;
+        }
+        return ldj;
+    }
 }
 
 /// <summary>

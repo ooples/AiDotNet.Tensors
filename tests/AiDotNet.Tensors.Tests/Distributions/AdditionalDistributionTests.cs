@@ -180,15 +180,23 @@ public class AdditionalDistributionTests
     // -------------------- ExpandingDistribution --------------------
 
     [Fact]
-    public void ExpandingDistribution_ReplicatesSampleAcrossExpandedBatch()
+    public void ExpandingDistribution_DrawsFreshSamplesPerExpandedBlock()
     {
-        var inner = new NormalDistribution(new[] { 5f }, new[] { 0.0001f });  // tiny var
+        // Width-1 unit Gaussian expanded to batch 8. With non-trivial variance, fresh draws
+        // produce distinct values across the expanded batch — replication would yield the
+        // same value 8 times. We assert at least 6 distinct values out of 8 to confirm
+        // independent sampling without being flaky on rare exact ties.
+        var inner = new NormalDistribution(new[] { 0f }, new[] { 1f });
         var expanded = new ExpandingDistribution(inner, batchSize: 8);
         var rng = new Random(0);
         var s = expanded.Sample(rng);
         Assert.Equal(8, s.Length);
-        // All samples should be ≈ 5 because inner's variance is tiny.
-        foreach (var v in s) Assert.InRange(v, 4.99f, 5.01f);
+        var distinct = new System.Collections.Generic.HashSet<float>(s);
+        Assert.True(distinct.Count >= 6,
+            $"expected fresh draws across expanded batch; only {distinct.Count}/8 distinct values");
+        // Mean over 8 standard-normal draws is finite and approximately 0.
+        float sum = 0f; foreach (var v in s) sum += v;
+        Assert.InRange(sum / 8f, -2f, 2f);
     }
 
     // -------------------- Philox RNG --------------------

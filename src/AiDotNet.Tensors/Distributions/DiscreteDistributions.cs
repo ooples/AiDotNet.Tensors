@@ -37,10 +37,13 @@ public sealed class BernoulliDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             float p = Probs[i]; float v = value[i];
-            // Stable: lp = v·log(p) + (1-v)·log(1-p) — but with clamps when p ∈ {0, 1}.
-            float logP = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
-            float log1mp = p < 1f ? MathF.Log(1f - p) : float.NegativeInfinity;
-            lp[i] = v * logP + (1f - v) * log1mp;
+            // Bernoulli support is {0, 1}. Branch explicitly so:
+            //  - non-binary inputs return -∞ (out of support)
+            //  - the deterministic edges p ∈ {0, 1} are not contaminated by 0·-∞ = NaN
+            //    that the generic v·log(p) + (1-v)·log(1-p) form would otherwise produce.
+            if (v == 1f) lp[i] = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
+            else if (v == 0f) lp[i] = p < 1f ? MathF.Log(1f - p) : float.NegativeInfinity;
+            else lp[i] = float.NegativeInfinity;
         }
         return lp;
     }
@@ -116,38 +119,34 @@ public sealed class BinomialDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             int n = TotalCount[i]; float p = Probs[i]; float k = value[i];
-            if (k < 0 || k > n) { lp[i] = float.NegativeInfinity; continue; }
+            // Discrete support: k must be a non-negative integer in [0, n]. Lgamma alone
+            // would silently accept fractional counts, so we filter them out explicitly.
+            if (k < 0f || k > n || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
+            // Deterministic edges: only k == 0 (for p == 0) or k == n (for p == 1) have mass.
+            // Skip the generic formula so we don't get 0 · -∞ = NaN at those edges.
+            if (p == 0f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
+            if (p == 1f) { lp[i] = k == n  ? 0f : float.NegativeInfinity; continue; }
             float logBinom = SpecialFunctions.Lgamma(n + 1f) - SpecialFunctions.Lgamma(k + 1f) - SpecialFunctions.Lgamma(n - k + 1f);
-            float logP = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
-            float log1mp = p < 1f ? MathF.Log(1f - p) : float.NegativeInfinity;
-            lp[i] = logBinom + k * logP + (n - k) * log1mp;
+            lp[i] = logBinom + k * MathF.Log(p) + (n - k) * MathF.Log(1f - p);
         }
         return lp;
     }
     /// <inheritdoc />
     public override float[] Entropy()
     {
-        // No simple closed form; sum over support.
+        // No simple closed form; sum over the support.
         var h = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
             int n = TotalCount[i];
+            float p = Probs[i];
+            // Deterministic ⇒ entropy is 0 (no uncertainty).
+            if (p == 0f || p == 1f) { h[i] = 0f; continue; }
             double s = 0;
             for (int k = 0; k <= n; k++)
             {
-                var lp = LogProb(new float[] { k })[0];
-                if (!float.IsNegativeInfinity(lp)) s += MathF.Exp(lp) * lp;
-            }
-            // Wait — this LogProb call uses the FULL batch's parameters. We need a single-batch path.
-            // Inline the formula instead:
-            s = 0;
-            for (int k = 0; k <= n; k++)
-            {
-                float p = Probs[i];
                 float logBinom = SpecialFunctions.Lgamma(n + 1f) - SpecialFunctions.Lgamma(k + 1f) - SpecialFunctions.Lgamma(n - k + 1f);
-                float logP = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
-                float log1mp = p < 1f ? MathF.Log(1f - p) : float.NegativeInfinity;
-                float lp2 = logBinom + k * logP + (n - k) * log1mp;
+                float lp2 = logBinom + k * MathF.Log(p) + (n - k) * MathF.Log(1f - p);
                 if (!float.IsNegativeInfinity(lp2)) s += MathF.Exp(lp2) * lp2;
             }
             h[i] = (float)(-s);
@@ -221,8 +220,11 @@ public sealed class CategoricalDistribution : DistributionBase
         var lp = new float[batch];
         for (int b = 0; b < batch; b++)
         {
-            int k = (int)value[b];
-            if (k < 0 || k >= K) { lp[b] = float.NegativeInfinity; continue; }
+            float v = value[b];
+            // Reject non-integer indices outright (truncation via (int) would silently
+            // accept e.g. 1.7 as category 1, which is wrong for a discrete support).
+            if (v < 0f || v >= K || v != MathF.Floor(v)) { lp[b] = float.NegativeInfinity; continue; }
+            int k = (int)v;
             float p = Probs[b * K + k];
             lp[b] = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
         }
@@ -312,14 +314,28 @@ public sealed class OneHotCategoricalDistribution : DistributionBase
     public override float[] LogProb(float[] value)
     {
         EnsureValueShape(value);
-        // Reduce the one-hot to an index, then call inner log-prob.
+        // Reduce the one-hot to an index, then call inner log-prob. The previous version
+        // accepted vectors like [1, 1, 0] (multi-hot) by stopping at the first 1; we now
+        // require exactly one entry to be 1 and the rest to be 0, returning -∞ otherwise.
         var idx = new float[BatchSize];
         for (int b = 0; b < BatchSize; b++)
         {
             int chosen = -1;
+            bool valid = true;
             for (int i = 0; i < K; i++)
-                if (value[b * K + i] == 1f) { chosen = i; break; }
-            idx[b] = chosen < 0 ? -1 : chosen;
+            {
+                float v = value[b * K + i];
+                if (v == 1f)
+                {
+                    if (chosen >= 0) { valid = false; break; } // multi-hot
+                    chosen = i;
+                }
+                else if (v != 0f)
+                {
+                    valid = false; break; // non-binary entry
+                }
+            }
+            idx[b] = valid && chosen >= 0 ? chosen : -1;
         }
         return _inner.LogProb(idx);
     }
@@ -521,7 +537,9 @@ public sealed class NegativeBinomialDistribution : DistributionBase
         for (int i = 0; i < probs.Length; i++)
         {
             if (!(totalCount[i] > 0f)) throw new ArgumentException("totalCount > 0.");
-            if (!(probs[i] >= 0f && probs[i] < 1f)) throw new ArgumentException("probs ∈ [0, 1).");
+            // Reject p == 0 outright — Sample divides by p and (1−p)/p would blow up.
+            // p == 1 is also disallowed because all mass would be on k = 0.
+            if (!(probs[i] > 0f && probs[i] < 1f)) throw new ArgumentException("probs ∈ (0, 1).");
         }
         TotalCount = (float[])totalCount.Clone(); Probs = (float[])probs.Clone();
     }
@@ -546,7 +564,8 @@ public sealed class NegativeBinomialDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             float k = value[i]; float r = TotalCount[i]; float p = Probs[i];
-            if (k < 0) { lp[i] = float.NegativeInfinity; continue; }
+            // k must be a non-negative integer; Lgamma alone would silently accept fractions.
+            if (k < 0f || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
             lp[i] = SpecialFunctions.Lgamma(r + k) - SpecialFunctions.Lgamma(k + 1f) - SpecialFunctions.Lgamma(r)
                   + r * MathF.Log(p) + k * MathF.Log(1f - p);
         }
@@ -632,6 +651,20 @@ public sealed class MultinomialDistribution : DistributionBase
         for (int b = 0; b < BatchSize; b++)
         {
             int n = TotalCount[b];
+            // Validate the count vector: each k_i must be a non-negative integer and
+            // Σ k_i must equal n. Otherwise the count vector is impossible under this
+            // multinomial — the analytical formula would otherwise return a finite (and
+            // wrong) value for fractional or mis-summed inputs.
+            float sumK = 0f;
+            bool valid = true;
+            for (int i = 0; i < K; i++)
+            {
+                float k = value[b * K + i];
+                if (k < 0f || k != MathF.Floor(k)) { valid = false; break; }
+                sumK += k;
+            }
+            if (!valid || sumK != n) { lp[b] = float.NegativeInfinity; continue; }
+
             float l = SpecialFunctions.Lgamma(n + 1f);
             for (int i = 0; i < K; i++)
             {

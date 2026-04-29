@@ -165,8 +165,26 @@ public sealed class KumaraswamyDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             float v = value[i];
-            if (v <= 0f || v >= 1f) { lp[i] = float.NegativeInfinity; continue; }
             float a = Concentration1[i], b = Concentration0[i];
+            if (v < 0f || v > 1f) { lp[i] = float.NegativeInfinity; continue; }
+            // Boundary densities depend on (a, b) — see Kumaraswamy density form
+            // f(x) = a·b·x^(a-1)·(1-x^a)^(b-1).
+            //   v=0: x^(a-1) → +∞ when a<1, log(a·b) when a=1, 0 (so log=-∞) when a>1.
+            //   v=1: (1-x^a)^(b-1) → +∞ when b<1, log(a·b) when b=1, 0 when b>1.
+            if (v == 0f)
+            {
+                lp[i] = a < 1f ? float.PositiveInfinity
+                      : a == 1f ? MathF.Log(a) + MathF.Log(b)
+                      : float.NegativeInfinity;
+                continue;
+            }
+            if (v == 1f)
+            {
+                lp[i] = b < 1f ? float.PositiveInfinity
+                      : b == 1f ? MathF.Log(a) + MathF.Log(b)
+                      : float.NegativeInfinity;
+                continue;
+            }
             lp[i] = MathF.Log(a) + MathF.Log(b)
                   + (a - 1f) * MathF.Log(v)
                   + (b - 1f) * MathF.Log(1f - MathF.Pow(v, a));

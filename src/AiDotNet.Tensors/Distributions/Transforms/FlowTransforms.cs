@@ -30,8 +30,16 @@ public sealed class PlanarFlowTransform : ITransform
     /// <summary>Build a planar flow.</summary>
     public PlanarFlowTransform(float[] u, float[] w, float b)
     {
+        if (u == null) throw new ArgumentNullException(nameof(u));
+        if (w == null) throw new ArgumentNullException(nameof(w));
         if (u.Length != w.Length) throw new ArgumentException("u and w must have the same length.");
-        U = u; W = w; B = b;
+        if (w.Length == 0) throw new ArgumentException("w must be non-empty.", nameof(w));
+        // Reject the degenerate w = 0 case — CorrectedU's w² normaliser would divide by 0.
+        float w2 = 0f;
+        for (int i = 0; i < w.Length; i++) w2 += w[i] * w[i];
+        if (!(w2 > 0f))
+            throw new ArgumentException("w must have non-zero norm (the planar flow is undefined when w == 0).", nameof(w));
+        U = (float[])u.Clone(); W = (float[])w.Clone(); B = b;
     }
 
     /// <inheritdoc />
@@ -149,8 +157,11 @@ public sealed class RadialFlowTransform : ITransform
     /// <summary>Build a radial flow.</summary>
     public RadialFlowTransform(float[] x0, float alpha, float beta)
     {
+        if (x0 == null) throw new ArgumentNullException(nameof(x0));
+        if (x0.Length == 0)
+            throw new ArgumentException("x0 must be non-empty (the flow dimension D is x0.Length).", nameof(x0));
         if (alpha <= 0f) throw new ArgumentException("alpha > 0.");
-        X0 = x0; Alpha = alpha; Beta = beta;
+        X0 = (float[])x0.Clone(); Alpha = alpha; Beta = beta;
     }
 
     /// <inheritdoc />
