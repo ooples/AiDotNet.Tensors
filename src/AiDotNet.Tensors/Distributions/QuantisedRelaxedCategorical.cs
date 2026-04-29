@@ -145,9 +145,11 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
     /// Bengio et al. 2013) and what #263 commits to for gradient
     /// flow through the quantised sampler.
     ///
-    /// <para>The Gumbel noise introduced by the sampler is captured
-    /// in the saved state at sample time so backward sees the same
-    /// random draw the forward used.</para>
+    /// <para>Backward uses pure identity STE; no Gumbel noise is
+    /// captured in saved state because the gradient flows through the
+    /// dequantise → quantise round-trip as an identity, and the
+    /// per-sample noise drops out of the chain rule. This matches the
+    /// VQ-VAE / Gumbel-softmax STE convention.</para>
     /// </summary>
     public Tensor<float> RSampleTape(Tensor<float> logits, Random rng)
     {
