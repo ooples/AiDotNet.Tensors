@@ -634,6 +634,26 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
             int code = hi ? (packed[dstByte] >> 4) & 0x0F : packed[dstByte] & 0x0F;
             dense[i] = Fp4E2M1.FromIndex(code);
         }
+        // Same simplex post-processing as the int4 path: clamp every
+        // cell to a positive ε-floor and renormalise per row so the
+        // dequantised sample is a valid simplex point. The
+        // distribution's Support advertises SimplexConstraint(K), so
+        // raw FP4 table values (which may include 0 / negatives)
+        // would violate the contract — and downstream LogProb's
+        // τ·log(y) would blow up on the zero cells.
+        const float floor = 1e-4f;
+        for (int b = 0; b < BatchSize; b++)
+        {
+            float rowSum = 0f;
+            for (int i = 0; i < K; i++)
+            {
+                int idx = b * K + i;
+                if (dense[idx] < floor) dense[idx] = floor;
+                rowSum += dense[idx];
+            }
+            float invSum = 1f / rowSum;
+            for (int i = 0; i < K; i++) dense[b * K + i] *= invSum;
+        }
         return dense;
     }
 
