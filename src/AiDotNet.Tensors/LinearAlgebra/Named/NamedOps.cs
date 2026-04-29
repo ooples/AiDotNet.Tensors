@@ -138,10 +138,20 @@ public static class NamedOps
                 bDimToA[bIdx] = aIdx;
             }
         }
-        // Reject any names in b not in a.
+        // Reject (a) any names in b not in a, and (b) any unnamed axis
+        // in b that isn't size 1. Non-singleton unnamed axes don't
+        // participate in the bDimToA projection — they would silently
+        // collapse onto the same destination slot, leaving only the
+        // last value written.
         for (int bIdx = 0; bIdx < b.Rank; bIdx++)
         {
-            if (b.Names[bIdx] is null) continue;
+            if (b.Names[bIdx] is null)
+            {
+                if (b.Tensor._shape[bIdx] != 1)
+                    throw new InvalidOperationException(
+                        $"Broadcast: unnamed axis {bIdx} in b must have size 1, got {b.Tensor._shape[bIdx]}.");
+                continue;
+            }
             if (!bDimToA.ContainsKey(bIdx))
                 throw new InvalidOperationException(
                     $"Broadcast: name '{b.Names[bIdx]}' from b is not in a's names.");

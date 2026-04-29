@@ -297,8 +297,11 @@ public static class NestedOps
 
     private static Tensor<T> ReshapeAsRows<T>(NestedTensor<T> x, int totalRows, int features)
     {
-        // Materialize a [totalRows, features] view of the values buffer.
-        // Cheap because it's a logical reshape, not a copy.
+        // Materialize a [totalRows, features] dense tensor. This IS a
+        // copy of the contiguous values buffer — the dense matmul
+        // kernels need a tensor with its own storage. Once Tensor<T>
+        // grows a zero-copy reshape API for the contiguous case we'll
+        // route through it.
         var t = new Tensor<T>(new[] { totalRows, features });
         x.Values.AsSpan().CopyTo(t.AsWritableSpan());
         return t;

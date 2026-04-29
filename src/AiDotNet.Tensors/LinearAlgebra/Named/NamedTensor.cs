@@ -107,6 +107,18 @@ public sealed class NamedTensor<T>
         if (targetNames.Length != Rank)
             throw new ArgumentException(
                 $"AlignTo expects {Rank} names; got {targetNames.Length}.", nameof(targetNames));
+        // Fully-named contract: AlignTo can't represent unnamed axes
+        // since the target list is just a string[]. Reject any
+        // unlabelled source or empty target name with a clear message
+        // rather than silently misalign.
+        for (int i = 0; i < Rank; i++)
+            if (string.IsNullOrEmpty(Names[i]))
+                throw new InvalidOperationException(
+                    $"AlignTo requires fully-named source tensor; axis {i} is unnamed.");
+        for (int i = 0; i < targetNames.Length; i++)
+            if (string.IsNullOrEmpty(targetNames[i]))
+                throw new ArgumentException(
+                    $"AlignTo target name at index {i} must be non-empty.", nameof(targetNames));
 
         var perm = new int[Rank];
         var used = new bool[Rank];
@@ -135,6 +147,13 @@ public sealed class NamedTensor<T>
     public NamedTensor<T> AlignAs(NamedTensor<T> other)
     {
         if (other is null) throw new ArgumentNullException(nameof(other));
+        // Fully-named contract on the source: every axis must be named
+        // for AlignAs to reach the count check below cleanly. (`other`
+        // can have unnamed axes — those become broadcast-1 dims.)
+        for (int i = 0; i < Rank; i++)
+            if (string.IsNullOrEmpty(Names[i]))
+                throw new InvalidOperationException(
+                    $"AlignAs requires fully-named source tensor; axis {i} is unnamed.");
         // Subset path: every name in `this` exists in `other` ⇒ permute then unsqueeze.
         var orderedSelfNames = new List<string>();
         var orderedSelfDims = new List<int>();
@@ -278,7 +297,11 @@ public sealed class NamedTensor<T>
         var dst = result.AsWritableSpan();
         var src = tensor.AsSpan();
 
-        var oldStrides = ComputeStrides(tensor._shape);
+        // Use the tensor's own strides — recomputing dense row-major
+        // strides from _shape is only correct for contiguous tensors.
+        // For views/slices with non-default strides we'd permute the
+        // wrong elements.
+        var oldStrides = tensor._strides;
         var indices = new int[perm.Length];
 
         for (int linear = 0; linear < tensor.Length; linear++)

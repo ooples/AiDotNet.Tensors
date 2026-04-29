@@ -118,13 +118,30 @@ public sealed class MaskedTensor<T>
     /// <summary>Constructs a masked tensor from a dense input where
     /// every lane equal to <paramref name="maskValue"/> is treated as
     /// masked-out. Common pattern: <c>FromDenseWithSentinel(t, T.NaN)</c>
-    /// for "ignore the NaNs in this float tensor".</summary>
+    /// for "ignore the NaNs in this float tensor".
+    ///
+    /// <para>NaN handling: IEEE 754 says <c>NaN.Equals(NaN) == false</c>,
+    /// so a plain <c>Equals</c> never matches a NaN sentinel. We
+    /// special-case <c>float.NaN</c> / <c>double.NaN</c> using
+    /// <c>IsNaN</c>; other sentinel values (including ±Inf, 0, any
+    /// normal float) compare via <c>Equals</c> as before.</para></summary>
     public static MaskedTensor<T> FromDenseWithSentinel(Tensor<T> values, T maskValue)
     {
         var mask = new bool[values.Length];
         var src = values.AsSpan();
+
+        bool isFloatNan = maskValue is float fSentinel && float.IsNaN(fSentinel);
+        bool isDoubleNan = maskValue is double dSentinel && double.IsNaN(dSentinel);
+
         for (int i = 0; i < src.Length; i++)
-            mask[i] = !src[i]!.Equals(maskValue);
+        {
+            if (isFloatNan && src[i] is float fv)
+                mask[i] = !float.IsNaN(fv);
+            else if (isDoubleNan && src[i] is double dv)
+                mask[i] = !double.IsNaN(dv);
+            else
+                mask[i] = !src[i]!.Equals(maskValue);
+        }
         return new MaskedTensor<T>(values, mask);
     }
 }
