@@ -90,7 +90,13 @@ public sealed class MaskedTensor<T>
     }
 
     /// <summary>Returns whether lane <paramref name="i"/> is valid.</summary>
-    public bool IsValid(int i) => (_packedMask[i >> 3] & (1 << (i & 7))) != 0;
+    public bool IsValid(int i)
+    {
+        if ((uint)i >= (uint)Length)
+            throw new ArgumentOutOfRangeException(nameof(i),
+                $"Lane index {i} out of range [0, {Length}).");
+        return (_packedMask[i >> 3] & (1 << (i & 7))) != 0;
+    }
 
     /// <summary>Materializes a dense tensor where masked-out lanes are
     /// replaced with <paramref name="fill"/>. Useful for handing a
@@ -127,6 +133,7 @@ public sealed class MaskedTensor<T>
     /// normal float) compare via <c>Equals</c> as before.</para></summary>
     public static MaskedTensor<T> FromDenseWithSentinel(Tensor<T> values, T maskValue)
     {
+        if (values is null) throw new ArgumentNullException(nameof(values));
         var mask = new bool[values.Length];
         var src = values.AsSpan();
 

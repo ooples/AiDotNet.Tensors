@@ -86,8 +86,14 @@ public static class StructuredBridges
         NestedTensor<T> nested, T padding, int outputSize = -1)
     {
         int batch = nested.BatchSize;
+        // outputSize == -1 means "use the max row length" (NestedToMasked's default).
+        // When outputSize truncates a row's content, the mask only covers up to
+        // outputSize lanes — so the returned lengths must be clamped too, otherwise
+        // the round-trip helper hands callers a (lengths) array that disagrees
+        // with the actual mask coverage.
+        int padLen = outputSize < 0 ? nested.MaxRowLength : outputSize;
         var lengths = new int[batch];
-        for (int b = 0; b < batch; b++) lengths[b] = nested.RowLength(b);
+        for (int b = 0; b < batch; b++) lengths[b] = Math.Min(nested.RowLength(b), padLen);
         return (NestedToMasked(nested, padding, outputSize), lengths);
     }
 
@@ -110,16 +116,31 @@ public static class StructuredBridges
         var lengths = new int[batch];
 
         // Each row's mask must be a contiguous prefix of trues to round-trip
-        // cleanly through nested form. We don't enforce that here — instead
-        // we count the longest valid prefix per row.
+        // cleanly through nested form. We count the longest prefix where
+        // every feature lane in the timestep is valid — the previous code
+        // checked only the first feature, so a partially-masked timestep
+        // (e.g. one feature dropped via FromDenseWithSentinel) was treated
+        // as fully valid and the row length was overestimated.
         for (int b = 0; b < batch; b++)
         {
             int len = 0;
             for (int s = 0; s < padLen; s++)
             {
-                int idx = hasFeatureAxis ? (b * padLen + s) * featureSize : b * padLen + s;
-                if (masked.IsValid(idx)) len++;
-                else break;
+                if (hasFeatureAxis)
+                {
+                    bool allValid = true;
+                    int baseIdx = (b * padLen + s) * featureSize;
+                    for (int f = 0; f < featureSize; f++)
+                    {
+                        if (!masked.IsValid(baseIdx + f)) { allValid = false; break; }
+                    }
+                    if (!allValid) break;
+                }
+                else
+                {
+                    if (!masked.IsValid(b * padLen + s)) break;
+                }
+                len++;
             }
             lengths[b] = len;
         }
