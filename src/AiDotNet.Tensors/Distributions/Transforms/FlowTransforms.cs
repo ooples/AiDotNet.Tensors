@@ -272,10 +272,22 @@ public sealed class RealNvpCouplingTransform : ITransform
     /// <summary>Build a RealNVP coupling layer.</summary>
     public RealNvpCouplingTransform(bool[] mask, float[] sScale, float[] sBias, float[] tScale, float[] tBias)
     {
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (sScale == null) throw new ArgumentNullException(nameof(sScale));
+        if (sBias == null) throw new ArgumentNullException(nameof(sBias));
+        if (tScale == null) throw new ArgumentNullException(nameof(tScale));
+        if (tBias == null) throw new ArgumentNullException(nameof(tBias));
+        if (mask.Length == 0)
+            throw new ArgumentException("mask must be non-empty (the flow dimension D = mask.Length).", nameof(mask));
         if (sScale.Length != mask.Length || sBias.Length != mask.Length
             || tScale.Length != mask.Length || tBias.Length != mask.Length)
             throw new ArgumentException("mask, s, t parameters must all be length D.");
-        Mask = mask; SScale = sScale; SBias = sBias; TScale = tScale; TBias = tBias;
+        // Defensive copies so external mutation can't break the transform's invariants.
+        Mask = (bool[])mask.Clone();
+        SScale = (float[])sScale.Clone();
+        SBias = (float[])sBias.Clone();
+        TScale = (float[])tScale.Clone();
+        TBias = (float[])tBias.Clone();
     }
 
     /// <inheritdoc />
@@ -290,6 +302,9 @@ public sealed class RealNvpCouplingTransform : ITransform
     /// <inheritdoc />
     public float[] Forward(float[] x)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException($"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         var y = new float[x.Length];
         for (int b = 0; b < batch; b++)
@@ -314,6 +329,9 @@ public sealed class RealNvpCouplingTransform : ITransform
     /// <inheritdoc />
     public float[] Inverse(float[] y)
     {
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (y.Length % D != 0)
+            throw new ArgumentException($"y.Length ({y.Length}) must be a multiple of D ({D}).", nameof(y));
         int batch = y.Length / D;
         var x = new float[y.Length];
         for (int b = 0; b < batch; b++)
@@ -337,6 +355,9 @@ public sealed class RealNvpCouplingTransform : ITransform
     /// <inheritdoc />
     public float[] LogAbsDetJacobian(float[] x, float[] y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (x.Length % D != 0)
+            throw new ArgumentException($"x.Length ({x.Length}) must be a multiple of D ({D}).", nameof(x));
         int batch = x.Length / D;
         var ldj = new float[x.Length];
         for (int b = 0; b < batch; b++)

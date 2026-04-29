@@ -342,7 +342,7 @@ public sealed class OneHotCategoricalDistribution : DistributionBase
     /// <inheritdoc />
     public override float[] Entropy() => _inner.Entropy();
     /// <inheritdoc />
-    public override float[] Mean => Probs;
+    public override float[] Mean => (float[])Probs.Clone();  // never expose internal storage
     /// <inheritdoc />
     public override float[] Variance
     {
@@ -397,9 +397,12 @@ public sealed class GeometricDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float k = value[i];
+            float k = value[i]; float p = Probs[i];
             if (k < 0 || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
-            lp[i] = k * MathF.Log(1f - Probs[i]) + MathF.Log(Probs[i]);
+            // Deterministic edge p == 1: all mass is on k = 0; otherwise log(0) = -∞.
+            // Avoids 0 · log(0) = NaN in the generic formula.
+            if (p == 1f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
+            lp[i] = k * MathF.Log(1f - p) + MathF.Log(p);
         }
         return lp;
     }
@@ -410,6 +413,8 @@ public sealed class GeometricDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             float p = Probs[i];
+            // p == 1 ⇒ deterministic point mass at 0 ⇒ entropy 0.
+            if (p == 1f) { h[i] = 0f; continue; }
             h[i] = -(p * MathF.Log(p) + (1f - p) * MathF.Log(1f - p)) / p;
         }
         return h;
@@ -652,16 +657,16 @@ public sealed class MultinomialDistribution : DistributionBase
         {
             int n = TotalCount[b];
             // Validate the count vector: each k_i must be a non-negative integer and
-            // Σ k_i must equal n. Otherwise the count vector is impossible under this
-            // multinomial — the analytical formula would otherwise return a finite (and
-            // wrong) value for fractional or mis-summed inputs.
-            float sumK = 0f;
+            // Σ k_i must equal n. Accumulate the integer cast (after the float-integrality
+            // check) so float rounding can't make a row sum mistakenly compare equal to n
+            // (or vice versa) for high-count cases.
+            long sumK = 0;
             bool valid = true;
             for (int i = 0; i < K; i++)
             {
                 float k = value[b * K + i];
                 if (k < 0f || k != MathF.Floor(k)) { valid = false; break; }
-                sumK += k;
+                sumK += (long)k;
             }
             if (!valid || sumK != n) { lp[b] = float.NegativeInfinity; continue; }
 
