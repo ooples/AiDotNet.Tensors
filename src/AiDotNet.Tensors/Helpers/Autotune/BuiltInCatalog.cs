@@ -2,6 +2,9 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Engines.Simd.Sparse;
+using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.LinearAlgebra.Sparse;
 
 namespace AiDotNet.Tensors.Helpers.Autotune;
 
@@ -41,6 +44,14 @@ internal static class BuiltInCatalog
 {
     public static readonly KernelId SGEMM = new("gemm", "cpu-simd-sgemm");
 
+    /// <summary>Sparse vs dense matmul crossover. PyTorch users have to
+    /// pick manually; we measure per shape × density and stash the
+    /// winner so subsequent runs flip automatically. ShapeProfile is
+    /// (rows, cols, k, density-per-thousand) — density encoded as a
+    /// permille int so the existing int[] dimensions field carries the
+    /// signal without boxing.</summary>
+    public static readonly KernelId SPARSE_MM = new("sparse_mm", "cpu-csr-vs-dense");
+
     // Registration latch MUST be set only AFTER Register() successfully
     // completes. The previous Interlocked.Exchange-then-Register ordering
     // had two failure modes: (a) a concurrent caller could observe
@@ -65,6 +76,10 @@ internal static class BuiltInCatalog
                 SGEMM,
                 variants: SgemmVariants,
                 benchmarkVariant: BenchmarkSgemmVariant));
+            AutotuneKernelCatalog.Register(new AutotuneCatalogEntry(
+                SPARSE_MM,
+                variants: SparseMmVariants,
+                benchmarkVariant: BenchmarkSparseMmVariant));
             // Publish only after Register() succeeds. If Register throws,
             // _registered stays 0 and the next caller retries.
             Volatile.Write(ref _registered, 1);
@@ -165,5 +180,113 @@ internal static class BuiltInCatalog
         if (secsPerIter <= 0) return Task.FromResult(0.0);
         double flops = 2.0 * m * k * n;
         return Task.FromResult(flops / 1e9 / secsPerIter);
+    }
+
+    private static IEnumerable<string> SparseMmVariants(ShapeProfile shape)
+    {
+        // CSR · dense vs dense · dense. Both are valid for any shape; the
+        // benchmark times each at the supplied (rows, cols, k, density).
+        yield return "csr";
+        yield return "dense";
+    }
+
+    private static Task<double> BenchmarkSparseMmVariant(ShapeProfile shape, string variant, CancellationToken ct)
+    {
+        // Shape profile is (rows, cols, k, densityPermille) where rows×k
+        // is the sparse-LHS shape, k×cols is dense-RHS, densityPermille is
+        // the fraction of A's entries that are non-zero (per-thousand so
+        // the int[] dims slot doesn't need a float).
+        int[] dims = shape.Dimensions;
+        if (dims.Length < 4) return Task.FromResult(0.0);
+        int rows = dims[0], cols = dims[1], k = dims[2];
+        int permille = dims[3];
+        if (rows <= 0 || cols <= 0 || k <= 0 || permille <= 0 || permille > 1000)
+            return Task.FromResult(0.0);
+
+        long aLen = (long)rows * k;
+        long bLen = (long)k * cols;
+        if (aLen > int.MaxValue || bLen > int.MaxValue) return Task.FromResult(0.0);
+
+        var rng = new Random(0x5BA5E5 + variant.GetHashCode());
+        // Build a sparse A at the requested density.
+        int nnzPerRow = (int)Math.Max(1, (long)k * permille / 1000);
+        var rowPtr = new int[rows + 1];
+        var colIdx = new int[rows * nnzPerRow];
+        var values = new float[rows * nnzPerRow];
+        int p = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            rowPtr[r] = p;
+            // Sparse — sample nnzPerRow distinct columns.
+            for (int j = 0; j < nnzPerRow; j++)
+            {
+                colIdx[p] = (int)(((long)j * k) / nnzPerRow);
+                values[p] = (float)rng.NextDouble();
+                p++;
+            }
+        }
+        rowPtr[rows] = p;
+
+        var bDense = new float[k * cols];
+        for (int i = 0; i < bDense.Length; i++) bDense[i] = (float)rng.NextDouble();
+
+        var output = new float[rows * cols];
+        const int iters = 5;
+
+        // Materialise the dense form ONCE outside the timed region.
+        // Including ToDense inside the dense branch's timer would
+        // charge the format-conversion cost to every dense iteration
+        // and bias the autotuner toward "csr" for the wrong reason —
+        // a real caller already has the dense representation when
+        // they're choosing a kernel.
+        float[]? aDense = variant == "dense" ? ToDense(rowPtr, colIdx, values, rows, k) : null;
+
+        // Warm up.
+        if (variant == "csr")
+        {
+            CsrDenseSimd.Multiply(rowPtr, colIdx, values, bDense, output, rows, cols);
+            CsrDenseSimd.Multiply(rowPtr, colIdx, values, bDense, output, rows, cols);
+        }
+        else
+        {
+            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+        }
+        ct.ThrowIfCancellationRequested();
+
+        var sw = Stopwatch.StartNew();
+        if (variant == "csr")
+        {
+            for (int i = 0; i < iters; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                CsrDenseSimd.Multiply(rowPtr, colIdx, values, bDense, output, rows, cols);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < iters; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+            }
+        }
+        sw.Stop();
+        double secsPerIter = sw.Elapsed.TotalSeconds / iters;
+        if (secsPerIter <= 0) return Task.FromResult(0.0);
+        // GFLOPs/s — sparse counts 2·nnz·cols, dense counts 2·rows·k·cols.
+        double flops = variant == "csr"
+            ? 2.0 * (rows * (long)nnzPerRow) * cols
+            : 2.0 * rows * k * cols;
+        return Task.FromResult(flops / 1e9 / secsPerIter);
+    }
+
+    private static float[] ToDense(int[] rowPtr, int[] colIdx, float[] values, int rows, int k)
+    {
+        var d = new float[rows * k];
+        for (int r = 0; r < rows; r++)
+            for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++)
+                d[r * k + colIdx[p]] = values[p];
+        return d;
     }
 }
