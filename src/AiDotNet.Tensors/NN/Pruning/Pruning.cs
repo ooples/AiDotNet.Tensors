@@ -22,6 +22,7 @@ public static class Pruning
     /// absolute value. Mirrors <c>prune.l1_unstructured</c>.</summary>
     public static PrunedTensor<T> L1Unstructured<T>(Tensor<T> raw, double amount)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
         if (amount < 0 || amount > 1) throw new ArgumentOutOfRangeException(nameof(amount));
         var ops = MathHelper.GetNumericOperations<T>();
         int total = raw.Length;
@@ -35,20 +36,17 @@ public static class Pruning
         if (toPrune >= total)
             return new PrunedTensor<T>(raw, mask);
 
+        // Threshold-only pruning under-counts when values tie at the
+        // cutoff. Switch to the (score, index) sort: take the first
+        // `toPrune` indices in ascending magnitude as the prune set.
+        // Exact-count regardless of ties; matches PyTorch's
+        // prune.l1_unstructured semantics.
         var src = raw.AsSpan();
-        // Compute |raw_i|, find the k-th smallest as the threshold.
-        var abs = new double[total];
-        for (int i = 0; i < total; i++) abs[i] = Math.Abs(ops.ToDouble(src[i]));
-        var sorted = (double[])abs.Clone();
-        Array.Sort(sorted);
-        double threshold = sorted[toPrune];
-        int actual = 0;
-        for (int i = 0; i < total; i++)
-        {
-            mask[i] = abs[i] >= threshold;
-            if (!mask[i]) actual++;
-            if (actual >= toPrune && abs[i] == threshold) mask[i] = true;
-        }
+        var indexed = new (double Mag, int Idx)[total];
+        for (int i = 0; i < total; i++) indexed[i] = (Math.Abs(ops.ToDouble(src[i])), i);
+        Array.Sort(indexed, (a, b) => a.Mag.CompareTo(b.Mag));
+        for (int i = 0; i < total; i++) mask[i] = true;
+        for (int k = 0; k < toPrune; k++) mask[indexed[k].Idx] = false;
         return new PrunedTensor<T>(raw, mask);
     }
 
@@ -106,14 +104,18 @@ public static class Pruning
         }
 
         int toPrune = (int)Math.Round(amount * axisLen);
-        var sortedNorms = (double[])sliceNorms.Clone();
-        Array.Sort(sortedNorms);
-        double threshold = toPrune > 0 ? sortedNorms[Math.Min(toPrune, axisLen - 1)] : double.MinValue;
+        // (norm, slice-index) sort + take-k for exact-count pruning
+        // even when norms tie at the cutoff.
+        var indexedNorms = new (double Norm, int Idx)[axisLen];
+        for (int a = 0; a < axisLen; a++) indexedNorms[a] = (sliceNorms[a], a);
+        Array.Sort(indexedNorms, (a, b) => a.Norm.CompareTo(b.Norm));
+        var pruneSlice = new bool[axisLen];
+        for (int k = 0; k < toPrune; k++) pruneSlice[indexedNorms[k].Idx] = true;
 
         var mask = new bool[raw.Length];
         for (int a = 0; a < axisLen; a++)
         {
-            bool keep = sliceNorms[a] >= threshold;
+            bool keep = !pruneSlice[a];
             for (int o = 0; o < outer; o++)
                 for (int i = 0; i < inner; i++)
                     mask[(o * axisLen + a) * inner + i] = keep;
@@ -176,20 +178,23 @@ public static class Pruning
             var span = raws[t].AsSpan();
             for (int i = 0; i < span.Length; i++) pool[cursor++] = Math.Abs(ops.ToDouble(span[i]));
         }
-        var sortedPool = (double[])pool.Clone();
-        Array.Sort(sortedPool);
-        double threshold = toPrune > 0 ? sortedPool[Math.Min(toPrune, total - 1)] : double.MinValue;
+        // Exact-count global pruning via (score, global-index) sort
+        // + take-k. Ties at the cutoff don't bias the prune count.
+        var indexed = new (double Mag, int GlobalIdx)[total];
+        for (int i = 0; i < total; i++) indexed[i] = (pool[i], i);
+        Array.Sort(indexed, (a, b) => a.Mag.CompareTo(b.Mag));
+        var pruneSet = new bool[total];
+        for (int k = 0; k < toPrune; k++) pruneSet[indexed[k].GlobalIdx] = true;
 
         var result = new PrunedTensor<T>[raws.Length];
         cursor = 0;
         for (int t = 0; t < raws.Length; t++)
         {
-            var mask = new bool[raws[t].Length];
-            var span = raws[t].AsSpan();
-            for (int i = 0; i < span.Length; i++)
-                mask[i] = Math.Abs(ops.ToDouble(span[i])) >= threshold;
+            int len = raws[t].Length;
+            var mask = new bool[len];
+            for (int i = 0; i < len; i++) mask[i] = !pruneSet[cursor + i];
             result[t] = new PrunedTensor<T>(raws[t], mask);
-            cursor += raws[t].Length;
+            cursor += len;
         }
         return result;
     }
@@ -234,9 +239,18 @@ public sealed class PrunedTensor<T>
     /// <summary>Number of un-pruned (kept) lanes.</summary>
     public int KeptCount { get; }
 
-    /// <summary>Constructs a pruned tensor with an explicit mask.</summary>
+    /// <summary>Constructs a pruned tensor with an explicit mask.
+    /// <paramref name="mask"/> must have the same length as
+    /// <paramref name="raw"/>; mismatched masks would surface as
+    /// IndexOutOfRangeException in <see cref="IsKept"/> /
+    /// <see cref="Pruning.Remove{T}"/>.</summary>
     public PrunedTensor(Tensor<T> raw, bool[] mask)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+        if (mask.Length != raw.Length)
+            throw new ArgumentException(
+                $"Mask length {mask.Length} doesn't match tensor length {raw.Length}.", nameof(mask));
         Raw = raw;
         _mask = mask;
         int kept = 0;

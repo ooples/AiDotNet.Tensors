@@ -18,6 +18,7 @@ public static class Activations
     /// <summary>Hard shrinkage: <c>x</c> when <c>|x| &gt; lambda</c>, else 0.</summary>
     public static Tensor<T> Hardshrink<T>(Tensor<T> input, double lambda = 0.5)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();
@@ -34,6 +35,7 @@ public static class Activations
     /// <c>|x| &gt; lambda</c>, else 0.</summary>
     public static Tensor<T> Softshrink<T>(Tensor<T> input, double lambda = 0.5)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();
@@ -52,6 +54,7 @@ public static class Activations
     /// <summary>Tanh shrinkage: <c>x − tanh(x)</c>.</summary>
     public static Tensor<T> Tanhshrink<T>(Tensor<T> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();
@@ -68,6 +71,7 @@ public static class Activations
     /// <paramref name="value"/>.</summary>
     public static Tensor<T> Threshold<T>(Tensor<T> input, double threshold, double value)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();
@@ -85,6 +89,7 @@ public static class Activations
     /// than the standard GELU and used in CLIP / GPT-2.</summary>
     public static Tensor<T> QuickGelu<T>(Tensor<T> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();
@@ -103,6 +108,7 @@ public static class Activations
     /// Mirrors PyTorch's <c>F.gelu(x, approximate="tanh")</c>.</summary>
     public static Tensor<T> GeluTanh<T>(Tensor<T> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var src = input.AsSpan();

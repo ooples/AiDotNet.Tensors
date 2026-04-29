@@ -90,13 +90,21 @@ public sealed class WeightNorm<T> : IParametrization<T>
     /// <see cref="G"/> from the input's per-row L2 norm.</summary>
     public WeightNorm(Tensor<T> initialV, int dim = 0)
     {
+        if ((uint)dim > 1)
+            throw new ArgumentOutOfRangeException(nameof(dim),
+                "WeightNorm dim must be 0 or 1 for the rank-2 path.");
         Dim = dim;
         var ops = MathHelper.GetNumericOperations<T>();
         if (initialV.Rank != 2)
             throw new ArgumentException("WeightNorm currently supports rank-2 inputs only.", nameof(initialV));
 
-        int outer = initialV._shape[1 - dim];
-        int inner = initialV._shape[dim];
+        // Issue: previously `outer = _shape[1 - dim]`, which made
+        // dim=0 produce one g per input column. The PyTorch
+        // convention is one g per slice along `dim` — for dim=0 on
+        // a [out, in] weight that's one g per output row. Fix to
+        // outer = _shape[dim] / inner = _shape[1 - dim].
+        int outer = initialV._shape[dim];
+        int inner = initialV._shape[1 - dim];
         G = new Tensor<T>(new[] { outer });
         var src = initialV.AsSpan();
         var gSpan = G.AsWritableSpan();
@@ -105,7 +113,8 @@ public sealed class WeightNorm<T> : IParametrization<T>
             double n = 0;
             for (int i = 0; i < inner; i++)
             {
-                double v = ops.ToDouble(dim == 0 ? src[i * outer + o] : src[o * inner + i]);
+                int idx = dim == 0 ? o * inner + i : i * outer + o;
+                double v = ops.ToDouble(src[idx]);
                 n += v * v;
             }
             gSpan[o] = ops.FromDouble(Math.Sqrt(n));
@@ -118,8 +127,11 @@ public sealed class WeightNorm<T> : IParametrization<T>
         var ops = MathHelper.GetNumericOperations<T>();
         if (raw.Rank != 2)
             throw new InvalidOperationException("WeightNorm forward: raw must be rank 2.");
-        int outer = raw._shape[1 - Dim];
-        int inner = raw._shape[Dim];
+        int outer = raw._shape[Dim];
+        int inner = raw._shape[1 - Dim];
+        if (outer != G.Length)
+            throw new InvalidOperationException(
+                $"WeightNorm: G length {G.Length} doesn't match raw axis {Dim} length {outer}.");
         var output = new Tensor<T>((int[])raw._shape.Clone());
         var src = raw.AsSpan();
         var dst = output.AsWritableSpan();
@@ -129,14 +141,15 @@ public sealed class WeightNorm<T> : IParametrization<T>
             double n = 0;
             for (int i = 0; i < inner; i++)
             {
-                double v = ops.ToDouble(Dim == 0 ? src[i * outer + o] : src[o * inner + i]);
+                int idx = Dim == 0 ? o * inner + i : i * outer + o;
+                double v = ops.ToDouble(src[idx]);
                 n += v * v;
             }
             double normInv = 1.0 / Math.Max(1e-12, Math.Sqrt(n));
             double g = ops.ToDouble(gSpan[o]);
             for (int i = 0; i < inner; i++)
             {
-                int idx = Dim == 0 ? i * outer + o : o * inner + i;
+                int idx = Dim == 0 ? o * inner + i : i * outer + o;
                 dst[idx] = ops.FromDouble(ops.ToDouble(src[idx]) * normInv * g);
             }
         }
@@ -180,6 +193,10 @@ public sealed class SpectralNorm<T> : IParametrization<T>
             throw new InvalidOperationException("SpectralNorm forward: raw must be rank 2.");
         int outF = raw._shape[0];
         int inF = raw._shape[1];
+        if (_u.Length != outF)
+            throw new InvalidOperationException(
+                $"SpectralNorm was initialised with outFeatures={_u.Length} but received a raw matrix " +
+                $"with {outF} rows. Construct a fresh SpectralNorm per parameter shape.");
 
         var u = _u;
         Tensor<T> v = new Tensor<T>(new[] { inF });

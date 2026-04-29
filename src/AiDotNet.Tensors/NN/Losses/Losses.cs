@@ -124,6 +124,9 @@ public static class Losses
             throw new ArgumentException("Target must be rank-1 with length = batch.", nameof(target));
         var ops = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], classes = input._shape[1];
+        if (weight is not null && weight.Length != classes)
+            throw new ArgumentException(
+                $"weight length {weight.Length} must equal classes {classes}.", nameof(weight));
         var output = new Tensor<T>(new[] { batch });
         var inSpan = input.AsSpan();
         var tSpan = target.AsSpan();
@@ -132,6 +135,9 @@ public static class Losses
         for (int b = 0; b < batch; b++)
         {
             int yi = tSpan[b];
+            if ((uint)yi >= (uint)classes)
+                throw new ArgumentException(
+                    $"Target class index {yi} out of range [0, {classes}).", nameof(target));
             double loss = 0;
             double xy = ops.ToDouble(inSpan[b * classes + yi]);
             for (int j = 0; j < classes; j++)
@@ -338,6 +344,9 @@ public static class Losses
             throw new ArgumentException("CosineEmbeddingLoss expects rank-2 inputs.", nameof(x1));
         var ops = MathHelper.GetNumericOperations<T>();
         int batch = x1._shape[0], features = x1._shape[1];
+        if (y.Rank != 1 || y.Length != batch)
+            throw new ArgumentException(
+                "y must be rank-1 with one label per input row.", nameof(y));
         var output = new Tensor<T>(new[] { batch });
         var s1 = x1.AsSpan();
         var s2 = x2.AsSpan();
@@ -345,6 +354,10 @@ public static class Losses
         var dst = output.AsWritableSpan();
         for (int b = 0; b < batch; b++)
         {
+            int yi = ySpan[b];
+            if (yi != 1 && yi != -1)
+                throw new ArgumentException(
+                    $"y values must be +1 or -1; got {yi} at index {b}.", nameof(y));
             double dot = 0, n1 = 0, n2 = 0;
             for (int f = 0; f < features; f++)
             {
@@ -355,7 +368,7 @@ public static class Losses
                 n2 += bb * bb;
             }
             double cos = dot / Math.Max(1e-12, Math.Sqrt(n1 * n2));
-            double loss = ySpan[b] == 1 ? 1.0 - cos : Math.Max(0.0, cos - margin);
+            double loss = yi == 1 ? 1.0 - cos : Math.Max(0.0, cos - margin);
             dst[b] = ops.FromDouble(loss);
         }
         return Reduce(output, reduction);

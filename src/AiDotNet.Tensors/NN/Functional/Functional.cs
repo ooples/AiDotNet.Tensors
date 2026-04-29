@@ -130,6 +130,12 @@ public static class Functional
         var ops = MathHelper.GetNumericOperations<T>();
         int numEmb = weight._shape[0];
         int embDim = weight._shape[1];
+        // paddingIdx (if supplied) must be a valid row — silently
+        // zero-filling for an invalid index would mask data
+        // corruption from upstream tokenizers / vocab fixups.
+        if (paddingIdx is int pi && (uint)pi >= (uint)numEmb)
+            throw new ArgumentOutOfRangeException(nameof(paddingIdx),
+                $"paddingIdx {pi} out of range [0, {numEmb}).");
 
         // Apply max-norm clipping in-place on the weight rows that are
         // referenced. Matches PyTorch behavior — the clipped rows
@@ -142,7 +148,10 @@ public static class Functional
             for (int i = 0; i < inputSpan.Length; i++)
             {
                 int row = inputSpan[i];
-                if ((uint)row >= (uint)numEmb || visited[row]) continue;
+                if ((uint)row >= (uint)numEmb)
+                    throw new ArgumentException(
+                        $"Index {row} out of range [0, {numEmb}).", nameof(input));
+                if (visited[row]) continue;
                 visited[row] = true;
                 double normP = 0;
                 for (int e = 0; e < embDim; e++)
@@ -173,14 +182,17 @@ public static class Functional
         for (int i = 0; i < inSpan.Length; i++)
         {
             int row = inSpan[i];
+            // Validate row bounds BEFORE the paddingIdx short-circuit
+            // so an out-of-range index that happens to equal
+            // paddingIdx still raises (otherwise corruption masquerades
+            // as padding).
+            if ((uint)row >= (uint)numEmb)
+                throw new ArgumentException($"Index {row} out of range [0, {numEmb}).", nameof(input));
             if (paddingIdx.HasValue && row == paddingIdx.Value)
             {
-                // Zero-fill the embedding for the padding index.
                 for (int e = 0; e < embDim; e++) outSpan[i * embDim + e] = ops.Zero;
                 continue;
             }
-            if ((uint)row >= (uint)numEmb)
-                throw new ArgumentException($"Index {row} out of range [0, {numEmb}).", nameof(input));
             for (int e = 0; e < embDim; e++)
                 outSpan[i * embDim + e] = weightSpan[row * embDim + e];
         }
@@ -209,6 +221,8 @@ public static class Functional
     public static Tensor<T> EmbeddingBag<T>(Tensor<int> input, Tensor<T> weight, int[] offsets,
         EmbeddingBagMode mode = EmbeddingBagMode.Mean)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (offsets is null) throw new ArgumentNullException(nameof(offsets));
         if (weight.Rank != 2)
             throw new ArgumentException("weight must be rank-2 [num_embeddings, embedding_dim].", nameof(weight));
@@ -216,12 +230,28 @@ public static class Functional
             throw new ArgumentException("input must be rank-1 (flattened indices).", nameof(input));
 
         var ops = MathHelper.GetNumericOperations<T>();
+        int numEmb = weight._shape[0];
         int bagCount = offsets.Length;
         int embDim = weight._shape[1];
         var output = new Tensor<T>(new[] { bagCount, embDim });
         var inSpan = input.AsSpan();
         var weightSpan = weight.AsSpan();
         var dst = output.AsWritableSpan();
+
+        // Pre-validate offsets: non-negative, monotonic, and within
+        // input.Length. Catches malformed inputs deterministically
+        // instead of letting them surface as negative counts or
+        // IndexOutOfRangeException later.
+        int previous = 0;
+        for (int b = 0; b < bagCount; b++)
+        {
+            int off = offsets[b];
+            if ((uint)off > (uint)inSpan.Length || off < previous)
+                throw new ArgumentException(
+                    $"offsets must be non-negative, sorted, and ≤ input.Length (got {off} at bag {b}).",
+                    nameof(offsets));
+            previous = off;
+        }
 
         for (int b = 0; b < bagCount; b++)
         {
@@ -240,6 +270,9 @@ public static class Functional
                     for (int k = start; k < end; k++)
                     {
                         int row = inSpan[k];
+                        if ((uint)row >= (uint)numEmb)
+                            throw new ArgumentException(
+                                $"Index {row} out of range [0, {numEmb}).", nameof(input));
                         double v = ops.ToDouble(weightSpan[row * embDim + e]);
                         if (v > best) best = v;
                     }
@@ -251,6 +284,9 @@ public static class Functional
                 for (int k = start; k < end; k++)
                 {
                     int row = inSpan[k];
+                    if ((uint)row >= (uint)numEmb)
+                        throw new ArgumentException(
+                            $"Index {row} out of range [0, {numEmb}).", nameof(input));
                     for (int e = 0; e < embDim; e++)
                         dst[b * embDim + e] = ops.Add(dst[b * embDim + e], weightSpan[row * embDim + e]);
                 }
