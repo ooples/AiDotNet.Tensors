@@ -5,6 +5,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -134,13 +137,217 @@ public sealed class ElasticLauncher
         return _options.Backend switch
         {
             RendezvousBackend.File => FileRendezvous(workerNonce),
-            RendezvousBackend.Tcp => throw new NotSupportedException(
-                "TCP rendezvous requires the network process-group transport. " +
-                "Use the File backend for single-machine multi-process or wait for the NCCL/Gloo binding."),
+            RendezvousBackend.Tcp => TcpRendezvous(workerNonce),
             RendezvousBackend.Etcd => throw new NotSupportedException(
                 "etcd rendezvous requires the etcd client + network process-group transport."),
             _ => throw new ArgumentException($"Unknown rendezvous backend {_options.Backend}."),
         };
+    }
+
+    /// <summary>
+    /// TCP rendezvous: parses <see cref="ElasticLauncherOptions.Endpoint"/>
+    /// as <c>host:port</c>. Each worker first attempts to bind a listener
+    /// on that endpoint — the bind winner becomes the coordinator and
+    /// the rest connect as clients. The coordinator collects every nonce,
+    /// sorts deterministically, and replies to each client with its rank.
+    /// Bit-equivalent rank assignment to file-rendezvous: the worker with
+    /// the lexicographically-smallest nonce gets rank 0.
+    /// </summary>
+    private RendezvousAssignment TcpRendezvous(string workerNonce)
+    {
+        var (host, port) = ParseHostPort(_options.Endpoint);
+
+        // Try to bind first. Whoever wins the bind acts as coordinator.
+        var listener = TryBindListener(host, port);
+        if (listener is not null)
+        {
+            try { return TcpCoordinator(listener, workerNonce, host, port); }
+            finally { try { listener.Stop(); } catch { /* listener already closed */ } }
+        }
+        // Bind failed — someone else is the coordinator. Connect.
+        return TcpClient(host, port, workerNonce);
+    }
+
+    private static (string Host, int Port) ParseHostPort(string endpoint)
+    {
+        // Accept "host:port" or "tcp://host:port".
+        if (endpoint.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase))
+            endpoint = endpoint.Substring("tcp://".Length);
+        int colon = endpoint.LastIndexOf(':');
+        if (colon <= 0)
+            throw new ArgumentException($"TCP rendezvous endpoint must be host:port; got '{endpoint}'.");
+        string host = endpoint.Substring(0, colon);
+        if (!int.TryParse(endpoint.Substring(colon + 1), out int port) || port <= 0 || port > 65535)
+            throw new ArgumentException($"TCP rendezvous port must be 1..65535; got '{endpoint.Substring(colon + 1)}'.");
+        return (host, port);
+    }
+
+    private static TcpListener? TryBindListener(string host, int port)
+    {
+        try
+        {
+            var address = ResolveBindAddress(host);
+            var l = new TcpListener(address, port);
+            l.ExclusiveAddressUse = true;
+            l.Start();
+            return l;
+        }
+        catch (SocketException)
+        {
+            return null;
+        }
+    }
+
+    private static IPAddress ResolveBindAddress(string host)
+    {
+        // "0.0.0.0" / "*" → any; otherwise parse-or-resolve.
+        if (host == "*" || host == "0.0.0.0") return IPAddress.Any;
+        if (IPAddress.TryParse(host, out var ip)) return ip;
+        var addrs = Dns.GetHostAddresses(host);
+        if (addrs.Length == 0)
+            throw new ArgumentException($"Could not resolve TCP rendezvous host '{host}'.");
+        return addrs[0];
+    }
+
+    private RendezvousAssignment TcpCoordinator(TcpListener listener, string ownNonce, string host, int port)
+    {
+        var nonces = new List<string> { ownNonce };
+        var clientReplies = new List<TcpReply>(_options.WorldSize - 1);
+        var deadline = DateTime.UtcNow.AddSeconds(_options.RendezvousTimeoutSeconds);
+
+        while (nonces.Count < _options.WorldSize)
+        {
+            if (DateTime.UtcNow >= deadline)
+                throw new TimeoutException(
+                    $"TCP rendezvous timed out after {_options.RendezvousTimeoutSeconds}s. " +
+                    $"Saw {nonces.Count} of {_options.WorldSize} workers.");
+            // Wait up to 250ms for the next connection so we can re-check the deadline.
+            if (!WaitForConnection(listener, TimeSpan.FromMilliseconds(250))) continue;
+            var client = listener.AcceptTcpClient();
+            client.NoDelay = true;
+            var stream = client.GetStream();
+            string nonce = ReadLine(stream);
+            nonces.Add(nonce);
+            // Hold this client open until we've collected all nonces, then
+            // reply. The stream + client are explicitly disposed in the
+            // reply loop below — DO NOT use a `using` here.
+            clientReplies.Add(new TcpReply(client, stream, nonce));
+        }
+
+        // Sort + assign ranks.
+        var ordered = new List<string>(nonces);
+        ordered.Sort(StringComparer.Ordinal);
+        int myRank = ordered.IndexOf(ownNonce);
+
+        // Write each client its rank.
+        foreach (var reply in clientReplies)
+        {
+            int rank = ordered.IndexOf(reply.Nonce);
+            try
+            {
+                WriteLine(reply.Stream, $"OK {rank} {_options.WorldSize}");
+            }
+            finally
+            {
+                reply.Stream.Dispose();
+                reply.Client.Dispose();
+            }
+        }
+
+        return new RendezvousAssignment
+        {
+            Rank = myRank,
+            WorldSize = _options.WorldSize,
+            Endpoint = $"{host}:{port}",
+        };
+    }
+
+    private RendezvousAssignment TcpClient(string host, int port, string workerNonce)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(_options.RendezvousTimeoutSeconds);
+        Exception? lastError = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                var connectTask = client.ConnectAsync(host, port);
+                if (!connectTask.Wait((int)Math.Min(2000, (deadline - DateTime.UtcNow).TotalMilliseconds)))
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+                client.NoDelay = true;
+                using var stream = client.GetStream();
+                stream.ReadTimeout = (int)Math.Max(1000, (deadline - DateTime.UtcNow).TotalMilliseconds);
+                WriteLine(stream, workerNonce);
+                string reply = ReadLine(stream);
+                // Format: "OK <rank> <worldSize>"
+                var parts = reply.Split(' ');
+                if (parts.Length != 3 || parts[0] != "OK")
+                    throw new InvalidOperationException($"Unexpected coordinator reply: '{reply}'.");
+                int rank = int.Parse(parts[1]);
+                int ws = int.Parse(parts[2]);
+                if (ws != _options.WorldSize)
+                    throw new InvalidOperationException(
+                        $"Coordinator advertised WorldSize {ws}, ours is {_options.WorldSize}.");
+                return new RendezvousAssignment
+                {
+                    Rank = rank,
+                    WorldSize = ws,
+                    Endpoint = $"{host}:{port}",
+                };
+            }
+            catch (SocketException ex) { lastError = ex; Thread.Sleep(50); }
+            catch (IOException ex) { lastError = ex; Thread.Sleep(50); }
+        }
+        throw new TimeoutException(
+            $"TCP rendezvous client could not reach coordinator at {host}:{port} within " +
+            $"{_options.RendezvousTimeoutSeconds}s." +
+            (lastError is null ? "" : $" Last error: {lastError.Message}"));
+    }
+
+    private static bool WaitForConnection(TcpListener listener, TimeSpan timeout)
+    {
+        // Pending() flips true when the OS has accepted a connection on our socket.
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (listener.Pending()) return true;
+            Thread.Sleep(10);
+        }
+        return false;
+    }
+
+    private static void WriteLine(NetworkStream stream, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value + "\n");
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush();
+    }
+
+    private static string ReadLine(NetworkStream stream)
+    {
+        var buf = new byte[1];
+        var sb = new StringBuilder();
+        while (true)
+        {
+            int n = stream.Read(buf, 0, 1);
+            if (n <= 0) throw new IOException("Connection closed before line terminator.");
+            if (buf[0] == (byte)'\n') return sb.ToString();
+            sb.Append((char)buf[0]);
+        }
+    }
+
+    private readonly struct TcpReply
+    {
+        public TcpReply(TcpClient client, NetworkStream stream, string nonce)
+        {
+            Client = client; Stream = stream; Nonce = nonce;
+        }
+        public TcpClient Client { get; }
+        public NetworkStream Stream { get; }
+        public string Nonce { get; }
     }
 
     private RendezvousAssignment FileRendezvous(string workerNonce)

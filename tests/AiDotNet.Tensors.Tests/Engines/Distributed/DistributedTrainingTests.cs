@@ -248,6 +248,86 @@ public class DistributedTrainingTests
     }
 
     [Fact]
+    public void FSDP_ShardOptimizerOnly_RealZero1_AllRanksConvergeToSameUpdate()
+    {
+        RunRanks(2, (rank, group) =>
+        {
+            var fsdp = new FullyShardedDataParallel<float>(group,
+                new FsdpOptions { Strategy = ShardingStrategy.ShardOptimizerOnly });
+
+            // 8-element param replicated, 8-element grad rank-dependent.
+            var fullParam = new Tensor<float>(new float[] { 1, 1, 1, 1, 1, 1, 1, 1 }, new[] { 8 });
+            var sharded = fsdp.RegisterParameter(fullParam);
+            // Each rank's local "full grad" is [r, r, r, r, r, r, r, r].
+            var fullGrad = new Tensor<float>(new[] { 8 });
+            for (int i = 0; i < 8; i++) fullGrad.AsWritableSpan()[i] = rank;
+
+            // Reduce-scatter for ZeRO-1 returns the rank-local slice (size 4).
+            var localGrad = fsdp.ReduceScatterGradients(sharded, fullGrad);
+            Assert.Equal(4, localGrad.Length);
+            // Avg over ranks {0,1} = 0.5 in every slot (local-slice-shaped).
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(0.5f, localGrad.AsSpan()[i]);
+
+            // Optimizer step: SGD with lr=1.0, applied only to local slice
+            // by the user's lambda. Each rank holds only its own m/v —
+            // simulated here as a no-op since SGD is stateless.
+            fsdp.OptimizerStep(sharded, fullParam, localGrad, (paramSlice, gradSlice) =>
+            {
+                var p = paramSlice.AsWritableSpan();
+                var g = gradSlice.AsSpan();
+                for (int i = 0; i < p.Length; i++) p[i] = p[i] - 1.0f * g[i];
+            });
+
+            // After all-gather, every rank's fullParam should equal the
+            // global update (1 - 0.5 = 0.5 in every slot).
+            for (int i = 0; i < 8; i++)
+                Assert.Equal(0.5f, fullParam.AsSpan()[i]);
+        });
+    }
+
+    [Fact]
+    public void AutoFsdp_BackwardHookFires_ZeRO1_LocalGradMatchesManualReduceScatter()
+    {
+        RunRanks(2, (rank, group) =>
+        {
+            var fsdp = new FullyShardedDataParallel<float>(group,
+                new FsdpOptions { Strategy = ShardingStrategy.ShardOptimizerOnly });
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var auto = new AutoFsdp<float>(fsdp, tape);
+            // 4-element param replicated on every rank.
+            var weights = new Tensor<float>(new float[] { 0, 0, 0, 0 }, new[] { 4 });
+            var sharded = auto.Shard(weights);
+
+            // Synthetic forward: y = weights * inputs (per-rank scaled),
+            // loss = sum(y) so dLoss/dweights = inputs (rank-dependent).
+            // Each rank's "inputs" differs → ZeRO-1 averages the gradient
+            // across ranks (= 1.5 in every slot) then slices to 2 entries
+            // per rank.
+            var inputs = new Tensor<float>(new[] { 4 });
+            for (int i = 0; i < 4; i++) inputs.AsWritableSpan()[i] = rank + 1;
+
+            var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+            var prod = engine.TensorMultiply(weights, inputs);
+            // Use prod as the loss tensor directly — ComputeGradients seeds
+            // a ones-shaped grad, so dLoss/dweights = inputs which is what
+            // we want to reduce-scatter.
+            var grads = tape.ComputeGradients(prod, sources: new[] { weights });
+            Assert.True(grads.ContainsKey(weights));
+
+            // Run the FSDP collective on every registered parameter in one pass.
+            auto.ProcessGradients(grads);
+            Assert.True(auto.HasLocalGradient(sharded),
+                "AutoFsdp.ProcessGradients should populate the rank-local slot.");
+            var local = auto.LocalGradient(sharded);
+            Assert.Equal(2, local.Length);
+            // Mean across ranks 0,1 of inputs = (1+2)/2 = 1.5, in every slot.
+            Assert.Equal(1.5f, local.AsSpan()[0], precision: 4);
+            Assert.Equal(1.5f, local.AsSpan()[1], precision: 4);
+        });
+    }
+
+    [Fact]
     public void FSDP_ReduceScatterGradients_PerRankSlice()
     {
         RunRanks(2, (rank, group) =>
@@ -414,6 +494,53 @@ public class DistributedTrainingTests
         {
             launcher.CleanupRendezvous();
         }
+    }
+
+    [Fact]
+    public void ElasticLauncher_TcpBackend_AssignsRanksDeterministically()
+    {
+        // 3 workers connect to a coordinator on a free loopback port.
+        // The bind-winner becomes the coordinator; the rest connect.
+        // Final ranks must be the deterministic sort of nonces.
+        int port = FreeLoopbackPort();
+        const int worldSize = 3;
+        var nonces = new[] { "alpha", "bravo", "charlie" };
+        var assigned = new int?[worldSize];
+
+        var tasks = new Task[worldSize];
+        for (int i = 0; i < worldSize; i++)
+        {
+            int idx = i;
+            tasks[i] = Task.Run(() =>
+            {
+                var launcher = new ElasticLauncher(new ElasticLauncherOptions
+                {
+                    WorldSize = worldSize,
+                    Backend = RendezvousBackend.Tcp,
+                    Endpoint = $"127.0.0.1:{port}",
+                    RendezvousTimeoutSeconds = 10,
+                });
+                var a = launcher.Rendezvous(nonces[idx]);
+                Assert.Equal(worldSize, a.WorldSize);
+                assigned[idx] = a.Rank;
+            });
+        }
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(15)),
+            "TCP rendezvous timed out — at least one worker did not converge.");
+
+        // Sort by nonce — alpha=0, bravo=1, charlie=2.
+        Assert.Equal(0, assigned[0]);
+        Assert.Equal(1, assigned[1]);
+        Assert.Equal(2, assigned[2]);
+    }
+
+    private static int FreeLoopbackPort()
+    {
+        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        return port;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

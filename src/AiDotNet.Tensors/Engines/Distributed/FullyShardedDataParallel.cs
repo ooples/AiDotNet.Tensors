@@ -179,19 +179,26 @@ public sealed class FullyShardedDataParallel<T>
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (fullGrad is null) throw new ArgumentNullException(nameof(fullGrad));
-        // NoShard and ShardOptimizerOnly both keep the gradient
-        // replicated across ranks — only the optimizer state shards
-        // in ShardOptimizerOnly. Both paths do a DDP-equivalent
-        // all-reduce of the full gradient.
-        if (_options.Strategy == ShardingStrategy.NoShard
-            || _options.Strategy == ShardingStrategy.ShardOptimizerOnly)
+        if (_options.Strategy == ShardingStrategy.NoShard)
         {
+            // DDP-equivalent: replicate the gradient across all ranks.
             _group.AllReduce(fullGrad, ReduceOp.Avg);
             return fullGrad;
         }
+        if (_options.Strategy == ShardingStrategy.ShardOptimizerOnly)
+        {
+            // ZeRO-1: gradient is averaged across ranks (full grad on every
+            // rank), then sliced down to the rank-local optimizer-state
+            // partition for the optimizer step. We return the local slice;
+            // the user invokes <see cref="OptimizerStep"/> with it. This
+            // lets callers adopt the same pattern as FullShard while
+            // keeping ZeRO-1's "params replicated" semantics intact.
+            _group.AllReduce(fullGrad, ReduceOp.Avg);
+            return ExtractLocalShardOf(fullGrad, param);
+        }
 
-        // Slice fullGrad into WorldSize equal-sized chunks, reduce-scatter
-        // so rank R ends up with its chunk's reduction.
+        // FullShard / HybridShard: reduce-scatter so rank R ends up with
+        // only its chunk's reduction.
         var perRankInputs = new List<Tensor<T>>(_group.WorldSize);
         int chunkLen = param.LocalShard.Length;
         var srcSpan = fullGrad.AsSpan();
@@ -207,6 +214,104 @@ public sealed class FullyShardedDataParallel<T>
         var output = new Tensor<T>((int[])param.LocalShard._shape.Clone());
         _group.ReduceScatter(perRankInputs, output, ReduceOp.Avg);
         return output;
+    }
+
+    /// <summary>
+    /// ZeRO-1 / ZeRO-3 optimizer-step plumbing. Runs the user-supplied
+    /// step function on the rank-local slice of the parameter, with the
+    /// rank-local optimizer state, then all-gathers across ranks so the
+    /// full parameter ends up replicated again. PyTorch parity: this
+    /// matches torch's <c>ZeroRedundancyOptimizer</c> wrap pattern.
+    ///
+    /// <para>For <see cref="ShardingStrategy.ShardOptimizerOnly"/>, the
+    /// step is invoked once with a (slice-shape) gradient and the rank's
+    /// portion of the full parameter — the user's optimizer mutates that
+    /// slice in place against its (smaller) optimizer-state buffers,
+    /// and this method then all-gathers to reconstitute the full param
+    /// across ranks (and writes it back into <paramref name="fullParam"/>).</para>
+    ///
+    /// <para>For <see cref="ShardingStrategy.NoShard"/>, the step runs
+    /// directly on the full param + grad (no gather/scatter is needed).</para>
+    /// </summary>
+    /// <param name="fullParam">Replicated full parameter to update in place.</param>
+    /// <param name="localGradOrFullGrad">For <see cref="ShardingStrategy.ShardOptimizerOnly"/>:
+    /// the rank-local gradient slice produced by <see cref="ReduceScatterGradients"/>.
+    /// For <see cref="ShardingStrategy.NoShard"/>: the full averaged gradient.</param>
+    /// <param name="step">Callback invoked with (param-slice-or-full, grad-slice-or-full).
+    /// Mutates the parameter slice in place. The optimizer-state buffers it owns are
+    /// the rank-local portion of the full optimizer state — so the rank only allocates
+    /// 1/world_size of m, v in Adam.</param>
+    public void OptimizerStep(
+        ShardedParameter<T> param,
+        Tensor<T> fullParam,
+        Tensor<T> localGradOrFullGrad,
+        Action<Tensor<T>, Tensor<T>> step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (fullParam is null) throw new ArgumentNullException(nameof(fullParam));
+        if (localGradOrFullGrad is null) throw new ArgumentNullException(nameof(localGradOrFullGrad));
+        if (step is null) throw new ArgumentNullException(nameof(step));
+
+        if (_options.Strategy == ShardingStrategy.NoShard)
+        {
+            // No sharding — step on the full param/grad directly.
+            step(fullParam, localGradOrFullGrad);
+            return;
+        }
+
+        if (_options.Strategy == ShardingStrategy.ShardOptimizerOnly)
+        {
+            // ZeRO-1: extract the rank's slice of the full param, mutate it
+            // in place via the user's step (which holds only its own slice
+            // of m/v), then all-gather across ranks so every rank ends up
+            // with the full updated param.
+            var localParamSlice = ExtractLocalShardOf(fullParam, param);
+            step(localParamSlice, localGradOrFullGrad);
+
+            // All-gather: write back into fullParam.
+            var perRank = new List<Tensor<T>>(_group.WorldSize);
+            for (int r = 0; r < _group.WorldSize; r++)
+                perRank.Add(new Tensor<T>(new[] { localParamSlice.Length }));
+            _group.AllGather(localParamSlice, perRank);
+
+            int chunkLen = localParamSlice.Length;
+            var dst = fullParam.AsWritableSpan();
+            for (int r = 0; r < _group.WorldSize; r++)
+            {
+                int from = r * chunkLen;
+                int copyLen = Math.Min(chunkLen, dst.Length - from);
+                if (copyLen <= 0) break;
+                perRank[r].AsSpan().Slice(0, copyLen).CopyTo(dst.Slice(from, copyLen));
+            }
+            return;
+        }
+
+        // FullShard / HybridShard: param is already only the rank's shard,
+        // grad is already only the rank's shard. Step in place; gather
+        // happens later via GatherParameter when forward needs the full param.
+        step(param.LocalShard, localGradOrFullGrad);
+    }
+
+    /// <summary>
+    /// Extracts a chunk-aligned slice of <paramref name="full"/> matching
+    /// the rank's optimizer-state partition. Used internally by
+    /// <see cref="OptimizerStep"/> and <see cref="ReduceScatterGradients"/>
+    /// for the ZeRO-1 path.
+    /// </summary>
+    private Tensor<T> ExtractLocalShardOf(Tensor<T> full, ShardedParameter<T> param)
+    {
+        int total = full.Length;
+        int chunk = (total + _group.WorldSize - 1) / _group.WorldSize;
+        int from = _group.Rank * chunk;
+        int actual = Math.Min(chunk, Math.Max(0, total - from));
+        var slice = new Tensor<T>(new[] { chunk });
+        if (actual > 0)
+            full.AsSpan().Slice(from, actual).CopyTo(slice.AsWritableSpan().Slice(0, actual));
+        // Reuse param to suppress unused-arg warnings; param.FullShape and
+        // local-chunk size are by construction the same as the inferred
+        // chunk above (RegisterParameter computes chunk identically).
+        _ = param;
+        return slice;
     }
 }
 
