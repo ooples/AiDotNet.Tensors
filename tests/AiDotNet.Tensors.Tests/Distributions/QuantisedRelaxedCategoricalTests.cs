@@ -2,6 +2,9 @@
 
 using System;
 using AiDotNet.Tensors.Distributions;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Distributions;
@@ -225,6 +228,68 @@ public class QuantisedRelaxedCategoricalTests
         double agreementRate = (double)agree / total;
         Assert.True(agreementRate > 0.8,
             $"Int4 vs FP32 argmax agreement {agreementRate:P} below 80% threshold.");
+    }
+
+    [Fact]
+    public void Int4_RSampleTape_StraightThroughGradFlowsToLogits()
+    {
+        // Verify the STE path: the gradient through RSampleTape should
+        // accumulate to logits as identity (the dequantise step is
+        // treated as a no-op in backward).
+        var (logitsArr, temp) = MakeBatch(batch: 4, k: 8, seed: 99);
+        var d = new RelaxedOneHotCategoricalInt4Distribution(logitsArr, temp, 8, groupSize: 8);
+        var logits = new Tensor<float>(new[] { 4, 8 });
+        for (int i = 0; i < logits.Length; i++) logits.AsWritableSpan()[i] = logitsArr[i];
+
+        using var tape = new GradientTape<float>();
+        var sample = d.RSampleTape(logits, new Random(7));
+        var engine = new CpuEngine();
+        var loss = engine.ReduceSum(sample, null);
+        var grads = tape.ComputeGradients(loss, new[] { logits });
+        Assert.True(grads.ContainsKey(logits));
+        // STE: dL/dlogits = 1 everywhere (since loss is sum of every cell).
+        var g = grads[logits].AsSpan();
+        for (int i = 0; i < g.Length; i++)
+            Assert.Equal(1f, g[i], 4);
+    }
+
+    [Fact]
+    public void Fp4_RSampleTape_StraightThroughGradFlowsToLogits()
+    {
+        var (logitsArr, temp) = MakeBatch(batch: 2, k: 8, seed: 199);
+        var d = new RelaxedOneHotCategoricalFp4Distribution(logitsArr, temp, 8);
+        var logits = new Tensor<float>(new[] { 2, 8 });
+        for (int i = 0; i < logits.Length; i++) logits.AsWritableSpan()[i] = logitsArr[i];
+
+        using var tape = new GradientTape<float>();
+        var sample = d.RSampleTape(logits, new Random(11));
+        var engine = new CpuEngine();
+        var loss = engine.ReduceSum(sample, null);
+        var grads = tape.ComputeGradients(loss, new[] { logits });
+        Assert.True(grads.ContainsKey(logits));
+        var g = grads[logits].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(1f, g[i], 4);
+    }
+
+    [Fact]
+    public void Int4_DequantizeRejectsUndersizedPackedBuffer()
+    {
+        var (logits, temp) = MakeBatch(batch: 4, k: 8, seed: 777);
+        var d = new RelaxedOneHotCategoricalInt4Distribution(logits, temp, 8, groupSize: 8);
+        var truncated = new QuantisedCategoricalSample(
+            new AiDotNet.Tensors.NumericOperations.PackedInt4[1],
+            new AiDotNet.Tensors.NumericOperations.QuantizationScale(new float[] { 1f }, 8),
+            batch: 4, k: 8);
+        Assert.Throws<ArgumentException>(() => d.Dequantize(truncated));
+    }
+
+    [Fact]
+    public void Fp4_DequantizeRejectsUndersizedPackedBuffer()
+    {
+        var (logits, temp) = MakeBatch(batch: 4, k: 8, seed: 778);
+        var d = new RelaxedOneHotCategoricalFp4Distribution(logits, temp, 8);
+        // 4 × 8 = 32 elements → 16 bytes expected; pass 1 byte.
+        Assert.Throws<ArgumentException>(() => d.Dequantize(new byte[1]));
     }
 
     private static int ArgMax(float[] arr, int offset, int len)

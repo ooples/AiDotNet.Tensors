@@ -3,6 +3,8 @@
 using System;
 using AiDotNet.Tensors.Distributions.Constraints;
 using AiDotNet.Tensors.Distributions.Helpers;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 
 namespace AiDotNet.Tensors.Distributions;
@@ -132,6 +134,62 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
     }
 
     /// <summary>
+    /// Tape-aware reparameterised sample. Forward returns the
+    /// dequantised int4 sample; backward uses the straight-through
+    /// estimator (STE) — the gradient flows from the dequantised
+    /// output back to <paramref name="logits"/> as if the quantise +
+    /// dequantise round-trip were an identity. This is the standard
+    /// VQ-VAE / int4-latent training trick (van den Oord 2017,
+    /// Bengio et al. 2013) and what #263 commits to for gradient
+    /// flow through the quantised sampler.
+    ///
+    /// <para>The Gumbel noise introduced by the sampler is captured
+    /// in the saved state at sample time so backward sees the same
+    /// random draw the forward used.</para>
+    /// </summary>
+    public Tensor<float> RSampleTape(Tensor<float> logits, Random rng)
+    {
+        if (logits is null) throw new ArgumentNullException(nameof(logits));
+        if (rng is null) throw new ArgumentNullException(nameof(rng));
+        if (logits.Length != Logits.Length)
+            throw new ArgumentException("logits length must match the distribution's logit count.");
+
+        // Forward: same path as RSample — quantise then dequant.
+        var quant = SampleInt4(rng);
+        var dense = Dequantize(quant);
+        var output = new Tensor<float>((int[])logits._shape.Clone());
+        var dst = output.AsWritableSpan();
+        for (int i = 0; i < dense.Length; i++) dst[i] = dense[i];
+
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+        DifferentiableOps.RecordUnary(
+            "RelaxedOneHotCategoricalInt4_RSample",
+            output,
+            logits,
+            StraightThroughBackward,
+            savedState: null);
+        return output;
+    }
+
+    private static void StraightThroughBackward(
+        Tensor<float> gradOutput,
+        Tensor<float>[] inputs,
+        Tensor<float> output,
+        object[] savedState,
+        Engines.IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gradAccumulator)
+    {
+        // STE: dL/dlogits = dL/doutput. The quantise/dequantise step
+        // is treated as identity for backward.
+        var logits = inputs[0];
+        if (gradAccumulator.TryGetValue(logits, out var existing))
+            gradAccumulator[logits] = engine.TensorAdd(existing, gradOutput);
+        else
+            gradAccumulator[logits] = gradOutput;
+        _ = output; _ = savedState;
+    }
+
+    /// <summary>
     /// Sub-byte sampling entry point. Draws a Gumbel-softmax sample at
     /// FP32, quantises to int4 via the standard symmetric per-group
     /// codec, and returns the packed values + scale. Callers that
@@ -166,16 +224,56 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
             for (int i = 0; i < K; i++) dense[b * K + i] = (float)(dense[b * K + i] / s);
         }
 
-        // Per-row int4 quantisation — group size capped by K so each
-        // row gets at least one scale slot, with extra rows spanning
-        // multiple groups when K > GroupSize.
+        // Per-row int4 quantisation. Each row gets its own scale
+        // group(s) so a group never spans the tail of row n and the
+        // head of row n+1 — the scale is row-local by construction.
         int groupSize = Math.Min(GroupSize, K);
         if ((groupSize & 1) != 0) groupSize = Math.Max(2, groupSize - 1);
+        int groupsPerRow = (K + groupSize - 1) / groupSize;
+        int totalGroups = groupsPerRow * batch;
 
         int packedBytes = (dense.Length + 1) / 2;
         var packed = new PackedInt4[packedBytes];
-        var scale = QuantizationHelpers.QuantizeInt4(dense, packed, groupSize);
-        return new QuantisedCategoricalSample(packed, scale, batch, K);
+        var combinedScales = new float[totalGroups];
+
+        // Quantize each row independently; copy the row's scale slots
+        // into the combined scales array at the matching offsets, and
+        // copy the packed nibbles into the right byte offset.
+        // Row n's K elements occupy bytes [n·K/2, (n+1)·K/2) when K is
+        // even; when K is odd, rows share a byte at the boundary, which
+        // we sidestep by quantizing one row at a time into a temporary
+        // packed buffer and then merging nibbles.
+        var rowDense = new float[K];
+        var rowPacked = new PackedInt4[(K + 1) / 2];
+        for (int b = 0; b < batch; b++)
+        {
+            Array.Copy(dense, b * K, rowDense, 0, K);
+            Array.Clear(rowPacked, 0, rowPacked.Length);
+            var rowScale = QuantizationHelpers.QuantizeInt4(rowDense, rowPacked, groupSize);
+            // Copy scales for this row into the combined array.
+            Array.Copy(rowScale.Scales, 0, combinedScales, b * groupsPerRow, groupsPerRow);
+            // Merge the row's nibbles into the global packed buffer.
+            for (int i = 0; i < K; i++)
+            {
+                int globalIdx = b * K + i;
+                int srcByte = i >> 1;
+                bool srcHi = (i & 1) == 1;
+                int nibble = srcHi ? (rowPacked[srcByte].RawValue >> 4) & 0x0F
+                                   : rowPacked[srcByte].RawValue & 0x0F;
+                int dstByte = globalIdx >> 1;
+                bool dstHi = (globalIdx & 1) == 1;
+                int existing = packed[dstByte].RawValue;
+                int mask = dstHi ? 0x0F : 0xF0;
+                int shift = dstHi ? 4 : 0;
+                packed[dstByte] = new PackedInt4((byte)((existing & mask) | (nibble << shift)));
+            }
+        }
+
+        // The combined scale's "groupSize" is still per-row groupSize,
+        // but consumers walk it as if it were flat. The Dequantize path
+        // below knows about the row stride and re-projects accordingly.
+        var combinedScale = new QuantizationScale(combinedScales, groupSize);
+        return new QuantisedCategoricalSample(packed, combinedScale, batch, K);
     }
 
     /// <summary>Reverses <see cref="SampleInt4"/> — produces the
@@ -185,8 +283,43 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
     public float[] Dequantize(QuantisedCategoricalSample sample)
     {
         if (sample is null) throw new ArgumentNullException(nameof(sample));
-        var dense = new float[sample.TotalElements];
-        QuantizationHelpers.DequantizeInt4(sample.PackedValues, sample.Scale, dense);
+        int batch = sample.BatchSize;
+        int kDim = sample.K;
+        int total = sample.TotalElements;
+        int expectedPacked = (total + 1) / 2;
+        if (sample.PackedValues.Length < expectedPacked)
+            throw new ArgumentException(
+                $"PackedValues must hold at least {expectedPacked} bytes (got {sample.PackedValues.Length}).",
+                nameof(sample));
+
+        var dense = new float[total];
+        // Row-aware dequant: scale layout is `groupsPerRow` slots per
+        // row, contiguous across rows. Element i in row b looks at
+        // scales[b · groupsPerRow + (i / groupSize)].
+        int groupSize = sample.Scale.GroupSize;
+        if (groupSize <= 0)
+            throw new InvalidOperationException("Scale.GroupSize must be positive.");
+        int groupsPerRow = (kDim + groupSize - 1) / groupSize;
+        if (sample.Scale.Scales.Length < batch * groupsPerRow)
+            throw new InvalidOperationException(
+                "Scale.Scales length insufficient for per-row groups.");
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < kDim; i++)
+            {
+                int globalIdx = b * kDim + i;
+                int srcByte = globalIdx >> 1;
+                bool hi = (globalIdx & 1) == 1;
+                int rawByte = sample.PackedValues[srcByte].RawValue;
+                int nibble = hi ? (rawByte >> 4) & 0x0F : rawByte & 0x0F;
+                // Sign-extend 4-bit two's-complement.
+                if ((nibble & 0x08) != 0) nibble |= unchecked((int)0xFFFFFFF0);
+                int rowGroup = i / groupSize;
+                float scale = sample.Scale.Scales[b * groupsPerRow + rowGroup];
+                dense[globalIdx] = nibble * scale;
+            }
+        }
         return dense;
     }
 
@@ -338,6 +471,52 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
     }
 
     /// <summary>
+    /// Tape-aware FP4 reparameterised sample. Forward returns the
+    /// dequantised FP4 sample; backward uses the straight-through
+    /// estimator — gradient flows from the output back to
+    /// <paramref name="logits"/> as identity. Mirrors
+    /// <see cref="RelaxedOneHotCategoricalInt4Distribution.RSampleTape"/>.
+    /// </summary>
+    public Tensor<float> RSampleTape(Tensor<float> logits, Random rng)
+    {
+        if (logits is null) throw new ArgumentNullException(nameof(logits));
+        if (rng is null) throw new ArgumentNullException(nameof(rng));
+        if (logits.Length != Logits.Length)
+            throw new ArgumentException("logits length must match the distribution's logit count.");
+
+        var packed = SampleFp4(rng);
+        var dense = Dequantize(packed);
+        var output = new Tensor<float>((int[])logits._shape.Clone());
+        var dst = output.AsWritableSpan();
+        for (int i = 0; i < dense.Length; i++) dst[i] = dense[i];
+
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+        DifferentiableOps.RecordUnary(
+            "RelaxedOneHotCategoricalFp4_RSample",
+            output,
+            logits,
+            Fp4StraightThroughBackward,
+            savedState: null);
+        return output;
+    }
+
+    private static void Fp4StraightThroughBackward(
+        Tensor<float> gradOutput,
+        Tensor<float>[] inputs,
+        Tensor<float> output,
+        object[] savedState,
+        Engines.IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gradAccumulator)
+    {
+        var logits = inputs[0];
+        if (gradAccumulator.TryGetValue(logits, out var existing))
+            gradAccumulator[logits] = engine.TensorAdd(existing, gradOutput);
+        else
+            gradAccumulator[logits] = gradOutput;
+        _ = output; _ = savedState;
+    }
+
+    /// <summary>
     /// Sub-byte sampling entry. Draws Gumbel-softmax at FP32, then
     /// rounds each cell to the nearest E2M1 representable value; the
     /// 4-bit codes are packed two-per-byte.
@@ -396,6 +575,10 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
     {
         if (packed is null) throw new ArgumentNullException(nameof(packed));
         int total = BatchSize * K;
+        int expectedPacked = (total + 1) / 2;
+        if (packed.Length < expectedPacked)
+            throw new ArgumentException(
+                $"packed must hold at least {expectedPacked} bytes (got {packed.Length}).", nameof(packed));
         var dense = new float[total];
         for (int i = 0; i < total; i++)
         {
