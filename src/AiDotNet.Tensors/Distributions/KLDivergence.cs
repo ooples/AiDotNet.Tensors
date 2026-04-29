@@ -115,10 +115,13 @@ public static class KLDivergence
     private static float[] KlBernoulliBernoulli(BernoulliDistribution p, BernoulliDistribution q)
     {
         if (p.BatchSize != q.BatchSize) throw new ArgumentException();
+        // ProbsRaw avoids the O(N) Clone() that the public Probs getter would do per access.
+        var pProbs = p.ProbsRaw;
+        var qProbs = q.ProbsRaw;
         var kl = new float[p.BatchSize];
         for (int i = 0; i < p.BatchSize; i++)
         {
-            float pp = p.Probs[i], qq = q.Probs[i];
+            float pp = pProbs[i], qq = qProbs[i];
             float a = pp > 0f ? pp * (MathF.Log(pp) - MathF.Log(qq)) : 0f;
             float b = pp < 1f ? (1f - pp) * (MathF.Log(1f - pp) - MathF.Log(1f - qq)) : 0f;
             kl[i] = a + b;
@@ -129,17 +132,15 @@ public static class KLDivergence
     private static float[] KlCategoricalCategorical(CategoricalDistribution p, CategoricalDistribution q)
     {
         if (p.BatchSize != q.BatchSize || p.K != q.K) throw new ArgumentException();
+        var pProbs = p.ProbsRaw;
+        var qProbs = q.ProbsRaw;
         var kl = new float[p.BatchSize];
         for (int b = 0; b < p.BatchSize; b++)
         {
             float s = 0f;
             for (int k = 0; k < p.K; k++)
             {
-                float pk = p.Probs[b * p.K + k]; float qk = q.Probs[b * q.K + k];
-                // KL(p || q) = +∞ whenever p has support where q does not (q absolutely
-                // continuous w.r.t. p is required). Without this guard a q_k=0 paired
-                // with p_k>0 would silently clamp via the 1e-30 floor and report a
-                // large-but-finite value, hiding a model misspecification.
+                float pk = pProbs[b * p.K + k]; float qk = qProbs[b * q.K + k];
                 if (pk > 0f && qk == 0f) { s = float.PositiveInfinity; break; }
                 if (pk > 0f) s += pk * (MathF.Log(pk) - MathF.Log(qk));
             }

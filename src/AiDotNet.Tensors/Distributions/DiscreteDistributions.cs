@@ -7,10 +7,12 @@ namespace AiDotNet.Tensors.Distributions;
 /// <summary>Bernoulli distribution.</summary>
 public sealed class BernoulliDistribution : DistributionBase
 {
-    /// <summary>Per-batch success probability.</summary>
-    public float[] Probs { get; }
+    private readonly float[] _probs;
+    /// <summary>Per-batch success probability. Returns a defensive copy so callers can't
+    /// mutate the validated parameters after construction.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <inheritdoc />
-    public override int BatchSize => Probs.Length;
+    public override int BatchSize => _probs.Length;
     /// <inheritdoc />
     public override int EventSize => 1;
     /// <inheritdoc />
@@ -18,15 +20,20 @@ public sealed class BernoulliDistribution : DistributionBase
     /// <summary>Build a Bernoulli from per-batch probabilities.</summary>
     public BernoulliDistribution(float[] probs)
     {
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         for (int i = 0; i < probs.Length; i++)
-            if (probs[i] < 0f || probs[i] > 1f) throw new ArgumentException("probs ∈ [0, 1].");
-        Probs = (float[])probs.Clone();
+        {
+            float p = probs[i];
+            if (float.IsNaN(p) || float.IsInfinity(p) || p < 0f || p > 1f)
+                throw new ArgumentException("probs must be finite and in [0, 1].");
+        }
+        _probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
     {
         var x = new float[BatchSize];
-        for (int i = 0; i < BatchSize; i++) x[i] = rng.NextDouble() < Probs[i] ? 1f : 0f;
+        for (int i = 0; i < BatchSize; i++) x[i] = rng.NextDouble() < _probs[i] ? 1f : 0f;
         return x;
     }
     /// <inheritdoc />
@@ -36,11 +43,7 @@ public sealed class BernoulliDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float p = Probs[i]; float v = value[i];
-            // Bernoulli support is {0, 1}. Branch explicitly so:
-            //  - non-binary inputs return -∞ (out of support)
-            //  - the deterministic edges p ∈ {0, 1} are not contaminated by 0·-∞ = NaN
-            //    that the generic v·log(p) + (1-v)·log(1-p) form would otherwise produce.
+            float p = _probs[i]; float v = value[i];
             if (v == 1f) lp[i] = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
             else if (v == 0f) lp[i] = p < 1f ? MathF.Log(1f - p) : float.NegativeInfinity;
             else lp[i] = float.NegativeInfinity;
@@ -53,7 +56,7 @@ public sealed class BernoulliDistribution : DistributionBase
         var h = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float p = Probs[i];
+            float p = _probs[i];
             float a = p > 0f ? -p * MathF.Log(p) : 0f;
             float b = p < 1f ? -(1f - p) * MathF.Log(1f - p) : 0f;
             h[i] = a + b;
@@ -61,21 +64,26 @@ public sealed class BernoulliDistribution : DistributionBase
         return h;
     }
     /// <inheritdoc />
-    public override float[] Mean => (float[])Probs.Clone();
+    public override float[] Mean => (float[])_probs.Clone();
     /// <inheritdoc />
     public override float[] Variance
-    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = Probs[i] * (1f - Probs[i]); return v; } }
+    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = _probs[i] * (1f - _probs[i]); return v; } }
+    /// <summary>Direct read access to the validated probs array — used by KL helpers
+    /// to avoid the per-access Clone() overhead of the public Probs getter.</summary>
+    internal float[] ProbsRaw => _probs;
 }
 
 /// <summary>Binomial distribution: number of successes in <c>totalCount</c> independent Bernoulli trials.</summary>
 public sealed class BinomialDistribution : DistributionBase
 {
-    /// <summary>Number of trials (per batch).</summary>
-    public int[] TotalCount { get; }
-    /// <summary>Per-batch success probability.</summary>
-    public float[] Probs { get; }
+    private readonly int[] _totalCount;
+    private readonly float[] _probs;
+    /// <summary>Number of trials (per batch). Returns a defensive copy.</summary>
+    public int[] TotalCount => (int[])_totalCount.Clone();
+    /// <summary>Per-batch success probability. Returns a defensive copy.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <inheritdoc />
-    public override int BatchSize => Probs.Length;
+    public override int BatchSize => _probs.Length;
     /// <inheritdoc />
     public override int EventSize => 1;
     /// <inheritdoc />
@@ -84,20 +92,24 @@ public sealed class BinomialDistribution : DistributionBase
         get
         {
             int max = 0;
-            for (int i = 0; i < TotalCount.Length; i++) if (TotalCount[i] > max) max = TotalCount[i];
+            for (int i = 0; i < _totalCount.Length; i++) if (_totalCount[i] > max) max = _totalCount[i];
             return new IntegerIntervalConstraint(0, max);
         }
     }
     /// <summary>Build a binomial from per-batch totalCount and probs.</summary>
     public BinomialDistribution(int[] totalCount, float[] probs)
     {
+        if (totalCount == null) throw new ArgumentNullException(nameof(totalCount));
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         if (totalCount.Length != probs.Length) throw new ArgumentException();
         for (int i = 0; i < totalCount.Length; i++)
         {
             if (totalCount[i] < 0) throw new ArgumentException("totalCount >= 0.");
-            if (probs[i] < 0f || probs[i] > 1f) throw new ArgumentException("probs ∈ [0, 1].");
+            float p = probs[i];
+            if (float.IsNaN(p) || float.IsInfinity(p) || p < 0f || p > 1f)
+                throw new ArgumentException("probs must be finite and in [0, 1].");
         }
-        TotalCount = (int[])totalCount.Clone(); Probs = (float[])probs.Clone();
+        _totalCount = (int[])totalCount.Clone(); _probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -106,7 +118,7 @@ public sealed class BinomialDistribution : DistributionBase
         for (int i = 0; i < BatchSize; i++)
         {
             int k = 0;
-            for (int t = 0; t < TotalCount[i]; t++) if (rng.NextDouble() < Probs[i]) k++;
+            for (int t = 0; t < _totalCount[i]; t++) if (rng.NextDouble() < _probs[i]) k++;
             x[i] = k;
         }
         return x;
@@ -118,12 +130,8 @@ public sealed class BinomialDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            int n = TotalCount[i]; float p = Probs[i]; float k = value[i];
-            // Discrete support: k must be a non-negative integer in [0, n]. Lgamma alone
-            // would silently accept fractional counts, so we filter them out explicitly.
+            int n = _totalCount[i]; float p = _probs[i]; float k = value[i];
             if (k < 0f || k > n || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
-            // Deterministic edges: only k == 0 (for p == 0) or k == n (for p == 1) have mass.
-            // Skip the generic formula so we don't get 0 · -∞ = NaN at those edges.
             if (p == 0f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
             if (p == 1f) { lp[i] = k == n  ? 0f : float.NegativeInfinity; continue; }
             float logBinom = SpecialFunctions.Lgamma(n + 1f) - SpecialFunctions.Lgamma(k + 1f) - SpecialFunctions.Lgamma(n - k + 1f);
@@ -134,13 +142,11 @@ public sealed class BinomialDistribution : DistributionBase
     /// <inheritdoc />
     public override float[] Entropy()
     {
-        // No simple closed form; sum over the support.
         var h = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            int n = TotalCount[i];
-            float p = Probs[i];
-            // Deterministic ⇒ entropy is 0 (no uncertainty).
+            int n = _totalCount[i];
+            float p = _probs[i];
             if (p == 0f || p == 1f) { h[i] = 0f; continue; }
             double s = 0;
             for (int k = 0; k <= n; k++)
@@ -155,21 +161,23 @@ public sealed class BinomialDistribution : DistributionBase
     }
     /// <inheritdoc />
     public override float[] Mean
-    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = TotalCount[i] * Probs[i]; return m; } }
+    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = _totalCount[i] * _probs[i]; return m; } }
     /// <inheritdoc />
     public override float[] Variance
-    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = TotalCount[i] * Probs[i] * (1f - Probs[i]); return v; } }
+    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = _totalCount[i] * _probs[i] * (1f - _probs[i]); return v; } }
 }
 
 /// <summary>Categorical distribution over <c>K</c> classes per batch element.</summary>
 public sealed class CategoricalDistribution : DistributionBase
 {
-    /// <summary>Per-batch probability vectors. Layout: <c>[batch, K]</c> row-major.</summary>
-    public float[] Probs { get; }
+    private readonly float[] _probs;
+    /// <summary>Per-batch probability vectors. Layout: <c>[batch, K]</c> row-major.
+    /// Returns a defensive copy so callers can't mutate validated parameters.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <summary>Number of categories.</summary>
     public int K { get; }
     /// <inheritdoc />
-    public override int BatchSize => Probs.Length / K;
+    public override int BatchSize => _probs.Length / K;
     /// <inheritdoc />
     public override int EventSize => 1; // sample is a single category index
     /// <inheritdoc />
@@ -177,22 +185,28 @@ public sealed class CategoricalDistribution : DistributionBase
     /// <summary>Build a categorical from per-batch prob vectors.</summary>
     public CategoricalDistribution(float[] probs, int k)
     {
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         if (k <= 0) throw new ArgumentException("K > 0.");
         if (probs.Length % k != 0) throw new ArgumentException("probs.Length must be a multiple of K.");
-        // Validate each row sums close to 1 and entries are non-negative.
         int batch = probs.Length / k;
         for (int b = 0; b < batch; b++)
         {
             float sum = 0f;
             for (int i = 0; i < k; i++)
             {
-                if (probs[b * k + i] < 0f) throw new ArgumentException("probs >= 0.");
-                sum += probs[b * k + i];
+                float p = probs[b * k + i];
+                if (float.IsNaN(p) || float.IsInfinity(p) || p < 0f)
+                    throw new ArgumentException($"probs[{b}, {i}] must be finite and ≥ 0.");
+                sum += p;
             }
-            if (MathF.Abs(sum - 1f) > 1e-3f) throw new ArgumentException($"probs row {b} must sum to 1 (got {sum}).");
+            if (float.IsNaN(sum) || float.IsInfinity(sum) || MathF.Abs(sum - 1f) > 1e-3f)
+                throw new ArgumentException($"probs row {b} must sum to 1 (got {sum}).");
         }
-        Probs = (float[])probs.Clone(); K = k;
+        _probs = (float[])probs.Clone(); K = k;
     }
+    /// <summary>Direct read access to the validated probs array — used by KL helpers
+    /// to avoid the per-access Clone() overhead of the public Probs getter.</summary>
+    internal float[] ProbsRaw => _probs;
     /// <inheritdoc />
     public override float[] Sample(Random rng)
     {
@@ -205,7 +219,7 @@ public sealed class CategoricalDistribution : DistributionBase
             int chosen = K - 1;
             for (int i = 0; i < K; i++)
             {
-                cum += Probs[b * K + i];
+                cum += _probs[b * K + i];
                 if (u <= cum) { chosen = i; break; }
             }
             x[b] = chosen;
@@ -221,11 +235,9 @@ public sealed class CategoricalDistribution : DistributionBase
         for (int b = 0; b < batch; b++)
         {
             float v = value[b];
-            // Reject non-integer indices outright (truncation via (int) would silently
-            // accept e.g. 1.7 as category 1, which is wrong for a discrete support).
             if (v < 0f || v >= K || v != MathF.Floor(v)) { lp[b] = float.NegativeInfinity; continue; }
             int k = (int)v;
-            float p = Probs[b * K + k];
+            float p = _probs[b * K + k];
             lp[b] = p > 0f ? MathF.Log(p) : float.NegativeInfinity;
         }
         return lp;
@@ -240,7 +252,7 @@ public sealed class CategoricalDistribution : DistributionBase
             float s = 0f;
             for (int i = 0; i < K; i++)
             {
-                float p = Probs[b * K + i];
+                float p = _probs[b * K + i];
                 if (p > 0f) s -= p * MathF.Log(p);
             }
             h[b] = s;
@@ -257,7 +269,7 @@ public sealed class CategoricalDistribution : DistributionBase
             for (int b = 0; b < batch; b++)
             {
                 float s = 0f;
-                for (int i = 0; i < K; i++) s += i * Probs[b * K + i];
+                for (int i = 0; i < K; i++) s += i * _probs[b * K + i];
                 m[b] = s;
             }
             return m;
@@ -277,7 +289,7 @@ public sealed class CategoricalDistribution : DistributionBase
                 for (int i = 0; i < K; i++)
                 {
                     float diff = i - mean[b];
-                    s += Probs[b * K + i] * diff * diff;
+                    s += _probs[b * K + i] * diff * diff;
                 }
                 v[b] = s;
             }
@@ -299,7 +311,10 @@ public sealed class OneHotCategoricalDistribution : DistributionBase
     /// <inheritdoc />
     public override int EventSize => K;
     /// <inheritdoc />
-    public override IConstraint Support => new SimplexConstraint(K);
+    /// <remarks>One-hot vectors only — <c>SimplexConstraint</c> is too broad because LogProb
+    /// rejects non-binary entries and multi-hot vectors. <see cref="OneHotConstraint"/> matches
+    /// the Sample/LogProb contract exactly.</remarks>
+    public override IConstraint Support => new OneHotConstraint(K);
     /// <summary>Build a one-hot categorical from per-batch prob vectors.</summary>
     public OneHotCategoricalDistribution(float[] probs, int k) { _inner = new CategoricalDistribution(probs, k); }
     /// <inheritdoc />
@@ -342,17 +357,18 @@ public sealed class OneHotCategoricalDistribution : DistributionBase
     /// <inheritdoc />
     public override float[] Entropy() => _inner.Entropy();
     /// <inheritdoc />
-    public override float[] Mean => (float[])Probs.Clone();  // never expose internal storage
+    public override float[] Mean => (float[])_inner.ProbsRaw.Clone();  // never expose internal storage
     /// <inheritdoc />
     public override float[] Variance
     {
         get
         {
+            var probs = _inner.ProbsRaw;  // borrow the inner's validated array — no per-iteration clone
             var v = new float[BatchSize * K];
             for (int b = 0; b < BatchSize; b++)
                 for (int i = 0; i < K; i++)
                 {
-                    float p = Probs[b * K + i];
+                    float p = probs[b * K + i];
                     v[b * K + i] = p * (1f - p);
                 }
             return v;
@@ -363,20 +379,26 @@ public sealed class OneHotCategoricalDistribution : DistributionBase
 /// <summary>Geometric distribution: number of failures before first success.</summary>
 public sealed class GeometricDistribution : DistributionBase
 {
-    /// <summary>Per-batch success probability.</summary>
-    public float[] Probs { get; }
+    private readonly float[] _probs;
+    /// <summary>Per-batch success probability. Returns a defensive copy.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <inheritdoc />
-    public override int BatchSize => Probs.Length;
+    public override int BatchSize => _probs.Length;
     /// <inheritdoc />
     public override int EventSize => 1;
     /// <inheritdoc />
-    public override IConstraint Support => NonNegativeConstraint.Instance;
+    public override IConstraint Support => NonNegativeIntegerConstraint.Instance;
     /// <summary>Build a geometric from per-batch probs.</summary>
     public GeometricDistribution(float[] probs)
     {
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         for (int i = 0; i < probs.Length; i++)
-            if (!(probs[i] > 0f && probs[i] <= 1f)) throw new ArgumentException("probs ∈ (0, 1].");
-        Probs = (float[])probs.Clone();
+        {
+            float p = probs[i];
+            if (float.IsNaN(p) || float.IsInfinity(p) || !(p > 0f && p <= 1f))
+                throw new ArgumentException("probs must be finite and in (0, 1].");
+        }
+        _probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -386,7 +408,7 @@ public sealed class GeometricDistribution : DistributionBase
         {
             double u = rng.NextDouble();
             if (u < 1e-12) u = 1e-12;
-            x[i] = MathF.Floor(MathF.Log((float)u) / MathF.Log(1f - Probs[i]));
+            x[i] = MathF.Floor(MathF.Log((float)u) / MathF.Log(1f - _probs[i]));
         }
         return x;
     }
@@ -397,10 +419,8 @@ public sealed class GeometricDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float k = value[i]; float p = Probs[i];
+            float k = value[i]; float p = _probs[i];
             if (k < 0 || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
-            // Deterministic edge p == 1: all mass is on k = 0; otherwise log(0) = -∞.
-            // Avoids 0 · log(0) = NaN in the generic formula.
             if (p == 1f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
             lp[i] = k * MathF.Log(1f - p) + MathF.Log(p);
         }
@@ -412,8 +432,7 @@ public sealed class GeometricDistribution : DistributionBase
         var h = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float p = Probs[i];
-            // p == 1 ⇒ deterministic point mass at 0 ⇒ entropy 0.
+            float p = _probs[i];
             if (p == 1f) { h[i] = 0f; continue; }
             h[i] = -(p * MathF.Log(p) + (1f - p) * MathF.Log(1f - p)) / p;
         }
@@ -421,34 +440,41 @@ public sealed class GeometricDistribution : DistributionBase
     }
     /// <inheritdoc />
     public override float[] Mean
-    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = (1f - Probs[i]) / Probs[i]; return m; } }
+    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = (1f - _probs[i]) / _probs[i]; return m; } }
     /// <inheritdoc />
     public override float[] Variance
-    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = (1f - Probs[i]) / (Probs[i] * Probs[i]); return v; } }
+    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = (1f - _probs[i]) / (_probs[i] * _probs[i]); return v; } }
 }
 
 /// <summary>Poisson distribution: f(k) = e^-λ · λ^k / k!.</summary>
 public sealed class PoissonDistribution : DistributionBase
 {
-    /// <summary>Per-batch rate λ &gt; 0.</summary>
-    public float[] Rate { get; }
+    private readonly float[] _rate;
+    /// <summary>Per-batch rate λ ≥ 0. Returns a defensive copy.</summary>
+    public float[] Rate => (float[])_rate.Clone();
     /// <inheritdoc />
-    public override int BatchSize => Rate.Length;
+    public override int BatchSize => _rate.Length;
     /// <inheritdoc />
     public override int EventSize => 1;
     /// <inheritdoc />
-    public override IConstraint Support => NonNegativeConstraint.Instance;
+    public override IConstraint Support => NonNegativeIntegerConstraint.Instance;
     /// <summary>Build a Poisson from per-batch rate.</summary>
     public PoissonDistribution(float[] rate)
     {
-        for (int i = 0; i < rate.Length; i++) if (!(rate[i] >= 0f)) throw new ArgumentException("rate >= 0.");
-        Rate = (float[])rate.Clone();
+        if (rate == null) throw new ArgumentNullException(nameof(rate));
+        for (int i = 0; i < rate.Length; i++)
+        {
+            float r = rate[i];
+            if (float.IsNaN(r) || float.IsInfinity(r) || !(r >= 0f))
+                throw new ArgumentException("rate must be finite and ≥ 0.");
+        }
+        _rate = (float[])rate.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
     {
         var x = new float[BatchSize];
-        for (int i = 0; i < BatchSize; i++) x[i] = SamplePoisson(rng, Rate[i]);
+        for (int i = 0; i < BatchSize; i++) x[i] = SamplePoisson(rng, _rate[i]);
         return x;
     }
     /// <inheritdoc />
@@ -460,22 +486,18 @@ public sealed class PoissonDistribution : DistributionBase
         {
             float k = value[i];
             if (k < 0 || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
-            // Degenerate Poisson(λ=0): the distribution is a point mass at 0.
-            // log p(0|0) = 0; log p(k>0|0) = -∞. Avoids log(0) = -∞ contaminating k=0.
-            if (Rate[i] == 0f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
-            lp[i] = k * MathF.Log(Rate[i]) - Rate[i] - SpecialFunctions.Lgamma(k + 1f);
+            if (_rate[i] == 0f) { lp[i] = k == 0f ? 0f : float.NegativeInfinity; continue; }
+            lp[i] = k * MathF.Log(_rate[i]) - _rate[i] - SpecialFunctions.Lgamma(k + 1f);
         }
         return lp;
     }
     /// <inheritdoc />
     public override float[] Entropy()
     {
-        // Numerical sum (closed form involves ψ).
         var h = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float lambda = Rate[i];
-            // Truncate at lambda + 10·sqrt(lambda) — captures essentially all mass.
+            float lambda = _rate[i];
             int kmax = (int)MathF.Ceiling(lambda + 10f * MathF.Sqrt(lambda + 1f));
             double s = 0;
             for (int k = 0; k <= kmax; k++)
@@ -488,9 +510,9 @@ public sealed class PoissonDistribution : DistributionBase
         return h;
     }
     /// <inheritdoc />
-    public override float[] Mean => (float[])Rate.Clone();
+    public override float[] Mean => (float[])_rate.Clone();
     /// <inheritdoc />
-    public override float[] Variance => (float[])Rate.Clone();
+    public override float[] Variance => (float[])_rate.Clone();
 
     /// <summary>Knuth's Poisson sampler for small λ; transformed-rejection for large λ.</summary>
     internal static float SamplePoisson(Random rng, float lambda)
@@ -525,38 +547,42 @@ public sealed class PoissonDistribution : DistributionBase
 /// <summary>Negative binomial distribution: number of failures before <c>totalCount</c> successes.</summary>
 public sealed class NegativeBinomialDistribution : DistributionBase
 {
-    /// <summary>Number of successes (per batch). Real-valued; PyTorch parity.</summary>
-    public float[] TotalCount { get; }
-    /// <summary>Per-batch success probability.</summary>
-    public float[] Probs { get; }
+    private readonly float[] _totalCount;
+    private readonly float[] _probs;
+    /// <summary>Number of successes (per batch). Real-valued; PyTorch parity. Returns a defensive copy.</summary>
+    public float[] TotalCount => (float[])_totalCount.Clone();
+    /// <summary>Per-batch success probability. Returns a defensive copy.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <inheritdoc />
-    public override int BatchSize => Probs.Length;
+    public override int BatchSize => _probs.Length;
     /// <inheritdoc />
     public override int EventSize => 1;
     /// <inheritdoc />
-    public override IConstraint Support => NonNegativeConstraint.Instance;
+    public override IConstraint Support => NonNegativeIntegerConstraint.Instance;
     /// <summary>Build a negative binomial.</summary>
     public NegativeBinomialDistribution(float[] totalCount, float[] probs)
     {
+        if (totalCount == null) throw new ArgumentNullException(nameof(totalCount));
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         if (totalCount.Length != probs.Length) throw new ArgumentException();
         for (int i = 0; i < probs.Length; i++)
         {
-            if (!(totalCount[i] > 0f)) throw new ArgumentException("totalCount > 0.");
-            // Reject p == 0 outright — Sample divides by p and (1−p)/p would blow up.
-            // p == 1 is also disallowed because all mass would be on k = 0.
-            if (!(probs[i] > 0f && probs[i] < 1f)) throw new ArgumentException("probs ∈ (0, 1).");
+            float r = totalCount[i]; float p = probs[i];
+            if (float.IsNaN(r) || float.IsInfinity(r) || !(r > 0f))
+                throw new ArgumentException("totalCount must be finite and > 0.");
+            if (float.IsNaN(p) || float.IsInfinity(p) || !(p > 0f && p < 1f))
+                throw new ArgumentException("probs must be finite and in (0, 1).");
         }
-        TotalCount = (float[])totalCount.Clone(); Probs = (float[])probs.Clone();
+        _totalCount = (float[])totalCount.Clone(); _probs = (float[])probs.Clone();
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
     {
-        // Sample λ ∼ Gamma(r, (1-p)/p); k ∼ Poisson(λ).
         var x = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float scale = (1f - Probs[i]) / Probs[i];
-            float lambda = GammaDistribution.MarsagliaTsang(rng, TotalCount[i]) * scale;
+            float scale = (1f - _probs[i]) / _probs[i];
+            float lambda = GammaDistribution.MarsagliaTsang(rng, _totalCount[i]) * scale;
             x[i] = PoissonDistribution.SamplePoisson(rng, lambda);
         }
         return x;
@@ -568,8 +594,7 @@ public sealed class NegativeBinomialDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int i = 0; i < BatchSize; i++)
         {
-            float k = value[i]; float r = TotalCount[i]; float p = Probs[i];
-            // k must be a non-negative integer; Lgamma alone would silently accept fractions.
+            float k = value[i]; float r = _totalCount[i]; float p = _probs[i];
             if (k < 0f || k != MathF.Floor(k)) { lp[i] = float.NegativeInfinity; continue; }
             lp[i] = SpecialFunctions.Lgamma(r + k) - SpecialFunctions.Lgamma(k + 1f) - SpecialFunctions.Lgamma(r)
                   + r * MathF.Log(p) + k * MathF.Log(1f - p);
@@ -580,53 +605,60 @@ public sealed class NegativeBinomialDistribution : DistributionBase
     public override float[] Entropy()
     {
         var h = new float[BatchSize];
-        for (int i = 0; i < BatchSize; i++) h[i] = float.NaN;  // no closed form; user can MC-estimate
+        for (int i = 0; i < BatchSize; i++) h[i] = float.NaN;
         return h;
     }
     /// <inheritdoc />
     public override float[] Mean
-    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = TotalCount[i] * (1f - Probs[i]) / Probs[i]; return m; } }
+    { get { var m = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) m[i] = _totalCount[i] * (1f - _probs[i]) / _probs[i]; return m; } }
     /// <inheritdoc />
     public override float[] Variance
-    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = TotalCount[i] * (1f - Probs[i]) / (Probs[i] * Probs[i]); return v; } }
+    { get { var v = new float[BatchSize]; for (int i = 0; i < BatchSize; i++) v[i] = _totalCount[i] * (1f - _probs[i]) / (_probs[i] * _probs[i]); return v; } }
 }
 
 /// <summary>Multinomial distribution: <c>totalCount</c> draws from a categorical.</summary>
 public sealed class MultinomialDistribution : DistributionBase
 {
-    /// <summary>Trials per batch element.</summary>
-    public int[] TotalCount { get; }
-    /// <summary>Per-batch probability vectors, layout <c>[batch, K]</c>.</summary>
-    public float[] Probs { get; }
+    private readonly int[] _totalCount;
+    private readonly float[] _probs;
+    /// <summary>Trials per batch element. Returns a defensive copy.</summary>
+    public int[] TotalCount => (int[])_totalCount.Clone();
+    /// <summary>Per-batch probability vectors, layout <c>[batch, K]</c>. Returns a defensive copy.</summary>
+    public float[] Probs => (float[])_probs.Clone();
     /// <summary>Number of categories.</summary>
     public int K { get; }
     /// <inheritdoc />
-    public override int BatchSize => TotalCount.Length;
+    public override int BatchSize => _totalCount.Length;
     /// <inheritdoc />
     public override int EventSize => K;
     /// <inheritdoc />
-    public override IConstraint Support => NonNegativeConstraint.Instance;
+    /// <remarks>Each row must be a non-negative integer count vector summing to the
+    /// matching <see cref="TotalCount"/> entry — a plain non-negative constraint
+    /// would over-advertise the support.</remarks>
+    public override IConstraint Support => new IntegerSimplexConstraint(K, _totalCount);
     /// <summary>Build a Multinomial from totalCount + probs.</summary>
     public MultinomialDistribution(int[] totalCount, float[] probs, int k)
     {
+        if (totalCount == null) throw new ArgumentNullException(nameof(totalCount));
+        if (probs == null) throw new ArgumentNullException(nameof(probs));
         if (k <= 0) throw new ArgumentException("K > 0.");
         if (probs.Length != totalCount.Length * k) throw new ArgumentException("probs length mismatch.");
-        // Each row of probs must be a valid probability vector (non-negative, sum to 1).
-        // Same validation surface as CategoricalDistribution.
         int batch = totalCount.Length;
         for (int b = 0; b < batch; b++)
         {
             float sum = 0f;
             for (int i = 0; i < k; i++)
             {
-                if (probs[b * k + i] < 0f) throw new ArgumentException($"probs[{b}, {i}] = {probs[b * k + i]} must be ≥ 0.");
-                sum += probs[b * k + i];
+                float p = probs[b * k + i];
+                if (float.IsNaN(p) || float.IsInfinity(p) || p < 0f)
+                    throw new ArgumentException($"probs[{b}, {i}] = {p} must be finite and ≥ 0.");
+                sum += p;
             }
-            if (MathF.Abs(sum - 1f) > 1e-3f)
+            if (float.IsNaN(sum) || float.IsInfinity(sum) || MathF.Abs(sum - 1f) > 1e-3f)
                 throw new ArgumentException($"probs row {b} must sum to 1 (got {sum}).");
             if (totalCount[b] < 0) throw new ArgumentException($"totalCount[{b}] = {totalCount[b]} must be >= 0.");
         }
-        TotalCount = (int[])totalCount.Clone(); Probs = (float[])probs.Clone(); K = k;
+        _totalCount = (int[])totalCount.Clone(); _probs = (float[])probs.Clone(); K = k;
     }
     /// <inheritdoc />
     public override float[] Sample(Random rng)
@@ -634,13 +666,13 @@ public sealed class MultinomialDistribution : DistributionBase
         var x = new float[BatchSize * K];
         for (int b = 0; b < BatchSize; b++)
         {
-            for (int t = 0; t < TotalCount[b]; t++)
+            for (int t = 0; t < _totalCount[b]; t++)
             {
                 float u = (float)rng.NextDouble();
                 float cum = 0f; int chosen = K - 1;
                 for (int i = 0; i < K; i++)
                 {
-                    cum += Probs[b * K + i];
+                    cum += _probs[b * K + i];
                     if (u <= cum) { chosen = i; break; }
                 }
                 x[b * K + chosen]++;
@@ -655,11 +687,7 @@ public sealed class MultinomialDistribution : DistributionBase
         var lp = new float[BatchSize];
         for (int b = 0; b < BatchSize; b++)
         {
-            int n = TotalCount[b];
-            // Validate the count vector: each k_i must be a non-negative integer and
-            // Σ k_i must equal n. Accumulate the integer cast (after the float-integrality
-            // check) so float rounding can't make a row sum mistakenly compare equal to n
-            // (or vice versa) for high-count cases.
+            int n = _totalCount[b];
             long sumK = 0;
             bool valid = true;
             for (int i = 0; i < K; i++)
@@ -674,7 +702,7 @@ public sealed class MultinomialDistribution : DistributionBase
             for (int i = 0; i < K; i++)
             {
                 float k = value[b * K + i];
-                float p = Probs[b * K + i];
+                float p = _probs[b * K + i];
                 l -= SpecialFunctions.Lgamma(k + 1f);
                 if (p > 0f) l += k * MathF.Log(p);
                 else if (k > 0f) l = float.NegativeInfinity;
@@ -698,7 +726,7 @@ public sealed class MultinomialDistribution : DistributionBase
             var m = new float[BatchSize * K];
             for (int b = 0; b < BatchSize; b++)
                 for (int i = 0; i < K; i++)
-                    m[b * K + i] = TotalCount[b] * Probs[b * K + i];
+                    m[b * K + i] = _totalCount[b] * _probs[b * K + i];
             return m;
         }
     }
@@ -711,8 +739,8 @@ public sealed class MultinomialDistribution : DistributionBase
             for (int b = 0; b < BatchSize; b++)
                 for (int i = 0; i < K; i++)
                 {
-                    float p = Probs[b * K + i];
-                    v[b * K + i] = TotalCount[b] * p * (1f - p);
+                    float p = _probs[b * K + i];
+                    v[b * K + i] = _totalCount[b] * p * (1f - p);
                 }
             return v;
         }

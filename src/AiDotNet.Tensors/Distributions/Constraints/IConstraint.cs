@@ -150,6 +150,97 @@ public sealed class IntegerIntervalConstraint : IConstraint
     }
 }
 
+/// <summary>Non-negative integers: x ≥ 0 and x is a whole, finite number.</summary>
+public sealed class NonNegativeIntegerConstraint : IConstraint
+{
+    /// <summary>Singleton instance.</summary>
+    public static readonly NonNegativeIntegerConstraint Instance = new NonNegativeIntegerConstraint();
+    /// <inheritdoc />
+    public bool[] Check(float[] values)
+    {
+        var ok = new bool[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            var v = values[i];
+            ok[i] = !float.IsNaN(v) && !float.IsInfinity(v) && v >= 0f && v == MathF.Floor(v);
+        }
+        return ok;
+    }
+}
+
+/// <summary>One-hot vector of length K: exactly one entry equals 1 and the rest equal 0.</summary>
+public sealed class OneHotConstraint : IConstraint
+{
+    /// <summary>Length of each one-hot vector.</summary>
+    public int K { get; }
+    /// <summary>Build a one-hot constraint of width K.</summary>
+    public OneHotConstraint(int k)
+    {
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        K = k;
+    }
+    /// <inheritdoc />
+    public bool[] Check(float[] values)
+    {
+        if (values.Length % K != 0)
+            throw new ArgumentException($"values.Length ({values.Length}) must be a multiple of K ({K}).");
+        int batch = values.Length / K;
+        var ok = new bool[batch];
+        for (int b = 0; b < batch; b++)
+        {
+            int hits = 0; bool good = true;
+            for (int i = 0; i < K; i++)
+            {
+                var v = values[b * K + i];
+                if (v == 1f) hits++;
+                else if (v != 0f) { good = false; break; }
+            }
+            ok[b] = good && hits == 1;
+        }
+        return ok;
+    }
+}
+
+/// <summary>Non-negative integer count vectors that sum to a fixed total per batch row.
+/// If <see cref="Totals"/> is null the per-row sum is unconstrained; otherwise each row's
+/// sum must equal the corresponding entry. Used by <c>MultinomialDistribution.Support</c>.</summary>
+public sealed class IntegerSimplexConstraint : IConstraint
+{
+    /// <summary>Length of each count vector.</summary>
+    public int K { get; }
+    /// <summary>Per-batch required totals (null = no sum constraint).</summary>
+    public int[]? Totals { get; }
+    /// <summary>Build an integer-simplex constraint.</summary>
+    public IntegerSimplexConstraint(int k, int[]? totals = null)
+    {
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        K = k; Totals = totals;
+    }
+    /// <inheritdoc />
+    public bool[] Check(float[] values)
+    {
+        if (values.Length % K != 0)
+            throw new ArgumentException($"values.Length ({values.Length}) must be a multiple of K ({K}).");
+        int batch = values.Length / K;
+        if (Totals != null && Totals.Length != batch)
+            throw new ArgumentException("Totals length must equal batch count.");
+        var ok = new bool[batch];
+        for (int b = 0; b < batch; b++)
+        {
+            long sum = 0; bool good = true;
+            for (int i = 0; i < K; i++)
+            {
+                var v = values[b * K + i];
+                if (float.IsNaN(v) || float.IsInfinity(v) || v < 0f || v != MathF.Floor(v))
+                { good = false; break; }
+                sum += (long)v;
+            }
+            ok[b] = good && (Totals == null || sum == Totals[b]);
+        }
+        return ok;
+    }
+}
+
 /// <summary>Probability simplex: x_i ≥ 0 and sum_i x_i = 1 (within tolerance).</summary>
 public sealed class SimplexConstraint : IConstraint
 {
