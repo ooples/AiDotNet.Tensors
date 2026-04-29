@@ -74,10 +74,29 @@ public class SparseTensor<T> : Tensor<T>
     public int[] ColumnPointers { get; }
 
     /// <summary>
-    /// Gets the number of non-zero elements stored.
-    /// This is the actual length of the backing data, not the logical element count.
+    /// Block-row dimension for BSR/BSC formats; 0 for COO/CSR/CSC. The
+    /// rectangular block shape is <c>BlockRowSize × BlockColSize</c>; both
+    /// must divide <see cref="Rows"/> and <see cref="Columns"/> respectively.
+    /// Common values for LLM weight pruning: 2, 4, 8, 16.
+    /// </summary>
+    public int BlockRowSize { get; }
+
+    /// <summary>Block-column dimension for BSR/BSC formats; 0 for non-block layouts.</summary>
+    public int BlockColSize { get; }
+
+    /// <summary>
+    /// Gets the number of non-zero elements stored. For BSR/BSC this counts
+    /// every value in every stored block (so a 4×4-block sparse tensor with
+    /// 10 stored blocks reports <c>NonZeroCount = 160</c>); use
+    /// <see cref="NonZeroBlockCount"/> for the block count.
     /// </summary>
     public int NonZeroCount => DataVector.Length;
+
+    /// <summary>Number of stored blocks for BSR/BSC; equal to <c>NonZeroCount</c>
+    /// divided by <c>BlockRowSize · BlockColSize</c>. Returns 0 for non-block
+    /// layouts.</summary>
+    public int NonZeroBlockCount =>
+        (BlockRowSize > 0 && BlockColSize > 0) ? NonZeroCount / (BlockRowSize * BlockColSize) : 0;
 
     /// <summary>
     /// Gets the non-zero values as an array. Backward-compatible accessor.
@@ -108,10 +127,13 @@ public class SparseTensor<T> : Tensor<T>
         RowPointers = Array.Empty<int>();
         ColumnPointers = Array.Empty<int>();
         Format = SparseStorageFormat.Coo;
+        BlockRowSize = 0;
+        BlockColSize = 0;
     }
 
     private SparseTensor(int rows, int columns, SparseStorageFormat format,
-        int[] rowIndices, int[] columnIndices, int[] rowPointers, int[] columnPointers, T[] values)
+        int[] rowIndices, int[] columnIndices, int[] rowPointers, int[] columnPointers, T[] values,
+        int blockRowSize = 0, int blockColSize = 0)
         : base(Vector<T>.Wrap(values), new[] { rows, columns }, isSparse: true)
     {
         Rows = rows;
@@ -121,6 +143,8 @@ public class SparseTensor<T> : Tensor<T>
         ColumnIndices = columnIndices;
         RowPointers = rowPointers;
         ColumnPointers = columnPointers;
+        BlockRowSize = blockRowSize;
+        BlockColSize = blockColSize;
     }
 
     /// <summary>
@@ -140,6 +164,82 @@ public class SparseTensor<T> : Tensor<T>
 
         return new SparseTensor<T>(rows, columns, SparseStorageFormat.Csr,
             Array.Empty<int>(), columnIndices, rowPointers, Array.Empty<int>(), values);
+    }
+
+    /// <summary>
+    /// Creates a BSR-format sparse tensor with rectangular blocks of
+    /// shape <paramref name="blockRowSize"/>×<paramref name="blockColSize"/>.
+    /// <paramref name="blockRowPointers"/> indexes the block-row stripes
+    /// (length = <c>rows / blockRowSize + 1</c>). <paramref name="blockColumnIndices"/>
+    /// gives the column-block index for each stored block. <paramref name="values"/>
+    /// is flat with length <c>nnzBlocks · blockRowSize · blockColSize</c>;
+    /// each block is row-major within itself.
+    /// </summary>
+    public static SparseTensor<T> FromBsr(int rows, int columns, int blockRowSize, int blockColSize,
+        int[] blockRowPointers, int[] blockColumnIndices, T[] values)
+    {
+        if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (columns < 0) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (blockRowSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockRowSize));
+        if (blockColSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockColSize));
+        if (rows % blockRowSize != 0)
+            throw new ArgumentException($"Rows {rows} must be divisible by blockRowSize {blockRowSize}.", nameof(rows));
+        if (columns % blockColSize != 0)
+            throw new ArgumentException($"Columns {columns} must be divisible by blockColSize {blockColSize}.", nameof(columns));
+        if (blockRowPointers is null) throw new ArgumentNullException(nameof(blockRowPointers));
+        if (blockColumnIndices is null) throw new ArgumentNullException(nameof(blockColumnIndices));
+        if (values is null) throw new ArgumentNullException(nameof(values));
+
+        int blockRows = rows / blockRowSize;
+        int blockSize = blockRowSize * blockColSize;
+        if (blockRowPointers.Length != blockRows + 1)
+            throw new ArgumentException($"blockRowPointers length must be {blockRows + 1} (= rows/blockRowSize + 1).",
+                nameof(blockRowPointers));
+        if (values.Length != blockColumnIndices.Length * blockSize)
+            throw new ArgumentException(
+                $"values length {values.Length} must equal blockColumnIndices.Length ({blockColumnIndices.Length}) · " +
+                $"blockRowSize · blockColSize ({blockSize}).", nameof(values));
+
+        return new SparseTensor<T>(rows, columns, SparseStorageFormat.Bsr,
+            Array.Empty<int>(), blockColumnIndices, blockRowPointers, Array.Empty<int>(),
+            values, blockRowSize, blockColSize);
+    }
+
+    /// <summary>
+    /// Creates a BSC-format sparse tensor — column-block analog of
+    /// <see cref="FromBsr"/>. <paramref name="blockColumnPointers"/> indexes
+    /// the block-column stripes (length = <c>columns / blockColSize + 1</c>);
+    /// <paramref name="blockRowIndices"/> gives the row-block index for each
+    /// stored block.
+    /// </summary>
+    public static SparseTensor<T> FromBsc(int rows, int columns, int blockRowSize, int blockColSize,
+        int[] blockColumnPointers, int[] blockRowIndices, T[] values)
+    {
+        if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (columns < 0) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (blockRowSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockRowSize));
+        if (blockColSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockColSize));
+        if (rows % blockRowSize != 0)
+            throw new ArgumentException($"Rows {rows} must be divisible by blockRowSize {blockRowSize}.", nameof(rows));
+        if (columns % blockColSize != 0)
+            throw new ArgumentException($"Columns {columns} must be divisible by blockColSize {blockColSize}.", nameof(columns));
+        if (blockColumnPointers is null) throw new ArgumentNullException(nameof(blockColumnPointers));
+        if (blockRowIndices is null) throw new ArgumentNullException(nameof(blockRowIndices));
+        if (values is null) throw new ArgumentNullException(nameof(values));
+
+        int blockCols = columns / blockColSize;
+        int blockSize = blockRowSize * blockColSize;
+        if (blockColumnPointers.Length != blockCols + 1)
+            throw new ArgumentException($"blockColumnPointers length must be {blockCols + 1} (= columns/blockColSize + 1).",
+                nameof(blockColumnPointers));
+        if (values.Length != blockRowIndices.Length * blockSize)
+            throw new ArgumentException(
+                $"values length {values.Length} must equal blockRowIndices.Length ({blockRowIndices.Length}) · " +
+                $"blockRowSize · blockColSize ({blockSize}).", nameof(values));
+
+        return new SparseTensor<T>(rows, columns, SparseStorageFormat.Bsc,
+            blockRowIndices, Array.Empty<int>(), Array.Empty<int>(), blockColumnPointers,
+            values, blockRowSize, blockColSize);
     }
 
     /// <summary>
@@ -211,6 +311,12 @@ public class SparseTensor<T> : Tensor<T>
         if (Format == SparseStorageFormat.Coo)
             return this;
 
+        if (Format == SparseStorageFormat.Bsr || Format == SparseStorageFormat.Bsc)
+        {
+            // Block formats expand block-by-block into per-element COO.
+            return ExpandBlocksToCoo();
+        }
+
         var valuesArray = DataVector.ToArray();
 
         if (Format == SparseStorageFormat.Csr)
@@ -244,6 +350,185 @@ public class SparseTensor<T> : Tensor<T>
             }
         }
         return new SparseTensor<T>(Rows, Columns, rowIdxCsc, colIdxCsc, valuesArray);
+    }
+
+    private SparseTensor<T> ExpandBlocksToCoo()
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int br = BlockRowSize, bc = BlockColSize;
+        int blockSize = br * bc;
+        var src = DataVector.ToArray();
+        var rowIdx = new List<int>();
+        var colIdx = new List<int>();
+        var vals = new List<T>();
+
+        if (Format == SparseStorageFormat.Bsr)
+        {
+            int blockRows = Rows / br;
+            for (int br_i = 0; br_i < blockRows; br_i++)
+            {
+                for (int p = RowPointers[br_i]; p < RowPointers[br_i + 1]; p++)
+                {
+                    int blockCol = ColumnIndices[p];
+                    int valOff = p * blockSize;
+                    for (int i = 0; i < br; i++)
+                    {
+                        for (int j = 0; j < bc; j++)
+                        {
+                            T v = src[valOff + i * bc + j];
+                            if (!ops.Equals(v, ops.Zero))
+                            {
+                                rowIdx.Add(br_i * br + i);
+                                colIdx.Add(blockCol * bc + j);
+                                vals.Add(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else // Bsc
+        {
+            int blockCols = Columns / bc;
+            for (int bc_j = 0; bc_j < blockCols; bc_j++)
+            {
+                for (int p = ColumnPointers[bc_j]; p < ColumnPointers[bc_j + 1]; p++)
+                {
+                    int blockRow = RowIndices[p];
+                    int valOff = p * blockSize;
+                    for (int i = 0; i < br; i++)
+                    {
+                        for (int j = 0; j < bc; j++)
+                        {
+                            T v = src[valOff + i * bc + j];
+                            if (!ops.Equals(v, ops.Zero))
+                            {
+                                rowIdx.Add(blockRow * br + i);
+                                colIdx.Add(bc_j * bc + j);
+                                vals.Add(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return new SparseTensor<T>(Rows, Columns, rowIdx.ToArray(), colIdx.ToArray(), vals.ToArray());
+    }
+
+    /// <summary>
+    /// Converts to BSR format with blocks of shape <paramref name="blockRowSize"/>×
+    /// <paramref name="blockColSize"/>. Any block that contains at least one
+    /// non-zero is materialized; the rest of the block holds zeros.
+    /// </summary>
+    public SparseTensor<T> ToBsr(int blockRowSize, int blockColSize)
+    {
+        if (blockRowSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockRowSize));
+        if (blockColSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockColSize));
+        if (Rows % blockRowSize != 0)
+            throw new ArgumentException($"Rows {Rows} must be divisible by blockRowSize {blockRowSize}.");
+        if (Columns % blockColSize != 0)
+            throw new ArgumentException($"Columns {Columns} must be divisible by blockColSize {blockColSize}.");
+        if (Format == SparseStorageFormat.Bsr && BlockRowSize == blockRowSize && BlockColSize == blockColSize)
+            return this;
+
+        int blockRows = Rows / blockRowSize;
+        int blockCols = Columns / blockColSize;
+        int blockSize = blockRowSize * blockColSize;
+
+        // Collect non-zeros into a (blockRow, blockCol) → block-buffer dictionary.
+        var blocks = new Dictionary<(int, int), T[]>();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var coo = ToCoo();
+        var cooVals = coo.DataVector.ToArray();
+        for (int k = 0; k < cooVals.Length; k++)
+        {
+            int r = coo.RowIndices[k], c = coo.ColumnIndices[k];
+            int br_i = r / blockRowSize, bc_j = c / blockColSize;
+            int li = r % blockRowSize, lj = c % blockColSize;
+            if (!blocks.TryGetValue((br_i, bc_j), out var buf))
+            {
+                buf = new T[blockSize];
+                for (int i = 0; i < blockSize; i++) buf[i] = ops.Zero;
+                blocks[(br_i, bc_j)] = buf;
+            }
+            // Accumulate so duplicates from un-coalesced COO survive the round-trip.
+            buf[li * blockColSize + lj] = ops.Add(buf[li * blockColSize + lj], cooVals[k]);
+        }
+
+        // Sort blocks in (block-row, block-col) order so each row's column
+        // indices come out monotone.
+        var sortedKeys = new List<(int br_i, int bc_j)>(blocks.Keys);
+        sortedKeys.Sort((a, b) => a.br_i != b.br_i ? a.br_i.CompareTo(b.br_i) : a.bc_j.CompareTo(b.bc_j));
+
+        var blockRowPtr = new int[blockRows + 1];
+        var blockColIdx = new int[sortedKeys.Count];
+        var values = new T[sortedKeys.Count * blockSize];
+        for (int p = 0; p < sortedKeys.Count; p++)
+        {
+            var (br_i, bc_j) = sortedKeys[p];
+            blockColIdx[p] = bc_j;
+            blockRowPtr[br_i + 1]++;
+            Array.Copy(blocks[sortedKeys[p]], 0, values, p * blockSize, blockSize);
+        }
+        for (int i = 0; i < blockRows; i++) blockRowPtr[i + 1] += blockRowPtr[i];
+        _ = blockCols;
+
+        return FromBsr(Rows, Columns, blockRowSize, blockColSize, blockRowPtr, blockColIdx, values);
+    }
+
+    /// <summary>Converts to BSC format — column-block analog of <see cref="ToBsr"/>.</summary>
+    public SparseTensor<T> ToBsc(int blockRowSize, int blockColSize)
+    {
+        if (blockRowSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockRowSize));
+        if (blockColSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockColSize));
+        if (Rows % blockRowSize != 0)
+            throw new ArgumentException($"Rows {Rows} must be divisible by blockRowSize {blockRowSize}.");
+        if (Columns % blockColSize != 0)
+            throw new ArgumentException($"Columns {Columns} must be divisible by blockColSize {blockColSize}.");
+        if (Format == SparseStorageFormat.Bsc && BlockRowSize == blockRowSize && BlockColSize == blockColSize)
+            return this;
+
+        int blockRows = Rows / blockRowSize;
+        int blockCols = Columns / blockColSize;
+        int blockSize = blockRowSize * blockColSize;
+
+        var blocks = new Dictionary<(int, int), T[]>();
+        var ops = MathHelper.GetNumericOperations<T>();
+        var coo = ToCoo();
+        var cooVals = coo.DataVector.ToArray();
+        for (int k = 0; k < cooVals.Length; k++)
+        {
+            int r = coo.RowIndices[k], c = coo.ColumnIndices[k];
+            int br_i = r / blockRowSize, bc_j = c / blockColSize;
+            int li = r % blockRowSize, lj = c % blockColSize;
+            if (!blocks.TryGetValue((br_i, bc_j), out var buf))
+            {
+                buf = new T[blockSize];
+                for (int i = 0; i < blockSize; i++) buf[i] = ops.Zero;
+                blocks[(br_i, bc_j)] = buf;
+            }
+            buf[li * blockColSize + lj] = ops.Add(buf[li * blockColSize + lj], cooVals[k]);
+        }
+
+        // Sort by (block-col, block-row) so each column's row-indices come out monotone.
+        var sortedKeys = new List<(int br_i, int bc_j)>(blocks.Keys);
+        sortedKeys.Sort((a, b) => a.bc_j != b.bc_j ? a.bc_j.CompareTo(b.bc_j) : a.br_i.CompareTo(b.br_i));
+
+        var blockColPtr = new int[blockCols + 1];
+        var blockRowIdx = new int[sortedKeys.Count];
+        var values = new T[sortedKeys.Count * blockSize];
+        for (int p = 0; p < sortedKeys.Count; p++)
+        {
+            var (br_i, bc_j) = sortedKeys[p];
+            blockRowIdx[p] = br_i;
+            blockColPtr[bc_j + 1]++;
+            Array.Copy(blocks[sortedKeys[p]], 0, values, p * blockSize, blockSize);
+        }
+        for (int j = 0; j < blockCols; j++) blockColPtr[j + 1] += blockColPtr[j];
+        _ = blockRows;
+
+        return FromBsc(Rows, Columns, blockRowSize, blockColSize, blockColPtr, blockRowIdx, values);
     }
 
     /// <summary>
@@ -382,17 +667,61 @@ public class SparseTensor<T> : Tensor<T>
         if (Format == SparseStorageFormat.Csr)
             return FromCsc(Columns, Rows, (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), valuesArray);
 
-        return FromCsr(Columns, Rows, (int[])ColumnPointers.Clone(), (int[])RowIndices.Clone(), valuesArray);
+        if (Format == SparseStorageFormat.Csc)
+            return FromCsr(Columns, Rows, (int[])ColumnPointers.Clone(), (int[])RowIndices.Clone(), valuesArray);
+
+        // Block formats: route through dense for the per-block transpose
+        // since each block itself transposes too. Cheap given block formats
+        // are typically loaded once and held for many forward passes.
+        return FromDense(ToDense().Transpose()).ToCsr();
     }
 
     /// <summary>
     /// Materializes the full dense tensor from the sparse representation.
+    /// Handles every supported format (COO/CSR/CSC/BSR/BSC).
     /// </summary>
     public Tensor<T> ToDense()
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var dense = new Tensor<T>(new[] { Rows, Columns });
         if (NonZeroCount == 0) return dense;
+
+        if (Format == SparseStorageFormat.Bsr)
+        {
+            int br = BlockRowSize, bc = BlockColSize, blockSize = br * bc;
+            var src = DataVector.ToArray();
+            int blockRows = Rows / br;
+            for (int br_i = 0; br_i < blockRows; br_i++)
+            {
+                for (int p = RowPointers[br_i]; p < RowPointers[br_i + 1]; p++)
+                {
+                    int blockCol = ColumnIndices[p];
+                    int valOff = p * blockSize;
+                    for (int i = 0; i < br; i++)
+                        for (int j = 0; j < bc; j++)
+                            dense[br_i * br + i, blockCol * bc + j] = src[valOff + i * bc + j];
+                }
+            }
+            return dense;
+        }
+        if (Format == SparseStorageFormat.Bsc)
+        {
+            int br = BlockRowSize, bc = BlockColSize, blockSize = br * bc;
+            var src = DataVector.ToArray();
+            int blockCols = Columns / bc;
+            for (int bc_j = 0; bc_j < blockCols; bc_j++)
+            {
+                for (int p = ColumnPointers[bc_j]; p < ColumnPointers[bc_j + 1]; p++)
+                {
+                    int blockRow = RowIndices[p];
+                    int valOff = p * blockSize;
+                    for (int i = 0; i < br; i++)
+                        for (int j = 0; j < bc; j++)
+                            dense[blockRow * br + i, bc_j * bc + j] = src[valOff + i * bc + j];
+                }
+            }
+            return dense;
+        }
 
         var coo = ToCoo();
         var cooValues = coo.DataVector.ToArray();
@@ -460,6 +789,12 @@ public class SparseTensor<T> : Tensor<T>
                 (int[])RowIndices.Clone(), (int[])ColumnIndices.Clone(), values),
             SparseStorageFormat.Csr => FromCsr(Rows, Columns,
                 (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), values),
+            SparseStorageFormat.Csc => FromCsc(Rows, Columns,
+                (int[])ColumnPointers.Clone(), (int[])RowIndices.Clone(), values),
+            SparseStorageFormat.Bsr => FromBsr(Rows, Columns, BlockRowSize, BlockColSize,
+                (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), values),
+            SparseStorageFormat.Bsc => FromBsc(Rows, Columns, BlockRowSize, BlockColSize,
+                (int[])ColumnPointers.Clone(), (int[])RowIndices.Clone(), values),
             _ => ToCsr().CloneSparse()
         };
     }
