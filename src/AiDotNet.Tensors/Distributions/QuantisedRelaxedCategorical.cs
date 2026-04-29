@@ -104,6 +104,8 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
     /// byte).</summary>
     public RelaxedOneHotCategoricalInt4Distribution(float[] logits, float[] temperature, int k, int groupSize = 32)
     {
+        if (logits is null) throw new ArgumentNullException(nameof(logits));
+        if (temperature is null) throw new ArgumentNullException(nameof(temperature));
         if (k <= 0) throw new ArgumentException("K must be positive.", nameof(k));
         if (logits.Length != temperature.Length * k)
             throw new ArgumentException("logits length must equal temperature.Length × K.", nameof(logits));
@@ -154,8 +156,11 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
         if (logits.Length != Logits.Length)
             throw new ArgumentException("logits length must match the distribution's logit count.");
 
-        // Forward: same path as RSample — quantise then dequant.
-        var quant = SampleInt4(rng);
+        // Forward uses the CALLER'S logits (not the snapshot in
+        // this.Logits) so when callers update logits between steps
+        // the forward sample reflects the new values. Backward STE
+        // remains identity through the dequant step.
+        var quant = SampleInt4(logits.AsSpan(), rng);
         var dense = Dequantize(quant);
         var output = new Tensor<float>((int[])logits._shape.Clone());
         var dst = output.AsWritableSpan();
@@ -197,9 +202,19 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
     /// packed end-to-end.
     /// </summary>
     public QuantisedCategoricalSample SampleInt4(Random rng)
+        => SampleInt4(((ReadOnlySpan<float>)Logits.AsSpan()), rng);
+
+    /// <summary>Overload that draws from caller-supplied logits
+    /// instead of the cached <see cref="Logits"/>. Used by
+    /// <see cref="RSampleTape"/> so forward reflects the latest
+    /// optimizer step on the input tensor.</summary>
+    public QuantisedCategoricalSample SampleInt4(ReadOnlySpan<float> logits, Random rng)
     {
         if (rng is null) throw new ArgumentNullException(nameof(rng));
         int batch = BatchSize;
+        if (logits.Length != batch * K)
+            throw new ArgumentException(
+                $"logits length {logits.Length} must equal batch ({batch}) × K ({K}).", nameof(logits));
         var dense = new float[batch * K];
 
         // Gumbel-softmax — same formula as the FP32 RelaxedOneHotCategorical.
@@ -211,7 +226,7 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
                 double u = rng.NextDouble();
                 if (u < 1e-12) u = 1e-12;
                 float g = -MathF.Log(-MathF.Log((float)u));
-                float v = (Logits[b * K + i] + g) / Temperature[b];
+                float v = (logits[b * K + i] + g) / Temperature[b];
                 dense[b * K + i] = v;
                 if (v > maxV) maxV = v;
             }
@@ -319,6 +334,26 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
                 float scale = sample.Scale.Scales[b * groupsPerRow + rowGroup];
                 dense[globalIdx] = nibble * scale;
             }
+
+            // Post-quant cleanup: clamp every cell into a positive
+            // ε-floor (rounding can push a cell to 0 or slightly
+            // negative), then renormalise so each row sums to 1.
+            // Without the floor, τ·log(y) in the LogProb formula
+            // blows up on the cells the int4 codec collapsed to 0.
+            // The floor is small enough that the dominant cell's
+            // probability mass stays nearly intact after
+            // renormalisation, but log(floor) = log(1e-4) ≈ -9.2
+            // bounds the per-cell log-prob contribution.
+            const float floor = 1e-4f;
+            float rowSum = 0f;
+            for (int i = 0; i < kDim; i++)
+            {
+                int idx = b * kDim + i;
+                if (dense[idx] < floor) dense[idx] = floor;
+                rowSum += dense[idx];
+            }
+            float invSum = 1f / rowSum;
+            for (int i = 0; i < kDim; i++) dense[b * kDim + i] *= invSum;
         }
         return dense;
     }
@@ -449,6 +484,8 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
     /// distribution.</summary>
     public RelaxedOneHotCategoricalFp4Distribution(float[] logits, float[] temperature, int k)
     {
+        if (logits is null) throw new ArgumentNullException(nameof(logits));
+        if (temperature is null) throw new ArgumentNullException(nameof(temperature));
         if (k <= 0) throw new ArgumentException("K must be positive.", nameof(k));
         if (logits.Length != temperature.Length * k)
             throw new ArgumentException("logits length must equal temperature.Length × K.", nameof(logits));
@@ -484,7 +521,10 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
         if (logits.Length != Logits.Length)
             throw new ArgumentException("logits length must match the distribution's logit count.");
 
-        var packed = SampleFp4(rng);
+        // Forward uses caller-supplied logits — see Int4 path's
+        // rationale; the cached Logits would let stale forward
+        // values leak across optimizer steps.
+        var packed = SampleFp4(logits.AsSpan(), rng);
         var dense = Dequantize(packed);
         var output = new Tensor<float>((int[])logits._shape.Clone());
         var dst = output.AsWritableSpan();
@@ -521,10 +561,17 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
     /// rounds each cell to the nearest E2M1 representable value; the
     /// 4-bit codes are packed two-per-byte.
     /// </summary>
-    public byte[] SampleFp4(Random rng)
+    public byte[] SampleFp4(Random rng) => SampleFp4(((ReadOnlySpan<float>)Logits.AsSpan()), rng);
+
+    /// <summary>Overload that draws from caller-supplied logits.
+    /// Used by <see cref="RSampleTape"/> for tape-aware sampling.</summary>
+    public byte[] SampleFp4(ReadOnlySpan<float> logits, Random rng)
     {
         if (rng is null) throw new ArgumentNullException(nameof(rng));
         int batch = BatchSize;
+        if (logits.Length != batch * K)
+            throw new ArgumentException(
+                $"logits length {logits.Length} must equal batch ({batch}) × K ({K}).", nameof(logits));
         var dense = new float[batch * K];
 
         for (int b = 0; b < batch; b++)
@@ -535,7 +582,7 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
                 double u = rng.NextDouble();
                 if (u < 1e-12) u = 1e-12;
                 float g = -MathF.Log(-MathF.Log((float)u));
-                float v = (Logits[b * K + i] + g) / Temperature[b];
+                float v = (logits[b * K + i] + g) / Temperature[b];
                 dense[b * K + i] = v;
                 if (v > maxV) maxV = v;
             }
