@@ -210,7 +210,13 @@ public class HFSyntheticModelParityTests
                 w.AddRaw(preset.MapReverse(kv.Key), SafetensorsDtype.F32, longShape, bytes);
             }
             int shards = w.Save();
-            Assert.True(shards >= 1);
+            // Tighter assertion — the test exists to exercise the
+            // multi-shard reader path. Accepting "≥ 1" silently
+            // passes if a regression collapses everything into a
+            // single shard (which a non-sharded reader can also
+            // handle).
+            Assert.True(shards >= 2,
+                $"expected the synthetic checkpoint to span multiple shards; got {shards}.");
 
             using var rd = ShardedSafetensorsReader.Open(Path.Combine(dir, "model.safetensors.index.json"));
             foreach (var key in src.Keys)

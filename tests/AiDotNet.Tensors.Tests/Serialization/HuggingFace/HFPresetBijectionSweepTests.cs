@@ -212,9 +212,18 @@ public class HFPresetBijectionSweepTests
     [Fact]
     public void AllShippedPresets_AreRegistered()
     {
-        var registered = HFStateDictMapper.AvailablePresets.ToList();
-        var expected = new[] { "BERT", "GPT2", "LLAMA", "VIT", "GPT_NEO", "CLIP", "T5", "WHISPER", "SD_UNET", "SDXL_UNET" };
-        foreach (var name in expected)
-            Assert.Contains(name, registered);
+        // Exact-match assertion (not subset) so a new SHIPPED preset
+        // (one that lands in src/) without being documented here
+        // fails the test. Test-only registrations (suffix "_TEST")
+        // are filtered out — those are added by other tests and
+        // would otherwise pollute the registry under shared-process
+        // xunit collection runs.
+        var registered = HFStateDictMapper.AvailablePresets
+            .Where(name => !name.EndsWith("_TEST"))
+            .OrderBy(x => x)
+            .ToList();
+        var expected = new[] { "BERT", "GPT2", "LLAMA", "VIT", "GPT_NEO", "CLIP", "T5", "WHISPER", "SD_UNET", "SDXL_UNET" }
+            .OrderBy(x => x).ToList();
+        Assert.Equal(expected, registered);
     }
 }

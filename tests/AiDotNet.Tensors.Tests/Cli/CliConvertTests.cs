@@ -79,6 +79,10 @@ public class CliConvertTests
         {
             int rc = Program.Main(Array.Empty<string>());
             Assert.Equal(1, rc);
+            // Verify the usage banner actually printed — without this
+            // assertion a regression in PrintUsage() would silently
+            // pass since we only check the exit code.
+            Assert.Contains("USAGE", sw.ToString(), StringComparison.OrdinalIgnoreCase);
         }
         finally { Console.SetOut(prior); }
     }
