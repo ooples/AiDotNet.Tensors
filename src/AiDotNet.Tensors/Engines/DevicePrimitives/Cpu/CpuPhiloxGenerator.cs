@@ -99,26 +99,23 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Normal(Tensor<float> output, float mean = 0f, float stddev = 1f)
     {
         var span = output.AsWritableSpan();
+        // Each Philox block produces four normals via two Box-Muller
+        // pairs. The previous loop's index mutations could fall through
+        // every emit on lengths {1, 5} and similar, leaving the tail
+        // uninitialised. Rewrite as a clean "emit while there's room"
+        // sequence: if span.Length is not a multiple of 4 we simply
+        // discard the unused tail of the last block, which is the
+        // standard PyTorch/cuRAND behaviour for partial-block requests.
         int i = 0;
-        while (i + 2 <= span.Length)
+        while (i < span.Length)
         {
             var (r0, r1, r2, r3) = NextBlock();
-            // Box-Muller from the first two uint32s; emit the second pair similarly.
             BoxMullerPair(r0, r1, out float n0, out float n1);
             BoxMullerPair(r2, r3, out float n2, out float n3);
-            span[i + 0] = mean + stddev * n0;
-            span[i + 1] = mean + stddev * n1;
-            if (i + 2 < span.Length)
-            {
-                span[i + 2] = mean + stddev * n2;
-                i++;
-                if (i + 2 < span.Length)
-                {
-                    span[i + 2] = mean + stddev * n3;
-                    i++;
-                }
-            }
-            i += 2;
+            if (i < span.Length) span[i++] = mean + stddev * n0;
+            if (i < span.Length) span[i++] = mean + stddev * n1;
+            if (i < span.Length) span[i++] = mean + stddev * n2;
+            if (i < span.Length) span[i++] = mean + stddev * n3;
         }
     }
 
@@ -126,16 +123,19 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Normal(Tensor<double> output, double mean = 0, double stddev = 1)
     {
         var span = output.AsWritableSpan();
+        // Same partial-block fix as the float Normal above — the previous
+        // `i + 2 <= span.Length` condition silently dropped the final
+        // element on odd-length tensors, so a `Normal(new Tensor<double>(1))`
+        // returned an uninitialised value.
         int i = 0;
-        while (i + 2 <= span.Length)
+        while (i < span.Length)
         {
             var (r0, r1, r2, r3) = NextBlock();
             ulong c0 = (((ulong)r0) << 21) | (r1 >> 11);
             ulong c1 = (((ulong)r2) << 21) | (r3 >> 11);
             BoxMullerPair53(c0, c1, out double n0, out double n1);
-            span[i + 0] = mean + stddev * n0;
-            span[i + 1] = mean + stddev * n1;
-            i += 2;
+            if (i < span.Length) span[i++] = mean + stddev * n0;
+            if (i < span.Length) span[i++] = mean + stddev * n1;
         }
     }
 

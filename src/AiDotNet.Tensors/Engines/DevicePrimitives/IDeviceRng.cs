@@ -30,13 +30,17 @@ public enum DeviceRngAlgorithm
 /// CPU (managed Philox / Sobol) and each GPU runtime (cuRAND on CUDA,
 /// rocRAND on HIP, MPS RNG on Metal, OpenCL kernel RNG on CL).
 ///
-/// <para><b>Determinism contract:</b> seed + offset + algorithm uniquely
-/// determines the output bits. The CPU and CUDA backends both implement
-/// the same Philox 4x32-10 algorithm so a (seed, offset) pair that
-/// produces a given bit on CPU produces the same bit on GPU. This is
-/// PyTorch's most-requested cross-backend determinism property —
-/// <c>torch.manual_seed(0)</c> + same code on CPU vs CUDA produces
-/// different sequences in PyTorch.</para>
+/// <para><b>Determinism contract:</b> the tuple
+/// (seed, offset, subsequence, algorithm) uniquely determines the
+/// output bits. <see cref="Subsequence"/> is part of the contract because
+/// parallel sub-streams (per-(epoch, worker, sample)) share a seed but
+/// advance independently — without it, a Philox-based generator could
+/// produce the same draws across different sub-streams. The CPU and
+/// CUDA backends both implement the same Philox 4x32-10 algorithm so a
+/// (seed, offset, subsequence) triple that produces a given bit on CPU
+/// produces the same bit on GPU. This is PyTorch's most-requested
+/// cross-backend determinism property — <c>torch.manual_seed(0)</c> +
+/// same code on CPU vs CUDA produces different sequences in PyTorch.</para>
 /// </summary>
 public interface IDeviceRng
 {

@@ -57,13 +57,20 @@ public sealed class CuRand : IDeviceRng
         set => _cpuFallback.Subsequence = value;
     }
 
-    /// <summary>Constructs a CUDA-backed RNG. <paramref name="algo"/>
-    /// must be one of cuRAND's supported algorithms; non-Philox
-    /// algorithms are passed straight through to the native side and
-    /// also implemented on CPU as fallback.</summary>
+    /// <summary>Constructs a CUDA-backed RNG. Currently only the Philox
+    /// algorithm is supported — every other <see cref="DeviceRngAlgorithm"/>
+    /// (Sobol, MRG, XorWow, …) throws <see cref="NotSupportedException"/>
+    /// to prevent silent miscompiles where a caller asks for Sobol and
+    /// gets Philox draws back. The native cuRAND dispatch is wired up as
+    /// a #219 follow-up; this CPU-only path is stable for tests +
+    /// reproducibility.</summary>
     public CuRand(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
         ulong subsequence = 0, ulong offset = 0)
     {
+        if (algo != DeviceRngAlgorithm.Philox)
+            throw new NotSupportedException(
+                $"CuRand currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}. " +
+                "Other algorithms (Sobol/MRG/XorWow) will be added when the native cuRAND dispatch is wired.");
         Algorithm = algo;
         _cpuFallback = new CpuPhiloxGenerator(seed, subsequence, offset);
     }

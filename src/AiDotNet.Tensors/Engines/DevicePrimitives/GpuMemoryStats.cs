@@ -28,6 +28,21 @@ public static class GpuMemoryStats
     private static long _currentBytes;
     private static long _totalBytes;
     private static long _activeAllocations;
+    // Per-allocator counters keyed by the label passed to
+    // RecordAllocation/RecordFree (e.g. "cuda_caching", "cuda_pinned_host",
+    // "rocm_caching", "gpu_workspace"). Without this, every backend's
+    // state collapsed into the global aggregates and the
+    // "backend-by-backend snapshot" #219 promised was unreachable from
+    // outside. Updated under the same _lock as the aggregates.
+    private static readonly Dictionary<string, AllocatorState> _byAllocator = new(StringComparer.Ordinal);
+
+    private sealed class AllocatorState
+    {
+        public long CurrentBytes;
+        public long PeakBytes;
+        public long TotalBytes;
+        public long ActiveAllocations;
+    }
 
     /// <summary>Bytes currently held by GPU allocators.</summary>
     public static long CurrentBytes
@@ -59,31 +74,56 @@ public static class GpuMemoryStats
     /// ROCm allocator) call into this to publish their state.</summary>
     public static void RecordAllocation(string allocator, long bytes)
     {
-        _ = allocator;
+        if (allocator is null) throw new ArgumentNullException(nameof(allocator));
         lock (_lock)
         {
             _currentBytes += bytes;
             _totalBytes += bytes;
             _activeAllocations++;
             if (_currentBytes > _peakBytes) _peakBytes = _currentBytes;
+
+            if (!_byAllocator.TryGetValue(allocator, out var state))
+            {
+                state = new AllocatorState();
+                _byAllocator[allocator] = state;
+            }
+            state.CurrentBytes += bytes;
+            state.TotalBytes += bytes;
+            state.ActiveAllocations++;
+            if (state.CurrentBytes > state.PeakBytes) state.PeakBytes = state.CurrentBytes;
         }
     }
 
     /// <summary>Free hook — pairs with <see cref="RecordAllocation"/>.</summary>
     public static void RecordFree(string allocator, long bytes)
     {
-        _ = allocator;
+        if (allocator is null) throw new ArgumentNullException(nameof(allocator));
         lock (_lock)
         {
             _currentBytes -= bytes;
             _activeAllocations--;
+
+            if (_byAllocator.TryGetValue(allocator, out var state))
+            {
+                state.CurrentBytes -= bytes;
+                state.ActiveAllocations--;
+            }
+            // No fallback for unknown-allocator frees — that's a real
+            // bug in the calling backend (paired Alloc/Free strings
+            // must match), and silently swallowing it would mask the
+            // bookkeeping drift forever.
         }
     }
 
     /// <summary>Resets the peak-bytes counter to the current value.</summary>
     public static void ResetPeakStats()
     {
-        lock (_lock) _peakBytes = _currentBytes;
+        lock (_lock)
+        {
+            _peakBytes = _currentBytes;
+            foreach (var state in _byAllocator.Values)
+                state.PeakBytes = state.CurrentBytes;
+        }
     }
 
     /// <summary>Drops every counter back to zero. Used for test
@@ -96,6 +136,32 @@ public static class GpuMemoryStats
             _currentBytes = 0;
             _totalBytes = 0;
             _activeAllocations = 0;
+            _byAllocator.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Snapshot of every per-allocator counter set, keyed by allocator
+    /// label. The dictionary is a deep copy taken under the lock — safe
+    /// to enumerate / serialise without holding any state from this
+    /// type. Mirrors PyTorch's per-pool entries in <c>memory_stats()</c>.
+    /// </summary>
+    public static IReadOnlyDictionary<string, IReadOnlyDictionary<string, long>> StatsByAllocator()
+    {
+        lock (_lock)
+        {
+            var result = new Dictionary<string, IReadOnlyDictionary<string, long>>(StringComparer.Ordinal);
+            foreach (var kv in _byAllocator)
+            {
+                result[kv.Key] = new Dictionary<string, long>
+                {
+                    ["allocated_bytes.current"] = kv.Value.CurrentBytes,
+                    ["allocated_bytes.peak"]    = kv.Value.PeakBytes,
+                    ["allocated_bytes.total"]   = kv.Value.TotalBytes,
+                    ["active.current"]          = kv.Value.ActiveAllocations,
+                };
+            }
+            return result;
         }
     }
 

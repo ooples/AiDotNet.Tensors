@@ -21,7 +21,21 @@ public sealed class CpuLinalgOps : IDeviceLinalgOps
     public Tensor<T> Cholesky<T>(Tensor<T> a, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        var (factor, _) = CholeskyDecomposition.Compute(a, upper);
+        // CholeskyDecomposition signals non-SPD batch entries via the
+        // `info` tensor (LAPACK convention: zero == success, k == minor
+        // of order k that's not positive definite). Discarding `_` here
+        // would silently return a partial factor on a non-SPD input,
+        // which downstream solvers would then use to produce garbage.
+        // Mirror cuSOLVER / NumPy semantics by throwing on the first
+        // non-zero info code.
+        var (factor, info) = CholeskyDecomposition.Compute(a, upper);
+        var infoSpan = info.AsSpan();
+        for (int i = 0; i < infoSpan.Length; i++)
+        {
+            if (infoSpan[i] != 0)
+                throw new InvalidOperationException(
+                    $"Cholesky failed for batch entry {i}: matrix is not symmetric positive definite (info={infoSpan[i]}).");
+        }
         return factor;
     }
 

@@ -27,6 +27,32 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         {
             // Reduce all elements to a scalar tensor.
             var src = input.AsSpan();
+            // Empty input has no elements to seed the accumulator. NumPy/
+            // PyTorch return the reduction's identity element here (0 for
+            // Sum, 1 for Prod, +Inf/-Inf for Min/Max), but we don't have
+            // a reliable cross-numeric-type identity for Min/Max without
+            // pulling in INumericOperations.MaxValue/MinValue — so the
+            // safest contract is to fail loudly with a diagnostic rather
+            // than silently produce an unsound zero. Sum and Prod still
+            // get a defined identity (Zero / One via the ops surface).
+            if (src.Length == 0)
+            {
+                if (kind == ReductionKind.Sum)
+                {
+                    var s = new Tensor<T>(new[] { 1 });
+                    s.AsWritableSpan()[0] = ops.Zero;
+                    return s;
+                }
+                if (kind == ReductionKind.Product)
+                {
+                    var s = new Tensor<T>(new[] { 1 });
+                    s.AsWritableSpan()[0] = ops.One;
+                    return s;
+                }
+                throw new ArgumentException(
+                    $"Cannot reduce an empty tensor with kind={kind} — Min/Max have no defined identity.",
+                    nameof(input));
+            }
             T acc = src[0];
             for (int i = 1; i < src.Length; i++) acc = Combine(acc, src[i], ops, kind);
             var scalar = new Tensor<T>(new[] { 1 });
@@ -111,18 +137,28 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
     /// <inheritdoc/>
     public Tensor<T> Sort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
+        // Resolve and validate the axis BEFORE any shape indexing — without
+        // this, a bad axis hit `_shape[axis]` deep inside SortAxis and
+        // surfaced as IndexOutOfRangeException with no parameter context.
+        int actualAxis = axis < 0 ? input.Rank - 1 : axis;
+        if (actualAxis < 0 || actualAxis >= input.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
         var output = new Tensor<T>((int[])input._shape.Clone());
         input.AsSpan().CopyTo(output.AsWritableSpan());
-        SortAxis<T>(output, axis < 0 ? input.Rank - 1 : axis, descending, ops);
+        SortAxis<T>(output, actualAxis, descending, ops);
         return output;
     }
 
     /// <inheritdoc/>
     public Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         int actualAxis = axis < 0 ? input.Rank - 1 : axis;
+        if (actualAxis < 0 || actualAxis >= input.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
         int outer = 1, axisLen = input._shape[actualAxis], inner = 1;
         for (int d = 0; d < actualAxis; d++) outer *= input._shape[d];
         for (int d = actualAxis + 1; d < input.Rank; d++) inner *= input._shape[d];
@@ -157,20 +193,29 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
     /// <inheritdoc/>
     public Tensor<int> Histogram<T>(Tensor<T> input, int bins, T lo, T hi)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         if (bins < 1) throw new ArgumentOutOfRangeException(nameof(bins));
         var ops = MathHelper.GetNumericOperations<T>();
+        // Reject hi <= lo before any width math. Generic
+        // ops.Divide on integer T with `(hi - lo) / bins` could collapse
+        // to 0 even when hi > lo (e.g. T=int, lo=0, hi=3, bins=4 →
+        // width=0). Computing widthD in double space side-steps both
+        // the integer-division collapse and any NaN-from-zero-width
+        // fallout downstream.
+        double loD = ops.ToDouble(lo);
+        double hiD = ops.ToDouble(hi);
+        if (!(hiD > loD))
+            throw new ArgumentException("Histogram requires hi > lo.", nameof(hi));
+        double widthD = (hiD - loD) / bins;
+
         var output = new Tensor<int>(new[] { bins });
         var counts = output.AsWritableSpan();
-        T width = ops.Divide(ops.Subtract(hi, lo), ops.FromDouble(bins));
-
         var src = input.AsSpan();
         for (int i = 0; i < src.Length; i++)
         {
             T v = src[i];
             if (ops.LessThan(v, lo) || !ops.LessThan(v, hi)) continue;
-            T offset = ops.Subtract(v, lo);
-            double offD = ops.ToDouble(offset);
-            double widthD = ops.ToDouble(width);
+            double offD = ops.ToDouble(v) - loD;
             int bin = (int)(offD / widthD);
             if (bin == bins) bin = bins - 1;
             counts[bin]++;

@@ -48,12 +48,17 @@ public static class Nvtx
     }
 
     /// <summary>Pushes a named range onto NVTX's per-thread stack.
-    /// Pair with <see cref="Pop"/>.</summary>
-    public static void Push(string name)
+    /// Returns <c>true</c> when the push actually reached the native
+    /// side; the <see cref="Range"/> RAII helper uses that to skip the
+    /// matching <see cref="Pop"/> on failure (an unconditional pop
+    /// would otherwise close an unrelated outer range from the caller's
+    /// stack). Pair with <see cref="Pop"/>.</summary>
+    public static bool Push(string name)
     {
-        if (!IsAvailable) return;
-        try { nvtxRangePushA(name); }
+        if (!IsAvailable) return false;
+        try { nvtxRangePushA(name); return true; }
         catch { /* swallow — instrumentation must never break the run */ }
+        return false;
     }
 
     /// <summary>Pops the most-recently pushed range. Idempotent on
@@ -74,21 +79,25 @@ public static class Nvtx
     }
 
     /// <summary>RAII helper — push on construction, pop on dispose.
-    /// <c>using (Nvtx.Range("matmul")) { ... }</c>.</summary>
+    /// <c>using (Nvtx.Range("matmul")) { ... }</c>. If the push fails
+    /// (instrumentation should never break the run), the dispose
+    /// becomes a no-op rather than closing an unrelated outer range.</summary>
     public static IDisposable Range(string name)
     {
-        Push(name);
-        return new RangeScope();
+        bool pushed = Push(name);
+        return new RangeScope(pushed);
     }
 
     private sealed class RangeScope : IDisposable
     {
+        private readonly bool _pushed;
         private bool _disposed;
+        public RangeScope(bool pushed) { _pushed = pushed; }
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            Pop();
+            if (_pushed) Pop();
         }
     }
 }

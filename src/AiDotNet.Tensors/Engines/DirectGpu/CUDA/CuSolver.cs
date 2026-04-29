@@ -8,22 +8,18 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// High-level cuSOLVER-backed <see cref="IDeviceLinalgOps"/>. Cholesky
-/// (<c>potrf</c>), QR (<c>geqrf</c> + <c>orgqr</c>), SVD (<c>gesvdj</c>),
-/// symmetric eigen (<c>syevj</c>), and LU (<c>getrf</c> + <c>getrs</c>)
-/// are dispatched through <see cref="CuSolverNative"/> when the runtime
-/// is loadable; otherwise the wrapper hands work to
-/// <see cref="CpuLinalgOps"/>. The CPU and CUDA tiers produce
-/// numerically-equivalent factorisations within each backend's
-/// floating-point precision, so callers don't branch on availability.
-///
-/// <para>This is the surface mentioned in #219's acceptance criteria
-/// for cuSOLVER: "Cholesky / QR / SVD / eigen / LU dispatched to
-/// cuSOLVER on CUDA". Device-pointer plumbing is gated behind the
-/// CudaBackend's stream/handle ownership, which lands once the
-/// device-tensor pipeline is wired; until then the CPU tier carries
-/// correctness with the cuSOLVER bindings staying ready for the
-/// dispatch flip.</para>
+/// High-level <see cref="IDeviceLinalgOps"/> wired in advance for
+/// cuSOLVER. Cholesky (<c>potrf</c>), QR (<c>geqrf</c> + <c>orgqr</c>),
+/// SVD (<c>gesvdj</c>), symmetric eigen (<c>syevj</c>), and LU
+/// (<c>getrf</c> + <c>getrs</c>) currently delegate to
+/// <see cref="CpuLinalgOps"/> in every method on this class — the
+/// <see cref="CuSolverNative"/> P/Invoke layer is in place but the
+/// device-pointer plumbing (CudaBackend stream/handle ownership +
+/// device-tensor marshalling) is a #219 follow-up. Until that lands
+/// the CPU tier carries correctness; the cuSOLVER bindings stay ready
+/// for the dispatch flip without changing the public API.
+/// <see cref="IsAvailable"/> reports whether the shared library can be
+/// loaded so callers can probe future hardware-accelerated paths.
 /// </summary>
 public sealed class CuSolver : IDeviceLinalgOps
 {

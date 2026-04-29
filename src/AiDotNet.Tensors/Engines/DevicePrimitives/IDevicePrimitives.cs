@@ -30,9 +30,10 @@ public interface IDevicePrimitives
     /// uses internally.</summary>
     Tensor<T> Scan<T>(Tensor<T> input, int axis = -1, ReductionKind kind = ReductionKind.Sum, bool exclusive = false);
 
-    /// <summary>Sorts <paramref name="input"/> along <paramref name="axis"/>.
-    /// Returns the sorted tensor and (optionally) the index permutation
-    /// that maps original positions to sorted positions.</summary>
+    /// <summary>Sorts <paramref name="input"/> along <paramref name="axis"/>
+    /// and returns the sorted tensor. Use <see cref="ArgSort{T}"/> when
+    /// you need the index permutation that maps original positions to
+    /// sorted positions — this overload returns sorted values only.</summary>
     Tensor<T> Sort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>Returns the index permutation that would sort the tensor.

@@ -20,8 +20,11 @@ public enum RnnCellType
 /// <summary>
 /// Recurrent-network primitive surface. CUDA backend wraps cuDNN RNN;
 /// HIP wraps MIOpen; Metal wraps MPS LSTM; CPU implements the unrolled
-/// forward + backward via the existing
-/// <c>BackwardFunctions&lt;T&gt;.LstmBackward</c> path. <see cref="ForwardLstm"/>
+/// forward only — backward is currently <see cref="NotSupportedException"/>
+/// on the CPU device. Use the GPU backends (CUDA / HIP / Metal) for
+/// training-time RNN backward; CPU is forward-only at this commit
+/// pending a future port of <c>BackwardFunctions&lt;T&gt;.LstmBackward</c>
+/// into the device-primitive surface. <see cref="ForwardLstm"/>
 /// is a convenience for the LSTM-specific case (most common cell type
 /// in production); <see cref="ForwardRnn"/> is the generic dispatcher.
 ///
