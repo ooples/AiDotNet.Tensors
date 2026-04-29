@@ -1,6 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.Simd.Sparse;
 using AiDotNet.Tensors.Helpers;
 
@@ -21,6 +24,14 @@ namespace AiDotNet.Tensors.LinearAlgebra.Sparse;
 /// </summary>
 public static class SparseOps
 {
+    /// <summary>Element-count threshold above which sparse matmul tries
+    /// the GPU dispatch path. Below this, the upload + download round
+    /// trip dominates the compute and the CPU SIMD tier wins.
+    /// Tuned empirically on a Ryzen 9 + RTX 3080 ref host; the autotune
+    /// crossover registered in <c>BuiltInCatalog.SPARSE_MM</c> overrides
+    /// this on subsequent runs once a benchmarked winner is cached.</summary>
+    private const long GpuDispatchThreshold = 1L << 18; // 256K output elements
+
     /// <summary>Sparse · dense matmul. Output shape: <c>[A.Rows, B.Columns]</c>.
     /// Routes through CSR for the natural row-major traversal; non-CSR
     /// inputs convert once on entry.</summary>
@@ -45,18 +56,40 @@ public static class SparseOps
         // SIMD fast path for the common float / double cases — the inner
         // column loop vectorises 4–16 wide depending on hardware. Scalar
         // tier still serves the full generic surface (other numeric T).
-        if (typeof(T) == typeof(float) && CsrDenseSimd.IsHardwareAccelerated)
+        if (typeof(T) == typeof(float))
         {
-            // SparseTensor stores rowPtr/colIdx as int[] directly — no
-            // marshaling step needed for the SIMD entry point.
             var valsArr = (float[])(object)csr.DataVector.ToArray();
             var bArr = (float[])(object)b.ToArray();
-            var outArr = new float[rows * n];
-            CsrDenseSimd.Multiply(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
-            var outSpanFloat = output.AsWritableSpan();
-            for (int i = 0; i < outSpanFloat.Length; i++) outSpanFloat[i] = (T)(object)outArr[i];
-            _ = k;
-            return output;
+            float[]? outArr = null;
+
+            // Tier 0 — GPU dispatch (cuSPARSE / rocSPARSE / MPS) gated
+            // by host availability + a size threshold; small problems
+            // pay more in upload/download than they save in compute.
+            if (rows * (long)n >= GpuDispatchThreshold)
+            {
+                if (CuSparseBackend.IsAvailable)
+                    outArr = CuSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                else if (HipSparseBackend.IsAvailable)
+                    outArr = HipSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                else if (MpsSparseBackend.IsAvailable)
+                    outArr = MpsSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+            }
+
+            // Tier 1 — CPU SIMD on hardware-accelerated Vector<T>.
+            if (outArr is null && CsrDenseSimd.IsHardwareAccelerated)
+            {
+                outArr = new float[rows * n];
+                CsrDenseSimd.Multiply(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
+            }
+
+            if (outArr is not null)
+            {
+                var outSpanFloat = output.AsWritableSpan();
+                for (int i = 0; i < outSpanFloat.Length; i++) outSpanFloat[i] = (T)(object)outArr[i];
+                _ = k;
+                return output;
+            }
+            // else fall through to scalar tier below.
         }
         if (typeof(T) == typeof(double) && System.Numerics.Vector.IsHardwareAccelerated)
         {

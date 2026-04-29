@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.LinearAlgebra.Sparse;
@@ -44,6 +45,11 @@ public sealed class SparseSemiStructured<T>
 
     /// <summary>The block pattern: stride of 4 columns.</summary>
     public const int M = 4;
+
+    /// <summary>Element-count threshold above which the GPU dispatch
+    /// path is even tried. Below this the upload/download trip
+    /// dominates compute. Tuned alongside the SparseMatMul threshold.</summary>
+    private const long GpuDispatchThreshold = 1L << 18; // 256K output elements
 
     private SparseSemiStructured(int rows, int columns, T[] packedValues, byte[] metadata)
     {
@@ -132,10 +138,11 @@ public sealed class SparseSemiStructured<T>
 
     /// <summary>2:4-structured · dense matmul. Skips the structural zeros:
     /// each row's <c>K</c>-loop touches <c>K / 2</c> stored values, beating
-    /// dense matmul at 50% sparsity on hosts with at least AVX-2 once the
-    /// SIMD specialisation lands. This managed reference is the
-    /// correctness baseline — the SIMD path lives behind the autotune
-    /// dispatcher.</summary>
+    /// dense matmul at 50% sparsity on hosts with AVX-2 / AVX-512 (the
+    /// SIMD path) and on Ampere+ GPUs (the <c>mma.sp.aligned.m16n8k16</c>
+    /// instruction surfaced by <see cref="SparseSemiStructuredGpuDispatch"/>).
+    /// This managed reference is the correctness baseline used when no
+    /// faster tier applies.</summary>
     public Tensor<T> MatMul(Tensor<T> dense)
     {
         if (dense is null) throw new ArgumentNullException(nameof(dense));
@@ -144,6 +151,32 @@ public sealed class SparseSemiStructured<T>
         if (dense._shape[0] != Columns)
             throw new ArgumentException(
                 $"Inner dim mismatch: A cols {Columns} vs B rows {dense._shape[0]}.");
+
+        // GPU dispatch — tries the Ampere mma.sp kernel first, then the
+        // baseline CUDA kernel. Falls through silently when no CUDA
+        // runtime is loadable; the managed loop below serves as the
+        // canonical reference path for those hosts.
+        if (typeof(T) == typeof(float) && SparseSemiStructuredGpuDispatch.IsAvailable
+            && (long)Rows * dense._shape[1] >= GpuDispatchThreshold)
+        {
+            try
+            {
+                var packedF = (float[])(object)PackedValues;
+                var bF = (float[])(object)dense.ToArray();
+                var outF = SparseSemiStructuredGpuDispatch.MatMul(
+                    packedF, Metadata, bF, Rows, Columns, dense._shape[1]);
+                var outputT = new Tensor<T>(new[] { Rows, dense._shape[1] });
+                var outSpanT = outputT.AsWritableSpan();
+                for (int i = 0; i < outSpanT.Length; i++) outSpanT[i] = (T)(object)outF[i];
+                return outputT;
+            }
+            catch
+            {
+                // GPU path failed mid-call (driver glitch / OOM) — fall
+                // through to the managed loop. The exception is intentionally
+                // swallowed because correctness is preserved by the fallback.
+            }
+        }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int n = dense._shape[1];
