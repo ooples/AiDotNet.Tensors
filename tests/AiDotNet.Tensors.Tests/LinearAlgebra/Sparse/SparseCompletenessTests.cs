@@ -368,7 +368,7 @@ public class SparseCompletenessTests
         using var tape = new GradientTape<float>();
         var aDense = a.ToDense();
 
-        var output = SparseAutograd.SparseMatMulRecord(a, b);
+        var output = SparseAutograd.SparseMatMulRecord(a, aDense, b);
         var loss = _engine.ReduceSum(output, null);
         var grads = tape.ComputeGradients(loss, new[] { b });
 

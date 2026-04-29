@@ -28,34 +28,48 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 public static class SparseAutograd
 {
     /// <summary>Tape-aware sparse · dense matmul. The backward returns
-    /// dense gradients for both sides.</summary>
-    public static Tensor<T> SparseMatMulRecord<T>(SparseTensor<T> a, Tensor<T> b)
+    /// dense gradients for both sides. <paramref name="aDense"/> is the
+    /// caller-visible <see cref="Tensor{T}"/> the gradient for A is
+    /// accumulated against — the same Tensor instance must be the one
+    /// passed to <c>ComputeGradients(loss, new[] { aDense, b })</c>,
+    /// otherwise the lookup misses and dA stays zero. The internal
+    /// dense snapshot used to compute <c>A^T · grad</c> still comes from
+    /// <c>a.ToDense()</c> at record time and is captured in savedState
+    /// so backward sees the values <em>at forward time</em> — matches
+    /// PyTorch's <c>sparse_mm_backward</c> which densifies before
+    /// transposing.</summary>
+    public static Tensor<T> SparseMatMulRecord<T>(SparseTensor<T> a, Tensor<T> aDense, Tensor<T> b)
     {
+        if (aDense is null) throw new ArgumentNullException(nameof(aDense));
         var output = SparseOps.SparseMatMul(a, b);
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
-        // Capture A as a dense reference so backward can compute A^T · grad
-        // via the standard dense matmul path. This matches PyTorch's
-        // sparse_mm_backward, which densifies A before transposing.
-        var aDense = a.ToDense();
+        // Snapshot A's values at forward time. Storing on savedState
+        // ensures backward uses the values that produced this output
+        // even if A was mutated downstream.
+        var aDenseSnapshot = a.ToDense();
         DifferentiableOps.RecordBinary(
             "SparseMatMul",
             output,
             aDense,
             b,
             SparseMatMulBackward,
-            savedState: null);
+            savedState: new object[] { aDenseSnapshot });
         return output;
     }
 
-    /// <summary>Tape-aware <c>α · (A_sparse · B) + β · C</c>.</summary>
-    public static Tensor<T> SparseAddMMRecord<T>(Tensor<T> c, SparseTensor<T> a, Tensor<T> b, T alpha, T beta)
+    /// <summary>Tape-aware <c>α · (A_sparse · B) + β · C</c>.
+    /// <paramref name="aDense"/> is the caller-visible Tensor that
+    /// receives dA — see <see cref="SparseMatMulRecord{T}"/> for the
+    /// rationale.</summary>
+    public static Tensor<T> SparseAddMMRecord<T>(Tensor<T> c, SparseTensor<T> a, Tensor<T> aDense, Tensor<T> b, T alpha, T beta)
     {
+        if (aDense is null) throw new ArgumentNullException(nameof(aDense));
         var output = SparseOps.SparseAddMM(c, a, b, alpha, beta);
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
-        var aDense = a.ToDense();
-        var savedState = new object[] { alpha!, beta! };
+        var aDenseSnapshot = a.ToDense();
+        var savedState = new object[] { alpha!, beta!, aDenseSnapshot };
         DifferentiableOps.RecordIfActive(
             "SparseAddMM",
             output,
@@ -97,20 +111,22 @@ public static class SparseAutograd
         IEngine engine,
         System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
     {
-        // Y = A · B (A dense-projected from sparse, B dense)
-        // dA = grad_Y · B^T
-        // dB = A^T · grad_Y
-        var aDense = inputs[0];
+        // Y = A · B (A is the caller-visible dense Tensor; the values
+        // used in the matmul are the snapshot in savedState[0])
+        // dA = grad_Y · B^T  → accumulated against `aDense` (caller-visible)
+        // dB = A^T · grad_Y  → uses the snapshot for the transpose
+        var aDense = inputs[0];     // caller-visible target (gradient destination)
         var b = inputs[1];
+        var aSnapshot = (Tensor<T>)savedState[0];
 
         var bT = engine.TensorTranspose(b);
         var gradA = engine.TensorMatMul(gradOutput, bT);
         AccumulateGrad(aDense, gradA, gradAccumulator, engine);
 
-        var aT = engine.TensorTranspose(aDense);
+        var aT = engine.TensorTranspose(aSnapshot);
         var gradB = engine.TensorMatMul(aT, gradOutput);
         AccumulateGrad(b, gradB, gradAccumulator, engine);
-        _ = output; _ = savedState;
+        _ = output;
     }
 
     private static void SparseAddMMBackward<T>(
@@ -126,8 +142,9 @@ public static class SparseAutograd
         // d(A·B) = α · grad_out  ⇒  dA = α · grad_out · B^T,  dB = α · A^T · grad_out
         T alpha = (T)savedState[0];
         T beta = (T)savedState[1];
+        var aSnapshot = (Tensor<T>)savedState[2];
         var c = inputs[0];
-        var aDense = inputs[1];
+        var aDense = inputs[1];     // caller-visible target
         var b = inputs[2];
 
         var gradC = engine.TensorMultiplyScalar(gradOutput, beta);
@@ -138,7 +155,7 @@ public static class SparseAutograd
         var gradA = engine.TensorMatMul(alphaGradOut, bT);
         AccumulateGrad(aDense, gradA, gradAccumulator, engine);
 
-        var aT = engine.TensorTranspose(aDense);
+        var aT = engine.TensorTranspose(aSnapshot);
         var gradB = engine.TensorMatMul(aT, alphaGradOut);
         AccumulateGrad(b, gradB, gradAccumulator, engine);
         _ = output;

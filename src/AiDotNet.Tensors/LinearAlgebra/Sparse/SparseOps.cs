@@ -406,7 +406,22 @@ public static class SparseOps
             var keys = new int[rowAcc.Count];
             rowAcc.Keys.CopyTo(keys, 0);
             Array.Sort(keys);
-            foreach (var c in keys) { values.Add(rowAcc[c]); colIdx.Add(c); }
+            // Filter exact-zero accumulators before emitting the row.
+            // SpGEMM accumulates contributions from every (a_col, b_col)
+            // path; cancellations (e.g. +x and -x into the same output
+            // column) yield ops.Zero. Storing those as explicit non-zeros
+            // breaks sparse invariants — NonZeroCount overstates the true
+            // pattern, mask/pattern ops keep zero structural entries, and
+            // sparse softmax mixes zero rows into its denominator. Output
+            // dense values stay correct either way; this just keeps the
+            // CSR pattern consistent with the mathematical sparsity.
+            foreach (var c in keys)
+            {
+                var v = rowAcc[c];
+                if (ops.Equals(v, ops.Zero)) continue;
+                values.Add(v);
+                colIdx.Add(c);
+            }
             rowPtr[r + 1] = values.Count;
         }
         return SparseTensor<T>.FromCsr(a.Rows, b.Columns, rowPtr, colIdx.ToArray(), values.ToArray());

@@ -191,6 +191,7 @@ public class SparseTensor<T> : Tensor<T>
         if (values is null) throw new ArgumentNullException(nameof(values));
 
         int blockRows = rows / blockRowSize;
+        int blockCols = columns / blockColSize;
         int blockSize = blockRowSize * blockColSize;
         if (blockRowPointers.Length != blockRows + 1)
             throw new ArgumentException($"blockRowPointers length must be {blockRows + 1} (= rows/blockRowSize + 1).",
@@ -199,6 +200,33 @@ public class SparseTensor<T> : Tensor<T>
             throw new ArgumentException(
                 $"values length {values.Length} must equal blockColumnIndices.Length ({blockColumnIndices.Length}) · " +
                 $"blockRowSize · blockColSize ({blockSize}).", nameof(values));
+
+        // Pointer-array invariants — without these, ToCoo/ToDense walks
+        // past the buffer or writes outside the logical matrix.
+        // 1. blockRowPointers[0] must be 0.
+        // 2. monotonic non-decreasing.
+        // 3. blockRowPointers[^1] must equal blockColumnIndices.Length.
+        // 4. every block-column index must be in [0, blockCols).
+        if (blockRowPointers[0] != 0)
+            throw new ArgumentException(
+                $"blockRowPointers[0] must be 0; got {blockRowPointers[0]}.", nameof(blockRowPointers));
+        for (int i = 0; i < blockRows; i++)
+        {
+            if (blockRowPointers[i] > blockRowPointers[i + 1])
+                throw new ArgumentException(
+                    $"blockRowPointers must be non-decreasing; entry {i}={blockRowPointers[i]} > {i + 1}={blockRowPointers[i + 1]}.",
+                    nameof(blockRowPointers));
+        }
+        if (blockRowPointers[blockRows] != blockColumnIndices.Length)
+            throw new ArgumentException(
+                $"blockRowPointers terminal entry must equal blockColumnIndices.Length ({blockColumnIndices.Length}); got {blockRowPointers[blockRows]}.",
+                nameof(blockRowPointers));
+        for (int i = 0; i < blockColumnIndices.Length; i++)
+        {
+            if (blockColumnIndices[i] < 0 || blockColumnIndices[i] >= blockCols)
+                throw new ArgumentOutOfRangeException(nameof(blockColumnIndices),
+                    $"blockColumnIndices[{i}]={blockColumnIndices[i]} is outside [0, {blockCols}).");
+        }
 
         return new SparseTensor<T>(rows, columns, SparseStorageFormat.Bsr,
             Array.Empty<int>(), blockColumnIndices, blockRowPointers, Array.Empty<int>(),
@@ -227,6 +255,7 @@ public class SparseTensor<T> : Tensor<T>
         if (blockRowIndices is null) throw new ArgumentNullException(nameof(blockRowIndices));
         if (values is null) throw new ArgumentNullException(nameof(values));
 
+        int blockRows = rows / blockRowSize;
         int blockCols = columns / blockColSize;
         int blockSize = blockRowSize * blockColSize;
         if (blockColumnPointers.Length != blockCols + 1)
@@ -236,6 +265,29 @@ public class SparseTensor<T> : Tensor<T>
             throw new ArgumentException(
                 $"values length {values.Length} must equal blockRowIndices.Length ({blockRowIndices.Length}) · " +
                 $"blockRowSize · blockColSize ({blockSize}).", nameof(values));
+
+        // Same pointer/index invariants as the BSR factory above —
+        // see that comment for the why.
+        if (blockColumnPointers[0] != 0)
+            throw new ArgumentException(
+                $"blockColumnPointers[0] must be 0; got {blockColumnPointers[0]}.", nameof(blockColumnPointers));
+        for (int i = 0; i < blockCols; i++)
+        {
+            if (blockColumnPointers[i] > blockColumnPointers[i + 1])
+                throw new ArgumentException(
+                    $"blockColumnPointers must be non-decreasing; entry {i}={blockColumnPointers[i]} > {i + 1}={blockColumnPointers[i + 1]}.",
+                    nameof(blockColumnPointers));
+        }
+        if (blockColumnPointers[blockCols] != blockRowIndices.Length)
+            throw new ArgumentException(
+                $"blockColumnPointers terminal entry must equal blockRowIndices.Length ({blockRowIndices.Length}); got {blockColumnPointers[blockCols]}.",
+                nameof(blockColumnPointers));
+        for (int i = 0; i < blockRowIndices.Length; i++)
+        {
+            if (blockRowIndices[i] < 0 || blockRowIndices[i] >= blockRows)
+                throw new ArgumentOutOfRangeException(nameof(blockRowIndices),
+                    $"blockRowIndices[{i}]={blockRowIndices[i]} is outside [0, {blockRows}).");
+        }
 
         return new SparseTensor<T>(rows, columns, SparseStorageFormat.Bsc,
             blockRowIndices, Array.Empty<int>(), Array.Empty<int>(), blockColumnPointers,
@@ -699,7 +751,15 @@ public class SparseTensor<T> : Tensor<T>
                     int valOff = p * blockSize;
                     for (int i = 0; i < br; i++)
                         for (int j = 0; j < bc; j++)
-                            dense[br_i * br + i, blockCol * bc + j] = src[valOff + i * bc + j];
+                        {
+                            // Accumulate rather than assign — duplicate
+                            // (block-row, block-col) pairs from FromBsr()
+                            // would otherwise produce order-dependent
+                            // dense materialisation. Matches the COO
+                            // path's ops.Add accumulator below.
+                            int rIdx = br_i * br + i, cIdx = blockCol * bc + j;
+                            dense[rIdx, cIdx] = ops.Add(dense[rIdx, cIdx], src[valOff + i * bc + j]);
+                        }
                 }
             }
             return dense;
@@ -717,7 +777,14 @@ public class SparseTensor<T> : Tensor<T>
                     int valOff = p * blockSize;
                     for (int i = 0; i < br; i++)
                         for (int j = 0; j < bc; j++)
-                            dense[blockRow * br + i, bc_j * bc + j] = src[valOff + i * bc + j];
+                        {
+                            // Accumulate — same rationale as the BSR
+                            // branch above. Transpose() routes through
+                            // here for block formats so this also fixes
+                            // duplicate-block transpose correctness.
+                            int rIdx = blockRow * br + i, cIdx = bc_j * bc + j;
+                            dense[rIdx, cIdx] = ops.Add(dense[rIdx, cIdx], src[valOff + i * bc + j]);
+                        }
                 }
             }
             return dense;
