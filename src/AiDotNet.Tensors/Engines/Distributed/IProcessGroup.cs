@@ -108,6 +108,14 @@ public interface IProcessGroup : IDisposable
     /// rank <paramref name="src"/>.</summary>
     void Recv<T>(Tensor<T> tensor, int src, int tag = 0);
 
+    /// <summary>Shape-discovering point-to-point recv — used by the
+    /// pipeline-parallel scheduler where the receiver doesn't know the
+    /// activation shape ahead of time. Network backends prepend the
+    /// shape on the wire; the in-process backend delivers the queued
+    /// tensor object directly. Backends that don't support this throw
+    /// <see cref="NotSupportedException"/>.</summary>
+    Tensor<T> RecvDiscoverShape<T>(int src, int tag = 0);
+
     /// <summary>Synchronization barrier — returns when every rank has
     /// reached this call.</summary>
     void Barrier();

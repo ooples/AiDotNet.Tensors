@@ -188,31 +188,53 @@ public sealed class ElasticLauncher
         if (_options.Backend != RendezvousBackend.File)
             throw new InvalidOperationException(
                 "SpawnInProcessWorkers only supports File backend. Use Rendezvous() directly for other backends.");
+        return SpawnInProcessWorkersWithGenerationRestart(worker);
+    }
 
-        var tasks = new Task[_options.WorldSize];
-        for (int i = 0; i < _options.WorldSize; i++)
+    private async Task SpawnInProcessWorkersWithGenerationRestart(Action<RendezvousAssignment> worker)
+    {
+        // Per-task restart tore down only the failing rank, leaving
+        // the healthy ranks at a stale rendezvous generation — the
+        // restarted rank would rejoin and deadlock on the next
+        // collective. Real elastic semantics restart the whole
+        // generation: when ANY rank fails, we tear down the
+        // rendezvous directory, the surviving ranks unwind out of
+        // their delegate, and the next generation re-rendezvouses
+        // from scratch.
+        int generation = 0;
+        while (true)
         {
-            int workerIndex = i;
-            tasks[i] = Task.Run(async () =>
+            using var generationCts = new System.Threading.CancellationTokenSource();
+            // Clean up any stale state at the start of each generation.
+            CleanupRendezvous();
+
+            var tasks = new Task[_options.WorldSize];
+            for (int i = 0; i < _options.WorldSize; i++)
             {
-                int restarts = 0;
-                while (true)
+                int workerIndex = i;
+                int gen = generation;
+                tasks[i] = Task.Run(() =>
                 {
-                    try
-                    {
-                        var assignment = Rendezvous($"worker-{workerIndex:D6}");
-                        worker(assignment);
-                        return;
-                    }
-                    catch (Exception) when (_options.RestartOnFailure && restarts < _options.MaxRestarts)
-                    {
-                        restarts++;
-                        await Task.Delay(_options.HealthCheckIntervalSeconds * 1000).ConfigureAwait(false);
-                    }
-                }
-            });
+                    var assignment = Rendezvous($"worker-{workerIndex:D6}-gen{gen:D3}");
+                    worker(assignment);
+                });
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+                return; // every worker finished cleanly
+            }
+            catch
+            {
+                if (!_options.RestartOnFailure || generation >= _options.MaxRestarts)
+                    throw;
+                generation++;
+                await Task.Delay(_options.HealthCheckIntervalSeconds * 1000).ConfigureAwait(false);
+                // Loop around — next iteration cleans up + re-rendezvouses
+                // the entire group at a fresh generation.
+            }
         }
-        return Task.WhenAll(tasks);
     }
 
     /// <summary>Removes the rendezvous directory + its contents.

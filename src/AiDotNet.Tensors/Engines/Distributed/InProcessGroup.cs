@@ -217,6 +217,13 @@ public sealed class InProcessGroup : IProcessGroup
     }
 
     /// <inheritdoc/>
+    public Tensor<T> RecvDiscoverShape<T>(int src, int tag = 0)
+    {
+        ThrowIfDisposed();
+        return _coord.RecvP2P<T>(src, Rank, tag);
+    }
+
+    /// <inheritdoc/>
     public void Barrier() { ThrowIfDisposed(); _coord.SyncBarrier(); }
 
     /// <inheritdoc/>
@@ -253,6 +260,12 @@ public sealed class InProcessGroup : IProcessGroup
     public IProcessGroup SplitGroup(int color, int? key = null)
     {
         ThrowIfDisposed();
+        // Reset stale split state from any prior SplitGroup call —
+        // _splits was append-only, so a second call would see members
+        // from the previous call mixed in. Rank 0 clears, barrier
+        // ensures all ranks see the cleared dict before publishing.
+        if (Rank == 0) _coord.ResetSplitState();
+        Barrier();
         // Every rank publishes its (color, key) pair; ranks with the same
         // color form a sub-group, ordered by key (ties broken by global rank).
         _coord.PublishSplit(Rank, color, key ?? Rank);
@@ -391,7 +404,13 @@ internal sealed class InProcessGroupCoordinator
             if (!_p2p.TryGetValue(key, out q!)) { q = new ConcurrentQueue<object>(); _p2p[key] = q; }
             if (!_p2pReady.TryGetValue(key, out mre!)) { mre = new ManualResetEventSlim(false); _p2pReady[key] = mre; }
         }
-        q.Enqueue(tensor);
+        // Snapshot the tensor on enqueue so the sender can mutate or
+        // reuse the source buffer immediately. Without this the
+        // receiver would observe post-send writes — divergent from
+        // every real network transport's value semantics.
+        var snapshot = new Tensor<T>((int[])tensor._shape.Clone());
+        tensor.AsSpan().CopyTo(snapshot.AsWritableSpan());
+        q.Enqueue(snapshot);
         mre.Set();
     }
 
@@ -427,6 +446,15 @@ internal sealed class InProcessGroupCoordinator
             }
             list.Add((rank, key));
         }
+    }
+
+    /// <summary>Clears the split membership dict — called at the start
+    /// of each <see cref="InProcessGroup.SplitGroup"/> by rank 0
+    /// (under a barrier) so a second SplitGroup call doesn't see
+    /// stale entries from the first.</summary>
+    public void ResetSplitState()
+    {
+        lock (_splitGate) _splits.Clear();
     }
 
     public List<(int Rank, int Key)> GetSplitMembers(int color)

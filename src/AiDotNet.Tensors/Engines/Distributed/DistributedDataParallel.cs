@@ -114,6 +114,11 @@ public sealed class DistributedDataParallel<T>
         if (_planFrozen)
             throw new InvalidOperationException(
                 "Cannot register parameters after the bucket plan has frozen (StaticGraph=true).");
+        // If a previous step already built a bucket plan, the new
+        // parameter would silently be dropped from every bucket
+        // boundary check the next ReduceGradients does. Invalidate
+        // the plan so EnsurePlan rebuilds at the next reduce.
+        if (_bucketBoundaries.Count > 0) _bucketBoundaries.Clear();
         _params.Add(param);
     }
 
@@ -130,7 +135,12 @@ public sealed class DistributedDataParallel<T>
     /// length must match.
     /// </summary>
     /// <param name="grads">Per-parameter gradient tensors. Same length and
-    /// order as <see cref="Parameters"/>. Each tensor is reduced in place.</param>
+    /// order as <see cref="Parameters"/>. Each tensor is reduced in place.
+    /// When <see cref="DdpOptions.FindUnusedParameters"/> is true, entries
+    /// may be <c>null</c> — the wrapper substitutes a zero-tensor of the
+    /// parameter's shape so the cross-rank average stays correct (a rank
+    /// with no gradient contributes zero, ranks with a gradient contribute
+    /// their value).</param>
     public void ReduceGradients(IReadOnlyList<Tensor<T>> grads)
     {
         if (grads is null) throw new ArgumentNullException(nameof(grads));
@@ -138,6 +148,21 @@ public sealed class DistributedDataParallel<T>
             throw new ArgumentException(
                 $"Expected {_params.Count} grads (one per registered param); got {grads.Count}.",
                 nameof(grads));
+
+        // FindUnusedParameters: substitute null entries with zero
+        // tensors of the matching parameter's shape so the bucket
+        // reduce treats the rank's contribution as zero. Without this
+        // pass, a null grad would NRE in the bucket walker.
+        var resolved = new Tensor<T>[_params.Count];
+        for (int i = 0; i < _params.Count; i++)
+        {
+            if (grads[i] is not null) { resolved[i] = grads[i]; continue; }
+            if (!_options.FindUnusedParameters)
+                throw new ArgumentException(
+                    $"Gradient for parameter {i} is null and FindUnusedParameters is false.",
+                    nameof(grads));
+            resolved[i] = new Tensor<T>((int[])_params[i]._shape.Clone());
+        }
 
         EnsurePlan();
 
@@ -151,7 +176,7 @@ public sealed class DistributedDataParallel<T>
         for (int b = 0; b < _bucketBoundaries.Count; b++)
         {
             int paramEnd = _bucketBoundaries[b];
-            ReduceBucket(grads, paramStart, paramEnd);
+            ReduceBucket(resolved, paramStart, paramEnd);
             paramStart = paramEnd;
         }
     }

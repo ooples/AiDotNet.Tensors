@@ -22,8 +22,13 @@ public enum ShardingStrategy
     /// communication cost.</summary>
     FullShard,
 
-    /// <summary>Shard params + grads, replicate optimizer state per
-    /// node. Equivalent to ZeRO-2 with hybrid placement.</summary>
+    /// <summary>Shard params + grads within an HSDP intra-node group,
+    /// replicate across the inter-node group. Equivalent to ZeRO-2
+    /// with hybrid placement. The in-process backend lacks a node
+    /// concept, so this strategy currently behaves like
+    /// <see cref="FullShard"/> with the inter-node replicate degree
+    /// = 1; multi-node placement requires the matching transport
+    /// backend (NCCL/Gloo) to land first.</summary>
     HybridShard,
 
     /// <summary>Shard only the optimizer state. Equivalent to ZeRO-1.
@@ -121,7 +126,13 @@ public sealed class FullyShardedDataParallel<T>
     public Tensor<T> GatherParameter(ShardedParameter<T> param)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
-        if (_options.Strategy == ShardingStrategy.NoShard) return param.LocalShard;
+        // NoShard and ShardOptimizerOnly both replicate the parameter;
+        // ShardOptimizerOnly only shards optimizer state (which lives
+        // in the optimizer's own buffers, not in this class). The
+        // gather/release surface is a no-op for both.
+        if (_options.Strategy == ShardingStrategy.NoShard
+            || _options.Strategy == ShardingStrategy.ShardOptimizerOnly)
+            return param.LocalShard;
 
         // All-gather: each rank contributes its shard; result is the
         // concatenation across ranks. We allocate the full tensor, then
@@ -168,9 +179,13 @@ public sealed class FullyShardedDataParallel<T>
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (fullGrad is null) throw new ArgumentNullException(nameof(fullGrad));
-        if (_options.Strategy == ShardingStrategy.NoShard)
+        // NoShard and ShardOptimizerOnly both keep the gradient
+        // replicated across ranks — only the optimizer state shards
+        // in ShardOptimizerOnly. Both paths do a DDP-equivalent
+        // all-reduce of the full gradient.
+        if (_options.Strategy == ShardingStrategy.NoShard
+            || _options.Strategy == ShardingStrategy.ShardOptimizerOnly)
         {
-            // DDP-equivalent: just all-reduce the full grad in place.
             _group.AllReduce(fullGrad, ReduceOp.Avg);
             return fullGrad;
         }
@@ -219,9 +234,12 @@ public sealed class ShardedParameter<T>
     internal static ShardedParameter<T> Create(Tensor<T> full, IProcessGroup group, FsdpOptions options)
     {
         var fullShape = (int[])full._shape.Clone();
-        if (options.Strategy == ShardingStrategy.NoShard)
+        // NoShard replicates everything. ShardOptimizerOnly replicates
+        // params + grads (only optimizer state shards, which lives
+        // outside this class) — same on-rank tensor layout as NoShard.
+        if (options.Strategy == ShardingStrategy.NoShard
+            || options.Strategy == ShardingStrategy.ShardOptimizerOnly)
         {
-            // No-shard: every rank holds the full param.
             return new ShardedParameter<T>(fullShape, full);
         }
 

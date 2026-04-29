@@ -29,6 +29,12 @@ public sealed class TensorRpc<T> : IDisposable
     private readonly IProcessGroup _group;
     private readonly ConcurrentDictionary<string, Func<Tensor<T>[], Tensor<T>>> _handlers = new();
     private readonly InProcessRpcRegistry? _registry;
+    // Names this instance has published into the registry — used at
+    // Dispose to unregister only OUR handlers, not every handler this
+    // rank ever published. Without this, disposing one TensorRpc
+    // instance wipes registrations owned by sibling instances on the
+    // same rank.
+    private readonly HashSet<string> _publishedNames = new();
     private bool _disposed;
 
     /// <summary>The process group this RPC channel runs over.</summary>
@@ -49,6 +55,7 @@ public sealed class TensorRpc<T> : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(TensorRpc<T>));
         _handlers[name] = handler;
         _registry?.PublishHandler<T>(_group.Rank, name, args => handler(args));
+        lock (_publishedNames) _publishedNames.Add(name);
     }
 
     /// <summary>
@@ -72,13 +79,18 @@ public sealed class TensorRpc<T> : IDisposable
     public Task<Tensor<T>> RpcAsync(int dst, string name, params Tensor<T>[] args)
         => Task.Run(() => RpcSync(dst, name, args));
 
-    /// <summary>Disposes — unregisters this rank's handlers from the
-    /// in-process registry.</summary>
+    /// <summary>Disposes — unregisters this instance's handlers from
+    /// the in-process registry. Sibling TensorRpc instances on the
+    /// same rank keep their registrations; only the names this
+    /// instance published get removed.</summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        _registry?.UnregisterRank(_group.Rank);
+        if (_registry is null) return;
+        string[] names;
+        lock (_publishedNames) names = _publishedNames.ToArray();
+        foreach (var n in names) _registry.Unregister(_group.Rank, n);
     }
 }
 
@@ -142,5 +154,13 @@ internal sealed class InProcessRpcRegistry
             foreach (var k in _handlers.Keys) if (k.Rank == rank) keys.Add(k);
             foreach (var k in keys) _handlers.Remove(k);
         }
+    }
+
+    /// <summary>Removes a single (rank, name) registration. Used by
+    /// <see cref="TensorRpc{T}.Dispose"/> so sibling instances'
+    /// registrations stay live.</summary>
+    public void Unregister(int rank, string name)
+    {
+        lock (_gate) _handlers.Remove((rank, name));
     }
 }

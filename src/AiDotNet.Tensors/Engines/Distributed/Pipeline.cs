@@ -79,13 +79,27 @@ public sealed class GPipeSchedule<T>
     /// stage 0; ignored elsewhere.</param>
     /// <param name="lossInitialGrads">Per-micro-batch initial gradient
     /// (typically ones for the loss seed). Required on the last stage.</param>
-    public Tensor<T>[] Run(IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
+    public Tensor<T>[] Run(int numMicroBatches,
+        IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
     {
-        int M = (microBatches?.Count) ?? (lossInitialGrads?.Count) ?? 0;
-        if (M == 0) throw new ArgumentException("At least one micro-batch is required.");
+        if (numMicroBatches <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numMicroBatches),
+                "numMicroBatches must be positive — middle ranks (microBatches=null and " +
+                "lossInitialGrads=null) can't infer the count from edge inputs.");
+        int M = numMicroBatches;
 
         bool isFirst = _group.Rank == 0;
         bool isLast = _group.Rank == _group.WorldSize - 1;
+
+        // Validate edge inputs against the explicit count.
+        if (isFirst && (microBatches is null || microBatches.Count != M))
+            throw new ArgumentException(
+                $"Stage 0 must receive exactly {M} microBatches; got {microBatches?.Count ?? 0}.",
+                nameof(microBatches));
+        if (isLast && (lossInitialGrads is null || lossInitialGrads.Count != M))
+            throw new ArgumentException(
+                $"Last stage must receive exactly {M} loss initial gradients; got {lossInitialGrads?.Count ?? 0}.",
+                nameof(lossInitialGrads));
 
         // Forward fill-drain: every micro-batch flows through every stage.
         var fwdActs = new Tensor<T>[M];
@@ -98,15 +112,6 @@ public sealed class GPipeSchedule<T>
             }
             else
             {
-                // Receive from previous stage. Shape must be agreed upon
-                // — typically the framework knows from the sub-model
-                // signature; here we accept any shape via a shape-handshake
-                // micro-message. Simpler approach: caller guarantees the
-                // upstream stage's output shape matches `lossInitialGrads`
-                // if provided, or a known activation-shape contract.
-                // For the in-process backend, the recv can use the actual
-                // tensor object size; for the network backend, the sender
-                // would prepend the shape.
                 input = ReceiveActivation(m);
             }
             fwdActs[m] = _stage.Forward(input);
@@ -128,9 +133,28 @@ public sealed class GPipeSchedule<T>
             }
             grads[m] = _stage.Backward(gradOut);
             if (!isFirst) _group.Send(grads[m], dst: _group.Rank - 1, tag: 100_000 + m);
+            // Free intermediate ranks' fwdActs as soon as backward
+            // for that micro-batch is done — only the last rank
+            // returns them, so non-last ranks don't need to retain.
+            if (!isLast) fwdActs[m] = null!;
         }
 
         return isLast ? fwdActs : Array.Empty<Tensor<T>>();
+    }
+
+    /// <summary>Backwards-compat overload — infers M from edge
+    /// inputs. Throws on middle ranks since neither edge input is
+    /// available there.</summary>
+    [Obsolete("Use the overload that takes numMicroBatches explicitly. The legacy " +
+        "edge-only inference deadlocks middle ranks where both lists are null.")]
+    public Tensor<T>[] Run(IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
+    {
+        int M = (microBatches?.Count) ?? (lossInitialGrads?.Count) ?? 0;
+        if (M == 0)
+            throw new InvalidOperationException(
+                "Cannot infer numMicroBatches on middle ranks; pass it explicitly to the " +
+                "Run(int, ...) overload.");
+        return Run(M, microBatches, lossInitialGrads);
     }
 
     private Tensor<T> ReceiveActivation(int m)
@@ -143,13 +167,13 @@ public sealed class GPipeSchedule<T>
         // equality, so a real implementation would either prepend a
         // shape or pass a typed contract. Here we trust the queued
         // object's shape via a custom recv path:
-        var msg = ((InProcessGroup)_group).RecvSized<T>(_group.Rank - 1, m);
+        var msg = _group.RecvDiscoverShape<T>(_group.Rank - 1, m);
         return msg;
     }
 
     private Tensor<T> ReceiveGrad(int m)
     {
-        var msg = ((InProcessGroup)_group).RecvSized<T>(_group.Rank + 1, 100_000 + m);
+        var msg = _group.RecvDiscoverShape<T>(_group.Rank + 1, 100_000 + m);
         return msg;
     }
 }
@@ -184,20 +208,30 @@ public sealed class OneForwardOneBackwardSchedule<T>
     ///   <item>Cooldown: drain remaining backwards.</item>
     /// </list>
     /// </summary>
-    public Tensor<T>[] Run(IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
+    public Tensor<T>[] Run(int numMicroBatches,
+        IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
     {
-        int M = (microBatches?.Count) ?? (lossInitialGrads?.Count) ?? 0;
+        if (numMicroBatches <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numMicroBatches),
+                "numMicroBatches must be positive — middle ranks can't infer it from edge inputs.");
+        int M = numMicroBatches;
         bool isFirst = _group.Rank == 0;
         bool isLast = _group.Rank == _group.WorldSize - 1;
         int S = _stage.StageIndex;
         int W = _stage.NumStages;
+        if (isFirst && (microBatches is null || microBatches.Count != M))
+            throw new ArgumentException(
+                $"Stage 0 must receive exactly {M} microBatches.", nameof(microBatches));
+        if (isLast && (lossInitialGrads is null || lossInitialGrads.Count != M))
+            throw new ArgumentException(
+                $"Last stage must receive exactly {M} loss initial gradients.", nameof(lossInitialGrads));
 
         // Warmup: this stage runs (W - S) forward steps before the first backward.
         int warmup = Math.Min(W - S, M);
         var fwdActs = new Tensor<T>[M];
         for (int m = 0; m < warmup; m++)
         {
-            var input = isFirst ? microBatches![m] : ((InProcessGroup)_group).RecvSized<T>(_group.Rank - 1, m);
+            var input = isFirst ? microBatches![m] : _group.RecvDiscoverShape<T>(_group.Rank - 1, m);
             fwdActs[m] = _stage.Forward(input);
             if (!isLast) _group.Send(fwdActs[m], dst: _group.Rank + 1, tag: m);
         }
@@ -208,14 +242,14 @@ public sealed class OneForwardOneBackwardSchedule<T>
         {
             // Backward for the oldest pending micro-batch.
             var gradOut = isLast ? lossInitialGrads![bwdIdx]
-                                 : ((InProcessGroup)_group).RecvSized<T>(_group.Rank + 1, 100_000 + bwdIdx);
+                                 : _group.RecvDiscoverShape<T>(_group.Rank + 1, 100_000 + bwdIdx);
             var gradIn = _stage.Backward(gradOut);
             if (!isFirst) _group.Send(gradIn, dst: _group.Rank - 1, tag: 100_000 + bwdIdx);
             bwdIdx++;
 
             // Forward for the next micro-batch.
             var input = isFirst ? microBatches![fwdIdx]
-                                : ((InProcessGroup)_group).RecvSized<T>(_group.Rank - 1, fwdIdx);
+                                : _group.RecvDiscoverShape<T>(_group.Rank - 1, fwdIdx);
             fwdActs[fwdIdx] = _stage.Forward(input);
             if (!isLast) _group.Send(fwdActs[fwdIdx], dst: _group.Rank + 1, tag: fwdIdx);
             fwdIdx++;
@@ -225,12 +259,27 @@ public sealed class OneForwardOneBackwardSchedule<T>
         while (bwdIdx < M)
         {
             var gradOut = isLast ? lossInitialGrads![bwdIdx]
-                                 : ((InProcessGroup)_group).RecvSized<T>(_group.Rank + 1, 100_000 + bwdIdx);
+                                 : _group.RecvDiscoverShape<T>(_group.Rank + 1, 100_000 + bwdIdx);
             var gradIn = _stage.Backward(gradOut);
             if (!isFirst) _group.Send(gradIn, dst: _group.Rank - 1, tag: 100_000 + bwdIdx);
+            // 1F1B's main memory-saving property: drop activations as
+            // each backward finishes on intermediate ranks. Only the
+            // last rank returns them.
+            if (!isLast) fwdActs[bwdIdx] = null!;
             bwdIdx++;
         }
 
         return isLast ? fwdActs : Array.Empty<Tensor<T>>();
+    }
+
+    /// <summary>Legacy overload — see GPipeSchedule.Run for rationale.</summary>
+    [Obsolete("Use the overload that takes numMicroBatches explicitly.")]
+    public Tensor<T>[] Run(IReadOnlyList<Tensor<T>>? microBatches, IReadOnlyList<Tensor<T>>? lossInitialGrads)
+    {
+        int M = (microBatches?.Count) ?? (lossInitialGrads?.Count) ?? 0;
+        if (M == 0)
+            throw new InvalidOperationException(
+                "Cannot infer numMicroBatches on middle ranks; pass it explicitly.");
+        return Run(M, microBatches, lossInitialGrads);
     }
 }
