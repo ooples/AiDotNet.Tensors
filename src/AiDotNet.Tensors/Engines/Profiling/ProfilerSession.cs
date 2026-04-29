@@ -26,6 +26,11 @@ public sealed class ProfilerSession : IDisposable
     // them onto every fresh buffer after a flush/reset so subsequent exports remain
     // self-describing — Reset() previously dropped these silently.
     private readonly List<TraceEvent> _metadataPrologue = new();
+    // Serializes buffer swaps against concurrent enqueues so the event counter and the
+    // queue identity stay in sync — without it, a producer thread could increment the
+    // counter, then the swapper resets it, then the producer dequeues from the wrong
+    // queue when it tries to evict at capacity, breaking retention accounting.
+    private readonly object _bufferGate = new();
     private readonly int _maxEvents;
     private readonly int _processId;
 
@@ -178,11 +183,17 @@ public sealed class ProfilerSession : IDisposable
     /// counter stays in sync with the new live queue.</summary>
     private ConcurrentQueue<TraceEvent> SwapBuffer()
     {
-        var fresh = new ConcurrentQueue<TraceEvent>();
-        foreach (var ev in _metadataPrologue) fresh.Enqueue(ev);
-        var old = System.Threading.Interlocked.Exchange(ref _events, fresh);
-        System.Threading.Volatile.Write(ref _eventCount, _metadataPrologue.Count);
-        return old;
+        // Take the gate so a concurrent enqueue can't observe a partially-rotated state
+        // (e.g. counter reset but queue not yet swapped, or vice versa).
+        lock (_bufferGate)
+        {
+            var fresh = new ConcurrentQueue<TraceEvent>();
+            foreach (var ev in _metadataPrologue) fresh.Enqueue(ev);
+            var old = _events;
+            _events = fresh;
+            _eventCount = _metadataPrologue.Count;
+            return old;
+        }
     }
 
     /// <summary>Flushes the trace to the registered handler one last time
@@ -237,14 +248,20 @@ public sealed class ProfilerSession : IDisposable
         // long-running profile can't OOM. The drop is silent — the alternative
         // would be to throw, which is hostile during a profiling run that the
         // user might not be able to easily restart.
-        if (System.Threading.Interlocked.Increment(ref _eventCount) > _maxEvents)
+        //
+        // Serialise with SwapBuffer via _bufferGate so the increment, the eviction-from-
+        // queue, and the queue-identity are always consistent: without the lock, a
+        // SwapBuffer running between Increment and TryDequeue would evict from the WRONG
+        // queue and corrupt the retention accounting.
+        lock (_bufferGate)
         {
-            if (_events.TryDequeue(out _))
-                System.Threading.Interlocked.Decrement(ref _eventCount);
-            else
-                System.Threading.Interlocked.Decrement(ref _eventCount);
+            if (++_eventCount > _maxEvents)
+            {
+                if (_events.TryDequeue(out _)) _eventCount--;
+                else _eventCount--;
+            }
+            _events.Enqueue(ev);
         }
-        _events.Enqueue(ev);
     }
 
     private long TicksToMicros(long ticks)
