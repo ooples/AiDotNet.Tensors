@@ -53,25 +53,34 @@ internal static class CuSparseBackend
             throw new InvalidOperationException("cuSPARSE backend is not available.");
 
         var backend = CudaBackend.CreateOrThrow();
-        var aValuesBuf = backend.AllocateBuffer(values);
-        var bBuf = backend.AllocateBuffer(b);
         var output = new float[rows * n];
-        var outBuf = backend.AllocateBuffer(output);
 
-        // int[] payloads need byte-buffer transport.
-        var rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
-        var colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
-        UploadInts(rowPtrBuf.Handle, rowPtr);
-        UploadInts(colIdxBuf.Handle, colIdx);
-
+        // All allocations sit inside the try/finally so an exception
+        // anywhere along the upload/descriptor-create chain still hits
+        // the cleanup branch — without this, a throw between the first
+        // AllocateBuffer and the try would leak every device buffer
+        // already allocated above (including any HGlobal pins). The
+        // null-checks in the finally make every cleanup branch
+        // independent so we don't skip later cleanups on partial init.
+        IGpuBuffer? aValuesBuf = null, bBuf = null, outBuf = null;
+        IGpuBuffer? rowPtrBuf = null, colIdxBuf = null, workspaceBuf = null;
         IntPtr handle = IntPtr.Zero;
         IntPtr matA = IntPtr.Zero, matB = IntPtr.Zero, matC = IntPtr.Zero;
-        IntPtr alphaPin = Marshal.AllocHGlobal(sizeof(float));
-        IntPtr betaPin = Marshal.AllocHGlobal(sizeof(float));
-        IntPtr workspace = IntPtr.Zero;
-        IGpuBuffer? workspaceBuf = null;
+        IntPtr alphaPin = IntPtr.Zero, betaPin = IntPtr.Zero, workspace = IntPtr.Zero;
         try
         {
+            aValuesBuf = backend.AllocateBuffer(values);
+            bBuf = backend.AllocateBuffer(b);
+            outBuf = backend.AllocateBuffer(output);
+
+            // int[] payloads need byte-buffer transport.
+            rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
+            colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
+            UploadInts(rowPtrBuf.Handle, rowPtr);
+            UploadInts(colIdxBuf.Handle, colIdx);
+
+            alphaPin = Marshal.AllocHGlobal(sizeof(float));
+            betaPin = Marshal.AllocHGlobal(sizeof(float));
             Marshal.StructureToPtr(1.0f, alphaPin, false);
             Marshal.StructureToPtr(0.0f, betaPin, false);
 
@@ -118,13 +127,13 @@ internal static class CuSparseBackend
             if (matA != IntPtr.Zero) CuSparseNative.cusparseDestroySpMat(matA);
             if (handle != IntPtr.Zero) CuSparseNative.cusparseDestroy(handle);
             workspaceBuf?.Dispose();
-            outBuf.Dispose();
-            bBuf.Dispose();
-            aValuesBuf.Dispose();
-            rowPtrBuf.Dispose();
-            colIdxBuf.Dispose();
-            Marshal.FreeHGlobal(alphaPin);
-            Marshal.FreeHGlobal(betaPin);
+            outBuf?.Dispose();
+            bBuf?.Dispose();
+            aValuesBuf?.Dispose();
+            rowPtrBuf?.Dispose();
+            colIdxBuf?.Dispose();
+            if (alphaPin != IntPtr.Zero) Marshal.FreeHGlobal(alphaPin);
+            if (betaPin != IntPtr.Zero) Marshal.FreeHGlobal(betaPin);
         }
     }
 

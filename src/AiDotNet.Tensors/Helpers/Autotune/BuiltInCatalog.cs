@@ -233,6 +233,14 @@ internal static class BuiltInCatalog
         var output = new float[rows * cols];
         const int iters = 5;
 
+        // Materialise the dense form ONCE outside the timed region.
+        // Including ToDense inside the dense branch's timer would
+        // charge the format-conversion cost to every dense iteration
+        // and bias the autotuner toward "csr" for the wrong reason —
+        // a real caller already has the dense representation when
+        // they're choosing a kernel.
+        float[]? aDense = variant == "dense" ? ToDense(rowPtr, colIdx, values, rows, k) : null;
+
         // Warm up.
         if (variant == "csr")
         {
@@ -241,10 +249,8 @@ internal static class BuiltInCatalog
         }
         else
         {
-            // Dense reference: materialize A then SGEMM.
-            var aDense = ToDense(rowPtr, colIdx, values, rows, k);
-            SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
-            SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
+            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
         }
         ct.ThrowIfCancellationRequested();
 
@@ -259,11 +265,10 @@ internal static class BuiltInCatalog
         }
         else
         {
-            var aDense = ToDense(rowPtr, colIdx, values, rows, k);
             for (int i = 0; i < iters; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
+                SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
             }
         }
         sw.Stop();

@@ -37,22 +37,30 @@ internal static class HipSparseBackend
         if (!backend.IsAvailable)
             throw new InvalidOperationException("HIP backend failed to initialise.");
 
-        var aValuesBuf = backend.AllocateBuffer(values);
-        var bBuf = backend.AllocateBuffer(b);
         var output = new float[rows * n];
-        var outBuf = backend.AllocateBuffer(output);
-        var rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
-        var colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
-        UploadInts(rowPtrBuf.Handle, rowPtr);
-        UploadInts(colIdxBuf.Handle, colIdx);
-
+        // All allocations / pins live inside the try so any failure in
+        // backend.AllocateBuffer / AllocateByteBuffer / UploadInts /
+        // Marshal.AllocHGlobal still hits the cleanup branch. Without
+        // this guard, a throw between two allocations leaked every
+        // earlier device buffer (and any HGlobal pin) — same fix
+        // pattern as CuSparseBackend.
+        IGpuBuffer? aValuesBuf = null, bBuf = null, outBuf = null;
+        IGpuBuffer? rowPtrBuf = null, colIdxBuf = null, workspaceBuf = null;
         IntPtr handle = IntPtr.Zero;
         IntPtr matA = IntPtr.Zero, matB = IntPtr.Zero, matC = IntPtr.Zero;
-        IntPtr alphaPin = Marshal.AllocHGlobal(sizeof(float));
-        IntPtr betaPin = Marshal.AllocHGlobal(sizeof(float));
-        IGpuBuffer? workspaceBuf = null;
+        IntPtr alphaPin = IntPtr.Zero, betaPin = IntPtr.Zero;
         try
         {
+            aValuesBuf = backend.AllocateBuffer(values);
+            bBuf = backend.AllocateBuffer(b);
+            outBuf = backend.AllocateBuffer(output);
+            rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
+            colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
+            UploadInts(rowPtrBuf.Handle, rowPtr);
+            UploadInts(colIdxBuf.Handle, colIdx);
+
+            alphaPin = Marshal.AllocHGlobal(sizeof(float));
+            betaPin = Marshal.AllocHGlobal(sizeof(float));
             Marshal.StructureToPtr(1.0f, alphaPin, false);
             Marshal.StructureToPtr(0.0f, betaPin, false);
 
@@ -101,13 +109,13 @@ internal static class HipSparseBackend
             if (matA != IntPtr.Zero) RocSparseNative.rocsparse_destroy_spmat_descr(matA);
             if (handle != IntPtr.Zero) RocSparseNative.rocsparse_destroy_handle(handle);
             workspaceBuf?.Dispose();
-            outBuf.Dispose();
-            bBuf.Dispose();
-            aValuesBuf.Dispose();
-            rowPtrBuf.Dispose();
-            colIdxBuf.Dispose();
-            Marshal.FreeHGlobal(alphaPin);
-            Marshal.FreeHGlobal(betaPin);
+            outBuf?.Dispose();
+            bBuf?.Dispose();
+            aValuesBuf?.Dispose();
+            rowPtrBuf?.Dispose();
+            colIdxBuf?.Dispose();
+            if (alphaPin != IntPtr.Zero) Marshal.FreeHGlobal(alphaPin);
+            if (betaPin != IntPtr.Zero) Marshal.FreeHGlobal(betaPin);
         }
     }
 

@@ -25,7 +25,45 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 internal static class CuSparseNative
 {
+    // Windows ships the lib as cusparse64_12.dll, Linux as
+    // libcusparse.so.12. .NET's native loader probes
+    // {name}.so / lib{name}.so / {name} / lib{name} from this string,
+    // so plain "cusparse64_12" never resolves to libcusparse.so.12 on
+    // Linux — IsAvailable would stay false on every host with a
+    // standard CUDA 12 install. We register a DllImportResolver below
+    // that maps the Windows-style name to the canonical Linux SONAME
+    // so the binding works on both platforms.
     private const string Lib = "cusparse64_12";
+
+#if NET5_0_OR_GREATER
+    static CuSparseNative()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(CuSparseNative).Assembly, ResolveLib);
+    }
+
+    private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)
+    {
+        if (name != Lib) return IntPtr.Zero;
+        // Try the platform-canonical names first, then fall back to
+        // the original. NativeLibrary.TryLoad returns false rather
+        // than throwing so we can chain candidates without
+        // exception-driven control flow.
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            if (NativeLibrary.TryLoad("libcusparse.so.12", asm, path, out var h)) return h;
+            if (NativeLibrary.TryLoad("libcusparse.so", asm, path, out h)) return h;
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // macOS doesn't ship a CUDA cuSPARSE — return zero so the
+            // probe fails gracefully and we route to the CPU path.
+            return IntPtr.Zero;
+        }
+        // Default — let the loader handle the original name (Windows
+        // ships cusparse64_12.dll which matches the const above).
+        return IntPtr.Zero;
+    }
+#endif
 
     public enum Status
     {

@@ -30,9 +30,18 @@ internal static class MpsSparseBackend
 {
     private const string LibMPS = "/System/Library/Frameworks/MetalPerformanceShaders.framework/MetalPerformanceShaders";
 
-    /// <summary>Whether the MPS sparse path can run on this host —
-    /// macOS 13+ and Metal device available.</summary>
-    public static bool IsAvailable => MetalNativeBindings.IsPlatformSupported && ProbeMpsSparse();
+    /// <summary>Whether the MPS sparse path can run on this host. Always
+    /// <c>false</c> at this commit — the descriptor-lifecycle binding
+    /// (commandBuffer / sparseMatrix / denseMatrix / encode) needs an
+    /// Apple-Silicon CI runner for end-to-end validation, and
+    /// <see cref="SpMM"/> currently throws <see cref="NotSupportedException"/>.
+    /// Returning <c>true</c> when the underlying class is reachable
+    /// would cause <c>SparseOps.SparseMatMul</c> to dispatch into a
+    /// method that always throws — turning a CPU fallback into a hard
+    /// failure on every macOS host with the probed class present. When
+    /// SpMM is wired, flip this back to
+    /// <c>MetalNativeBindings.IsPlatformSupported &amp;&amp; ProbeMpsSparse()</c>.</summary>
+    public static bool IsAvailable => false;
 
     private static bool _probed;
     private static bool _probedOk;

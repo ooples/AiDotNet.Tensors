@@ -155,14 +155,22 @@ public static class SparseOps
     /// </summary>
     public static Tensor<T> SparseAddMM<T>(Tensor<T> c, SparseTensor<T> a, Tensor<T> b, T alpha, T beta)
     {
+        if (c is null) throw new ArgumentNullException(nameof(c));
         var product = SparseMatMul(a, b);
         var ops = MathHelper.GetNumericOperations<T>();
+        // Length check alone treated [2,4] and [4,2] as interchangeable
+        // and silently added the wrong layout. Require rank + per-axis
+        // shape match against the A·B product so a misshaped C surfaces
+        // as a clear error rather than producing garbage.
+        if (c.Rank != 2 || c._shape[0] != product._shape[0] || c._shape[1] != product._shape[1])
+            throw new ArgumentException(
+                $"C must be 2-D with shape [{product._shape[0]}, {product._shape[1]}] (matching A·B); " +
+                $"got rank {c.Rank} with shape [{string.Join(", ", c._shape)}].",
+                nameof(c));
         var output = new Tensor<T>((int[])product._shape.Clone());
         var pSpan = product.AsSpan();
         var cSpan = c.AsSpan();
         var oSpan = output.AsWritableSpan();
-        if (cSpan.Length != pSpan.Length)
-            throw new ArgumentException($"C length {cSpan.Length} doesn't match A·B output length {pSpan.Length}.");
         for (int i = 0; i < oSpan.Length; i++)
             oSpan[i] = ops.Add(ops.Multiply(alpha, pSpan[i]), ops.Multiply(beta, cSpan[i]));
         return output;
@@ -176,6 +184,11 @@ public static class SparseOps
         if (denseBatch is null) throw new ArgumentNullException(nameof(denseBatch));
         if (denseBatch.Rank != 3)
             throw new ArgumentException("denseBatch must be 3-D [batch, k, n].", nameof(denseBatch));
+        // Empty batch: indexing batchSparse[0] below would throw an
+        // IndexOutOfRangeException with no diagnostic. Reject empty up
+        // front with a clear message.
+        if (batchSparse.Length == 0)
+            throw new ArgumentException("batchSparse must contain at least one sparse tensor.", nameof(batchSparse));
         if (batchSparse.Length != denseBatch._shape[0])
             throw new ArgumentException("Batch dim mismatch between sparse list and dense batch.");
 
@@ -183,6 +196,21 @@ public static class SparseOps
         int outRows = batchSparse[0].Rows;
         int outCols = denseBatch._shape[2];
         int k = batchSparse[0].Columns;
+        // Mixed-shape batch: SparseMatMul would throw deep inside the
+        // per-batch loop AFTER the output tensor is allocated and
+        // partially populated, leaving an invalid result + work
+        // wasted. Validate every batch member's shape (and null) up
+        // front so the caller fails fast.
+        for (int i = 0; i < batch; i++)
+        {
+            if (batchSparse[i] is null)
+                throw new ArgumentException($"batchSparse[{i}] cannot be null.", nameof(batchSparse));
+            if (batchSparse[i].Rows != outRows || batchSparse[i].Columns != k)
+                throw new ArgumentException(
+                    $"All sparse batch members must share shape [{outRows}, {k}]; " +
+                    $"batchSparse[{i}] is [{batchSparse[i].Rows}, {batchSparse[i].Columns}].",
+                    nameof(batchSparse));
+        }
         var output = new Tensor<T>(new[] { batch, outRows, outCols });
         var outSpan = output.AsWritableSpan();
 

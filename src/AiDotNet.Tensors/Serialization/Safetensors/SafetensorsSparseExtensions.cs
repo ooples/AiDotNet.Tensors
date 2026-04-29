@@ -117,7 +117,7 @@ public static class SafetensorsSparseExtensions
     {
         // tag := "<kind>:<rows>x<cols>" or "<kind>:<rows>x<cols>:<br>x<bc>"
         var parts = tag.Split(':');
-        if (parts.Length < 2)
+        if (parts.Length < 2 || parts.Length > 3)
             throw new FormatException($"Malformed sparse-format tag '{tag}'.");
         string kind = parts[0];
         var dims = parts[1].Split('x');
@@ -134,6 +134,21 @@ public static class SafetensorsSparseExtensions
             br = int.Parse(blockDims[0]);
             bc = int.Parse(blockDims[1]);
         }
-        return (kind, rows, cols, br, bc);
+        // Cross-validate kind vs structure: dense-pointer formats
+        // (coo/csr/csc) must NOT carry a block-dim tail; block formats
+        // (bsr/bsc) MUST carry positive block dims. The earlier code
+        // accepted "bsr:4x4" with br=bc=0 and forwarded that into
+        // FromBsr's `blockRowSize <= 0` guard — leaking the corruption
+        // path through several downstream layers before throwing.
+        return kind switch
+        {
+            "coo" or "csr" or "csc" when parts.Length == 2 => (kind, rows, cols, 0, 0),
+            "bsr" or "bsc" when parts.Length == 3 && br > 0 && bc > 0 => (kind, rows, cols, br, bc),
+            "coo" or "csr" or "csc" => throw new FormatException(
+                $"Unexpected block dims in sparse-format tag '{tag}' for non-block kind '{kind}'."),
+            "bsr" or "bsc" => throw new FormatException(
+                $"Missing or non-positive block dims in sparse-format tag '{tag}' for block kind '{kind}'."),
+            _ => throw new FormatException($"Unknown sparse-format tag '{tag}'."),
+        };
     }
 }

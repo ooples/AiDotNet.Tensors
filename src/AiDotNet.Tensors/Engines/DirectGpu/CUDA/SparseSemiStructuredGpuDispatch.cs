@@ -17,8 +17,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 internal static class SparseSemiStructuredGpuDispatch
 {
-    private static readonly ConcurrentDictionary<int, IntPtr> _moduleCache = new();
-    private static readonly ConcurrentDictionary<int, IntPtr> _functionCache = new();
+    // Cache key includes (variant, sm-major, sm-minor) so a multi-GPU
+    // process with mixed compute capabilities doesn't reuse a module
+    // compiled for sm_80 on a sm_75 device (or vice-versa). Keying by
+    // variant alone meant the FIRST GPU compiled for would lock the
+    // module for every subsequent GPU — defeating the multi-GPU
+    // correctness this dispatcher's docstring claims.
+    private static readonly ConcurrentDictionary<(int Variant, int Major, int Minor), IntPtr> _moduleCache = new();
+    private static readonly ConcurrentDictionary<(int Variant, int Major, int Minor), IntPtr> _functionCache = new();
 
     /// <summary>Whether a CUDA backend is reachable for 2:4 dispatch.</summary>
     public static bool IsAvailable => CudaBackend.IsCudaAvailable;
@@ -38,61 +44,81 @@ internal static class SparseSemiStructuredGpuDispatch
             throw new InvalidOperationException("CUDA backend is not available for 2:4 sparse dispatch.");
 
         var backend = CudaBackend.CreateOrThrow();
-        var packedBuf = backend.AllocateBuffer(packedValues);
-        var bBuf = backend.AllocateBuffer(b);
         var output = new float[rows * n];
-        var outBuf = backend.AllocateBuffer(output);
-        var metaBuf = backend.AllocateByteBuffer(metadata.Length);
-        UploadBytes(metaBuf.Handle, metadata);
-
-        // Block tile: 16 cols × 16 rows is friendly to memory coalescing
-        // for the baseline kernel and to the warp-cooperative tile shape
-        // for the Ampere kernel.
-        const int blockX = 16, blockY = 16;
-        int gridX = (n + blockX - 1) / blockX;
-        int gridY = (rows + blockY - 1) / blockY;
-
-        // Pick variant by compute capability — 8.0+ gets the mma.sp kernel.
-        int variant = ComputeCapabilityMajor() >= 8 ? 1 : 0;
-        IntPtr fn = GetOrCompileKernel(variant);
-
-        // Marshal kernel arguments — pinned IntPtr array of pointers.
-        unsafe
+        // Allocate inside the try so any failure during alloc /
+        // upload / kernel compile / launch / download still hits the
+        // disposal branch. The previous flat layout disposed only on
+        // the happy path — every error path between AllocateBuffer
+        // and the final outBuf.Dispose() leaked GPU memory.
+        IGpuBuffer? packedBuf = null, bBuf = null, outBuf = null, metaBuf = null;
+        try
         {
-            IntPtr aPtr = packedBuf.Handle;
-            IntPtr metaPtr = metaBuf.Handle;
-            IntPtr bPtr = bBuf.Handle;
-            IntPtr outPtr = outBuf.Handle;
-            void*[] args = new void*[]
-            {
-                &aPtr, &metaPtr, &bPtr, &outPtr,
-                &rows, &cols, &n,
-            };
-            fixed (void** pArgs = args)
-            {
-                var status = CudaNativeBindings.cuLaunchKernel(
-                    fn,
-                    (uint)gridX, (uint)gridY, 1u,
-                    (uint)blockX, (uint)blockY, 1u,
-                    sharedMemBytes: 0u,
-                    stream: IntPtr.Zero,
-                    kernelParams: (IntPtr)pArgs,
-                    extra: IntPtr.Zero);
-                CuBlasNative.CheckCudaResult(status, "cuLaunchKernel(sparse_2_4_matmul)");
-            }
-        }
+            packedBuf = backend.AllocateBuffer(packedValues);
+            bBuf = backend.AllocateBuffer(b);
+            outBuf = backend.AllocateBuffer(output);
+            metaBuf = backend.AllocateByteBuffer(metadata.Length);
+            UploadBytes(metaBuf.Handle, metadata);
 
-        backend.DownloadBuffer(outBuf, output);
-        outBuf.Dispose();
-        bBuf.Dispose();
-        metaBuf.Dispose();
-        packedBuf.Dispose();
-        return output;
+            // Block tile: 16 cols × 16 rows is friendly to memory coalescing
+            // for the baseline kernel and to the warp-cooperative tile shape
+            // for the Ampere kernel.
+            const int blockX = 16, blockY = 16;
+            int gridX = (n + blockX - 1) / blockX;
+            int gridY = (rows + blockY - 1) / blockY;
+
+            // Pick variant by compute capability — 8.0+ gets the mma.sp kernel.
+            int variant = ComputeCapabilityMajor() >= 8 ? 1 : 0;
+            IntPtr fn = GetOrCompileKernel(variant);
+
+            // Marshal kernel arguments — pinned IntPtr array of pointers.
+            unsafe
+            {
+                IntPtr aPtr = packedBuf.Handle;
+                IntPtr metaPtr = metaBuf.Handle;
+                IntPtr bPtr = bBuf.Handle;
+                IntPtr outPtr = outBuf.Handle;
+                void*[] args = new void*[]
+                {
+                    &aPtr, &metaPtr, &bPtr, &outPtr,
+                    &rows, &cols, &n,
+                };
+                fixed (void** pArgs = args)
+                {
+                    var status = CudaNativeBindings.cuLaunchKernel(
+                        fn,
+                        (uint)gridX, (uint)gridY, 1u,
+                        (uint)blockX, (uint)blockY, 1u,
+                        sharedMemBytes: 0u,
+                        stream: IntPtr.Zero,
+                        kernelParams: (IntPtr)pArgs,
+                        extra: IntPtr.Zero);
+                    CuBlasNative.CheckCudaResult(status, "cuLaunchKernel(sparse_2_4_matmul)");
+                }
+            }
+
+            backend.DownloadBuffer(outBuf, output);
+            return output;
+        }
+        finally
+        {
+            outBuf?.Dispose();
+            bBuf?.Dispose();
+            metaBuf?.Dispose();
+            packedBuf?.Dispose();
+        }
     }
 
     private static IntPtr GetOrCompileKernel(int variant)
     {
-        if (_functionCache.TryGetValue(variant, out var cached)) return cached;
+        // Snapshot the SM arch ONCE — a single dispatcher call must
+        // compile, cache, and look up against the same (major, minor)
+        // pair, otherwise a process that switched current device
+        // between the two reads could keep adding cache entries that
+        // don't match either hardware.
+        int major = ComputeCapabilityMajor();
+        int minor = ComputeCapabilityMinor();
+        var key = (variant, major, minor);
+        if (_functionCache.TryGetValue(key, out var cached)) return cached;
 
         // Compile through the same NVRTC path the rest of the engine uses.
         // The CudaBackend exposes a reusable kernel-module compiler; we
@@ -114,7 +140,7 @@ internal static class SparseSemiStructuredGpuDispatch
 
         try
         {
-            string arch = $"--gpu-architecture=sm_{ComputeCapabilityMajor()}{ComputeCapabilityMinor()}";
+            string arch = $"--gpu-architecture=sm_{major}{minor}";
             string[] options = new[] { arch };
             var compileResult = NvrtcNativeBindings.nvrtcCompileProgram(program, options.Length, options);
             if (compileResult != NvrtcResult.Success)
@@ -127,16 +153,16 @@ internal static class SparseSemiStructuredGpuDispatch
                 NvrtcNativeBindings.nvrtcGetPTX(program, ptxBuffer);
                 var loadResult = CudaNativeBindings.cuModuleLoadData(out IntPtr module, ptxBuffer);
                 CuBlasNative.CheckCudaResult(loadResult, "cuModuleLoadData(sparse_2_4)");
-                _moduleCache[variant] = module;
+                _moduleCache[key] = module;
             }
             finally
             {
                 System.Runtime.InteropServices.Marshal.FreeHGlobal(ptxBuffer);
             }
-            var moduleHandle = _moduleCache[variant];
+            var moduleHandle = _moduleCache[key];
             var fnResult = CudaNativeBindings.cuModuleGetFunction(out IntPtr fn, moduleHandle, entry);
             CuBlasNative.CheckCudaResult(fnResult, $"cuModuleGetFunction({entry})");
-            _functionCache[variant] = fn;
+            _functionCache[key] = fn;
             return fn;
         }
         finally

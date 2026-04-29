@@ -290,17 +290,28 @@ public static class SparseAutograd
     public static Tensor<T> SparseSpGeMMRecord<T>(SparseTensor<T> a, SparseTensor<T> b,
         Tensor<T> aDense, Tensor<T> bDense)
     {
+        if (aDense is null) throw new ArgumentNullException(nameof(aDense));
+        if (bDense is null) throw new ArgumentNullException(nameof(bDense));
         var sparseOut = SparseOps.SparseSpGeMM(a, b);
         var output = sparseOut.ToDense();
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
+        // Snapshot both dense views at forward time. Without these,
+        // backward reads inputs[0]/inputs[1] which still point at the
+        // caller's tensors — if those are mutated between forward and
+        // backward (a real pattern in optimisers that modify weights
+        // in-place between tape recording and ComputeGradients), the
+        // matmul transposes use the wrong values and gradients are
+        // wrong. Matches the snapshot pattern used by SparseMatMul.
+        var aSnapshot = aDense.Clone();
+        var bSnapshot = bDense.Clone();
         DifferentiableOps.RecordBinary(
             "SparseSpGeMM",
             output,
             aDense,
             bDense,
             SpGeMMBackward<T>,
-            savedState: null);
+            savedState: new object[] { aSnapshot, bSnapshot });
         return output;
     }
 
@@ -421,16 +432,24 @@ public static class SparseAutograd
         System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
     {
         // dA = grad · B^T,  dB = A^T · grad  — same Jacobian as dense matmul.
-        var aDense = inputs[0];
-        var bDense = inputs[1];
-        var bT = engine.TensorTranspose(bDense);
+        // inputs[0]/inputs[1] are the caller-visible gradient targets;
+        // savedState carries the forward-time snapshots so the matmul
+        // transposes use the values that produced this output even if
+        // the caller mutated their tensors in-place between forward
+        // and backward.
+        var aDense = inputs[0];      // caller-visible gradient target
+        var bDense = inputs[1];      // caller-visible gradient target
+        var aSnapshot = (Tensor<T>)savedState[0];
+        var bSnapshot = (Tensor<T>)savedState[1];
+
+        var bT = engine.TensorTranspose(bSnapshot);
         var gradA = engine.TensorMatMul(gradOutput, bT);
         AccumulateGrad(aDense, gradA, gradAccumulator, engine);
 
-        var aT = engine.TensorTranspose(aDense);
+        var aT = engine.TensorTranspose(aSnapshot);
         var gradB = engine.TensorMatMul(aT, gradOutput);
         AccumulateGrad(bDense, gradB, gradAccumulator, engine);
-        _ = output; _ = savedState;
+        _ = output;
     }
 
     private static void AccumulateGrad<T>(
