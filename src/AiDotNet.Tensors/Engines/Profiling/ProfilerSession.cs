@@ -21,7 +21,11 @@ public sealed class ProfilerSession : IDisposable
     private readonly ProfilerSchedule? _schedule;
     private readonly long _sessionStartTicks;
     private readonly long _ticksPerSecond;
-    private readonly ConcurrentQueue<TraceEvent> _events = new();
+    private ConcurrentQueue<TraceEvent> _events = new();
+    // Metadata events (process_name, thread_name) emitted at construction time. We replay
+    // them onto every fresh buffer after a flush/reset so subsequent exports remain
+    // self-describing — Reset() previously dropped these silently.
+    private readonly List<TraceEvent> _metadataPrologue = new();
     private readonly int _maxEvents;
     private readonly int _processId;
 
@@ -44,23 +48,25 @@ public sealed class ProfilerSession : IDisposable
         // Emit a metadata event so chrome-trace UIs label the process and the
         // initial thread. Per-thread metadata is added lazily when each
         // worker thread emits its first event (see RecordCompleteInternal).
-        EnqueueEvent(TraceEvent.Metadata("process_name", _processId, threadId: 0,
-            args: new Dictionary<string, string> { ["name"] = "AiDotNet.Tensors" }));
+        var processName = TraceEvent.Metadata("process_name", _processId, threadId: 0,
+            args: new Dictionary<string, string> { ["name"] = "AiDotNet.Tensors" });
+        _metadataPrologue.Add(processName);
+        EnqueueEvent(processName);
     }
 
     /// <summary>Configuration this session was started with.</summary>
     public ProfilerOptions Options => _options;
 
     /// <summary>Snapshot of events recorded so far. Thread-safe — the returned
-    /// array is a copy at call time.</summary>
+    /// array is a copy at call time. If accessed from inside an
+    /// <see cref="ProfilerOptions.OnTraceReady"/> handler, returns just the events from the
+    /// closed window (the buffer that was swapped out before the handler fired).</summary>
     public IReadOnlyList<TraceEvent> Events
     {
         get
         {
-            // CopyTo gives a stable snapshot. Concurrent enqueues after the
-            // copy go to the next snapshot — same semantics as PyTorch.
-            var arr = _events.ToArray();
-            return arr;
+            var snap = _flushSnapshot;
+            return snap != null ? snap.ToArray() : _events.ToArray();
         }
     }
 
@@ -97,9 +103,16 @@ public sealed class ProfilerSession : IDisposable
     /// use this; user code should prefer <see cref="Profiler.Range(string)"/>
     /// which auto-times via a using-scope.
     /// </summary>
+    /// <summary>True iff CPU activity capture is enabled by the session's options.
+    /// Honours <see cref="ProfilerOptions.Activities"/>: a session configured with
+    /// <c>ProfilerActivities.None</c> or GPU/memory-only flags must not record CPU
+    /// ranges or instants.</summary>
+    private bool IsCpuCaptureEnabled() => (_options.Activities & ProfilerActivities.Cpu) != 0;
+
     internal void RecordCompleteInternal(string name, string category, long startTicks, long endTicks, IReadOnlyDictionary<string, string>? args)
     {
         if (_disposed) return;
+        if (!IsCpuCaptureEnabled()) return;
         var phase = CurrentPhase;
         if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return;
 
@@ -120,6 +133,7 @@ public sealed class ProfilerSession : IDisposable
     public void RecordInstant(string name, string category, IReadOnlyDictionary<string, string>? args = null)
     {
         if (_disposed) return;
+        if (!IsCpuCaptureEnabled()) return;
         var phase = CurrentPhase;
         if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return;
 
@@ -147,11 +161,28 @@ public sealed class ProfilerSession : IDisposable
     }
 
     /// <summary>Drops every retained event. Useful between explicit phases
-    /// when running in always-active mode.</summary>
+    /// when running in always-active mode. Atomic-swaps the live buffer for a
+    /// fresh one (preserving the metadata prologue so future exports remain
+    /// self-describing) so concurrent producers never have to coordinate with
+    /// the reset.</summary>
     public void Reset()
     {
-        while (_events.TryDequeue(out _)) { }
-        System.Threading.Volatile.Write(ref _eventCount, 0);
+        SwapBuffer();
+    }
+
+    /// <summary>Atomically replaces <see cref="_events"/> with a fresh queue seeded
+    /// with the metadata prologue, returning the old queue to the caller. Producers
+    /// that already obtained a reference to the old queue will keep enqueueing into
+    /// it harmlessly; their events are still observable on the snapshot returned to
+    /// the caller. <see cref="_eventCount"/> is reset to the prologue count so the
+    /// counter stays in sync with the new live queue.</summary>
+    private ConcurrentQueue<TraceEvent> SwapBuffer()
+    {
+        var fresh = new ConcurrentQueue<TraceEvent>();
+        foreach (var ev in _metadataPrologue) fresh.Enqueue(ev);
+        var old = System.Threading.Interlocked.Exchange(ref _events, fresh);
+        System.Threading.Volatile.Write(ref _eventCount, _metadataPrologue.Count);
+        return old;
     }
 
     /// <summary>Flushes the trace to the registered handler one last time
@@ -173,21 +204,31 @@ public sealed class ProfilerSession : IDisposable
         }
     }
 
+    /// <summary>Snapshot exposed to the OnTraceReady handler during a flush so it can
+    /// observe exactly the events that belonged to the active window — even if other
+    /// threads are still appending into the new live buffer.</summary>
+    private ConcurrentQueue<TraceEvent>? _flushSnapshot;
+
     private void FlushTraceReady()
     {
         var handler = _options.OnTraceReady;
-        handler?.Invoke(this);
-        // After the handler runs (it typically writes the trace to disk),
-        // drop the events so the next window starts clean. This matches
-        // PyTorch's behaviour: `on_trace_ready` consumes the active window.
-        Reset();
+        // Atomically swap to a fresh buffer FIRST so producers immediately move on to
+        // the next window. The drained snapshot is what we hand to the handler.
+        var snapshot = SwapBuffer();
+        if (handler != null)
+        {
+            _flushSnapshot = snapshot;
+            try { handler.Invoke(this); }
+            finally { _flushSnapshot = null; }
+        }
     }
 
     private IReadOnlyList<TraceEvent> FilterRetainedEvents()
     {
-        // The ConcurrentQueue preserves enqueue order so the snapshot is
-        // already chronological. Just materialize.
-        return _events.ToArray();
+        // During a flush the handler should see ONLY the events from the just-closed
+        // window; outside a flush we materialise the live queue.
+        var snap = _flushSnapshot;
+        return snap != null ? snap.ToArray() : _events.ToArray();
     }
 
     private void EnqueueEvent(TraceEvent ev)

@@ -148,8 +148,11 @@ public static class Profiler
 
         return session =>
         {
+            // Millisecond-stamped filenames collide when two flushes land in the same
+            // millisecond (back-to-back schedule windows on a fast machine), and File.Create
+            // overwrites silently. Append a Guid suffix so each trace lands in its own file.
             string stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", System.Globalization.CultureInfo.InvariantCulture);
-            string path = Path.Combine(directory, $"trace-{stamp}.json");
+            string path = Path.Combine(directory, $"trace-{stamp}-{Guid.NewGuid():N}.json");
             session.ExportChromeTrace(path);
         };
     }

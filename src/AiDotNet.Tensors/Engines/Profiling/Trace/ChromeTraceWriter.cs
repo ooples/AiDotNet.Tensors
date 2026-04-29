@@ -52,11 +52,11 @@ public static class ChromeTraceWriter
     /// The stream is left open; the caller owns its lifetime.</summary>
     public static void Write(Stream stream, IReadOnlyList<TraceEvent> events)
     {
-        // BufferedStream + UTF-8 writer keeps the per-event cost dominated by
-        // string formatting, not syscalls. 64 KB matches the default file-cache
-        // page size on Windows and Linux — larger buffers don't measurably help.
-        using var buffered = new BufferedStream(stream, bufferSize: 64 * 1024);
-        using var writer = new StreamWriter(buffered, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 64 * 1024, leaveOpen: true);
+        // Use StreamWriter directly with a 64 KB buffer (matches the default file-cache
+        // page size on Windows and Linux). The previous BufferedStream wrapper was
+        // redundant — and worse, disposing it would close the caller-owned underlying
+        // stream even though StreamWriter was given leaveOpen: true.
+        using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 64 * 1024, leaveOpen: true);
 
         writer.Write("{\"traceEvents\":[");
         for (int i = 0; i < events.Count; i++)
