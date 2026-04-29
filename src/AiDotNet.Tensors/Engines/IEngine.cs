@@ -49,6 +49,24 @@ public interface IEngine
     /// </remarks>
     DirectGpu.DirectGpuEngine? DirectGpu { get; }
 
+    /// <summary>
+    /// Device-wide reduce / scan / sort / histogram / RLE primitives —
+    /// the Thrust/CUB-equivalent surface this engine exposes. Backends
+    /// override to route to native libraries (cuRAND/cuSPARSE/cuSOLVER
+    /// for CUDA, MPS for Metal, etc.); the default implementation
+    /// returns a managed CPU implementation so every engine has a
+    /// usable primitive surface without explicitly opting in.
+    /// </summary>
+    /// <remarks>
+    /// Surfaced on <see cref="IEngine"/> directly so callers discover
+    /// these primitives through the same engine handle they already
+    /// use for matmul / activation / reduction APIs — without a
+    /// parallel <c>IDevicePrimitives</c> probe interface that would
+    /// duplicate the engine-discovery path.
+    /// </remarks>
+    AiDotNet.Tensors.Engines.DevicePrimitives.IDevicePrimitives DevicePrimitives
+        => AiDotNet.Tensors.Engines.DevicePrimitives.Cpu.CpuDevicePrimitivesSingleton.Instance;
+
     #region Vector Operations
 
     /// <summary>

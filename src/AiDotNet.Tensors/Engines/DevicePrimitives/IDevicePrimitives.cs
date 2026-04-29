@@ -13,10 +13,13 @@ namespace AiDotNet.Tensors.Engines.DevicePrimitives;
 /// like the data-loading sampler and the distributed reducer) can call
 /// the same warp-friendly implementations directly.
 ///
-/// <para><b>Backends:</b> CPU (managed SIMD), CUDA (Thrust/CUB),
-/// HIP (rocThrust), Metal (MPS reduce/sort), OpenCL/Vulkan/WebGPU
-/// (managed kernels). Every backend implements the same surface so
-/// callers don't branch on backend.</para>
+/// <para><b>Backends shipping in this PR:</b> CPU (managed SIMD); the
+/// CUDA wrapper class is wired but currently delegates each method to
+/// the CPU implementation pending the device-pointer plumbing
+/// follow-up. <em>Planned</em> ports — HIP (rocThrust), Metal
+/// (MPS reduce/sort), OpenCL/Vulkan/WebGPU (managed kernels) — share
+/// this same surface so callers don't branch on backend, but those
+/// implementations are not in this PR.</para>
 /// </summary>
 public interface IDevicePrimitives
 {

@@ -56,7 +56,16 @@ public static class Nvtx
     public static bool Push(string name)
     {
         if (!IsAvailable) return false;
-        try { nvtxRangePushA(name); return true; }
+        try
+        {
+            // NVTX contract: nvtxRangePushA returns the 0-based nesting
+            // depth on success and a NEGATIVE value on failure. Treating
+            // non-throwing calls as success would set _pushed = true on
+            // a negative return, and the matching Pop in RangeScope
+            // would close someone else's range — exactly the
+            // unbalanced-pop case this code is meant to prevent.
+            return nvtxRangePushA(name) >= 0;
+        }
         catch { /* swallow — instrumentation must never break the run */ }
         return false;
     }

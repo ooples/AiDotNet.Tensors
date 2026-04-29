@@ -75,6 +75,9 @@ public static class GpuMemoryStats
     public static void RecordAllocation(string allocator, long bytes)
     {
         if (allocator is null) throw new ArgumentNullException(nameof(allocator));
+        if (bytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(bytes),
+                $"Allocation byte count must be > 0; got {bytes}. A negative or zero value would silently corrupt the live-byte counter.");
         lock (_lock)
         {
             _currentBytes += bytes;
@@ -98,20 +101,32 @@ public static class GpuMemoryStats
     public static void RecordFree(string allocator, long bytes)
     {
         if (allocator is null) throw new ArgumentNullException(nameof(allocator));
+        if (bytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(bytes),
+                $"Free byte count must be > 0; got {bytes}. A negative or zero value would silently corrupt the live-byte counter.");
         lock (_lock)
         {
+            // Verify the per-allocator state exists AND covers this free
+            // BEFORE mutating the global counters — without this guard,
+            // a backend with a stale allocator label or a double-free
+            // would silently drive _currentBytes / _activeAllocations
+            // negative. Mismatches mean the backend's Alloc/Free
+            // bookkeeping is broken; surface that as an
+            // InvalidOperationException rather than swallowing the drift.
+            if (!_byAllocator.TryGetValue(allocator, out var state))
+                throw new InvalidOperationException(
+                    $"RecordFree called for unknown allocator '{allocator}' — no matching RecordAllocation seen. " +
+                    "This indicates the calling backend's allocator labels don't pair between Alloc/Free.");
+            if (bytes > state.CurrentBytes || state.ActiveAllocations <= 0)
+                throw new InvalidOperationException(
+                    $"Mismatched free for allocator '{allocator}': free bytes={bytes}, " +
+                    $"current per-allocator bytes={state.CurrentBytes}, active count={state.ActiveAllocations}. " +
+                    "Possible double-free or wrong-size free.");
+
             _currentBytes -= bytes;
             _activeAllocations--;
-
-            if (_byAllocator.TryGetValue(allocator, out var state))
-            {
-                state.CurrentBytes -= bytes;
-                state.ActiveAllocations--;
-            }
-            // No fallback for unknown-allocator frees — that's a real
-            // bug in the calling backend (paired Alloc/Free strings
-            // must match), and silently swallowing it would mask the
-            // bookkeeping drift forever.
+            state.CurrentBytes -= bytes;
+            state.ActiveAllocations--;
         }
     }
 

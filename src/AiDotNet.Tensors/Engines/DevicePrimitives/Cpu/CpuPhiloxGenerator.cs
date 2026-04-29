@@ -142,7 +142,20 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     /// <inheritdoc/>
     public void Bernoulli(Tensor<float> output, float p)
     {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (float.IsNaN(p) || p < 0f || p > 1f)
+            throw new ArgumentOutOfRangeException(nameof(p),
+                $"Bernoulli probability must be in [0, 1]; got {p}.");
         var span = output.AsWritableSpan();
+        // Edge cases: with p exactly 0 or 1, the comparison
+        // `(r * Inv2_32 < p)` is technically deterministic but using a
+        // straight Fill avoids any rare boundary mis-evaluation that
+        // could surface from float rounding on the scaled uint at the
+        // top of the [0,1) range. It also skips the NextBlock cost
+        // entirely for the deterministic cases.
+        if (p == 0f) { span.Fill(0f); return; }
+        if (p == 1f) { span.Fill(1f); return; }
+
         const float Inv2_32 = 1.0f / 4294967296.0f;
         int i = 0;
         while (i + 4 <= span.Length)

@@ -226,6 +226,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
     /// <inheritdoc/>
     public (Tensor<T> Values, Tensor<int> Counts) RunLengthEncode<T>(Tensor<T> input)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var src = input.AsSpan();
         if (src.Length == 0)
