@@ -143,7 +143,11 @@ public static class Activations
     private static Tensor<T> GLUFamily<T>(Tensor<T> input, GLUKind kind)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank == 0)
+            throw new ArgumentException("GLU family requires rank ≥ 1.", nameof(input));
         int last = input._shape[input.Rank - 1];
+        if (last == 0)
+            throw new ArgumentException("GLU family requires last dim > 0.", nameof(input));
         if (last % 2 != 0)
             throw new ArgumentException(
                 $"GLU family requires last dim be even; got {last}.", nameof(input));
@@ -153,7 +157,8 @@ public static class Activations
         newShape[input.Rank - 1] = half;
         var output = new Tensor<T>(newShape);
 
-        int outer = input.Length / last;
+        int outer = 1;
+        for (int d = 0; d < input.Rank - 1; d++) outer *= input._shape[d];
         var src = input.AsSpan();
         var dst = output.AsWritableSpan();
 

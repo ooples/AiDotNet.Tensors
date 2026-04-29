@@ -54,6 +54,7 @@ public static class Pruning
     /// chooses the random subset.</summary>
     public static PrunedTensor<T> RandomUnstructured<T>(Tensor<T> raw, double amount, int seed = 0)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
         if (amount < 0 || amount > 1) throw new ArgumentOutOfRangeException(nameof(amount));
         int total = raw.Length;
         int toPrune = (int)Math.Round(amount * total);
@@ -79,6 +80,7 @@ public static class Pruning
     /// norm get the entire slice masked. Mirrors <c>prune.ln_structured</c>.</summary>
     public static PrunedTensor<T> LnStructured<T>(Tensor<T> raw, double amount, int n, int dim)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
         if (amount < 0 || amount > 1) throw new ArgumentOutOfRangeException(nameof(amount));
         if (dim < 0 || dim >= raw.Rank) throw new ArgumentOutOfRangeException(nameof(dim));
         var ops = MathHelper.GetNumericOperations<T>();
@@ -128,6 +130,7 @@ public static class Pruning
     /// <see cref="LnStructured{T}"/> but the slice selection is random.</summary>
     public static PrunedTensor<T> RandomStructured<T>(Tensor<T> raw, double amount, int dim, int seed = 0)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
         if (amount < 0 || amount > 1) throw new ArgumentOutOfRangeException(nameof(amount));
         if (dim < 0 || dim >= raw.Rank) throw new ArgumentOutOfRangeException(nameof(dim));
 
@@ -165,6 +168,9 @@ public static class Pruning
     public static PrunedTensor<T>[] GlobalUnstructured<T>(Tensor<T>[] raws, double amount)
     {
         if (raws is null) throw new ArgumentNullException(nameof(raws));
+        for (int i = 0; i < raws.Length; i++)
+            if (raws[i] is null)
+                throw new ArgumentException($"raws[{i}] is null.", nameof(raws));
         if (amount < 0 || amount > 1) throw new ArgumentOutOfRangeException(nameof(amount));
         var ops = MathHelper.GetNumericOperations<T>();
         int total = 0;
@@ -203,11 +209,12 @@ public static class Pruning
     /// <c>prune.custom_from_mask</c>.</summary>
     public static PrunedTensor<T> CustomFromMask<T>(Tensor<T> raw, bool[] mask)
     {
+        if (raw is null) throw new ArgumentNullException(nameof(raw));
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         if (mask.Length != raw.Length)
             throw new ArgumentException(
                 $"Mask length {mask.Length} doesn't match tensor length {raw.Length}.", nameof(mask));
-        return new PrunedTensor<T>(raw, (bool[])mask.Clone());
+        return new PrunedTensor<T>(raw, mask);
     }
 
     /// <summary>Consolidates the mask into the raw values — the
@@ -215,6 +222,7 @@ public static class Pruning
     /// <c>prune.remove</c>.</summary>
     public static Tensor<T> Remove<T>(PrunedTensor<T> pruned)
     {
+        if (pruned is null) throw new ArgumentNullException(nameof(pruned));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])pruned.Raw._shape.Clone());
         var src = pruned.Raw.AsSpan();
@@ -243,7 +251,11 @@ public sealed class PrunedTensor<T>
     /// <paramref name="mask"/> must have the same length as
     /// <paramref name="raw"/>; mismatched masks would surface as
     /// IndexOutOfRangeException in <see cref="IsKept"/> /
-    /// <see cref="Pruning.Remove{T}"/>.</summary>
+    /// <see cref="Pruning.Remove{T}"/>.
+    ///
+    /// <para>The mask is cloned on entry so the caller can't mutate
+    /// it after construction (which would silently change pruning
+    /// behaviour while <see cref="KeptCount"/> stays stale).</para></summary>
     public PrunedTensor(Tensor<T> raw, bool[] mask)
     {
         if (raw is null) throw new ArgumentNullException(nameof(raw));
@@ -252,9 +264,9 @@ public sealed class PrunedTensor<T>
             throw new ArgumentException(
                 $"Mask length {mask.Length} doesn't match tensor length {raw.Length}.", nameof(mask));
         Raw = raw;
-        _mask = mask;
+        _mask = (bool[])mask.Clone();
         int kept = 0;
-        for (int i = 0; i < mask.Length; i++) if (mask[i]) kept++;
+        for (int i = 0; i < _mask.Length; i++) if (_mask[i]) kept++;
         KeptCount = kept;
     }
 
@@ -265,7 +277,10 @@ public sealed class PrunedTensor<T>
     /// equivalent to calling <see cref="Pruning.Remove{T}"/>.</summary>
     public Tensor<T> EffectiveValue() => Pruning.Remove(this);
 
-    /// <summary>Read-only view of the mask. Useful for serializing
-    /// or for a custom forward path.</summary>
-    public IReadOnlyList<bool> Mask => _mask;
+    /// <summary>Read-only view of the mask. Wrapped via
+    /// <see cref="Array.AsReadOnly{T}"/> so callers can't downcast
+    /// back to <c>bool[]</c> and mutate the internal mask
+    /// (<c>(IReadOnlyList&lt;bool&gt;)bool[]</c> is the same array
+    /// reference; the wrapper breaks that round-trip).</summary>
+    public IReadOnlyList<bool> Mask => Array.AsReadOnly(_mask);
 }

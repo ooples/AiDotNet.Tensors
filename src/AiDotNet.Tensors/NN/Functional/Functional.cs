@@ -23,6 +23,10 @@ public static class Functional
     public static Tensor<T> Normalize<T>(Tensor<T> input, double p = 2.0, int dim = 1, double eps = 1e-12)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (double.IsNaN(p) || double.IsInfinity(p) || p <= 0.0)
+            throw new ArgumentOutOfRangeException(nameof(p), "p must be finite and > 0.");
+        if (double.IsNaN(eps) || double.IsInfinity(eps) || eps <= 0.0)
+            throw new ArgumentOutOfRangeException(nameof(eps), "eps must be finite and > 0.");
         int actualDim = dim < 0 ? input.Rank + dim : dim;
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentOutOfRangeException(nameof(dim));
@@ -89,6 +93,12 @@ public static class Functional
     /// </summary>
     public static Tensor<T> PairwiseDistance<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0, double eps = 1e-6)
     {
+        if (x1 is null) throw new ArgumentNullException(nameof(x1));
+        if (x2 is null) throw new ArgumentNullException(nameof(x2));
+        if (double.IsNaN(p) || double.IsInfinity(p) || p <= 0.0)
+            throw new ArgumentOutOfRangeException(nameof(p), "p must be finite and > 0.");
+        if (double.IsNaN(eps) || double.IsInfinity(eps) || eps < 0.0)
+            throw new ArgumentOutOfRangeException(nameof(eps), "eps must be finite and ≥ 0.");
         if (x1.Rank != 2 || x2.Rank != 2)
             throw new ArgumentException("PairwiseDistance expects rank-2 inputs.", nameof(x1));
         if (x1._shape[0] != x2._shape[0] || x1._shape[1] != x2._shape[1])
@@ -136,6 +146,11 @@ public static class Functional
         if (paddingIdx is int pi && (uint)pi >= (uint)numEmb)
             throw new ArgumentOutOfRangeException(nameof(paddingIdx),
                 $"paddingIdx {pi} out of range [0, {numEmb}).");
+        if (maxNorm is double mn && (double.IsNaN(mn) || double.IsInfinity(mn) || mn <= 0.0))
+            throw new ArgumentOutOfRangeException(nameof(maxNorm), "maxNorm must be finite and > 0.");
+        if (maxNorm is not null && (double.IsNaN(normType) || double.IsInfinity(normType) || normType <= 0.0))
+            throw new ArgumentOutOfRangeException(nameof(normType),
+                "normType must be finite and > 0 when maxNorm is set.");
 
         // Apply max-norm clipping in-place on the weight rows that are
         // referenced. Matches PyTorch behavior — the clipped rows
@@ -228,6 +243,8 @@ public static class Functional
             throw new ArgumentException("weight must be rank-2 [num_embeddings, embedding_dim].", nameof(weight));
         if (input.Rank != 1)
             throw new ArgumentException("input must be rank-1 (flattened indices).", nameof(input));
+        if (!Enum.IsDefined(typeof(EmbeddingBagMode), mode))
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported EmbeddingBagMode.");
 
         var ops = MathHelper.GetNumericOperations<T>();
         int numEmb = weight._shape[0];

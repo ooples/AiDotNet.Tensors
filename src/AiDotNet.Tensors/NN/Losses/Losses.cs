@@ -247,6 +247,8 @@ public static class Losses
     {
         EnsureSameShape(anchor, positive);
         EnsureSameShape(anchor, negative);
+        if (p <= 0)
+            throw new ArgumentOutOfRangeException(nameof(p), "p must be > 0.");
         var ops = MathHelper.GetNumericOperations<T>();
         int last = anchor._shape[anchor.Rank - 1];
         int rows = anchor.Length / last;
@@ -263,11 +265,16 @@ public static class Losses
                 double a = ops.ToDouble(aSpan[r * last + c]);
                 double pp = ops.ToDouble(pSpan[r * last + c]);
                 double n = ops.ToDouble(nSpan[r * last + c]);
-                dPos += Math.Pow(Math.Abs(a - pp) + eps, p);
-                dNeg += Math.Pow(Math.Abs(a - n) + eps, p);
+                // Standard Lp distance: sum |a-p|^p, then root.
+                // Adding eps INSIDE the |·| would inflate negative
+                // deltas — eps is a numerical-stability nudge applied
+                // AFTER the per-element power so the gradient stays
+                // finite at zero.
+                dPos += Math.Pow(Math.Abs(a - pp), p);
+                dNeg += Math.Pow(Math.Abs(a - n), p);
             }
-            double dPosNorm = Math.Pow(dPos, 1.0 / p);
-            double dNegNorm = Math.Pow(dNeg, 1.0 / p);
+            double dPosNorm = Math.Pow(dPos + eps, 1.0 / p);
+            double dNegNorm = Math.Pow(dNeg + eps, 1.0 / p);
             double loss = Math.Max(0.0, dPosNorm - dNegNorm + margin);
             outSpan[r] = ops.FromDouble(loss);
         }
@@ -285,10 +292,15 @@ public static class Losses
         if (distanceFn is null) throw new ArgumentNullException(nameof(distanceFn));
         var dPos = distanceFn(anchor, positive);
         var dNeg = distanceFn(anchor, negative);
+        // Reject scalar / mismatched-shape distance fn outputs up
+        // front instead of letting them truncate or read past spans
+        // in the swap merge / loss loop.
+        EnsureSameShape(dPos, dNeg);
         if (swap)
         {
             // PyTorch's "swap" replaces dNeg with min(dNeg, distance(positive, negative)).
             var dPosNeg = distanceFn(positive, negative);
+            EnsureSameShape(dNeg, dPosNeg);
             var ops = MathHelper.GetNumericOperations<T>();
             var swapped = new Tensor<T>((int[])dNeg._shape.Clone());
             var srcN = dNeg.AsSpan();
