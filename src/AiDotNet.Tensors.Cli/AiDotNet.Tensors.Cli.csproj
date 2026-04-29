@@ -15,4 +15,8 @@
   <ItemGroup>
     <ProjectReference Include="..\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
+  </ItemGroup>
 </Project>
