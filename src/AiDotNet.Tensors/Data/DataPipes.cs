@@ -277,58 +277,40 @@ public static class DataPipeExtensions
     {
         public static IIterableDataset<TSample>[] Build(IIterableDataset<TSample> src, int branches, Func<TSample, int> route)
         {
-            // Shared enumerator + per-branch queue. Each branch dataset's
-            // enumerator pulls from the upstream until its queue has a value.
-            // Concurrent-safe via a lock — multi-threaded consumption of the
-            // returned datasets is supported.
-            var queues = new Queue<TSample>[branches];
-            for (int i = 0; i < branches; i++) queues[i] = new Queue<TSample>();
-            var gate = new object();
-            IEnumerator<TSample>? upstream = null;
-            bool drained = false;
-
-            IEnumerator<TSample> Upstream()
-            {
-                upstream ??= src.GetEnumerator();
-                return upstream;
-            }
-
-            void PumpUntil(int branch)
-            {
-                lock (gate)
-                {
-                    while (queues[branch].Count == 0 && !drained)
-                    {
-                        var e = Upstream();
-                        if (!e.MoveNext()) { drained = true; e.Dispose(); break; }
-                        int target = route(e.Current);
-                        if ((uint)target >= (uint)branches)
-                            throw new InvalidOperationException(
-                                $"Demultiplex route returned {target} which is outside [0, {branches}).");
-                        queues[target].Enqueue(e.Current);
-                    }
-                }
-            }
-
+            // Each returned dataset enumerates the upstream independently
+            // and yields only items routed to its branch index. Closing
+            // `upstream` / `queues` / `drained` over Build (the previous
+            // design) made every branch share one cursor, so a second
+            // GetEnumerator() on ANY branch resumed from the previous
+            // pass's state instead of starting fresh — which violates
+            // the IIterableDataset contract and silently dropped data on
+            // multi-epoch reuse.
+            //
+            // Cost: N branches × full upstream pass when each branch is
+            // consumed in turn. The shared-pump optimisation is dropped
+            // because correctness across epochs is non-negotiable; if a
+            // caller wants single-pass demultiplex, they should consume
+            // the upstream once and route into per-branch buffers
+            // themselves.
             var datasets = new IIterableDataset<TSample>[branches];
             for (int i = 0; i < branches; i++)
             {
                 int branchId = i;
-                datasets[i] = new InlineIterable<TSample>(() => Drain(branchId, queues, gate, PumpUntil));
+                datasets[i] = new InlineIterable<TSample>(() => RouteFilter(branchId, src, route, branches));
             }
             return datasets;
         }
 
-        private static IEnumerator<TSample> Drain(int branch, Queue<TSample>[] queues, object gate, Action<int> pump)
+        private static IEnumerator<TSample> RouteFilter(int branch, IIterableDataset<TSample> src, Func<TSample, int> route, int branches)
         {
-            while (true)
+            using var e = src.GetEnumerator();
+            while (e.MoveNext())
             {
-                pump(branch);
-                lock (gate)
-                {
-                    if (queues[branch].Count == 0) yield break;
-                    yield return queues[branch].Dequeue();
-                }
+                int target = route(e.Current);
+                if ((uint)target >= (uint)branches)
+                    throw new InvalidOperationException(
+                        $"Demultiplex route returned {target} which is outside [0, {branches}).");
+                if (target == branch) yield return e.Current;
             }
         }
     }

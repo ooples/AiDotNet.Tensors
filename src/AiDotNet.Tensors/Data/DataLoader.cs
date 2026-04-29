@@ -175,6 +175,17 @@ public class DataLoader<TSample, TBatch> : IEnumerable<TBatch>
             });
 
         var pumpCts = new CancellationTokenSource();
+        // Background-task exceptions need to surface to the consumer.
+        // Without this, a sampler/dataset/collate failure was silently
+        // converted into early epoch truncation: the channel completed,
+        // the reader saw end-of-stream, and the offending exception was
+        // swallowed by `try { ... } catch { /* best-effort */ }` blocks
+        // on the join. Capture the first exception (any thread, any
+        // task) atomically and rethrow it from the iterator's finally.
+        Exception? backgroundFault = null;
+        void CaptureFault(Exception ex) =>
+            Interlocked.CompareExchange(ref backgroundFault, ex, null);
+
         var pumpTask = Task.Run(async () =>
         {
             try
@@ -182,11 +193,29 @@ public class DataLoader<TSample, TBatch> : IEnumerable<TBatch>
                 int seq = 0;
                 foreach (var batch in _batchSampler.GetBatches())
                 {
-                    if (pumpCts.IsCancellationRequested) break;
-                    await jobChannel.Writer.WriteAsync((seq++, batch)).ConfigureAwait(false);
+                    // Pass pumpCts.Token so a bounded-channel back-pressure
+                    // wait is unblocked immediately on iterator disposal —
+                    // otherwise the pump deadlocks on a full channel and
+                    // the caller's finally hangs for the 5s WaitAll timeout.
+                    await jobChannel.Writer.WriteAsync((seq++, batch), pumpCts.Token).ConfigureAwait(false);
                 }
+                jobChannel.Writer.TryComplete();
             }
-            finally { jobChannel.Writer.TryComplete(); }
+            catch (OperationCanceledException) when (pumpCts.IsCancellationRequested)
+            {
+                // Cooperative cancellation — not a fault, but we still
+                // need to close the channel so workers wake up.
+                jobChannel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                CaptureFault(ex);
+                // Complete with the exception so workers reading the job
+                // channel see the failure rather than a clean EOF; that
+                // also lets the result channel pick it up if no consumer
+                // beat us to TryComplete.
+                jobChannel.Writer.TryComplete(ex);
+            }
         });
 
         var workers = new Task[_options.NumWorkers];
@@ -195,11 +224,12 @@ public class DataLoader<TSample, TBatch> : IEnumerable<TBatch>
         {
             workers[w] = Task.Run(async () =>
             {
+                Exception? localFault = null;
                 try
                 {
                     // Manual WaitToRead/TryRead loop instead of ReadAllAsync —
                     // ReadAllAsync is netstandard2.1+ and we still target net471.
-                    while (await jobChannel.Reader.WaitToReadAsync().ConfigureAwait(false))
+                    while (await jobChannel.Reader.WaitToReadAsync(pumpCts.Token).ConfigureAwait(false))
                     {
                         while (jobChannel.Reader.TryRead(out var job))
                         {
@@ -207,15 +237,34 @@ public class DataLoader<TSample, TBatch> : IEnumerable<TBatch>
                             var samples = new TSample[job.Idx.Count];
                             for (int i = 0; i < job.Idx.Count; i++) samples[i] = _dataset[job.Idx[i]];
                             var batch = _collate(samples);
-                            await resultChannel.Writer.WriteAsync((job.Seq, batch)).ConfigureAwait(false);
+                            // Pass token so a stuck WriteAsync on a full
+                            // result channel unblocks on disposal/cancel.
+                            await resultChannel.Writer.WriteAsync((job.Seq, batch), pumpCts.Token).ConfigureAwait(false);
                         }
                         if (pumpCts.IsCancellationRequested) break;
                     }
                 }
+                catch (OperationCanceledException) when (pumpCts.IsCancellationRequested) { /* shutdown */ }
+                catch (ChannelClosedException) { /* upstream completed (incl. with exception) */ }
+                catch (Exception ex)
+                {
+                    localFault = ex;
+                    CaptureFault(ex);
+                }
                 finally
                 {
                     if (Interlocked.Decrement(ref activeWorkers) == 0)
-                        resultChannel.Writer.TryComplete();
+                    {
+                        // Last worker out — complete the result channel.
+                        // If we (or any prior worker / the pump) faulted,
+                        // attach the exception so the reader surfaces it
+                        // instead of a silent end-of-stream. CompareExchange
+                        // above means the first observed fault wins; pass
+                        // that one to TryComplete.
+                        var fault = Volatile.Read(ref backgroundFault) ?? localFault;
+                        if (fault is not null) resultChannel.Writer.TryComplete(fault);
+                        else resultChannel.Writer.TryComplete();
+                    }
                 }
             });
         }
@@ -260,10 +309,22 @@ public class DataLoader<TSample, TBatch> : IEnumerable<TBatch>
         finally
         {
             pumpCts.Cancel();
-            try { Task.WaitAll(workers, TimeSpan.FromSeconds(5)); } catch { /* best-effort */ }
-            try { pumpTask.Wait(TimeSpan.FromSeconds(5)); } catch { /* best-effort */ }
+            // Wait for background tasks to drain — bounded by 5s so a
+            // wedged worker can't hang the consumer indefinitely. The
+            // catch swallows wait/aggregation exceptions because the
+            // first-fault is already captured in `backgroundFault` and
+            // any per-task TaskCanceledException is expected on Cancel.
+            try { Task.WaitAll(workers, TimeSpan.FromSeconds(5)); } catch { /* aggregated below */ }
+            try { pumpTask.Wait(TimeSpan.FromSeconds(5)); } catch { /* aggregated below */ }
             pumpCts.Dispose();
         }
+        // Surface the first background fault — pump or worker — if any.
+        // Without this, a dataset/collate/sampler exception was silently
+        // converted into early epoch truncation. Done OUTSIDE the
+        // try/finally so the throw isn't immediately re-caught.
+        if (backgroundFault is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(backgroundFault).Throw();
         _epoch++;
     }
 

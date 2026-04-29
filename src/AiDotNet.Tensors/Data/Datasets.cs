@@ -32,9 +32,21 @@ public sealed class TensorDataset<T> : IDataset<Tensor<T>[]>
     {
         if (tensors is null || tensors.Length == 0)
             throw new ArgumentException("TensorDataset requires at least one tensor.", nameof(tensors));
+        // Reject scalars (rank 0) explicitly — without this, indexing
+        // `_shape[0]` would throw IndexOutOfRangeException with no
+        // diagnostic context. TensorDataset requires a leading sample
+        // axis on every member tensor by definition.
+        if (tensors[0]._shape.Length == 0)
+            throw new ArgumentException(
+                "TensorDataset requires tensors with at least one dimension; tensor 0 is rank 0.",
+                nameof(tensors));
         int n = tensors[0]._shape[0];
         for (int i = 1; i < tensors.Length; i++)
         {
+            if (tensors[i]._shape.Length == 0)
+                throw new ArgumentException(
+                    $"TensorDataset requires tensors with at least one dimension; tensor {i} is rank 0.",
+                    nameof(tensors));
             if (tensors[i]._shape[0] != n)
                 throw new ArgumentException(
                     $"TensorDataset tensors must share their leading dimension. " +

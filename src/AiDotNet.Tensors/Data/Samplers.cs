@@ -40,6 +40,14 @@ public sealed class SequentialSampler : ISampler
 /// </summary>
 public sealed class RandomSampler : ISampler
 {
+    // Source dataset size (the upper bound for replacement draws). This
+    // MUST be tracked separately from _numSamples because PyTorch's
+    // RandomSampler(replacement=True, num_samples=N) supports N != count
+    // — both N > count (oversampling) and N < count (subsampling). The
+    // previous implementation drew from [0, _numSamples) which produced
+    // out-of-range indices when _numSamples > count and made the tail of
+    // the dataset unreachable when _numSamples < count.
+    private readonly int _sourceCount;
     private readonly int _seedBase;
     private readonly bool _hasSeed;
     private readonly bool _replacement;
@@ -62,6 +70,10 @@ public sealed class RandomSampler : ISampler
         if (numSamples != count && !replacement)
             throw new ArgumentException(
                 "numSamples != count requires replacement=true.", nameof(numSamples));
+        if (replacement && count == 0 && numSamples > 0)
+            throw new ArgumentException(
+                "Cannot draw replacement samples from an empty source dataset.", nameof(count));
+        _sourceCount = count;
         Count = numSamples;
         _seedBase = seed ?? 0;
         _hasSeed = seed.HasValue;
@@ -78,15 +90,13 @@ public sealed class RandomSampler : ISampler
         var rng = MakeRng();
         if (_replacement)
         {
-            // Bound is the source size — we never yield outside [0, source).
-            int source = _numSamples; // when replacement+numSamples specified, source==numSamples is wrong; track it separately
-            // Actually source size is what was passed at construction — we
-            // didn't keep it explicitly. The non-replacement path uses Count.
-            // For replacement, Count == numSamples, but we sample from [0, Count)
-            // when count==numSamples; the only legit replacement case is
-            // numSamples == count anyway.
+            // Draw from [0, _sourceCount) regardless of how many we yield —
+            // the upper bound is always the dataset size, never the
+            // requested sample count. This is the contract that makes
+            // numSamples > count (oversampling) and numSamples < count
+            // (subsampling with the full dataset still reachable) work.
             for (int i = 0; i < _numSamples; i++)
-                yield return rng.Next(_numSamples);
+                yield return rng.Next(_sourceCount);
         }
         else
         {
@@ -165,12 +175,19 @@ public sealed class WeightedRandomSampler : ISampler
         for (int s = 0; s < Count; s++)
         {
             double u = rng.NextDouble() * _total;
-            // Binary search the prefix-sum array.
+            // Upper-bound binary search on the prefix-sum array — find
+            // the smallest index i where _cumulative[i] > u. Using a
+            // strict `<` here would produce a lower-bound search that
+            // can land on a zero-weight bucket: e.g. weights [0.5, 0.0,
+            // 0.5] give cumulative [0.5, 0.5, 1.0]; if u happens to
+            // equal 0.5 the lower-bound search returns index 1 (the
+            // zero-weight entry). The `<=` keeps zero-weight indices
+            // strictly unsampleable.
             int lo = 0, hi = _cumulative.Length - 1;
             while (lo < hi)
             {
                 int mid = (lo + hi) >> 1;
-                if (_cumulative[mid] < u) lo = mid + 1;
+                if (_cumulative[mid] <= u) lo = mid + 1;
                 else hi = mid;
             }
             yield return lo;
@@ -357,14 +374,21 @@ public sealed class DistributedSampler : ISampler
         else
         {
             totalSize = Count * _worldSize;
-            // Pad by replicating from the start. Avoids the "rank 0 sees an
-            // extra sample, others stall" deadlock at the all-reduce boundary.
+            // Pad by replicating cyclically from the start. Avoids the
+            // "rank 0 sees an extra sample, others stall" deadlock at
+            // the all-reduce boundary. Cyclic indexing is required
+            // because padCount can exceed _datasetCount when the
+            // dataset is smaller than worldSize (e.g. datasetCount=1
+            // with worldSize=4 needs 3 pad slots filled from a 1-item
+            // source). A single Array.Copy of `padCount` elements
+            // would index past the source on those small-dataset cases.
             if (totalSize > _datasetCount)
             {
                 var padded = new int[totalSize];
                 Array.Copy(indices, padded, _datasetCount);
                 int padCount = totalSize - _datasetCount;
-                Array.Copy(indices, 0, padded, _datasetCount, padCount);
+                for (int i = 0; i < padCount; i++)
+                    padded[_datasetCount + i] = indices[i % _datasetCount];
                 indices = padded;
             }
         }

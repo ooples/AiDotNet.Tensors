@@ -62,6 +62,16 @@ public sealed class CheckpointableLoader<TSample, TBatch> : IEnumerable<TBatch>
     {
         if (checkpoint.Epoch < 0) throw new ArgumentOutOfRangeException(nameof(checkpoint));
         if (checkpoint.BatchIndex < 0) throw new ArgumentOutOfRangeException(nameof(checkpoint));
+        // BatchIndex == BatchCount is the legitimate end-of-epoch
+        // resume state (every batch already consumed; next call rolls
+        // to the next epoch). Anything beyond that would skip the
+        // entire next epoch by silently zeroing through every batch
+        // in the GetEnumerator skip-loop, dropping data on a corrupt
+        // or hand-edited checkpoint.
+        if (checkpoint.BatchIndex > _batchSampler.Count)
+            throw new ArgumentOutOfRangeException(
+                nameof(checkpoint),
+                $"BatchIndex {checkpoint.BatchIndex} exceeds epoch batch count {_batchSampler.Count}.");
         _epoch = checkpoint.Epoch;
         _batchIndex = checkpoint.BatchIndex;
     }
