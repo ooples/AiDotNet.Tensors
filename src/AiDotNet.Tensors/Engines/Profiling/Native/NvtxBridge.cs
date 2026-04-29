@@ -75,10 +75,14 @@ public static class NvtxBridge
         // .NET resolves the right name per-platform via DllImportSearchPath rules.
         private const string Lib = "nvToolsExt64_1";
 
-        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true)]
+        // NVTX uses CDECL on every platform NVIDIA ships it for; pin the calling
+        // convention so the ABI is unambiguous (the platform default of Winapi /
+        // stdcall on x86 Windows would corrupt the call frame on this entry-point set).
+        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true,
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern int nvtxRangePushA(string message);
 
-        [DllImport(Lib)]
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern int nvtxRangePopA();
     }
 }

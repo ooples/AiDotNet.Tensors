@@ -97,6 +97,16 @@ public sealed class ProfilerSession : IDisposable
         _stepIndex = next;
 
         if (_schedule is null) return;
+        // Drop the warmup-window samples before the measured window opens. Without
+        // this reset, the snapshot flushed at the next trace-ready edge would be
+        // contaminated with warmup events even though the schedule documents
+        // "warmup = recorded, discarded".
+        var prevPhase = _schedule.Classify(prev);
+        var nextPhase = _schedule.Classify(next);
+        if (prevPhase == ProfilerSchedulePhase.Warmup && nextPhase == ProfilerSchedulePhase.Active)
+        {
+            Reset();
+        }
         if (_schedule.IsTraceReadyEdge(prev, next))
         {
             FlushTraceReady();
@@ -266,9 +276,13 @@ public sealed class ProfilerSession : IDisposable
 
     private long TicksToMicros(long ticks)
     {
-        // Stopwatch.Frequency is ticks-per-second; convert to microseconds
-        // with a single multiply + divide. Avoid floating-point so the trace
-        // ts/dur values are byte-stable across runs.
-        return (ticks * 1_000_000L) / _ticksPerSecond;
+        // Stopwatch.Frequency is ticks-per-second; convert to microseconds without
+        // floating-point so the trace ts/dur values are byte-stable across runs.
+        // Direct (ticks * 1e6) overflows long after ~2.5h on 1 GHz frequencies, so
+        // split the conversion into whole-seconds plus sub-second remainder. Both
+        // intermediate products stay in range (remainder < _ticksPerSecond).
+        long wholeSeconds = ticks / _ticksPerSecond;
+        long remainder = ticks % _ticksPerSecond;
+        return (wholeSeconds * 1_000_000L) + ((remainder * 1_000_000L) / _ticksPerSecond);
     }
 }

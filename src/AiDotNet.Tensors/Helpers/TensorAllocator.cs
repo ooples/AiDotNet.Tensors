@@ -36,21 +36,22 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        // MemoryProfiler hook (#220): records the allocation when the profiler
-        // is on. The check inside RecordAllocation short-circuits on Mode==Off
-        // so this is a single volatile read when profiling is disabled.
-        // Unsafe.SizeOf<T>() works for any T (returns IntPtr.Size for refs,
-        // primitive sizes for value types) and is much cheaper than
-        // Marshal.SizeOf, which doesn't support all our generic instantiations.
-        if (totalSize > 0)
-        {
-            long bytes = (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
-            AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
-                "TensorAllocator", bytes, shape, typeof(T).Name);
-        }
+        // MemoryProfiler hook (#220): only record branches that actually allocate
+        // new memory — arena/pool/cache reuse paths do not, and recording them
+        // without matching frees would monotonically inflate CurrentBytes. The
+        // RecordAllocation calls below are conditional on each tier so the
+        // profiler counter reflects real allocations, not Rent invocations.
+        // Pairing each record with a Free on tensor disposal is tracked
+        // separately (full lifecycle wrapping Tensor<T>).
+        long bytesIfTracking = totalSize > 0
+            ? (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()
+            : 0L;
 
         if (!TensorPool.Enabled || totalSize == 0)
         {
+            if (bytesIfTracking > 0)
+                AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+                    "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             return new Tensor<T>(shape);
         }
 
@@ -80,9 +81,13 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, cached);
         }
 
-        // Tier 3: ArrayPool for large reference types.
+        // Tier 3: ArrayPool for large reference types — Rent may return a fresh array
+        // or reuse a pooled one; the underlying ArrayPool tracks reuse so we record
+        // unconditionally here (RentUninitialized records on the same path).
         if (totalSize >= ArrayPoolThreshold)
         {
+            AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+                "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             Array.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
@@ -90,11 +95,15 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Tier 4: Standard managed allocation for small tensors.
+        // Tier 4: Standard managed allocation for small tensors — always a fresh alloc.
+        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+            "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         T[] arr = new T[totalSize];
         var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
+        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+            "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         return new Tensor<T>(shape);
 #endif
     }

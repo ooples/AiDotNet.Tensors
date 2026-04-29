@@ -124,12 +124,17 @@ public static class MemoryProfiler
     /// off at allocation time) or when recording was reset between alloc/free.</summary>
     public static void RecordFree(long allocationId)
     {
-        if (allocationId < 0 || _mode == RecordMode.Off) return;
+        // Even when recording is currently Off we still need to retire allocations that
+        // were tracked while it was on — otherwise CurrentBytes stays permanently
+        // inflated and live-allocation snapshots leak. We just suppress the new Free
+        // event in Off mode.
+        if (allocationId < 0) return;
         if (!_live.TryRemove(allocationId, out var live)) return;
 
         long now = Stopwatch.GetTimestamp();
         System.Threading.Interlocked.Add(ref _currentBytes, -live.Bytes);
-        _events.Enqueue(MemoryEvent.Free(allocationId, live.Allocator, live.Bytes, ToMicrosFromStart(now)));
+        if (_mode != RecordMode.Off)
+            _events.Enqueue(MemoryEvent.Free(allocationId, live.Allocator, live.Bytes, ToMicrosFromStart(now)));
     }
 
     /// <summary>

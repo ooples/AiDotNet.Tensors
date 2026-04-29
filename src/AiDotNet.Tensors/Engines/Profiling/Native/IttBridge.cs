@@ -63,16 +63,21 @@ public static class IttBridge
 
         public static readonly IntPtr __itt_null = IntPtr.Zero;
 
-        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true)]
+        // libittnotify uses CDECL on every platform Intel ships it on. Spell that
+        // explicitly so the P/Invoke ABI doesn't accidentally fall back to the
+        // platform-default (Winapi/stdcall on x86 Windows) and corrupt the call frame.
+        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true,
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern IntPtr __itt_domain_create(string name);
 
-        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true)]
+        [DllImport(Lib, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true,
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern IntPtr __itt_string_handle_create(string name);
 
-        [DllImport(Lib)]
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void __itt_task_begin(IntPtr domain, IntPtr taskId, IntPtr parentId, IntPtr name);
 
-        [DllImport(Lib)]
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void __itt_task_end(IntPtr domain);
     }
 }

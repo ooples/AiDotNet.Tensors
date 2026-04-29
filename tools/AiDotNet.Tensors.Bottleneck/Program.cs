@@ -119,22 +119,31 @@ internal static class Program
     private static void InvokeEntry(MethodInfo entry)
     {
         // Match either parameterless or string[] entrypoints — the two
-        // shapes a real workload-style harness uses.
+        // shapes a real workload-style harness uses. If the entrypoint
+        // returns a Task, block on completion so async work is included
+        // in the profile (otherwise the harness exits with the workload
+        // still running and the trace would miss most of the events).
         var ps = entry.GetParameters();
         object? instance = entry.IsStatic ? null : Activator.CreateInstance(entry.DeclaringType!);
+        object? result;
         if (ps.Length == 0)
         {
-            entry.Invoke(instance, null);
+            result = entry.Invoke(instance, null);
         }
         else if (ps.Length == 1 && ps[0].ParameterType == typeof(string[]))
         {
-            entry.Invoke(instance, new object?[] { Array.Empty<string>() });
+            result = entry.Invoke(instance, new object?[] { Array.Empty<string>() });
         }
         else
         {
             throw new InvalidOperationException(
                 $"Entry method {entry.DeclaringType?.FullName}.{entry.Name} has unsupported signature; " +
                 "must be either parameterless or take a single string[].");
+        }
+        if (result is System.Threading.Tasks.Task task)
+        {
+            // Block until the async entry completes; GetResult unwraps any exception.
+            task.GetAwaiter().GetResult();
         }
     }
 
