@@ -76,19 +76,114 @@ public sealed class CuRand : IDeviceRng
     }
 
     /// <inheritdoc/>
-    public void Uniform(Tensor<float> output) => _cpuFallback.Uniform(output);
+    public void Uniform(Tensor<float> output)
+    {
+        if (!CuRandNative.IsAvailable || !TryDeviceUniform(output, normal: false, mean: 0f, stddev: 1f))
+            _cpuFallback.Uniform(output);
+    }
 
     /// <inheritdoc/>
-    public void Uniform(Tensor<double> output) => _cpuFallback.Uniform(output);
+    public void Uniform(Tensor<double> output)
+    {
+        if (!CuRandNative.IsAvailable || !TryDeviceUniformDouble(output, normal: false, mean: 0, stddev: 1))
+            _cpuFallback.Uniform(output);
+    }
 
     /// <inheritdoc/>
     public void Normal(Tensor<float> output, float mean = 0f, float stddev = 1f)
-        => _cpuFallback.Normal(output, mean, stddev);
+    {
+        if (!CuRandNative.IsAvailable || !TryDeviceUniform(output, normal: true, mean: mean, stddev: stddev))
+            _cpuFallback.Normal(output, mean, stddev);
+    }
 
     /// <inheritdoc/>
     public void Normal(Tensor<double> output, double mean = 0, double stddev = 1)
-        => _cpuFallback.Normal(output, mean, stddev);
+    {
+        if (!CuRandNative.IsAvailable || !TryDeviceUniformDouble(output, normal: true, mean: mean, stddev: stddev))
+            _cpuFallback.Normal(output, mean, stddev);
+    }
 
     /// <inheritdoc/>
     public void Bernoulli(Tensor<float> output, float p) => _cpuFallback.Bernoulli(output, p);
+
+    private bool TryDeviceUniform(Tensor<float> output, bool normal, float mean, float stddev)
+    {
+        if (!CuRandNative.IsAvailable) return false;
+        IntPtr dPtr = IntPtr.Zero;
+        IntPtr generator = IntPtr.Zero;
+        try
+        {
+            ulong bytes = (ulong)output.Length * sizeof(float);
+            if (CudaNativeBindings.cuMemAlloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+
+            if (CuRandNative.curandCreateGenerator(out generator, CuRandNative.GeneratorType.PseudoPhilox4_32_10) != CuRandNative.Status.Success) return false;
+            CuRandNative.curandSetPseudoRandomGeneratorSeed(generator, _cpuFallback.Seed);
+            CuRandNative.curandSetGeneratorOffset(generator, _cpuFallback.Offset);
+
+            var status = normal
+                ? CuRandNative.curandGenerateNormal(generator, dPtr, (ulong)output.Length, mean, stddev)
+                : CuRandNative.curandGenerateUniform(generator, dPtr, (ulong)output.Length);
+            if (status != CuRandNative.Status.Success) return false;
+
+            unsafe
+            {
+                fixed (float* hostPtr = output.AsWritableSpan())
+                {
+                    if (CudaNativeBindings.cuMemcpyDtoH((IntPtr)hostPtr, dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+                }
+            }
+            // Advance the offset so the next call returns disjoint draws (Philox parity with cuRAND).
+            _cpuFallback.Offset += (ulong)output.Length;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (generator != IntPtr.Zero) CuRandNative.curandDestroyGenerator(generator);
+            if (dPtr != IntPtr.Zero) CudaNativeBindings.cuMemFree(dPtr);
+        }
+    }
+
+    private bool TryDeviceUniformDouble(Tensor<double> output, bool normal, double mean, double stddev)
+    {
+        if (!CuRandNative.IsAvailable) return false;
+        IntPtr dPtr = IntPtr.Zero;
+        IntPtr generator = IntPtr.Zero;
+        try
+        {
+            ulong bytes = (ulong)output.Length * sizeof(double);
+            if (CudaNativeBindings.cuMemAlloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+
+            if (CuRandNative.curandCreateGenerator(out generator, CuRandNative.GeneratorType.PseudoPhilox4_32_10) != CuRandNative.Status.Success) return false;
+            CuRandNative.curandSetPseudoRandomGeneratorSeed(generator, _cpuFallback.Seed);
+            CuRandNative.curandSetGeneratorOffset(generator, _cpuFallback.Offset);
+
+            var status = normal
+                ? CuRandNative.curandGenerateNormalDouble(generator, dPtr, (ulong)output.Length, mean, stddev)
+                : CuRandNative.curandGenerateUniformDouble(generator, dPtr, (ulong)output.Length);
+            if (status != CuRandNative.Status.Success) return false;
+
+            unsafe
+            {
+                fixed (double* hostPtr = output.AsWritableSpan())
+                {
+                    if (CudaNativeBindings.cuMemcpyDtoH((IntPtr)hostPtr, dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+                }
+            }
+            _cpuFallback.Offset += (ulong)output.Length;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (generator != IntPtr.Zero) CuRandNative.curandDestroyGenerator(generator);
+            if (dPtr != IntPtr.Zero) CudaNativeBindings.cuMemFree(dPtr);
+        }
+    }
 }
