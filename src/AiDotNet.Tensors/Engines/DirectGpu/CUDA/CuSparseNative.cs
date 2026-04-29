@@ -45,6 +45,26 @@ internal static class CuSparseNative
     public enum SpMatDescr_Format { Csr = 1, Csc = 2, Coo = 3 }
     public enum DnMatDescr_Order { RowMajor = 0, ColMajor = 1 }
 
+    public enum Operation
+    {
+        NonTranspose = 0,
+        Transpose = 1,
+        ConjugateTranspose = 2,
+    }
+
+    public enum SpMMAlg
+    {
+        Default = 0,
+        CooAlg1 = 1,
+        CooAlg2 = 2,
+        CooAlg3 = 3,
+        CsrAlg1 = 4,
+        CooAlg4 = 5,
+        CsrAlg2 = 6,
+        CsrAlg3 = 12,
+        BlockedEllAlg1 = 13,
+    }
+
     [DllImport(Lib)] public static extern Status cusparseCreate(out IntPtr handle);
     [DllImport(Lib)] public static extern Status cusparseDestroy(IntPtr handle);
 
@@ -63,14 +83,14 @@ internal static class CuSparseNative
     [DllImport(Lib)] public static extern Status cusparseDestroyDnMat(IntPtr descr);
 
     [DllImport(Lib)]
-    public static extern Status cusparseSpMM_bufferSize(IntPtr handle, int opA, int opB,
+    public static extern Status cusparseSpMM_bufferSize(IntPtr handle, Operation opA, Operation opB,
         IntPtr alpha, IntPtr matA, IntPtr matB, IntPtr beta, IntPtr matC,
-        DataType computeType, int alg, out ulong bufferSize);
+        DataType computeType, SpMMAlg alg, out ulong bufferSize);
 
     [DllImport(Lib)]
-    public static extern Status cusparseSpMM(IntPtr handle, int opA, int opB,
+    public static extern Status cusparseSpMM(IntPtr handle, Operation opA, Operation opB,
         IntPtr alpha, IntPtr matA, IntPtr matB, IntPtr beta, IntPtr matC,
-        DataType computeType, int alg, IntPtr externalBuffer);
+        DataType computeType, SpMMAlg alg, IntPtr externalBuffer);
 
     public static readonly bool IsAvailable = Probe();
 
