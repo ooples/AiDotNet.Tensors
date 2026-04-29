@@ -136,6 +136,14 @@ public sealed class FullyShardedDataParallel<T>
     public Tensor<T> GatherParameter(ShardedParameter<T> param)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
+        // CpuOffload restore: if the local shard was parked by ReleaseParameter,
+        // pull it back before any collective. Mirror PyTorch FSDP's host->device
+        // copy-on-demand semantics — the dictionary entry is consumed.
+        if (_options.CpuOffload && _offloadedShards.TryGetValue(param, out var offloaded))
+        {
+            offloaded.AsSpan().CopyTo(param.LocalShard.AsWritableSpan());
+            _offloadedShards.Remove(param);
+        }
         // NoShard and ShardOptimizerOnly both replicate the parameter;
         // ShardOptimizerOnly only shards optimizer state (which lives
         // in the optimizer's own buffers, not in this class). The

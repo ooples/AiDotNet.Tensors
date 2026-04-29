@@ -108,8 +108,8 @@ public sealed class NcclProcessGroup : IProcessGroup
 
     /// <summary>Allocates a temp device buffer, uploads the host tensor,
     /// runs the supplied collective lambda with the device pointer, and
-    /// downloads the result back to the host tensor. Frees the buffer
-    /// before returning.</summary>
+    /// downloads the result back into the host tensor's writable span.
+    /// Frees the buffer before returning. Every cuMem* return is checked.</summary>
     private static void RunOnDevice<T>(Tensor<T> tensor, Func<IntPtr, NcclNative.Result> kernel)
     {
         ulong bytes = (ulong)tensor.Length * (ulong)ElemSize<T>();
@@ -118,7 +118,11 @@ public sealed class NcclProcessGroup : IProcessGroup
         {
             if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out dev, bytes) != CudaResult.Success)
                 throw new InvalidOperationException("cuMemAlloc failed.");
-            var hostHandle = GCHandle.Alloc(GetBackingArray(tensor), GCHandleType.Pinned);
+
+            // Upload: pin a copy of the tensor's contents and HtoD.
+            var hostBuffer = new T[tensor.Length];
+            tensor.AsSpan().CopyTo(hostBuffer);
+            var hostHandle = GCHandle.Alloc(hostBuffer, GCHandleType.Pinned);
             try
             {
                 if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoD(dev, hostHandle.AddrOfPinnedObject(), bytes) != CudaResult.Success)
@@ -130,13 +134,17 @@ public sealed class NcclProcessGroup : IProcessGroup
             if (status != NcclNative.Result.Success)
                 throw new InvalidOperationException($"NCCL collective returned {status}.");
 
-            hostHandle = GCHandle.Alloc(GetBackingArray(tensor), GCHandleType.Pinned);
+            // Download: pin the SAME buffer, DtoH into it, then copy back into the tensor's writable span.
+            // The previous code allocated a fresh array via GetBackingArray, which silently dropped the
+            // collective result because the tensor was never updated.
+            hostHandle = GCHandle.Alloc(hostBuffer, GCHandleType.Pinned);
             try
             {
                 if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(hostHandle.AddrOfPinnedObject(), dev, bytes) != CudaResult.Success)
                     throw new InvalidOperationException("cuMemcpyDtoH failed.");
             }
             finally { hostHandle.Free(); }
+            hostBuffer.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         finally
         {
@@ -146,11 +154,14 @@ public sealed class NcclProcessGroup : IProcessGroup
 
     private static T[] GetBackingArray<T>(Tensor<T> t)
     {
-        // Tensor<T> exposes its backing via AsSpan / AsWritableSpan; the wrapper here
-        // is permitted to copy through a managed array, which keeps the pin scope tight.
         var arr = new T[t.Length];
         t.AsSpan().CopyTo(arr);
         return arr;
+    }
+
+    private static void CheckCuda(CudaResult r, string op)
+    {
+        if (r != CudaResult.Success) throw new InvalidOperationException($"{op} failed: {r}.");
     }
 
     /// <inheritdoc/>
@@ -205,7 +216,7 @@ public sealed class NcclProcessGroup : IProcessGroup
             var sendHandle = GCHandle.Alloc(sendArr, GCHandleType.Pinned);
             try
             {
-                AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoD(sendDev, sendHandle.AddrOfPinnedObject(), sendBytes);
+                CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoD(sendDev, sendHandle.AddrOfPinnedObject(), sendBytes), "cuMemcpyHtoD(AllGather send)");
             }
             finally { sendHandle.Free(); }
 
@@ -221,7 +232,7 @@ public sealed class NcclProcessGroup : IProcessGroup
                 try
                 {
                     var src = (IntPtr)((long)recvDev + r * (long)sendBytes);
-                    AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(ch.AddrOfPinnedObject(), src, sendBytes);
+                    CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(ch.AddrOfPinnedObject(), src, sendBytes), "cuMemcpyDtoH(AllGather rank chunk)");
                 }
                 finally { ch.Free(); }
                 chunk.AsSpan().CopyTo(output[r].AsWritableSpan());
@@ -258,7 +269,7 @@ public sealed class NcclProcessGroup : IProcessGroup
                 try
                 {
                     var dst = (IntPtr)((long)sendDev + r * (long)recvBytes);
-                    AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoD(dst, h.AddrOfPinnedObject(), recvBytes);
+                    CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoD(dst, h.AddrOfPinnedObject(), recvBytes), "cuMemcpyHtoD(ReduceScatter rank chunk)");
                 }
                 finally { h.Free(); }
             }
@@ -268,7 +279,7 @@ public sealed class NcclProcessGroup : IProcessGroup
 
             var outArr = new T[output.Length];
             var oh = GCHandle.Alloc(outArr, GCHandleType.Pinned);
-            try { AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(oh.AddrOfPinnedObject(), recvDev, recvBytes); }
+            try { CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(oh.AddrOfPinnedObject(), recvDev, recvBytes), "cuMemcpyDtoH(ReduceScatter result)"); }
             finally { oh.Free(); }
             outArr.AsSpan().CopyTo(output.AsWritableSpan());
         }

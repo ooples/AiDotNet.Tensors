@@ -463,8 +463,31 @@ public sealed class ElasticLauncher
         public string Nonce { get; }
     }
 
+    /// <summary>
+    /// Treat <paramref name="nonce"/> as untrusted: reject path separators,
+    /// '..' segments, rooted paths, and any character that's invalid in a
+    /// filename on the host OS. Without this guard a caller could escape
+    /// the rendezvous directory or produce silently-failed writes.
+    /// </summary>
+    private static void ValidateNonceAsFilename(string nonce)
+    {
+        if (string.IsNullOrEmpty(nonce))
+            throw new ArgumentException("Worker nonce must be non-empty.", nameof(nonce));
+        if (nonce.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+            || nonce.IndexOf('/') >= 0
+            || nonce.IndexOf('\\') >= 0
+            || nonce == "." || nonce == ".."
+            || Path.IsPathRooted(nonce))
+        {
+            throw new ArgumentException(
+                $"Worker nonce '{nonce}' contains path separators / invalid filename characters / a rooted path.",
+                nameof(nonce));
+        }
+    }
+
     private RendezvousAssignment FileRendezvous(string workerNonce)
     {
+        ValidateNonceAsFilename(workerNonce);
         Directory.CreateDirectory(_options.Endpoint);
         // Atomic-write our nonce file. Other workers do the same.
         string myFile = Path.Combine(_options.Endpoint, workerNonce);

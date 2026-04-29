@@ -150,3 +150,48 @@ public interface IDistributedHandle : IDisposable
     /// <summary>True if the collective has already completed.</summary>
     bool IsCompleted { get; }
 }
+
+/// <summary>
+/// Async overloads for <see cref="IProcessGroup"/>. Implemented as
+/// extension methods so backends don't have to ship per-collective
+/// async pairs; the default delegates to a Task-wrapped synchronous
+/// call, giving DDP / FSDP a non-blocking handle without breaking
+/// the existing in-process / TCP / NCCL implementers' interface
+/// contract. Backends that have a true async path (NCCL streams,
+/// MPI nonblocking) can add specialized methods on their concrete
+/// type and dispatch through these helpers.
+/// </summary>
+public static class ProcessGroupAsyncExtensions
+{
+    /// <summary>Non-blocking all-reduce. Returns a handle whose
+    /// <see cref="IDistributedHandle.Wait"/> blocks until the underlying
+    /// collective completes.</summary>
+    public static IDistributedHandle AllReduceAsync<T>(this IProcessGroup g, Tensor<T> tensor, ReduceOp op = ReduceOp.Sum)
+    {
+        var task = System.Threading.Tasks.Task.Run(() => g.AllReduce(tensor, op));
+        return new TaskDistributedHandle(task);
+    }
+
+    /// <summary>Non-blocking broadcast.</summary>
+    public static IDistributedHandle BroadcastAsync<T>(this IProcessGroup g, Tensor<T> tensor, int root)
+    {
+        var task = System.Threading.Tasks.Task.Run(() => g.Broadcast(tensor, root));
+        return new TaskDistributedHandle(task);
+    }
+
+    /// <summary>Non-blocking reduce-scatter.</summary>
+    public static IDistributedHandle ReduceScatterAsync<T>(this IProcessGroup g, IList<Tensor<T>> input, Tensor<T> output, ReduceOp op = ReduceOp.Sum)
+    {
+        var task = System.Threading.Tasks.Task.Run(() => g.ReduceScatter(input, output, op));
+        return new TaskDistributedHandle(task);
+    }
+
+    private sealed class TaskDistributedHandle : IDistributedHandle
+    {
+        private readonly System.Threading.Tasks.Task _task;
+        public TaskDistributedHandle(System.Threading.Tasks.Task t) { _task = t; }
+        public bool IsCompleted => _task.IsCompleted;
+        public void Wait() => _task.GetAwaiter().GetResult();
+        public void Dispose() { /* Task disposes itself; no-op */ }
+    }
+}

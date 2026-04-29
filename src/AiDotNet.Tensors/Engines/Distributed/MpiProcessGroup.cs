@@ -50,6 +50,7 @@ public sealed class MpiProcessGroup : IProcessGroup
 
     private static int _initRefcount;
     private static readonly object _initLock = new();
+    private bool _disposed;
 
     /// <summary>True when libmpi (or msmpi) is loadable.</summary>
     public static bool IsAvailable => MpiNative.IsAvailable;
@@ -74,18 +75,38 @@ public sealed class MpiProcessGroup : IProcessGroup
 
 #if NET5_0_OR_GREATER
         // Resolve MPI_COMM_WORLD and the predefined op / type constants by symbol.
+        // - Open MPI exports them as Fortran-named globals (ompi_mpi_*).
+        // - MPICH defines them as small-integer macros (#define MPI_COMM_WORLD ((MPI_Comm)0x44000000)),
+        //   so they aren't visible as symbols at all. For MPICH we fall back to MPICH's documented
+        //   integer-handle constants and pass them as IntPtrs.
         if (!NativeLibrary.TryLoad(GetMpiLibName(), typeof(MpiNative).Assembly, null, out var lib))
             throw new InvalidOperationException("Failed to resolve MPI library handle for symbol lookup.");
         try
         {
-            _commWorld = ResolveSymbol(lib, "ompi_mpi_comm_world", "MPI_COMM_WORLD");
-            _floatType = ResolveSymbol(lib, "ompi_mpi_float", "MPI_FLOAT");
-            _doubleType = ResolveSymbol(lib, "ompi_mpi_double", "MPI_DOUBLE");
-            _intType = ResolveSymbol(lib, "ompi_mpi_int", "MPI_INT");
-            _opSum = ResolveSymbol(lib, "ompi_mpi_op_sum", "MPI_SUM");
-            _opMin = ResolveSymbol(lib, "ompi_mpi_op_min", "MPI_MIN");
-            _opMax = ResolveSymbol(lib, "ompi_mpi_op_max", "MPI_MAX");
-            _opProd = ResolveSymbol(lib, "ompi_mpi_op_prod", "MPI_PROD");
+            // Open MPI symbol path (named globals).
+            if (NativeLibrary.TryGetExport(lib, "ompi_mpi_comm_world", out _))
+            {
+                _commWorld = NativeLibrary.GetExport(lib, "ompi_mpi_comm_world");
+                _floatType = NativeLibrary.GetExport(lib, "ompi_mpi_float");
+                _doubleType = NativeLibrary.GetExport(lib, "ompi_mpi_double");
+                _intType = NativeLibrary.GetExport(lib, "ompi_mpi_int");
+                _opSum = NativeLibrary.GetExport(lib, "ompi_mpi_op_sum");
+                _opMin = NativeLibrary.GetExport(lib, "ompi_mpi_op_min");
+                _opMax = NativeLibrary.GetExport(lib, "ompi_mpi_op_max");
+                _opProd = NativeLibrary.GetExport(lib, "ompi_mpi_op_prod");
+            }
+            else
+            {
+                // MPICH / MS-MPI integer-handle constants (mpi.h #defines reproduced here).
+                _commWorld = (IntPtr)0x44000000;
+                _floatType = (IntPtr)0x4c00040a;
+                _doubleType = (IntPtr)0x4c00080b;
+                _intType = (IntPtr)0x4c000405;
+                _opSum = (IntPtr)0x58000003;
+                _opMin = (IntPtr)0x58000002;
+                _opMax = (IntPtr)0x58000001;
+                _opProd = (IntPtr)0x58000004;
+            }
         }
         finally
         {
@@ -314,6 +335,8 @@ public sealed class MpiProcessGroup : IProcessGroup
     {
         lock (_initLock)
         {
+            if (_disposed) return; // idempotent — guard against unbalanced MPI_Finalize.
+            _disposed = true;
             _initRefcount--;
             if (_initRefcount == 0)
             {

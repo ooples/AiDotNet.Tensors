@@ -141,7 +141,7 @@ public sealed class DistributedDataParallel<T>
     /// parameter's shape so the cross-rank average stays correct (a rank
     /// with no gradient contributes zero, ranks with a gradient contribute
     /// their value).</param>
-    public void ReduceGradients(IReadOnlyList<Tensor<T>> grads)
+    public void ReduceGradients(IList<Tensor<T>?> grads)
     {
         if (grads is null) throw new ArgumentNullException(nameof(grads));
         if (grads.Count != _params.Count)
@@ -151,17 +151,22 @@ public sealed class DistributedDataParallel<T>
 
         // FindUnusedParameters: substitute null entries with zero
         // tensors of the matching parameter's shape so the bucket
-        // reduce treats the rank's contribution as zero. Without this
-        // pass, a null grad would NRE in the bucket walker.
+        // reduce treats the rank's contribution as zero. We write the
+        // freshly-allocated tensor back into the caller's list so the
+        // optimizer can read the cross-rank-averaged gradient (which
+        // for an unused-on-this-rank param is the average over the
+        // ranks that DID compute a gradient — the right thing).
         var resolved = new Tensor<T>[_params.Count];
         for (int i = 0; i < _params.Count; i++)
         {
-            if (grads[i] is not null) { resolved[i] = grads[i]; continue; }
+            if (grads[i] is not null) { resolved[i] = grads[i]!; continue; }
             if (!_options.FindUnusedParameters)
                 throw new ArgumentException(
                     $"Gradient for parameter {i} is null and FindUnusedParameters is false.",
                     nameof(grads));
-            resolved[i] = new Tensor<T>((int[])_params[i]._shape.Clone());
+            var fresh = new Tensor<T>((int[])_params[i]._shape.Clone());
+            resolved[i] = fresh;
+            grads[i] = fresh; // write back so caller observes the reduced value
         }
 
         EnsurePlan();

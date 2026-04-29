@@ -101,6 +101,11 @@ public sealed class AutoFsdp<T>
     public void ProcessGradients(IReadOnlyDictionary<Tensor<T>, Tensor<T>> grads)
     {
         if (grads is null) throw new ArgumentNullException(nameof(grads));
+        // Drop stale entries before reprocessing. If a registered parameter
+        // is absent from this backward pass we must not hand back its prior
+        // value — that would silently leak step N-1's gradient into the
+        // step-N optimizer call.
+        _localGrads.Clear();
         foreach (var kv in _byFullParam)
         {
             var fullParam = kv.Key;

@@ -143,7 +143,26 @@ internal sealed class InProcessRpcRegistry
             throw new InvalidOperationException(
                 $"No RPC handler registered on rank {dstRank} with name '{name}'. " +
                 "Every rank must call Register before any rank invokes.");
-        return handler(args);
+
+        // Snapshot args so the remote handler can't mutate caller-owned
+        // input tensors. PyTorch's RPC has the same wire-level isolation
+        // guarantee — the in-process backend has to emulate it explicitly
+        // because there's no serialization boundary in the way.
+        var argsCopy = new Tensor<T>[args.Length];
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] is null) { argsCopy[i] = null!; continue; }
+            argsCopy[i] = new Tensor<T>((int[])args[i]._shape.Clone());
+            args[i].AsSpan().CopyTo(argsCopy[i].AsWritableSpan());
+        }
+        var result = handler(argsCopy);
+
+        // Snapshot the return tensor too — caller mustn't share storage
+        // with the remote rank's internal buffers.
+        if (result is null) return null!;
+        var resultCopy = new Tensor<T>((int[])result._shape.Clone());
+        result.AsSpan().CopyTo(resultCopy.AsWritableSpan());
+        return resultCopy;
     }
 
     public void UnregisterRank(int rank)

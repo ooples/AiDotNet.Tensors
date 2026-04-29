@@ -204,8 +204,8 @@ public sealed class DTensor<T>
             current = (oldP, newP) switch
             {
                 (Placement.Partial, Placement.Replicate) => AllReduceCopy(current, dimGroup),
-                (Placement.Partial, Placement.Shard)     => PartialToShard(current, dimGroup, d),
-                (Placement.Shard, Placement.Replicate)   => ShardToReplicate(current, dimGroup, d),
+                (Placement.Partial, Placement.Shard)     => PartialToShard(current, dimGroup, d, LogicalShape[d]),
+                (Placement.Shard, Placement.Replicate)   => ShardToReplicate(current, dimGroup, d, LogicalShape[d]),
                 (Placement.Replicate, Placement.Shard)   => ReplicateToShard(current, dimGroup, d),
                 _ => throw new NotSupportedException(
                     $"Redistribute {oldP}→{newP} on mesh dim {d} is not implemented."),
@@ -222,8 +222,9 @@ public sealed class DTensor<T>
         return copy;
     }
 
-    private static Tensor<T> PartialToShard(Tensor<T> t, IProcessGroup g, int axis)
+    private static Tensor<T> PartialToShard(Tensor<T> t, IProcessGroup g, int axis, int logicalAxisSize)
     {
+        _ = logicalAxisSize; // logical size is preserved across the per-rank list shape.
         // Reduce-scatter along the requested tensor axis. Each rank
         // contributes the full partial; result is its slice of the
         // axis-aligned sum. We slice along `axis` to build the per-
@@ -249,7 +250,7 @@ public sealed class DTensor<T>
         return output;
     }
 
-    private static Tensor<T> ShardToReplicate(Tensor<T> t, IProcessGroup g, int axis)
+    private static Tensor<T> ShardToReplicate(Tensor<T> t, IProcessGroup g, int axis, int logicalAxisSize)
     {
         if (axis < 0 || axis >= t.Rank)
             throw new ArgumentOutOfRangeException(nameof(axis),
@@ -257,13 +258,22 @@ public sealed class DTensor<T>
         var perRank = new List<Tensor<T>>(g.WorldSize);
         for (int r = 0; r < g.WorldSize; r++) perRank.Add(new Tensor<T>((int[])t._shape.Clone()));
         g.AllGather(t, perRank);
-        // Concatenate along the sharding axis. Output shape multiplies
-        // axis by WorldSize; non-sharded dims are preserved.
+        // Concatenate along the sharding axis. Output uses the LOGICAL
+        // axis size (pre-padding) — every shard contributes ceil-chunk
+        // padded width on the wire, but the tail rank's padding is
+        // dropped here so the result matches the original unsharded
+        // shape exactly.
         var fullShape = (int[])t._shape.Clone();
-        fullShape[axis] *= g.WorldSize;
+        fullShape[axis] = logicalAxisSize;
         var full = new Tensor<T>(fullShape);
+        int chunk = t._shape[axis];
         for (int r = 0; r < g.WorldSize; r++)
-            CopyAxisSlice(perRank[r], full, axis, dstStart: r * t._shape[axis], srcLen: t._shape[axis]);
+        {
+            int dstStart = r * chunk;
+            int copyLen = Math.Min(chunk, Math.Max(0, logicalAxisSize - dstStart));
+            if (copyLen <= 0) break;
+            CopyAxisSlice(perRank[r], full, axis, dstStart: dstStart, srcLen: copyLen);
+        }
         return full;
     }
 

@@ -311,21 +311,21 @@ public sealed class TcpProcessGroup : IProcessGroup
             }
             else
             {
-                WriteOpcode(_coordStream!, OP_SEND);
-                WriteInt32(_coordStream!, dst);
-                WriteInt32(_coordStream!, tag);
-                WriteTensorPayload(_coordStream!, tensor);
+                // Fail fast BEFORE writing any frame so the coordinator's
+                // socket isn't left with a stray opcode + length-prefixed
+                // payload buffered. The previous code wrote 4+4+payload then
+                // threw — if the caller caught the exception, the next
+                // collective would read the buffered frame as garbage.
                 if (dst != 0)
                 {
-                    // The coord forwards the frame to dst when dst's Recv arrives. Coord serializes.
-                    // For simplicity in this iteration we route only via direct coord → dst when src = 0;
-                    // src ≠ 0 ∧ dst ≠ 0 is handled by the coord's main loop in CoordRouteSend below
-                    // (called explicitly by the next collective). Until that arrives, use AllReduce
-                    // (rank 0 forwards) or call through rank-0 explicitly.
                     throw new NotSupportedException(
                         "TcpProcessGroup currently routes Send through rank 0 only. " +
                         "Use a rank-0 hop for src≠0 ∧ dst≠0 sends, or use InProcessGroup for tests.");
                 }
+                WriteOpcode(_coordStream!, OP_SEND);
+                WriteInt32(_coordStream!, dst);
+                WriteInt32(_coordStream!, tag);
+                WriteTensorPayload(_coordStream!, tensor);
             }
         }
     }
@@ -530,54 +530,117 @@ public sealed class TcpProcessGroup : IProcessGroup
         }
     }
 
+    /// <summary>Wire codec. Floats / doubles travel as their IEEE-754 bit pattern;
+    /// integer types travel as their natural width so values above 2^53 round-trip
+    /// without loss. Other T fall back to a double-bit cast (no-op for IEEE types,
+    /// best-effort for novel numeric types).</summary>
     private static void WriteTensorPayload<T>(Stream s, Tensor<T> tensor)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         WriteInt32(s, tensor.Length);
-        var buf = new byte[8];
-        var span = tensor.AsSpan();
-        for (int i = 0; i < span.Length; i++)
-        {
-            double v = ops.ToDouble(span[i]);
-            long bits = BitConverter.DoubleToInt64Bits(v);
-            for (int b = 0; b < 8; b++) buf[b] = (byte)(bits >> (b * 8));
-            s.Write(buf, 0, 8);
-        }
+        WritePayloadCore(s, tensor.AsSpan());
         s.Flush();
     }
 
     private static void WriteRawArray<T>(Stream s, T[] arr)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         WriteInt32(s, arr.Length);
+        WritePayloadCore<T>(s, arr);
+        s.Flush();
+    }
+
+    private static void WritePayloadCore<T>(Stream s, ReadOnlySpan<T> span)
+    {
         var buf = new byte[8];
-        for (int i = 0; i < arr.Length; i++)
+        // Branch on T type so high-bit integer values round-trip without
+        // a 2^53 IEEE-754 mantissa truncation. The boxing on the typed
+        // branches is paid once per element; the typical hot path
+        // (float / double) takes the IEEE-bit-marshal branch below.
+        if (typeof(T) == typeof(long))
         {
-            double v = ops.ToDouble(arr[i]);
-            long bits = BitConverter.DoubleToInt64Bits(v);
-            for (int b = 0; b < 8; b++) buf[b] = (byte)(bits >> (b * 8));
+            for (int i = 0; i < span.Length; i++) { WriteI64(buf, (long)(object)span[i]!); s.Write(buf, 0, 8); }
+            return;
+        }
+        if (typeof(T) == typeof(ulong))
+        {
+            for (int i = 0; i < span.Length; i++) { WriteI64(buf, unchecked((long)(ulong)(object)span[i]!)); s.Write(buf, 0, 8); }
+            return;
+        }
+        if (typeof(T) == typeof(int))
+        {
+            for (int i = 0; i < span.Length; i++) { WriteI64(buf, (int)(object)span[i]!); s.Write(buf, 0, 8); }
+            return;
+        }
+        if (typeof(T) == typeof(uint))
+        {
+            for (int i = 0; i < span.Length; i++) { WriteI64(buf, (uint)(object)span[i]!); s.Write(buf, 0, 8); }
+            return;
+        }
+        // Default path: marshal via double. Lossless for float / double / smaller
+        // integer types; best-effort for novel numeric types.
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < span.Length; i++)
+        {
+            double dv = ops.ToDouble(span[i]);
+            WriteI64(buf, BitConverter.DoubleToInt64Bits(dv));
             s.Write(buf, 0, 8);
         }
-        s.Flush();
+    }
+
+    private static void WriteI64(byte[] buf, long bits)
+    {
+        for (int b = 0; b < 8; b++) buf[b] = (byte)(bits >> (b * 8));
     }
 
     private static T[] ReadTensorArray<T>(Stream s, int expectedLen)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         int len = ReadInt32(s);
         if (len != expectedLen)
             throw new IOException($"Tensor length mismatch on wire: expected {expectedLen}, got {len}.");
         var arr = new T[len];
+        ReadPayloadCore<T>(s, arr);
+        return arr;
+    }
+
+    private static void ReadPayloadCore<T>(Stream s, T[] arr)
+    {
         var buf = new byte[8];
-        for (int i = 0; i < len; i++)
+        if (typeof(T) == typeof(long))
+        {
+            var v = (long[])(object)arr;
+            for (int i = 0; i < v.Length; i++) { ReadExact(s, buf, 8); v[i] = ReadI64(buf); }
+            return;
+        }
+        if (typeof(T) == typeof(ulong))
+        {
+            var v = (ulong[])(object)arr;
+            for (int i = 0; i < v.Length; i++) { ReadExact(s, buf, 8); v[i] = unchecked((ulong)ReadI64(buf)); }
+            return;
+        }
+        if (typeof(T) == typeof(int))
+        {
+            var v = (int[])(object)arr;
+            for (int i = 0; i < v.Length; i++) { ReadExact(s, buf, 8); v[i] = (int)ReadI64(buf); }
+            return;
+        }
+        if (typeof(T) == typeof(uint))
+        {
+            var v = (uint[])(object)arr;
+            for (int i = 0; i < v.Length; i++) { ReadExact(s, buf, 8); v[i] = (uint)ReadI64(buf); }
+            return;
+        }
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < arr.Length; i++)
         {
             ReadExact(s, buf, 8);
-            long bits = 0;
-            for (int b = 0; b < 8; b++) bits |= ((long)buf[b]) << (b * 8);
-            double v = BitConverter.Int64BitsToDouble(bits);
-            arr[i] = ops.FromDouble(v);
+            arr[i] = ops.FromDouble(BitConverter.Int64BitsToDouble(ReadI64(buf)));
         }
-        return arr;
+    }
+
+    private static long ReadI64(byte[] buf)
+    {
+        long bits = 0;
+        for (int b = 0; b < 8; b++) bits |= ((long)buf[b]) << (b * 8);
+        return bits;
     }
 
     private static (string Host, int Port) ParseHostPort(string endpoint)
