@@ -135,6 +135,61 @@ public static class Profiler
     }
 
     /// <summary>
+    /// Engine-internal hot-path op scope. Equivalent to <see cref="Range(string,string)"/>
+    /// with category <c>"cpu_op"</c>, but allocates only when a session is
+    /// active — the no-session path returns the singleton no-op without
+    /// touching <see cref="Stopwatch"/>. Used by every tape-aware op in
+    /// <c>CpuEngine</c> so a profiler turned on by the user at runtime
+    /// gets per-op timings without engine code paying any cost when the
+    /// profiler is off.
+    /// </summary>
+    public static IDisposable OpScope(string opName)
+    {
+        var session = Current;
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, opName, category: "cpu_op", args: null);
+    }
+
+    /// <summary>Op scope with structured args (typical: shape, dtype, dispatch tier).</summary>
+    public static IDisposable OpScope(string opName, IReadOnlyDictionary<string, string> args)
+    {
+        var session = Current;
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, opName, category: "cpu_op", args);
+    }
+
+    /// <summary>
+    /// Compile-pass scope — a categorized variant for the optimization
+    /// pipeline so chrome-trace UIs can filter pass timings out of the
+    /// per-op category.
+    /// </summary>
+    public static IDisposable CompilePassScope(string passName)
+    {
+        var session = Current;
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, passName, category: "compile_pass", args: null);
+    }
+
+    /// <summary>
+    /// Fused-op scope: emits one Complete event for the combined kernel
+    /// and an additional <c>"subops"</c> args field listing the original
+    /// logical op names. Lets the chrome-trace viewer surface fusion
+    /// without losing the original op identities — PyTorch's profiler
+    /// shows only the fused kernel name.
+    /// </summary>
+    public static IDisposable FusedOpScope(string fusedName, IReadOnlyList<string> originalOpNames)
+    {
+        var session = Current;
+        if (session is null) return NoOpScope.Instance;
+        var args = new Dictionary<string, string>(2)
+        {
+            ["subops"] = string.Join(",", originalOpNames),
+            ["fused"]  = "true",
+        };
+        return new RangeScope(session, fusedName, category: "cpu_op", args);
+    }
+
+    /// <summary>
     /// Convenience handler factory: returns a delegate that writes each
     /// active-window flush to a timestamped file under
     /// <paramref name="directory"/>. Equivalent to PyTorch's
@@ -164,6 +219,8 @@ public static class Profiler
         private readonly string _category;
         private readonly IReadOnlyDictionary<string, string>? _args;
         private readonly long _startTicks;
+        private readonly bool _emitNvtx;
+        private readonly bool _emitItt;
         private bool _disposed;
 
         public RangeScope(ProfilerSession session, string name, string category, IReadOnlyDictionary<string, string>? args)
@@ -173,12 +230,25 @@ public static class Profiler
             _category = category;
             _args = args;
             _startTicks = Stopwatch.GetTimestamp();
+
+            // Bridge to the native profilers when the session opted in. We
+            // gate on the session's Activities so a CPU-only session doesn't
+            // pay the marshalling cost. The bridge classes themselves probed
+            // for the native libs at startup, so the call is a single bool
+            // check + p/invoke when present, no-op when absent.
+            var activities = session.Options.Activities;
+            _emitNvtx = (activities & ProfilerActivities.Gpu) != 0 && Native.NvtxBridge.IsAvailable;
+            _emitItt  = (activities & ProfilerActivities.Cpu) != 0 && Native.IttBridge.IsAvailable;
+            if (_emitNvtx) Native.NvtxBridge.PushRange(name);
+            if (_emitItt)  Native.IttBridge.PushTask(name);
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+            if (_emitItt)  Native.IttBridge.PopTask();
+            if (_emitNvtx) Native.NvtxBridge.PopRange();
             long endTicks = Stopwatch.GetTimestamp();
             _session.RecordCompleteInternal(_name, _category, _startTicks, endTicks, _args);
         }

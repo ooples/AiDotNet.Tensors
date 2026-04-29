@@ -450,7 +450,24 @@ public sealed class GradientTape<T> : IDisposable
                             {
                                 double val = numOpsForAnomaly.ToDouble(inputGrad[k]);
                                 if (double.IsNaN(val) || double.IsInfinity(val))
+                                {
+                                    // Emit an instant marker on the active profiler
+                                    // so a chrome-trace export pinpoints the failing
+                                    // op visually. The marker carries the op name
+                                    // and the input index so users can localize the
+                                    // NaN to the exact backward edge — #220 anomaly
+                                    // localization scope.
+                                    Profiling.Profiler.RecordInstant(
+                                        $"anomaly:{entry.OperationName}",
+                                        category: "autograd",
+                                        args: new System.Collections.Generic.Dictionary<string, string>
+                                        {
+                                            ["op"] = entry.OperationName,
+                                            ["element"] = k.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                                            ["value"] = val.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                                        });
                                     throw new AnomalyDetectedException(entry.OperationName);
+                                }
                             }
                         }
                     }

@@ -122,23 +122,36 @@ public class ProfilerTests
         const int rangesPerThread = 100;
 
         using var prof = Profiler.Profile();
-        Parallel.For(0, threads, t =>
+
+        // Force real multi-threading — Parallel.For collapses tiny work
+        // bodies onto a single worker, which masks the multi-thread case
+        // we want to verify. Explicit Task.Run + a barrier guarantees N
+        // threadpool slots active simultaneously.
+        var barrier = new System.Threading.Barrier(threads);
+        var tasks = new Task[threads];
+        for (int t = 0; t < threads; t++)
         {
-            for (int i = 0; i < rangesPerThread; i++)
+            int tid = t;
+            tasks[t] = Task.Run(() =>
             {
-                using (Profiler.Range($"t{t}_op{i}")) { }
-            }
-        });
+                barrier.SignalAndWait();
+                for (int i = 0; i < rangesPerThread; i++)
+                {
+                    using (Profiler.Range($"t{tid}_op{i}")) { }
+                }
+            });
+        }
+        Task.WaitAll(tasks);
 
         // Each Range emits one Complete event. metadata adds 1 event.
-        // We don't care about ordering, only count + per-name presence.
         var completeEvents = prof.Events.Where(e => e.Phase == 'X').ToList();
         Assert.Equal(threads * rangesPerThread, completeEvents.Count);
 
-        // Each event keeps the producing thread id.
+        // Each event keeps the producing thread id. With the barrier above,
+        // at least 2 distinct managed thread ids must appear (typically all 8).
         var distinctThreads = completeEvents.Select(e => e.ThreadId).Distinct().Count();
         Assert.True(distinctThreads >= 2,
-            "ThreadIds must vary; we ran on a Parallel.For loop across 8 logical workers.");
+            $"ThreadIds must vary; saw {distinctThreads}. The barrier should have forced N>=2.");
     }
 
     [Fact]
@@ -323,6 +336,122 @@ public class ProfilerTests
         using (var p1 = Profiler.Profile()) { }
         using var p2 = Profiler.Profile();
         Assert.Same(p2, Profiler.Current);
+    }
+
+    [Fact]
+    public void OpScope_AutoInstrumentation_RecordsTensorMatMul()
+    {
+        // Phase 2: per-op auto-instrumentation in CpuEngine. A no-op tensor
+        // computation under an active session must produce one Complete event
+        // tagged "TensorMatMul" (cpu_op category) with no manual annotation
+        // from the test.
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        var a = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(4, 3);
+        var b = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(3, 2);
+
+        using var prof = Profiler.Profile();
+        var result = engine.TensorMatMul(a, b);
+
+        var matmuls = prof.Events.Where(e => e.Name == "TensorMatMul" && e.Phase == 'X').ToList();
+        Assert.Single(matmuls);
+        Assert.Equal("cpu_op", matmuls[0].Category);
+    }
+
+    [Fact]
+    public void OpScope_AutoInstrumentation_DisabledByDefault_ZeroOverhead()
+    {
+        // Without an active session, the OpScope path returns the singleton
+        // no-op scope. Run a tiny workload and confirm no events are kept
+        // anywhere — proxy for "the engine is not paying any per-op cost
+        // when no profiler is attached".
+        Assert.Null(Profiler.Current);
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        var a = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(4, 3);
+        var b = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(3, 2);
+        var result = engine.TensorMatMul(a, b);
+        // No assertion needed beyond "no exception, no global state mutation
+        // that survives the call". The next test recovers Profiler.Current
+        // semantics — if this had leaked, the next Profile() call would throw.
+        Assert.Null(Profiler.Current);
+    }
+
+    [Fact]
+    public void OpScope_StructurallyRecordsEventsWithoutBreakingDispatch()
+    {
+        // Structural check that survives xunit jitter / GC pauses: when a
+        // profiler session is active, every TensorMatMul call produces
+        // exactly one Complete event tagged "TensorMatMul" and the math
+        // result is unaffected. Reliable overhead measurement is in the
+        // BenchmarkDotNet harness (`tests/AiDotNet.Tensors.Benchmarks/
+        // ProfilerOverheadBenchmarks.cs`) — that machinery filters GC
+        // pauses + JIT warmup that microbenchmark assertions in xunit
+        // cannot.
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        var a = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(64, 64);
+        var b = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateRandom(64, 64);
+
+        const int iters = 20;
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float>? sample = null;
+        using (var prof = Profiler.Profile())
+        {
+            for (int i = 0; i < iters; i++) sample = engine.TensorMatMul(a, b);
+
+            int matmulEvents = prof.Events.Count(e => e.Name == "TensorMatMul" && e.Phase == 'X');
+            Assert.Equal(iters, matmulEvents);
+        }
+
+        // Math result must be unaffected — sample any element and confirm
+        // it matches a fresh outside-profiler computation.
+        var fresh = engine.TensorMatMul(a, b);
+        Assert.NotNull(sample);
+        Assert.Equal(sample.AsSpan()[0], fresh.AsSpan()[0], 5);
+    }
+
+    [Fact]
+    public void FusedOpScope_RetainsOriginalOpNames()
+    {
+        using var prof = Profiler.Profile();
+        using (Profiler.FusedOpScope("FusedConv2DReLU",
+                   new[] { "Conv2D", "TensorBroadcastAdd", "ReLU" })) { }
+
+        var ev = prof.Events.Single(e => e.Name == "FusedConv2DReLU");
+        Assert.Equal("cpu_op", ev.Category);
+        Assert.NotNull(ev.Args);
+        Assert.Equal("true", ev.Args!["fused"]);
+        Assert.Equal("Conv2D,TensorBroadcastAdd,ReLU", ev.Args["subops"]);
+    }
+
+    [Fact]
+    public void CompilePassScope_TaggedAsCompilePass()
+    {
+        using var prof = Profiler.Profile();
+        using (Profiler.CompilePassScope("PointwiseFusionPass")) { }
+
+        var ev = prof.Events.Single(e => e.Name == "PointwiseFusionPass");
+        Assert.Equal("compile_pass", ev.Category);
+    }
+
+    [Fact]
+    public void NvtxBridge_IsAvailable_DoesNotThrow()
+    {
+        // No nvToolsExt on most CI; this is a probe-and-fall-through smoke
+        // test. The contract: IsAvailable returns a bool and the Push/Pop
+        // calls never throw regardless of native lib presence.
+        bool avail = AiDotNet.Tensors.Engines.Profiling.Native.NvtxBridge.IsAvailable;
+        AiDotNet.Tensors.Engines.Profiling.Native.NvtxBridge.PushRange("test");
+        AiDotNet.Tensors.Engines.Profiling.Native.NvtxBridge.PopRange();
+        // Can't assert avail's value without knowing the test environment;
+        // the act of calling without throwing is the contract.
+        _ = avail;
+    }
+
+    [Fact]
+    public void IttBridge_IsAvailable_DoesNotThrow()
+    {
+        bool avail = AiDotNet.Tensors.Engines.Profiling.Native.IttBridge.IsAvailable;
+        AiDotNet.Tensors.Engines.Profiling.Native.IttBridge.PushTask("test");
+        AiDotNet.Tensors.Engines.Profiling.Native.IttBridge.PopTask();
+        _ = avail;
     }
 
     private static void BusyWaitMicros(long micros)

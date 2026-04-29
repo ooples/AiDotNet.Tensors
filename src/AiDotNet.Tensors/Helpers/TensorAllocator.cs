@@ -36,6 +36,19 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
+        // MemoryProfiler hook (#220): records the allocation when the profiler
+        // is on. The check inside RecordAllocation short-circuits on Mode==Off
+        // so this is a single volatile read when profiling is disabled.
+        // Unsafe.SizeOf<T>() works for any T (returns IntPtr.Size for refs,
+        // primitive sizes for value types) and is much cheaper than
+        // Marshal.SizeOf, which doesn't support all our generic instantiations.
+        if (totalSize > 0)
+        {
+            long bytes = (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+            AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+                "TensorAllocator", bytes, shape, typeof(T).Name);
+        }
+
         if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape);
