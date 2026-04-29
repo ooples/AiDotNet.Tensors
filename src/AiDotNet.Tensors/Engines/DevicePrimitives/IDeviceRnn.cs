@@ -98,4 +98,14 @@ public sealed class RnnOptions
     /// <c>cudnnRNNDataLayout_t</c> packed format) — saves memory at the
     /// cost of a one-time pack/unpack on weight load.</summary>
     public bool PackedWeights { get; set; }
+
+    /// <summary>Optional seed for the inter-layer dropout RNG. When set,
+    /// dropout masks are deterministic for the (seed, layer-output) pair.
+    /// Leave null for cryptographically-secure non-deterministic masking.</summary>
+    public int? DropoutSeed { get; set; }
+
+    /// <summary>True if the RNN is in training mode (controls whether
+    /// inter-layer dropout is applied). PyTorch parity with
+    /// <c>nn.Module.train()</c> / <c>eval()</c>.</summary>
+    public bool Training { get; set; } = true;
 }

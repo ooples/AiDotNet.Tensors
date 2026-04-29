@@ -256,6 +256,243 @@ public class DevicePrimitivesTests
     }
 
     [Fact]
+    public void CpuRnn_ForwardLstm_MultiLayer_OutputShapesMatchPyTorch()
+    {
+        // 2-layer unidirectional LSTM: output [seqLen, batch, hidden],
+        // hN/cN [numLayers, batch, hidden].
+        const int seqLen = 4, batch = 2, inputSize = 3, hidden = 5, numLayers = 2;
+        const int gates = 4;
+
+        var input = NewLinear<float>(seqLen * batch * inputSize, scale: 0.05f);
+        var inputT = new Tensor<float>(new[] { seqLen, batch, inputSize });
+        input.AsSpan().CopyTo(inputT.AsWritableSpan());
+
+        var h0 = new Tensor<float>(new[] { numLayers, batch, hidden });
+        var c0 = new Tensor<float>(new[] { numLayers, batch, hidden });
+
+        // Layer 0: input=inputSize=3; layer 1: input=hidden=5.
+        int wL0 = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        int wL1 = gates * hidden * hidden + gates * hidden * hidden + 2 * gates * hidden;
+        var weights = NewLinear<float>(wL0 + wL1, scale: 0.03f);
+        var weightsT = new Tensor<float>(new[] { wL0 + wL1 });
+        weights.AsSpan().CopyTo(weightsT.AsWritableSpan());
+
+        var rnn = new CpuRnn();
+        var (output, hN, cN) = rnn.ForwardLstm(inputT, h0, c0, weightsT,
+            new RnnOptions { HiddenSize = hidden, NumLayers = numLayers, Training = false });
+
+        Assert.Equal(new[] { seqLen, batch, hidden }, output._shape);
+        Assert.Equal(new[] { numLayers, batch, hidden }, hN._shape);
+        Assert.Equal(new[] { numLayers, batch, hidden }, cN._shape);
+    }
+
+    [Fact]
+    public void CpuRnn_ForwardLstm_Bidirectional_FeatureDimDoubled()
+    {
+        const int seqLen = 3, batch = 1, inputSize = 2, hidden = 4;
+        const int gates = 4;
+
+        var inputT = new Tensor<float>(new[] { seqLen, batch, inputSize });
+        var inSpan = inputT.AsWritableSpan();
+        for (int i = 0; i < inSpan.Length; i++) inSpan[i] = ((i % 5) - 2) * 0.1f;
+
+        var h0 = new Tensor<float>(new[] { 2, batch, hidden });
+        var c0 = new Tensor<float>(new[] { 2, batch, hidden });
+
+        // 2 directions × 1 layer.
+        int perDir = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        var weightsT = NewLinearTensor<float>(2 * perDir, scale: 0.04f);
+
+        var rnn = new CpuRnn();
+        var (output, hN, cN) = rnn.ForwardLstm(inputT, h0, c0, weightsT,
+            new RnnOptions { HiddenSize = hidden, NumLayers = 1, Bidirectional = true, Training = false });
+
+        Assert.Equal(new[] { seqLen, batch, hidden * 2 }, output._shape);
+        Assert.Equal(new[] { 2, batch, hidden }, hN._shape);
+        Assert.Equal(new[] { 2, batch, hidden }, cN._shape);
+    }
+
+    [Fact]
+    public void CpuRnn_ForwardLstm_Projection_OutputUsesProjSize()
+    {
+        const int seqLen = 3, batch = 2, inputSize = 4, hidden = 6, proj = 3;
+        const int gates = 4;
+
+        var inputT = NewLinearTensor<float>(seqLen * batch * inputSize, scale: 0.06f);
+        inputT = inputT.Reshape(new[] { seqLen, batch, inputSize });
+
+        var h0 = new Tensor<float>(new[] { 1, batch, proj });
+        var c0 = new Tensor<float>(new[] { 1, batch, hidden });
+
+        // For projection: W_hh has shape [G·H, P], W_hr has shape [P, H].
+        int wIh = gates * hidden * inputSize;
+        int wHh = gates * hidden * proj;
+        int wB = 2 * gates * hidden;
+        int wHr = proj * hidden;
+        var weightsT = NewLinearTensor<float>(wIh + wHh + wB + wHr, scale: 0.02f);
+
+        var rnn = new CpuRnn();
+        var (output, hN, cN) = rnn.ForwardLstm(inputT, h0, c0, weightsT,
+            new RnnOptions { HiddenSize = hidden, NumLayers = 1, ProjSize = proj, Training = false });
+
+        Assert.Equal(new[] { seqLen, batch, proj }, output._shape);
+        Assert.Equal(new[] { 1, batch, proj }, hN._shape);
+        Assert.Equal(new[] { 1, batch, hidden }, cN._shape);
+    }
+
+    [Fact]
+    public void CpuRnn_ForwardLstm_Dropout_TrainingChangesOutputButEvalDoesNot()
+    {
+        const int seqLen = 3, batch = 2, inputSize = 3, hidden = 4, numLayers = 2;
+        const int gates = 4;
+        var inputT = NewLinearTensor<float>(seqLen * batch * inputSize, scale: 0.07f).Reshape(new[] { seqLen, batch, inputSize });
+        var h0 = new Tensor<float>(new[] { numLayers, batch, hidden });
+        var c0 = new Tensor<float>(new[] { numLayers, batch, hidden });
+        int wL0 = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        int wL1 = gates * hidden * hidden + gates * hidden * hidden + 2 * gates * hidden;
+        var weightsT = NewLinearTensor<float>(wL0 + wL1, scale: 0.03f);
+
+        var rnn = new CpuRnn();
+        var evalOpts = new RnnOptions { HiddenSize = hidden, NumLayers = numLayers, Dropout = 0.5, Training = false };
+        var trainOpts = new RnnOptions { HiddenSize = hidden, NumLayers = numLayers, Dropout = 0.5, Training = true, DropoutSeed = 7 };
+        var trainOpts2 = new RnnOptions { HiddenSize = hidden, NumLayers = numLayers, Dropout = 0.5, Training = true, DropoutSeed = 13 };
+
+        var (oEval, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, evalOpts);
+        var (oEval2, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, evalOpts);
+        var (oTrain, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, trainOpts);
+        var (oTrain2, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, trainOpts2);
+
+        // Eval is deterministic: two eval runs match.
+        for (int i = 0; i < oEval.Length; i++) Assert.Equal(oEval[i], oEval2[i]);
+        // Training with different dropout seeds should diverge somewhere.
+        bool anyDifferent = false;
+        for (int i = 0; i < oTrain.Length; i++)
+            if (Math.Abs(oTrain[i] - oTrain2[i]) > 1e-6f) { anyDifferent = true; break; }
+        Assert.True(anyDifferent, "Different dropout seeds should produce different outputs.");
+    }
+
+    [Fact]
+    public void CpuRnn_BackwardPlainTanh_MatchesFiniteDifferenceOnGradInput()
+    {
+        const int seqLen = 3, batch = 1, inputSize = 2, hidden = 3;
+        const int gates = 1;
+
+        var inputT = NewLinearTensor<float>(seqLen * batch * inputSize, scale: 0.1f).Reshape(new[] { seqLen, batch, inputSize });
+        var h0 = new Tensor<float>(new[] { 1, batch, hidden });
+        int wTotal = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        var weightsT = NewLinearTensor<float>(wTotal, scale: 0.05f);
+
+        var rnn = new CpuRnn();
+        var opts = new RnnOptions { HiddenSize = hidden, Training = false };
+
+        var (output, _, _) = rnn.ForwardRnn(RnnCellType.RnnTanh, inputT, h0, c0: null, weightsT, opts);
+        var dY = new Tensor<float>(output._shape);
+        for (int i = 0; i < dY.Length; i++) dY[i] = 1.0f; // gradient of sum-loss
+
+        var (gradInput, _, _, _) = rnn.BackwardRnn(RnnCellType.RnnTanh, inputT, h0, c0: null,
+            dY, gradHN: null, gradCN: null, weightsT, opts);
+
+        // Finite-difference check on a few input elements.
+        float eps = 1e-3f;
+        for (int probe = 0; probe < Math.Min(4, inputT.Length); probe++)
+        {
+            int idx = probe * 2; // sparse probe
+            if (idx >= inputT.Length) break;
+            float orig = inputT[idx];
+            inputT[idx] = orig + eps;
+            var (oPlus, _, _) = rnn.ForwardRnn(RnnCellType.RnnTanh, inputT, h0, c0: null, weightsT, opts);
+            inputT[idx] = orig - eps;
+            var (oMinus, _, _) = rnn.ForwardRnn(RnnCellType.RnnTanh, inputT, h0, c0: null, weightsT, opts);
+            inputT[idx] = orig;
+
+            float fd = 0;
+            for (int i = 0; i < oPlus.Length; i++) fd += (oPlus[i] - oMinus[i]) / (2 * eps);
+            float analytical = gradInput[idx];
+            Assert.InRange(analytical, fd - 0.02f, fd + 0.02f);
+        }
+    }
+
+    [Fact]
+    public void CpuRnn_BackwardLstm_MatchesFiniteDifferenceOnGradWeights()
+    {
+        const int seqLen = 2, batch = 1, inputSize = 2, hidden = 2;
+        const int gates = 4;
+
+        var inputT = NewLinearTensor<float>(seqLen * batch * inputSize, scale: 0.1f).Reshape(new[] { seqLen, batch, inputSize });
+        var h0 = new Tensor<float>(new[] { 1, batch, hidden });
+        var c0 = new Tensor<float>(new[] { 1, batch, hidden });
+        int wTotal = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        var weightsT = NewLinearTensor<float>(wTotal, scale: 0.1f);
+
+        var rnn = new CpuRnn();
+        var opts = new RnnOptions { HiddenSize = hidden, Training = false };
+
+        var (output, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, opts);
+        var dY = new Tensor<float>(output._shape);
+        for (int i = 0; i < dY.Length; i++) dY[i] = 1.0f;
+
+        var (_, _, _, gradWeights) = rnn.BackwardRnn(RnnCellType.Lstm, inputT, h0, c0,
+            dY, gradHN: null, gradCN: null, weightsT, opts);
+
+        // Probe a couple of weight indices.
+        float eps = 1e-3f;
+        for (int probe = 0; probe < 6; probe++)
+        {
+            int idx = probe * 7 % wTotal;
+            float orig = weightsT[idx];
+            weightsT[idx] = orig + eps;
+            var (oPlus, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, opts);
+            weightsT[idx] = orig - eps;
+            var (oMinus, _, _) = rnn.ForwardLstm(inputT, h0, c0, weightsT, opts);
+            weightsT[idx] = orig;
+
+            float fd = 0;
+            for (int i = 0; i < oPlus.Length; i++) fd += (oPlus[i] - oMinus[i]) / (2 * eps);
+            float analytical = gradWeights[idx];
+            Assert.InRange(analytical, fd - 0.05f, fd + 0.05f);
+        }
+    }
+
+    [Fact]
+    public void CpuRnn_BackwardGru_MatchesFiniteDifferenceOnGradWeights()
+    {
+        const int seqLen = 2, batch = 1, inputSize = 2, hidden = 2;
+        const int gates = 3;
+
+        var inputT = NewLinearTensor<float>(seqLen * batch * inputSize, scale: 0.1f).Reshape(new[] { seqLen, batch, inputSize });
+        var h0 = new Tensor<float>(new[] { 1, batch, hidden });
+        int wTotal = gates * hidden * inputSize + gates * hidden * hidden + 2 * gates * hidden;
+        var weightsT = NewLinearTensor<float>(wTotal, scale: 0.1f);
+
+        var rnn = new CpuRnn();
+        var opts = new RnnOptions { HiddenSize = hidden, Training = false };
+
+        var (output, _, _) = rnn.ForwardRnn(RnnCellType.Gru, inputT, h0, c0: null, weightsT, opts);
+        var dY = new Tensor<float>(output._shape);
+        for (int i = 0; i < dY.Length; i++) dY[i] = 1.0f;
+
+        var (_, _, _, gradWeights) = rnn.BackwardRnn(RnnCellType.Gru, inputT, h0, c0: null,
+            dY, gradHN: null, gradCN: null, weightsT, opts);
+
+        float eps = 1e-3f;
+        for (int probe = 0; probe < 6; probe++)
+        {
+            int idx = probe * 5 % wTotal;
+            float orig = weightsT[idx];
+            weightsT[idx] = orig + eps;
+            var (oPlus, _, _) = rnn.ForwardRnn(RnnCellType.Gru, inputT, h0, c0: null, weightsT, opts);
+            weightsT[idx] = orig - eps;
+            var (oMinus, _, _) = rnn.ForwardRnn(RnnCellType.Gru, inputT, h0, c0: null, weightsT, opts);
+            weightsT[idx] = orig;
+
+            float fd = 0;
+            for (int i = 0; i < oPlus.Length; i++) fd += (oPlus[i] - oMinus[i]) / (2 * eps);
+            float analytical = gradWeights[idx];
+            Assert.InRange(analytical, fd - 0.05f, fd + 0.05f);
+        }
+    }
+
+    [Fact]
     public void Nvtx_PushPopMark_AreSafeOnHostsWithoutNvToolsExt()
     {
         // The wrapper must never throw — instrumentation can never break
@@ -303,5 +540,22 @@ public class DevicePrimitivesTests
         Assert.Equal(1L, stats["active.current"]);
 
         GpuMemoryStats.Reset();
+    }
+
+    private static T[] NewLinear<T>(int n, T scale)
+    {
+        var a = new T[n];
+        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < n; i++)
+            a[i] = ops.Multiply(ops.FromDouble(((i % 7) - 3) * 0.1), scale);
+        return a;
+    }
+
+    private static Tensor<T> NewLinearTensor<T>(int n, T scale)
+    {
+        var t = new Tensor<T>(new[] { n });
+        var arr = NewLinear(n, scale);
+        arr.AsSpan().CopyTo(t.AsWritableSpan());
+        return t;
     }
 }
