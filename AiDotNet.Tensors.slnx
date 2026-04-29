@@ -5,6 +5,7 @@
     <Project Path="src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj" />
     <Project Path="src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj" />
     <Project Path="src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" />
+    <Project Path="src/AiDotNet.Tensors.Cli/AiDotNet.Tensors.Cli.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj" />

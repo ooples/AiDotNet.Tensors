@@ -468,11 +468,21 @@ public sealed class HFNamingPreset
         string current = aidnName;
         foreach (var r in Rules)
         {
-            // Convert "$1" / "${1}" backrefs in the replacement into
-            // a (\d+) capture group on the inverse pattern.
-            string invPattern = Regex.Escape(r.AiDotNetReplacement)
-                .Replace(@"\$1", @"(\d+)")
-                .Replace(@"\$\{1\}", @"(\d+)");
+            // Convert every "$N" / "${N}" backref in the AiDotNet
+            // replacement into a (\d+) capture group on the inverse
+            // pattern. Rules with a single capture (LLAMA, BERT, …) hit
+            // the N=1 branch; rules with two captures (SD_UNET
+            // `down_blocks.(\d+).attentions.(\d+).` → `down[$1].attn[$2].`,
+            // T5 layer/sub-layer, …) need every numbered backref
+            // replaced or the inverse pattern would still contain a
+            // literal `$2` and miss the source name entirely.
+            string invPattern = Regex.Escape(r.AiDotNetReplacement);
+            for (int i = 9; i >= 1; i--)
+            {
+                invPattern = invPattern
+                    .Replace(@"\$" + i, @"(\d+)")
+                    .Replace(@"\$\{" + i + "}", @"(\d+)");
+            }
             // Preserve forward-rule anchors on the inverse pattern.
             // Without this, an exact-match forward rule like
             //   ^vit\.embeddings\.position_embeddings$ -> pos_embed
@@ -485,13 +495,31 @@ public sealed class HFNamingPreset
                 invPattern = "^" + invPattern;
             if (r.HfPattern.EndsWith("$", StringComparison.Ordinal))
                 invPattern += "$";
+
+            // Strip regex anchors before converting capture groups to
+            // backrefs. Stripping `$` AFTER the conversion would also
+            // strip the dollar from a freshly-introduced `$1` /
+            // `$2` backreference, collapsing them to literal digits.
             string invReplacement = r.HfPattern
-                .Replace(@"(\d+)", "$1")
-                // Strip regex anchors that are valid in the forward
-                // direction but invalid as a literal in the reverse
-                // substitution.
                 .Replace("^", "")
                 .Replace("$", "");
+            // Convert each (\d+) capture group in the forward pattern
+            // into a numbered backref ($1, $2, …) — the Nth (\d+) in
+            // forward order maps to $N. A single .Replace("(\d+)", "$1")
+            // would collapse every capture to $1, breaking any rule
+            // with more than one numbered capture.
+            int captureIndex = 0;
+            int searchFrom = 0;
+            while (true)
+            {
+                int hit = invReplacement.IndexOf(@"(\d+)", searchFrom, StringComparison.Ordinal);
+                if (hit < 0) break;
+                captureIndex++;
+                string token = "$" + captureIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                invReplacement = invReplacement.Substring(0, hit) + token +
+                    invReplacement.Substring(hit + @"(\d+)".Length);
+                searchFrom = hit + token.Length;
+            }
             // Strip backslash escapes from any literal '.' in the
             // forward pattern so it appears as plain '.' in the
             // emitted HF name.
