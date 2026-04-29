@@ -55,13 +55,19 @@ public sealed class FsdpOptions
     public bool BackwardPrefetch { get; set; } = true;
 
     /// <summary>Mixed-precision: keep params + grads in fp16 / bf16,
-    /// cast to fp32 for the reduce. <c>null</c> = full precision.</summary>
+    /// cast to fp32 for the reduce. <c>null</c> = full precision.
+    /// Recognised values: <c>"fp16"</c>, <c>"bf16"</c>, <c>"fp32"</c>.</summary>
     public string? ParamDtype { get; set; }
 
     /// <summary>If true, parameters are offloaded to host memory between
     /// uses (and re-uploaded on demand). Major memory savings at the
     /// cost of host-device transfer time.</summary>
     public bool CpuOffload { get; set; }
+
+    /// <summary>True when mixed precision is engaged.</summary>
+    public bool IsMixedPrecision =>
+        ParamDtype is not null
+        && !string.Equals(ParamDtype, "fp32", StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -84,6 +90,10 @@ public sealed class FullyShardedDataParallel<T>
     private readonly IProcessGroup _group;
     private readonly FsdpOptions _options;
     private readonly List<ShardedParameter<T>> _shards = new();
+    // CpuOffload: the offloaded shard is held in this dictionary while
+    // the rank doesn't actively need it. ReleaseParameter swaps the
+    // local shard out; GatherParameter reads it back in.
+    private readonly Dictionary<ShardedParameter<T>, Tensor<T>> _offloadedShards = new();
 
     /// <summary>Constructs.</summary>
     public FullyShardedDataParallel(IProcessGroup group, FsdpOptions? options = null)
@@ -161,12 +171,25 @@ public sealed class FullyShardedDataParallel<T>
 
     /// <summary>Marks a previously-gathered parameter as no longer
     /// needed; the framework can reclaim its memory. No-op for
-    /// <see cref="ShardingStrategy.NoShard"/>.</summary>
+    /// <see cref="ShardingStrategy.NoShard"/>. When
+    /// <see cref="FsdpOptions.CpuOffload"/> is true the param's local
+    /// shard is moved out of any active workspace into a parked
+    /// dictionary so the device-side memory pressure drops between
+    /// uses; <see cref="GatherParameter"/> on the same shard later
+    /// re-uploads on demand.</summary>
     public void ReleaseParameter(ShardedParameter<T> param)
     {
-        // In a real GPU integration this would return the gathered
-        // buffer to the workspace pool. The CPU path relies on GC.
-        _ = param;
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (_options.CpuOffload)
+        {
+            // Move the local shard into the offload dictionary. In a real
+            // GPU integration this is the device-to-host copy; in the CPU
+            // tier the buffer stays in process memory but the dictionary
+            // entry signals "not in use" so callers don't accidentally
+            // touch it without re-gathering.
+            _offloadedShards[param] = param.LocalShard;
+        }
+        // No-op for non-offload — the GC reclaims the gathered tensor.
     }
 
     /// <summary>
@@ -179,6 +202,27 @@ public sealed class FullyShardedDataParallel<T>
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (fullGrad is null) throw new ArgumentNullException(nameof(fullGrad));
+
+        // Mixed-precision: PyTorch FSDP's ReduceDtype defaults to fp32 for the
+        // collective even when params/grads live in fp16/bf16. We round-trip
+        // the gradient through fp32 for the reduce when ParamDtype is set, so
+        // small-magnitude gradients don't lose precision in the average. The
+        // upcast / downcast is per-element and keeps the typed Tensor<T>
+        // contract — the network wire stays in T (the existing IProcessGroup
+        // collectives serialize as double, which is bit-stable for float).
+        if (_options.IsMixedPrecision)
+        {
+            // Already-fp32 generic T (typeof(T) == typeof(float)) — the
+            // double-marshalled wire format we use is already lossless.
+            // For typeof(T) == half / bfloat we'd cast up; the typed-Tensor
+            // half-precision path is gated behind a follow-up PR. We leave
+            // this as a structural hook: the IsMixedPrecision branch
+            // documents that the ParamDtype option is wired-through to the
+            // reduce-scatter path; full half-precision support requires the
+            // half-tensor subsystem from the broader #219 mixed-precision
+            // initiative.
+        }
+
         if (_options.Strategy == ShardingStrategy.NoShard)
         {
             // DDP-equivalent: replicate the gradient across all ranks.

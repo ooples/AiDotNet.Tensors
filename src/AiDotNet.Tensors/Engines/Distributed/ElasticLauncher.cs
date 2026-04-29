@@ -138,11 +138,124 @@ public sealed class ElasticLauncher
         {
             RendezvousBackend.File => FileRendezvous(workerNonce),
             RendezvousBackend.Tcp => TcpRendezvous(workerNonce),
-            RendezvousBackend.Etcd => throw new NotSupportedException(
-                "etcd rendezvous requires the etcd client + network process-group transport."),
+            RendezvousBackend.Etcd => EtcdRendezvous(workerNonce),
             _ => throw new ArgumentException($"Unknown rendezvous backend {_options.Backend}."),
         };
     }
+
+    /// <summary>
+    /// etcd rendezvous: each worker registers its nonce as a key under
+    /// a shared prefix; once <see cref="ElasticLauncherOptions.WorldSize"/>
+    /// keys land the deterministic sort decides ranks. We talk to etcd
+    /// over its v3 HTTP/JSON gateway, so the implementation works
+    /// against any standard etcd cluster without a client-library
+    /// dependency.
+    ///
+    /// <para>Endpoint format: <c>etcd://host:port/prefix</c>. Workers
+    /// PUT their nonce under <c>{prefix}/{nonce}</c>, then poll a
+    /// RANGE over <c>{prefix}/</c> until the worker count is met.</para>
+    /// </summary>
+    private RendezvousAssignment EtcdRendezvous(string workerNonce)
+    {
+#if NET5_0_OR_GREATER
+        var (baseUrl, prefix) = ParseEtcdEndpoint(_options.Endpoint);
+        EtcdPut(baseUrl, $"{prefix}/{workerNonce}",
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString());
+
+        var deadline = DateTime.UtcNow.AddSeconds(_options.RendezvousTimeoutSeconds);
+        while (DateTime.UtcNow < deadline)
+        {
+            var keys = EtcdRangeKeys(baseUrl, prefix + "/");
+            if (keys.Count >= _options.WorldSize)
+            {
+                keys.Sort(StringComparer.Ordinal);
+                int rank = keys.IndexOf($"{prefix}/{workerNonce}");
+                if (rank < 0)
+                    throw new InvalidOperationException(
+                        $"Our nonce {workerNonce} disappeared from etcd prefix {prefix}.");
+                return new RendezvousAssignment
+                {
+                    Rank = rank,
+                    WorldSize = _options.WorldSize,
+                    Endpoint = _options.Endpoint,
+                };
+            }
+            Thread.Sleep(100);
+        }
+        throw new TimeoutException(
+            $"etcd rendezvous timed out after {_options.RendezvousTimeoutSeconds}s.");
+#else
+        _ = workerNonce;
+        throw new NotSupportedException(
+            "etcd rendezvous requires .NET 5+ (HttpClient). Use the File or TCP backend on net471.");
+#endif
+    }
+
+#if NET5_0_OR_GREATER
+    private static (string BaseUrl, string Prefix) ParseEtcdEndpoint(string endpoint)
+    {
+        if (endpoint.StartsWith("etcd://", StringComparison.OrdinalIgnoreCase))
+            endpoint = endpoint.Substring("etcd://".Length);
+        int slash = endpoint.IndexOf('/');
+        if (slash <= 0)
+            throw new ArgumentException($"etcd endpoint must be host:port/prefix; got '{endpoint}'.");
+        string hostPort = endpoint.Substring(0, slash);
+        string prefix = endpoint.Substring(slash);
+        return ($"http://{hostPort}", prefix.TrimEnd('/'));
+    }
+
+    private static void EtcdPut(string baseUrl, string key, string value)
+    {
+        string body = "{\"key\":\"" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(key)) +
+                      "\",\"value\":\"" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value)) + "\"}";
+        EtcdHttpPost($"{baseUrl}/v3/kv/put", body);
+    }
+
+    private static List<string> EtcdRangeKeys(string baseUrl, string prefix)
+    {
+        var prefixBytes = System.Text.Encoding.UTF8.GetBytes(prefix);
+        var end = (byte[])prefixBytes.Clone();
+        if (end.Length > 0) end[end.Length - 1] = (byte)(end[end.Length - 1] + 1);
+
+        string body = "{\"key\":\"" + Convert.ToBase64String(prefixBytes) +
+                      "\",\"range_end\":\"" + Convert.ToBase64String(end) +
+                      "\",\"keys_only\":true}";
+        string response = EtcdHttpPost($"{baseUrl}/v3/kv/range", body);
+        return ParseEtcdRangeResponse(response);
+    }
+
+    // HttpClient is shared across calls — etcd rendezvous traffic is light.
+    private static readonly System.Net.Http.HttpClient _etcdHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
+
+    private static string EtcdHttpPost(string url, string body)
+    {
+        using var content = new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = _etcdHttp.PostAsync(url, content).GetAwaiter().GetResult();
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"etcd HTTP {url} returned {resp.StatusCode}.");
+        return resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    }
+
+    private static List<string> ParseEtcdRangeResponse(string json)
+    {
+        // Minimal extractor for the "kvs" array's "key" entries.
+        var keys = new List<string>();
+        int i = 0;
+        while (true)
+        {
+            int idx = json.IndexOf("\"key\":\"", i, StringComparison.Ordinal);
+            if (idx < 0) break;
+            idx += "\"key\":\"".Length;
+            int end = json.IndexOf('"', idx);
+            if (end < 0) break;
+            string b64 = json.Substring(idx, end - idx);
+            try { keys.Add(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64))); }
+            catch { /* skip malformed */ }
+            i = end + 1;
+        }
+        return keys;
+    }
+#endif
 
     /// <summary>
     /// TCP rendezvous: parses <see cref="ElasticLauncherOptions.Endpoint"/>

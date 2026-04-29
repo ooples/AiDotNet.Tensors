@@ -288,9 +288,10 @@ internal static class CudaNativeBindings
     /// <summary>Flag for cuMemHostRegister: memory is mapped into device address space.</summary>
     public const uint CU_MEMHOSTREGISTER_DEVICEMAP = 2;
 
-    /// <summary>Allocates a device buffer of <paramref name="bytesize"/> bytes;
-    /// caller frees with <see cref="cuMemFree"/>. Used by the on-device dispatch
-    /// path in <see cref="CuRand"/> / <see cref="CuSparse"/> / etc.</summary>
+    /// <summary>Allocates a CUDA device buffer of <paramref name="bytesize"/>
+    /// bytes; caller frees with <see cref="cuMemFree"/>. Used by the on-device
+    /// dispatch path in <see cref="CuRand"/> / <see cref="CuSparse"/> / etc.
+    /// and by the transport-side wrappers (NCCL, etc.) to stage host tensors.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemAlloc_v2")]
     public static extern CudaResult cuMemAlloc(out IntPtr dptr, ulong bytesize);
 
