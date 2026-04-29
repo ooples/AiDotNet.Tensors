@@ -185,8 +185,17 @@ public static class NestedOps
     public static NestedTensor<T> ScaledDotProductAttention<T>(
         NestedTensor<T> q, NestedTensor<T> k, NestedTensor<T> v)
     {
+        if (q is null) throw new ArgumentNullException(nameof(q));
+        if (k is null) throw new ArgumentNullException(nameof(k));
+        if (v is null) throw new ArgumentNullException(nameof(v));
         if (q.BatchSize != k.BatchSize || q.BatchSize != v.BatchSize)
             throw new ArgumentException("Q, K, V must share the same batch size.");
+        // Reject zero feature axis up-front: with FeatureSize==0,
+        // Math.Sqrt(0) = 0 → 1/sqrt(d) becomes Infinity and silently
+        // corrupts the attention scores. MultiHeadAttention already
+        // has this guard; SDPA matches it for consistency.
+        if (q.FeatureSize == 0)
+            throw new InvalidOperationException("ScaledDotProductAttention requires a non-zero feature axis.");
         if (q.FeatureSize != k.FeatureSize || q.FeatureSize != v.FeatureSize)
             throw new ArgumentException("Q, K, V must share the same head dimension.");
         for (int i = 0; i < q.BatchSize; i++)
