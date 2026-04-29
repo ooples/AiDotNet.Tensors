@@ -497,6 +497,93 @@ public class DistributedTrainingTests
     }
 
     [Fact]
+    public void TcpProcessGroup_AllReduce_AveragesAcrossRanks()
+    {
+        // 3 ranks on loopback; each contributes a different vector;
+        // AllReduce-Avg should converge to the per-element mean on every rank.
+        int port = FreeLoopbackPort();
+        const int worldSize = 3;
+        var endpoint = $"127.0.0.1:{port}";
+        var results = new float[worldSize][];
+
+        var tasks = new Task[worldSize];
+        for (int i = 0; i < worldSize; i++)
+        {
+            int rank = i;
+            tasks[i] = Task.Run(() =>
+            {
+                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+                var t = new Tensor<float>(new[] { 4 });
+                for (int k = 0; k < 4; k++) t.AsWritableSpan()[k] = rank + 1; // rank 0:[1,1,1,1]; 1:[2,2,2,2]; 2:[3,3,3,3]
+                pg.AllReduce(t, ReduceOp.Avg);
+                results[rank] = new float[4];
+                t.AsSpan().CopyTo(results[rank]);
+            });
+        }
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+        for (int r = 0; r < worldSize; r++)
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(2.0f, results[r][i], precision: 4); // mean(1,2,3) = 2
+    }
+
+    [Fact]
+    public void TcpProcessGroup_Broadcast_FromNonRoot_ReachesEveryone()
+    {
+        int port = FreeLoopbackPort();
+        const int worldSize = 3;
+        var endpoint = $"127.0.0.1:{port}";
+        var results = new float[worldSize][];
+
+        var tasks = new Task[worldSize];
+        for (int i = 0; i < worldSize; i++)
+        {
+            int rank = i;
+            tasks[i] = Task.Run(() =>
+            {
+                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+                var t = new Tensor<float>(new[] { 3 });
+                if (rank == 1) // root is rank 1, not coord
+                {
+                    t.AsWritableSpan()[0] = 7; t.AsWritableSpan()[1] = 8; t.AsWritableSpan()[2] = 9;
+                }
+                pg.Broadcast(t, root: 1);
+                results[rank] = new float[3];
+                t.AsSpan().CopyTo(results[rank]);
+            });
+        }
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+        for (int r = 0; r < worldSize; r++)
+        {
+            Assert.Equal(7, results[r][0]);
+            Assert.Equal(8, results[r][1]);
+            Assert.Equal(9, results[r][2]);
+        }
+    }
+
+    [Fact]
+    public void TcpProcessGroup_Barrier_ReturnsForEveryRank()
+    {
+        int port = FreeLoopbackPort();
+        const int worldSize = 4;
+        var endpoint = $"127.0.0.1:{port}";
+        int reachedBarrier = 0;
+
+        var tasks = new Task[worldSize];
+        for (int i = 0; i < worldSize; i++)
+        {
+            int rank = i;
+            tasks[i] = Task.Run(() =>
+            {
+                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+                pg.Barrier();
+                System.Threading.Interlocked.Increment(ref reachedBarrier);
+            });
+        }
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+        Assert.Equal(worldSize, reachedBarrier);
+    }
+
+    [Fact]
     public void ElasticLauncher_TcpBackend_AssignsRanksDeterministically()
     {
         // 3 workers connect to a coordinator on a free loopback port.
