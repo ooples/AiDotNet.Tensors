@@ -34,7 +34,7 @@ internal static class OpRegistry
         "TensorFrac", "TensorPow",
 
         // Matrix
-        "TensorMatMul", "BatchMatMul", "TensorOuterProduct", "TensorBatchOuterProduct", "TensorOuter",
+        "TensorMatMul", "TensorMatMulTransposed", "BatchMatMul", "TensorOuterProduct", "TensorBatchOuterProduct", "TensorOuter",
 
         // Activations
         "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Swish", "Mish",

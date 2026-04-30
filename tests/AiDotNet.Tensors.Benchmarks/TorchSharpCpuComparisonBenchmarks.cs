@@ -947,11 +947,13 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     public void AiDotNet_AttentionQKT()
     {
-        // Q @ K^T for attention scores (512x64 @ 64x512 = 512x512)
-        var keyT = _cpuEngine.TensorTranspose(_aiKeyMatrix!);
-        var result = _cpuEngine.TensorMatMul(_aiQueryMatrix!, keyT);
+        // Q @ K^T for attention scores (512x64 @ 64x512 = 512x512).
+        // _aiKeyMatrix is stored as [N, K] = [512, 64] so the user-pattern
+        // Transpose(K) + MatMul(Q, K^T) is equivalent to MatMulTransposed(Q, K)
+        // — the new method skips materializing the transpose and routes
+        // through SimdGemm.Sgemm(transB=true) directly.
+        var result = _cpuEngine.TensorMatMulTransposed(_aiQueryMatrix!, _aiKeyMatrix!);
         TensorPool.Return(result);
-        TensorPool.Return(keyT);
     }
 
     [Benchmark]
