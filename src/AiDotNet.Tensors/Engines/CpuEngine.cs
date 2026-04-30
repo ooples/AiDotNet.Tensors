@@ -17057,10 +17057,62 @@ public partial class CpuEngine : ITensorLevelEngine
             fVar[b] = v2;
 
             // Pass 2: SIMD transform: out = (in - m) * invStd * gamma + beta.
+            // 4-way unrolled for the same OoO-saturation reason as pass 1 —
+            // sub→mul→fmadd is an 11-cycle dependency chain; running 4 in
+            // parallel hides latency and saturates both FMA ports.
             float invStd = 1f / MathF.Sqrt(v2 + fEps);
             var vInvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
             var vMNeg = System.Runtime.Intrinsics.Vector256.Create(m);
             f = 0;
+            int fs2_32 = fs & ~31;
+            for (; f < fs2_32; f += 32)
+            {
+                var v0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f]));
+                var v1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 8]));
+                var v2v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 16]));
+                var v3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 24]));
+                var vG0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f]));
+                var vG1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f + 8]));
+                var vG2 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f + 16]));
+                var vG3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f + 24]));
+                var vB0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f]));
+                var vB1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f + 8]));
+                var vB2 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f + 16]));
+                var vB3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f + 24]));
+                var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(v0, vMNeg);
+                var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(v1, vMNeg);
+                var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(v2v, vMNeg);
+                var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(v3, vMNeg);
+                var s0 = System.Runtime.Intrinsics.X86.Avx.Multiply(d0, vInvStd);
+                var s1 = System.Runtime.Intrinsics.X86.Avx.Multiply(d1, vInvStd);
+                var s2 = System.Runtime.Intrinsics.X86.Avx.Multiply(d2, vInvStd);
+                var s3 = System.Runtime.Intrinsics.X86.Avx.Multiply(d3, vInvStd);
+                var f0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(s0, vG0, vB0);
+                var f1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(s1, vG1, vB1);
+                var f2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(s2, vG2, vB2);
+                var f3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(s3, vG3, vB3);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f]), f0);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f + 8]), f1);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f + 16]), f2);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + f + 24]), f3);
+            }
+            // Tail: handle remaining 8-vector chunks.
             for (; f + 8 <= fs; f += 8)
             {
                 var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
@@ -17069,7 +17121,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[f]));
                 var vB = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
                     ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[f]));
-                // (in - m) * invStd * gamma + beta
                 var d = System.Runtime.Intrinsics.X86.Avx.Subtract(v, vMNeg);
                 var scaled = System.Runtime.Intrinsics.X86.Avx.Multiply(d, vInvStd);
                 var final = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(scaled, vG, vB);
