@@ -274,6 +274,17 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuMemAllocHost_v2")]
     public static extern CudaResult cuMemAllocHost(out IntPtr pp, ulong bytesize);
 
+    /// <summary>Unified-memory allocation (cudaMallocManaged equivalent at
+    /// the driver-API level). Driver handles page migration on access. Used
+    /// by <see cref="WeightLifetime.GpuManaged"/> via the offload pool.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAllocManaged")]
+    public static extern CudaResult cuMemAllocManaged(out IntPtr dptr, ulong bytesize, uint flags);
+
+    /// <summary>cuMemAllocManaged flag: attach to global stream context (default).</summary>
+    public const uint CU_MEM_ATTACH_GLOBAL = 1;
+    /// <summary>cuMemAllocManaged flag: attach to host stream only.</summary>
+    public const uint CU_MEM_ATTACH_HOST = 2;
+
     [DllImport(CudaLibrary, EntryPoint = "cuMemFreeHost")]
     public static extern CudaResult cuMemFreeHost(IntPtr p);
 

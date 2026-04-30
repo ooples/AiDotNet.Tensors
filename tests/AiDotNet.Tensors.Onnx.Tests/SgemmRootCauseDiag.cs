@@ -1,8 +1,7 @@
-// SimdGemm.SgemmWithCachedB / SgemmWithInt8CachedB are gated to
-// .NET 5+ in src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs (the
-// AVX-512 / Vector256 paths they wrap aren't available on net471).
-// Mirror that gate here so the net471 leg of this multi-target test
-// project compiles.
+// SimdGemm.SgemmWithCachedB / SgemmWithInt8CachedB are gated to .NET 5+
+// in src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs (the AVX-512 / Vector256
+// paths they wrap aren't available on net471). Mirror that gate here so
+// the net471 leg of this multi-target test project compiles.
 #if NET5_0_OR_GREATER
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines.Simd;

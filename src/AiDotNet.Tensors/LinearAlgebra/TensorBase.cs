@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
@@ -378,6 +379,56 @@ public abstract class TensorBase<T> : IDisposable
     /// before passing to BLAS/SIMD operations.
     /// </summary>
     public bool IsContiguous { get; }
+
+    /// <summary>
+    /// Lifetime / placement hint for the issue-#276 large-model memory paths.
+    /// <see cref="WeightLifetime.Default"/> ⇒ regular allocation, GC-bound;
+    /// <see cref="WeightLifetime.Streaming"/> ⇒ register with the streaming pool;
+    /// <see cref="WeightLifetime.GpuOffload"/> ⇒ allocate from pinned-host pool;
+    /// <see cref="WeightLifetime.GpuManaged"/> ⇒ allocate from unified-memory pool.
+    /// Default is <see cref="WeightLifetime.Default"/> — only weights tagged
+    /// otherwise hit the offload / streaming dispatch.
+    /// </summary>
+    public WeightLifetime Lifetime { get; set; } = WeightLifetime.Default;
+
+    /// <summary>
+    /// Streaming-pool handle when <see cref="Lifetime"/> is
+    /// <see cref="WeightLifetime.Streaming"/>. -1 means "not registered".
+    /// Owned by <see cref="WeightRegistry"/>; user code reads but doesn't
+    /// mutate (the setter is internal so external code can't unilaterally
+    /// invalidate the pool's bookkeeping).
+    /// </summary>
+    public long StreamingPoolHandle { get; internal set; } = -1;
+
+    /// <summary>
+    /// GPU offload allocation handle when <see cref="Lifetime"/> is
+    /// <see cref="WeightLifetime.GpuOffload"/> or
+    /// <see cref="WeightLifetime.GpuManaged"/>. Owned by
+    /// <see cref="WeightRegistry"/>; setter is internal.
+    /// </summary>
+    public IntPtr OffloadDevicePointer { get; internal set; } = IntPtr.Zero;
+
+    /// <summary>Host-visible pointer for the offload allocation. Some
+    /// backends (CUDA pinned, HIP HostMalloc) return host==device while
+    /// others (Vulkan, OpenCL pinned) return distinct host and device
+    /// pointers. The allocator's <c>_live</c> dictionary keys by
+    /// HostPointer, so we must persist it separately to reconstruct the
+    /// full <see cref="Engines.DirectGpu.GpuOffloadHandle"/> at free time
+    /// — using DevicePointer as the host arg silently fails the
+    /// allocator's TryRemove and leaks the allocation.</summary>
+    public IntPtr OffloadHostPointer { get; internal set; } = IntPtr.Zero;
+
+    /// <summary>Backend-specific opaque handle paired with
+    /// <see cref="OffloadDevicePointer"/> (e.g. cl_mem for OpenCL,
+    /// VkDeviceMemory for Vulkan). Owned by <see cref="WeightRegistry"/>.</summary>
+    public object? OffloadOpaqueHandle { get; internal set; }
+
+    /// <summary>Total bytes of the offload allocation. Used by
+    /// <see cref="WeightRegistry.UnregisterWeight"/> when reconstructing
+    /// the <see cref="Engines.DirectGpu.GpuOffloadHandle"/> for the free
+    /// path — element-size × Length is unsafe when T is a managed type
+    /// without a stable Marshal.SizeOf.</summary>
+    public long OffloadByteCount { get; internal set; }
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.

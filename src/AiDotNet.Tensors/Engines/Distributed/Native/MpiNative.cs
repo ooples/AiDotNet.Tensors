@@ -31,7 +31,7 @@ internal static class MpiNative
 #if NET5_0_OR_GREATER
     static MpiNative()
     {
-        NativeLibrary.SetDllImportResolver(typeof(MpiNative).Assembly, ResolveLib);
+        AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
     }
 
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)

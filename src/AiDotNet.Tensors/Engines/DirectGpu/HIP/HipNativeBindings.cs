@@ -387,6 +387,23 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipHostFree(IntPtr ptr);
 
+    /// <summary>
+    /// Unified-memory allocation. Driver handles page migration on access.
+    /// Used by <see cref="LinearAlgebra.WeightLifetime.GpuManaged"/> via the
+    /// HIP offload allocator. Counterpart to CUDA's cuMemAllocManaged.
+    /// </summary>
+    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
+    public static extern HipError hipMallocManaged(ref IntPtr ptr, UIntPtr size, uint flags);
+
+    /// <summary>hipMallocManaged flag: attach to global stream context.</summary>
+    public const uint HIP_MEM_ATTACH_GLOBAL = 1;
+    /// <summary>hipMallocManaged flag: attach to host stream only.</summary>
+    public const uint HIP_MEM_ATTACH_HOST = 2;
+    /// <summary>hipHostMalloc flag: portable across HIP contexts.</summary>
+    public const uint HIP_HOST_MALLOC_PORTABLE = 1;
+    /// <summary>hipHostMalloc flag: mapped into device address space.</summary>
+    public const uint HIP_HOST_MALLOC_MAPPED = 2;
+
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipMemcpy(
         IntPtr dst,

@@ -23,7 +23,7 @@ internal static class UccNative
 #if NET5_0_OR_GREATER
     static UccNative()
     {
-        NativeLibrary.SetDllImportResolver(typeof(UccNative).Assembly, ResolveLib);
+        AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
     }
 
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)

@@ -59,7 +59,10 @@ public sealed class TcpProcessGroup : IProcessGroup
     private readonly TcpListener? _listener;          // non-null on coordinator
     private readonly TcpClient[]? _clients;           // coordinator's per-rank sockets [r]
     private readonly Stream[]? _clientStreams;        // one stream per peer rank (rank 0 unused on coord)
-    private readonly TcpClient? _coordSocket;         // non-coordinator's socket to coord
+    // Non-coordinator's socket to coord. Not readonly — the connect loop
+    // allocates a fresh TcpClient per retry iteration since TcpClient is
+    // single-use (a failed ConnectAsync poisons the instance).
+    private TcpClient? _coordSocket;
     private readonly Stream? _coordStream;
     private readonly object _lock = new();
 
@@ -116,17 +119,39 @@ public sealed class TcpProcessGroup : IProcessGroup
         else
         {
             // Non-coordinator: connect, send our rank.
-            _coordSocket = new TcpClient();
+            // TcpClient is single-use — once ConnectAsync completes (whether
+            // it succeeds, refuses, or times out), the instance can't be
+            // re-connected. The previous loop reused one TcpClient across
+            // retries which deadlocked when rank 0 hadn't bound yet on the
+            // first attempt. We allocate a fresh client per iteration and
+            // dispose the failed ones to release the socket handle.
             while (DateTime.UtcNow < deadline)
             {
+                var attempt = new TcpClient();
                 try
                 {
-                    var connectTask = _coordSocket.ConnectAsync(host, port);
-                    if (connectTask.Wait(TimeSpan.FromSeconds(2))) break;
+                    var connectTask = attempt.ConnectAsync(host, port);
+                    if (connectTask.Wait(TimeSpan.FromSeconds(2)) && attempt.Connected)
+                    {
+                        _coordSocket = attempt;
+                        break;
+                    }
+                    // Either timed out (Wait returned false) or completed
+                    // unsuccessfully — close this attempt and retry with
+                    // a fresh socket on the next iteration.
+                    attempt.Dispose();
+                    Thread.Sleep(50);
                 }
-                catch (SocketException) { Thread.Sleep(50); }
+                catch (Exception ex) when (ex is SocketException
+                                            || ex is AggregateException ae && ae.InnerException is SocketException)
+                {
+                    // Connection refused / unreachable — coordinator hasn't
+                    // bound yet. Backoff and retry with a fresh client.
+                    attempt.Dispose();
+                    Thread.Sleep(50);
+                }
             }
-            if (!_coordSocket.Connected)
+            if (_coordSocket is null || !_coordSocket.Connected)
                 throw new TimeoutException($"TcpProcessGroup rank {rank} could not connect to coord at {endpoint}.");
             _coordSocket.NoDelay = true;
             _coordStream = _coordSocket.GetStream();
