@@ -12413,6 +12413,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // GPU path: float-only + 2D for now (matches the CPU fast-path
+        // contract). Other dtypes / higher rank fall through to the
+        // CpuEngine base implementation which correctly materializes
+        // the transpose for the generic case.
+        if (typeof(T) != typeof(float) || a.Rank != 2 || b.Rank != 2 || !TryGetBackend(out var backend))
+            return base.TensorMatMulTransposed(a, b);
+
+        try
+        {
+            int M = a._shape[0];
+            int K = a._shape[1];
+            int N = b._shape[0];
+            if (b._shape[1] != K)
+                throw new ArgumentException(
+                    $"TensorMatMulTransposed K mismatch: a's trailing dim {K} != b's trailing dim {b._shape[1]}.");
+
+            using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, M * N);
+            // Backend-native A·Bᵀ: cuBLAS / rocBLAS / MPS / CLBlast use
+            // their transB flag; Vulkan/WebGPU dispatch a custom kernel
+            // that reads B with the [N, K] index pattern. Either way,
+            // no materialized transpose copy.
+            backend.MatMulTransposed(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
+            var result = FinishGpuOp<T>(backend, bufOut, M * N);
+            var output = new Tensor<T>(result, new[] { M, N });
+            // Use the dedicated MatMulTransposedBackward — see CpuEngine
+            // override for why MatMulBackward is wrong here.
+            Autodiff.DifferentiableOps.RecordBinary("TensorMatMulTransposed", output, a, b,
+                Autodiff.BackwardFunctions<T>.MatMulTransposedBackward);
+            return output;
+        }
+        catch (Exception)
+        {
+            return base.TensorMatMulTransposed(a, b);
+        }
+    }
+
     public override Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend) || a.Rank < 3 || b.Rank < 3)

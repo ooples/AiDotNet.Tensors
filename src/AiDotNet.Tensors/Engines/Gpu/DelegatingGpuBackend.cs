@@ -83,6 +83,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.MatMul(A, B, M, N, K);
 
     /// <inheritdoc/>
+    public virtual void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+        => Inner.MatMulTransposed(A, B, C, M, N, K, alpha, beta);
+
+    /// <inheritdoc/>
     public virtual void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
         => Inner.BatchedGemm(A, B, C, M, N, K, batchCount, alpha, beta);
 

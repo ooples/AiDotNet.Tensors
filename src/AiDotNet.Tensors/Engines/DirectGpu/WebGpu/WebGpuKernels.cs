@@ -713,6 +713,25 @@ fn gemm_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     C[idx] = params.alpha * acc + params.beta * C[idx];
 }
+
+// C[M,N] = A[M,K] · Bᵀ where B is stored row-major as [N, K].
+// The K-axis stays the contracted dim; we just change B's index pattern
+// from B[k*N + col] (B is [K,N]) to B[col*K + k] (B is [N,K]).
+@compute @workgroup_size(256)
+fn gemm_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) {
+        return;
+    }
+    let row = idx / params.N;
+    let col = idx % params.N;
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+        acc = acc + A[row * params.K + k] * B[col * params.K + k];
+    }
+    C[idx] = params.alpha * acc + params.beta * C[idx];
+}
 ";
 
     /// <summary>

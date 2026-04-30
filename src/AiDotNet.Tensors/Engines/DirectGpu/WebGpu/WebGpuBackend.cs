@@ -600,6 +600,33 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     /// <summary>
     /// General matrix multiplication: C = alpha * A * B + beta * C
     /// </summary>
+    /// <summary>
+    /// C = A · Bᵀ where B is stored row-major as [N, K]. Uses the
+    /// dedicated <c>gemm_transposed_simple</c> WGSL kernel so the
+    /// transpose copy is skipped.
+    /// </summary>
+    public async Task MatMulTransposedAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)A;
+        var bBuffer = (WebGpuBuffer)B;
+        var cBuffer = (WebGpuBuffer)C;
+        var pipelineId = await GetOrCreatePipelineAsync("MatMulTransposed", WebGpuKernels.MatMulSource, "gemm_transposed_simple");
+        var paramsData = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(K),
+            alpha,
+            beta, 0, 0, 0
+        };
+        using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        var (wg, _) = _device.CalculateWorkgroups1D(M * N);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     public async Task GemmAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         ThrowIfNotInitialized();

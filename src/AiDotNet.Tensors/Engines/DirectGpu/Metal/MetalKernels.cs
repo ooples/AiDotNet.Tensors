@@ -1702,6 +1702,46 @@ kernel void matmul_tiled(
     }
 }
 
+// C[M,N] = A[M,K] · Bᵀ where B is stored row-major as [N, K].
+// Same TILE_SIZE-tiled algorithm as matmul_tiled but loads B with the
+// rows-are-K index pattern so the K-axis stays the contracted dim.
+kernel void matmul_tiled_transposed(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    threadgroup float* tileA [[threadgroup(0)]],
+    threadgroup float* tileB [[threadgroup(1)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint2 group_id [[threadgroup_position_in_grid]])
+{
+    uint row = group_id.y * TILE_SIZE + lid.y;
+    uint col = group_id.x * TILE_SIZE + lid.x;
+    float sum = 0.0f;
+    uint numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    for (uint t = 0; t < numTiles; t++) {
+        uint aRow = row;
+        uint aCol = t * TILE_SIZE + lid.x;
+        tileA[lid.y * TILE_SIZE + lid.x] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0.0f;
+        // B is [N, K] row-major, so B^T[K,N] reads as B[col, k] = B[col*K+k].
+        // Thread (lid.y, lid.x) loads bRow = t*TILE+lid.y, bCol = col.
+        uint bRow = t * TILE_SIZE + lid.y;
+        uint bCol = col;
+        tileB[lid.y * TILE_SIZE + lid.x] = (bRow < K && bCol < N) ? B[bCol * K + bRow] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tileA[lid.y * TILE_SIZE + k] * tileB[k * TILE_SIZE + lid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
 // Batched matrix multiplication
 kernel void batch_matmul(
     device const float* A [[buffer(0)]],

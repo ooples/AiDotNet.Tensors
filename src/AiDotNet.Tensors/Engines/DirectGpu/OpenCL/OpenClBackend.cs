@@ -2003,6 +2003,40 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        /// <inheritdoc/>
+        public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (!ClBlastNative.IsAvailable)
+                throw new NotSupportedException(
+                    "MatMulTransposed currently requires CLBlast on the OpenCL path. " +
+                    "Either install CLBlast or use TensorMatMul(A, transpose(B)).");
+
+            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
+            var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
+            var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
+            IntPtr queue = _context.CommandQueue;
+
+            // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
+            // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
+            // stride of A), ldB=K (row stride of B as stored), ldC=N.
+            var status = ClBlastNative.Sgemm(
+                ClBlastNative.Layout.RowMajor,
+                ClBlastNative.Transpose.No,
+                ClBlastNative.Transpose.Yes,
+                (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                alpha,
+                bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
+                bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
+                beta,
+                bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
+                ref queue,
+                IntPtr.Zero);
+            if (status != ClBlastNative.StatusCode.Success)
+                throw new InvalidOperationException($"CLBlast Sgemm(MatMulTransposed) failed: {status}");
+        }
+
         public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)

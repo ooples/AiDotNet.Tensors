@@ -949,6 +949,38 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             "cublasSgemm");
     }
 
+    public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        ValidateGemmArgs(A, B, C, M, N, K);
+
+        using var _ = PushContext();
+        float alphaVal = alpha;
+        float betaVal = beta;
+
+        // Row-major C[M,N] = A[M,K] · Bᵀ where B is stored row-major as
+        // [N, K]. cuBLAS is column-major, so the row-major contract maps
+        // to the column-major equivalent C^T[N,M] = B[N,K] · A^T[K,M],
+        // which means we pass B with NO transpose flag and A with the
+        // transpose flag in cuBLAS terms — i.e., transA=N (B stays as
+        // its column-major K×N view), transB=T (A treated transposed).
+        // Leading dims: B's column-major stride is K (its row stride);
+        // A's column-major stride is K (its row stride).
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasSgemm(
+                _cublasHandle,
+                CublasOperation.None,        // op(B) — no transpose, K×N column-major
+                CublasOperation.Transpose,   // op(A) — transposed, K×M
+                N, M, K,
+                ref alphaVal,
+                B.Handle, K,                 // ldb = K (B is row-major [N,K])
+                A.Handle, K,                 // lda = K (A is row-major [M,K])
+                ref betaVal,
+                C.Handle, N),
+            "cublasSgemm(MatMulTransposed)");
+    }
+
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);

@@ -1070,6 +1070,62 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize");
     }
 
+    /// <inheritdoc/>
+    public unsafe void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        {
+            // No vendor BLAS: route through Gemm with a materialized
+            // transpose (slower fallback; the win exists when hipBLAS is
+            // present which is the common case on supported AMD GPUs).
+            using var bT = TransposeBufferRowMajor(B, N, K);
+            Gemm(A, bT, C, M, N, K, alpha, beta);
+            return;
+        }
+
+        var bufferA = (HipGpuBuffer)A;
+        var bufferB = (HipGpuBuffer)B;
+        var bufferC = (HipGpuBuffer)C;
+        float alphaVal = alpha;
+        float betaVal = beta;
+
+        // Same column-major swap as Gemm: row-major C[M,N] = A[M,K] · Bᵀ
+        // ↔ column-major Cᵀ[N,M] = B[N,K] · Aᵀ[K,M]. So pass:
+        //   transA=N (B unchanged, K×N column-major), transB=T (A
+        //   transposed to K×M), with leading dims = K for both.
+        var status = HipBlasNative.hipblasSgemm(
+            _hipblasHandle,
+            HipBlasNative.HipBlasOperation.None,        // op(B)
+            HipBlasNative.HipBlasOperation.Transpose,   // op(A)
+            N, M, K,
+            ref alphaVal,
+            bufferB.Handle, K,
+            bufferA.Handle, K,
+            ref betaVal,
+            bufferC.Handle, N);
+        if (status != HipBlasNative.HipBlasStatus.Success)
+            throw new InvalidOperationException($"hipblasSgemm(MatMulTransposed) failed: {status}");
+    }
+
+    /// <summary>Materialize a row-major [N, K] buffer as a transposed
+    /// row-major [K, N] copy via the existing Gemm fallback. Slow path
+    /// used only when hipBLAS isn't available.</summary>
+    private IGpuBuffer TransposeBufferRowMajor(IGpuBuffer src, int rows, int cols)
+    {
+        // Caller cleans up via using; allocate a fresh buffer of the
+        // same size and re-arrange element layout. The custom kernel
+        // route would be faster, but this fallback is dead-code on
+        // hardware where hipBLAS is loadable.
+        var dst = AllocateBuffer(rows * cols);
+        var hostBuf = new float[rows * cols];
+        var srcArr = DownloadBuffer(src);
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                hostBuf[c * rows + r] = srcArr[r * cols + c];
+        UploadToBuffer(dst, hostBuf);
+        return dst;
+    }
+
     private bool TryExecuteHipBlasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
         if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)

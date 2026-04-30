@@ -339,6 +339,30 @@ public sealed unsafe partial class VulkanBackend
         return result;
     }
 
+    /// <inheritdoc/>
+    public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        EnsureInitialized();
+        // Same managed-fallback shape as Gemm — Vulkan compute pipeline
+        // for matmul isn't wired here yet; the buffer download/upload
+        // pair lets the kernel operate on host floats. The transposed-B
+        // index pattern accesses B[j, k] = b[j*K+k] instead of b[k*N+j].
+        var a = DownloadBuffer(A);
+        var b = DownloadBuffer(B);
+        var c = beta != 0.0f ? DownloadBuffer(C) : new float[M * N];
+        for (int i = 0; i < M; i++)
+        {
+            for (int j = 0; j < N; j++)
+            {
+                float sum = 0;
+                for (int k = 0; k < K; k++)
+                    sum += a[i * K + k] * b[j * K + k];
+                c[i * N + j] = beta != 0.0f ? alpha * sum + beta * c[i * N + j] : alpha * sum;
+            }
+        }
+        UploadToBuffer(c, C);
+    }
+
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
         EnsureInitialized();

@@ -245,6 +245,24 @@ public class MathInvariantExtendedTests
         var oobIdx = new Tensor<int>(new[] { 0, 5 }, new[] { 2 });
         Assert.Throws<ArgumentOutOfRangeException>(() => E.TensorScatterAdd(dst, oobIdx, src, 0));
     }
+    [Fact] public void MatMulTransposed_MatchesMaterializedTranspose()
+    {
+        // C[M,N] = A[M,K] · Bᵀ where B is stored as [N,K]. Result must equal
+        // MatMul(A, Transpose(B)) for the materialized fallback path.
+        var a = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 }); // [M=2, K=3]
+        var b = new Tensor<float>(new float[] { 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 }, new[] { 4, 3 }); // [N=4, K=3]
+        var fast = E.TensorMatMulTransposed(a, b).GetDataArray();
+        var bT = E.TensorTranspose(b);
+        var slow = E.TensorMatMul(a, bT).GetDataArray();
+        Assert.Equal(slow.Length, fast.Length);
+        for (int i = 0; i < slow.Length; i++) Assert.Equal(slow[i], fast[i], Tol);
+    }
+    [Fact] public void MatMulTransposed_KMismatch_Throws()
+    {
+        var a = R([2, 3], 1);    // [M=2, K=3]
+        var b = R([4, 5], 2);    // [N=4, K=5] — mismatched K
+        Assert.Throws<ArgumentException>(() => E.TensorMatMulTransposed(a, b));
+    }
 
     // ================================================================
     // TensorLerp (3)
