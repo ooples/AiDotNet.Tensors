@@ -61,6 +61,14 @@ public static class FusedDequantMatmulKernels
             throw new NotSupportedException(
                 "Q8MatMul currently supports symmetric quantization only. " +
                 "Asymmetric (non-empty ZeroPoints) requires a separate kernel.");
+        if (k == 0)
+        {
+            // Empty inner dimension — output is the zero matrix (matmul of an
+            // M×0 by 0×N is conventionally 0). Skip groupSize derivation so
+            // we don't divide by zero on per-tensor scale layouts.
+            output.Clear();
+            return;
+        }
 
         int groupSize = weightsScale.GroupSize <= 0 ? k : weightsScale.GroupSize;
         int groupsPerCol = (k + groupSize - 1) / groupSize;

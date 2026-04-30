@@ -22,30 +22,37 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
 {
     private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
+    private readonly object _lifecycleLock = new();
     private bool _disposed;
 
     public bool IsAvailable => MpsRngNative.IsAvailable;
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(MetalOffloadAllocator));
-        if (!IsAvailable)
-            throw new NotSupportedException("Metal/MPS framework is not loadable on this host (macOS only).");
-        if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        // Hold _lifecycleLock across the alloc + register so a concurrent
+        // Dispose cannot snapshot _live, clear it, and let this allocation
+        // slip in afterwards (which would leak the page-aligned buffer).
+        lock (_lifecycleLock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(MetalOffloadAllocator));
+            if (!IsAvailable)
+                throw new NotSupportedException("Metal/MPS framework is not loadable on this host (macOS only).");
+            if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-        // On Apple Silicon both Pinned and Managed map to MTLStorageModeShared
-        // (zero-copy unified memory). On Intel Macs Managed would map to
-        // storageModeManaged with explicit didModifyRange; we surface Shared
-        // as the default — MTLDevice.hasUnifiedMemory probes which the
-        // higher-level dispatch reads when picking schemes for the user.
-        // The host-visible buffer is allocated via posix_memalign so the
-        // pointer is page-aligned — required for MTLDevice.makeBuffer
-        // (no-copy variant) to succeed.
-        IntPtr ptr = AllocAligned(bytes);
-        var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Managed : scheme;
-        var h = new GpuOffloadHandle(ptr, ptr, bytes, effective);
-        _live[ptr] = h;
-        return h;
+            // On Apple Silicon both Pinned and Managed map to MTLStorageModeShared
+            // (zero-copy unified memory). On Intel Macs Managed would map to
+            // storageModeManaged with explicit didModifyRange; we surface Shared
+            // as the default — MTLDevice.hasUnifiedMemory probes which the
+            // higher-level dispatch reads when picking schemes for the user.
+            // The host-visible buffer is allocated via posix_memalign so the
+            // pointer is page-aligned — required for MTLDevice.makeBuffer
+            // (no-copy variant) to succeed.
+            IntPtr ptr = AllocAligned(bytes);
+            var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Managed : scheme;
+            var h = new GpuOffloadHandle(ptr, ptr, bytes, effective);
+            _live[ptr] = h;
+            return h;
+        }
     }
 
     public void Free(GpuOffloadHandle handle)
@@ -91,10 +98,17 @@ public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
 
     public void Dispose()
     {
-        if (_disposed) return;
-        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
-        foreach (var h in snapshot) Free(h);
-        _live.Clear();
-        _disposed = true;
+        GpuOffloadHandle[] snapshot;
+        lock (_lifecycleLock)
+        {
+            if (_disposed) return;
+            // Flip _disposed under the lock so any racing Allocate observes
+            // the flip and throws before introducing a new entry.
+            _disposed = true;
+            snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+            _live.Clear();
+        }
+        // Native frees outside the lock so libc's free can't deadlock us.
+        foreach (var h in snapshot) FreeAligned(h.HostPointer);
     }
 }

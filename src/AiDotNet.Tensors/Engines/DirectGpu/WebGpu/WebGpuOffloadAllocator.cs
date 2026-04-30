@@ -36,22 +36,29 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(WebGpuOffloadAllocator));
-        if (!IsAvailable)
-            throw new NotSupportedException("WebGPU implementation (Dawn / wgpu-native) is not loadable.");
-        if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        // Hold _lock across allocate + register so a concurrent Dispose
+        // cannot snapshot _live, clear it, and let this allocation leak.
+        // _lock is reentrant so EnsureInstance's nested lock is safe.
+        lock (_lock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(WebGpuOffloadAllocator));
+            if (!IsAvailable)
+                throw new NotSupportedException("WebGPU implementation (Dawn / wgpu-native) is not loadable.");
+            if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-        EnsureInstance();
-        // The host-mapped MAP_READ | MAP_WRITE pattern: we allocate a host
-        // buffer for the user-visible HostPointer; the Adapter+Device
-        // binding (which the WebGpu engine handles when staging a kernel)
-        // creates the GPUBuffer via wgpuDeviceCreateBuffer with the
-        // appropriate usage flags. Allocator owns the host backing only;
-        // device-buffer creation happens lazily under the kernel staging.
-        IntPtr hostBuf = Marshal.AllocHGlobal((IntPtr)bytes);
-        var rec = new AllocRecord { HostPtr = hostBuf, Bytes = bytes };
-        _live[hostBuf] = rec;
-        return new GpuOffloadHandle(hostBuf, hostBuf, bytes, OffloadScheme.Pinned);
+            EnsureInstance();
+            // The host-mapped MAP_READ | MAP_WRITE pattern: we allocate a
+            // host buffer for the user-visible HostPointer; the
+            // Adapter+Device binding (which the WebGpu engine handles when
+            // staging a kernel) creates the GPUBuffer via
+            // wgpuDeviceCreateBuffer with the appropriate usage flags.
+            // Allocator owns the host backing only; device-buffer creation
+            // happens lazily under the kernel staging.
+            IntPtr hostBuf = Marshal.AllocHGlobal((IntPtr)bytes);
+            var rec = new AllocRecord { HostPtr = hostBuf, Bytes = bytes };
+            _live[hostBuf] = rec;
+            return new GpuOffloadHandle(hostBuf, hostBuf, bytes, OffloadScheme.Pinned);
+        }
     }
 
     public void Free(GpuOffloadHandle handle)
@@ -63,19 +70,27 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
 
     public void Dispose()
     {
-        if (_disposed) return;
-        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        AllocRecord[] snapshot;
+        IntPtr instance;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            // Flip _disposed under the lock so any racing Allocate observes
+            // the flip on entry and throws before adding a new record.
+            _disposed = true;
+            snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+            _live.Clear();
+            instance = _instance;
+            _instance = IntPtr.Zero;
+        }
         foreach (var rec in snapshot)
         {
             try { Marshal.FreeHGlobal(rec.HostPtr); } catch { }
         }
-        _live.Clear();
-        if (_instance != IntPtr.Zero)
+        if (instance != IntPtr.Zero)
         {
-            try { WebGpuNativeBindings.wgpuInstanceRelease(_instance); } catch { }
-            _instance = IntPtr.Zero;
+            try { WebGpuNativeBindings.wgpuInstanceRelease(instance); } catch { }
         }
-        _disposed = true;
     }
 
     private sealed class AllocRecord

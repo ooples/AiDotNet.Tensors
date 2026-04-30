@@ -31,6 +31,13 @@ public static class WeightRegistry
         if (options is null) throw new ArgumentNullException(nameof(options));
         lock (_lock)
         {
+            // Dispose the previous allocator before swapping — otherwise its
+            // outstanding pinned/managed allocations + native context are
+            // leaked. Skip disposal when the caller passes the same instance
+            // back in (defensive: lets a caller re-Configure with new options
+            // without losing live allocations).
+            if (!ReferenceEquals(_offloadAllocator, offloadAllocator))
+                _offloadAllocator?.Dispose();
             _options = options;
             _offloadAllocator = offloadAllocator;
             _streamingPool?.Dispose();
@@ -91,17 +98,30 @@ public static class WeightRegistry
                     int byteCount = weight.Length * ElementSize<T>();
                     var scheme = weight.Lifetime == WeightLifetime.GpuManaged
                         ? OffloadScheme.Managed : OffloadScheme.Pinned;
-                    var h = alloc.Allocate(byteCount, scheme);
-                    // Persist the full handle so UnregisterWeight can
-                    // recreate it correctly — DevicePointer alone discards
-                    // the backend-specific opaque (cl_mem / VkDeviceMemory)
-                    // that the allocator's Free path needs.
-                    weight.OffloadDevicePointer = h.DevicePointer;
-                    weight.OffloadOpaqueHandle = h.BackendOpaque;
-                    weight.OffloadByteCount = byteCount;
+                    // Serialize FIRST so a SerializeToBytes failure (e.g.,
+                    // unsupported element type) doesn't leak a native
+                    // allocation. Then allocate, copy, and only on success
+                    // commit the metadata onto the tensor — wrap copy in
+                    // try/catch to free the handle if Marshal.Copy throws.
                     var stageBytes = new byte[byteCount];
                     SerializeToBytes(weight, stageBytes);
-                    System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
+                    var h = alloc.Allocate(byteCount, scheme);
+                    try
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
+                        // Persist the full handle so UnregisterWeight can
+                        // recreate it correctly — DevicePointer alone
+                        // discards the backend-specific opaque (cl_mem /
+                        // VkDeviceMemory) the allocator's Free path needs.
+                        weight.OffloadDevicePointer = h.DevicePointer;
+                        weight.OffloadOpaqueHandle = h.BackendOpaque;
+                        weight.OffloadByteCount = byteCount;
+                    }
+                    catch
+                    {
+                        alloc.Free(h);
+                        throw;
+                    }
                     return;
                 }
             default:
@@ -213,6 +233,7 @@ public static class WeightRegistry
         {
             _streamingPool?.Dispose();
             _streamingPool = null;
+            _offloadAllocator?.Dispose();
             _offloadAllocator = null;
             _options = new GpuOffloadOptions();
         }

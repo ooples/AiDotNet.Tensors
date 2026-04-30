@@ -95,8 +95,9 @@ public class BFloat16Tests
         var b = BFloat16.FromFloat(2.5f);
         Assert.True(a < b);
         Assert.True(b > a);
-        Assert.True(a <= a);
-        Assert.True(a >= a);
+        var aCopy = BFloat16.FromFloat(1.5f);
+        Assert.True(a <= aCopy);
+        Assert.True(a >= aCopy);
         Assert.False(a == b);
     }
 

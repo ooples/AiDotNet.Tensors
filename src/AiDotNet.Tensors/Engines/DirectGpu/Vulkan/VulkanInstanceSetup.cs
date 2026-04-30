@@ -108,10 +108,18 @@ internal static class VulkanInstanceSetup
 
         uint pdCount = 0;
         if (vkEnumeratePhysicalDevices(instance, ref pdCount, null) != 0 || pdCount == 0)
+        {
+            // Tear the instance down before throwing so we don't leak the
+            // VkInstance handle when no physical devices are present.
+            vkDestroyInstance(instance, IntPtr.Zero);
             throw new InvalidOperationException("Vulkan: no physical devices.");
+        }
         var pds = new IntPtr[pdCount];
         if (vkEnumeratePhysicalDevices(instance, ref pdCount, pds) != 0)
+        {
+            vkDestroyInstance(instance, IntPtr.Zero);
             throw new InvalidOperationException("vkEnumeratePhysicalDevices failed.");
+        }
 
         // Pick first HOST_VISIBLE memory type on first device.
         IntPtr chosenPd = IntPtr.Zero;

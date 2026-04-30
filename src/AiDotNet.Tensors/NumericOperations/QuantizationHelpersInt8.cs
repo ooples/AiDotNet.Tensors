@@ -60,8 +60,22 @@ public static class QuantizationHelpersInt8
         ReadOnlySpan<sbyte> src, QuantizationScale scale, Span<float> dst)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
+        // Symmetric-only contract — asymmetric requires a separate kernel.
+        if (scale.ZeroPoints.Length != 0)
+            throw new NotSupportedException(
+                "DequantizeInt8 supports symmetric quantization only (ZeroPoints must be empty).");
         if (dst.Length != src.Length)
             throw new ArgumentException($"dst.Length {dst.Length} must equal src.Length {src.Length}.");
+        // Empty-input guard: with src.Length == 0 and scale.GroupSize <= 0,
+        // the group derivation below would divide by zero.
+        if (src.Length == 0)
+        {
+            if (scale.Scales.Length > 1)
+                throw new ArgumentException(
+                    $"scale.Scales.Length {scale.Scales.Length} must be 0 or 1 when src is empty.",
+                    nameof(scale));
+            return;
+        }
         int groupSize = scale.GroupSize <= 0 ? src.Length : scale.GroupSize;
         int groups = (src.Length + groupSize - 1) / groupSize;
         if (scale.Scales.Length != groups)

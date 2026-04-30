@@ -44,45 +44,62 @@ public static class StreamingAutogradHook
 
     private static void DeserializeFromBytes<T>(Tensor<T> tensor, ReadOnlySpan<byte> src)
     {
-        // Write into a fresh T[] of the right element type via Buffer.BlockCopy,
-        // then copy that into the tensor's writable span using Tensor<T>'s
-        // own typed accessor (which handles the underlying buffer copy).
         var srcArr = src.ToArray();
         var dstSpan = tensor.AsWritableSpan();
         if (typeof(T) == typeof(float))
         {
+            int expected = checked(dstSpan.Length * sizeof(float));
+            if (srcArr.Length != expected)
+                throw new InvalidOperationException(
+                    $"Streaming payload size mismatch for float tensor: expected {expected} bytes, got {srcArr.Length}.");
             var typed = new float[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(float)));
+            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = (T)(object)typed[i];
             return;
         }
         if (typeof(T) == typeof(double))
         {
+            int expected = checked(dstSpan.Length * sizeof(double));
+            if (srcArr.Length != expected)
+                throw new InvalidOperationException(
+                    $"Streaming payload size mismatch for double tensor: expected {expected} bytes, got {srcArr.Length}.");
             var typed = new double[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(double)));
+            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = (T)(object)typed[i];
             return;
         }
         if (typeof(T) == typeof(int))
         {
+            int expected = checked(dstSpan.Length * sizeof(int));
+            if (srcArr.Length != expected)
+                throw new InvalidOperationException(
+                    $"Streaming payload size mismatch for int tensor: expected {expected} bytes, got {srcArr.Length}.");
             var typed = new int[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(int)));
+            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = (T)(object)typed[i];
             return;
         }
         if (typeof(T) == typeof(long))
         {
+            int expected = checked(dstSpan.Length * sizeof(long));
+            if (srcArr.Length != expected)
+                throw new InvalidOperationException(
+                    $"Streaming payload size mismatch for long tensor: expected {expected} bytes, got {srcArr.Length}.");
             var typed = new long[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(long)));
+            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = (T)(object)typed[i];
             return;
         }
         if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
         {
+            int expected = checked(dstSpan.Length * 2);
+            if (srcArr.Length != expected)
+                throw new InvalidOperationException(
+                    $"Streaming payload size mismatch for bfloat16 tensor: expected {expected} bytes, got {srcArr.Length}.");
             for (int i = 0; i < dstSpan.Length; i++)
             {
                 ushort raw = (ushort)(srcArr[i * 2] | (srcArr[i * 2 + 1] << 8));
@@ -90,8 +107,8 @@ public static class StreamingAutogradHook
             }
             return;
         }
-        // Unsupported T: the registry rejects unknown types at registration,
-        // so this path is unreachable in practice. No-op for safety.
+        throw new NotSupportedException(
+            $"Streaming rehydrate does not support tensor element type {typeof(T)}.");
     }
 
     /// <summary>Called when a forward op records an entry; touches the

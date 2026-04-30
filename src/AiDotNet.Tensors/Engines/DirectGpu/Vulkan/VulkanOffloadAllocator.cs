@@ -56,62 +56,85 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(VulkanOffloadAllocator));
-        if (!IsAvailable)
-            throw new NotSupportedException("Vulkan loader is not registered on this host.");
-        if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        // Hold _lock across allocate + register so a concurrent Dispose
+        // cannot snapshot _live and tear down the device while we're
+        // mid-allocate. _lock is reentrant so EnsureDevice's nested lock
+        // is safe.
+        lock (_lock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(VulkanOffloadAllocator));
+            if (!IsAvailable)
+                throw new NotSupportedException("Vulkan loader is not registered on this host.");
+            if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-        EnsureDevice();
-        var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
-        // vkAllocateMemory + vkMapMemory.
-        var allocInfo = new VulkanInstanceSetup.VkMemoryAllocateInfo
-        {
-            sType = 5, // VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
-            pNext = IntPtr.Zero,
-            allocationSize = (ulong)bytes,
-            memoryTypeIndex = _hostVisibleMemTypeIndex,
-        };
-        if (VulkanInstanceSetup.vkAllocateMemory(_device, ref allocInfo, IntPtr.Zero, out IntPtr memHandle) != 0)
-            throw new InvalidOperationException("vkAllocateMemory failed.");
-        if (VulkanInstanceSetup.vkMapMemory(_device, memHandle, 0, (ulong)bytes, 0, out IntPtr mappedPtr) != 0)
-        {
-            VulkanInstanceSetup.vkFreeMemory(_device, memHandle, IntPtr.Zero);
-            throw new InvalidOperationException("vkMapMemory failed.");
+            EnsureDevice();
+            var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
+            // vkAllocateMemory + vkMapMemory.
+            var allocInfo = new VulkanInstanceSetup.VkMemoryAllocateInfo
+            {
+                sType = 5, // VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+                pNext = IntPtr.Zero,
+                allocationSize = (ulong)bytes,
+                memoryTypeIndex = _hostVisibleMemTypeIndex,
+            };
+            if (VulkanInstanceSetup.vkAllocateMemory(_device, ref allocInfo, IntPtr.Zero, out IntPtr memHandle) != 0)
+                throw new InvalidOperationException("vkAllocateMemory failed.");
+            if (VulkanInstanceSetup.vkMapMemory(_device, memHandle, 0, (ulong)bytes, 0, out IntPtr mappedPtr) != 0)
+            {
+                VulkanInstanceSetup.vkFreeMemory(_device, memHandle, IntPtr.Zero);
+                throw new InvalidOperationException("vkMapMemory failed.");
+            }
+            var rec = new AllocRecord { MemHandle = memHandle, MappedPtr = mappedPtr, Bytes = bytes };
+            _live[mappedPtr] = rec;
+            return new GpuOffloadHandle(mappedPtr, mappedPtr, bytes, effective, memHandle);
         }
-        var rec = new AllocRecord { MemHandle = memHandle, MappedPtr = mappedPtr, Bytes = bytes };
-        _live[mappedPtr] = rec;
-        return new GpuOffloadHandle(mappedPtr, mappedPtr, bytes, effective, memHandle);
     }
 
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
         if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
-        try { VulkanInstanceSetup.vkUnmapMemory(_device, rec.MemHandle); } catch { }
-        try { VulkanInstanceSetup.vkFreeMemory(_device, rec.MemHandle, IntPtr.Zero); } catch { }
+        FreeRecord(rec, _device);
+    }
+
+    private static void FreeRecord(AllocRecord rec, IntPtr device)
+    {
+        if (device == IntPtr.Zero) return; // device already torn down
+        try { VulkanInstanceSetup.vkUnmapMemory(device, rec.MemHandle); } catch { }
+        try { VulkanInstanceSetup.vkFreeMemory(device, rec.MemHandle, IntPtr.Zero); } catch { }
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
-        foreach (var rec in snapshot)
+        AllocRecord[] snapshot;
+        IntPtr device;
+        IntPtr instance;
+        lock (_lock)
         {
-            try { VulkanInstanceSetup.vkUnmapMemory(_device, rec.MemHandle); } catch { }
-            try { VulkanInstanceSetup.vkFreeMemory(_device, rec.MemHandle, IntPtr.Zero); } catch { }
+            if (_disposed) return;
+            // Flip _disposed under the lock so any racing Allocate observes
+            // the flip on entry and throws — no allocations can sneak in.
+            _disposed = true;
+            snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+            _live.Clear();
+            device = _device;
+            instance = _instance;
         }
-        _live.Clear();
-        if (_device != IntPtr.Zero)
+        // Free outside the lock; vk*Memory must run BEFORE vkDestroyDevice.
+        foreach (var rec in snapshot) FreeRecord(rec, device);
+        if (device != IntPtr.Zero)
         {
-            try { VulkanInstanceSetup.vkDestroyDevice(_device, IntPtr.Zero); } catch { }
+            try { VulkanInstanceSetup.vkDestroyDevice(device, IntPtr.Zero); } catch { }
+        }
+        if (instance != IntPtr.Zero)
+        {
+            try { VulkanInstanceSetup.vkDestroyInstance(instance, IntPtr.Zero); } catch { }
+        }
+        lock (_lock)
+        {
             _device = IntPtr.Zero;
-        }
-        if (_instance != IntPtr.Zero)
-        {
-            try { VulkanInstanceSetup.vkDestroyInstance(_instance, IntPtr.Zero); } catch { }
             _instance = IntPtr.Zero;
         }
-        _disposed = true;
     }
 
     private sealed class AllocRecord

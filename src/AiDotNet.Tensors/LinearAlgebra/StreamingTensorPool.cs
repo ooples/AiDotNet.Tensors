@@ -131,7 +131,11 @@ public sealed class StreamingTensorPool : IDisposable
                     var freshNode = _lruOrder.AddFirst(handleId);
                     _lruIndex[handleId] = freshNode;
                 }
-                EvictIfOverBudget();
+                // Skip the just-rehydrated entry during eviction. If this
+                // tensor alone exceeds the budget, evicting it here would
+                // page it back out before Rehydrate returns and the caller
+                // would see stale/empty bytes.
+                EvictIfOverBudget(protectedHandleId: handleId);
             }
 
             // Refresh LRU on resident hit.
@@ -163,19 +167,24 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
-    private void EvictIfOverBudget()
+    private void EvictIfOverBudget(long? protectedHandleId = null)
     {
         // Caller already holds _lock.
         while (_residentBytes > _maxResidentBytes && _lruOrder.Count > 0)
         {
-            // Tail of LRU is least-recently-used.
-            var oldest = _lruOrder.Last!;
+            // Tail of LRU is least-recently-used. Walk forward (toward more
+            // recent) past the protected entry so a single tensor exceeding
+            // the budget doesn't page itself back out during rehydrate.
+            var oldest = _lruOrder.Last;
+            while (oldest is not null && protectedHandleId.HasValue && oldest.Value == protectedHandleId.Value)
+                oldest = oldest.Previous;
+            if (oldest is null) break; // only the protected entry remains
             long id = oldest.Value;
 
             if (!_entries.TryGetValue(id, out var entry) || entry.Data is null)
             {
                 // Stale LRU node (entry already evicted/unregistered) — drop.
-                _lruOrder.RemoveLast();
+                _lruOrder.Remove(oldest);
                 _lruIndex.Remove(id);
                 continue;
             }
@@ -188,7 +197,7 @@ public sealed class StreamingTensorPool : IDisposable
             _residentBytes -= entry.ResidentBytes;
             entry.ResidentBytes = 0;
             entry.Data = null;
-            _lruOrder.RemoveLast();
+            _lruOrder.Remove(oldest);
             _lruIndex.Remove(id);
         }
     }

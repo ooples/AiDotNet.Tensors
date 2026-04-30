@@ -60,43 +60,50 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(OpenClOffloadAllocator));
-        if (!IsAvailable)
-            throw new NotSupportedException("OpenCL ICD is not loadable on this host.");
-        if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        // Hold _lock across allocate + register so a concurrent Dispose
+        // cannot snapshot _live, clear it, and let this allocation slip in
+        // afterwards (which would leak the cl_mem / SVM pointer). _lock is
+        // reentrant so EnsureContext's nested lock is safe.
+        lock (_lock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(OpenClOffloadAllocator));
+            if (!IsAvailable)
+                throw new NotSupportedException("OpenCL ICD is not loadable on this host.");
+            if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-        EnsureContext();
-        var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
-        if (effective == OffloadScheme.Managed)
-        {
-            // SVM (OpenCL 2.0+).
-            var svmPtr = OpenClPlatformProbe.clSVMAlloc(_context,
-                OpenClPlatformProbe.CL_MEM_READ_WRITE | OpenClPlatformProbe.CL_MEM_SVM_FINE_GRAIN_BUFFER,
-                (UIntPtr)bytes, alignment: 0);
-            if (svmPtr == IntPtr.Zero)
-                throw new InvalidOperationException("clSVMAlloc returned null (OpenCL 2.0 SVM not supported on this device).");
-            var rec = new AllocRecord { Scheme = effective, IsSvm = true, HostPtr = svmPtr };
-            _live[svmPtr] = rec;
-            return new GpuOffloadHandle(svmPtr, svmPtr, bytes, effective);
-        }
-        else
-        {
-            // Pinned-host: clCreateBuffer with CL_MEM_ALLOC_HOST_PTR.
-            // The driver allocates pinned host memory and returns a cl_mem
-            // handle; we ALSO keep an aligned host buffer for the user-
-            // visible HostPointer.
-            IntPtr hostBuf = Marshal.AllocHGlobal((IntPtr)bytes);
-            var memObj = OpenClPlatformProbe.clCreateBuffer(_context,
-                OpenClPlatformProbe.CL_MEM_READ_WRITE | OpenClPlatformProbe.CL_MEM_ALLOC_HOST_PTR,
-                (UIntPtr)bytes, IntPtr.Zero, out int err);
-            if (err != 0 || memObj == IntPtr.Zero)
+            EnsureContext();
+            var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
+            if (effective == OffloadScheme.Managed)
             {
-                Marshal.FreeHGlobal(hostBuf);
-                throw new InvalidOperationException($"clCreateBuffer returned errcode {err}.");
+                // SVM (OpenCL 2.0+).
+                var svmPtr = OpenClPlatformProbe.clSVMAlloc(_context,
+                    OpenClPlatformProbe.CL_MEM_READ_WRITE | OpenClPlatformProbe.CL_MEM_SVM_FINE_GRAIN_BUFFER,
+                    (UIntPtr)bytes, alignment: 0);
+                if (svmPtr == IntPtr.Zero)
+                    throw new InvalidOperationException("clSVMAlloc returned null (OpenCL 2.0 SVM not supported on this device).");
+                var rec = new AllocRecord { Scheme = effective, IsSvm = true, HostPtr = svmPtr };
+                _live[svmPtr] = rec;
+                return new GpuOffloadHandle(svmPtr, svmPtr, bytes, effective);
             }
-            var rec = new AllocRecord { Scheme = effective, IsSvm = false, HostPtr = hostBuf, MemObject = memObj };
-            _live[hostBuf] = rec;
-            return new GpuOffloadHandle(hostBuf, hostBuf, bytes, effective, memObj);
+            else
+            {
+                // Pinned-host: clCreateBuffer with CL_MEM_ALLOC_HOST_PTR.
+                // The driver allocates pinned host memory and returns a cl_mem
+                // handle; we ALSO keep an aligned host buffer for the user-
+                // visible HostPointer.
+                IntPtr hostBuf = Marshal.AllocHGlobal((IntPtr)bytes);
+                var memObj = OpenClPlatformProbe.clCreateBuffer(_context,
+                    OpenClPlatformProbe.CL_MEM_READ_WRITE | OpenClPlatformProbe.CL_MEM_ALLOC_HOST_PTR,
+                    (UIntPtr)bytes, IntPtr.Zero, out int err);
+                if (err != 0 || memObj == IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(hostBuf);
+                    throw new InvalidOperationException($"clCreateBuffer returned errcode {err}.");
+                }
+                var rec = new AllocRecord { Scheme = effective, IsSvm = false, HostPtr = hostBuf, MemObject = memObj };
+                _live[hostBuf] = rec;
+                return new GpuOffloadHandle(hostBuf, hostBuf, bytes, effective, memObj);
+            }
         }
     }
 
@@ -104,41 +111,50 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
     {
         if (handle.HostPointer == IntPtr.Zero) return;
         if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
-        if (rec.IsSvm)
+        FreeRecord(rec, _context);
+    }
+
+    private static void FreeRecord(AllocRecord rec, IntPtr context)
+    {
+        try
         {
-            OpenClPlatformProbe.clSVMFree(_context, handle.HostPointer);
+            if (rec.IsSvm)
+            {
+                // clSVMFree requires the context that owned the allocation;
+                // skipping when context is zero (already released in Dispose).
+                if (context != IntPtr.Zero) OpenClPlatformProbe.clSVMFree(context, rec.HostPtr);
+            }
+            else
+            {
+                if (rec.MemObject != IntPtr.Zero) OpenClPlatformProbe.clReleaseMemObject(rec.MemObject);
+                Marshal.FreeHGlobal(rec.HostPtr);
+            }
         }
-        else
-        {
-            if (rec.MemObject != IntPtr.Zero) OpenClPlatformProbe.clReleaseMemObject(rec.MemObject);
-            Marshal.FreeHGlobal(handle.HostPointer);
-        }
+        catch { /* best-effort */ }
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
-        foreach (var rec in snapshot)
+        AllocRecord[] snapshot;
+        IntPtr ctx;
+        lock (_lock)
         {
-            try
-            {
-                if (rec.IsSvm) OpenClPlatformProbe.clSVMFree(_context, rec.HostPtr);
-                else
-                {
-                    if (rec.MemObject != IntPtr.Zero) OpenClPlatformProbe.clReleaseMemObject(rec.MemObject);
-                    Marshal.FreeHGlobal(rec.HostPtr);
-                }
-            }
-            catch { /* best-effort */ }
+            if (_disposed) return;
+            // Flip _disposed under the lock so any racing Allocate observes
+            // the flip on entry and throws before adding new records.
+            _disposed = true;
+            snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+            _live.Clear();
+            ctx = _context;
         }
-        _live.Clear();
-        if (_context != IntPtr.Zero)
+        // Free the records using the still-valid context. clSVMFree must run
+        // BEFORE clReleaseContext, so we don't null _context until after.
+        foreach (var rec in snapshot) FreeRecord(rec, ctx);
+        if (ctx != IntPtr.Zero)
         {
-            try { OpenClPlatformProbe.clReleaseContext(_context); } catch { }
-            _context = IntPtr.Zero;
+            try { OpenClPlatformProbe.clReleaseContext(ctx); } catch { }
         }
-        _disposed = true;
+        lock (_lock) { _context = IntPtr.Zero; }
     }
 
     private sealed class AllocRecord
