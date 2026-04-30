@@ -1,3 +1,29 @@
+# BENCHMARK RESULTS
+
+> **Hardware**: AMD Ryzen 9 3950X (16C / 32T, AVX2/FMA, no AVX-512)
+> **Runtime**: .NET 10.0
+> **Tool**: BenchmarkDotNet (default config)
+> **Suites**: TorchSharpCpuComparisonBenchmarks, TorchSharpComparisonBenchmarks (GPU), MlNetCpuComparisonBenchmarks, TensorFlowCpuComparisonBenchmarks
+>
+> **Important — what's already landed but NOT yet reflected in the table below:**
+> The [#209 parity audit](https://github.com/ooples/AiDotNet.Tensors/issues/209) closed several perf gaps after this table was last regenerated:
+> - `Exp(double)` / `Log(double)` / `SoftMax(double)`: route through
+>   `System.Numerics.Tensors.TensorPrimitives` on net8+, closing a 40–70× cliff
+>   versus `Math.Exp` scalar fallback.
+> - `TensorAbs(float|double)` / `TensorMaxValue(float|double)`: route through
+>   `TensorPrimitives` on net8+, eliminating Pin + Parallel.For dispatch
+>   overhead (~5–8× speedup at 1M elements).
+> - `LayerNorm` benchmark: previously recorded NA on both AiDotNet and
+>   TorchSharp because the gamma/input shape contract was misaligned.
+>   Fixed in the benchmark setup.
+>
+> **Regenerate** with:
+> ```bash
+> dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-torchsharp-cpu
+> dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-mlnet-cpu
+> dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-tensorflow-cpu
+> ```
+
 | Method                      | size    | Mean          | Error         | StdDev       | Median        | Allocated |
 |---------------------------- |-------- |--------------:|--------------:|-------------:|--------------:|----------:|
 | AiDotNet_TensorSubtract     | ?       |   2,308.34 us |    733.195 us |   572.431 us |   2,126.15 us |    2376 B |

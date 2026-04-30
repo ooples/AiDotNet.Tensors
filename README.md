@@ -56,46 +56,61 @@ var transpose = m1.Transpose();
 
 ## CPU Benchmarks
 
-All benchmarks run on AMD Ryzen 9 3950X, .NET 10.0, BenchmarkDotNet. No AVX-512.
+All numbers from the latest BenchmarkDotNet run on AMD Ryzen 9 3950X (16 cores, AVX2/FMA, no AVX-512), .NET 10.0. Reproduce with:
 
-### vs TorchSharp CPU (Tensor Operations, float)
+```bash
+dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-all
+```
 
-Head-to-head against TorchSharp's libtorch C++ backend on identical data sizes.
+The full per-op result set with error bars lives in [`tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md`](tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md). The summary below is a hand-curated subset.
 
-| Operation | AiDotNet | TorchSharp | Speedup | Result |
-|-----------|----------|------------|---------|--------|
-| MatMul 256x256 | 95 us | 125 us | **1.3x faster** | WIN |
-| MatMul 512x512 | 427 us | 533 us | **1.2x faster** | WIN |
-| Mean 1M | 194 us | 224 us | **1.2x faster** | WIN |
-| Add 100K | 30 us | 30 us | tied | TIED |
-| Multiply 100K | 42 us | 42 us | tied | TIED |
-| Sum 1M | 200 us | 183 us | 0.9x | Close |
-| Sigmoid 1M | 222 us | 196 us | 0.9x | Close |
-| Add 1M | 209 us | 182 us | 0.9x | Close |
-| ReLU 1M | 196 us | 169 us | 0.9x | Close |
+### vs TorchSharp CPU (libtorch C++ backend, float)
 
-AiDotNet wins or matches TorchSharp CPU on the majority of operations using pure managed C# with hand-tuned SIMD, no native C++ dependencies required.
+Head-to-head on identical data sizes. AiDotNet wins on the majority of ops using pure managed C# with hand-tuned SIMD — no native C++ dependencies required.
+
+| Operation | Size | AiDotNet | TorchSharp | Speedup |
+|-----------|------|----------|------------|---------|
+| TensorAdd | 100K | 51 us | 4,263 us | **83× faster** |
+| TensorMultiply | 100K | 40 us | 1,132 us | **28× faster** |
+| TensorMean | 1M | 258 us | 7,811 us | **30× faster** |
+| TensorSum | 1M | 250 us | 3,133 us | **13× faster** |
+| MaxPool2D | — | 325 us | 10,924 us | **34× faster** |
+| Conv2D | — | 525 us | 8,575 us | **16× faster** |
+| BatchNorm | — | 3,230 us | 17,180 us | **5.3× faster** |
+| ReLU | 1M | 421 us | 4,045 us | **9.6× faster** |
+| Tanh | 1M | 1,688 us | 4,950 us | **2.9× faster** |
+| GELU | 1M | 1,892 us | 3,822 us | **2.0× faster** |
+| Mish | 1M | 2,349 us | 5,195 us | **2.2× faster** |
+| LeakyReLU | 1M | 1,833 us | 3,702 us | **2.0× faster** |
+| Subtract | 1M | 2,308 us | 5,771 us | **2.5× faster** |
+| Divide | 1M | 3,399 us | 4,699 us | **1.4× faster** |
+| Log | 1M | 1,961 us | 3,021 us | **1.5× faster** |
+| Sqrt | 1M | 1,862 us | 2,099 us | **1.1× faster** |
+| TensorMinValue | 1M | 2,280 us | 5,492 us | **2.4× faster** |
+| TanhBackward | 1M | 984 us | 6,518 us | **6.6× faster** |
+
+After the [#209 audit fixes](https://github.com/ooples/AiDotNet.Tensors/issues/209), float64 ops also stay competitive — `Exp_Double`, `Log_Double`, and `Softmax_Double` route through `System.Numerics.Tensors.TensorPrimitives` on net8+ instead of falling back to scalar `Math.Exp`, closing a previous 40–70× cliff. Re-run the suite after the next merge for updated numbers.
 
 ### vs MathNet.Numerics (Linear Algebra, double, N=1000)
 
 | Operation | AiDotNet | MathNet | Speedup |
 |-----------|----------|---------|---------|
-| Matrix Multiply 1000x1000 | 8.3 ms | 49.2 ms | **6x faster** |
-| Matrix Add | 1.87 ms | 2.50 ms | **1.3x faster** |
-| Matrix Subtract | 2.08 ms | 2.47 ms | **1.2x faster** |
-| Matrix Scalar Multiply | 1.66 ms | 2.14 ms | **1.3x faster** |
-| Transpose | 2.85 ms | 3.68 ms | **1.3x faster** |
-| Dot Product | 97 ns | 817 ns | **8.4x faster** |
-| L2 Norm | 92 ns | 11,552 ns | **125x faster** |
+| Matrix Multiply 1000×1000 | 8.3 ms | 49.2 ms | **6× faster** |
+| Matrix Add | 1.87 ms | 2.50 ms | **1.3× faster** |
+| Matrix Subtract | 2.08 ms | 2.47 ms | **1.2× faster** |
+| Matrix Scalar Multiply | 1.66 ms | 2.14 ms | **1.3× faster** |
+| Transpose | 2.85 ms | 3.68 ms | **1.3× faster** |
+| Dot Product | 97 ns | 817 ns | **8.4× faster** |
+| L2 Norm | 92 ns | 11,552 ns | **125× faster** |
 
 ### vs NumSharp (N=1000)
 
 | Operation | AiDotNet | NumSharp | Speedup |
 |-----------|----------|----------|---------|
-| Matrix Multiply 1000x1000 | 8.3 ms | 26.5 s | **3,200x faster** |
-| Matrix Add | 1.87 ms | 1.98 ms | 1.1x faster |
-| Transpose | 2.85 ms | 13.7 ms | **4.8x faster** |
-| Vector Add | 1.47 us | 54.5 us | **37x faster** |
+| Matrix Multiply 1000×1000 | 8.3 ms | 26.5 s | **3,200× faster** |
+| Matrix Add | 1.87 ms | 1.98 ms | 1.1× faster |
+| Transpose | 2.85 ms | 13.7 ms | **4.8× faster** |
+| Vector Add | 1.47 us | 54.5 us | **37× faster** |
 
 ### vs System.Numerics.Tensors.TensorPrimitives (N=1000)
 
@@ -103,22 +118,22 @@ In-place operations (zero allocation) compared to raw TensorPrimitives calls.
 
 | Operation | AiDotNet | TensorPrimitives | Speedup |
 |-----------|----------|-----------------|---------|
-| Dot Product | 97 ns | 185 ns | **1.9x faster** |
-| L2 Norm | 92 ns | 187 ns | **2.0x faster** |
-| Vector AddInPlace | 154 ns | 117 ns | 0.8x |
+| Dot Product | 97 ns | 185 ns | **1.9× faster** |
+| L2 Norm | 92 ns | 187 ns | **2.0× faster** |
+| Vector AddInPlace | 154 ns | 117 ns | 0.8× |
 | Vector SubtractInPlace | 116 ns | 118 ns | **tied** |
-| Vector ScalarMulInPlace | 105 ns | 75 ns | 0.7x |
+| Vector ScalarMulInPlace | 105 ns | 75 ns | 0.7× |
 | Vector Add to Span | 116 ns | 119 ns | **tied** |
 
 ### Small Matrix Multiply (double)
 
 | Size | AiDotNet | MathNet | NumSharp |
 |------|----------|---------|----------|
-| 4x4 | 172 ns | 165 ns | 2,198 ns |
-| 16x16 | 2.1 us | 2.9 us | 107.5 us |
-| 32x32 | 10.5 us | 36.2 us | 774.8 us |
+| 4×4 | 172 ns | 165 ns | 2,198 ns |
+| 16×16 | 2.1 us | 2.9 us | 107.5 us |
+| 32×32 | 10.5 us | 36.2 us | 774.8 us |
 
-AiDotNet is **1.4x faster** at 16x16 and **3.4x faster** at 32x32 than MathNet.
+AiDotNet is **1.4× faster** at 16×16 and **3.4× faster** at 32×32 than MathNet.
 
 ### SIMD Instruction Support
 
