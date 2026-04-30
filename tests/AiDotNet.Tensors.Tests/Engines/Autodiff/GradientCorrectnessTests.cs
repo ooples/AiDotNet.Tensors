@@ -859,12 +859,57 @@ public class GradientCorrectnessTests
         var loss = _engine.ReduceSum(sq, axes: null);
         var grads = tape.ComputeGradients(loss, sources: new[] { x }, createGraph: true);
         Assert.True(grads.ContainsKey(x));
-        var g = grads[x].AsSpan();
+        // createGraph=true keeps the original non-contiguous grad reference so
+        // double-backward stays graph-connected (PyTorch parity); materialize
+        // before reading the span. .Contiguous() preserves values without
+        // touching the recorded graph.
+        var g = grads[x].Contiguous().AsSpan();
         // d(sum(x^2))/dx = 2x.
         Assert.Equal(2f, g[0], 4);
         Assert.Equal(4f, g[1], 4);
         Assert.Equal(6f, g[2], 4);
         Assert.Equal(8f, g[3], 4);
+    }
+
+    /// <summary>Double-backward through Permute — exercises that the createGraph=true
+    /// path keeps GradFn lineage intact through non-contiguous incoming gradients.
+    /// If AccumulateGrad eagerly materialized via .Contiguous(), the second backward
+    /// would fail to walk back through the detached copy and yield wrong grads
+    /// (or throw). PyTorch parity: x^3 → d/dx = 3x², d²/dx² = 6x.</summary>
+    [Fact]
+    public void Permute_DoubleBackward_PreservesGraphLineage_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+
+        // First backward with createGraph=true so the backward ops record on the tape.
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(x, new[] { 1, 0 });
+        var pSq = _engine.TensorMultiply(p, p);             // p²
+        var pCube = _engine.TensorMultiply(pSq, p);          // p³
+        var loss1 = _engine.ReduceSum(pCube, axes: null);
+        var grads1 = tape.ComputeGradients(loss1, sources: new[] { x }, createGraph: true);
+        Assert.True(grads1.ContainsKey(x));
+        var g1 = grads1[x];
+
+        // First-derivative sanity: d/dx(x³) = 3x² → at [1,2,3,4] = [3,12,27,48].
+        // .Contiguous() materializes a value-copy without disturbing g1's
+        // tape lineage (g1 itself is the live reference for double-backward).
+        var g1Span = g1.Contiguous().AsSpan();
+        Assert.Equal(3f, g1Span[0], 3);
+        Assert.Equal(12f, g1Span[1], 3);
+        Assert.Equal(27f, g1Span[2], 3);
+        Assert.Equal(48f, g1Span[3], 3);
+
+        // Second backward — sum the first gradient and differentiate again.
+        // d²/dx² of x³ = 6x → at [1,2,3,4] = [6,12,18,24]; d/dx of sum(3x²) = 6x.
+        var loss2 = _engine.ReduceSum(g1, axes: null);
+        var grads2 = tape.ComputeGradients(loss2, sources: new[] { x }, createGraph: false);
+        Assert.True(grads2.ContainsKey(x));
+        var g2 = grads2[x].Contiguous().AsSpan();
+        Assert.Equal(6f, g2[0], 2);
+        Assert.Equal(12f, g2[1], 2);
+        Assert.Equal(18f, g2[2], 2);
+        Assert.Equal(24f, g2[3], 2);
     }
 
     // ──────────────────────────────────────────────────────────────
