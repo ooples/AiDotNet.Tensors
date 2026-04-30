@@ -231,6 +231,20 @@ internal static class DifferentiableOps
         // tensor references — the graph stays connected.
         bool needsOutOfPlace = _isBackwardCreateGraph;
 
+        // CONTIGUITY INVARIANT (issue #274): every backward op that
+        // permutes / reshapes / slices its incoming grad produces a
+        // non-contiguous view tensor (e.g. PermuteBackward returns
+        // engine.TensorPermute(...) which is a stride-rewrite, not a
+        // contiguous copy). If we store that view as the first
+        // gradient and a later AccumulateGrad call hits TensorAddInPlace
+        // on it, the engine throws "In-place add requires contiguous
+        // target tensor." Materialize at storage time so every grad
+        // accumulator slot holds a contiguous buffer. The
+        // .Contiguous() call no-ops when already contiguous, so the
+        // hot path (Add / Mul / MatMul backward producing contiguous
+        // grads) pays nothing.
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
         int idx = tensor._gradIndex;
         if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)
@@ -241,11 +255,15 @@ internal static class DifferentiableOps
                 Tensor<T> accumulated;
                 if (needsOutOfPlace)
                 {
-                    accumulated = engine.TensorAdd(existing, grad);
+                    accumulated = engine.TensorAdd(existing, gradContig);
                 }
                 else
                 {
-                    engine.TensorAddInPlace(existing, grad);
+                    // Defensive: if the existing slot is somehow
+                    // non-contiguous (e.g. populated outside this
+                    // method), materialize before in-place add.
+                    if (!existing.IsContiguous) existing = existing.Contiguous();
+                    engine.TensorAddInPlace(existing, gradContig);
                     accumulated = existing;
                 }
                 _indexedGrads[idx] = accumulated;
@@ -253,8 +271,8 @@ internal static class DifferentiableOps
             }
             else
             {
-                _indexedGrads[idx] = grad;
-                tensor.Grad = grad;
+                _indexedGrads[idx] = gradContig;
+                tensor.Grad = gradContig;
             }
             grads[tensor] = tensor.Grad!;
             return;
@@ -265,20 +283,25 @@ internal static class DifferentiableOps
         {
             if (needsOutOfPlace)
             {
-                var accumulated = engine.TensorAdd(existingDict, grad);
+                var accumulated = engine.TensorAdd(existingDict, gradContig);
                 grads[tensor] = accumulated;
                 tensor.Grad = accumulated;
             }
             else
             {
-                engine.TensorAddInPlace(existingDict, grad);
+                if (!existingDict.IsContiguous)
+                {
+                    existingDict = existingDict.Contiguous();
+                    grads[tensor] = existingDict;
+                }
+                engine.TensorAddInPlace(existingDict, gradContig);
                 tensor.Grad = existingDict;
             }
         }
         else
         {
-            grads[tensor] = grad;
-            tensor.Grad = grad;
+            grads[tensor] = gradContig;
+            tensor.Grad = gradContig;
         }
     }
 }

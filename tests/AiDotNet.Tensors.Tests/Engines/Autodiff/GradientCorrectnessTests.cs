@@ -589,6 +589,284 @@ public class GradientCorrectnessTests
         VerifyGradient(inp => _engine.TensorPermute(inp, new[] { 1, 0 }), x, "Permute");
     }
 
+    /// <summary>
+    /// Regression for #274: when a permute output is consumed by multiple
+    /// downstream ops, the second AccumulateGrad call into the permute's
+    /// input previously hit "In-place add requires contiguous target tensor"
+    /// because PermuteBackward returns a non-contiguous (strided view)
+    /// gradient and AccumulateGrad stored it as the first-write target.
+    /// Now AccumulateGrad materializes via .Contiguous() at storage time.
+    /// </summary>
+    [Fact]
+    public void Permute_GradAccumulation_AcrossMultipleConsumers_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+
+        using var tape = new GradientTape<float>();
+        // Permute creates a non-contiguous view; both branches consume it
+        // so its gradient accumulates twice — the failing path in #274.
+        var p = _engine.TensorPermute(x, new[] { 1, 0 });          // [3, 2]
+        var s1 = _engine.TensorMultiplyScalar(p, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(p, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+
+        // Pre-fix: throws InvalidOperationException with the #274 message.
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+
+        Assert.True(grads.ContainsKey(x));
+        // dL/dx = 5 everywhere (perm is just a re-indexing; both scalar-mults
+        // contribute 2 + 3 = 5 to every cell).
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    /// <summary>Audit-companion to #274: same multi-consumer pattern through Transpose
+    /// (which also returns a stride-rewritten view). Caught by the universal
+    /// AccumulateGrad contiguity fix.</summary>
+    [Fact]
+    public void Transpose_GradAccumulation_AcrossMultipleConsumers_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        using var tape = new GradientTape<float>();
+        var t = _engine.TensorTranspose(x);
+        var s1 = _engine.TensorMultiplyScalar(t, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(t, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    /// <summary>Audit-companion to #274: Squeeze returns a metadata-only view.
+    /// Multi-consumer accumulation must not hit the in-place contiguity throw.</summary>
+    [Fact]
+    public void Squeeze_GradAccumulation_AcrossMultipleConsumers_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [1, 2, 3]);
+        using var tape = new GradientTape<float>();
+        var sq = _engine.TensorSqueeze(x, 0);
+        var s1 = _engine.TensorMultiplyScalar(sq, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(sq, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    /// <summary>Audit-companion to #274: ExpandDims returns a view.</summary>
+    [Fact]
+    public void ExpandDims_GradAccumulation_AcrossMultipleConsumers_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        using var tape = new GradientTape<float>();
+        var e = _engine.TensorExpandDims(x, 0);
+        var s1 = _engine.TensorMultiplyScalar(e, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(e, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    /// <summary>Audit-companion to #274: Reshape can return a view in some
+    /// stride configurations. Multi-consumer pattern through Reshape.</summary>
+    [Fact]
+    public void Reshape_GradAccumulation_AcrossMultipleConsumers_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        using var tape = new GradientTape<float>();
+        var r = _engine.Reshape(x, new[] { 3, 2 });
+        var s1 = _engine.TensorMultiplyScalar(r, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(r, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // #274 edge-case integration suite — deeper graphs, more
+    // consumers, non-contiguous input, large tensors, chained views.
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>Permute → Permute → multi-consumer. The view is composed
+    /// before the fan-out, so the cached gradient buffer for the inner
+    /// permute is itself non-contiguous AND has a non-contiguous incoming
+    /// gradient. Both legs of the AccumulateGrad fix must engage.</summary>
+    [Fact]
+    public void Permute_Chained_GradAccumulation_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, [2, 2, 2]);
+        using var tape = new GradientTape<float>();
+        var p1 = _engine.TensorPermute(x, new[] { 1, 0, 2 });   // first stride-rewrite
+        var p2 = _engine.TensorPermute(p1, new[] { 0, 2, 1 });  // second stride-rewrite
+        var s1 = _engine.TensorMultiplyScalar(p2, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(p2, 3.0f);
+        var s3 = _engine.TensorMultiplyScalar(p2, 7.0f);        // 3 consumers, not 2
+        var sum12 = _engine.TensorAdd(s1, s2);
+        var sum123 = _engine.TensorAdd(sum12, s3);
+        var loss = _engine.ReduceSum(sum123, axes: null);
+
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        // dL/dx = 2 + 3 + 7 = 12 everywhere (the permutes only re-index, sum is invariant).
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(12f, g[i], 4);
+    }
+
+    /// <summary>Permute fan-out with FIVE downstream consumers. Stress the
+    /// AccumulateGrad fast path (indexed) under repeated in-place adds onto
+    /// a previously non-contiguous slot.</summary>
+    [Fact]
+    public void Permute_FiveConsumers_GradAccumulation_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(x, new[] { 1, 0 });
+        var sums = new[] { 1.5f, 2.5f, 3.5f, 4.5f, 5.5f };
+        Tensor<float>? acc = null;
+        foreach (var s in sums)
+        {
+            var sm = _engine.TensorMultiplyScalar(p, s);
+            acc = acc is null ? sm : _engine.TensorAdd(acc, sm);
+        }
+        var loss = _engine.ReduceSum(acc!, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        // dL/dx = sum(scalars) = 17.5 everywhere.
+        var g = grads[x].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(17.5f, g[i], 3);
+    }
+
+    /// <summary>Mixed-view multi-consumer: Permute output AND Transpose output
+    /// of the same source feed downstream — exercises that gradient
+    /// accumulation through TWO different non-contiguous views into the same
+    /// source tensor stays correct.</summary>
+    [Fact]
+    public void Permute_AndTranspose_BothToSameSource_GradAccumulation_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(x, new[] { 1, 0 });
+        var t = _engine.TensorTranspose(x);
+        var s1 = _engine.TensorMultiplyScalar(p, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(t, 5.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        var g = grads[x].AsSpan();
+        // dL/dx = 7 everywhere (Permute and Transpose are equivalent for [2,3] → [3,2]).
+        for (int i = 0; i < g.Length; i++) Assert.Equal(7f, g[i], 4);
+    }
+
+    /// <summary>NBEATS-style scenario from the issue: a permuted basis tensor
+    /// feeds two downstream linear projections (backcast + forecast) whose
+    /// gradients flow back through accumulation.</summary>
+    [Fact]
+    public void NBeatsStyle_PermuteThenTwoMatMuls_GradAccumulation_Issue274()
+    {
+        // NBEATS pattern: a (channels × time) basis is permuted to
+        // (time × channels), then two head MatMuls (backcast / forecast)
+        // both consume the permuted view → the gradient accumulator hits
+        // the failing #274 path on the second backward write into perm's input.
+        // basis: [channels=4, time=3]; perm: [3, 4]; wBack/wFore: [4, 2].
+        var basis = new Tensor<float>(
+            Enumerable.Range(0, 4 * 3).Select(i => (float)i).ToArray(), [4, 3]);
+        var wBack = new Tensor<float>(new float[] { 1f, 0f, 0f, 1f, 1f, 1f, 1f, 1f }, [4, 2]);
+        var wFore = new Tensor<float>(new float[] { 1f, 1f, 0f, 1f, 1f, 0f, 1f, 1f }, [4, 2]);
+
+        using var tape = new GradientTape<float>();
+        var perm = _engine.TensorPermute(basis, new[] { 1, 0 });    // [3, 4]
+        var bc = _engine.TensorMatMul(perm, wBack);                  // [3, 2]
+        var fc = _engine.TensorMatMul(perm, wFore);                  // [3, 2]
+        var combined = _engine.TensorAdd(bc, fc);
+        var loss = _engine.ReduceSum(combined, axes: null);
+
+        // Pre-fix, this is the failing path NBEATSModel.cs:398 hits.
+        var grads = tape.ComputeGradients(loss, sources: new[] { basis });
+        Assert.True(grads.ContainsKey(basis));
+        Assert.Equal(basis.Length, grads[basis].Length);
+        var g = grads[basis].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.True(float.IsFinite(g[i]), $"g[{i}] not finite: {g[i]}");
+    }
+
+    /// <summary>Large-tensor stress: 64×64×8 permuted then fanned out. Ensures
+    /// the .Contiguous() copy in AccumulateGrad scales without NRE / overflow.</summary>
+    [Fact]
+    public void Permute_LargeTensor_GradAccumulation_Issue274()
+    {
+        const int A = 64, B = 64, C = 8;
+        var arr = new float[A * B * C];
+        for (int i = 0; i < arr.Length; i++) arr[i] = (i % 13) * 0.01f;
+        var x = new Tensor<float>(arr, [A, B, C]);
+
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(x, new[] { 2, 0, 1 });
+        var s1 = _engine.TensorMultiplyScalar(p, 0.5f);
+        var s2 = _engine.TensorMultiplyScalar(p, 0.25f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        // dL/dx = 0.75 everywhere.
+        for (int i = 0; i < g.Length; i++) Assert.Equal(0.75f, g[i], 3);
+    }
+
+    /// <summary>Source x is itself non-contiguous (already permuted) BEFORE
+    /// it reaches the watched op. Exercises that AccumulateGrad's
+    /// dictionary-fallback existing-slot materialization works when the
+    /// source tensor itself was a view.</summary>
+    [Fact]
+    public void Permute_NonContiguousSource_GradAccumulation_Issue274()
+    {
+        var rawSrc = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, [2, 4]);
+        // Make source non-contiguous BEFORE it enters the tape's source set
+        // (callers do this when feeding a transposed batch into a model).
+        var nonContig = _engine.TensorTranspose(rawSrc);  // [4, 2], non-contiguous
+
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(nonContig, new[] { 1, 0 });
+        var s1 = _engine.TensorMultiplyScalar(p, 2.0f);
+        var s2 = _engine.TensorMultiplyScalar(p, 3.0f);
+        var sum = _engine.TensorAdd(s1, s2);
+        var loss = _engine.ReduceSum(sum, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { nonContig });
+        Assert.True(grads.ContainsKey(nonContig));
+        var g = grads[nonContig].AsSpan();
+        for (int i = 0; i < g.Length; i++) Assert.Equal(5f, g[i], 4);
+    }
+
+    /// <summary>Higher-order autograd path — createGraph=true takes the
+    /// out-of-place TensorAdd branch, but the FIRST-write contiguity fix
+    /// must still apply so the SECOND backward pass sees a clean target.</summary>
+    [Fact]
+    public void Permute_HigherOrder_GradAccumulation_Issue274()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        using var tape = new GradientTape<float>();
+        var p = _engine.TensorPermute(x, new[] { 1, 0 });
+        var sq = _engine.TensorMultiply(p, p);          // x^2 path — d/dx = 2x
+        var loss = _engine.ReduceSum(sq, axes: null);
+        var grads = tape.ComputeGradients(loss, sources: new[] { x }, createGraph: true);
+        Assert.True(grads.ContainsKey(x));
+        var g = grads[x].AsSpan();
+        // d(sum(x^2))/dx = 2x.
+        Assert.Equal(2f, g[0], 4);
+        Assert.Equal(4f, g[1], 4);
+        Assert.Equal(6f, g[2], 4);
+        Assert.Equal(8f, g[3], 4);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Loss function gradient tests
     // ──────────────────────────────────────────────────────────────
