@@ -6,64 +6,14 @@ using System.Runtime.InteropServices;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// P/Invoke bindings into <c>libcusparse</c> (cusparse64_12.dll on
-/// Windows, libcusparse.so.12 on Linux). Surfaces SpMM, SpMV, and
-/// SpGEMM entry points that <see cref="LinearAlgebra.Sparse.SparseOps"/>
-/// dispatches to when running with a CUDA-capable host.
-///
-/// <para>Cached <see cref="IsAvailable"/> probe so callers can fall
-/// through to the CPU CSR / SIMD path when the native lib is missing
-/// (no NVIDIA driver / CUDA install). Every entry is wrapped in a
-/// <c>try/catch (DllNotFoundException)</c> at probe time so the static
-/// init never throws on hosts without CUDA.</para>
-///
-/// <para>Co-evolves with #219's broader GPU-primitives surface — the
-/// same binding set lives there. When #219 lands first these can be
-/// deduped against that file; until then the binding owns its own
-/// declarations so #221's GPU dispatch path has no cross-PR
-/// dependency.</para>
+/// Raw P/Invoke bindings into <c>libcusparse</c>. Surfaces SpMM, SpMV,
+/// and SpGEMM entry points. Cached <see cref="IsAvailable"/> probe so
+/// callers can fall through to a CPU CSR implementation when the native
+/// lib is missing.
 /// </summary>
 internal static class CuSparseNative
 {
-    // Windows ships the lib as cusparse64_12.dll, Linux as
-    // libcusparse.so.12. .NET's native loader probes
-    // {name}.so / lib{name}.so / {name} / lib{name} from this string,
-    // so plain "cusparse64_12" never resolves to libcusparse.so.12 on
-    // Linux — IsAvailable would stay false on every host with a
-    // standard CUDA 12 install. We register a DllImportResolver below
-    // that maps the Windows-style name to the canonical Linux SONAME
-    // so the binding works on both platforms.
     private const string Lib = "cusparse64_12";
-
-#if NET5_0_OR_GREATER
-    static CuSparseNative()
-    {
-        NativeLibrary.SetDllImportResolver(typeof(CuSparseNative).Assembly, ResolveLib);
-    }
-
-    private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)
-    {
-        if (name != Lib) return IntPtr.Zero;
-        // Try the platform-canonical names first, then fall back to
-        // the original. NativeLibrary.TryLoad returns false rather
-        // than throwing so we can chain candidates without
-        // exception-driven control flow.
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            if (NativeLibrary.TryLoad("libcusparse.so.12", asm, path, out var h)) return h;
-            if (NativeLibrary.TryLoad("libcusparse.so", asm, path, out h)) return h;
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            // macOS doesn't ship a CUDA cuSPARSE — return zero so the
-            // probe fails gracefully and we route to the CPU path.
-            return IntPtr.Zero;
-        }
-        // Default — let the loader handle the original name (Windows
-        // ships cusparse64_12.dll which matches the const above).
-        return IntPtr.Zero;
-    }
-#endif
 
     public enum Status
     {
@@ -83,8 +33,8 @@ internal static class CuSparseNative
 
     public enum DataType
     {
-        R32F = 0,
-        R64F = 1,
+        R32F = 0,  // float
+        R64F = 1,  // double
     }
 
     public enum IndexType
@@ -92,13 +42,31 @@ internal static class CuSparseNative
         I32 = 1,
     }
 
-    public enum SpMMAlg { Default = 0, CooDefault = 0, CsrAlg1 = 4, CsrAlg2 = 6, CsrAlg3 = 12 }
-    public enum SpMVAlg { Default = 0, CooAlg1 = 1, CsrAlg1 = 2, CsrAlg2 = 3 }
-    public enum Operation { NonTranspose = 0, Transpose = 1, ConjTranspose = 2 }
+    public enum SpMatDescr_Format { Csr = 1, Csc = 2, Coo = 3 }
+    public enum DnMatDescr_Order { RowMajor = 0, ColMajor = 1 }
+
+    public enum Operation
+    {
+        NonTranspose = 0,
+        Transpose = 1,
+        ConjugateTranspose = 2,
+    }
+
+    public enum SpMMAlg
+    {
+        Default = 0,
+        CooAlg1 = 1,
+        CooAlg2 = 2,
+        CooAlg3 = 3,
+        CsrAlg1 = 4,
+        CooAlg4 = 5,
+        CsrAlg2 = 6,
+        CsrAlg3 = 12,
+        BlockedEllAlg1 = 13,
+    }
 
     [DllImport(Lib)] public static extern Status cusparseCreate(out IntPtr handle);
     [DllImport(Lib)] public static extern Status cusparseDestroy(IntPtr handle);
-    [DllImport(Lib)] public static extern Status cusparseSetStream(IntPtr handle, IntPtr stream);
 
     [DllImport(Lib)]
     public static extern Status cusparseCreateCsr(out IntPtr descr,
@@ -109,7 +77,7 @@ internal static class CuSparseNative
 
     [DllImport(Lib)]
     public static extern Status cusparseCreateDnMat(out IntPtr descr,
-        long rows, long cols, long ld, IntPtr values, DataType valueType, int order /* 0 = row-major, 1 = col-major */);
+        long rows, long cols, long ld, IntPtr values, DataType valueType, DnMatDescr_Order order);
 
     [DllImport(Lib)] public static extern Status cusparseDestroySpMat(IntPtr descr);
     [DllImport(Lib)] public static extern Status cusparseDestroyDnMat(IntPtr descr);
@@ -124,9 +92,6 @@ internal static class CuSparseNative
         IntPtr alpha, IntPtr matA, IntPtr matB, IntPtr beta, IntPtr matC,
         DataType computeType, SpMMAlg alg, IntPtr externalBuffer);
 
-    /// <summary>Cached availability probe. <c>true</c> when libcusparse
-    /// loaded successfully and <c>cusparseCreate</c> returned
-    /// <see cref="Status.Success"/>.</summary>
     public static readonly bool IsAvailable = Probe();
 
     private static bool Probe()

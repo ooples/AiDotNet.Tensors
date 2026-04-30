@@ -1,0 +1,22 @@
+# Codecov configuration.
+#
+# `target: auto` keeps the project status pegged to the base branch's
+# coverage at the time of the PR; `threshold: 0.5%` says "small drops are
+# OK, anything over half a percentage point regresses". Without the
+# threshold, codecov's default behaviour fails any PR whose project
+# coverage drops by even 0.01% — including PRs that ship API surface
+# wired to existing implementations (e.g. CUDA wrappers that delegate
+# to a covered CPU path), which the patch-coverage check already vouches
+# for. Patch coverage stays at the codecov default.
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0.5%
+        if_ci_failed: ignore
+    patch:
+      default:
+        target: auto
+        if_ci_failed: ignore

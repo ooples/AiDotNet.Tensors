@@ -287,4 +287,22 @@ internal static class CudaNativeBindings
     public const uint CU_MEMHOSTREGISTER_PORTABLE = 1;
     /// <summary>Flag for cuMemHostRegister: memory is mapped into device address space.</summary>
     public const uint CU_MEMHOSTREGISTER_DEVICEMAP = 2;
+
+    /// <summary>Allocates a device buffer of <paramref name="bytesize"/> bytes;
+    /// caller frees with <see cref="cuMemFree"/>. Used by the on-device dispatch
+    /// path in <see cref="CuRand"/> / <see cref="CuSparse"/> / etc.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAlloc_v2")]
+    public static extern CudaResult cuMemAlloc(out IntPtr dptr, ulong bytesize);
+
+    /// <summary>Frees a device buffer allocated via <see cref="cuMemAlloc"/>.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemFree_v2")]
+    public static extern CudaResult cuMemFree(IntPtr dptr);
+
+    /// <summary>Synchronous host-to-device copy.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoD_v2")]
+    public static extern CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount);
+
+    /// <summary>Synchronous device-to-host copy.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoH_v2")]
+    public static extern CudaResult cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount);
 }

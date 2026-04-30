@@ -54,6 +54,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public DirectGpu.DirectGpuEngine? DirectGpu => Engine.DirectGpu;
 
     /// <inheritdoc/>
+    public AiDotNet.Tensors.Engines.DevicePrimitives.IDevicePrimitives DevicePrimitives
+        => AiDotNet.Tensors.Engines.DevicePrimitives.Cpu.CpuDevicePrimitivesSingleton.Instance;
+
+    /// <inheritdoc/>
     public Vector<T> Add<T>(Vector<T> a, Vector<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

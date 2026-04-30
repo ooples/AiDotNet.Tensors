@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -27,6 +28,10 @@ internal sealed class CudaPinnedBufferPool : IDisposable
 
         var result = CuBlasNative.cuMemAllocHost(out ptr, (ulong)bucketSize);
         CuBlasNative.CheckCudaResult(result, "cuMemAllocHost");
+        // Publish allocation to the unified GPU memory ledger so a
+        // memory_snapshot during a training step lists this pinned-host
+        // bucket alongside CUDA caching-allocator + workspace allocs.
+        GpuMemoryStats.RecordAllocation("cuda_pinned_host", bucketSize);
         return ptr;
     }
 
@@ -41,11 +46,19 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         int bucketSize = NextPowerOfTwo(sizeInBytes);
         var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentBag<IntPtr>());
 
-        // Limit pool size to prevent unbounded growth
+        // Limit pool size to prevent unbounded growth.
+        // Either the buffer goes back to the bucket (still resident, still
+        // counted as allocated) or it gets freed — the freed branch is
+        // what actually decrements the live byte count for memory_stats.
         if (bag.Count < 8)
+        {
             bag.Add(ptr);
+        }
         else
+        {
             CuBlasNative.cuMemFreeHost(ptr);
+            GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
+        }
     }
 
     private static int NextPowerOfTwo(int value)
@@ -70,6 +83,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
             while (kvp.Value.TryTake(out var ptr))
             {
                 CuBlasNative.cuMemFreeHost(ptr);
+                GpuMemoryStats.RecordFree("cuda_pinned_host", kvp.Key);
             }
         }
         _buckets.Clear();
