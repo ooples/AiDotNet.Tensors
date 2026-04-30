@@ -15,10 +15,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// </summary>
 public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
 {
-    private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
+    private readonly ConcurrentDictionary<IntPtr, AllocRecord> _live = new();
+    private IntPtr _instance = IntPtr.Zero;
+    private readonly object _lock = new();
     private bool _disposed;
 
     public bool IsAvailable => WebGpuLoaderProbe.IsAvailable;
+
+    private void EnsureInstance()
+    {
+        if (_instance != IntPtr.Zero) return;
+        lock (_lock)
+        {
+            if (_instance != IntPtr.Zero) return;
+            _instance = WebGpuNativeBindings.wgpuCreateInstance(IntPtr.Zero);
+            if (_instance == IntPtr.Zero)
+                throw new InvalidOperationException("wgpuCreateInstance returned null.");
+        }
+    }
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
@@ -27,18 +41,24 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
             throw new NotSupportedException("WebGPU implementation (Dawn / wgpu-native) is not loadable.");
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-        IntPtr ptr = Marshal.AllocHGlobal((IntPtr)bytes);
-        var effective = OffloadScheme.Pinned; // WebGPU lacks managed/unified memory.
-        var h = new GpuOffloadHandle(ptr, ptr, bytes, effective);
-        _live[ptr] = h;
-        return h;
+        EnsureInstance();
+        // The host-mapped MAP_READ | MAP_WRITE pattern: we allocate a host
+        // buffer for the user-visible HostPointer; the Adapter+Device
+        // binding (which the WebGpu engine handles when staging a kernel)
+        // creates the GPUBuffer via wgpuDeviceCreateBuffer with the
+        // appropriate usage flags. Allocator owns the host backing only;
+        // device-buffer creation happens lazily under the kernel staging.
+        IntPtr hostBuf = Marshal.AllocHGlobal((IntPtr)bytes);
+        var rec = new AllocRecord { HostPtr = hostBuf, Bytes = bytes };
+        _live[hostBuf] = rec;
+        return new GpuOffloadHandle(hostBuf, hostBuf, bytes, OffloadScheme.Pinned);
     }
 
     public void Free(GpuOffloadHandle handle)
     {
         if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
-        _live.TryRemove(handle.HostPointer, out _);
+        if (!_live.TryRemove(handle.HostPointer, out _)) return;
         Marshal.FreeHGlobal(handle.HostPointer);
     }
 
@@ -46,7 +66,36 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var h in _live.Values) Free(h);
+        foreach (var rec in _live.Values)
+        {
+            try { Marshal.FreeHGlobal(rec.HostPtr); } catch { }
+        }
         _live.Clear();
+        if (_instance != IntPtr.Zero)
+        {
+            try { WebGpuNativeBindings.wgpuInstanceRelease(_instance); } catch { }
+            _instance = IntPtr.Zero;
+        }
     }
+
+    private sealed class AllocRecord
+    {
+        public IntPtr HostPtr;
+        public long Bytes;
+    }
+}
+
+// Issue #276 sub-feature 4: instance create/release entry points used by
+// the WebGpu offload allocator. The existing WebGpuNativeBindings class
+// in the file of the same name doesn't bind these — we add them here as
+// a partial extension so both files compile into the same static class.
+public static partial class WebGpuNativeBindings
+{
+    private const string LibForOffload = "webgpu_dawn";
+
+    [DllImport(LibForOffload, EntryPoint = "wgpuCreateInstance")]
+    public static extern IntPtr wgpuCreateInstance(IntPtr descriptor);
+
+    [DllImport(LibForOffload, EntryPoint = "wgpuInstanceRelease")]
+    public static extern void wgpuInstanceRelease(IntPtr instance);
 }

@@ -391,6 +391,13 @@ public sealed class GradientTape<T> : IDisposable
                 // Construct input array once for this entry's backward pass
                 var inputsArray = entry.GetInputsArray();
 
+                // Issue #276 streaming-pool prefetch: rehydrate any input
+                // that's tagged WeightLifetime.Streaming before the kernel
+                // reads it. No-op for default-lifetime tensors (the hot
+                // path), so the indexed-grad fast loop pays only one
+                // branch per input.
+                StreamingAutogradHook.OnForwardRecorded(inputsArray);
+
                 // Apply tensor hooks (skip dictionary lookup entirely when no hooks registered)
                 if (hasHooks && _hooks!.TryGetValue(entry.Output, out var hookList))
                 {

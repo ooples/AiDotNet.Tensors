@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
@@ -378,6 +379,36 @@ public abstract class TensorBase<T> : IDisposable
     /// before passing to BLAS/SIMD operations.
     /// </summary>
     public bool IsContiguous { get; }
+
+    /// <summary>
+    /// Lifetime / placement hint for the issue-#276 large-model memory paths.
+    /// <see cref="WeightLifetime.Default"/> ⇒ regular allocation, GC-bound;
+    /// <see cref="WeightLifetime.Streaming"/> ⇒ register with the streaming pool;
+    /// <see cref="WeightLifetime.GpuOffload"/> ⇒ allocate from pinned-host pool;
+    /// <see cref="WeightLifetime.GpuManaged"/> ⇒ allocate from unified-memory pool.
+    /// Default is <see cref="WeightLifetime.Default"/> — only weights tagged
+    /// otherwise hit the offload / streaming dispatch.
+    /// </summary>
+    public WeightLifetime Lifetime { get; set; } = WeightLifetime.Default;
+
+    /// <summary>
+    /// Streaming-pool handle when <see cref="Lifetime"/> is
+    /// <see cref="WeightLifetime.Streaming"/>. The autodiff replay hook
+    /// reads this to call <see cref="StreamingTensorPool.MarkAccessed"/>
+    /// before kernel dispatch and <see cref="StreamingTensorPool.Rehydrate"/>
+    /// when the entry has been evicted. -1 means "not registered".
+    /// </summary>
+    public long StreamingPoolHandle { get; set; } = -1;
+
+    /// <summary>
+    /// GPU offload allocation handle when <see cref="Lifetime"/> is
+    /// <see cref="WeightLifetime.GpuOffload"/> or
+    /// <see cref="WeightLifetime.GpuManaged"/>. Backend dispatchers read
+    /// this to plumb the pinned-host / managed pointer through to the
+    /// kernel binding without an explicit cudaMemcpy / clEnqueueWriteBuffer
+    /// per op.
+    /// </summary>
+    public IntPtr OffloadDevicePointer { get; set; } = IntPtr.Zero;
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.

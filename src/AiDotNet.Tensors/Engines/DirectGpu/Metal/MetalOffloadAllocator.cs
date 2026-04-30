@@ -56,14 +56,39 @@ public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
         FreeAligned(handle.HostPointer);
     }
 
+    [DllImport("libc", EntryPoint = "posix_memalign")]
+    private static extern int posix_memalign(out IntPtr memptr, UIntPtr alignment, UIntPtr size);
+    [DllImport("libc", EntryPoint = "free")]
+    private static extern void posix_free(IntPtr p);
+
     private static IntPtr AllocAligned(long bytes)
     {
-        // 16K page alignment for MTLBuffer no-copy compatibility.
-        const int Alignment = 16384;
-        return Marshal.AllocHGlobal((IntPtr)((bytes + Alignment - 1) / Alignment * Alignment));
+        // 16K page alignment for MTLBuffer no-copy compatibility on
+        // Apple Silicon (vm_page_size = 16384). On macOS we use
+        // posix_memalign so MTLDevice.makeBuffer(bytesNoCopy:) accepts
+        // the pointer without an extra copy. On non-macOS hosts the
+        // Mps probe gates IsAvailable to false so this never runs.
+        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            const int Alignment = 16384;
+            long padded = (bytes + Alignment - 1) / Alignment * Alignment;
+            int rc = posix_memalign(out IntPtr ptr, (UIntPtr)Alignment, (UIntPtr)padded);
+            if (rc != 0 || ptr == IntPtr.Zero)
+                throw new InvalidOperationException($"posix_memalign returned {rc}.");
+            return ptr;
+        }
+        // Fallback for non-macOS — IsAvailable is false there anyway,
+        // but keep the path safe.
+        return Marshal.AllocHGlobal((IntPtr)bytes);
     }
 
-    private static void FreeAligned(IntPtr p) => Marshal.FreeHGlobal(p);
+    private static void FreeAligned(IntPtr p)
+    {
+        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            posix_free(p);
+        else
+            Marshal.FreeHGlobal(p);
+    }
 
     public void Dispose()
     {

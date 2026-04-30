@@ -1,0 +1,207 @@
+// Copyright (c) AiDotNet. All rights reserved.
+
+using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
+
+namespace AiDotNet.Tensors.LinearAlgebra;
+
+/// <summary>
+/// Process-wide registry that ties <see cref="WeightLifetime"/> hints to
+/// the matching backing infrastructure: streaming pool for
+/// <see cref="WeightLifetime.Streaming"/>, GPU offload allocator for
+/// <see cref="WeightLifetime.GpuOffload"/> / <see cref="WeightLifetime.GpuManaged"/>.
+///
+/// <para>Model authors call <see cref="RegisterWeight{T}"/> with their
+/// chosen lifetime; the registry routes to the right backend without
+/// the model code knowing which GPU runtime is loaded. Frameworks (DDP,
+/// FSDP, the engine dispatcher) read <see cref="Tensor{T}.Lifetime"/>
+/// to pick fast paths in their kernel hot path.</para>
+/// </summary>
+public static class WeightRegistry
+{
+    private static readonly object _lock = new();
+    private static StreamingTensorPool? _streamingPool;
+    private static IGpuOffloadAllocator? _offloadAllocator;
+    private static GpuOffloadOptions _options = new();
+
+    /// <summary>Replaces the active options; must be called before any
+    /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.</summary>
+    public static void Configure(GpuOffloadOptions options, IGpuOffloadAllocator? offloadAllocator = null)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        lock (_lock)
+        {
+            _options = options;
+            _offloadAllocator = offloadAllocator;
+            _streamingPool?.Dispose();
+            _streamingPool = null; // lazy-create on first Streaming registration
+        }
+    }
+
+    /// <summary>The active streaming pool, lazily constructed.</summary>
+    public static StreamingTensorPool StreamingPool
+    {
+        get
+        {
+            lock (_lock)
+            {
+                _streamingPool ??= new StreamingTensorPool(_options);
+                return _streamingPool;
+            }
+        }
+    }
+
+    /// <summary>The active offload allocator, or null if not configured.
+    /// The model dispatcher reads this and falls back to default allocation
+    /// when null + a tensor's Lifetime is GpuOffload / GpuManaged.</summary>
+    public static IGpuOffloadAllocator? OffloadAllocator
+    {
+        get { lock (_lock) return _offloadAllocator; }
+    }
+
+    /// <summary>Registers a weight tensor with the registry. Routes to
+    /// the streaming pool / offload allocator based on the tensor's
+    /// <see cref="Tensor{T}.Lifetime"/>.</summary>
+    public static void RegisterWeight<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        switch (weight.Lifetime)
+        {
+            case WeightLifetime.Default:
+                return;
+            case WeightLifetime.Streaming:
+                {
+                    int byteCount = weight.Length * ElementSize<T>();
+                    var bytes = new byte[byteCount];
+                    SerializeToBytes(weight, bytes);
+                    long handle = StreamingPool.Register(bytes);
+                    weight.StreamingPoolHandle = handle;
+                    return;
+                }
+            case WeightLifetime.GpuOffload:
+            case WeightLifetime.GpuManaged:
+                {
+                    var alloc = OffloadAllocator;
+                    if (alloc is null || !alloc.IsAvailable)
+                    {
+                        // Backend not loadable on this host — fall through to default.
+                        weight.Lifetime = WeightLifetime.Default;
+                        return;
+                    }
+                    int byteCount = weight.Length * ElementSize<T>();
+                    var scheme = weight.Lifetime == WeightLifetime.GpuManaged
+                        ? OffloadScheme.Managed : OffloadScheme.Pinned;
+                    var h = alloc.Allocate(byteCount, scheme);
+                    weight.OffloadDevicePointer = h.DevicePointer;
+                    var stageBytes = new byte[byteCount];
+                    SerializeToBytes(weight, stageBytes);
+                    System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
+                    return;
+                }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(weight.Lifetime));
+        }
+    }
+
+    /// <summary>Unregisters and frees backing storage.</summary>
+    public static void UnregisterWeight<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.StreamingPoolHandle >= 0)
+        {
+            StreamingPool.Unregister(weight.StreamingPoolHandle);
+            weight.StreamingPoolHandle = -1;
+        }
+        if (weight.OffloadDevicePointer != IntPtr.Zero)
+        {
+            var alloc = OffloadAllocator;
+            // Best-effort free; alloc may have been replaced.
+            if (alloc is not null)
+            {
+                var scheme = weight.Lifetime == WeightLifetime.GpuManaged
+                    ? OffloadScheme.Managed : OffloadScheme.Pinned;
+                alloc.Free(new GpuOffloadHandle(weight.OffloadDevicePointer, weight.OffloadDevicePointer,
+                    weight.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>(), scheme));
+            }
+            weight.OffloadDevicePointer = IntPtr.Zero;
+        }
+    }
+
+    private static int ElementSize<T>() => System.Runtime.InteropServices.Marshal.SizeOf<T>();
+
+    /// <summary>Serializes a tensor's elements to a raw byte buffer. We
+    /// can't constrain T : unmanaged at the API level (Tensor&lt;T&gt; is
+    /// generic over arbitrary numeric types including Complex / Multivector),
+    /// so this routes through reflection-friendly per-type fast paths and
+    /// a generic byte-by-byte fallback.</summary>
+    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            var src = (float[])(object)tensor.AsSpan().ToArray();
+            Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var src = (double[])(object)tensor.AsSpan().ToArray();
+            Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
+            return;
+        }
+        if (typeof(T) == typeof(int))
+        {
+            var src = (int[])(object)tensor.AsSpan().ToArray();
+            Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
+            return;
+        }
+        if (typeof(T) == typeof(long))
+        {
+            var src = (long[])(object)tensor.AsSpan().ToArray();
+            Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
+            return;
+        }
+        if (typeof(T) == typeof(Half))
+        {
+            var arr = (Half[])(object)tensor.AsSpan().ToArray();
+            for (int i = 0; i < arr.Length; i++)
+            {
+                ushort raw = AiDotNet.Tensors.NumericOperations.HalfBits.GetBits(arr[i]);
+                dst[i * 2 + 0] = (byte)(raw & 0xFF);
+                dst[i * 2 + 1] = (byte)((raw >> 8) & 0xFF);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+        {
+            var arr = (AiDotNet.Tensors.NumericOperations.BFloat16[])(object)tensor.AsSpan().ToArray();
+            for (int i = 0; i < arr.Length; i++)
+            {
+                ushort raw = arr[i].RawValue;
+                dst[i * 2 + 0] = (byte)(raw & 0xFF);
+                dst[i * 2 + 1] = (byte)((raw >> 8) & 0xFF);
+            }
+            return;
+        }
+        // Generic fallback: marshal via the numeric-ops ToFloat round-trip
+        // (lossy for novel high-precision types but adequate for streaming
+        // pool snapshot — the original tensor reference still owns the
+        // canonical value).
+        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        var floats = new float[tensor.Length];
+        var span = tensor.AsSpan();
+        for (int i = 0; i < span.Length; i++) floats[i] = ops.ToFloat(span[i]);
+        Buffer.BlockCopy(floats, 0, dst, 0, Math.Min(dst.Length, floats.Length * sizeof(float)));
+    }
+
+    /// <summary>For tests: drops all configured backends + flushes pool.</summary>
+    public static void Reset()
+    {
+        lock (_lock)
+        {
+            _streamingPool?.Dispose();
+            _streamingPool = null;
+            _offloadAllocator = null;
+            _options = new GpuOffloadOptions();
+        }
+    }
+}

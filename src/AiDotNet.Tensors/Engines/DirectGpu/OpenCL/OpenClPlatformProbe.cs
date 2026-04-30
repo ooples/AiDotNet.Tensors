@@ -39,7 +39,34 @@ internal static class OpenClPlatformProbe
 #endif
 
     [DllImport(Lib)]
-    private static extern int clGetPlatformIDs(uint numEntries, IntPtr platforms, out uint numPlatforms);
+    internal static extern int clGetPlatformIDs(uint numEntries, IntPtr[]? platforms, out uint numPlatforms);
+
+    // Issue #276 sub-feature 4: real OpenCL host-pointer + SVM bindings.
+    [DllImport(Lib)]
+    internal static extern int clGetDeviceIDs(IntPtr platform, ulong deviceType, uint num, IntPtr[]? devices, out uint numDevicesOut);
+
+    [DllImport(Lib)]
+    internal static extern IntPtr clCreateContext(IntPtr properties, uint numDevices, IntPtr[] devices, IntPtr pfnNotify, IntPtr userData, out int errcodeRet);
+
+    [DllImport(Lib)]
+    internal static extern int clReleaseContext(IntPtr context);
+
+    [DllImport(Lib)]
+    internal static extern IntPtr clCreateBuffer(IntPtr context, ulong flags, UIntPtr size, IntPtr hostPtr, out int errcodeRet);
+
+    [DllImport(Lib)]
+    internal static extern int clReleaseMemObject(IntPtr memObject);
+
+    [DllImport(Lib)]
+    internal static extern IntPtr clSVMAlloc(IntPtr context, ulong flags, UIntPtr size, uint alignment);
+
+    [DllImport(Lib)]
+    internal static extern void clSVMFree(IntPtr context, IntPtr svmPtr);
+
+    internal const ulong CL_MEM_READ_WRITE = 1UL << 0;
+    internal const ulong CL_MEM_ALLOC_HOST_PTR = 1UL << 4;
+    internal const ulong CL_MEM_SVM_FINE_GRAIN_BUFFER = 1UL << 10;
+    internal const ulong CL_DEVICE_TYPE_GPU = 1UL << 2;
 
     public static readonly bool IsAvailable = Probe();
 
@@ -47,7 +74,7 @@ internal static class OpenClPlatformProbe
     {
         try
         {
-            int err = clGetPlatformIDs(0, IntPtr.Zero, out uint num);
+            int err = clGetPlatformIDs(0, null, out uint num);
             return err == 0 && num > 0;
         }
         catch (DllNotFoundException) { return false; }
