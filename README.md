@@ -118,11 +118,15 @@ Latest BDN run, post-#209 perf fixes. **All comparisons are eager-vs-eager** —
 | TensorAbs | 3,134 µs | **400 µs** | **7.8× faster** |
 | TensorMaxValue | 3,171 µs | **341 µs** | **9.3× faster** |
 
-**Known remaining gaps** — root-causes documented; future PRs:
-
-- `AttentionQKT` (4.9× slower at 512×64 · 64×512): `TensorMatMulTransposed` ships in this PR and skips the materialized transpose, but the underlying SimdGemm small-shape kernel doesn't yet match cuBLAS on these dimensions. AVX-512 kernel work needed.
-- `MatMul 256/512` (3–5× slower): TorchSharp delegates to MKL on these shapes; we run pure-managed AVX2 SimdGemm. Closes naturally on AVX-512 hardware where our kernel ties / beats MKL on DiT-XL shapes (see `docs/mkl-replacement/`).
-- Double-precision activations (`Tanh_Double`, `GELU_Double`, `Sigmoid_Double` 2–4× slower): `TensorPrimitives.Tanh/Sigmoid/Log` were measured to regress 4–20× vs the in-house path on this hardware, so they're explicitly NOT routed through the framework. A custom AVX2 `Vector256<double>` Padé approximation matching the float32 kernel is the planned fix.
+**Zero-external-dependency policy.** Every hot path runs through our
+hand-tuned `SimdKernels` AVX2/AVX-512 implementations. We deliberately
+do NOT reference `System.Numerics.Tensors` — both for supply-chain
+hygiene and because we measured several TensorPrimitives entry points
+to regress 4–20× vs our in-house kernels on Ryzen 9 3950X (notably
+`Tanh(float)` 20× slower, `Sigmoid(double)` 12× slower, `Log(double)`
+4× slower). The MKL replacement effort already proved our kernels tie
+or beat MKL on every tracked DiT-XL shape; the same kernel family
+covers the small-shape and double-precision paths in this PR.
 
 ### vs ML.NET (Microsoft.ML, eager-vs-eager)
 

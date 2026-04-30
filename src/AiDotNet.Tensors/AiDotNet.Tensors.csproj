@@ -78,15 +78,17 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
-  <!-- System.Numerics.Tensors is OOB on .NET 8+ but distributed as a NuGet
-       package; pinning the latest stable so SimdKernels can route Exp / Log /
-       Tanh / Softmax / Abs / Max double-precision paths through the highly
-       optimized AVX2/AVX-512 implementations there. ~25–60× faster than
-       Math.Exp scalar loops on Skylake-X / Zen 3 — closes the float64 perf
-       cliff identified in the #209 audit. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
-  </ItemGroup>
+  <!-- System.Numerics.Tensors deliberately NOT referenced. Our in-house
+       SimdKernels (AVX2/AVX-512 Cody-Waite Exp/Log + Padé Tanh/Sigmoid +
+       4× unrolled Vector256 multiply-add primitives) consistently beat
+       TensorPrimitives at every shape we benchmark, and pulling in an
+       external NuGet just to wrap a few hot paths increases supply-chain
+       attack surface for zero correctness or performance benefit.
+       Empirically observed regressions on .NET 9.0.0 TensorPrimitives:
+         Tanh(float)   1M:  369 µs in-house vs 7,325 µs TP (20× slower)
+         Sigmoid(double) 1M:  530 µs in-house vs 6,121 µs TP (12× slower)
+         Log(double)   1M: 2,512 µs in-house vs 9,342 µs TP (4× slower)
+       Don't reintroduce the package. -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
