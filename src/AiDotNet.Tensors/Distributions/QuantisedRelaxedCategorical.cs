@@ -107,7 +107,9 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
         if (logits is null) throw new ArgumentNullException(nameof(logits));
         if (temperature is null) throw new ArgumentNullException(nameof(temperature));
         if (k <= 0) throw new ArgumentException("K must be positive.", nameof(k));
-        if (logits.Length != temperature.Length * k)
+        // Use long multiplication so overflow can't make a malformed
+        // shape pass and surface later as an out-of-bounds index.
+        if ((long)logits.Length != (long)temperature.Length * k)
             throw new ArgumentException("logits length must equal temperature.Length × K.", nameof(logits));
         for (int i = 0; i < temperature.Length; i++)
             if (!(temperature[i] > 0f))
@@ -489,7 +491,9 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
         if (logits is null) throw new ArgumentNullException(nameof(logits));
         if (temperature is null) throw new ArgumentNullException(nameof(temperature));
         if (k <= 0) throw new ArgumentException("K must be positive.", nameof(k));
-        if (logits.Length != temperature.Length * k)
+        // Use long multiplication so overflow can't make a malformed
+        // shape pass and surface later as an out-of-bounds index.
+        if ((long)logits.Length != (long)temperature.Length * k)
             throw new ArgumentException("logits length must equal temperature.Length × K.", nameof(logits));
         for (int i = 0; i < temperature.Length; i++)
             if (!(temperature[i] > 0f))
