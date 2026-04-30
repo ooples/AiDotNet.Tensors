@@ -54,7 +54,7 @@
 > Softmax_Double, Abs, Max) and loses badly on others. Each route was
 > picked individually based on measured BDN data, not on assumption.
 
-```
+```text
 BenchmarkDotNet v0.15.8, Windows 11 (10.0.26220.8283)
 AMD Ryzen 9 3950X 3.70GHz, 1 CPU, 32 logical and 16 physical cores
 .NET SDK 10.0.203

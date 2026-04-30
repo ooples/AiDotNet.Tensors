@@ -234,6 +234,17 @@ public class MathInvariantExtendedTests
         var r = E.TensorScatterAdd(dst, idx, src, 0).GetDataArray();
         Assert.Equal(new[] { 3f, 3f,  3f, 3f,  0f, 0f }, r);
     }
+    [Fact] public void ScatterAdd_OutOfRangeIndex_Throws()
+    {
+        // Match PyTorch's index_add_ contract: out-of-range indices throw,
+        // never silently drop the update.
+        var dst = C(0f, [3, 2]);
+        var src = R([2, 2], 1);
+        var negIdx = new Tensor<int>(new[] { -1, 0 }, new[] { 2 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => E.TensorScatterAdd(dst, negIdx, src, 0));
+        var oobIdx = new Tensor<int>(new[] { 0, 5 }, new[] { 2 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => E.TensorScatterAdd(dst, oobIdx, src, 0));
+    }
 
     // ================================================================
     // TensorLerp (3)

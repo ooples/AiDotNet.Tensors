@@ -5500,14 +5500,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-#if NET8_0_OR_GREATER
-            // .NET 8+ TensorPrimitives.SoftMax fuses max, exp, sum, divide
-            // into 2 vectorized passes (vs the local 4-pass implementation
-            // below). Empirically ~30× faster than scalar Math.Exp on
-            // large inputs, and matches torch's softmax accuracy bounds.
-            System.Numerics.Tensors.TensorPrimitives.SoftMax(input, output);
-            return;
-#else
+            // NOTE: System.Numerics.Tensors.TensorPrimitives.SoftMax was
+            // tested and explicitly NOT used here — it does NOT subtract
+            // max(x) before exponentiating, which causes overflow → +Infinity
+            // → NaN/zeros for any logit > ~709 (typical for unnormalized
+            // attention scores). The numerically stable max-subtract path
+            // below is the IEEE-correct contract that torch / numpy ship.
             double maxVal = Max(input);
 
             // Subtract max and exp — use SIMD path
@@ -5535,7 +5533,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 MultiplyScalar(output, 1.0 / sum, output);
             }
-#endif
         }
 
         #endregion

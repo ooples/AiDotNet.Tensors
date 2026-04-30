@@ -279,6 +279,11 @@ public sealed class SafetensorsReader : IDisposable
         long position = _dataBlockStart + entry.DataOffsetStart;
         while (remaining > 0)
         {
+            // Re-check disposal on every chunk. Iterator yields are deferred
+            // — without this, an already-disposed reader would still pump
+            // bytes from a closed stream (UB) or from a stream the caller
+            // has reused for another tensor.
+            ThrowIfDisposed();
             int want = (int)Math.Min(buf.Length, remaining);
             int got;
             // Hold the stream lock only across the seek+read pair so

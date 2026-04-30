@@ -2653,13 +2653,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // TensorPrimitives.Add: AVX-512/AVX2 across the run, no Pin/JIT
             // dispatch overhead. Closes the small-overhead gap vs torch on
             // sub-1M shapes (torch's libtorch is ~equivalent overhead).
-            var aF = (float[])(object)a.GetDataArray();
-            var bF = (float[])(object)b.GetDataArray();
-            var rF = (float[])(object)result.GetDataArray();
+            // IMPORTANT: use the raw storage array + storageOffset rather
+            // than tensor.GetDataArray() — the latter copies when the
+            // tensor is a sliced view of a larger buffer (storageOffset != 0
+            // OR storage.Length != Length), which would erase the perf win.
+            var aF = (float[])(object)a._storage.GetDataArray();
+            var bF = (float[])(object)b._storage.GetDataArray();
+            var rF = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Add(
-                new ReadOnlySpan<float>(aF, 0, length),
-                new ReadOnlySpan<float>(bF, 0, length),
-                new Span<float>(rF, 0, length));
+                new ReadOnlySpan<float>(aF, a._storageOffset, length),
+                new ReadOnlySpan<float>(bF, b._storageOffset, length),
+                new Span<float>(rF, result._storageOffset, length));
 #else
             // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
             // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
@@ -2720,13 +2724,15 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var aD = (double[])(object)a.GetDataArray();
-            var bD = (double[])(object)b.GetDataArray();
-            var rD = (double[])(object)result.GetDataArray();
+            // Storage + offset slice — see TensorPrimitives.Add(float)
+            // path above for the rationale.
+            var aD = (double[])(object)a._storage.GetDataArray();
+            var bD = (double[])(object)b._storage.GetDataArray();
+            var rD = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Add(
-                new ReadOnlySpan<double>(aD, 0, length),
-                new ReadOnlySpan<double>(bD, 0, length),
-                new Span<double>(rD, 0, length));
+                new ReadOnlySpan<double>(aD, a._storageOffset, length),
+                new ReadOnlySpan<double>(bD, b._storageOffset, length),
+                new Span<double>(rD, result._storageOffset, length));
 #else
             var aMem = AsDoubleMemory(a.Data);
             var bMem = AsDoubleMemory(b.Data);
@@ -3943,15 +3949,15 @@ public partial class CpuEngine : ITensorLevelEngine
 #if NET8_0_OR_GREATER
             // TensorPrimitives.Subtract avoids the Pin + JIT-dispatch +
             // Parallel.For trampoline that dominated per-call overhead at
-            // 1M-element shapes. Empirically ~3× faster than the manual
-            // path on Ryzen 9 3950X for contiguous float spans.
-            var aF = (float[])(object)a.GetDataArray();
-            var bF = (float[])(object)b.GetDataArray();
-            var rF = (float[])(object)result.GetDataArray();
+            // 1M-element shapes. Storage + offset slice avoids the copy
+            // GetDataArray() would do for sliced views.
+            var aF = (float[])(object)a._storage.GetDataArray();
+            var bF = (float[])(object)b._storage.GetDataArray();
+            var rF = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Subtract(
-                new ReadOnlySpan<float>(aF, 0, length),
-                new ReadOnlySpan<float>(bF, 0, length),
-                new Span<float>(rF, 0, length));
+                new ReadOnlySpan<float>(aF, a._storageOffset, length),
+                new ReadOnlySpan<float>(bF, b._storageOffset, length),
+                new Span<float>(rF, result._storageOffset, length));
 #else
             // Fast path for float tensors
             var aMem = AsFloatMemory(a.Data);
@@ -3996,13 +4002,13 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var aD = (double[])(object)a.GetDataArray();
-            var bD = (double[])(object)b.GetDataArray();
-            var rD = (double[])(object)result.GetDataArray();
+            var aD = (double[])(object)a._storage.GetDataArray();
+            var bD = (double[])(object)b._storage.GetDataArray();
+            var rD = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Subtract(
-                new ReadOnlySpan<double>(aD, 0, length),
-                new ReadOnlySpan<double>(bD, 0, length),
-                new Span<double>(rD, 0, length));
+                new ReadOnlySpan<double>(aD, a._storageOffset, length),
+                new ReadOnlySpan<double>(bD, b._storageOffset, length),
+                new Span<double>(rD, result._storageOffset, length));
 #else
             var numOps = MathHelper.GetNumericOperations<T>();
             numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
@@ -4069,13 +4075,13 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(float))
         {
 #if NET8_0_OR_GREATER
-            var aF = (float[])(object)a.GetDataArray();
-            var bF = (float[])(object)b.GetDataArray();
-            var rF = (float[])(object)result.GetDataArray();
+            var aF = (float[])(object)a._storage.GetDataArray();
+            var bF = (float[])(object)b._storage.GetDataArray();
+            var rF = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Multiply(
-                new ReadOnlySpan<float>(aF, 0, length),
-                new ReadOnlySpan<float>(bF, 0, length),
-                new Span<float>(rF, 0, length));
+                new ReadOnlySpan<float>(aF, a._storageOffset, length),
+                new ReadOnlySpan<float>(bF, b._storageOffset, length),
+                new Span<float>(rF, result._storageOffset, length));
 #else
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
@@ -4119,13 +4125,13 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var aD = (double[])(object)a.GetDataArray();
-            var bD = (double[])(object)b.GetDataArray();
-            var rD = (double[])(object)result.GetDataArray();
+            var aD = (double[])(object)a._storage.GetDataArray();
+            var bD = (double[])(object)b._storage.GetDataArray();
+            var rD = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Multiply(
-                new ReadOnlySpan<double>(aD, 0, length),
-                new ReadOnlySpan<double>(bD, 0, length),
-                new Span<double>(rD, 0, length));
+                new ReadOnlySpan<double>(aD, a._storageOffset, length),
+                new ReadOnlySpan<double>(bD, b._storageOffset, length),
+                new Span<double>(rD, result._storageOffset, length));
 #else
             var numOps = MathHelper.GetNumericOperations<T>();
             numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
@@ -4639,13 +4645,13 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(float))
         {
 #if NET8_0_OR_GREATER
-            var aF = (float[])(object)a.GetDataArray();
-            var bF = (float[])(object)b.GetDataArray();
-            var rF = (float[])(object)result.GetDataArray();
+            var aF = (float[])(object)a._storage.GetDataArray();
+            var bF = (float[])(object)b._storage.GetDataArray();
+            var rF = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Divide(
-                new ReadOnlySpan<float>(aF, 0, length),
-                new ReadOnlySpan<float>(bF, 0, length),
-                new Span<float>(rF, 0, length));
+                new ReadOnlySpan<float>(aF, a._storageOffset, length),
+                new ReadOnlySpan<float>(bF, b._storageOffset, length),
+                new Span<float>(rF, result._storageOffset, length));
 #else
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
@@ -4686,13 +4692,13 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var aD = (double[])(object)a.GetDataArray();
-            var bD = (double[])(object)b.GetDataArray();
-            var rD = (double[])(object)result.GetDataArray();
+            var aD = (double[])(object)a._storage.GetDataArray();
+            var bD = (double[])(object)b._storage.GetDataArray();
+            var rD = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Divide(
-                new ReadOnlySpan<double>(aD, 0, length),
-                new ReadOnlySpan<double>(bD, 0, length),
-                new Span<double>(rD, 0, length));
+                new ReadOnlySpan<double>(aD, a._storageOffset, length),
+                new ReadOnlySpan<double>(bD, b._storageOffset, length),
+                new Span<double>(rD, result._storageOffset, length));
 #else
             var numOps = MathHelper.GetNumericOperations<T>();
             numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
@@ -5098,11 +5104,12 @@ public partial class CpuEngine : ITensorLevelEngine
             // TensorPrimitives.Abs avoids the manual Pin + Parallel.For
             // dispatch and gets the same SIMD throughput with lower per-
             // call overhead — measurable ~5–8× speedup at 1M elements.
-            var srcF = (float[])(object)tensor.GetDataArray();
-            var dstF = (float[])(object)result.GetDataArray();
+            // Use _storage + offset to avoid GetDataArray() copying views.
+            var srcF = (float[])(object)tensor._storage.GetDataArray();
+            var dstF = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Abs(
-                new ReadOnlySpan<float>(srcF, 0, tensor.Length),
-                new Span<float>(dstF, 0, tensor.Length));
+                new ReadOnlySpan<float>(srcF, tensor._storageOffset, tensor.Length),
+                new Span<float>(dstF, result._storageOffset, tensor.Length));
 #else
             var iMem = AsFloatMemory(tensor.Data);
             var rMem = AsFloatMemory(result.Data);
@@ -5116,11 +5123,11 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var srcD = (double[])(object)tensor.GetDataArray();
-            var dstD = (double[])(object)result.GetDataArray();
+            var srcD = (double[])(object)tensor._storage.GetDataArray();
+            var dstD = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Abs(
-                new ReadOnlySpan<double>(srcD, 0, tensor.Length),
-                new Span<double>(dstD, 0, tensor.Length));
+                new ReadOnlySpan<double>(srcD, tensor._storageOffset, tensor.Length),
+                new Span<double>(dstD, result._storageOffset, tensor.Length));
 #else
             var numOps = MathHelper.GetNumericOperations<T>();
             numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
@@ -6230,10 +6237,11 @@ public partial class CpuEngine : ITensorLevelEngine
 #if NET8_0_OR_GREATER
             // Net 8+ TensorPrimitives.Max is end-to-end vectorized + skips
             // the manual Parallel.For dispatch overhead — ~6× faster than
-            // the previous SIMD path on 1M-element reductions.
-            var fArr = (float[])(object)tensor.GetDataArray();
+            // the previous SIMD path on 1M-element reductions. Storage +
+            // offset avoids GetDataArray() copying for sliced views.
+            var fArr = (float[])(object)tensor._storage.GetDataArray();
             float tp = System.Numerics.Tensors.TensorPrimitives.Max(
-                new ReadOnlySpan<float>(fArr, 0, tensor.Length));
+                new ReadOnlySpan<float>(fArr, tensor._storageOffset, tensor.Length));
             return Unsafe.As<float, T>(ref tp);
 #else
             var fArr = (float[])(object)tensor.GetDataArray();
@@ -6249,9 +6257,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && tensor.IsContiguous)
         {
 #if NET8_0_OR_GREATER
-            var dArr = (double[])(object)tensor.GetDataArray();
+            var dArr = (double[])(object)tensor._storage.GetDataArray();
             double tp = System.Numerics.Tensors.TensorPrimitives.Max(
-                new ReadOnlySpan<double>(dArr, 0, tensor.Length));
+                new ReadOnlySpan<double>(dArr, tensor._storageOffset, tensor.Length));
             return Unsafe.As<double, T>(ref tp);
 #endif
         }
@@ -8412,19 +8420,22 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcArr = (float[])(object)tensor.GetDataArray();
-            var dstArr = (float[])(object)result.GetDataArray();
-
 #if NET8_0_OR_GREATER
             // TensorPrimitives.Max(span, 0f, dst) is fused max-with-scalar:
             // a single AVX2/AVX-512 pass with no Pin/JIT/Parallel.For
             // dispatch overhead. Cuts ~250us of fixed cost per call vs
             // the previous path on net10 — closes most of the gap to torch.
+            // Use _storage + offset to avoid GetDataArray() copying for
+            // sliced views.
+            var srcArrTp = (float[])(object)tensor._storage.GetDataArray();
+            var dstArrTp = (float[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Max(
-                new ReadOnlySpan<float>(srcArr, 0, length),
+                new ReadOnlySpan<float>(srcArrTp, tensor._storageOffset, length),
                 0f,
-                new Span<float>(dstArr, 0, length));
+                new Span<float>(dstArrTp, result._storageOffset, length));
 #else
+            var srcArr = (float[])(object)tensor.GetDataArray();
+            var dstArr = (float[])(object)result.GetDataArray();
             int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (reluChunks >= 2)
             {
@@ -8461,12 +8472,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
 #if NET8_0_OR_GREATER
-            var srcArr = (double[])(object)tensor.GetDataArray();
-            var dstArr = (double[])(object)result.GetDataArray();
+            var srcArrTp = (double[])(object)tensor._storage.GetDataArray();
+            var dstArrTp = (double[])(object)result._storage.GetDataArray();
             System.Numerics.Tensors.TensorPrimitives.Max(
-                new ReadOnlySpan<double>(srcArr, 0, length),
+                new ReadOnlySpan<double>(srcArrTp, tensor._storageOffset, length),
                 0.0,
-                new Span<double>(dstArr, 0, length));
+                new Span<double>(dstArrTp, result._storageOffset, length));
 #else
             var numOps = MathHelper.GetNumericOperations<T>();
             numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
@@ -9608,7 +9619,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 ldb: K, transB: true,
                 new Span<float>(rArr, 0, M * N),
                 M, K, N);
-            DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulBackward);
+            // Register the transpose-aware backward — the standard
+            // MatMulBackward assumes C = A·B and emits wrong gradients
+            // for the C = A·Bᵀ contract this method computes.
+            DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulTransposedBackward);
             return result;
         }
 
@@ -16897,7 +16911,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // transformer-style shape that's 32768 micro-tasks, where the
             // queueing overhead dwarfs the per-row work. Chunk into ~core-count
             // groups so each worker processes thousands of rows in a tight loop.
-            int chunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, batchSize);
+            // Guard batchSize == 0: with no batches the chunkSize formula
+            // (batchSize + chunks - 1) / chunks would divide by zero.
+            if (batchSize == 0) return;
+            int chunks = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, batchSize));
             int chunkSize = (batchSize + chunks - 1) / chunks;
             Parallel.For(0, chunks, c =>
             {
@@ -24483,7 +24500,13 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < srcAxisLen; i++)
             {
                 int idx = indicesData[i];
-                if (idx < 0 || idx >= dstAxisLen) continue;
+                // PyTorch's index_add_ throws "index out of range" rather than
+                // silently dropping; matching that here so callers see real bugs
+                // instead of mysteriously-zero update slots.
+                if ((uint)idx >= (uint)dstAxisLen)
+                    throw new ArgumentOutOfRangeException(
+                        nameof(indices),
+                        $"indices[{i}]={idx} is out of range for axis length {dstAxisLen}.");
                 int dstOffset = outerDstStride + idx * innerSize;
                 int srcOffset = outerSrcStride + i * innerSize;
                 for (int k = 0; k < innerSize; k++)

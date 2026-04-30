@@ -9565,12 +9565,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float[] resultFloat = backend.DownloadBuffer(valuesBuffer.Buffer);
         T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
         // Indices come back as float (DownloadBuffer is float-typed) but
-        // hold int32 bit patterns the kernel wrote — cast back via
-        // BitConverter to preserve the int identity exactly.
+        // hold int32 bit patterns the kernel wrote (WebGPU `bitcast<f32>(i32)`,
+        // Vulkan/Metal `Int32BitsToSingleCompat`). Use bit reinterpretation —
+        // a value cast `(int)f` would truncate the float interpretation of
+        // those bit patterns and corrupt every index above ~16M.
         float[] indicesFloat = backend.DownloadBuffer(indicesBuffer.Buffer);
         maxIndices = new int[indicesFloat.Length];
         for (int i = 0; i < indicesFloat.Length; i++)
-            maxIndices[i] = (int)indicesFloat[i];
+        {
+#if NET5_0_OR_GREATER
+            maxIndices[i] = BitConverter.SingleToInt32Bits(indicesFloat[i]);
+#else
+            // net471 fallback: same bit pattern via Unsafe.As, since
+            // BitConverter.SingleToInt32Bits is .NET 5+ only.
+            float f = indicesFloat[i];
+            maxIndices[i] = System.Runtime.CompilerServices.Unsafe.As<float, int>(ref f);
+#endif
+        }
         // If we permuted, the kernel-emitted indices are over the
         // permuted-axis layout. The caller expects indices in the
         // original tensor's frame — but the permutation collapsed every

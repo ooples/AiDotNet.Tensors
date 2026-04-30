@@ -177,11 +177,20 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         if (tag is null) throw new ArgumentNullException(nameof(tag));
         if (bucketUpperEdges.Length == 0)
             throw new ArgumentException("bucketUpperEdges must contain at least one edge.", nameof(bucketUpperEdges));
-        for (int i = 1; i < bucketUpperEdges.Length; i++)
+        for (int i = 0; i < bucketUpperEdges.Length; i++)
         {
-            if (!(bucketUpperEdges[i] > bucketUpperEdges[i - 1]))
+            // Reject NaN / ±Infinity up front — the strict-ascending check
+            // alone doesn't catch a single NaN edge or a single +Infinity
+            // edge, and the protobuf consumers downstream produce garbage
+            // rather than fail when given non-finite buckets.
+            double edge = bucketUpperEdges[i];
+            if (double.IsNaN(edge) || double.IsInfinity(edge))
                 throw new ArgumentException(
-                    $"bucketUpperEdges must be strictly ascending; edge[{i}]={bucketUpperEdges[i]} <= edge[{i - 1}]={bucketUpperEdges[i - 1]}.",
+                    $"bucketUpperEdges must contain only finite values; edge[{i}]={edge}.",
+                    nameof(bucketUpperEdges));
+            if (i > 0 && !(edge > bucketUpperEdges[i - 1]))
+                throw new ArgumentException(
+                    $"bucketUpperEdges must be strictly ascending; edge[{i}]={edge} <= edge[{i - 1}]={bucketUpperEdges[i - 1]}.",
                     nameof(bucketUpperEdges));
         }
         if (values.Length == 0) return;
