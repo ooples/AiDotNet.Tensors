@@ -408,6 +408,16 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public IntPtr OffloadDevicePointer { get; internal set; } = IntPtr.Zero;
 
+    /// <summary>Host-visible pointer for the offload allocation. Some
+    /// backends (CUDA pinned, HIP HostMalloc) return host==device while
+    /// others (Vulkan, OpenCL pinned) return distinct host and device
+    /// pointers. The allocator's <c>_live</c> dictionary keys by
+    /// HostPointer, so we must persist it separately to reconstruct the
+    /// full <see cref="Engines.DirectGpu.GpuOffloadHandle"/> at free time
+    /// — using DevicePointer as the host arg silently fails the
+    /// allocator's TryRemove and leaks the allocation.</summary>
+    public IntPtr OffloadHostPointer { get; internal set; } = IntPtr.Zero;
+
     /// <summary>Backend-specific opaque handle paired with
     /// <see cref="OffloadDevicePointer"/> (e.g. cl_mem for OpenCL,
     /// VkDeviceMemory for Vulkan). Owned by <see cref="WeightRegistry"/>.</summary>

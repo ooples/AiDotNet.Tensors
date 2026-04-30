@@ -119,9 +119,12 @@ public static class WeightRegistry
                         {
                             System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
                             // Persist the full handle so UnregisterWeight can
-                            // recreate it correctly — DevicePointer alone
-                            // discards the backend-specific opaque (cl_mem /
-                            // VkDeviceMemory) the allocator's Free path needs.
+                            // recreate it correctly. We track HostPointer
+                            // separately because the allocator's _live dict
+                            // keys by HostPointer; for Vulkan / OpenCL
+                            // pinned, host != device, and reconstructing
+                            // with device-as-host would silently leak.
+                            weight.OffloadHostPointer = h.HostPointer;
                             weight.OffloadDevicePointer = h.DevicePointer;
                             weight.OffloadOpaqueHandle = h.BackendOpaque;
                             weight.OffloadByteCount = byteCount;
@@ -153,7 +156,7 @@ public static class WeightRegistry
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
                 weight.StreamingPoolHandle = -1;
             }
-            if (weight.OffloadDevicePointer != IntPtr.Zero)
+            if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
             {
                 var alloc = _offloadAllocator;
                 if (alloc is not null)
@@ -162,14 +165,22 @@ public static class WeightRegistry
                         ? OffloadScheme.Managed : OffloadScheme.Pinned;
                     // Reconstruct the full GpuOffloadHandle from persisted
                     // metadata so the allocator's Free path sees the same
-                    // backend-specific opaque it allocated.
+                    // host / device / opaque it allocated. Host pointer is
+                    // load-bearing — Free's TryRemove keys by HostPointer.
+                    // Fall back to DevicePointer for pre-existing tensors
+                    // that don't have OffloadHostPointer set (CUDA/HIP
+                    // pinned where host==device).
+                    IntPtr host = weight.OffloadHostPointer != IntPtr.Zero
+                        ? weight.OffloadHostPointer
+                        : weight.OffloadDevicePointer;
                     alloc.Free(new GpuOffloadHandle(
-                        host: weight.OffloadDevicePointer,
+                        host: host,
                         device: weight.OffloadDevicePointer,
                         bytes: weight.OffloadByteCount,
                         scheme: scheme,
                         opaque: weight.OffloadOpaqueHandle));
                 }
+                weight.OffloadHostPointer = IntPtr.Zero;
                 weight.OffloadDevicePointer = IntPtr.Zero;
                 weight.OffloadOpaqueHandle = null;
                 weight.OffloadByteCount = 0;

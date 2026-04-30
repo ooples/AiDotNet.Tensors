@@ -273,18 +273,26 @@ public class BFloat16Operations : INumericOperations<BFloat16>
 
     public void ToFloatSpan(ReadOnlySpan<BFloat16> src, Span<float> dst)
     {
+        if (src.Length != dst.Length)
+            throw new ArgumentException($"ToFloatSpan requires equal-length spans: src={src.Length}, dst={dst.Length}.");
         for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
     }
     public void FromFloatSpan(ReadOnlySpan<float> src, Span<BFloat16> dst)
     {
+        if (src.Length != dst.Length)
+            throw new ArgumentException($"FromFloatSpan requires equal-length spans: src={src.Length}, dst={dst.Length}.");
         for (int i = 0; i < src.Length; i++) dst[i] = BFloat16.FromFloat(src[i]);
     }
     public void ToHalfSpan(ReadOnlySpan<BFloat16> src, Span<Half> dst)
     {
+        if (src.Length != dst.Length)
+            throw new ArgumentException($"ToHalfSpan requires equal-length spans: src={src.Length}, dst={dst.Length}.");
         for (int i = 0; i < src.Length; i++) dst[i] = (Half)(float)src[i];
     }
     public void FromHalfSpan(ReadOnlySpan<Half> src, Span<BFloat16> dst)
     {
+        if (src.Length != dst.Length)
+            throw new ArgumentException($"FromHalfSpan requires equal-length spans: src={src.Length}, dst={dst.Length}.");
         for (int i = 0; i < src.Length; i++) dst[i] = BFloat16.FromFloat((float)src[i]);
     }
 

@@ -89,7 +89,9 @@ public readonly struct BFloat16 : IEquatable<BFloat16>, IComparable<BFloat16>, I
         return UInt32BitsToSingle(bits);
     }
 
-    /// <summary>Implicit float → bfloat16 (PyTorch parity: bf16 is a strict subset of float in range).</summary>
+    /// <summary>Explicit float → bfloat16. Conversion is lossy (truncates
+    /// the lower 16 mantissa bits with round-to-nearest-even), so it's
+    /// explicit even though the bf16 range is a superset of float.</summary>
     public static explicit operator BFloat16(float v) => FromFloat(v);
     /// <summary>Explicit double → bfloat16 (lossy).</summary>
     public static explicit operator BFloat16(double v) => FromFloat((float)v);

@@ -26,6 +26,8 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
     private IntPtr _instance = IntPtr.Zero;
     private IntPtr _device = IntPtr.Zero;
     private uint _hostVisibleMemTypeIndex = uint.MaxValue;
+    private uint _hostCoherentMemTypeIndex = uint.MaxValue;          // Managed scheme
+    private uint _hostVisibleDeviceLocalMemTypeIndex = uint.MaxValue; // Pinned scheme (ReBAR)
     private readonly object _lock = new();
     private bool _disposed;
 
@@ -37,14 +39,17 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
         lock (_lock)
         {
             if (_device != IntPtr.Zero) return;
-            // Initialize a Vulkan instance + pick the first physical device
-            // and a HOST_VISIBLE | DEVICE_LOCAL (or HOST_COHERENT-fallback)
-            // memory type. Reused for every Allocate call so the heavy
-            // setup amortizes across the model's weights.
+            // Initialize a Vulkan instance + pick the first physical device.
+            // CreateMinimal scans memory types once and emits scheme-specific
+            // indices: HOST_COHERENT for Managed (no flush needed), HOST_VISIBLE
+            // | DEVICE_LOCAL for Pinned (ReBAR fast path). Both fall back to
+            // plain HOST_VISIBLE when the preferred type is missing.
             var setup = VulkanInstanceSetup.CreateMinimal();
             _instance = setup.Instance;
             _device = setup.Device;
             _hostVisibleMemTypeIndex = setup.HostVisibleMemTypeIndex;
+            _hostCoherentMemTypeIndex = setup.HostCoherentMemTypeIndex;
+            _hostVisibleDeviceLocalMemTypeIndex = setup.HostVisibleDeviceLocalMemTypeIndex;
             if (_hostVisibleMemTypeIndex == uint.MaxValue)
                 throw new InvalidOperationException(
                     "Vulkan: no HOST_VISIBLE memory type on selected device.");
@@ -69,13 +74,23 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
 
             EnsureDevice();
             var effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
+            // Pick the memory type that matches the documented scheme
+            // contract: Managed → HOST_COHERENT (no flush needed), Pinned
+            // → HOST_VISIBLE | DEVICE_LOCAL (ReBAR fast path). Each falls
+            // back to plain HOST_VISIBLE when the preferred type is absent.
+            uint memTypeIndex = effective switch
+            {
+                OffloadScheme.Managed => _hostCoherentMemTypeIndex,
+                OffloadScheme.Pinned => _hostVisibleDeviceLocalMemTypeIndex,
+                _ => _hostVisibleMemTypeIndex,
+            };
             // vkAllocateMemory + vkMapMemory.
             var allocInfo = new VulkanInstanceSetup.VkMemoryAllocateInfo
             {
                 sType = 5, // VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
                 pNext = IntPtr.Zero,
                 allocationSize = (ulong)bytes,
-                memoryTypeIndex = _hostVisibleMemTypeIndex,
+                memoryTypeIndex = memTypeIndex,
             };
             if (VulkanInstanceSetup.vkAllocateMemory(_device, ref allocInfo, IntPtr.Zero, out IntPtr memHandle) != 0)
                 throw new InvalidOperationException("vkAllocateMemory failed.");

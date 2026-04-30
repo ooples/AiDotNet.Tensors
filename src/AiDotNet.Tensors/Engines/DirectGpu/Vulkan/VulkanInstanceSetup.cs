@@ -88,6 +88,7 @@ internal static class VulkanInstanceSetup
         public unsafe fixed long memoryHeapData[16 * 3];  // padding for the heap array
     }
 
+    public const uint VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 0x00000001;
     public const uint VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002;
     public const uint VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x00000004;
 
@@ -95,12 +96,35 @@ internal static class VulkanInstanceSetup
     {
         public IntPtr Instance;
         public IntPtr Device;
+
+        /// <summary>Generic HOST_VISIBLE memory type. Always set; falls back
+        /// to the first HOST_VISIBLE type when no preferred type matches.
+        /// Kept for back-compat — new code should use the scheme-specific
+        /// fields below.</summary>
         public uint HostVisibleMemTypeIndex;
+
+        /// <summary>HOST_VISIBLE | HOST_COHERENT memory type for Managed
+        /// scheme (no explicit vkFlushMappedMemoryRanges needed). Falls
+        /// back to <see cref="HostVisibleMemTypeIndex"/> when no coherent
+        /// type exists — caller is responsible for flushing in that case.</summary>
+        public uint HostCoherentMemTypeIndex;
+
+        /// <summary>HOST_VISIBLE | DEVICE_LOCAL memory type for Pinned
+        /// scheme — the "smart access memory" / ReBAR path that lets the
+        /// GPU read host-resident memory without a staging copy. Falls
+        /// back to <see cref="HostVisibleMemTypeIndex"/> on hardware
+        /// without ReBAR (most pre-2020 dGPUs).</summary>
+        public uint HostVisibleDeviceLocalMemTypeIndex;
     }
 
     public static Setup CreateMinimal()
     {
-        var setup = new Setup { HostVisibleMemTypeIndex = uint.MaxValue };
+        var setup = new Setup
+        {
+            HostVisibleMemTypeIndex = uint.MaxValue,
+            HostCoherentMemTypeIndex = uint.MaxValue,
+            HostVisibleDeviceLocalMemTypeIndex = uint.MaxValue,
+        };
         var instInfo = new VkInstanceCreateInfo { sType = 1 };
         if (vkCreateInstance(ref instInfo, IntPtr.Zero, out IntPtr instance) != 0)
             throw new InvalidOperationException("vkCreateInstance failed.");
@@ -121,24 +145,39 @@ internal static class VulkanInstanceSetup
             throw new InvalidOperationException("vkEnumeratePhysicalDevices failed.");
         }
 
-        // Pick first HOST_VISIBLE memory type on first device.
+        // Pick first device with at least one HOST_VISIBLE type, scanning
+        // for both Pinned (HOST_VISIBLE | DEVICE_LOCAL) and Managed
+        // (HOST_VISIBLE | HOST_COHERENT) preferences. Falls back to plain
+        // HOST_VISIBLE on the same device when a preferred type isn't
+        // available, so callers always get a usable index.
         IntPtr chosenPd = IntPtr.Zero;
         unsafe
         {
             for (int p = 0; p < pds.Length; p++)
             {
                 vkGetPhysicalDeviceMemoryProperties(pds[p], out var props);
+                uint? hostVisible = null;
+                uint? hostCoherent = null;
+                uint? hostVisibleDeviceLocal = null;
                 for (uint t = 0; t < props.memoryTypeCount && t < 32; t++)
                 {
                     uint flags = props.memoryTypeFlags[t * 2];
-                    if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
-                    {
-                        chosenPd = pds[p];
-                        setup.HostVisibleMemTypeIndex = t;
-                        break;
-                    }
+                    bool hv = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+                    bool hc = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+                    bool dl = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+                    if (!hv) continue;
+                    hostVisible ??= t;
+                    if (hc && hostCoherent is null) hostCoherent = t;
+                    if (dl && hostVisibleDeviceLocal is null) hostVisibleDeviceLocal = t;
                 }
-                if (chosenPd != IntPtr.Zero) break;
+                if (hostVisible.HasValue)
+                {
+                    chosenPd = pds[p];
+                    setup.HostVisibleMemTypeIndex = hostVisible.Value;
+                    setup.HostCoherentMemTypeIndex = hostCoherent ?? hostVisible.Value;
+                    setup.HostVisibleDeviceLocalMemTypeIndex = hostVisibleDeviceLocal ?? hostVisible.Value;
+                    break;
+                }
             }
         }
         if (chosenPd == IntPtr.Zero)
