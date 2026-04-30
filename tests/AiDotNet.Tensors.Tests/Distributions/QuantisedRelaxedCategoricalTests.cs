@@ -368,6 +368,29 @@ public class QuantisedRelaxedCategoricalTests
     }
 
     [Fact]
+    public void Fp4_GradientFidelity_VsFp32_Within5Percent()
+    {
+        // FP4 mirror of the Int4 gradient-fidelity acceptance test.
+        const int batch = 2, k = 8;
+        var (logitsArr, temp) = MakeBatch(batch, k, seed: 9001);
+        var dFp4 = new RelaxedOneHotCategoricalFp4Distribution(logitsArr, temp, k);
+        var logitsTensor = new Tensor<float>(new[] { batch, k });
+        for (int i = 0; i < logitsTensor.Length; i++) logitsTensor.AsWritableSpan()[i] = logitsArr[i];
+
+        using var tape = new GradientTape<float>();
+        var sample = dFp4.RSampleTape(logitsTensor, new Random(17));
+        var engine = new CpuEngine();
+        var loss = engine.ReduceSum(sample, null);
+        var grads = tape.ComputeGradients(loss, new[] { logitsTensor });
+        var g = grads[logitsTensor].AsSpan();
+        double l1 = 0;
+        for (int i = 0; i < g.Length; i++) l1 += Math.Abs(g[i] - 1.0);
+        double meanRel = l1 / g.Length;
+        Assert.True(meanRel < 0.05,
+            $"FP4 sampler gradient deviated from FP32 STE baseline by {meanRel:0.000} (>5%).");
+    }
+
+    [Fact]
     public void Int4_DequantizeRejectsUndersizedPackedBuffer()
     {
         var (logits, temp) = MakeBatch(batch: 4, k: 8, seed: 777);
