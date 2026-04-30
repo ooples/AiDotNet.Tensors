@@ -2,8 +2,16 @@
 
 > **Hardware**: AMD Ryzen 9 3950X (16C / 32T, AVX2/FMA, no AVX-512)
 > **Runtime**: .NET 10.0.7, BenchmarkDotNet v0.15.8
-> **Last regenerated**: 2026-04-30, post-#209 perf-fix merge
-> **Suites**: TorchSharpCpuComparisonBenchmarks (this file), MlNetCpuComparisonBenchmarks, TensorFlowCpuComparisonBenchmarks
+> **Last regenerated**: 2026-04-30, post-#209 perf-fix merge — full-competitor sweep
+> **Suites run**:
+>   - `TorchSharpCpuComparisonBenchmarks` — table below
+>   - `MlNetCpuComparisonBenchmarks` — see `BenchmarkDotNet.Artifacts/results/AiDotNet.Tensors.Benchmarks.MlNetCpuComparisonBenchmarks-report-github.md`
+>   - `TensorFlowCpuComparisonBenchmarks` — see `BenchmarkDotNet.Artifacts/results/AiDotNet.Tensors.Benchmarks.TensorFlowCpuComparisonBenchmarks-report-github.md`
+>
+> **Headline cross-competitor wins** (this PR):
+> - vs **TorchSharp** (libtorch C++): LayerNorm 2.5×, BatchNorm 3.4×, Mish 2×, TensorAdd 100K 2.2×
+> - vs **ML.NET** (Microsoft.ML): TensorAdd 100K 8.7×, TensorSum 2.3×, TensorMean 1.9×, Multiply 100K 2.6×
+> - vs **TensorFlow.NET**: TensorSum 10.6×, TensorMean 3.2×, ReLU 1.7×, Sigmoid 1.8×
 >
 > **Regenerate** with:
 > ```bash

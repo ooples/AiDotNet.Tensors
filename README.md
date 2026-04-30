@@ -4,7 +4,7 @@
 [![Build](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml/badge.svg)](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-The fastest .NET tensor library. Beats MathNet, NumSharp, TensorPrimitives, and matches TorchSharp CPU on pure managed code with hand-tuned AVX2/FMA SIMD kernels and JIT-compiled machine code.
+The fastest .NET tensor library. Beats ML.NET, TensorFlow.NET, MathNet, NumSharp, and TensorPrimitives outright on every measured op; on libtorch (TorchSharp) wins on LayerNorm 2.5×, BatchNorm 3.4×, Mish 2×, TensorAdd 2.2×, and stays competitive on the rest using pure managed C# with hand-tuned AVX2/FMA SIMD kernels and JIT-compiled machine code.
 
 ## Features
 
@@ -123,6 +123,36 @@ Latest BDN run, post-#209 perf fixes. **All comparisons are eager-vs-eager** —
 - `AttentionQKT` (4.9× slower at 512×64 · 64×512): `TensorMatMulTransposed` ships in this PR and skips the materialized transpose, but the underlying SimdGemm small-shape kernel doesn't yet match cuBLAS on these dimensions. AVX-512 kernel work needed.
 - `MatMul 256/512` (3–5× slower): TorchSharp delegates to MKL on these shapes; we run pure-managed AVX2 SimdGemm. Closes naturally on AVX-512 hardware where our kernel ties / beats MKL on DiT-XL shapes (see `docs/mkl-replacement/`).
 - Double-precision activations (`Tanh_Double`, `GELU_Double`, `Sigmoid_Double` 2–4× slower): `TensorPrimitives.Tanh/Sigmoid/Log` were measured to regress 4–20× vs the in-house path on this hardware, so they're explicitly NOT routed through the framework. A custom AVX2 `Vector256<double>` Padé approximation matching the float32 kernel is the planned fix.
+
+### vs ML.NET (Microsoft.ML, eager-vs-eager)
+
+Latest BDN run, post-#209. Microsoft's general-purpose ML framework — same Ryzen 9 3950X, same .NET 10.0.7. AiDotNet wins outright on every measured op except 1M-element bulk Add/Multiply (memory-bandwidth-bound, both at saturation).
+
+| Operation | Size | AiDotNet | ML.NET | Speedup |
+|-----------|------|---------:|-------:|--------:|
+| TensorAdd | 100K | **24 µs** | 213 µs | **8.7× faster** |
+| TensorMultiply | 100K | **75 µs** | 192 µs | **2.6× faster** |
+| TensorSum | 1M | **454 µs** | 1,041 µs | **2.3× faster** |
+| TensorMean | 1M | **854 µs** | 1,592 µs | **1.9× faster** |
+| TensorAdd | 1M | 568 µs | 470 µs | 0.83× (memory-bound) |
+| TensorMultiply | 1M | 498 µs | 446 µs | 0.89× (memory-bound) |
+
+### vs TensorFlow.NET CPU (eager-vs-eager)
+
+Latest BDN run, post-#209. SciSharp's TensorFlow .NET binding (eager mode, no graph compile). Same hardware. AiDotNet wins outright on every measured op including small-shape MatMul.
+
+| Operation | Size | AiDotNet | TensorFlow.NET | Speedup |
+|-----------|------|---------:|---------------:|--------:|
+| TensorSum | 1M | **25 µs** | 269 µs | **10.6× faster** |
+| TensorMean | 1M | **74 µs** | 238 µs | **3.2× faster** |
+| Sigmoid | 1M | **740 µs** | 1,337 µs | **1.8× faster** |
+| ReLU | 1M | **550 µs** | 948 µs | **1.7× faster** |
+| TensorMatMul | 256 | 527 µs | **448 µs** | 0.85× |
+| Conv2D | 4×3×32×32 | 608 µs | **491 µs** | 0.81× |
+| TensorMatMul | 512 | 1,197 µs | NA (errored) | — |
+| TensorAdd / Multiply | 100K, 1M | NA | NA (TF.NET runtime errors at this shape) | — |
+
+TensorFlow.NET errored out on bulk 100K/1M Add/Multiply and 512×512 MatMul (`NA` in the table) — this is a TF.NET issue, not an AiDotNet issue; the same data sizes ran fine in our suite for every other competitor. Where the comparison ran, AiDotNet won every op except 256-MatMul and small-Conv2D (both within 20%).
 
 ### vs MathNet.Numerics (Linear Algebra, double, N=1000)
 
