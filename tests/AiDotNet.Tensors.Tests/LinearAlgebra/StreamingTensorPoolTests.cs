@@ -60,9 +60,10 @@ public class StreamingTensorPoolTests
             // got paged out. Rehydrating it must bring back the original bytes.
             var hbBack = pool.Rehydrate(hb);
             for (int i = 0; i < 256; i++) Assert.Equal((byte)0xBB, hbBack[i]);
-            // After rehydrate hb is LRU-promoted; another over-budget
-            // registration would now evict ha or hc.
-            Assert.True(pool.ResidentBytes <= 600 || pool.ResidentBytes <= 768);
+            // After rehydrate hb is LRU-promoted; the budget invariant
+            // is that ResidentBytes never exceeds the configured cap.
+            Assert.True(pool.ResidentBytes <= 600,
+                $"ResidentBytes={pool.ResidentBytes} must stay ≤ 600 budget after rehydrate.");
             _ = hc;
         }
         finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }

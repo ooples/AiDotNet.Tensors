@@ -42,8 +42,12 @@ public static class QuantizationHelpersInt8
             float invScale = 1f / scale;
             for (int i = start; i < end; i++)
             {
-                int q = (int)Math.Round(src[i] * invScale);
-                if (q < -127) q = -127; // clip to symmetric range
+                // GGUF Q8_0 / llama.cpp use roundf (round-half-AWAY-from-zero),
+                // not Math.Round's default banker's-rounding. Mismatch here
+                // would produce off-by-one quant indices vs the reference
+                // and break GGUF interop on edge values like 0.5.
+                int q = (int)Math.Round(src[i] * invScale, MidpointRounding.AwayFromZero);
+                if (q < -127) q = -127;
                 if (q > 127) q = 127;
                 dst[i] = (sbyte)q;
             }

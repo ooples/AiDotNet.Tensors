@@ -56,7 +56,6 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
         if (!_live.TryRemove(handle.HostPointer, out _)) return;
         Marshal.FreeHGlobal(handle.HostPointer);
@@ -65,8 +64,8 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var rec in _live.Values)
+        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        foreach (var rec in snapshot)
         {
             try { Marshal.FreeHGlobal(rec.HostPtr); } catch { }
         }
@@ -76,6 +75,7 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
             try { WebGpuNativeBindings.wgpuInstanceRelease(_instance); } catch { }
             _instance = IntPtr.Zero;
         }
+        _disposed = true;
     }
 
     private sealed class AllocRecord

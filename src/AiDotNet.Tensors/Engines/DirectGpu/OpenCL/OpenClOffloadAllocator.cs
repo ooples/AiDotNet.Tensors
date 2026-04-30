@@ -102,7 +102,6 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
         if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
         if (rec.IsSvm)
@@ -119,8 +118,8 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var rec in _live.Values)
+        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        foreach (var rec in snapshot)
         {
             try
             {
@@ -139,6 +138,7 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
             try { OpenClPlatformProbe.clReleaseContext(_context); } catch { }
             _context = IntPtr.Zero;
         }
+        _disposed = true;
     }
 
     private sealed class AllocRecord

@@ -85,7 +85,6 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
         if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
         try { VulkanInstanceSetup.vkUnmapMemory(_device, rec.MemHandle); } catch { }
@@ -95,8 +94,8 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var rec in _live.Values)
+        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        foreach (var rec in snapshot)
         {
             try { VulkanInstanceSetup.vkUnmapMemory(_device, rec.MemHandle); } catch { }
             try { VulkanInstanceSetup.vkFreeMemory(_device, rec.MemHandle, IntPtr.Zero); } catch { }
@@ -112,6 +111,7 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
             try { VulkanInstanceSetup.vkDestroyInstance(_instance, IntPtr.Zero); } catch { }
             _instance = IntPtr.Zero;
         }
+        _disposed = true;
     }
 
     private sealed class AllocRecord

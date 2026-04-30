@@ -66,9 +66,10 @@ public sealed class HipOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
-        _live.TryRemove(handle.HostPointer, out _);
+        // Native free only for handles we own — a foreign handle or
+        // double-free would corrupt the HIP heap on second release.
+        if (!_live.TryRemove(handle.HostPointer, out _)) return;
         switch (handle.Scheme)
         {
             case OffloadScheme.Pinned: HipNativeBindings.hipHostFree(handle.HostPointer); break;
@@ -79,8 +80,11 @@ public sealed class HipOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var h in _live.Values) Free(h);
+        // Snapshot live entries BEFORE setting _disposed so Free() still
+        // releases native memory.
+        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        foreach (var h in snapshot) Free(h);
         _live.Clear();
+        _disposed = true;
     }
 }

@@ -48,8 +48,26 @@ public sealed class StreamingTensorPool : IDisposable
     /// triggering eviction.</summary>
     public long ResidentBytes => Interlocked.Read(ref _residentBytes);
 
-    /// <summary>Number of entries currently resident in the working set.</summary>
-    public int ResidentEntryCount { get { lock (_lock) return _entries.Count; } }
+    /// <summary>Number of entries currently resident in the working set.
+    /// Excludes entries that have been paged out to the backing store.</summary>
+    public int ResidentEntryCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                int count = 0;
+                foreach (var entry in _entries.Values)
+                {
+                    if (entry.Data is not null) count++;
+                }
+                return count;
+            }
+        }
+    }
+
+    /// <summary>Total registered entries (resident + paged out).</summary>
+    public int RegisteredEntryCount { get { lock (_lock) return _entries.Count; } }
 
     /// <summary>Registers a weight buffer with the streaming pool. Returns a
     /// handle the caller stores on its <see cref="Tensor{T}"/> and uses for
@@ -105,10 +123,18 @@ public sealed class StreamingTensorPool : IDisposable
                 entry.Data = buffer;
                 entry.ResidentBytes = buffer.Length;
                 _residentBytes += buffer.Length;
+                // Re-add to LRU — the prior eviction removed it from
+                // _lruIndex/_lruOrder, so MarkAccessed and future eviction
+                // walks would silently skip the rehydrated entry.
+                if (!_lruIndex.ContainsKey(handleId))
+                {
+                    var freshNode = _lruOrder.AddFirst(handleId);
+                    _lruIndex[handleId] = freshNode;
+                }
                 EvictIfOverBudget();
             }
 
-            // Refresh LRU.
+            // Refresh LRU on resident hit.
             if (_lruIndex.TryGetValue(handleId, out var node))
             {
                 _lruOrder.Remove(node);
@@ -145,21 +171,25 @@ public sealed class StreamingTensorPool : IDisposable
             // Tail of LRU is least-recently-used.
             var oldest = _lruOrder.Last!;
             long id = oldest.Value;
+
+            if (!_entries.TryGetValue(id, out var entry) || entry.Data is null)
+            {
+                // Stale LRU node (entry already evicted/unregistered) — drop.
+                _lruOrder.RemoveLast();
+                _lruIndex.Remove(id);
+                continue;
+            }
+
+            // Page out: write to backing store, drop resident reference,
+            // remove from LRU index (Rehydrate re-adds it).
+            string path = BackingPathFor(id);
+            File.WriteAllBytes(path, entry.Data);
+            entry.PagedOutBytes = entry.Data.Length;
+            _residentBytes -= entry.ResidentBytes;
+            entry.ResidentBytes = 0;
+            entry.Data = null;
             _lruOrder.RemoveLast();
             _lruIndex.Remove(id);
-
-            if (_entries.TryGetValue(id, out var entry) && entry.Data is not null)
-            {
-                // Page out: write to backing-store file then drop the
-                // resident reference. Eviction is preserved by the
-                // memory-mapped file so Rehydrate can pull it back.
-                string path = BackingPathFor(id);
-                File.WriteAllBytes(path, entry.Data);
-                entry.PagedOutBytes = entry.Data.Length;
-                _residentBytes -= entry.ResidentBytes;
-                entry.ResidentBytes = 0;
-                entry.Data = null;
-            }
         }
     }
 

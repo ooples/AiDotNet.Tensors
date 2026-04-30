@@ -50,9 +50,8 @@ public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
-        _live.TryRemove(handle.HostPointer, out _);
+        if (!_live.TryRemove(handle.HostPointer, out _)) return;
         FreeAligned(handle.HostPointer);
     }
 
@@ -93,8 +92,9 @@ public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var h in _live.Values) Free(h);
+        var snapshot = System.Linq.Enumerable.ToArray(_live.Values);
+        foreach (var h in snapshot) Free(h);
         _live.Clear();
+        _disposed = true;
     }
 }

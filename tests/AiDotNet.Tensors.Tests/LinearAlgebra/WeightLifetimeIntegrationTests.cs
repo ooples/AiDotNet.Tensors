@@ -11,7 +11,14 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// Issue #276 follow-up gaps: end-to-end Tensor.Lifetime + WeightRegistry
 /// dispatch, integrating streaming pool / offload allocator into a real
 /// model-author workflow.
+///
+/// <para>WeightRegistry is process-wide static state — Configure / Reset /
+/// Register all share global slots. xUnit parallelizes test classes by
+/// default; <c>[Collection("WeightRegistry")]</c> serializes this class
+/// against any other class that touches the registry to prevent
+/// interleaved-test corruption.</para>
 /// </summary>
+[Collection("WeightRegistry")]
 public class WeightLifetimeIntegrationTests
 {
     [Fact]

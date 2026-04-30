@@ -393,22 +393,32 @@ public abstract class TensorBase<T> : IDisposable
 
     /// <summary>
     /// Streaming-pool handle when <see cref="Lifetime"/> is
-    /// <see cref="WeightLifetime.Streaming"/>. The autodiff replay hook
-    /// reads this to call <see cref="StreamingTensorPool.MarkAccessed"/>
-    /// before kernel dispatch and <see cref="StreamingTensorPool.Rehydrate"/>
-    /// when the entry has been evicted. -1 means "not registered".
+    /// <see cref="WeightLifetime.Streaming"/>. -1 means "not registered".
+    /// Owned by <see cref="WeightRegistry"/>; user code reads but doesn't
+    /// mutate (the setter is internal so external code can't unilaterally
+    /// invalidate the pool's bookkeeping).
     /// </summary>
-    public long StreamingPoolHandle { get; set; } = -1;
+    public long StreamingPoolHandle { get; internal set; } = -1;
 
     /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is
     /// <see cref="WeightLifetime.GpuOffload"/> or
-    /// <see cref="WeightLifetime.GpuManaged"/>. Backend dispatchers read
-    /// this to plumb the pinned-host / managed pointer through to the
-    /// kernel binding without an explicit cudaMemcpy / clEnqueueWriteBuffer
-    /// per op.
+    /// <see cref="WeightLifetime.GpuManaged"/>. Owned by
+    /// <see cref="WeightRegistry"/>; setter is internal.
     /// </summary>
-    public IntPtr OffloadDevicePointer { get; set; } = IntPtr.Zero;
+    public IntPtr OffloadDevicePointer { get; internal set; } = IntPtr.Zero;
+
+    /// <summary>Backend-specific opaque handle paired with
+    /// <see cref="OffloadDevicePointer"/> (e.g. cl_mem for OpenCL,
+    /// VkDeviceMemory for Vulkan). Owned by <see cref="WeightRegistry"/>.</summary>
+    public object? OffloadOpaqueHandle { get; internal set; }
+
+    /// <summary>Total bytes of the offload allocation. Used by
+    /// <see cref="WeightRegistry.UnregisterWeight"/> when reconstructing
+    /// the <see cref="Engines.DirectGpu.GpuOffloadHandle"/> for the free
+    /// path — element-size × Length is unsafe when T is a managed type
+    /// without a stable Marshal.SizeOf.</summary>
+    public long OffloadByteCount { get; internal set; }
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.

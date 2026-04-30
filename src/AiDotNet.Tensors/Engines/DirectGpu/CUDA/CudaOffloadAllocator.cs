@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -53,9 +54,10 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator
 
     public void Free(GpuOffloadHandle handle)
     {
-        if (_disposed) return;
         if (handle.HostPointer == IntPtr.Zero) return;
-        _live.TryRemove(handle.HostPointer, out _);
+        // Only call native free for handles WE own. A foreign handle (or a
+        // double-free) would corrupt the heap on the second native release.
+        if (!_live.TryRemove(handle.HostPointer, out _)) return;
         switch (handle.Scheme)
         {
             case OffloadScheme.Pinned:
@@ -70,8 +72,13 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
-        foreach (var h in _live.Values) Free(h);
+        // Snapshot live entries BEFORE flipping _disposed so Free() still
+        // performs the native release. The previous code marked _disposed
+        // first which made Free() a no-op and leaked every outstanding
+        // CUDA allocation.
+        var snapshot = _live.Values.ToArray();
+        foreach (var h in snapshot) Free(h);
         _live.Clear();
+        _disposed = true;
     }
 }

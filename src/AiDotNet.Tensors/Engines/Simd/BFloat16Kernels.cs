@@ -147,7 +147,21 @@ public static class BFloat16Kernels
         Span<BFloat16> c, int cRowStride,
         int m, int k, int n)
     {
-        Span<float> tmpB = stackalloc float[8]; // single allocation, reused.
+        if (m < 0 || k < 0 || n < 0)
+            throw new ArgumentException($"Matmul shapes must be non-negative; got m={m}, k={k}, n={n}.");
+        if (aRowStride < k)
+            throw new ArgumentException($"aRowStride {aRowStride} must be ≥ k {k}.");
+        if (bRowStride < n)
+            throw new ArgumentException($"bRowStride {bRowStride} must be ≥ n {n}.");
+        if (cRowStride < n)
+            throw new ArgumentException($"cRowStride {cRowStride} must be ≥ n {n}.");
+        if (m > 0 && a.Length < (m - 1) * aRowStride + k)
+            throw new ArgumentException($"a span ({a.Length}) too short for m={m}, k={k}, stride={aRowStride}.");
+        if (k > 0 && b.Length < (k - 1) * bRowStride + n)
+            throw new ArgumentException($"b span ({b.Length}) too short for k={k}, n={n}, stride={bRowStride}.");
+        if (m > 0 && c.Length < (m - 1) * cRowStride + n)
+            throw new ArgumentException($"c span ({c.Length}) too short for m={m}, n={n}, stride={cRowStride}.");
+        Span<float> tmpB = stackalloc float[8];
         for (int i = 0; i < m; i++)
         {
             for (int j = 0; j < n; j++)
@@ -197,6 +211,8 @@ public static class BFloat16Kernels
     /// the memory win.</summary>
     public static void Gelu(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
+        if (dst.Length < x.Length)
+            throw new ArgumentException($"dst length {dst.Length} must be ≥ x length {x.Length}.");
         const float c0 = 0.7978845608f; // sqrt(2/π)
         const float c1 = 0.044715f;
         for (int i = 0; i < x.Length; i++)
@@ -212,6 +228,8 @@ public static class BFloat16Kernels
     /// <summary>SiLU (swish): x * sigmoid(x). Computed in float.</summary>
     public static void Silu(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
+        if (dst.Length < x.Length)
+            throw new ArgumentException($"dst length {dst.Length} must be ≥ x length {x.Length}.");
         for (int i = 0; i < x.Length; i++)
         {
             float v = (float)x[i];
@@ -225,6 +243,8 @@ public static class BFloat16Kernels
     public static void Softmax(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
         int n = x.Length;
+        if (dst.Length < n)
+            throw new ArgumentException($"dst length {dst.Length} must be ≥ x length {n}.");
         if (n == 0) return;
         // Pass 1: max (in float).
         float m = (float)x[0];

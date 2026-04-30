@@ -22,6 +22,7 @@ internal static class VulkanInstanceSetup
     [DllImport(Lib)] internal static extern void vkGetPhysicalDeviceMemoryProperties(IntPtr device, out VkPhysicalDeviceMemoryProperties props);
     [DllImport(Lib)] internal static extern int vkCreateDevice(IntPtr physical, ref VkDeviceCreateInfo info, IntPtr alloc, out IntPtr device);
     [DllImport(Lib)] internal static extern void vkDestroyDevice(IntPtr device, IntPtr alloc);
+    [DllImport(Lib)] internal static extern void vkGetPhysicalDeviceQueueFamilyProperties(IntPtr device, ref uint count, IntPtr properties);
     [DllImport(Lib)] internal static extern int vkAllocateMemory(IntPtr device, ref VkMemoryAllocateInfo info, IntPtr alloc, out IntPtr mem);
     [DllImport(Lib)] internal static extern void vkFreeMemory(IntPtr device, IntPtr mem, IntPtr alloc);
     [DllImport(Lib)] internal static extern int vkMapMemory(IntPtr device, IntPtr mem, ulong offset, ulong size, uint flags, out IntPtr data);
@@ -62,6 +63,17 @@ internal static class VulkanInstanceSetup
         public IntPtr pNext;
         public ulong allocationSize;
         public uint memoryTypeIndex;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct VkDeviceQueueCreateInfo
+    {
+        public int sType;            // VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2
+        public IntPtr pNext;
+        public uint flags;
+        public uint queueFamilyIndex;
+        public uint queueCount;
+        public IntPtr pQueuePriorities;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -127,13 +139,42 @@ internal static class VulkanInstanceSetup
             throw new InvalidOperationException("Vulkan: no HOST_VISIBLE memory type.");
         }
 
-        var devInfo = new VkDeviceCreateInfo { sType = 3 };
-        if (vkCreateDevice(chosenPd, ref devInfo, IntPtr.Zero, out IntPtr device) != 0)
+        // VkDeviceCreateInfo MUST include at least one VkDeviceQueueCreateInfo
+        // — Vulkan rejects a no-queue logical device. Use queue family 0
+        // with one queue at priority 1.0; that's the universal compute-
+        // capable family on every modern desktop GPU.
+        float[] priorities = { 1.0f };
+        IntPtr prioritiesHandle = Marshal.AllocHGlobal(sizeof(float));
+        Marshal.Copy(priorities, 0, prioritiesHandle, 1);
+        var queueInfo = new VkDeviceQueueCreateInfo
         {
-            vkDestroyInstance(instance, IntPtr.Zero);
-            throw new InvalidOperationException("vkCreateDevice failed.");
+            sType = 2,
+            queueFamilyIndex = 0,
+            queueCount = 1,
+            pQueuePriorities = prioritiesHandle,
+        };
+        IntPtr queueInfoHandle = Marshal.AllocHGlobal(Marshal.SizeOf<VkDeviceQueueCreateInfo>());
+        Marshal.StructureToPtr(queueInfo, queueInfoHandle, false);
+        try
+        {
+            var devInfo = new VkDeviceCreateInfo
+            {
+                sType = 3,
+                queueCreateInfoCount = 1,
+                pQueueCreateInfos = queueInfoHandle,
+            };
+            if (vkCreateDevice(chosenPd, ref devInfo, IntPtr.Zero, out IntPtr device) != 0)
+            {
+                vkDestroyInstance(instance, IntPtr.Zero);
+                throw new InvalidOperationException("vkCreateDevice failed.");
+            }
+            setup.Device = device;
         }
-        setup.Device = device;
+        finally
+        {
+            Marshal.FreeHGlobal(queueInfoHandle);
+            Marshal.FreeHGlobal(prioritiesHandle);
+        }
         return setup;
     }
 }

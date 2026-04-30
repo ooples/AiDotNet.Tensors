@@ -33,6 +33,15 @@ public sealed class QatTrainingHook
         int groupSize = 32,
         QuantizationScheme scheme = QuantizationScheme.SymmetricPerGroup)
     {
+        if (bits != QuantizationBits.Int8 && bits != QuantizationBits.Int4)
+            throw new ArgumentOutOfRangeException(nameof(bits),
+                $"QAT only supports Int8 and Int4; got {bits}.");
+        if (groupSize <= 0 || (groupSize & 1) != 0)
+            throw new ArgumentOutOfRangeException(nameof(groupSize),
+                $"groupSize must be a positive even integer; got {groupSize}.");
+        if (scheme != QuantizationScheme.SymmetricPerGroup)
+            throw new NotSupportedException(
+                $"QAT currently supports SymmetricPerGroup only; got {scheme}.");
         _bits = bits;
         _groupSize = groupSize;
         _scheme = scheme;
@@ -44,10 +53,13 @@ public sealed class QatTrainingHook
     public Tensor<float> RegisterFloatMaster(object key, Tensor<float> floatWeight)
     {
         if (floatWeight is null) throw new ArgumentNullException(nameof(floatWeight));
+        // Materialize non-contiguous views — AsSpan throws on non-contiguous,
+        // and registering a sliced/transposed parameter is a legitimate use.
+        var contig = floatWeight.IsContiguous ? floatWeight : floatWeight.Contiguous();
         var master = new FloatMaster
         {
-            Buffer = (float[])floatWeight.AsSpan().ToArray(),
-            Shape = (int[])floatWeight._shape.Clone(),
+            Buffer = contig.AsSpan().ToArray(),
+            Shape = (int[])contig._shape.Clone(),
         };
         _masters[key] = master;
         return FakeQuantize(key);

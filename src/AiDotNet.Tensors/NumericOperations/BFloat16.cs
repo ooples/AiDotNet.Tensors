@@ -46,8 +46,15 @@ public readonly struct BFloat16 : IEquatable<BFloat16>, IComparable<BFloat16>, I
     public static BFloat16 MaxValue => new(0x7F7F);
     /// <summary>Most-negative representable finite value.</summary>
     public static BFloat16 MinValue => new(0xFF7F);
-    /// <summary>Smallest positive normal value (~1.18e-38).</summary>
-    public static BFloat16 Epsilon => new(0x0080);
+    /// <summary>Smallest positive non-zero (subnormal) value. PyTorch parity:
+    /// <c>torch.finfo(torch.bfloat16).tiny</c> reports the smallest positive
+    /// representable value, not the smallest normal. Generic underflow /
+    /// tolerance code reads this expecting "smallest representable nonzero".</summary>
+    public static BFloat16 Epsilon => new(0x0001);
+
+    /// <summary>Smallest positive NORMAL value (~1.18e-38). Use this when
+    /// you specifically need a normal (non-subnormal) anchor.</summary>
+    public static BFloat16 SmallestNormal => new(0x0080);
 
     // ── Conversions ─────────────────────────────────────────────
 
@@ -110,7 +117,15 @@ public readonly struct BFloat16 : IEquatable<BFloat16>, IComparable<BFloat16>, I
 
     public bool Equals(BFloat16 other) => RawValue == other.RawValue || ToFloat(this) == ToFloat(other);
     public override bool Equals(object? obj) => obj is BFloat16 b && Equals(b);
-    public override int GetHashCode() => RawValue.GetHashCode();
+    /// <summary>Hash matches Equals: +0 and -0 hash identically (because
+    /// they compare equal via float semantics), and NaN hashes by raw bits
+    /// since NaN ≠ NaN under <see cref="Equals"/>.</summary>
+    public override int GetHashCode()
+    {
+        // Normalize -0 → +0 so equal-zero values share a hash.
+        if ((RawValue & 0x7FFF) == 0) return 0;
+        return ToFloat(this).GetHashCode();
+    }
 
     public int CompareTo(BFloat16 other) => ToFloat(this).CompareTo(ToFloat(other));
 

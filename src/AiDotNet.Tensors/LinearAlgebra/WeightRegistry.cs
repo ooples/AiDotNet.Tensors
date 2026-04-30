@@ -92,7 +92,13 @@ public static class WeightRegistry
                     var scheme = weight.Lifetime == WeightLifetime.GpuManaged
                         ? OffloadScheme.Managed : OffloadScheme.Pinned;
                     var h = alloc.Allocate(byteCount, scheme);
+                    // Persist the full handle so UnregisterWeight can
+                    // recreate it correctly — DevicePointer alone discards
+                    // the backend-specific opaque (cl_mem / VkDeviceMemory)
+                    // that the allocator's Free path needs.
                     weight.OffloadDevicePointer = h.DevicePointer;
+                    weight.OffloadOpaqueHandle = h.BackendOpaque;
+                    weight.OffloadByteCount = byteCount;
                     var stageBytes = new byte[byteCount];
                     SerializeToBytes(weight, stageBytes);
                     System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
@@ -115,15 +121,23 @@ public static class WeightRegistry
         if (weight.OffloadDevicePointer != IntPtr.Zero)
         {
             var alloc = OffloadAllocator;
-            // Best-effort free; alloc may have been replaced.
             if (alloc is not null)
             {
                 var scheme = weight.Lifetime == WeightLifetime.GpuManaged
                     ? OffloadScheme.Managed : OffloadScheme.Pinned;
-                alloc.Free(new GpuOffloadHandle(weight.OffloadDevicePointer, weight.OffloadDevicePointer,
-                    weight.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>(), scheme));
+                // Reconstruct the full GpuOffloadHandle from persisted
+                // metadata so the allocator's Free path sees the same
+                // backend-specific opaque it allocated.
+                alloc.Free(new GpuOffloadHandle(
+                    host: weight.OffloadDevicePointer,
+                    device: weight.OffloadDevicePointer,
+                    bytes: weight.OffloadByteCount,
+                    scheme: scheme,
+                    opaque: weight.OffloadOpaqueHandle));
             }
             weight.OffloadDevicePointer = IntPtr.Zero;
+            weight.OffloadOpaqueHandle = null;
+            weight.OffloadByteCount = 0;
         }
     }
 
@@ -182,15 +196,14 @@ public static class WeightRegistry
             }
             return;
         }
-        // Generic fallback: marshal via the numeric-ops ToFloat round-trip
-        // (lossy for novel high-precision types but adequate for streaming
-        // pool snapshot — the original tensor reference still owns the
-        // canonical value).
-        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
-        var floats = new float[tensor.Length];
-        var span = tensor.AsSpan();
-        for (int i = 0; i < span.Length; i++) floats[i] = ops.ToFloat(span[i]);
-        Buffer.BlockCopy(floats, 0, dst, 0, Math.Min(dst.Length, floats.Length * sizeof(float)));
+        // No exact serializer for T. Streaming pool / GPU offload would
+        // silently lose data through a lossy round-trip; refuse instead so
+        // the caller knows to convert to a supported element type first
+        // (or extend this method with a new fast path).
+        throw new NotSupportedException(
+            $"WeightRegistry: no exact serializer for element type {typeof(T).Name}. " +
+            "Supported types: float, double, int, long, Half, BFloat16. " +
+            "For other types, convert weights to a supported representation before tagging Lifetime.");
     }
 
     /// <summary>For tests: drops all configured backends + flushes pool.</summary>

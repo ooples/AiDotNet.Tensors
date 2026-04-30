@@ -56,7 +56,13 @@ public sealed class GpuOffloadOptions
 /// <summary>Memory-placement scheme for <see cref="WeightLifetime.GpuOffload"/> weights.</summary>
 public enum OffloadScheme
 {
-    /// <summary>Auto-detect: query the device's pageableMemoryAccess and pick the best.</summary>
+    /// <summary>Allocator picks a sensible default for the backend.
+    /// Today: CUDA / HIP / OpenCL / Vulkan / WebGPU map this to
+    /// <see cref="Pinned"/>; Metal maps to <see cref="Managed"/> (Apple
+    /// Silicon's unified memory is the natural shared path). Future
+    /// iterations may probe <c>cudaDeviceProp.pageableMemoryAccess</c> /
+    /// equivalent to dynamically pick Managed when supported; for now
+    /// the mapping is a fixed per-backend default.</summary>
     Auto = 0,
 
     /// <summary>Pinned host memory + zero-copy DMA. CUDA: cudaHostAlloc with

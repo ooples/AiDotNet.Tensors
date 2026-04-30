@@ -49,15 +49,26 @@ public static class FusedDequantMatmulKernels
         int m, int k, int n)
     {
         if (weightsScale is null) throw new ArgumentNullException(nameof(weightsScale));
+        if (m < 0 || k < 0 || n < 0)
+            throw new ArgumentException($"shapes must be non-negative; got m={m}, k={k}, n={n}");
         if (activations.Length != m * k)
             throw new ArgumentException($"activations length {activations.Length} != m*k {m * k}");
         if (weightsInt8.Length != k * n)
             throw new ArgumentException($"weights length {weightsInt8.Length} != k*n {k * n}");
         if (output.Length != m * n)
             throw new ArgumentException($"output length {output.Length} != m*n {m * n}");
+        if (weightsScale.ZeroPoints.Length != 0)
+            throw new NotSupportedException(
+                "Q8MatMul currently supports symmetric quantization only. " +
+                "Asymmetric (non-empty ZeroPoints) requires a separate kernel.");
 
         int groupSize = weightsScale.GroupSize <= 0 ? k : weightsScale.GroupSize;
         int groupsPerCol = (k + groupSize - 1) / groupSize;
+        // Per-tensor (length 1) OR per-(group, column) layout.
+        int expectedScaleCount = weightsScale.Scales.Length == 1 ? 1 : groupsPerCol * n;
+        if (weightsScale.Scales.Length != expectedScaleCount)
+            throw new ArgumentException(
+                $"Scales length {weightsScale.Scales.Length} must be 1 (per-tensor) or {groupsPerCol * n} (groupsPerCol={groupsPerCol} × n={n}).");
         // weightsScale.Scales is laid out as [groupsPerCol * n] with
         // group-major-then-col-minor ordering — one scale per (column, group).
         // For per-tensor scales, scales.Length == 1 and we apply uniformly.
@@ -132,16 +143,18 @@ public static class FusedDequantMatmulKernels
         int m, int k, int n)
     {
         if (weightsScale is null) throw new ArgumentNullException(nameof(weightsScale));
+        if (m < 0 || k < 0 || n < 0)
+            throw new ArgumentException($"shapes must be non-negative; got m={m}, k={k}, n={n}");
         if (activations.Length != m * k)
             throw new ArgumentException($"activations length {activations.Length} != m*k {m * k}");
-        // weightsInt4 has (k * n + 1) / 2 packed bytes — but column-major
-        // packing means we can't trivially address a single column. The
-        // simplest cross-correctness path is per-element unpack per (k, n).
+        int expectedPackedLen = (k * n + 1) / 2;
+        if (weightsInt4.Length != expectedPackedLen)
+            throw new ArgumentException($"weightsInt4 length {weightsInt4.Length} != ceil(k*n/2) {expectedPackedLen}");
         if (output.Length != m * n)
             throw new ArgumentException($"output length {output.Length} != m*n {m * n}");
-
-        int groupSize = weightsScale.GroupSize <= 0 ? k : weightsScale.GroupSize;
-        bool perTensor = weightsScale.Scales.Length == 1;
+        if (weightsScale.ZeroPoints.Length != 0)
+            throw new NotSupportedException(
+                "Q4MatMul currently supports symmetric quantization only.");
 
         // Unpack once into a temp int8 buffer so the inner loop matches Q8_0.
         // For very large weights the temp buffer is k*n bytes — same as Q8_0

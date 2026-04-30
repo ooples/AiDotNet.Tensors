@@ -34,14 +34,64 @@ public static class StreamingAutogradHook
         // Mark accessed so the LRU keeps it resident; rehydrate if evicted.
         pool.MarkAccessed(input.StreamingPoolHandle);
         var bytes = pool.Rehydrate(input.StreamingPoolHandle);
-        // The Tensor<T> backing storage is the canonical reference for
-        // kernels — rehydrating from the pool means deserializing the
-        // bytes back into the tensor's own buffer if it's been freed.
-        // For the current iteration we trust that the Tensor<T>'s buffer
-        // is still alive (the streaming-pool snapshot is a backup, not
-        // a replacement). The Rehydrate call still serves the purpose of
-        // touching the LRU slot so eviction order respects access patterns.
-        _ = bytes;
+
+        // Deserialize the rehydrated bytes back into the Tensor<T>'s live
+        // storage. This is what closes the streaming-pool loop: when the
+        // pool evicts a weight, the Tensor<T> buffer goes stale; on next
+        // access we restore it from the backing-store snapshot.
+        DeserializeFromBytes(input, bytes);
+    }
+
+    private static void DeserializeFromBytes<T>(Tensor<T> tensor, ReadOnlySpan<byte> src)
+    {
+        // Write into a fresh T[] of the right element type via Buffer.BlockCopy,
+        // then copy that into the tensor's writable span using Tensor<T>'s
+        // own typed accessor (which handles the underlying buffer copy).
+        var srcArr = src.ToArray();
+        var dstSpan = tensor.AsWritableSpan();
+        if (typeof(T) == typeof(float))
+        {
+            var typed = new float[dstSpan.Length];
+            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(float)));
+            for (int i = 0; i < dstSpan.Length; i++)
+                dstSpan[i] = (T)(object)typed[i];
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var typed = new double[dstSpan.Length];
+            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(double)));
+            for (int i = 0; i < dstSpan.Length; i++)
+                dstSpan[i] = (T)(object)typed[i];
+            return;
+        }
+        if (typeof(T) == typeof(int))
+        {
+            var typed = new int[dstSpan.Length];
+            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(int)));
+            for (int i = 0; i < dstSpan.Length; i++)
+                dstSpan[i] = (T)(object)typed[i];
+            return;
+        }
+        if (typeof(T) == typeof(long))
+        {
+            var typed = new long[dstSpan.Length];
+            Buffer.BlockCopy(srcArr, 0, typed, 0, Math.Min(srcArr.Length, typed.Length * sizeof(long)));
+            for (int i = 0; i < dstSpan.Length; i++)
+                dstSpan[i] = (T)(object)typed[i];
+            return;
+        }
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+        {
+            for (int i = 0; i < dstSpan.Length; i++)
+            {
+                ushort raw = (ushort)(srcArr[i * 2] | (srcArr[i * 2 + 1] << 8));
+                dstSpan[i] = (T)(object)AiDotNet.Tensors.NumericOperations.BFloat16.FromRawBits(raw);
+            }
+            return;
+        }
+        // Unsupported T: the registry rejects unknown types at registration,
+        // so this path is unreachable in practice. No-op for safety.
     }
 
     /// <summary>Called when a forward op records an entry; touches the
