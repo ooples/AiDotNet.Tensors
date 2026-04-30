@@ -134,6 +134,17 @@ public sealed class ElasticLauncher
     /// </summary>
     public RendezvousAssignment Rendezvous(string workerNonce)
     {
+        if (string.IsNullOrWhiteSpace(workerNonce))
+            throw new ArgumentException("Worker nonce must be a non-empty / non-whitespace string.", nameof(workerNonce));
+        // Reject control characters across every backend — empty / control
+        // chars sort before everything and would let a hostile worker
+        // grab rank 0 by passing "\0" or "" as its nonce.
+        for (int i = 0; i < workerNonce.Length; i++)
+        {
+            if (char.IsControl(workerNonce[i]))
+                throw new ArgumentException(
+                    $"Worker nonce contains a control character at position {i}.", nameof(workerNonce));
+        }
         return _options.Backend switch
         {
             RendezvousBackend.File => FileRendezvous(workerNonce),

@@ -527,6 +527,32 @@ public class DistributedTrainingTests
     }
 
     [Fact]
+    public void ElasticLauncher_Rendezvous_RejectsHostileNonces()
+    {
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"aidotnet-rendezvous-{Guid.NewGuid():N}");
+        var launcher = new ElasticLauncher(new ElasticLauncherOptions
+        {
+            WorldSize = 2, Backend = RendezvousBackend.File, Endpoint = dir,
+        });
+        try
+        {
+            // Empty / whitespace nonce → arg validation.
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous(""));
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous("   "));
+            // Control characters (would sort before everything → rank 0 grab).
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous("\0bad"));
+            // Path traversal — file backend only.
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous("../escape"));
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous("a/b"));
+            Assert.Throws<ArgumentException>(() => launcher.Rendezvous(".."));
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void TcpProcessGroup_Broadcast_FromNonRoot_ReachesEveryone()
     {
         int port = FreeLoopbackPort();
