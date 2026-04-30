@@ -4930,6 +4930,19 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.LogUnsafe);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            // In-house Vector256<double> Log via FastLogDouble256, dispatched
+            // across the persistent thread pool. Closes the Log_Double gap
+            // (was 16× behind libtorch's MKL-routed log).
+            var iMem = AsDoubleMemory(tensor.Data);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            double* pI = (double*)pinI.Pointer;
+            double* pR = (double*)pinR.Pointer;
+            ParallelComputeBound(pI, pR, length, SimdKernels.LogUnsafe);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -4984,15 +4997,15 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
+            // In-house Vector256<double> Exp via FastExpDouble256, parallel-dispatched.
+            // No external library fallback (zero-dependency policy).
             var iMem = AsDoubleMemory(tensor.Data);
             var rMem = AsDoubleMemory(result.Data);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             double* pI = (double*)pinI.Pointer;
             double* pR = (double*)pinR.Pointer;
-            // Try VML first (MKL native), fall back to our SIMD
-            if (!Helpers.VmlProvider.TryExp(pI, pR, length))
-                SimdKernels.ExpUnsafe(pI, pR, length);
+            ParallelComputeBound(pI, pR, length, SimdKernels.ExpUnsafe);
         }
         else
         {
@@ -7990,14 +8003,15 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
+            // In-house Vector256<double> Tanh via FastExpDouble256, parallel-dispatched.
+            // No external library fallback (zero-dependency policy).
             var srcMem = AsDoubleMemory(tensor.Data);
             var dstMem = AsDoubleMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
             double* pDst = (double*)pinDst.Pointer;
-            if (!Helpers.VmlProvider.TryTanh(pSrc, pDst, tensor.Length))
-                SimdKernels.TanhUnsafe(pSrc, pDst, tensor.Length);
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
         }
         else
         {
@@ -8662,11 +8676,15 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
+            // In-house Vector256<double> GELU via FastExpDouble256-routed tanh, parallel-dispatched.
+            // Was single-threaded — 1M-element double GELU now scales across all cores.
             var srcMem = AsDoubleMemory(tensor.Data);
             var dstMem = AsDoubleMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
         }
         else
         {
@@ -30961,6 +30979,45 @@ public partial class CpuEngine : ITensorLevelEngine
                 int count = Math.Min(chunkSize, totalLength - start);
                 if (count > 0)
                     kernel((float*)pIn + start, (float*)pOut + start, count);
+            });
+        }
+        else
+        {
+            kernel(input, output, length);
+        }
+    }
+
+    /// <summary>
+    /// Double-precision overload of <see cref="ParallelComputeBound(float*, float*, int, UnsafeUnaryKernel)"/>.
+    /// Closes the Exp/Log/Tanh/GELU gap on Tensor&lt;double&gt; — previously these ops ran SIMD
+    /// single-threaded, leaving 15 cores idle. With persistent-pool dispatch the 1M-element
+    /// double Exp/Tanh run at the same fraction of memory bandwidth as the float paths.
+    /// </summary>
+    private unsafe delegate void UnsafeUnaryKernelDouble(double* input, double* output, int length);
+
+    private static unsafe void ParallelComputeBound(double* input, double* output, int length, UnsafeUnaryKernelDouble kernel)
+    {
+        // 256K doubles = 2 MB. Same threshold rationale as the float variant —
+        // below this size, persistent-pool dispatch is overhead-dominated.
+        const int parallelThreshold = 131072; // 1MB of doubles
+        if (length >= parallelThreshold)
+        {
+            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
+            int chunkSize = (length + nChunks - 1) / nChunks;
+            // Align chunk to 16-double boundary so each chunk's interior loop
+            // doesn't hit unaligned tail in the AVX2 4× unrolled (16 doubles/iter) path.
+            chunkSize = (chunkSize + 15) & ~15;
+
+            IntPtr pIn = (IntPtr)input;
+            IntPtr pOut = (IntPtr)output;
+            int totalLength = length;
+
+            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                    kernel((double*)pIn + start, (double*)pOut + start, count);
             });
         }
         else

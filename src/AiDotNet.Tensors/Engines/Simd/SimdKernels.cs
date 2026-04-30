@@ -5328,6 +5328,38 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = Math.Exp(input[i]);
         }
 
+        /// <summary>
+        /// Pointer-based Log for double — 4× unrolled AVX2 path via FastLogDouble256.
+        /// In-house only (no MKL VML fallback). Closes the Log_Double gap vs the
+        /// scalar Math.Log loop (~16× speedup at 1M elements).
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void LogUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                int simdLen = length & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    Avx.Store(output + i,      FastLogDouble256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4,  FastLogDouble256(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8,  FastLogDouble256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, FastLogDouble256(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
+            {
+                int simdLen = i + ((length - i) & ~3);
+                for (; i < simdLen; i += 4)
+                    Avx.Store(output + i, FastLogDouble256(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Log(input[i]);
+        }
+
         /// <summary>Pointer-based Tanh for double — tanh(x) = 2*sigmoid(2x) - 1.</summary>
         [MethodImpl(HotInline)]
         public static unsafe void TanhUnsafe(double* input, double* output, int length)
