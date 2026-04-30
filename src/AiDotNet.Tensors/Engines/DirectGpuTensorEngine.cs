@@ -9517,40 +9517,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int reduceSize = 1;
         int outerSize = 1;
         bool permuted = false;
+        var reduceDimsSet = new HashSet<int>(normalizedAxes);
 
         if (normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
         {
             for (int i = 0; i < inputRank - 1; i++)
-            {
                 outerSize *= inputShape[i];
-                outputShapeList.Add(inputShape[i]);
-            }
             reduceSize = inputShape[^1];
-            if (keepDims) outputShapeList.Add(1);
         }
         else
         {
             var permutation = new List<int>();
-            var reduceDims = new HashSet<int>(normalizedAxes);
             for (int i = 0; i < inputRank; i++)
             {
-                if (!reduceDims.Contains(i))
+                if (!reduceDimsSet.Contains(i))
                 {
                     permutation.Add(i);
                     outerSize *= inputShape[i];
-                    outputShapeList.Add(inputShape[i]);
                 }
             }
             foreach (int axis in normalizedAxes)
             {
                 permutation.Add(axis);
                 reduceSize *= inputShape[axis];
-                if (keepDims) outputShapeList.Add(1);
             }
             input = PermuteImpl(input, permutation.ToArray());
             permuted = true;
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
+
+        // Build output shape preserving original axis positions. Earlier
+        // version appended `1`s to the END which produced [3,4,1] instead
+        // of [1,3,4] when reducing axis 0 with keepDims — broke ReduceMax
+        // for every non-trailing axis.
+        outputShapeList.Clear();
+        if (keepDims)
+        {
+            for (int i = 0; i < inputRank; i++)
+                outputShapeList.Add(reduceDimsSet.Contains(i) ? 1 : inputShape[i]);
+        }
+        else
+        {
+            for (int i = 0; i < inputRank; i++)
+                if (!reduceDimsSet.Contains(i))
+                    outputShapeList.Add(inputShape[i]);
+            if (outputShapeList.Count == 0) outputShapeList.Add(1);
+        }
         var outputShape = outputShapeList.ToArray();
 
         float[] inputFloat = DirectGpuEngine.ToFloatArray(input.GetDataArray());
@@ -9565,22 +9576,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float[] resultFloat = backend.DownloadBuffer(valuesBuffer.Buffer);
         T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
         // Indices come back as float (DownloadBuffer is float-typed) but
-        // hold int32 bit patterns the kernel wrote (WebGPU `bitcast<f32>(i32)`,
-        // Vulkan/Metal `Int32BitsToSingleCompat`). Use bit reinterpretation —
-        // a value cast `(int)f` would truncate the float interpretation of
-        // those bit patterns and corrupt every index above ~16M.
+        // each backend's kernel encodes the int32 index differently:
+        //   - WebGPU / Vulkan: bitcast — int32 bits stored in the float
+        //     slot. Recover via BitConverter.SingleToInt32Bits.
+        //   - CUDA / HIP / OpenCL / Metal: value cast — (float)idx. Recover
+        //     with (int)f.
+        // The capability flag on each backend tells us which encoding
+        // to use; mixing the two corrupts every index above ~16M (for
+        // bit-reinterp on a value-cast backend) or every non-trivial
+        // value (for value-cast on a bit-reinterp backend).
         float[] indicesFloat = backend.DownloadBuffer(indicesBuffer.Buffer);
         maxIndices = new int[indicesFloat.Length];
+        bool bitReinterp = backend.ArgMaxIndicesAreBitReinterpreted;
         for (int i = 0; i < indicesFloat.Length; i++)
         {
+            if (bitReinterp)
+            {
 #if NET5_0_OR_GREATER
-            maxIndices[i] = BitConverter.SingleToInt32Bits(indicesFloat[i]);
+                maxIndices[i] = BitConverter.SingleToInt32Bits(indicesFloat[i]);
 #else
-            // net471 fallback: same bit pattern via Unsafe.As, since
-            // BitConverter.SingleToInt32Bits is .NET 5+ only.
-            float f = indicesFloat[i];
-            maxIndices[i] = System.Runtime.CompilerServices.Unsafe.As<float, int>(ref f);
+                float f = indicesFloat[i];
+                maxIndices[i] = System.Runtime.CompilerServices.Unsafe.As<float, int>(ref f);
 #endif
+            }
+            else
+            {
+                maxIndices[i] = (int)indicesFloat[i];
+            }
         }
         // If we permuted, the kernel-emitted indices are over the
         // permuted-axis layout. The caller expects indices in the

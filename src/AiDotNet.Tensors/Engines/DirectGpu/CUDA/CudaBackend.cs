@@ -959,25 +959,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         float alphaVal = alpha;
         float betaVal = beta;
 
-        // Row-major C[M,N] = A[M,K] · Bᵀ where B is stored row-major as
-        // [N, K]. cuBLAS is column-major, so the row-major contract maps
-        // to the column-major equivalent C^T[N,M] = B[N,K] · A^T[K,M],
-        // which means we pass B with NO transpose flag and A with the
-        // transpose flag in cuBLAS terms — i.e., transA=N (B stays as
-        // its column-major K×N view), transB=T (A treated transposed).
-        // Leading dims: B's column-major stride is K (its row stride);
-        // A's column-major stride is K (its row stride).
+        // Row-major C[M,N] = A[M,K] · Bᵀ. Memory equivalences (column-
+        // major view of the same bytes):
+        //   B_row[N,K] === B_col[K,N]   (lda = K)
+        //   A_row[M,K] === A_col[K,M]   (lda = K)
+        //   C_row[M,N] === C_col[N,M]   (lda = N)
+        // We need cuBLAS to compute C_col[N,M] = B_col[K,N]ᵀ · A_col[K,M]
+        // because (A · Bᵀ)_row === (B · Aᵀ)_col. So:
+        //   op(A_cu = my B) = Transpose → N×K
+        //   op(B_cu = my A) = None      → K×M
+        //   m_cu=N, n_cu=M, k_cu=K, ldA=K, ldB=K, ldC=N.
+        // Earlier version had the transpose flags swapped — produced
+        // wrong results for any non-square input.
         CuBlasNative.CheckCublasStatus(
             CuBlasNative.cublasSgemm(
                 _cublasHandle,
-                CublasOperation.None,        // op(B) — no transpose, K×N column-major
-                CublasOperation.Transpose,   // op(A) — transposed, K×M
+                CublasOperation.Transpose,   // op(my B) — transposed, becomes N×K
+                CublasOperation.None,        // op(my A) — no transpose, stays K×M
                 N, M, K,
                 ref alphaVal,
-                B.Handle, K,                 // ldb = K (B is row-major [N,K])
-                A.Handle, K,                 // lda = K (A is row-major [M,K])
+                B.Handle, K,                 // lda for B_col[K,N] = K
+                A.Handle, K,                 // ldb for A_col[K,M] = K
                 ref betaVal,
-                C.Handle, N),
+                C.Handle, N),                // ldc for C_col[N,M] = N
             "cublasSgemm(MatMulTransposed)");
     }
 
@@ -9516,6 +9520,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
             "cuMemcpyDtoD(strided)");
     }
+
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // CUDA kernel uses (float)cast
 
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {

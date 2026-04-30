@@ -343,6 +343,19 @@ public sealed unsafe partial class VulkanBackend
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         EnsureInitialized();
+        // Shape validation up-front — without this, mismatched shapes
+        // would IndexOutOfRange inside the inner loop instead of failing
+        // with a clear ArgumentException. CUDA backend validates the same
+        // contract via ValidateGemmArgs.
+        if (M <= 0 || N <= 0 || K <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "Matrix dimensions M, N, K must all be positive.");
+        if ((long)A.Size < (long)M * K)
+            throw new ArgumentException($"A.Size {A.Size} < M*K = {(long)M * K}.", nameof(A));
+        if ((long)B.Size < (long)N * K)
+            throw new ArgumentException($"B.Size {B.Size} < N*K = {(long)N * K}.", nameof(B));
+        if ((long)C.Size < (long)M * N)
+            throw new ArgumentException($"C.Size {C.Size} < M*N = {(long)M * N}.", nameof(C));
+
         // Same managed-fallback shape as Gemm — Vulkan compute pipeline
         // for matmul isn't wired here yet; the buffer download/upload
         // pair lets the kernel operate on host floats. The transposed-B

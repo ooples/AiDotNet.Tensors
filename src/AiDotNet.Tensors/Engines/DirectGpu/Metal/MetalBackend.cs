@@ -520,6 +520,13 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         ThrowIfDisposed();
+        // The matmul_tiled_transposed kernel writes C unconditionally
+        // (no β·C blend). Fail fast on β != 0 rather than silently
+        // discarding the existing C contents.
+        if (Math.Abs(beta) > 1e-7f)
+            throw new NotSupportedException(
+                "Metal MatMulTransposed currently supports only beta == 0. " +
+                "For beta != 0, route through TensorMatMul(A, Transpose(B)).");
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer || C is not MetalGpuBuffer cBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
@@ -1618,6 +1625,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// <summary>
     /// ArgMax along axis for batched data using GPU kernel.
     /// </summary>
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // Metal kernel uses (float)cast
+
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();

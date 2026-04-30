@@ -9397,6 +9397,9 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(outerSize, Math.Min(64, outerSize));
         }
 
+        /// <inheritdoc/>
+        public bool ArgMaxIndicesAreBitReinterpreted => false; // OpenCL kernel uses (float)cast
+
         public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");

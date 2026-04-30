@@ -1905,6 +1905,17 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="reduceSize">Number of columns.</param>
     void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize);
 
+    /// <summary>
+    /// True iff <see cref="ArgMaxAxis"/> writes indices into the float
+    /// output buffer as raw int32 bit patterns (e.g. WebGPU's
+    /// <c>bitcast&lt;f32&gt;(i32(idx))</c>, Vulkan's
+    /// <c>Int32BitsToSingleCompat</c>). False when indices are written
+    /// with a value cast (<c>(float)idx</c>) — the case for CUDA, HIP,
+    /// OpenCL, and Metal kernels. The host-side reader must use the
+    /// matching deserialization or every index above ~16M is corrupted.
+    /// </summary>
+    bool ArgMaxIndicesAreBitReinterpreted { get; }
+
     #endregion
 
     #region Optimizer Operations

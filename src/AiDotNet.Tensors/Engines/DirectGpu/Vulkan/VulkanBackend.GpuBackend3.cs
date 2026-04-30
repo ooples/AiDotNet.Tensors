@@ -979,6 +979,9 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(idx, indices);
     }
 
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => true; // Vulkan shader uses Int32BitsToSingleCompat
+
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         => ArgMax(A, indices, outerSize, reduceSize);
 

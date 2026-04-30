@@ -1089,22 +1089,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         float alphaVal = alpha;
         float betaVal = beta;
 
-        // Same column-major swap as Gemm: row-major C[M,N] = A[M,K] · Bᵀ
-        // ↔ column-major Cᵀ[N,M] = B[N,K] · Aᵀ[K,M]. So pass:
-        //   transA=N (B unchanged, K×N column-major), transB=T (A
-        //   transposed to K×M), with leading dims = K for both.
+        // Row-major C[M,N] = A[M,K] · Bᵀ. Same column-major derivation
+        // as the CUDA path: cuBLAS/rocBLAS compute C_col[N,M] = B_col[K,N]ᵀ
+        // · A_col[K,M] where the row-major buffers reinterpret as the
+        // column-major matrices noted in the comments. Earlier version
+        // had transA/transB swapped — swap restored.
         var status = HipBlasNative.hipblasSgemm(
             _hipblasHandle,
-            HipBlasNative.HipBlasOperation.None,        // op(B)
-            HipBlasNative.HipBlasOperation.Transpose,   // op(A)
+            HipBlasNative.HipBlasOperation.Transpose,   // op(my B) → N×K
+            HipBlasNative.HipBlasOperation.None,        // op(my A) → K×M
             N, M, K,
             ref alphaVal,
-            bufferB.Handle, K,
-            bufferA.Handle, K,
+            bufferB.Handle, K,                          // lda = K
+            bufferA.Handle, K,                          // ldb = K
             ref betaVal,
-            bufferC.Handle, N);
+            bufferC.Handle, N);                         // ldc = N
         if (status != HipBlasNative.HipBlasStatus.Success)
             throw new InvalidOperationException($"hipblasSgemm(MatMulTransposed) failed: {status}");
+
+        // Match Gemm's synchronous contract: callers expect C ready on
+        // return, not in-flight on the stream.
+        var syncResult = HipNativeBindings.hipStreamSynchronize(_stream);
+        HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize (hipBLAS MatMulTransposed)");
     }
 
     /// <summary>Materialize a row-major [N, K] buffer as a transposed
@@ -9065,6 +9071,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
     }
+
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // HIP kernel uses (float)cast
 
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {

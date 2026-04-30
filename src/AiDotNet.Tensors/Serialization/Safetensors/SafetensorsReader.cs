@@ -234,25 +234,42 @@ public sealed class SafetensorsReader : IDisposable
         ThrowIfDisposed();
         if (name is null) throw new ArgumentNullException(nameof(name));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        // Fail fast on a non-writable destination — clearer than the
+        // NotSupportedException Write() would throw mid-stream.
+        if (!destination.CanWrite)
+            throw new ArgumentException("Destination stream must be writable.", nameof(destination));
         if (bufferSize <= 0) throw new ArgumentOutOfRangeException(nameof(bufferSize), "bufferSize must be > 0.");
         if (!_entries.TryGetValue(name, out var entry))
             throw new KeyNotFoundException($"Tensor '{name}' not found.");
 
+        // Hold _streamLock only across the seek+read pair. Releasing
+        // before destination.Write lets concurrent reads on the same
+        // SafetensorsReader make progress instead of serializing on
+        // a slow output destination (e.g., a network pipe).
         var buf = new byte[bufferSize];
-        lock (_streamLock)
+        long remaining = entry.ByteLength;
+        long position = _dataBlockStart + entry.DataOffsetStart;
+        while (remaining > 0)
         {
-            _stream.Seek(_dataBlockStart + entry.DataOffsetStart, SeekOrigin.Begin);
-            long remaining = entry.ByteLength;
-            while (remaining > 0)
+            ThrowIfDisposed();
+            int want = (int)Math.Min(buf.Length, remaining);
+            int got;
+            lock (_streamLock)
             {
-                int want = (int)Math.Min(buf.Length, remaining);
-                int n = _stream.Read(buf, 0, want);
-                if (n == 0)
-                    throw new EndOfStreamException(
-                        $"Unexpected EOF while streaming tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
-                destination.Write(buf, 0, n);
-                remaining -= n;
+                _stream.Seek(position, SeekOrigin.Begin);
+                got = 0;
+                while (got < want)
+                {
+                    int n = _stream.Read(buf, got, want - got);
+                    if (n == 0)
+                        throw new EndOfStreamException(
+                            $"Unexpected EOF while streaming tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
+                    got += n;
+                }
             }
+            destination.Write(buf, 0, got);
+            position += got;
+            remaining -= got;
         }
     }
 
