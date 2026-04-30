@@ -20,7 +20,7 @@ internal static class WebGpuLoaderProbe
 #if NET5_0_OR_GREATER
     static WebGpuLoaderProbe()
     {
-        NativeLibrary.SetDllImportResolver(typeof(WebGpuLoaderProbe).Assembly, ResolveLib);
+        AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
     }
 
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)

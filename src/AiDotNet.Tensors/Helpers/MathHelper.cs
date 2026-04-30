@@ -61,6 +61,8 @@ public static class MathHelper
             return new FloatOperations();
         if (typeof(T) == typeof(Half))
             return new HalfOperations();
+        if (typeof(T) == typeof(NumericOperations.BFloat16))
+            return new NumericOperations.BFloat16Operations();
         if (typeof(T) == typeof(decimal))
             return new DecimalOperations();
         if (typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>))
@@ -202,7 +204,10 @@ public static class MathHelper
     /// <returns>True if T is float, double, or Half; otherwise, false.</returns>
     public static bool IsFloatingPoint<T>()
     {
-        return typeof(T) == typeof(float) || typeof(T) == typeof(double) || typeof(T) == typeof(Half);
+        return typeof(T) == typeof(float)
+            || typeof(T) == typeof(double)
+            || typeof(T) == typeof(Half)
+            || typeof(T) == typeof(NumericOperations.BFloat16);
     }
 
     /// <summary>

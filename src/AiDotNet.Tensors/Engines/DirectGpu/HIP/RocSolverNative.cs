@@ -20,7 +20,7 @@ internal static class RocSolverNative
 #if NET5_0_OR_GREATER
     static RocSolverNative()
     {
-        NativeLibrary.SetDllImportResolver(typeof(RocSolverNative).Assembly, ResolveLib);
+        AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
     }
 
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)

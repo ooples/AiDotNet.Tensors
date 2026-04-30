@@ -121,14 +121,10 @@ public static class CuBlasNative
 #if !NET471
     static CuBlasNative()
     {
-        try
-        {
-            NativeLibrary.SetDllImportResolver(typeof(CuBlasNative).Assembly, ResolveCuBlasLibrary);
-        }
-        catch (InvalidOperationException)
-        {
-            // A resolver was already registered for this assembly — skip.
-        }
+        // Use the shared registry so cuBLAS, cuRAND, cuSparse, rocBLAS,
+        // OpenCL, Vulkan, etc. all chain through one assembly-level
+        // resolver. Direct SetDllImportResolver throws on second call.
+        NativeLibraryResolverRegistry.Register(ResolveCuBlasLibrary);
     }
 
     private static IntPtr ResolveCuBlasLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)

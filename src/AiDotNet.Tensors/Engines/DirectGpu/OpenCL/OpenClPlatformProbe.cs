@@ -19,7 +19,7 @@ internal static class OpenClPlatformProbe
 #if NET5_0_OR_GREATER
     static OpenClPlatformProbe()
     {
-        NativeLibrary.SetDllImportResolver(typeof(OpenClPlatformProbe).Assembly, ResolveLib);
+        AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
     }
 
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)

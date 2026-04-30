@@ -40,32 +40,24 @@ public static unsafe class VulkanNativeBindings
     static VulkanNativeBindings()
     {
         // On macOS, DllImport entries reference "libvulkan.so.1" (Linux name).
-        // Remap to "libvulkan.1.dylib" so MoltenVK is found correctly.
+        // Remap to "libvulkan.1.dylib" so MoltenVK is found correctly. Uses the
+        // shared resolver registry so this handler chains with every other
+        // backend's per-lib aliasing.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            try
-            {
-                System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
-                    typeof(VulkanNativeBindings).Assembly,
-                    (libraryName, assembly, searchPath) =>
+            AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(
+                (libraryName, assembly, searchPath) =>
+                {
+                    if (libraryName == VulkanLinux)
                     {
-                        // Only remap Vulkan library names; pass through all other libraries
-                        if (libraryName == VulkanLinux)
+                        if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                            VulkanMacOS, assembly, searchPath, out var handle))
                         {
-                            if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
-                                VulkanMacOS, assembly, searchPath, out var handle))
-                            {
-                                return handle;
-                            }
+                            return handle;
                         }
-                        // Return IntPtr.Zero for non-Vulkan libraries so the default resolver handles them
-                        return IntPtr.Zero;
-                    });
-            }
-            catch (InvalidOperationException)
-            {
-                // A resolver was already registered for this assembly — skip.
-            }
+                    }
+                    return IntPtr.Zero;
+                });
         }
     }
 #endif
