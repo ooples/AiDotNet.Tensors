@@ -16090,40 +16090,20 @@ public partial class CpuEngine : ITensorLevelEngine
 #if NET5_0_OR_GREATER
             if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 32)
             {
-                // Pin once for all 3 passes — avoids per-pass pinning overhead
+                // Pin once for all passes — avoids per-pass pinning overhead.
                 fixed (float* inp = input, outp = output)
                 {
-                    // Pass 1: Mean with 4x unrolled SIMD accumulation
+                    // FUSED Pass 1+2: simultaneous sum AND sum-of-squares via
+                    //   Var[X] = E[X²] - E[X]²
+                    // Cuts input reads from 3× to 2× — saves one full sweep
+                    // over the per-channel data (matches the LayerNorm fix).
+                    // 4-way unrolled to saturate both FMA ports on Zen 2.
                     float sum = 0f;
+                    float sumSq = 0f;
                     var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
                     var vsum1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
                     var vsum2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
                     var vsum3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
-                    for (int n = 0; n < batch; n++)
-                    {
-                        int offset = n * channels * spatialSize + c * spatialSize;
-                        float* ptr = inp + offset;
-                        int s = 0;
-                        int simdLen = spatialSize & ~31;
-                        for (; s < simdLen; s += 32)
-                        {
-                            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
-                            vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8));
-                            vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16));
-                            vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24));
-                        }
-                        for (; s < spatialSize; s++)
-                            sum += ptr[s];
-                    }
-                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
-                    sum += SimdKernels.HorizontalSum(vsum0);
-
-                    float channelMean = sum * invCount;
-                    meanOut[c] = channelMean;
-
-                    // Pass 2: Variance with 4x unrolled FMA
-                    float sumSq = 0f;
-                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
                     var vsq0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
                     var vsq1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
                     var vsq2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
@@ -16136,25 +16116,42 @@ public partial class CpuEngine : ITensorLevelEngine
                         int simdLen = spatialSize & ~31;
                         for (; s < simdLen; s += 32)
                         {
-                            var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
-                            var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8), vmean);
-                            var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16), vmean);
-                            var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24), vmean);
-                            vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, vsq0);
-                            vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, vsq1);
-                            vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, d2, vsq2);
-                            vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, d3, vsq3);
+                            var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s);
+                            var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8);
+                            var v2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16);
+                            var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24);
+                            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, v0);
+                            vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, v1);
+                            vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, v2v);
+                            vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, v3);
+                            vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsq0);
+                            vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsq1);
+                            vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2v, v2v, vsq2);
+                            vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsq3);
                         }
                         for (; s < spatialSize; s++)
                         {
-                            float diff = ptr[s] - channelMean;
-                            sumSq += diff * diff;
+                            float x = ptr[s];
+                            sum += x;
+                            sumSq += x * x;
                         }
                     }
+                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                    sum += SimdKernels.HorizontalSum(vsum0);
                     vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1), System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
                     sumSq += SimdKernels.HorizontalSum(vsq0);
 
-                    float channelVar = sumSq * invCount;
+                    float channelMean = sum * invCount;
+                    meanOut[c] = channelMean;
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                    // Variance via E[X²] - E[X]². Numerical-safety clamp:
+                    // catastrophic cancellation can drive this slightly
+                    // negative for near-uniform channels — clamp to 0
+                    // (matches the LayerNorm clamp; gives invStd → ∞ which
+                    // produces zero output for zero-variance channels, the
+                    // correct degenerate normalization result).
+                    float channelVar = sumSq * invCount - channelMean * channelMean;
+                    if (channelVar < 0f) channelVar = 0f;
                     varOut[c] = channelVar;
                     float invStd = 1f / MathF.Sqrt(channelVar + eps);
                     float g = gamma[c];
