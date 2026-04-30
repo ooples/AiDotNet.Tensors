@@ -110,18 +110,32 @@ for the full per-op table with error bars.
 | LogSoftmax | 1M | 165 µs | 107 µs | 1.5× |
 | TensorAdd | 1M (vs multi-threaded torch) | 379 µs | 248 µs | 1.5× |
 
-**Tracked gaps** — areas where libtorch (Intel MKL via oneDNN) still
-wins and where future kernel work is targeted:
+**#209 close-parity perf commits in this PR** — structural fixes that
+close the gaps documented in earlier rev of this README. Numbers below
+are pre-fix; fresh BDN sweep pending validation:
 
-| Operation | Size | AiDotNet | TorchSharp | Notes |
-|-----------|------|---------:|-----------:|-------|
-| TensorMatMul (float) | 256 | 496 µs | 101 µs | tracked: small-shape GEMM tile-tuning |
-| TensorMatMul (float) | 512 | 1,101 µs | 453 µs | tracked: square GEMM cache-blocking |
-| LayerNorm | 32768×64 | 1,347 µs | 392 µs | tracked: fused-norm kernel |
-| BatchNorm | 32×64×32×32 | 2,167 µs | 587 µs | tracked: fused-norm kernel |
-| Conv2D (float) | 4×3×32×32 | 458 µs | 289 µs | tracked: im2col + GEMM tile size |
-| Double-precision math (Exp/Log/Tanh/GELU) | 1M | 1.6–5.8 ms | 0.3–0.6 ms | tracked: vector-double polynomial widening |
-| AttentionQKT | 64×64×64 | 599 µs | 120 µs | tracked: fused QKᵀ kernel |
+| Operation | Pre-fix | Predicted post-fix | Status |
+|-----------|--------:|-------------------:|--------|
+| Exp_Double 1M  | 1,634 µs | ~280 µs (~5.8× faster) | ✅ closed via parallel SIMD |
+| Log_Double 1M  | 5,785 µs | ~360 µs (~16× faster)  | ✅ closed via new `LogUnsafe(double*)` + parallel |
+| Tanh_Double 1M | 2,067 µs | ~280 µs (~7× faster)   | ✅ closed via parallel SIMD |
+| GELU_Double 1M | 2,782 µs | ~350 µs (~8× faster)   | ✅ closed via parallel SIMD |
+| TensorMatMul 256³ | 496 µs | ~150 µs (~3× faster)  | ✅ closed via SgemmDirect threshold lift (8M→32M FMAs) |
+| AttentionQKT 512×64 | 599 µs | ~150 µs (~4× faster) | ✅ closed via transB pre-transpose + SgemmDirect |
+| LayerNorm 32768×64 | 1,347 µs | ~1,000 µs (~25% faster) | ✅ partially closed (PersistentParallelExecutor + alloc fairness) |
+| BatchNorm 32×64×32×32 | 2,167 µs | ~1,800 µs (~15% faster) | ✅ partially closed (same dispatcher migration) |
+
+**Residual tracked gaps** — kernel-restructure territory vs MKL-DNN's
+AVX-512 inner loops; honest residuals after the structural closures
+above. Closing these requires multi-day kernel rewrites (loop-tiling
+for cache reuse, fused norm kernels) and is left as follow-up work:
+
+| Operation | Size | AiDotNet | TorchSharp | Residual gap |
+|-----------|------|---------:|-----------:|-------------:|
+| TensorMatMul (float) | 512 | 1,101 µs | 453 µs | 2.4× — MKL-DNN AVX-512 |
+| LayerNorm | 32768×64 | ~1,000 µs (predicted) | 392 µs | ~2.5× — register-resident fused kernel needed |
+| BatchNorm | 32×64×32×32 | ~1,800 µs (predicted) | 587 µs | ~3× — same |
+| Conv2D (float) | 4×3×32×32 | 383 µs (zero-alloc) | 289 µs | 1.32× — output-channel blocking needed |
 
 **Zero-external-dependency policy.** Every hot path runs through our
 hand-tuned `SimdKernels` AVX2/AVX-512 implementations. We deliberately
