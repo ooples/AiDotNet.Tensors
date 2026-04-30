@@ -7989,13 +7989,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-#if NET8_0_OR_GREATER
-            var sArr = (float[])(object)tensor.GetDataArray();
-            var dArr = (float[])(object)result.GetDataArray();
-            System.Numerics.Tensors.TensorPrimitives.Tanh(
-                new ReadOnlySpan<float>(sArr, 0, tensor.Length),
-                new Span<float>(dArr, 0, tensor.Length));
-#else
+            // NOTE: TensorPrimitives.Tanh is unexpectedly 20× SLOWER than
+            // our own Padé-approximation SIMD kernel on Ryzen 9 3950X for
+            // 1M-element inputs (measured 7325 µs vs 369 µs in BENCHMARK
+            // RESULTS). Stay on the in-house path until that regresses.
             var srcMem = AsFloatMemory(tensor.Data);
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
@@ -8003,17 +8000,9 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
-#endif
         }
         else if (typeof(T) == typeof(double))
         {
-#if NET8_0_OR_GREATER
-            var sArr = (double[])(object)tensor.GetDataArray();
-            var dArr = (double[])(object)result.GetDataArray();
-            System.Numerics.Tensors.TensorPrimitives.Tanh(
-                new ReadOnlySpan<double>(sArr, 0, tensor.Length),
-                new Span<double>(dArr, 0, tensor.Length));
-#else
             var srcMem = AsDoubleMemory(tensor.Data);
             var dstMem = AsDoubleMemory(result.Data);
             using var pinSrc = srcMem.Pin();
@@ -8022,7 +8011,6 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pDst = (double*)pinDst.Pointer;
             if (!Helpers.VmlProvider.TryTanh(pSrc, pDst, tensor.Length))
                 SimdKernels.TanhUnsafe(pSrc, pDst, tensor.Length);
-#endif
         }
         else
         {
@@ -8084,21 +8072,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy
         if (typeof(T) == typeof(float))
         {
-#if NET8_0_OR_GREATER
-            // TensorPrimitives.Sigmoid fuses Negate + Exp + AddOne + Reciprocal
-            // into a single SIMD pass with no Pin/JIT/Parallel.For dispatch
-            // overhead. Empirically faster than the JIT-compiled kernel path
-            // on net10 because the per-call overhead is fixed-cost dominant
-            // at the benchmarked 1M-element shape.
-            var srcArrTp = (float[])(object)tensor.GetDataArray();
-            var dstArrTp = (float[])(object)result.GetDataArray();
-            System.Numerics.Tensors.TensorPrimitives.Sigmoid(
-                new ReadOnlySpan<float>(srcArrTp, 0, length),
-                new Span<float>(dstArrTp, 0, length));
-            DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
-            { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
-            return result;
-#else
+            // NOTE: TensorPrimitives.Sigmoid was tested and shown to be on
+            // par with our JIT-compiled Padé-3,3 approximation, but for
+            // double precision it regresses 12× (530 µs → 6,121 µs in
+            // BENCHMARK_RESULTS). Stay on the in-house path.
             var srcMem = AsFloatMemory(tensor.Data);
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
@@ -8158,22 +8135,14 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
-#endif
         }
 
-        // Double fast path: pointer-based SIMD Sigmoid with polynomial approximation
+        // Double fast path: pointer-based SIMD Sigmoid with polynomial approximation.
+        // NOTE: TensorPrimitives.Sigmoid for double regressed 12× in BENCHMARK
+        // RESULTS (530 µs → 6,121 µs at 1M elements) — staying on the in-house
+        // path until the framework path improves.
         if (typeof(T) == typeof(double))
         {
-#if NET8_0_OR_GREATER
-            var srcArrTp = (double[])(object)tensor.GetDataArray();
-            var dstArrTp = (double[])(object)result.GetDataArray();
-            System.Numerics.Tensors.TensorPrimitives.Sigmoid(
-                new ReadOnlySpan<double>(srcArrTp, 0, length),
-                new Span<double>(dstArrTp, 0, length));
-            DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
-            { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
-            return result;
-#else
             var srcMem = AsDoubleMemory(tensor.Data);
             var dstMem = AsDoubleMemory(result.Data);
             using var pinSrc = srcMem.Pin();
@@ -8208,7 +8177,6 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
-#endif
         }
 
         // Generic fallback

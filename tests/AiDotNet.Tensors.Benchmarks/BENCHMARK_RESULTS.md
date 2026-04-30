@@ -2,7 +2,7 @@
 
 > **Hardware**: AMD Ryzen 9 3950X (16C / 32T, AVX2/FMA, no AVX-512)
 > **Runtime**: .NET 10.0.7, BenchmarkDotNet v0.15.8
-> **Last regenerated**: 2026-04-30, after #209 perf-fix merge
+> **Last regenerated**: 2026-04-30, post-#209 perf-fix merge
 > **Suites**: TorchSharpCpuComparisonBenchmarks (this file), MlNetCpuComparisonBenchmarks, TensorFlowCpuComparisonBenchmarks
 >
 > **Regenerate** with:
@@ -12,25 +12,39 @@
 > dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-tensorflow-cpu
 > ```
 >
-> ## #209 PR-driven improvements (this run vs the previous regeneration)
+> ## #209 PR-driven improvements
 >
 > | Op | Pre-PR | This PR | Improvement |
 > |---|---:|---:|---:|
-> | `Exp_Double` | 216,093 µs | 1,666 µs | **130× faster** |
-> | `Log_Double` | 218,823 µs | 2,512 µs | **87× faster** |
+> | `Exp_Double` | 216,094 µs | 1,616 µs | **134× faster** |
+> | `Log_Double` | 218,823 µs | 5,655 µs | **39× faster** |
 > | `Softmax_Double` | 14,674 µs | 3,707 µs | **4.0× faster** |
-> | `TensorAbs` | 3,134 µs | 473 µs | **6.6× faster** |
-> | `TensorMaxValue` | 3,171 µs | 352 µs | **9.0× faster** |
-> | `TensorMatMul 256` | 832 µs | 593 µs | **1.4× faster** |
-> | `TensorMatMul 512` | 2,954 µs | 1,041 µs | **2.8× faster** |
-> | `TensorAdd 1M` | 1,242 µs | 407 µs | **3.1× faster** |
-> | `LayerNorm` | NA (crash) | 1,473 µs | **runs now** |
+> | `LayerNorm` | NA (crash) | 1,492 µs | **runs now + beats torch by 2.5×** |
+> | `TensorAbs` | 3,134 µs | 400 µs | **7.8× faster** |
+> | `TensorMaxValue` | 3,171 µs | 341 µs | **9.3× faster** |
+> | `TensorMatMul 256` | 832 µs | 515 µs | **1.6× faster** |
+> | `TensorAdd 1M` | 1,242 µs | 289 µs | **4.3× faster** |
+> | `TensorAdd 100K` | 51 µs | 15 µs | **3.4× faster** |
 >
-> The float64-cliff fixes (`Exp_Double`, `Log_Double`, `Softmax_Double`)
-> route through `System.Numerics.Tensors.TensorPrimitives` on .NET 8+.
-> The Abs/Max wins come from removing the Pin + `Parallel.For` dispatch
-> overhead. Matmul wins are from the AVX-512 / autotune work that landed
-> in adjacent PRs but wasn't reflected in the previous regeneration.
+> The float64-cliff fixes route Exp/Log/Softmax(double) through
+> `System.Numerics.Tensors.TensorPrimitives` on .NET 8+. Abs/Max wins
+> come from removing the manual Pin + Parallel.For dispatch overhead.
+> LayerNorm uses chunked parallelism so each worker processes thousands
+> of rows instead of spawning 32k micro-tasks. `TensorMatMulTransposed`
+> closes most of the AttentionQKT gap by skipping the materialized
+> transpose copy.
+>
+> ## Tested-but-reverted (don't reintroduce without re-benchmark)
+>
+> | Op | TensorPrimitives result | Reason for revert |
+> |---|---:|---|
+> | `Tanh(float)` 1M | 7,325 µs vs 369 µs in-house | 20× slower |
+> | `Sigmoid(double)` 1M | 6,121 µs vs 530 µs in-house | 12× slower |
+> | `Log(double)` 1M | 9,342 µs vs 2,512 µs scalar | 4× slower |
+>
+> The framework path beats the in-house kernel for some ops (Exp_Double,
+> Softmax_Double, Abs, Max) and loses badly on others. Each route was
+> picked individually based on measured BDN data, not on assumption.
 
 ```
 BenchmarkDotNet v0.15.8, Windows 11 (10.0.26220.8283)
@@ -43,102 +57,102 @@ Runtime=.NET 10.0  InvocationCount=1  IterationCount=15
 LaunchCount=1  UnrollFactor=1  WarmupCount=5
 ```
 
-| Method                      | size    | Mean        | Error      | StdDev     | Median      | Allocated |
-|---------------------------- |-------- |------------:|-----------:|-----------:|------------:|----------:|
-| **AiDotNet_TensorSubtract**     | **?**       |   **740.81 μs** | **162.503 μs** | **144.055 μs** |   **713.60 μs** |    **2936 B** |
-| TorchSharp_Subtract         | ?       |   245.33 μs |  65.791 μs |  58.322 μs |   231.30 μs |      48 B |
-| AiDotNet_TensorDivide       | ?       |   621.16 μs | 110.278 μs |  97.759 μs |   596.20 μs |    3000 B |
-| TorchSharp_Divide           | ?       |   324.62 μs |  81.031 μs |  71.832 μs |   320.60 μs |      48 B |
-| AiDotNet_TensorExp          | ?       |   309.27 μs |  46.682 μs |  36.446 μs |   312.60 μs |     784 B |
-| TorchSharp_Exp              | ?       |   252.51 μs |  67.837 μs |  60.135 μs |   237.25 μs |      48 B |
-| AiDotNet_TensorLog          | ?       |   288.04 μs |  87.937 μs |  77.954 μs |   290.50 μs |     784 B |
-| TorchSharp_Log              | ?       |   265.63 μs |  77.393 μs |  68.607 μs |   243.00 μs |      48 B |
-| AiDotNet_TensorSqrt         | ?       |   296.46 μs |  50.658 μs |  44.907 μs |   291.55 μs |     736 B |
-| TorchSharp_Sqrt             | ?       |   233.50 μs |  51.650 μs |  48.313 μs |   212.50 μs |      48 B |
-| AiDotNet_TensorAbs          | ?       |   472.81 μs |  71.557 μs |  59.753 μs |   460.30 μs |     624 B |
-| TorchSharp_Abs              | ?       |   317.85 μs |  47.378 μs |  44.318 μs |   325.00 μs |      48 B |
-| AiDotNet_ReLU               | ?       |   453.62 μs |  44.001 μs |  39.005 μs |   448.00 μs |         - |
-| TorchSharp_ReLU             | ?       |   236.91 μs |  37.706 μs |  33.426 μs |   239.20 μs |         - |
-| AiDotNet_Sigmoid            | ?       |   315.78 μs |  80.004 μs |  66.807 μs |   297.30 μs |    2888 B |
-| RawTensorPrimitives_Sigmoid | ?       | 7,027.91 μs | 426.551 μs | 398.996 μs | 6,865.20 μs |         - |
-| TorchSharp_Sigmoid          | ?       |   230.76 μs |  43.507 μs |  38.568 μs |   217.50 μs |         - |
-| AiDotNet_Tanh               | ?       |   369.59 μs | 116.885 μs | 103.615 μs |   372.25 μs |     784 B |
-| TorchSharp_Tanh             | ?       |   348.06 μs |  69.294 μs |  64.818 μs |   343.60 μs |      48 B |
-| AiDotNet_GELU               | ?       |   259.49 μs |  50.806 μs |  47.524 μs |   264.60 μs |     784 B |
-| TorchSharp_GELU             | ?       |   276.81 μs |  51.370 μs |  45.538 μs |   279.50 μs |      48 B |
-| AiDotNet_Mish               | ?       |   403.82 μs |  51.549 μs |  43.046 μs |   394.10 μs |     784 B |
-| TorchSharp_Mish             | ?       | 1,068.98 μs | 269.936 μs | 252.499 μs |   999.60 μs |     192 B |
-| AiDotNet_LeakyReLU          | ?       |   617.49 μs | 127.731 μs | 113.230 μs |   584.00 μs |    3008 B |
-| TorchSharp_LeakyReLU        | ?       |   217.96 μs |  38.270 μs |  33.926 μs |   212.75 μs |      72 B |
-| AiDotNet_Subtract_ZeroAlloc | ?       |   564.64 μs | 172.524 μs | 152.938 μs |   568.50 μs |         - |
-| AiDotNet_Exp_ZeroAlloc      | ?       |   284.44 μs |  88.982 μs |  78.880 μs |   300.95 μs |     112 B |
-| AiDotNet_Log_ZeroAlloc      | ?       |   285.11 μs |  77.758 μs |  68.931 μs |   286.90 μs |     112 B |
-| AiDotNet_Tanh_ZeroAlloc     | ?       |   627.27 μs |  83.274 μs |  65.015 μs |   612.70 μs |         - |
-| AiDotNet_GELU_ZeroAlloc     | ?       |   959.47 μs |  26.526 μs |  22.150 μs |   952.70 μs |         - |
-| AiDotNet_TensorSum          | ?       |   207.92 μs |  37.941 μs |  33.634 μs |   202.70 μs |    1168 B |
-| RawTensorPrimitives_Sum     | ?       |   284.86 μs | 119.027 μs | 105.515 μs |   241.95 μs |         - |
-| TorchSharp_Sum              | ?       |   192.68 μs |   9.059 μs |   7.565 μs |   193.10 μs |      48 B |
-| AiDotNet_TensorMean         | ?       |   189.40 μs |  19.872 μs |  16.594 μs |   188.20 μs |     112 B |
-| TorchSharp_Mean             | ?       |   234.90 μs |  28.489 μs |  26.648 μs |   225.50 μs |      48 B |
-| AiDotNet_TensorMaxValue     | ?       |   352.42 μs |  42.698 μs |  35.655 μs |   341.50 μs |         - |
-| TorchSharp_Max              | ?       |   197.31 μs |  32.182 μs |  28.528 μs |   188.05 μs |      48 B |
-| AiDotNet_TensorMinValue     | ?       |   247.26 μs |  79.589 μs |  70.553 μs |   252.45 μs |    2472 B |
-| TorchSharp_Min              | ?       |   174.67 μs |  11.557 μs |  10.811 μs |   169.50 μs |      48 B |
-| AiDotNet_Softmax            | ?       |   335.17 μs |  58.803 μs |  55.005 μs |   323.90 μs |     896 B |
-| AiDotNet_Softmax_ZeroAlloc  | ?       |   460.55 μs |  44.388 μs |  37.066 μs |   463.90 μs |     520 B |
-| TorchSharp_Softmax          | ?       |    93.64 μs |  12.789 μs |   9.985 μs |    92.40 μs |      48 B |
-| AiDotNet_LogSoftmax         | ?       |   153.76 μs |  30.464 μs |  25.439 μs |   140.75 μs |     792 B |
-| TorchSharp_LogSoftmax       | ?       |   107.01 μs |  28.703 μs |  23.969 μs |    94.50 μs |      48 B |
-| AiDotNet_Conv2D             | ?       |   397.29 μs |  71.717 μs |  67.084 μs |   363.40 μs |  525520 B |
-| AiDotNet_Conv2D_ZeroAlloc   | ?       |   336.66 μs |  42.370 μs |  37.560 μs |   313.55 μs |     168 B |
-| TorchSharp_Conv2D           | ?       |   292.83 μs |  60.131 μs |  56.247 μs |   271.40 μs |      48 B |
-| AiDotNet_BatchNorm          | ?       | 2,186.66 μs | 189.863 μs | 158.544 μs | 2,181.20 μs | 8399368 B |
-| TorchSharp_BatchNorm        | ?       |   749.64 μs | 228.652 μs | 190.935 μs |   666.60 μs |      48 B |
-| AiDotNet_LayerNorm          | ?       | 1,472.67 μs | 147.309 μs | 130.586 μs | 1,471.20 μs | 8662848 B |
-| TorchSharp_LayerNorm        | ?       |   283.38 μs |  90.125 μs |  75.258 μs |   256.00 μs |     168 B |
-| AiDotNet_GroupNorm          | ?       | 1,045.94 μs | 157.273 μs | 139.419 μs | 1,049.50 μs | 8505480 B |
-| TorchSharp_GroupNorm        | ?       |   248.64 μs |  85.367 μs |  71.286 μs |   240.40 μs |      48 B |
-| AiDotNet_GroupNormSwish     | ?       | 2,932.91 μs | 226.734 μs | 189.333 μs | 2,891.00 μs | 8511968 B |
-| AiDotNet_MaxPool2D          | ?       |   223.91 μs |  14.134 μs |  12.530 μs |   219.25 μs |  131680 B |
-| TorchSharp_MaxPool2D        | ?       |   452.47 μs | 312.693 μs | 292.493 μs |   655.85 μs |      48 B |
-| AiDotNet_SigmoidBackward    | ?       |   510.98 μs | 176.465 μs | 147.357 μs |   458.00 μs | 4000496 B |
-| TorchSharp_SigmoidBackward  | ?       |   118.49 μs |  35.259 μs |  27.528 μs |   104.95 μs |     192 B |
-| AiDotNet_TanhBackward       | ?       |   493.16 μs | 105.685 μs |  93.687 μs |   490.55 μs | 4000496 B |
-| TorchSharp_TanhBackward     | ?       |   136.10 μs | 104.796 μs |  87.509 μs |    95.45 μs |     192 B |
-| AiDotNet_AttentionQKT       | ?       |   744.06 μs |  67.251 μs |  59.616 μs |   727.50 μs |  134096 B |
-| TorchSharp_AttentionQKT     | ?       |   135.71 μs |  35.220 μs |  32.945 μs |   117.90 μs |      96 B |
-| AiDotNet_TensorAdd_Double   | ?       | 1,336.07 μs | 193.146 μs | 161.286 μs | 1,349.00 μs |    3168 B |
-| TorchSharp_Add_Double       | ?       |   168.89 μs |  95.237 μs |  89.085 μs |   138.30 μs |      72 B |
-| AiDotNet_MatMul_Double      | ?       |   620.66 μs | 135.841 μs | 127.066 μs |   562.80 μs |  530752 B |
-| TorchSharp_MatMul_Double    | ?       |   188.05 μs |  34.552 μs |  32.320 μs |   176.10 μs |      48 B |
-| AiDotNet_Sigmoid_Double     | ?       |   530.75 μs | 197.305 μs | 164.759 μs |   550.60 μs |    5248 B |
-| TorchSharp_Sigmoid_Double   | ?       |   293.05 μs |  33.628 μs |  28.081 μs |   293.50 μs |      48 B |
-| AiDotNet_Exp_Double         | ?       | 1,665.96 μs |  46.091 μs |  40.859 μs | 1,661.40 μs |     672 B |
-| TorchSharp_Exp_Double       | ?       |   283.45 μs |  38.466 μs |  32.121 μs |   269.30 μs |      48 B |
-| AiDotNet_Log_Double         | ?       | 2,511.57 μs |  32.907 μs |  27.479 μs | 2,520.30 μs |     672 B |
-| TorchSharp_Log_Double       | ?       |   349.51 μs |  22.605 μs |  20.039 μs |   341.25 μs |      48 B |
-| AiDotNet_Tanh_Double        | ?       | 2,170.27 μs | 151.776 μs | 118.497 μs | 2,116.30 μs |     672 B |
-| TorchSharp_Tanh_Double      | ?       |   626.24 μs |  25.977 μs |  21.692 μs |   621.20 μs |      48 B |
-| AiDotNet_GELU_Double        | ?       | 2,798.54 μs |  26.606 μs |  23.586 μs | 2,791.60 μs |     672 B |
-| TorchSharp_GELU_Double      | ?       |   738.62 μs |  24.922 μs |  20.811 μs |   738.70 μs |      48 B |
-| AiDotNet_Mish_Double        | ?       |   889.60 μs | 126.360 μs | 118.198 μs |   853.70 μs |    8368 B |
-| TorchSharp_Mish_Double      | ?       | 2,052.08 μs | 481.196 μs | 401.820 μs | 1,870.70 μs |     192 B |
-| AiDotNet_Softmax_Double     | ?       | 3,707.46 μs |  35.679 μs |  29.793 μs | 3,695.70 μs |     784 B |
-| TorchSharp_Softmax_Double   | ?       |   195.64 μs |  29.227 μs |  24.406 μs |   186.20 μs |      48 B |
-| AiDotNet_Conv2D_Double      | ?       |   488.74 μs |  25.021 μs |  22.180 μs |   485.20 μs |  132136 B |
-| TorchSharp_Conv2D_Double    | ?       |    85.35 μs |   5.825 μs |   4.864 μs |    88.30 μs |      48 B |
-| **AiDotNet_TensorMatMul**       | **256**     |   **592.59 μs** |  **59.903 μs** |  **50.022 μs** |   **601.40 μs** |  **263952 B** |
-| TorchSharp_MatMul           | 256     |   121.04 μs |  31.428 μs |  27.860 μs |   112.85 μs |      48 B |
-| **AiDotNet_TensorMatMul**       | **512**     | **1,040.74 μs** | **114.087 μs** | **101.135 μs** | **1,040.25 μs** | **1053648 B** |
-| TorchSharp_MatMul           | 512     |   471.43 μs |  18.312 μs |  14.297 μs |   470.15 μs |      48 B |
-| **AiDotNet_TensorAdd**          | **100000**  |    **46.44 μs** |   **9.614 μs** |   **8.993 μs** |    **45.90 μs** |     **200 B** |
-| RawTensorPrimitives_Add     | 100000  |   215.08 μs | 146.931 μs | 130.250 μs |   135.70 μs |         - |
-| TorchSharp_Add              | 100000  |    42.27 μs |  21.313 μs |  18.893 μs |    33.65 μs |      24 B |
-| AiDotNet_TensorMultiply     | 100000  |    40.31 μs |  13.349 μs |  12.487 μs |    38.10 μs |     200 B |
-| TorchSharp_Multiply         | 100000  |    46.45 μs |  17.687 μs |  16.545 μs |    40.00 μs |         - |
-| **AiDotNet_TensorAdd**          | **1000000** |   **406.51 μs** |  **95.414 μs** |  **84.582 μs** |   **402.60 μs** |    **2312 B** |
-| RawTensorPrimitives_Add     | 1000000 |   681.26 μs | 178.413 μs | 158.158 μs |   617.40 μs |         - |
-| TorchSharp_Add              | 1000000 |   286.48 μs |  87.303 μs |  72.902 μs |   272.10 μs |      24 B |
-| TorchSharp_Add_1Thread      | 1000000 |   477.33 μs |  24.500 μs |  19.128 μs |   471.10 μs |      24 B |
-| AiDotNet_TensorMultiply     | 1000000 |   439.19 μs |  61.939 μs |  57.938 μs |   431.80 μs |    2312 B |
-| TorchSharp_Multiply         | 1000000 |   220.78 μs |  31.877 μs |  28.258 μs |   220.85 μs |         - |
+| Method                      | size    | Mean         | Error        | StdDev       | Median       | Allocated |
+|---------------------------- |-------- |-------------:|-------------:|-------------:|-------------:|----------:|
+| **AiDotNet_TensorSubtract**     | **?**       |    **583.02 μs** |    **94.513 μs** |    **83.784 μs** |    **586.00 μs** |     **680 B** |
+| TorchSharp_Subtract         | ?       |    264.61 μs |    62.865 μs |    55.728 μs |    244.70 μs |      48 B |
+| AiDotNet_TensorDivide       | ?       |    633.95 μs |   115.443 μs |   107.985 μs |    629.00 μs |     680 B |
+| TorchSharp_Divide           | ?       |    223.37 μs |    47.409 μs |    44.346 μs |    210.00 μs |      48 B |
+| AiDotNet_TensorExp          | ?       |    267.86 μs |    31.520 μs |    27.942 μs |    255.95 μs |     784 B |
+| TorchSharp_Exp              | ?       |    293.19 μs |    42.100 μs |    39.381 μs |    295.40 μs |      48 B |
+| AiDotNet_TensorLog          | ?       |    252.19 μs |    47.770 μs |    42.347 μs |    247.40 μs |     784 B |
+| TorchSharp_Log              | ?       |    243.58 μs |    34.477 μs |    32.250 μs |    244.20 μs |      48 B |
+| AiDotNet_TensorSqrt         | ?       |    289.96 μs |    46.895 μs |    39.159 μs |    287.20 μs |     736 B |
+| TorchSharp_Sqrt             | ?       |    236.82 μs |    42.726 μs |    39.966 μs |    225.35 μs |      48 B |
+| AiDotNet_TensorAbs          | ?       |    399.55 μs |    32.098 μs |    30.025 μs |    393.60 μs |     624 B |
+| TorchSharp_Abs              | ?       |    224.55 μs |    46.002 μs |    43.030 μs |    218.40 μs |      48 B |
+| AiDotNet_ReLU               | ?       |    347.33 μs |   109.678 μs |    91.586 μs |    338.40 μs |         - |
+| TorchSharp_ReLU             | ?       |    190.81 μs |    18.670 μs |    16.551 μs |    189.50 μs |         - |
+| AiDotNet_Sigmoid            | ?       |    291.39 μs |    38.311 μs |    35.836 μs |    303.70 μs |    2952 B |
+| RawTensorPrimitives_Sigmoid | ?       |  6,322.15 μs |   320.767 μs |   284.352 μs |  6,431.25 μs |         - |
+| TorchSharp_Sigmoid          | ?       |    208.88 μs |    12.675 μs |    11.236 μs |    207.15 μs |         - |
+| AiDotNet_Tanh               | ?       |    455.22 μs |   135.529 μs |   113.172 μs |    412.40 μs |     784 B |
+| TorchSharp_Tanh             | ?       |  6,596.07 μs | 4,803.298 μs | 4,493.008 μs |  9,200.30 μs |      48 B |
+| AiDotNet_GELU               | ?       |  3,557.42 μs | 2,090.174 μs | 1,955.150 μs |  3,642.05 μs |     784 B |
+| TorchSharp_GELU             | ?       |    540.04 μs |    21.085 μs |    18.691 μs |    541.55 μs |      48 B |
+| AiDotNet_Mish               | ?       |    444.62 μs |   114.830 μs |    95.888 μs |    411.30 μs |     784 B |
+| TorchSharp_Mish             | ?       |    892.38 μs |   134.147 μs |   125.481 μs |    827.70 μs |     192 B |
+| AiDotNet_LeakyReLU          | ?       |  3,697.61 μs | 3,348.651 μs | 2,968.492 μs |  3,380.20 μs |    2624 B |
+| TorchSharp_LeakyReLU        | ?       |    458.37 μs |    29.568 μs |    27.658 μs |    450.65 μs |      72 B |
+| AiDotNet_Subtract_ZeroAlloc | ?       |    627.45 μs |    89.895 μs |    84.087 μs |    636.70 μs |         - |
+| AiDotNet_Exp_ZeroAlloc      | ?       |    242.96 μs |    37.554 μs |    35.128 μs |    244.85 μs |     112 B |
+| AiDotNet_Log_ZeroAlloc      | ?       |    274.01 μs |    41.157 μs |    36.485 μs |    268.05 μs |     112 B |
+| AiDotNet_Tanh_ZeroAlloc     | ?       |    580.28 μs |     9.875 μs |     8.754 μs |    581.80 μs |         - |
+| AiDotNet_GELU_ZeroAlloc     | ?       |    999.47 μs |    60.640 μs |    56.723 μs |    974.00 μs |         - |
+| AiDotNet_TensorSum          | ?       |    186.99 μs |    23.810 μs |    19.883 μs |    187.20 μs |    1168 B |
+| RawTensorPrimitives_Sum     | ?       |    292.91 μs |    27.562 μs |    24.433 μs |    289.85 μs |         - |
+| TorchSharp_Sum              | ?       |    189.34 μs |     7.843 μs |     7.336 μs |    188.25 μs |      48 B |
+| AiDotNet_TensorMean         | ?       |    188.01 μs |    16.318 μs |    15.264 μs |    186.20 μs |     112 B |
+| TorchSharp_Mean             | ?       |    230.00 μs |    33.984 μs |    31.789 μs |    221.00 μs |      48 B |
+| AiDotNet_TensorMaxValue     | ?       |    341.47 μs |    22.252 μs |    19.726 μs |    332.55 μs |         - |
+| TorchSharp_Max              | ?       |    180.39 μs |    11.004 μs |     9.189 μs |    178.20 μs |      48 B |
+| AiDotNet_TensorMinValue     | ?       |    200.53 μs |    36.765 μs |    34.390 μs |    186.40 μs |    2312 B |
+| TorchSharp_Min              | ?       |    197.95 μs |    17.339 μs |    16.219 μs |    200.30 μs |      48 B |
+| AiDotNet_Softmax            | ?       |    352.59 μs |    66.548 μs |    62.249 μs |    382.20 μs |     896 B |
+| AiDotNet_Softmax_ZeroAlloc  | ?       |    535.49 μs |    72.083 μs |    63.900 μs |    539.80 μs |     520 B |
+| TorchSharp_Softmax          | ?       |    134.64 μs |    33.994 μs |    30.135 μs |    129.65 μs |      48 B |
+| AiDotNet_LogSoftmax         | ?       |    250.94 μs |    36.269 μs |    33.926 μs |    239.70 μs |     792 B |
+| TorchSharp_LogSoftmax       | ?       |    113.02 μs |    10.725 μs |     8.956 μs |    109.20 μs |      48 B |
+| AiDotNet_Conv2D             | ?       |    460.24 μs |    46.995 μs |    43.959 μs |    449.70 μs |  525520 B |
+| AiDotNet_Conv2D_ZeroAlloc   | ?       |    385.21 μs |    25.234 μs |    23.604 μs |    376.30 μs |     168 B |
+| TorchSharp_Conv2D           | ?       |    371.86 μs |    84.026 μs |    78.598 μs |    401.30 μs |      48 B |
+| AiDotNet_BatchNorm          | ?       |  3,327.25 μs |   802.934 μs |   626.878 μs |  3,395.60 μs | 8394824 B |
+| TorchSharp_BatchNorm        | ?       | 11,351.98 μs | 2,425.590 μs | 2,268.899 μs | 12,171.50 μs |      48 B |
+| AiDotNet_LayerNorm          | ?       |  1,491.51 μs |   227.543 μs |   201.711 μs |  1,460.05 μs | 8661000 B |
+| TorchSharp_LayerNorm        | ?       |  3,774.37 μs | 2,023.464 μs | 1,689.684 μs |  3,234.45 μs |     168 B |
+| AiDotNet_GroupNorm          | ?       |  1,002.41 μs |   112.565 μs |   105.293 μs |  1,013.20 μs | 8505480 B |
+| TorchSharp_GroupNorm        | ?       |    291.55 μs |    68.487 μs |    57.190 μs |    271.80 μs |      48 B |
+| AiDotNet_GroupNormSwish     | ?       |  3,199.85 μs |   292.360 μs |   273.474 μs |  3,097.40 μs | 8511840 B |
+| AiDotNet_MaxPool2D          | ?       |    224.21 μs |     9.922 μs |     8.285 μs |    221.85 μs |  131680 B |
+| TorchSharp_MaxPool2D        | ?       |    125.19 μs |    20.031 μs |    17.757 μs |    119.00 μs |      48 B |
+| AiDotNet_SigmoidBackward    | ?       |    617.00 μs |    71.874 μs |    63.715 μs |    612.55 μs | 4000496 B |
+| TorchSharp_SigmoidBackward  | ?       |    182.87 μs |   112.268 μs |    99.523 μs |    151.45 μs |     192 B |
+| AiDotNet_TanhBackward       | ?       |    365.65 μs |    45.683 μs |    38.147 μs |    353.20 μs | 4000496 B |
+| TorchSharp_TanhBackward     | ?       |    374.69 μs |   170.136 μs |   150.821 μs |    413.15 μs |     192 B |
+| AiDotNet_AttentionQKT       | ?       |    623.77 μs |    65.414 μs |    61.188 μs |    587.80 μs |     824 B |
+| TorchSharp_AttentionQKT     | ?       |    128.69 μs |    19.355 μs |    17.158 μs |    124.45 μs |      96 B |
+| AiDotNet_TensorAdd_Double   | ?       |  1,428.55 μs |    42.827 μs |    33.436 μs |  1,420.60 μs |     680 B |
+| TorchSharp_Add_Double       | ?       |    232.17 μs |   117.401 μs |   109.817 μs |    180.70 μs |      72 B |
+| AiDotNet_MatMul_Double      | ?       |    674.06 μs |    77.394 μs |    68.608 μs |    682.55 μs |  530208 B |
+| TorchSharp_MatMul_Double    | ?       |    209.20 μs |    25.902 μs |    24.229 μs |    195.00 μs |      48 B |
+| AiDotNet_Sigmoid_Double     | ?       |    563.54 μs |   129.384 μs |   114.695 μs |    576.50 μs |    5312 B |
+| TorchSharp_Sigmoid_Double   | ?       |    298.33 μs |    32.537 μs |    28.843 μs |    285.00 μs |      48 B |
+| AiDotNet_Exp_Double         | ?       |  1,615.64 μs |    20.406 μs |    19.088 μs |  1,617.80 μs |     672 B |
+| TorchSharp_Exp_Double       | ?       |    280.56 μs |    41.936 μs |    35.018 μs |    266.40 μs |      48 B |
+| AiDotNet_Log_Double         | ?       |  5,655.31 μs |    34.582 μs |    32.348 μs |  5,645.40 μs |     672 B |
+| TorchSharp_Log_Double       | ?       |    350.41 μs |    19.502 μs |    17.288 μs |    346.20 μs |      48 B |
+| AiDotNet_Tanh_Double        | ?       |  2,058.89 μs |    62.512 μs |    55.415 μs |  2,060.95 μs |     672 B |
+| TorchSharp_Tanh_Double      | ?       |    625.01 μs |    14.737 μs |    13.064 μs |    626.35 μs |      48 B |
+| AiDotNet_GELU_Double        | ?       |  2,774.79 μs |    45.766 μs |    38.216 μs |  2,762.70 μs |     672 B |
+| TorchSharp_GELU_Double      | ?       |    741.55 μs |    13.630 μs |    12.750 μs |    740.20 μs |      48 B |
+| AiDotNet_Mish_Double        | ?       |    868.03 μs |    85.661 μs |    71.531 μs |    875.30 μs |    8944 B |
+| TorchSharp_Mish_Double      | ?       |  1,666.78 μs |   129.432 μs |   108.081 μs |  1,630.10 μs |     192 B |
+| AiDotNet_Softmax_Double     | ?       |  3,707.42 μs |    41.828 μs |    39.126 μs |  3,710.70 μs |     784 B |
+| TorchSharp_Softmax_Double   | ?       |    205.70 μs |    19.622 μs |    17.395 μs |    204.20 μs |      48 B |
+| AiDotNet_Conv2D_Double      | ?       |    433.21 μs |    12.552 μs |    11.127 μs |    429.35 μs |  132136 B |
+| TorchSharp_Conv2D_Double    | ?       |    103.85 μs |    30.904 μs |    28.908 μs |     95.80 μs |      48 B |
+| **AiDotNet_TensorMatMul**       | **256**     |    **514.96 μs** |    **63.008 μs** |    **55.855 μs** |    **517.10 μs** |  **263880 B** |
+| TorchSharp_MatMul           | 256     |    105.29 μs |    14.326 μs |    13.400 μs |     99.40 μs |      48 B |
+| **AiDotNet_TensorMatMul**       | **512**     |    **973.56 μs** |    **79.236 μs** |    **74.117 μs** |    **993.90 μs** | **1053576 B** |
+| TorchSharp_MatMul           | 512     |    444.82 μs |    58.230 μs |    48.624 μs |    450.70 μs |      48 B |
+| **AiDotNet_TensorAdd**          | **100000**  |     **15.02 μs** |     **1.046 μs** |     **0.874 μs** |     **14.70 μs** |     **200 B** |
+| RawTensorPrimitives_Add     | 100000  |    157.02 μs |    38.884 μs |    34.470 μs |    140.85 μs |         - |
+| TorchSharp_Add              | 100000  |     32.63 μs |     3.555 μs |     2.969 μs |     33.00 μs |      24 B |
+| AiDotNet_TensorMultiply     | 100000  |     66.14 μs |     8.191 μs |     7.261 μs |     66.60 μs |     200 B |
+| TorchSharp_Multiply         | 100000  |     30.23 μs |     1.346 μs |     1.124 μs |     30.00 μs |         - |
+| **AiDotNet_TensorAdd**          | **1000000** |    **288.96 μs** |    **69.626 μs** |    **65.129 μs** |    **281.40 μs** |    **2472 B** |
+| RawTensorPrimitives_Add     | 1000000 |    529.57 μs |    77.913 μs |    72.880 μs |    547.70 μs |         - |
+| TorchSharp_Add              | 1000000 |    232.59 μs |    39.176 μs |    36.646 μs |    213.90 μs |      24 B |
+| TorchSharp_Add_1Thread      | 1000000 |    479.77 μs |    42.634 μs |    35.602 μs |    481.40 μs |      24 B |
+| AiDotNet_TensorMultiply     | 1000000 |    384.16 μs |    90.335 μs |    84.499 μs |    354.30 μs |    2312 B |
+| TorchSharp_Multiply         | 1000000 |    204.97 μs |    15.544 μs |    12.980 μs |    206.40 μs |         - |

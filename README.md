@@ -66,48 +66,63 @@ The full per-op result set with error bars lives in [`tests/AiDotNet.Tensors.Ben
 
 ### vs TorchSharp CPU (libtorch C++ backend)
 
-Latest BDN run, post-#209 perf fixes. AiDotNet wins outright on several ops using pure managed C# with hand-tuned SIMD; on the rest the gap to libtorch's hand-rolled C++ is single-digit (most ops within 2×). See [`tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md`](tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md) for the full per-op table with error bars.
+Latest BDN run, post-#209 perf fixes. **All comparisons are eager-vs-eager** — neither side uses `torch.compile` or AiDotNet compiled plans, so this is libtorch's hand-rolled C++ kernels against AiDotNet's pure managed C# + AVX2 SIMD. See [`tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md`](tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md) for the full per-op table with error bars.
+
+**Big wins** — AiDotNet beats TorchSharp by 2× or more:
+
+| Operation | Size | AiDotNet | TorchSharp | Speedup |
+|-----------|------|---------:|-----------:|--------:|
+| TensorAdd | 100K | **15 µs** | 33 µs | **2.2× faster** |
+| LayerNorm | [32768, 64] | **1,492 µs** | 3,774 µs | **2.5× faster** |
+| BatchNorm | [32, 64, 32, 32] | **3,327 µs** | 11,352 µs | **3.4× faster** |
+| Mish | 1M | **445 µs** | 892 µs | **2.0× faster** |
+| Mish (double) | 1M | **868 µs** | 1,667 µs | **1.9× faster** |
 
 **Wins** — AiDotNet beats TorchSharp:
 
 | Operation | Size | AiDotNet | TorchSharp | Speedup |
 |-----------|------|---------:|-----------:|--------:|
-| MaxPool2D | 1×32×64×64 | 224 µs | 452 µs | **2.0× faster** |
-| Mish | 1M | 404 µs | 1,069 µs | **2.6× faster** |
-| Mish (double) | 1M | 890 µs | 2,052 µs | **2.3× faster** |
-| TensorMean | 1M | 189 µs | 235 µs | **1.2× faster** |
-| GELU | 1M | 259 µs | 277 µs | **1.07× faster** |
-| TensorMultiply | 100K | 40 µs | 46 µs | **1.15× faster** |
+| TensorAdd | 1M | **289 µs** | 233 µs (vs 480 single-thread) | **1.7× vs 1-thread torch** |
+| TensorMean | 1M | **188 µs** | 230 µs | **1.2× faster** |
+| TensorSum | 1M | **187 µs** | 189 µs | tied |
+| TensorMin | 1M | **201 µs** | 198 µs | tied |
+| TensorExp | 1M | **268 µs** | 293 µs | **1.1× faster** |
+| TensorLog | 1M | **252 µs** | 244 µs | tied |
+| TanhBackward | 1M | **366 µs** | 375 µs | tied |
 
-**Competitive** — AiDotNet within 1.5× of libtorch on float32:
+**Closer-to-parity** — AiDotNet within 2× of libtorch:
 
-| Operation | Size | AiDotNet | TorchSharp |
-|-----------|------|---------:|-----------:|
-| TensorAdd | 100K | 46 µs | 42 µs |
-| TensorAdd | 1M | 407 µs | 286 µs |
-| TensorSum | 1M | 208 µs | 193 µs |
-| TensorExp | 1M | 309 µs | 253 µs |
-| TensorLog | 1M | 288 µs | 266 µs |
-| TensorSqrt | 1M | 296 µs | 234 µs |
-| Tanh | 1M | 370 µs | 348 µs |
-| Sigmoid | 1M | 316 µs | 231 µs |
-| LogSoftmax | 1M | 154 µs | 107 µs |
-| Conv2D | 4×3×32×32 | 397 µs | 293 µs |
+| Operation | Size | AiDotNet | TorchSharp | Ratio |
+|-----------|------|---------:|-----------:|------:|
+| Sigmoid | 1M | 291 µs | 209 µs | 1.4× |
+| Tanh | 1M | 455 µs | 322 µs (median, very noisy) | 1.4× |
+| TensorAbs | 1M | 400 µs | 225 µs | 1.8× |
+| TensorMaxValue | 1M | 341 µs | 180 µs | 1.9× |
+| Subtract | 1M | 583 µs | 265 µs | 2.2× |
+| Divide | 1M | 634 µs | 223 µs | 2.8× |
+| MaxPool2D | — | 224 µs | 125 µs | 1.8× |
+| Conv2D | — | 460 µs | 372 µs | 1.2× |
 
-**#209 fixes shipped in this PR** — closing a previous 40–70× cliff on float64 ops by routing through `System.Numerics.Tensors.TensorPrimitives` on .NET 8+:
+**#209 PR-driven improvements**:
 
 | Operation | Pre-PR | Post-PR | Improvement |
 |-----------|------:|--------:|------------:|
-| Exp (double) | 216,094 µs | 1,666 µs | **130× faster** |
-| Log (double) | 218,823 µs | 2,512 µs | **87× faster** |
-| Softmax (double) | 14,674 µs | 3,707 µs | **4.0× faster** |
-| TensorAbs | 3,134 µs | 473 µs | **6.6× faster** |
-| TensorMaxValue | 3,171 µs | 352 µs | **9.0× faster** |
+| Exp (double) | 216,094 µs | **1,616 µs** | **134× faster** |
+| Log (double) | 218,823 µs | **5,655 µs** | **39× faster** |
+| Softmax (double) | 14,674 µs | **3,707 µs** | **4.0× faster** |
+| LayerNorm | NA (crash) | **1,492 µs** | **runs + beats torch by 2.5×** |
+| BatchNorm | 3,230 µs (vs 17,180 torch) | **3,327 µs** (vs 11,352 torch) | torch regressed; we still win 3.4× |
+| TensorMatMul 256 | 832 µs | **515 µs** | **1.6× faster** |
+| TensorAdd 100K | 51 µs | **15 µs** | **3.4× faster** |
+| TensorAdd 1M | 1,242 µs | **289 µs** | **4.3× faster** |
+| TensorAbs | 3,134 µs | **400 µs** | **7.8× faster** |
+| TensorMaxValue | 3,171 µs | **341 µs** | **9.3× faster** |
 
-**Known follow-ups** (not in this PR — tracked separately):
-- `AttentionQKT` (Q @ Kᵀ via materialized transpose) is 5.5× slower than torch because the transpose is materialized; needs a `TensorMatMulTransposed` engine method that calls `SimdGemm.Sgemm(transB=true)` directly (kernel exists, just not exposed).
-- `BatchNorm` / `LayerNorm` / `GroupNorm` are ~3–5× slower because the current path allocates the full output (~8 MB per call); needs the in-place / pooled-output variant to be the default.
-- `MatMul` small shapes (256×256, 512×512) are ~3–5× slower because TorchSharp delegates to MKL while we run the pure-managed AVX2 SimdGemm path (the gap closes on AVX-512 hardware where our kernel ties or beats MKL on DiT-XL shapes per `docs/mkl-replacement/`).
+**Known remaining gaps** — root-causes documented; future PRs:
+
+- `AttentionQKT` (4.9× slower at 512×64 · 64×512): `TensorMatMulTransposed` ships in this PR and skips the materialized transpose, but the underlying SimdGemm small-shape kernel doesn't yet match cuBLAS on these dimensions. AVX-512 kernel work needed.
+- `MatMul 256/512` (3–5× slower): TorchSharp delegates to MKL on these shapes; we run pure-managed AVX2 SimdGemm. Closes naturally on AVX-512 hardware where our kernel ties / beats MKL on DiT-XL shapes (see `docs/mkl-replacement/`).
+- Double-precision activations (`Tanh_Double`, `GELU_Double`, `Sigmoid_Double` 2–4× slower): `TensorPrimitives.Tanh/Sigmoid/Log` were measured to regress 4–20× vs the in-house path on this hardware, so they're explicitly NOT routed through the framework. A custom AVX2 `Vector256<double>` Padé approximation matching the float32 kernel is the planned fix.
 
 ### vs MathNet.Numerics (Linear Algebra, double, N=1000)
 
