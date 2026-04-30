@@ -231,6 +231,27 @@ internal static class DifferentiableOps
         // tensor references — the graph stays connected.
         bool needsOutOfPlace = _isBackwardCreateGraph;
 
+        // CONTIGUITY INVARIANT (issue #274): every backward op that
+        // permutes / reshapes / slices its incoming grad produces a
+        // non-contiguous view tensor (e.g. PermuteBackward returns
+        // engine.TensorPermute(...) which is a stride-rewrite, not a
+        // contiguous copy). If we store that view as the first
+        // gradient and a later AccumulateGrad call hits TensorAddInPlace
+        // on it, the engine throws "In-place add requires contiguous
+        // target tensor." Materialize for the in-place path only.
+        //
+        // HIGHER-ORDER AD CAVEAT: when `needsOutOfPlace` is true (the
+        // createGraph=true path that records backward ops on the tape
+        // for double-backward), we must NOT materialize via .Contiguous()
+        // before TensorAdd. Contiguous() produces a fresh tensor whose
+        // GradFn is detached from the original op chain — the second
+        // backward pass would then fail to walk back through it. The
+        // out-of-place TensorAdd itself records a tape entry that
+        // preserves graph connectivity through the original grad
+        // reference. Keep the original `grad` for the out-of-place
+        // path; only materialize for in-place add storage.
+        var gradForInPlace = grad.IsContiguous ? grad : grad.Contiguous();
+
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
         int idx = tensor._gradIndex;
         if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)
@@ -241,11 +262,18 @@ internal static class DifferentiableOps
                 Tensor<T> accumulated;
                 if (needsOutOfPlace)
                 {
+                    // Higher-order: keep `grad` (not the materialized
+                    // copy) so TensorAdd's recorded tape entry chains
+                    // back through the original GradFn lineage.
                     accumulated = engine.TensorAdd(existing, grad);
                 }
                 else
                 {
-                    engine.TensorAddInPlace(existing, grad);
+                    // Defensive: if the existing slot is somehow
+                    // non-contiguous (e.g. populated outside this
+                    // method), materialize before in-place add.
+                    if (!existing.IsContiguous) existing = existing.Contiguous();
+                    engine.TensorAddInPlace(existing, gradForInPlace);
                     accumulated = existing;
                 }
                 _indexedGrads[idx] = accumulated;
@@ -253,8 +281,13 @@ internal static class DifferentiableOps
             }
             else
             {
-                _indexedGrads[idx] = grad;
-                tensor.Grad = grad;
+                // First-write slot. In createGraph mode keep the
+                // original `grad` so future TensorAdd entries can chain
+                // through it; in normal mode store the contiguous copy
+                // so the next AccumulateGrad can in-place-add into it.
+                var stored = needsOutOfPlace ? grad : gradForInPlace;
+                _indexedGrads[idx] = stored;
+                tensor.Grad = stored;
             }
             grads[tensor] = tensor.Grad!;
             return;
@@ -271,14 +304,20 @@ internal static class DifferentiableOps
             }
             else
             {
-                engine.TensorAddInPlace(existingDict, grad);
+                if (!existingDict.IsContiguous)
+                {
+                    existingDict = existingDict.Contiguous();
+                    grads[tensor] = existingDict;
+                }
+                engine.TensorAddInPlace(existingDict, gradForInPlace);
                 tensor.Grad = existingDict;
             }
         }
         else
         {
-            grads[tensor] = grad;
-            tensor.Grad = grad;
+            var stored = needsOutOfPlace ? grad : gradForInPlace;
+            grads[tensor] = stored;
+            tensor.Grad = stored;
         }
     }
 }
