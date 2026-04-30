@@ -58,7 +58,16 @@ public sealed class MetalOffloadAllocator : IGpuOffloadAllocator
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        if (!_live.TryRemove(handle.HostPointer, out _)) return;
+        // Lock the registry-side TryRemove against Dispose's snapshot+clear
+        // so a concurrent Dispose can't free the same pointer twice. Native
+        // FreeAligned runs outside the lock — libc/posix_free can serialize
+        // internally and we don't want to hold our lock during it.
+        bool removed;
+        lock (_lifecycleLock)
+        {
+            removed = _live.TryRemove(handle.HostPointer, out _);
+        }
+        if (!removed) return;
         FreeAligned(handle.HostPointer);
     }
 

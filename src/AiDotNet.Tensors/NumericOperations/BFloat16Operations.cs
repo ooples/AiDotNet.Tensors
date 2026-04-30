@@ -78,11 +78,29 @@ public class BFloat16Operations : INumericOperations<BFloat16>
         for (int i = 0; i < len; i++) dst[i] = BFloat16.FromFloat(src[i]);
     }
 
+    private static void RequireBinaryLengths(int xLen, int yLen, int dstLen, string op)
+    {
+        if (xLen != yLen || xLen != dstLen)
+            throw new ArgumentException(
+                $"{op} requires equal-length spans: x={xLen}, y={yLen}, dst={dstLen}.");
+    }
+
+    private static void RequireUnaryLengths(int xLen, int dstLen, string op)
+    {
+        if (xLen != dstLen)
+            throw new ArgumentException(
+                $"{op} requires equal-length spans: x={xLen}, dst={dstLen}.");
+    }
+
     private void Lift(
         ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y, Span<BFloat16> dst,
         Action<float[], float[], float[], int> kernel)
     {
         int n = x.Length;
+        // Pooled buffers are rented at length n but only the first n entries
+        // are populated. With mismatched spans, the kernel would consume
+        // stale tail values from the pool — silent wrong results.
+        RequireBinaryLengths(n, y.Length, dst.Length, nameof(Lift));
         var xf = ArrayPool<float>.Shared.Rent(n);
         var yf = ArrayPool<float>.Shared.Rent(n);
         var df = ArrayPool<float>.Shared.Rent(n);
@@ -103,6 +121,7 @@ public class BFloat16Operations : INumericOperations<BFloat16>
     private void Lift1(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst, Action<float[], float[], int> kernel)
     {
         int n = x.Length;
+        RequireUnaryLengths(n, dst.Length, nameof(Lift1));
         var xf = ArrayPool<float>.Shared.Rent(n);
         var df = ArrayPool<float>.Shared.Rent(n);
         try
@@ -130,6 +149,8 @@ public class BFloat16Operations : INumericOperations<BFloat16>
     public BFloat16 Dot(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y)
     {
         int n = x.Length;
+        if (y.Length != n)
+            throw new ArgumentException($"Dot requires equal-length spans: x={n}, y={y.Length}.");
         var xf = ArrayPool<float>.Shared.Rent(n);
         var yf = ArrayPool<float>.Shared.Rent(n);
         try
@@ -177,6 +198,8 @@ public class BFloat16Operations : INumericOperations<BFloat16>
     public BFloat16 CosineSimilarity(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y)
     {
         int n = x.Length;
+        if (y.Length != n)
+            throw new ArgumentException($"CosineSimilarity requires equal-length spans: x={n}, y={y.Length}.");
         var xf = ArrayPool<float>.Shared.Rent(n);
         var yf = ArrayPool<float>.Shared.Rent(n);
         try

@@ -115,11 +115,16 @@ public readonly struct BFloat16 : IEquatable<BFloat16>, IComparable<BFloat16>, I
     public static bool operator <=(BFloat16 a, BFloat16 b) => ToFloat(a) <= ToFloat(b);
     public static bool operator >=(BFloat16 a, BFloat16 b) => ToFloat(a) >= ToFloat(b);
 
-    public bool Equals(BFloat16 other) => RawValue == other.RawValue || ToFloat(this) == ToFloat(other);
+    /// <summary>Equality follows IEEE float semantics so it never disagrees
+    /// with <c>operator ==</c>: +0 equals -0, and NaN equals nothing
+    /// (including itself). Consequence: NaN values don't survive a
+    /// round-trip through a hashed collection, same as <c>float</c> /
+    /// <c>double</c> in the BCL — use <see cref="RawValue"/> directly
+    /// when bit-equality is required.</summary>
+    public bool Equals(BFloat16 other) => ToFloat(this) == ToFloat(other);
     public override bool Equals(object? obj) => obj is BFloat16 b && Equals(b);
-    /// <summary>Hash matches Equals: +0 and -0 hash identically (because
-    /// they compare equal via float semantics), and NaN hashes by raw bits
-    /// since NaN ≠ NaN under <see cref="Equals"/>.</summary>
+    /// <summary>Hash matches Equals: +0 and -0 hash identically (they
+    /// compare equal under IEEE float semantics).</summary>
     public override int GetHashCode()
     {
         // Normalize -0 → +0 so equal-zero values share a hash.

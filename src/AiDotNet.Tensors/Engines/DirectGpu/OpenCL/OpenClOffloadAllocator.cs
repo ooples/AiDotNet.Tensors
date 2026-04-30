@@ -110,8 +110,17 @@ public sealed class OpenClOffloadAllocator : IGpuOffloadAllocator
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
-        FreeRecord(rec, _context);
+        // Lock TryRemove + context snapshot against Dispose so a concurrent
+        // Dispose can't free the same record twice or release the context
+        // out from under us mid-free.
+        AllocRecord? rec;
+        IntPtr ctx;
+        lock (_lock)
+        {
+            if (!_live.TryRemove(handle.HostPointer, out rec)) return;
+            ctx = _context;
+        }
+        FreeRecord(rec, ctx);
     }
 
     private static void FreeRecord(AllocRecord rec, IntPtr context)

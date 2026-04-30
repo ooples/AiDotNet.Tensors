@@ -93,8 +93,18 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        if (!_live.TryRemove(handle.HostPointer, out var rec)) return;
-        FreeRecord(rec, _device);
+        // Lock TryRemove + device snapshot against Dispose so we don't run
+        // vkUnmapMemory / vkFreeMemory against a device that Dispose has
+        // already vkDestroyDevice'd (or release the same memory twice).
+        AllocRecord? rec;
+        IntPtr device;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            if (!_live.TryRemove(handle.HostPointer, out rec)) return;
+            device = _device;
+        }
+        FreeRecord(rec, device);
     }
 
     private static void FreeRecord(AllocRecord rec, IntPtr device)

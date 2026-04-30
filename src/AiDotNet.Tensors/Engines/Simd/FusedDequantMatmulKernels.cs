@@ -70,49 +70,46 @@ public static class FusedDequantMatmulKernels
             return;
         }
 
-        int groupSize = weightsScale.GroupSize <= 0 ? k : weightsScale.GroupSize;
-        int groupsPerCol = (k + groupSize - 1) / groupSize;
-        // Per-tensor (length 1) OR per-(group, column) layout.
-        int expectedScaleCount = weightsScale.Scales.Length == 1 ? 1 : groupsPerCol * n;
+        // QuantizationHelpersInt8.QuantizeInt8 emits scales over consecutive
+        // groups of the FLATTENED row-major weight buffer (flat index =
+        // kk * n + j). The kernel must use the same indexing — earlier
+        // versions assumed a per-(K-group, column) layout which silently
+        // produced wrong fused matmul results for n > 1 + groupSize < k*n
+        // (the scale-count guard still passed since both layouts have the
+        // same total count for groupSize that divides k*n evenly).
+        int totalElements = checked(k * n);
+        int groupSize = weightsScale.GroupSize <= 0 ? totalElements : weightsScale.GroupSize;
+        int totalGroups = (totalElements + groupSize - 1) / groupSize;
+        int expectedScaleCount = weightsScale.Scales.Length == 1 ? 1 : totalGroups;
         if (weightsScale.Scales.Length != expectedScaleCount)
             throw new ArgumentException(
-                $"Scales length {weightsScale.Scales.Length} must be 1 (per-tensor) or {groupsPerCol * n} (groupsPerCol={groupsPerCol} × n={n}).");
-        // weightsScale.Scales is laid out as [groupsPerCol * n] with
-        // group-major-then-col-minor ordering — one scale per (column, group).
-        // For per-tensor scales, scales.Length == 1 and we apply uniformly.
+                $"Scales length {weightsScale.Scales.Length} must be 1 (per-tensor) or {totalGroups} " +
+                $"(groups over flat k*n with groupSize={groupSize}).");
         bool perTensor = weightsScale.Scales.Length == 1;
 
-        Span<int> wb = stackalloc int[8]; // hoisted once
-        for (int i = 0; i < m; i++)
+        if (perTensor)
         {
-            for (int j = 0; j < n; j++)
+            // Per-tensor: one scale across the whole K accumulation, so we
+            // can keep the AVX2/FMA fast path with a single multiply at end.
+            float perTensorScale = weightsScale.Scales[0];
+            Span<int> wb = stackalloc int[8];
+            for (int i = 0; i < m; i++)
             {
-                float acc = 0f;
-                int actRow = i * k;
-                for (int gStart = 0; gStart < k; gStart += groupSize)
+                for (int j = 0; j < n; j++)
                 {
-                    int gEnd = Math.Min(gStart + groupSize, k);
-                    float scale = perTensor
-                        ? weightsScale.Scales[0]
-                        : weightsScale.Scales[(gStart / groupSize) * n + j];
-
-                    // Per-group accumulator (int8 multiplied by activation,
-                    // accumulated in float).
-                    float groupAcc = 0f;
-                    int kk = gStart;
-
-                    if (Avx2.IsSupported && (gEnd - kk) >= 8)
+                    int actRow = i * k;
+                    float sum = 0f;
+                    int kk = 0;
+                    if (Avx2.IsSupported && k >= 8)
                     {
                         var vsum = Vector256<float>.Zero;
-                        for (; kk + 8 <= gEnd; kk += 8)
+                        for (; kk + 8 <= k; kk += 8)
                         {
-                            // Activation 8 floats — Vector256 load.
                             var av = Vector256.Create(
                                 activations[actRow + kk + 0], activations[actRow + kk + 1],
                                 activations[actRow + kk + 2], activations[actRow + kk + 3],
                                 activations[actRow + kk + 4], activations[actRow + kk + 5],
                                 activations[actRow + kk + 6], activations[actRow + kk + 7]);
-                            // 8 int8 weights → 8 floats (sign-extend, convert).
                             for (int t = 0; t < 8; t++) wb[t] = weightsInt8[(kk + t) * n + j];
                             var wv = Vector256.Create(wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], wb[7]);
                             var wf = Avx.ConvertToVector256Single(wv);
@@ -125,13 +122,34 @@ public static class FusedDequantMatmulKernels
                         var sum128 = Sse.Add(lo, hi);
                         sum128 = Sse.Add(sum128, Sse.Shuffle(sum128, sum128, 0b01_00_11_10));
                         sum128 = Sse.Add(sum128, Sse.Shuffle(sum128, sum128, 0b10_11_00_01));
-                        groupAcc = sum128.ToScalar();
+                        sum = sum128.ToScalar();
                     }
-                    for (; kk < gEnd; kk++)
-                    {
-                        groupAcc += activations[actRow + kk] * weightsInt8[kk * n + j];
-                    }
-                    acc += groupAcc * scale;
+                    for (; kk < k; kk++)
+                        sum += activations[actRow + kk] * weightsInt8[kk * n + j];
+                    output[i * n + j] = sum * perTensorScale;
+                }
+            }
+            return;
+        }
+
+        // Per-group path: scale changes as flat = kk*n + j crosses a group
+        // boundary. For typical transformer shapes (n large, groupSize
+        // small) the scale changes every kk step for fixed j, so SIMD
+        // batching across kk would require a per-element scale gather.
+        // We use a scalar inner loop with a per-element scale fold-in.
+        // The fused dequant-then-multiply this kernel exists for is still
+        // a single pass over the int8 payload — the win remains.
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                int actRow = i * k;
+                float acc = 0f;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    int flatIdx = kk * n + j;
+                    float scale = weightsScale.Scales[flatIdx / groupSize];
+                    acc += activations[actRow + kk] * weightsInt8[flatIdx] * scale;
                 }
                 output[i * n + j] = acc;
             }

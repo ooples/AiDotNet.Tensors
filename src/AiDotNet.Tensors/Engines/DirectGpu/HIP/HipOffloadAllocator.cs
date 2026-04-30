@@ -76,7 +76,14 @@ public sealed class HipOffloadAllocator : IGpuOffloadAllocator
         if (handle.HostPointer == IntPtr.Zero) return;
         // Native free only for handles we own — a foreign handle or
         // double-free would corrupt the HIP heap on second release.
-        if (!_live.TryRemove(handle.HostPointer, out _)) return;
+        // Lock TryRemove against Dispose's snapshot+clear so a concurrent
+        // Dispose can't free the same pointer twice.
+        bool removed;
+        lock (_lifecycleLock)
+        {
+            removed = _live.TryRemove(handle.HostPointer, out _);
+        }
+        if (!removed) return;
         FreeNative(handle);
     }
 

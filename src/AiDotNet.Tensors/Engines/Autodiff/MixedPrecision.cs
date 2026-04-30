@@ -63,8 +63,26 @@ public sealed class GradScaler
     public GradScaler(MixedPrecisionConfig? config = null)
     {
         _config = config ?? new MixedPrecisionConfig();
+        // Validate the schedule up-front. A zero/negative/non-finite scale
+        // makes UnscaleGradients produce NaN/zeros, an unbounded growth
+        // factor lets _scale overflow to Infinity, and a backoff outside
+        // (0, 1) either inverts or freezes the schedule — all silently
+        // corrupt training.
+        if (!IsFinite(_config.LossScale) || _config.LossScale <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(config), "MixedPrecisionConfig.LossScale must be finite and > 0.");
+        if (_config.GrowthInterval <= 0)
+            throw new ArgumentOutOfRangeException(nameof(config), "MixedPrecisionConfig.GrowthInterval must be > 0.");
+        if (!IsFinite(_config.GrowthFactor) || _config.GrowthFactor <= 1f)
+            throw new ArgumentOutOfRangeException(nameof(config), "MixedPrecisionConfig.GrowthFactor must be finite and > 1.");
+        if (!IsFinite(_config.BackoffFactor) || _config.BackoffFactor <= 0f || _config.BackoffFactor >= 1f)
+            throw new ArgumentOutOfRangeException(nameof(config), "MixedPrecisionConfig.BackoffFactor must be finite and in (0, 1).");
+        if (!IsFinite(_config.MinLossScale) || _config.MinLossScale <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(config), "MixedPrecisionConfig.MinLossScale must be finite and > 0.");
         _scale = _config.LossScale;
     }
+
+    // float.IsFinite isn't available on net471, so route through manual checks.
+    private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
     /// <summary>Current loss-scale factor. Multiply the loss by this
     /// before <see cref="GradientTape{T}.ComputeGradients"/>.</summary>
@@ -88,6 +106,12 @@ public sealed class GradScaler
     /// dynamic-scale schedule.</summary>
     public bool UnscaleGradients<T>(IDictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (grads is null) throw new ArgumentNullException(nameof(grads));
+        // Defensive: even with constructor validation, a foreign mutation
+        // of _scale (subclass / reflection) shouldn't silently divide.
+        if (!IsFinite(_scale) || _scale <= 0f)
+            throw new InvalidOperationException(
+                $"GradScaler current loss scale must be finite and > 0; got {_scale}.");
         var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
         T invScale = ops.FromDouble(1.0 / _scale);
         bool foundInfNan = false;
@@ -118,7 +142,11 @@ public sealed class GradScaler
             _stepsSinceLastBackoff++;
             if (_stepsSinceLastBackoff >= _config.GrowthInterval)
             {
-                _scale *= _config.GrowthFactor;
+                // Cap growth at float.MaxValue to keep _scale finite —
+                // without this, a long no-overflow run can push _scale to
+                // +Infinity which then silently corrupts UnscaleGradients.
+                float grown = _scale * _config.GrowthFactor;
+                _scale = IsFinite(grown) ? grown : float.MaxValue;
                 _stepsSinceLastBackoff = 0;
             }
         }
@@ -153,6 +181,9 @@ public sealed class MasterWeights
     /// low-precision compute weight. Standard SGD/Adam round-trip.</summary>
     public void UpdateMaster(object key, Action<float[]> optimizerUpdate, Action<float[]> writeBack)
     {
+        if (key is null) throw new ArgumentNullException(nameof(key));
+        if (optimizerUpdate is null) throw new ArgumentNullException(nameof(optimizerUpdate));
+        if (writeBack is null) throw new ArgumentNullException(nameof(writeBack));
         if (!_master.TryGetValue(key, out var master))
             throw new KeyNotFoundException();
         optimizerUpdate(master);

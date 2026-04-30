@@ -64,7 +64,14 @@ public sealed class WebGpuOffloadAllocator : IGpuOffloadAllocator
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        if (!_live.TryRemove(handle.HostPointer, out _)) return;
+        // Lock TryRemove against Dispose's snapshot+clear so a concurrent
+        // Dispose can't FreeHGlobal the same host pointer twice.
+        bool removed;
+        lock (_lock)
+        {
+            removed = _live.TryRemove(handle.HostPointer, out _);
+        }
+        if (!removed) return;
         Marshal.FreeHGlobal(handle.HostPointer);
     }
 

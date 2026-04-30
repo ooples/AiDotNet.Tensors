@@ -63,9 +63,16 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        // Only call native free for handles WE own. A foreign handle (or a
-        // double-free) would corrupt the heap on the second native release.
-        if (!_live.TryRemove(handle.HostPointer, out _)) return;
+        // Only call native free for handles WE own — a foreign handle or
+        // double-free would corrupt the heap on the second native release.
+        // Lock TryRemove against Dispose's snapshot+clear so a concurrent
+        // Dispose can't free the same pointer twice.
+        bool removed;
+        lock (_lifecycleLock)
+        {
+            removed = _live.TryRemove(handle.HostPointer, out _);
+        }
+        if (!removed) return;
         FreeNative(handle);
     }
 

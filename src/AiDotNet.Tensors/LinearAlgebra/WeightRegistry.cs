@@ -72,60 +72,70 @@ public static class WeightRegistry
     public static void RegisterWeight<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
-        switch (weight.Lifetime)
+        // Hold _lock across the whole register operation so a concurrent
+        // Configure / Reset can't dispose the allocator or pool out from
+        // under us mid-allocate. Lock order is always [_lock, then any
+        // backend-internal lock] — no inverse pattern exists, so no
+        // deadlock. The allocator's Allocate is atomic via its own
+        // _lifecycleLock; we hold _lock just to keep the allocator
+        // reference and StreamingPool field stable for the duration.
+        lock (_lock)
         {
-            case WeightLifetime.Default:
-                return;
-            case WeightLifetime.Streaming:
-                {
-                    int byteCount = weight.Length * ElementSize<T>();
-                    var bytes = new byte[byteCount];
-                    SerializeToBytes(weight, bytes);
-                    long handle = StreamingPool.Register(bytes);
-                    weight.StreamingPoolHandle = handle;
+            switch (weight.Lifetime)
+            {
+                case WeightLifetime.Default:
                     return;
-                }
-            case WeightLifetime.GpuOffload:
-            case WeightLifetime.GpuManaged:
-                {
-                    var alloc = OffloadAllocator;
-                    if (alloc is null || !alloc.IsAvailable)
+                case WeightLifetime.Streaming:
                     {
-                        // Backend not loadable on this host — fall through to default.
-                        weight.Lifetime = WeightLifetime.Default;
+                        int byteCount = weight.Length * ElementSize<T>();
+                        var bytes = new byte[byteCount];
+                        SerializeToBytes(weight, bytes);
+                        long handle = StreamingPoolUnlocked().Register(bytes);
+                        weight.StreamingPoolHandle = handle;
                         return;
                     }
-                    int byteCount = weight.Length * ElementSize<T>();
-                    var scheme = weight.Lifetime == WeightLifetime.GpuManaged
-                        ? OffloadScheme.Managed : OffloadScheme.Pinned;
-                    // Serialize FIRST so a SerializeToBytes failure (e.g.,
-                    // unsupported element type) doesn't leak a native
-                    // allocation. Then allocate, copy, and only on success
-                    // commit the metadata onto the tensor — wrap copy in
-                    // try/catch to free the handle if Marshal.Copy throws.
-                    var stageBytes = new byte[byteCount];
-                    SerializeToBytes(weight, stageBytes);
-                    var h = alloc.Allocate(byteCount, scheme);
-                    try
+                case WeightLifetime.GpuOffload:
+                case WeightLifetime.GpuManaged:
                     {
-                        System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
-                        // Persist the full handle so UnregisterWeight can
-                        // recreate it correctly — DevicePointer alone
-                        // discards the backend-specific opaque (cl_mem /
-                        // VkDeviceMemory) the allocator's Free path needs.
-                        weight.OffloadDevicePointer = h.DevicePointer;
-                        weight.OffloadOpaqueHandle = h.BackendOpaque;
-                        weight.OffloadByteCount = byteCount;
+                        var alloc = _offloadAllocator;
+                        if (alloc is null || !alloc.IsAvailable)
+                        {
+                            // Backend not loadable on this host — fall through to default.
+                            weight.Lifetime = WeightLifetime.Default;
+                            return;
+                        }
+                        int byteCount = weight.Length * ElementSize<T>();
+                        var scheme = weight.Lifetime == WeightLifetime.GpuManaged
+                            ? OffloadScheme.Managed : OffloadScheme.Pinned;
+                        // Serialize FIRST so a SerializeToBytes failure (e.g.,
+                        // unsupported element type) doesn't leak a native
+                        // allocation. Then allocate, copy, and only on success
+                        // commit the metadata onto the tensor — wrap copy in
+                        // try/catch to free the handle if Marshal.Copy throws.
+                        var stageBytes = new byte[byteCount];
+                        SerializeToBytes(weight, stageBytes);
+                        var h = alloc.Allocate(byteCount, scheme);
+                        try
+                        {
+                            System.Runtime.InteropServices.Marshal.Copy(stageBytes, 0, h.HostPointer, byteCount);
+                            // Persist the full handle so UnregisterWeight can
+                            // recreate it correctly — DevicePointer alone
+                            // discards the backend-specific opaque (cl_mem /
+                            // VkDeviceMemory) the allocator's Free path needs.
+                            weight.OffloadDevicePointer = h.DevicePointer;
+                            weight.OffloadOpaqueHandle = h.BackendOpaque;
+                            weight.OffloadByteCount = byteCount;
+                        }
+                        catch
+                        {
+                            alloc.Free(h);
+                            throw;
+                        }
+                        return;
                     }
-                    catch
-                    {
-                        alloc.Free(h);
-                        throw;
-                    }
-                    return;
-                }
-            default:
-                throw new ArgumentOutOfRangeException(nameof(weight.Lifetime));
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(weight.Lifetime));
+            }
         }
     }
 
@@ -133,32 +143,47 @@ public static class WeightRegistry
     public static void UnregisterWeight<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
-        if (weight.StreamingPoolHandle >= 0)
+        // Hold _lock for the same reason RegisterWeight does — Configure /
+        // Reset must not dispose the allocator/pool while we're freeing
+        // outstanding allocations.
+        lock (_lock)
         {
-            StreamingPool.Unregister(weight.StreamingPoolHandle);
-            weight.StreamingPoolHandle = -1;
-        }
-        if (weight.OffloadDevicePointer != IntPtr.Zero)
-        {
-            var alloc = OffloadAllocator;
-            if (alloc is not null)
+            if (weight.StreamingPoolHandle >= 0)
             {
-                var scheme = weight.Lifetime == WeightLifetime.GpuManaged
-                    ? OffloadScheme.Managed : OffloadScheme.Pinned;
-                // Reconstruct the full GpuOffloadHandle from persisted
-                // metadata so the allocator's Free path sees the same
-                // backend-specific opaque it allocated.
-                alloc.Free(new GpuOffloadHandle(
-                    host: weight.OffloadDevicePointer,
-                    device: weight.OffloadDevicePointer,
-                    bytes: weight.OffloadByteCount,
-                    scheme: scheme,
-                    opaque: weight.OffloadOpaqueHandle));
+                _streamingPool?.Unregister(weight.StreamingPoolHandle);
+                weight.StreamingPoolHandle = -1;
             }
-            weight.OffloadDevicePointer = IntPtr.Zero;
-            weight.OffloadOpaqueHandle = null;
-            weight.OffloadByteCount = 0;
+            if (weight.OffloadDevicePointer != IntPtr.Zero)
+            {
+                var alloc = _offloadAllocator;
+                if (alloc is not null)
+                {
+                    var scheme = weight.Lifetime == WeightLifetime.GpuManaged
+                        ? OffloadScheme.Managed : OffloadScheme.Pinned;
+                    // Reconstruct the full GpuOffloadHandle from persisted
+                    // metadata so the allocator's Free path sees the same
+                    // backend-specific opaque it allocated.
+                    alloc.Free(new GpuOffloadHandle(
+                        host: weight.OffloadDevicePointer,
+                        device: weight.OffloadDevicePointer,
+                        bytes: weight.OffloadByteCount,
+                        scheme: scheme,
+                        opaque: weight.OffloadOpaqueHandle));
+                }
+                weight.OffloadDevicePointer = IntPtr.Zero;
+                weight.OffloadOpaqueHandle = null;
+                weight.OffloadByteCount = 0;
+            }
         }
+    }
+
+    /// <summary>Caller must hold <see cref="_lock"/> — returns the lazy
+    /// streaming pool without retaking the lock so RegisterWeight can hold
+    /// it across the whole register operation.</summary>
+    private static StreamingTensorPool StreamingPoolUnlocked()
+    {
+        _streamingPool ??= new StreamingTensorPool(_options);
+        return _streamingPool;
     }
 
     private static int ElementSize<T>() => System.Runtime.InteropServices.Marshal.SizeOf<T>();
