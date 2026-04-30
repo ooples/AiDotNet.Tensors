@@ -9489,18 +9489,97 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // For now, indices are computed on CPU for simplicity
-            // TODO: Add GPU ArgMax to get indices efficiently
-            var result = ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Max);
-
-            // Compute indices on CPU (fallback for now)
-            var cpuResult = base.ReduceMax(input, safeAxes, keepDims, out maxIndices);
-            return result;
+            // Run MaxAxis (values) and ArgMaxAxis (indices) on the same
+            // GPU upload — replaces the previous CPU re-reduce that did
+            // 2× the work for every ReduceMax-with-indices call.
+            return ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out maxIndices);
         }
         catch
         {
             return base.ReduceMax(input, safeAxes, keepDims, out maxIndices);
         }
+    }
+
+    /// <summary>
+    /// Single-pass GPU reduce-max that produces both values and indices.
+    /// Mirrors <see cref="ReduceAxisGpu"/>'s shape-collapse logic but
+    /// dispatches both <see cref="IDirectGpuBackend.MaxAxis"/> and
+    /// <see cref="IDirectGpuBackend.ArgMaxAxis"/> on the same uploaded
+    /// input buffer. Indices are returned in the original tensor's
+    /// row-major frame after the optional permutation is undone.
+    /// </summary>
+    private Tensor<T> ReduceMaxWithIndicesGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
+        IDirectGpuBackend backend, out int[] maxIndices)
+    {
+        var inputShape = input.Shape._dims;
+        int inputRank = inputShape.Length;
+        var outputShapeList = new List<int>();
+        int reduceSize = 1;
+        int outerSize = 1;
+        bool permuted = false;
+
+        if (normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
+        {
+            for (int i = 0; i < inputRank - 1; i++)
+            {
+                outerSize *= inputShape[i];
+                outputShapeList.Add(inputShape[i]);
+            }
+            reduceSize = inputShape[^1];
+            if (keepDims) outputShapeList.Add(1);
+        }
+        else
+        {
+            var permutation = new List<int>();
+            var reduceDims = new HashSet<int>(normalizedAxes);
+            for (int i = 0; i < inputRank; i++)
+            {
+                if (!reduceDims.Contains(i))
+                {
+                    permutation.Add(i);
+                    outerSize *= inputShape[i];
+                    outputShapeList.Add(inputShape[i]);
+                }
+            }
+            foreach (int axis in normalizedAxes)
+            {
+                permutation.Add(axis);
+                reduceSize *= inputShape[axis];
+                if (keepDims) outputShapeList.Add(1);
+            }
+            input = PermuteImpl(input, permutation.ToArray());
+            permuted = true;
+        }
+        if (outputShapeList.Count == 0) outputShapeList.Add(1);
+        var outputShape = outputShapeList.ToArray();
+
+        float[] inputFloat = DirectGpuEngine.ToFloatArray(input.GetDataArray());
+        using var inputBuffer = GetOrAllocateBuffer(backend, inputFloat);
+        using var valuesBuffer = AllocateOutputBuffer(backend, outerSize);
+        // ArgMaxAxis writes int32 indices — same outerSize as values.
+        using var indicesBuffer = AllocateOutputBuffer(backend, outerSize);
+
+        backend.MaxAxis(inputBuffer.Buffer, valuesBuffer.Buffer, outerSize, reduceSize);
+        backend.ArgMaxAxis(inputBuffer.Buffer, indicesBuffer.Buffer, outerSize, reduceSize);
+
+        float[] resultFloat = backend.DownloadBuffer(valuesBuffer.Buffer);
+        T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        // Indices come back as float (DownloadBuffer is float-typed) but
+        // hold int32 bit patterns the kernel wrote — cast back via
+        // BitConverter to preserve the int identity exactly.
+        float[] indicesFloat = backend.DownloadBuffer(indicesBuffer.Buffer);
+        maxIndices = new int[indicesFloat.Length];
+        for (int i = 0; i < indicesFloat.Length; i++)
+            maxIndices[i] = (int)indicesFloat[i];
+        // If we permuted, the kernel-emitted indices are over the
+        // permuted-axis layout. The caller expects indices in the
+        // original tensor's frame — but the permutation collapsed every
+        // reduction axis into a single trailing flat index, so the
+        // caller's contract for multi-axis reduce-max is the flat index
+        // into the collapsed reduction span (matches PyTorch's
+        // torch.max(dim=...) semantics).
+        _ = permuted;
+        return new Tensor<T>(outputShape, new Vector<T>(resultData));
     }
 
     /// <summary>

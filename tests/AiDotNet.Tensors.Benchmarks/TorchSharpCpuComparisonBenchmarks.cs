@@ -833,13 +833,28 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_LayerNorm()
-        => _cpuEngine.LayerNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+    {
+        // LayerNorm normalizes over the trailing dims that match gamma's
+        // shape; gamma is [channels], so the input must have channels as
+        // its last dim. Reshape NCHW → (N*H*W, C) so the per-element
+        // (mean, var) is computed across the channel axis — the standard
+        // transformer-style layer-norm contract that gamma=[channels]
+        // implies. Without this reshape AiDotNet's LayerNorm threw a
+        // shape-mismatch (channels at axis 1, not last) and the
+        // benchmark recorded NA.
+        var reshaped = _cpuEngine.Reshape(_aiNormInput!, new[] { 32 * 32 * 32, 64 });
+        _cpuEngine.LayerNorm(reshaped, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+    }
 
     [Benchmark]
     public void TorchSharp_LayerNorm()
     {
+        // Match the AiDotNet shape contract: normalize over the last dim
+        // (channels) of the (N*H*W, C) reshape. PyTorch's normalized_shape
+        // is just [C].
+        using var reshaped = _torchNormInput!.reshape(32 * 32 * 32, 64);
         using var result = torch.nn.functional.layer_norm(
-            _torchNormInput!, new long[] { 64, 32, 32 }, _torchNormWeight, _torchNormBias, eps: 1e-5);
+            reshaped, new long[] { 64 }, _torchNormWeight, _torchNormBias, eps: 1e-5);
         ConsumeTorchResult(result);
     }
 

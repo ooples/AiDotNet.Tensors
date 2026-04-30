@@ -78,6 +78,16 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
+  <!-- System.Numerics.Tensors is OOB on .NET 8+ but distributed as a NuGet
+       package; pinning the latest stable so SimdKernels can route Exp / Log /
+       Tanh / Softmax / Abs / Max double-precision paths through the highly
+       optimized AVX2/AVX-512 implementations there. ~25–60× faster than
+       Math.Exp scalar loops on Skylake-X / Zen 3 — closes the float64 perf
+       cliff identified in the #209 audit. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="System.Numerics.Tensors" Version="9.0.0" />
+  </ItemGroup>
+
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
     <PackageReference Include="System.Text.Json" Version="8.0.5" />

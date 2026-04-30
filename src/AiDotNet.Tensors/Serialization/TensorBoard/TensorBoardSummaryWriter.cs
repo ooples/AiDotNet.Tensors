@@ -164,9 +164,80 @@ public sealed class TensorBoardSummaryWriter : IDisposable
 
     /// <summary>
     /// Logs a histogram of <paramref name="values"/> under
-    /// <paramref name="tag"/>. Bucket count is auto-selected;
-    /// callers wanting custom edges should call the explicit
-    /// <see cref="AddHistogramWithBuckets"/> overload (TODO follow-up).
+    /// <paramref name="tag"/> with caller-specified bucket upper edges.
+    /// Edges must be sorted ascending; values strictly less than
+    /// <c>edges[0]</c> count into bucket 0, values >= <c>edges[^1]</c>
+    /// count into the last bucket. Use this when you want the same
+    /// fixed bin layout across runs so TensorBoard's overlay view
+    /// stacks the histograms cleanly.
+    /// </summary>
+    public void AddHistogramWithBuckets(string tag, ReadOnlySpan<float> values, ReadOnlySpan<double> bucketUpperEdges, long step)
+    {
+        ThrowIfDisposed();
+        if (tag is null) throw new ArgumentNullException(nameof(tag));
+        if (bucketUpperEdges.Length == 0)
+            throw new ArgumentException("bucketUpperEdges must contain at least one edge.", nameof(bucketUpperEdges));
+        for (int i = 1; i < bucketUpperEdges.Length; i++)
+        {
+            if (!(bucketUpperEdges[i] > bucketUpperEdges[i - 1]))
+                throw new ArgumentException(
+                    $"bucketUpperEdges must be strictly ascending; edge[{i}]={bucketUpperEdges[i]} <= edge[{i - 1}]={bucketUpperEdges[i - 1]}.",
+                    nameof(bucketUpperEdges));
+        }
+        if (values.Length == 0) return;
+
+        double min = values[0], max = values[0], sum = 0, sumSq = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            double v = values[i];
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+            sumSq += v * v;
+        }
+
+        int n = bucketUpperEdges.Length;
+        var bucketEdges = new double[n];
+        var bucketCounts = new double[n];
+        for (int i = 0; i < n; i++) bucketEdges[i] = bucketUpperEdges[i];
+        // Binary search per value — O(N log B) which beats the naive
+        // O(N×B) when B is large (e.g., 256 fine-grained edges).
+        for (int i = 0; i < values.Length; i++)
+        {
+            double v = values[i];
+            int lo = 0, hi = n - 1;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (v < bucketEdges[mid]) hi = mid;
+                else lo = mid + 1;
+            }
+            // Final bucket holds the >=last-edge tail.
+            if (v >= bucketEdges[n - 1]) lo = n - 1;
+            bucketCounts[lo]++;
+        }
+
+        var ev = new EventBuilder
+        {
+            WallTime = (DateTimeOffset.UtcNow - new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero)).TotalSeconds,
+            Step = step,
+            HistogramTag = tag,
+            HistogramMin = min,
+            HistogramMax = max,
+            HistogramNum = values.Length,
+            HistogramSum = sum,
+            HistogramSumSq = sumSq,
+            HistogramBucketLimits = bucketEdges,
+            HistogramBucketCounts = bucketCounts,
+        }.ToBytes();
+        WriteRecord(ev);
+    }
+
+    /// <summary>
+    /// Logs a histogram of <paramref name="values"/> under
+    /// <paramref name="tag"/>. Bucket count is auto-selected (30
+    /// equal-width bins from min to max). For caller-specified edges
+    /// use <see cref="AddHistogramWithBuckets"/>.
     /// </summary>
     public void AddHistogram(string tag, ReadOnlySpan<float> values, long step)
     {
