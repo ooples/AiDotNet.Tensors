@@ -795,7 +795,9 @@ public class GradientCorrectnessTests
         Assert.True(grads.ContainsKey(basis));
         Assert.Equal(basis.Length, grads[basis].Length);
         var g = grads[basis].AsSpan();
-        for (int i = 0; i < g.Length; i++) Assert.True(float.IsFinite(g[i]), $"g[{i}] not finite: {g[i]}");
+        // float.IsFinite is .NET 2.1+; net471 uses !IsNaN && !IsInfinity.
+        for (int i = 0; i < g.Length; i++)
+            Assert.True(!float.IsNaN(g[i]) && !float.IsInfinity(g[i]), $"g[{i}] not finite: {g[i]}");
     }
 
     /// <summary>Large-tensor stress: 64×64×8 permuted then fanned out. Ensures
