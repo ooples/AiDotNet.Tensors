@@ -821,7 +821,16 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_BatchNorm()
-        => _cpuEngine.BatchNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+    {
+        // Apples-to-apples: torch uses `using var result` which immediately
+        // recycles via libtorch's caching allocator. Mirror that by pool-returning
+        // the result + mean/variance tensors so the ArrayPool stays warm.
+        var r = _cpuEngine.BatchNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5,
+            out var bnMean, out var bnVar);
+        TensorPool.Return(r);
+        TensorPool.Return(bnMean);
+        TensorPool.Return(bnVar);
+    }
 
     [Benchmark]
     public void TorchSharp_BatchNorm()
@@ -843,7 +852,15 @@ public class TorchSharpCpuComparisonBenchmarks
         // shape-mismatch (channels at axis 1, not last) and the
         // benchmark recorded NA.
         var reshaped = _cpuEngine.Reshape(_aiNormInput!, new[] { 32 * 32 * 32, 64 });
-        _cpuEngine.LayerNorm(reshaped, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+        var r = _cpuEngine.LayerNorm(reshaped, _aiNormGamma!, _aiNormBeta!, 1e-5,
+            out var lnMean, out var lnVar);
+        // Apples-to-apples with torch's `using var result`: pool-return so
+        // the ArrayPool stays warm across BDN iterations (was producing 8.6 MB
+        // alloc/iter vs torch's 168 B because the un-returned tensors forced
+        // Gen0/Gen1/Gen2 collections every call).
+        TensorPool.Return(r);
+        TensorPool.Return(lnMean);
+        TensorPool.Return(lnVar);
     }
 
     [Benchmark]
