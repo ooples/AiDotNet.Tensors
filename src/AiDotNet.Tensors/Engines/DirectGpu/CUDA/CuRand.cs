@@ -132,8 +132,11 @@ public sealed class CuRand : IDeviceRng
                     if (CudaNativeBindings.cuMemcpyDtoH((IntPtr)hostPtr, dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
                 }
             }
-            // Advance the offset so the next call returns disjoint draws (Philox parity with cuRAND).
-            _cpuFallback.Offset += (ulong)output.Length;
+            // Advance offset by Philox 4x32 BLOCK count (one block produces 4 outputs).
+            // Both cuRAND and our managed Philox treat the offset as a block counter,
+            // so increment by ceil(N/4) — element-counter advancement would over-skip
+            // by 4× and break the cross-call determinism contract.
+            _cpuFallback.Offset += ((ulong)output.Length + 3) / 4;
             return true;
         }
         catch
