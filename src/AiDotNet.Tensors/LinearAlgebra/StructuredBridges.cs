@@ -46,6 +46,7 @@ public static class StructuredBridges
     /// </summary>
     public static MaskedTensor<T> NestedToMasked<T>(NestedTensor<T> nested, T padding, int outputSize = -1)
     {
+        if (nested is null) throw new ArgumentNullException(nameof(nested));
         int padLen = outputSize < 0 ? nested.MaxRowLength : outputSize;
         var values = nested.ToPadded(padding, padLen);
         int batch = nested.BatchSize;
@@ -85,6 +86,7 @@ public static class StructuredBridges
     public static (MaskedTensor<T> Masked, int[] Lengths) NestedToMaskedFromPadding<T>(
         NestedTensor<T> nested, T padding, int outputSize = -1)
     {
+        if (nested is null) throw new ArgumentNullException(nameof(nested));
         int batch = nested.BatchSize;
         // outputSize == -1 means "use the max row length" (NestedToMasked's default).
         // When outputSize truncates a row's content, the mask only covers up to
@@ -106,6 +108,7 @@ public static class StructuredBridges
     /// </summary>
     public static NestedTensor<T> MaskedToNested<T>(MaskedTensor<T> masked)
     {
+        if (masked is null) throw new ArgumentNullException(nameof(masked));
         if (masked.Rank != 2 && masked.Rank != 3)
             throw new ArgumentException("MaskedToNested requires rank 2 or 3.");
 

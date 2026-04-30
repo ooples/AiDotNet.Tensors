@@ -140,6 +140,7 @@ public sealed class MaskedTensor<T>
         bool isFloatNan = maskValue is float fSentinel && float.IsNaN(fSentinel);
         bool isDoubleNan = maskValue is double dSentinel && double.IsNaN(dSentinel);
 
+        var cmp = System.Collections.Generic.EqualityComparer<T>.Default;
         for (int i = 0; i < src.Length; i++)
         {
             if (isFloatNan && src[i] is float fv)
@@ -147,7 +148,10 @@ public sealed class MaskedTensor<T>
             else if (isDoubleNan && src[i] is double dv)
                 mask[i] = !double.IsNaN(dv);
             else
-                mask[i] = !src[i]!.Equals(maskValue);
+                // EqualityComparer<T>.Default handles null and reference types
+                // safely; .Equals(maskValue) would NRE when T is a reference
+                // type and the lane is null.
+                mask[i] = !cmp.Equals(src[i], maskValue);
         }
         return new MaskedTensor<T>(values, mask);
     }
