@@ -24,6 +24,46 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunSoftmaxDouble()
+    {
+        Console.WriteLine("=== Softmax<double> micro-benchmark ===");
+        var engine = new CpuEngine();
+        // BDN benchmark shape: [512, 1024]
+        var shapes = new (int rows, int cols)[]
+        {
+            (512, 1024),  // BDN benchmark
+            (32, 1024),   // small batch
+            (4, 32768),   // single very-long row
+            (1024, 256),  // many rows
+        };
+        foreach (var (rows, cols) in shapes)
+        {
+            var rng = new Random(42);
+            var data = new double[rows * cols];
+            for (int i = 0; i < data.Length; i++) data[i] = rng.NextDouble() * 4 - 2;
+            var input = new Tensor<double>(data, new[] { rows, cols });
+
+            // Warmup
+            for (int i = 0; i < 10; i++) { var _ = engine.Softmax(input, axis: -1); }
+
+            // Measure
+            const int iters = 50;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                var _ = engine.Softmax(input, axis: -1);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double mean = samples.Average();
+            double min = samples.Min();
+            Console.WriteLine($"  Shape [{rows},{cols}]:  mean={mean,8:F1} µs   min={min,8:F1} µs");
+        }
+        Console.WriteLine();
+    }
+
     public static void Run()
     {
         Console.WriteLine("=== Conv3x3Stride1 A/B variant benchmark ===");

@@ -29,6 +29,14 @@ class Program
             return;
         }
 
+        // Softmax<double> micro-benchmark — same-process measurement
+        // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
+        if (args[0] == "--ab-softmax-double")
+        {
+            Conv2DAbBench.RunSoftmaxDouble();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
