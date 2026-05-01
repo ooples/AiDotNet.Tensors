@@ -124,6 +124,7 @@ baseline by fresh BDN re-runs and same-process micro-benchmarks:
 | LayerNorm 32k×64 | 1,347 µs | 890 µs | 1.5× faster |
 | TensorAdd 1M | 480 µs | 350 µs | 1.4× faster |
 | AttentionQKT 512×64 | 599 µs | 522 µs (after threshold-split fix) | 1.15× faster |
+| Conv2D 1×16×64×64→32 | 458 µs (regressed to 764 with naive 4-oc) | **397 µs** (Auto policy picks PerChannel) | back to baseline + 13% |
 
 **Residual tracked gaps** — areas where libtorch's Intel MKL-DNN
 (with AVX-512 inner kernels on Intel hardware) still wins. These need
@@ -137,8 +138,8 @@ tuning) and are left as follow-up work:
 | TensorMatMul (float) | 512 | 1,074 µs | 534 µs | 2.0× |
 | LayerNorm | 32k×64 | 890 µs | 303 µs | 2.9× |
 | BatchNorm | 32×64×32×32 | 2,201 µs | 745 µs | 3.0× |
-| Conv2D (float) | 4×3×32×32 | 718–764 µs | 310 µs | 2.3–2.5× |
-| Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× |
+| Conv2D (float) | 1×16×64×64→32 | ~397 µs (Auto picks PerChannel) | 310 µs | 1.3× — was 2.3× before A/B fix |
+| Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× — unchanged this PR |
 | AttentionQKT | 512×64 | 522 µs | 135 µs | 3.9× (was 4.3×) |
 | Softmax_Double 512×1024 | — | **185 µs** | 206 µs | **slight win** ✓ closed |
 
