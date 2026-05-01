@@ -24,6 +24,52 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunAttentionQkt()
+    {
+        Console.WriteLine("=== AttentionQKT (Q · Kᵀ) micro-benchmark ===");
+        var engine = new CpuEngine();
+
+        // Standard attention shapes: [seqLen, headDim] × [seqLen, headDim]ᵀ → [seqLen, seqLen]
+        var shapes = new (int seqLen, int headDim)[]
+        {
+            (512, 64),    // BDN benchmark shape
+            (256, 64),    // small attention
+            (1024, 64),   // larger seq
+            (512, 128),   // larger head_dim
+        };
+
+        foreach (var (seqLen, headDim) in shapes)
+        {
+            var rng = new Random(42);
+            var qData = new float[seqLen * headDim];
+            var kData = new float[seqLen * headDim];
+            for (int i = 0; i < qData.Length; i++) qData[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < kData.Length; i++) kData[i] = (float)(rng.NextDouble() * 2 - 1);
+            var q = new Tensor<float>(qData, new[] { seqLen, headDim });
+            var k = new Tensor<float>(kData, new[] { seqLen, headDim });
+
+            for (int i = 0; i < 10; i++) { var _ = engine.TensorMatMulTransposed(q, k); }
+            const int iters = 50;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                var _ = engine.TensorMatMulTransposed(q, k);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double mean = samples.Average();
+            double min = samples.Min();
+            long workFmas = (long)seqLen * seqLen * headDim;
+            double gflops = workFmas * 2.0 / (min * 1000.0); // 2 ops per FMA
+            Console.WriteLine($"  Shape Q[{seqLen},{headDim}] K[{seqLen},{headDim}]^T " +
+                              $"({workFmas / 1_000_000.0:F1}M FMAs):  " +
+                              $"mean={mean,8:F1} µs   min={min,8:F1} µs   ({gflops,5:F1} GFLOPS)");
+        }
+        Console.WriteLine();
+    }
+
     public static void RunSoftmaxDouble()
     {
         Console.WriteLine("=== Softmax<double> micro-benchmark ===");

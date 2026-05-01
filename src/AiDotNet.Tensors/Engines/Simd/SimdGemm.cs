@@ -935,7 +935,7 @@ internal static partial class SimdGemm
             // SgemmDirect fast path. This eliminates the 5× gap to libtorch
             // on the 512×64 → 512×512 attention shape.
             if (!transA && transB
-                && directWork <= SmallMatmulWorkThreshold
+                && directWork <= SmallMatmulWorkThresholdTransB
                 && k <= SmallMatmulKThreshold
                 && (n % 8 == 0))
             {
@@ -1008,11 +1008,19 @@ internal static partial class SimdGemm
 
     // Iter 34 small-matmul gate. Originally 8M FMAs captured per-head attention
     // [256,72]×[72,256] (4.7M) and [256,256]×[256,72] (4.7M); raised to 32M for
-    // #209 close-parity to capture 256³ MatMul (16.8M) and 512² × K=64 attention
-    // shapes (16.8M) as well. K ≤ 512 keeps the 6-row A panel at 12 KB, still
-    // well within Zen 2's 32 KB L1d. Above 32M (e.g. 512³ = 134M, 1024² = 1B),
-    // the packed SgemmTiled path's better cache reuse wins.
+    // #209 close-parity to capture 256³ MatMul (16.8M) as well. K ≤ 512 keeps
+    // the 6-row A panel at 12 KB, still well within Zen 2's 32 KB L1d.
+    // Above 32M (e.g. 512³ = 134M, 1024² = 1B), the packed SgemmTiled path's
+    // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
+
+    // For transB=true (e.g. AttentionQKT Q·K^T), keep the original 8M
+    // threshold. The pre-transpose + SgemmDirect path is single-threaded;
+    // above 8M FMAs the parallel SgemmTiled path wins despite its packing
+    // overhead. Validated by --ab-attention-qkt: at 16.8M FMAs single-thread
+    // SgemmDirect hits 57 GFLOPS (near AVX2 single-core peak), but torch's
+    // parallel kernel is at 248 GFLOPS — only parallelism closes that gap.
+    private const long SmallMatmulWorkThresholdTransB = 8L * 1024 * 1024;
     private const int SmallMatmulKThreshold = 512;
 
     /// <summary>

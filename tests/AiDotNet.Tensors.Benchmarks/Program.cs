@@ -37,6 +37,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-attention-qkt")
+        {
+            Conv2DAbBench.RunAttentionQkt();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
