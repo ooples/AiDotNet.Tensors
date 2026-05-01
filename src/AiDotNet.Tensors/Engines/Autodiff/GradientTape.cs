@@ -608,14 +608,71 @@ public sealed class GradientTape<T> : IDisposable
         // Execute the chain
         var result = chain.Execute(loss, sources, engine);
 
-        // Clear GradFn to release graph memory (non-persistent tapes get new graphs each step)
+        // Clear GradFn to release graph memory (non-persistent tapes
+        // get new graphs each step). Walk inputs inline rather than
+        // via GetInputsArray() — that helper allocates a fresh
+        // Tensor<T>[] every call and we'd burn one allocation per
+        // node solely to traverse refs we already have direct field
+        // access to. Issue #279: the per-train allocation bloat
+        // compounds the leak signature.
+        //
+        // ALSO clear .Grad on intermediate tensors. AccumulateGrad
+        // sets `tensor.Grad = stored` for every tensor that receives
+        // a gradient contribution, including forward intermediates
+        // (Q, K, V, attention scores, layernorm outputs, …). Those
+        // intermediates have no caller-visible reason to keep .Grad
+        // populated after backward returns — only the `sources`
+        // (model parameters) are read by the optimizer. Leaving
+        // .Grad set chains the gradient tensor's lifetime to the
+        // intermediate's lifetime; when ANY external reference holds
+        // the intermediate (a pooled output buffer, a weak-ref
+        // tracker, debugging hook, …) the gradient stays live too.
+        // Source tensors keep .Grad — that's the optimizer's input.
         if (!_options.Persistent)
         {
+            // Build a set of source tensors for O(1) sourcehood check.
+            // Skip the set construction when no sources were specified
+            // (caller wants the full grads dict), since we can't
+            // safely null .Grad on anything in that mode.
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (sources is not null && sources.Count > 0)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) sourceSet.Add(s);
+            }
             foreach (var node in topoOrder)
             {
                 node.Output.GradFn = null;
-                foreach (var inp in node.GetInputsArray())
-                    inp.GradFn = null;
+                if (sourceSet is not null && !sourceSet.Contains(node.Output))
+                    node.Output.Grad = null;
+                if (node.Input0 is not null)
+                {
+                    node.Input0.GradFn = null;
+                    if (sourceSet is not null && !sourceSet.Contains(node.Input0))
+                        node.Input0.Grad = null;
+                }
+                if (node.Input1 is not null)
+                {
+                    node.Input1.GradFn = null;
+                    if (sourceSet is not null && !sourceSet.Contains(node.Input1))
+                        node.Input1.Grad = null;
+                }
+                if (node.Input2 is not null)
+                {
+                    node.Input2.GradFn = null;
+                    if (sourceSet is not null && !sourceSet.Contains(node.Input2))
+                        node.Input2.Grad = null;
+                }
+                if (node.InputsOverflow is not null)
+                {
+                    foreach (var inp in node.InputsOverflow)
+                    {
+                        if (inp is null) continue;
+                        inp.GradFn = null;
+                        if (sourceSet is not null && !sourceSet.Contains(inp))
+                            inp.Grad = null;
+                    }
+                }
             }
         }
 
@@ -842,6 +899,11 @@ public sealed class GradientTape<T> : IDisposable
         Compilation.AutoTrainingCompiler.ReplayMode = _savedReplayMode;
         System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         SetCurrentTape(_parent);
+        // Defensively null the cached delegate chain. For non-persistent
+        // tapes it's already null; this protects against any path that
+        // sets it (e.g. a future code change that caches across a
+        // re-execute call) from leaking BackwardStep[] across Dispose.
+        _cachedDelegateChain = null;
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
