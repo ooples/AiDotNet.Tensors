@@ -211,6 +211,10 @@ public sealed class TensorBoardSummaryWriter : IDisposable
         for (int i = 0; i < n; i++) bucketEdges[i] = bucketUpperEdges[i];
         // Binary search per value — O(N log B) which beats the naive
         // O(N×B) when B is large (e.g., 256 fine-grained edges).
+        // Uses lower_bound semantics to match TensorFlow's HistogramProto
+        // convention: bucket i covers (bucketEdges[i-1], bucketEdges[i]]
+        // (right-inclusive). A value exactly equal to bucketEdges[i] lands
+        // in bucket i, NOT in bucket i+1.
         for (int i = 0; i < values.Length; i++)
         {
             double v = values[i];
@@ -218,11 +222,12 @@ public sealed class TensorBoardSummaryWriter : IDisposable
             while (lo < hi)
             {
                 int mid = (lo + hi) >> 1;
-                if (v < bucketEdges[mid]) hi = mid;
+                // lower_bound: smallest mid with bucketEdges[mid] >= v.
+                if (v <= bucketEdges[mid]) hi = mid;
                 else lo = mid + 1;
             }
-            // Final bucket holds the >=last-edge tail.
-            if (v >= bucketEdges[n - 1]) lo = n - 1;
+            // Values strictly above the last edge clamp into the final bucket.
+            if (v > bucketEdges[n - 1]) lo = n - 1;
             bucketCounts[lo]++;
         }
 
