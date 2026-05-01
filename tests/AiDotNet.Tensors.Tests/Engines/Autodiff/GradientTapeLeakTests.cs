@@ -80,7 +80,7 @@ public class GradientTapeLeakTests
     public void TrainStep_TransformerBlock_DoesNotLeak()
     {
         var engine = AiDotNetEngine.Current;
-        const int Batch = 1, Seq = 16, Dim = 64, Heads = 4, FF = 128;
+        const int Batch = 1, Seq = 16, Dim = 64, FF = 128;
         // Drain any thread-local caches left over from earlier tests
         // (AutoTensorCache pools tensors per-thread; leftover entries
         // from other test classes inflate the start-of-window heap and
