@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Benchmarks;
@@ -47,7 +48,14 @@ internal static class Conv2DAbBench
             Console.WriteLine($"--- size = {n:N0} ---");
             foreach (var (name, op) in ops)
             {
-                for (int i = 0; i < 10; i++) { var rWarm = op(); _ = rWarm; }
+                // Return result tensors so the binary-op micro-bench
+                // measures the kernel cost, not allocator pressure.
+                // Same fix-pattern applied to RunMatMul/RunLayerNorm/etc.
+                for (int i = 0; i < 10; i++)
+                {
+                    var rWarm = op();
+                    TensorPool.Return(rWarm);
+                }
                 const int iters = 50;
                 var samples = new double[iters];
                 var sw = new Stopwatch();
@@ -57,6 +65,7 @@ internal static class Conv2DAbBench
                     var rMeas = op();
                     sw.Stop();
                     samples[i] = sw.Elapsed.TotalMicroseconds;
+                    TensorPool.Return(rMeas);
                 }
                 double mean = samples.Average();
                 double min = samples.Min();
@@ -86,7 +95,13 @@ internal static class Conv2DAbBench
             var input = new Tensor<double>(inputData, new[] { b, ic, h, w });
             var kernel = new Tensor<double>(kernelData, new[] { oc, ic, 3, 3 });
 
-            for (int i = 0; i < 10; i++) { var rWarm = engine.Conv2D(input, kernel, 1, 1, 1); _ = rWarm; }
+            // Return Conv2D output to TensorPool — same allocator-warm
+            // rationale as RunMatMul/RunLayerNorm above.
+            for (int i = 0; i < 10; i++)
+            {
+                var rWarm = engine.Conv2D(input, kernel, 1, 1, 1);
+                TensorPool.Return(rWarm);
+            }
             const int iters = 50;
             var samples = new double[iters];
             var sw = new Stopwatch();
@@ -96,6 +111,7 @@ internal static class Conv2DAbBench
                 var rMeas = engine.Conv2D(input, kernel, 1, 1, 1);
                 sw.Stop();
                 samples[i] = sw.Elapsed.TotalMicroseconds;
+                TensorPool.Return(rMeas);
             }
             double mean = samples.Average();
             double min = samples.Min();
@@ -126,7 +142,17 @@ internal static class Conv2DAbBench
             var a = new Tensor<float>(aData, new[] { M, K });
             var b = new Tensor<float>(bData, new[] { K, N });
 
-            for (int i = 0; i < 10; i++) { var rWarm = engine.TensorMatMul(a, b); _ = rWarm; }
+            // Return result tensors to TensorPool inside warmup + measure
+            // loops so the micro-bench measures kernel time, not allocator
+            // pressure. Without this the per-iter `engine.TensorMatMul`
+            // allocates a fresh output tensor every call and timings get
+            // dominated by GC churn — disagreeing with the BDN-side
+            // benchmarks that run with the pool warm.
+            for (int i = 0; i < 10; i++)
+            {
+                var rWarm = engine.TensorMatMul(a, b);
+                TensorPool.Return(rWarm);
+            }
             const int iters = 50;
             var samples = new double[iters];
             var sw = new Stopwatch();
@@ -136,6 +162,7 @@ internal static class Conv2DAbBench
                 var rMeas = engine.TensorMatMul(a, b);
                 sw.Stop();
                 samples[i] = sw.Elapsed.TotalMicroseconds;
+                TensorPool.Return(rMeas);
             }
             double mean = samples.Average();
             double min = samples.Min();
@@ -172,16 +199,29 @@ internal static class Conv2DAbBench
             var gamma = new Tensor<float>(gam, new[] { fs });
             var beta  = new Tensor<float>(bet, new[] { fs });
 
-            for (int i = 0; i < 10; i++) { var rWarm = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _); _ = rWarm; }
+            // Return LayerNorm output + per-row mean/var to TensorPool
+            // — same rationale as RunMatMul above. LayerNorm allocates
+            // three result tensors; without pooling the inner loop
+            // becomes allocation-bound rather than kernel-bound.
+            for (int i = 0; i < 10; i++)
+            {
+                var rWarm = engine.LayerNorm(input, gamma, beta, 1e-5, out var meanWarm, out var varWarm);
+                TensorPool.Return(rWarm);
+                TensorPool.Return(meanWarm);
+                TensorPool.Return(varWarm);
+            }
             const int iters = 50;
             var samples = new double[iters];
             var sw = new Stopwatch();
             for (int i = 0; i < iters; i++)
             {
                 sw.Restart();
-                var rMeas = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+                var rMeas = engine.LayerNorm(input, gamma, beta, 1e-5, out var meanOut, out var varOut);
                 sw.Stop();
                 samples[i] = sw.Elapsed.TotalMicroseconds;
+                TensorPool.Return(rMeas);
+                TensorPool.Return(meanOut);
+                TensorPool.Return(varOut);
             }
             double mean = samples.Average();
             double min = samples.Min();
@@ -214,16 +254,23 @@ internal static class Conv2DAbBench
             var q = new Tensor<float>(qData, new[] { seqLen, headDim });
             var k = new Tensor<float>(kData, new[] { seqLen, headDim });
 
-            for (int i = 0; i < 10; i++) { var _ = engine.TensorMatMulTransposed(q, k); }
+            // Return attention output to TensorPool — same allocator-warm
+            // rationale as RunMatMul.
+            for (int i = 0; i < 10; i++)
+            {
+                var rWarm = engine.TensorMatMulTransposed(q, k);
+                TensorPool.Return(rWarm);
+            }
             const int iters = 50;
             var samples = new double[iters];
             var sw = new Stopwatch();
             for (int i = 0; i < iters; i++)
             {
                 sw.Restart();
-                var _ = engine.TensorMatMulTransposed(q, k);
+                var rMeas = engine.TensorMatMulTransposed(q, k);
                 sw.Stop();
                 samples[i] = sw.Elapsed.TotalMicroseconds;
+                TensorPool.Return(rMeas);
             }
             double mean = samples.Average();
             double min = samples.Min();
@@ -255,8 +302,12 @@ internal static class Conv2DAbBench
             for (int i = 0; i < data.Length; i++) data[i] = rng.NextDouble() * 4 - 2;
             var input = new Tensor<double>(data, new[] { rows, cols });
 
-            // Warmup
-            for (int i = 0; i < 10; i++) { var _ = engine.Softmax(input, axis: -1); }
+            // Warmup — return softmax output so the pool stays warm.
+            for (int i = 0; i < 10; i++)
+            {
+                var rWarm = engine.Softmax(input, axis: -1);
+                TensorPool.Return(rWarm);
+            }
 
             // Measure
             const int iters = 50;
@@ -265,9 +316,10 @@ internal static class Conv2DAbBench
             for (int i = 0; i < iters; i++)
             {
                 sw.Restart();
-                var _ = engine.Softmax(input, axis: -1);
+                var rMeas = engine.Softmax(input, axis: -1);
                 sw.Stop();
                 samples[i] = sw.Elapsed.TotalMicroseconds;
+                TensorPool.Return(rMeas);
             }
             double mean = samples.Average();
             double min = samples.Min();

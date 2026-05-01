@@ -246,30 +246,47 @@ public sealed class SafetensorsReader : IDisposable
         // before destination.Write lets concurrent reads on the same
         // SafetensorsReader make progress instead of serializing on
         // a slow output destination (e.g., a network pipe).
-        var buf = new byte[bufferSize];
-        long remaining = entry.ByteLength;
-        long position = _dataBlockStart + entry.DataOffsetStart;
-        while (remaining > 0)
+        //
+        // Rent the staging buffer from ArrayPool<byte>.Shared rather
+        // than allocating fresh — repeated large-model loads call this
+        // method once per tensor, and the default 1 MiB allocation per
+        // call adds avoidable GC pressure. Mirror ChunkedIterator's
+        // try/finally pattern so the buffer is always returned, even
+        // on exception (mid-read EOF, disposal race, destination
+        // write failure).
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
         {
-            ThrowIfDisposed();
-            int want = (int)Math.Min(buf.Length, remaining);
-            int got;
-            lock (_streamLock)
+            long remaining = entry.ByteLength;
+            long position = _dataBlockStart + entry.DataOffsetStart;
+            while (remaining > 0)
             {
-                _stream.Seek(position, SeekOrigin.Begin);
-                got = 0;
-                while (got < want)
+                ThrowIfDisposed();
+                int want = (int)Math.Min(bufferSize, remaining);
+                int got;
+                lock (_streamLock)
                 {
-                    int n = _stream.Read(buf, got, want - got);
-                    if (n == 0)
-                        throw new EndOfStreamException(
-                            $"Unexpected EOF while streaming tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
-                    got += n;
+                    _stream.Seek(position, SeekOrigin.Begin);
+                    got = 0;
+                    while (got < want)
+                    {
+                        int n = _stream.Read(buf, got, want - got);
+                        if (n == 0)
+                            throw new EndOfStreamException(
+                                $"Unexpected EOF while streaming tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
+                        got += n;
+                    }
                 }
+                destination.Write(buf, 0, got);
+                position += got;
+                remaining -= got;
             }
-            destination.Write(buf, 0, got);
-            position += got;
-            remaining -= got;
+        }
+        finally
+        {
+            // ArrayPool.Return: clearArray=false because the next
+            // caller will overwrite from the start before reading.
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf, clearArray: false);
         }
     }
 
