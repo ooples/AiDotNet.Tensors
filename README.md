@@ -123,7 +123,10 @@ baseline by fresh BDN re-runs and same-process micro-benchmarks:
 | Exp_Double 1M  | 1,634 µs | 753 µs | 2.2× faster |
 | LayerNorm 32k×64 | 1,347 µs | 890 µs | 1.5× faster |
 | TensorAdd 1M | 480 µs | 350 µs | 1.4× faster |
-| AttentionQKT 512×64 | 599 µs | 522 µs (after threshold-split fix) | 1.15× faster |
+| AttentionQKT 512×64 | 599 µs | **419 µs** (parallel-M pre-transpose) | **1.4× faster** |
+| AttentionQKT 512×128 | (not measured) | **451 µs** | (149 GFLOPS, parallel-M kernel) |
+| MatMul 256³ | 510 µs | **196 µs** (parallel-M SgemmDirect) | **2.6× faster** |
+| MatMul 512³ | 1,074 µs | **930 µs** | 1.15× faster |
 | Conv2D 1×16×64×64→32 | 458 µs (regressed to 764 with naive 4-oc) | **397 µs** (Auto policy picks PerChannel) | back to baseline + 13% |
 
 **Residual tracked gaps** — areas where libtorch's Intel MKL-DNN
@@ -134,13 +137,14 @@ tuning) and are left as follow-up work:
 
 | Operation | Size | AiDotNet | TorchSharp | Ratio |
 |-----------|------|---------:|-----------:|------:|
-| TensorMatMul (float) | 256 | 510 µs | 109 µs | 4.7× |
-| TensorMatMul (float) | 512 | 1,074 µs | 534 µs | 2.0× |
+| TensorMatMul (float) | 256 | **196 µs** (parallel-M SgemmDirect) | 109 µs | 1.8× — was 4.7× |
+| TensorMatMul (float) | 512 | 930 µs | 534 µs | 1.7× — was 2.0× |
 | LayerNorm | 32k×64 | 890 µs | 303 µs | 2.9× |
 | BatchNorm | 32×64×32×32 | 2,201 µs | 745 µs | 3.0× |
 | Conv2D (float) | 1×16×64×64→32 | ~397 µs (Auto picks PerChannel) | 310 µs | 1.3× — was 2.3× before A/B fix |
 | Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× — unchanged this PR |
-| AttentionQKT | 512×64 | 522 µs | 135 µs | 3.9× (was 4.3×) |
+| AttentionQKT | 512×64 | **419 µs** (parallel-M pre-transpose) | 135 µs | 3.1× — was 4.3× |
+| AttentionQKT | 512×128 | **451 µs** (parallel-M) | — | 149 GFLOPS, was 1,102 µs |
 | Softmax_Double 512×1024 | — | **185 µs** | 206 µs | **slight win** ✓ closed |
 
 **Zero-external-dependency policy.** Every hot path runs through our
