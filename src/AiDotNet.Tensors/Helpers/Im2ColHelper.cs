@@ -1,7 +1,5 @@
 using System;
 using System.Buffers;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Helpers;

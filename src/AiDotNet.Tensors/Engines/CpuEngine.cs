@@ -9604,19 +9604,27 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous && b.IsContiguous)
         {
             var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            var aArr = (float[])(object)a.GetDataArray();
-            var bArr = (float[])(object)b.GetDataArray();
-            var rArr = (float[])(object)result.GetDataArray();
+            // Use the storage + storageOffset directly. AutoTensorCache /
+            // pooled tensors back themselves with arrays that may be larger
+            // than Length (capacity headroom from ArrayPool buckets), so
+            // GetDataArray() returns the BUCKET-sized array — slicing with
+            // (0, M*K) on a contiguous-but-offset tensor would index wrong.
+            // The _storageOffset is 0 for non-view tensors but the explicit
+            // pin keeps the contract clean for any future view caller.
+            var aRaw = (float[])(object)a._storage.GetDataArray();
+            var bRaw = (float[])(object)b._storage.GetDataArray();
+            var rRaw = (float[])(object)result._storage.GetDataArray();
+            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
             // Sgemm(a, lda, transA, b, ldb, transB, c, m, k, n).
             // a is [M,K] row-major (lda=K, transA=false). b is stored
             // [N,K] row-major (lda for b = K, transB=true so the kernel
             // treats it as Kᵀ-major and contracts over K).
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
-                new ReadOnlySpan<float>(aArr, 0, M * K),
+                new ReadOnlySpan<float>(aRaw, aOff, M * K),
                 lda: K, transA: false,
-                new ReadOnlySpan<float>(bArr, 0, N * K),
+                new ReadOnlySpan<float>(bRaw, bOff, N * K),
                 ldb: K, transB: true,
-                new Span<float>(rArr, 0, M * N),
+                new Span<float>(rRaw, rOff, M * N),
                 M, K, N);
             // Register the transpose-aware backward — the standard
             // MatMulBackward assumes C = A·B and emits wrong gradients

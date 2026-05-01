@@ -1424,7 +1424,6 @@ internal static partial class SimdGemm
                 float* pA = (float*)ipA;
                 float* pB = (float*)ipB;
                 float* pC = (float*)ipC;
-                int nFull = (nCap / Nr) * Nr;
 
                 for (int i = iStart; i < iEnd; i += Mr)
                 {

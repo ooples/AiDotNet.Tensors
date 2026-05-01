@@ -5,10 +5,14 @@
 > **Last regenerated**: 2026-04-30 — full three-suite validation run after
 > the #209 close-parity perf grinding (10 perf commits 921f4a2..940363c).
 >
-> **Zero external library dependencies.** No `System.Numerics.Tensors`,
-> no MKL, no MKL.NET, no oneDNN. Every SIMD path is a hand-written
-> AVX2/AVX-512 kernel in `SimdKernels.cs` / `SimdGemm.cs` /
-> `SimdConvHelper.cs`.
+> **Zero external library dependencies in the runtime library**
+> (`AiDotNet.Tensors.csproj`). No `System.Numerics.Tensors`, no MKL,
+> no MKL.NET, no oneDNN. Every SIMD path on the runtime hot path is
+> a hand-written AVX2/AVX-512 kernel in `SimdKernels.cs` / `SimdGemm.cs`
+> / `SimdConvHelper.cs`. The benchmarks project itself does pull in
+> BenchmarkDotNet, TorchSharp, ML.NET, and TensorFlow.NET — those are
+> the *competitors being measured*, not runtime dependencies of the
+> library under test.
 >
 > **Suites run** (each standalone — no parallel BDN runs to avoid the
 > file-lock contention that corrupted the earlier sweep):
@@ -76,7 +80,7 @@
 > | Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× | unchanged path |
 > | AttentionQKT | 512×64 | 586 µs | 135 µs | 4.3× | needs proper fused QKᵀ kernel |
 > | Sigmoid_Double | 1M | 716 µs | 386 µs | 1.9× | acceptable |
-> | Softmax_Double | 1M | 3,766 µs | 206 µs | 18× | unchanged this PR |
+> | Softmax_Double 512×1024 | — | **185 µs** | 206 µs | **closed** ✓ | SIMD parallel via FastExpDouble256 (commit dc421f0) |
 
 ## TorchSharp CPU (libtorch C++)
 

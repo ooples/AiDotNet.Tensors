@@ -199,7 +199,7 @@ public sealed class SafetensorsReader : IDisposable
         if (byteLen > int.MaxValue)
             throw new InvalidOperationException(
                 $"Tensor '{name}' is {byteLen} bytes — exceeds the {int.MaxValue}-byte single-array limit. " +
-                $"Use ReadRawBytesStreaming(name, destination) to copy into a pre-sized buffer, or " +
+                $"Use ReadRawBytesStreaming(name, destination) to copy directly into a destination Stream, or " +
                 $"ReadRawBytesChunked(name, chunkBytes) to enumerate fixed-size chunks.");
 
         var buf = new byte[byteLen];
@@ -274,10 +274,11 @@ public sealed class SafetensorsReader : IDisposable
     }
 
     /// <summary>
-    /// Enumerates the tensor's raw bytes as fixed-size chunks. Each
-    /// yielded segment is owned by the iterator (a single rented buffer
-    /// is reused) — copy out before pulling the next chunk. Skips the
-    /// 2 GiB single-array cap and avoids materializing the full payload.
+    /// Enumerates the tensor's raw bytes as fixed-size chunks. Each yielded
+    /// segment is owned by the iterator (a single rented buffer from
+    /// <see cref="ArrayPool{T}.Shared"/> is reused) — copy out before pulling
+    /// the next chunk. Skips the 2 GiB single-array cap and avoids
+    /// materializing the full payload.
     /// </summary>
     public IEnumerable<ArraySegment<byte>> ReadRawBytesChunked(string name, int chunkBytes = 1 << 20)
     {
@@ -286,42 +287,53 @@ public sealed class SafetensorsReader : IDisposable
         if (chunkBytes <= 0) throw new ArgumentOutOfRangeException(nameof(chunkBytes), "chunkBytes must be > 0.");
         if (!_entries.TryGetValue(name, out var entry))
             throw new KeyNotFoundException($"Tensor '{name}' not found.");
-        return ChunkedIterator(entry, chunkBytes);
+        return ChunkedIterator(entry, chunkBytes, name);
     }
 
-    private IEnumerable<ArraySegment<byte>> ChunkedIterator(SafetensorsTensorEntry entry, int chunkBytes)
+    private IEnumerable<ArraySegment<byte>> ChunkedIterator(SafetensorsTensorEntry entry, int chunkBytes, string name)
     {
-        var buf = new byte[chunkBytes];
-        long remaining = entry.ByteLength;
-        long position = _dataBlockStart + entry.DataOffsetStart;
-        while (remaining > 0)
+        // Single rented buffer reused across all yielded chunks (matches the
+        // XML doc above). The caller MUST copy out before pulling the next
+        // chunk — the segment's underlying array is overwritten on each
+        // iteration. Returned to the pool on enumerator dispose.
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkBytes);
+        try
         {
-            // Re-check disposal on every chunk. Iterator yields are deferred
-            // — without this, an already-disposed reader would still pump
-            // bytes from a closed stream (UB) or from a stream the caller
-            // has reused for another tensor.
-            ThrowIfDisposed();
-            int want = (int)Math.Min(buf.Length, remaining);
-            int got;
-            // Hold the stream lock only across the seek+read pair so
-            // multiple chunked iterators can interleave on the same
-            // reader without corrupting each other's stream positions.
-            lock (_streamLock)
+            long remaining = entry.ByteLength;
+            long position = _dataBlockStart + entry.DataOffsetStart;
+            while (remaining > 0)
             {
-                _stream.Seek(position, SeekOrigin.Begin);
-                got = 0;
-                while (got < want)
+                // Re-check disposal on every chunk. Iterator yields are deferred
+                // — without this, an already-disposed reader would still pump
+                // bytes from a closed stream (UB) or from a stream the caller
+                // has reused for another tensor.
+                ThrowIfDisposed();
+                int want = (int)Math.Min(chunkBytes, remaining);
+                int got;
+                // Hold the stream lock only across the seek+read pair so
+                // multiple chunked iterators can interleave on the same
+                // reader without corrupting each other's stream positions.
+                lock (_streamLock)
                 {
-                    int n = _stream.Read(buf, got, want - got);
-                    if (n == 0)
-                        throw new EndOfStreamException(
-                            $"Unexpected EOF while chunked-reading tensor — {remaining} bytes remaining of {entry.ByteLength}.");
-                    got += n;
+                    _stream.Seek(position, SeekOrigin.Begin);
+                    got = 0;
+                    while (got < want)
+                    {
+                        int n = _stream.Read(buf, got, want - got);
+                        if (n == 0)
+                            throw new EndOfStreamException(
+                                $"Unexpected EOF while chunked-reading tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
+                        got += n;
+                    }
                 }
+                yield return new ArraySegment<byte>(buf, 0, got);
+                position += got;
+                remaining -= got;
             }
-            yield return new ArraySegment<byte>(buf, 0, got);
-            position += got;
-            remaining -= got;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
         }
     }
 

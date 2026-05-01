@@ -1,3 +1,5 @@
+using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -34,12 +36,17 @@ public class NormConvAccuracyTests
         return d;
     }
 
+    // Hot-path equality check called millions of times by the per-element
+    // loops. Build the failure string only on mismatch — eager interpolation
+    // would allocate one string per element (a 32k×64 LayerNorm = 2M strings).
     private static void AssertCloseFloat(float expected, float actual, string ctx)
     {
         float diff = Math.Abs(expected - actual);
         float scale = Math.Max(1f, Math.Max(Math.Abs(expected), Math.Abs(actual)));
-        Assert.True(diff <= AbsTol + RelTol * scale,
-            $"{ctx}: expected={expected:G9}, actual={actual:G9}, diff={diff:G9}");
+        if (diff > AbsTol + RelTol * scale)
+        {
+            Assert.Fail($"{ctx}: expected={expected:G9}, actual={actual:G9}, diff={diff:G9}");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -288,10 +295,14 @@ public class NormConvAccuracyTests
         {
             // Conv2D accumulates more terms than LayerNorm/BatchNorm so the
             // tolerance loosens slightly (more rounding error compounding).
+            // Build the failure message only on mismatch (lazy) — see
+            // AssertCloseFloat for rationale.
             float diff = Math.Abs(expected[i] - actual[i]);
             float scale = Math.Max(1f, Math.Max(Math.Abs(expected[i]), Math.Abs(actual[i])));
-            Assert.True(diff <= 1e-4f + 1e-3f * scale,
-                $"i={i}: expected={expected[i]:G9}, actual={actual[i]:G9}, diff={diff:G9}");
+            if (diff > 1e-4f + 1e-3f * scale)
+            {
+                Assert.Fail($"i={i}: expected={expected[i]:G9}, actual={actual[i]:G9}, diff={diff:G9}");
+            }
         }
     }
 
@@ -394,8 +405,10 @@ public class NormConvAccuracyTests
         {
             double diff = Math.Abs(expected[i] - actual[i]);
             double scale = Math.Max(1.0, Math.Max(Math.Abs(expected[i]), Math.Abs(actual[i])));
-            Assert.True(diff <= 1e-12 + 1e-10 * scale,
-                $"i={i}: expected={expected[i]:G17}, actual={actual[i]:G17}, diff={diff:G17}");
+            if (diff > 1e-12 + 1e-10 * scale)
+            {
+                Assert.Fail($"i={i}: expected={expected[i]:G17}, actual={actual[i]:G17}, diff={diff:G17}");
+            }
         }
 
         // Sanity: each row sums to 1.0 (within numerical precision)

@@ -598,9 +598,6 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     #region Matrix Operations
 
     /// <summary>
-    /// General matrix multiplication: C = alpha * A * B + beta * C
-    /// </summary>
-    /// <summary>
     /// C = A · Bᵀ where B is stored row-major as [N, K]. Uses the
     /// dedicated <c>gemm_transposed_simple</c> WGSL kernel so the
     /// transpose copy is skipped.

@@ -349,12 +349,12 @@ internal static class Conv2DAbBench
         const int measureIters = 100;
 
         // Warmup — JIT, populate caches, etc.
+        // Pool-return each result so the ArrayPool stays warm across iterations
+        // (matches the BDN benchmarks' apples-to-apples allocator pattern).
         for (int i = 0; i < warmupIters; i++)
         {
             var r = engine.Conv2D(input, kernel, 1, 1, 1);
-            // Drop reference so AutoTensorCache can recycle. No explicit return
-            // since we want the same alloc behavior the public API has.
-            _ = r;
+            AiDotNet.Tensors.Helpers.TensorPool.Return(r);
         }
 
         // Measure
@@ -366,7 +366,7 @@ internal static class Conv2DAbBench
             var r = engine.Conv2D(input, kernel, 1, 1, 1);
             sw.Stop();
             samples[i] = sw.Elapsed.TotalMicroseconds;
-            _ = r;
+            AiDotNet.Tensors.Helpers.TensorPool.Return(r);
         }
 
         double mean = samples.Average();

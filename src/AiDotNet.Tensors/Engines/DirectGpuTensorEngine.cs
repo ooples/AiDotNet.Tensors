@@ -9505,8 +9505,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Mirrors <see cref="ReduceAxisGpu"/>'s shape-collapse logic but
     /// dispatches both <see cref="IDirectGpuBackend.MaxAxis"/> and
     /// <see cref="IDirectGpuBackend.ArgMaxAxis"/> on the same uploaded
-    /// input buffer. Indices are returned in the original tensor's
-    /// row-major frame after the optional permutation is undone.
+    /// input buffer.
+    ///
+    /// <para>For multi-axis reductions the input is permuted so that the
+    /// reduction axes are contiguous in the trailing dimension, and the
+    /// returned indices are flat indices into that collapsed reduction
+    /// span (matching <c>torch.max(dim=...)</c> when multiple dims are
+    /// reduced via successive collapse). Indices are NOT un-permuted back
+    /// to the original frame — the contract is that the caller treats
+    /// them as opaque positions within the reduction window for the
+    /// corresponding output element.</para>
     /// </summary>
     private Tensor<T> ReduceMaxWithIndicesGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
         IDirectGpuBackend backend, out int[] maxIndices)
@@ -9516,7 +9524,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShapeList = new List<int>();
         int reduceSize = 1;
         int outerSize = 1;
-        bool permuted = false;
         var reduceDimsSet = new HashSet<int>(normalizedAxes);
 
         if (normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
@@ -9542,7 +9549,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 reduceSize *= inputShape[axis];
             }
             input = PermuteImpl(input, permutation.ToArray());
-            permuted = true;
         }
 
         // Build output shape preserving original axis positions. Earlier
@@ -9578,9 +9584,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Indices come back as float (DownloadBuffer is float-typed) but
         // each backend's kernel encodes the int32 index differently:
         //   - WebGPU / Vulkan: bitcast — int32 bits stored in the float
-        //     slot. Recover via BitConverter.SingleToInt32Bits.
-        //   - CUDA / HIP / OpenCL / Metal: value cast — (float)idx. Recover
-        //     with (int)f.
+        //     slot. Recover via BitConverter.SingleToInt32Bits. Lossless.
+        //   - CUDA / HIP / OpenCL / Metal: value cast — (float)idx. Indices
+        //     up to 2^24 = 16,777,216 are exactly representable. Above that
+        //     float32 starts skipping integers (16,777,217 rounds to
+        //     16,777,216) so the recovered index can be off by 1+. Throw
+        //     to fail loudly rather than return silently-wrong indices.
         // The capability flag on each backend tells us which encoding
         // to use; mixing the two corrupts every index above ~16M (for
         // bit-reinterp on a value-cast backend) or every non-trivial
@@ -9588,6 +9597,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float[] indicesFloat = backend.DownloadBuffer(indicesBuffer.Buffer);
         maxIndices = new int[indicesFloat.Length];
         bool bitReinterp = backend.ArgMaxIndicesAreBitReinterpreted;
+        const int Float32ExactIntLimit = 16_777_216; // 2^24
         for (int i = 0; i < indicesFloat.Length; i++)
         {
             if (bitReinterp)
@@ -9601,17 +9611,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
+                // Value-cast backend: only safe for reduceSize ≤ 2^24.
+                // Guard once outside the loop by checking reduceSize, but
+                // also clamp+throw here for safety (the cast itself doesn't
+                // raise on overflow).
+                if (reduceSize > Float32ExactIntLimit)
+                {
+                    throw new InvalidOperationException(
+                        $"ArgMax reduction span {reduceSize} exceeds the {Float32ExactIntLimit} " +
+                        "(2^24) limit at which float32 still represents every integer exactly. " +
+                        $"This GPU backend ({backend.GetType().Name}) emits indices via (float)cast " +
+                        "and cannot return correct indices for spans this large. Use a backend with " +
+                        "ArgMaxIndicesAreBitReinterpreted=true (Vulkan/WebGPU) or perform the reduce on CPU.");
+                }
                 maxIndices[i] = (int)indicesFloat[i];
             }
         }
-        // If we permuted, the kernel-emitted indices are over the
-        // permuted-axis layout. The caller expects indices in the
-        // original tensor's frame — but the permutation collapsed every
-        // reduction axis into a single trailing flat index, so the
-        // caller's contract for multi-axis reduce-max is the flat index
-        // into the collapsed reduction span (matches PyTorch's
-        // torch.max(dim=...) semantics).
-        _ = permuted;
+        // For multi-axis reductions: the kernel emits indices over the
+        // permuted-axis layout (reduction axes collapsed into the trailing
+        // dim). The caller's contract is that those indices are flat
+        // positions within the collapsed reduction span — matches
+        // torch.max(dim=...) when multiple dims are reduced via successive
+        // collapse. We do not un-permute back to the original frame.
         return new Tensor<T>(outputShape, new Vector<T>(resultData));
     }
 
