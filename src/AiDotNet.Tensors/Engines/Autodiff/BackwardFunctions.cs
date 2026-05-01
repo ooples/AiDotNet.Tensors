@@ -358,14 +358,27 @@ internal static class BackwardFunctions<T>
     // Matrix operations
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Threshold (in FMAs ≈ 2·M·K·N flops / 2) above which the float32 backward
+    /// MatMul prefers the in-process parallel <see cref="SimdGemm"/> path over
+    /// <see cref="BlasProvider.TryGemmEx"/>. The provider may dispatch to a
+    /// single-threaded BLAS install (Microsoft.ML/CRT BLAS lacks Parallel.For
+    /// internally on some runtimes), which silently caps backward throughput
+    /// to one core during training. SimdGemm is guaranteed parallel on shapes
+    /// at or above its own internal threshold, so we use it directly when the
+    /// work is large enough to amortize task spawn cost. 4096 FMAs ≈ a 16×16×16
+    /// matmul — small enough that anything resembling a transformer FFN
+    /// (≥256×768×768 ≈ 150M FMAs) crosses it by orders of magnitude.
+    /// </summary>
+    private const long MatMulBackwardSimdThreshold = 4096L;
+
     /// <summary>d(A@B)/dA = grad @ B^T, d(A@B)/dB = A^T @ grad</summary>
     internal static void MatMulBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // BLAS fast path: compute transposed GEMMs into fresh buffers, then accumulate.
-        // Allocates two float[] arrays but avoids materializing full transpose tensors.
-        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2 && BlasProvider.IsAvailable)
+        // Float32 + 2D fast path: compute transposed GEMMs into pooled buffers, then accumulate.
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
@@ -373,28 +386,47 @@ internal static class BackwardFunctions<T>
 
             if (dCArr is not null && aArr is not null && bArr is not null)
             {
-                int M = gradOutput._shape[0], K = gradOutput._shape[1];
-                int N_a = inputs[1]._shape[0]; // rows of B = cols of grad_A
-                int N_b = gradOutput._shape[1]; // cols of grad_B
+                int M = inputs[0]._shape[0];     // rows of A and gradOutput
+                int K = inputs[0]._shape[1];     // inner dim (cols of A = rows of B)
+                int N = inputs[1]._shape[1];     // cols of B and gradOutput
 
                 // Pool gradient buffers via AutoTensorCache — zero allocation on steps 2+.
                 var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                 var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
                 var gradAData = (float[])(object)gradATensor.GetDataArray();
                 var gradBData = (float[])(object)gradBTensor.GetDataArray();
-                // No Array.Clear needed — TryGemmEx uses beta=0 which overwrites C entirely
 
-                bool okA = BlasProvider.TryGemmEx(M, N_a, K, dCArr, 0, K, false, bArr, 0, K, true, gradAData, 0, N_a);
-                bool okB = BlasProvider.TryGemmEx(inputs[0]._shape[1], N_b, inputs[0]._shape[0],
-                    aArr, 0, inputs[0]._shape[1], true, dCArr, 0, N_b, false, gradBData, 0, N_b);
-
-                if (okA && okB)
+                // Parallel SimdGemm path: bypasses single-threaded BLAS providers when
+                // no tape is recording (createGraph=true would need engine ops to wire
+                // gradients into the outer tape — that path stays on the engine below).
+                long backwardWork = (long)M * K * N;
+                if (GradientTape<T>.Current is null && backwardWork >= MatMulBackwardSimdThreshold)
                 {
+                    // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. B is stored row-major [K,N] (ldb=N), transB=true.
+                    SimdGemm.Sgemm(dCArr, N, false, bArr, N, true, gradAData.AsSpan(0, M * K), M, N, K);
+                    // gradB[K,N] = Aᵀ[K,M] · dC[M,N]. A is stored row-major [M,K] (lda=K), transA=true.
+                    SimdGemm.Sgemm(aArr, K, true, dCArr, N, false, gradBData.AsSpan(0, K * N), K, M, N);
+
                     DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                     DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
                     return;
                 }
-                // Either GEMM refused — fall through to generic path
+
+                // BLAS fast path (may be single-threaded depending on provider):
+                if (BlasProvider.IsAvailable)
+                {
+                    bool okA = BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, N, true, gradAData, 0, K);
+                    bool okB = BlasProvider.TryGemmEx(K, N, M,
+                        aArr, 0, K, true, dCArr, 0, N, false, gradBData, 0, N);
+
+                    if (okA && okB)
+                    {
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                        return;
+                    }
+                    // Either GEMM refused — fall through to generic path
+                }
             }
         }
 
