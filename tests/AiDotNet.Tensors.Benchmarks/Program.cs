@@ -20,6 +20,15 @@ class Program
             return;
         }
 
+        // #209 close-parity: A/B test the Conv3x3Stride1 variants
+        // (per-channel, 2-oc-blocked, 4-oc-blocked) on shared shapes
+        // in the same process. Faster turnaround than full BDN.
+        if (args[0] == "--ab-conv2d")
+        {
+            Conv2DAbBench.Run();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {

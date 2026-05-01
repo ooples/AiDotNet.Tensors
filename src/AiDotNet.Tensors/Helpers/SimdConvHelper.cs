@@ -25,6 +25,27 @@ internal static class SimdConvHelper
     // Output channel block size for better cache utilization
     private const int ChannelBlockSize = 4;
 
+    // #209 close-parity A/B testing: choose the Conv3x3Stride1 variant at runtime.
+    //   "per-channel"  → existing Conv3x3Stride1SingleChannel kernel (1 oc per task)
+    //   "block4"       → Conv3x3Stride1Pad1_OcBlock4 (4 oc per task, register-resident)
+    //   "block2"       → Conv3x3Stride1Pad1_OcBlock2 (2 oc per task, balances parallelism)
+    //   "auto"         → choose based on outChannels and core count
+    // Set via env var AIDOTNET_CONV3X3_VARIANT or by direct field assignment.
+    internal enum Conv3x3Variant { Auto, PerChannel, Block2, Block4 }
+    internal static Conv3x3Variant ActiveConv3x3Variant = ParseConv3x3VariantFromEnv();
+
+    private static Conv3x3Variant ParseConv3x3VariantFromEnv()
+    {
+        var v = Environment.GetEnvironmentVariable("AIDOTNET_CONV3X3_VARIANT");
+        return v switch
+        {
+            "per-channel" or "perchannel" or "per_channel" => Conv3x3Variant.PerChannel,
+            "block2"                                       => Conv3x3Variant.Block2,
+            "block4"                                       => Conv3x3Variant.Block4,
+            _                                              => Conv3x3Variant.Auto,
+        };
+    }
+
     /// <summary>
     /// Check if SIMD-optimized convolution is available for this configuration.
     /// </summary>
@@ -55,26 +76,42 @@ internal static class SimdConvHelper
 
         bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
 
-        // #209 close-parity: 4-oc-blocked fast path (oneDNN's nb_oc_blocking=4
-        // strategy). Holds 4 output-channel accumulators in registers across
-        // the input-channel reduction, eliminating the per-ic load+add+store
-        // round-trip on the output buffer that the per-channel kernel does.
-        // Reference: oneDNN/src/cpu/x64/jit_avx2_conv_kernel_f32.cpp
-        //
-        // Gating: requires outChannels % 4 == 0, padH=padW=1, no dilation
-        // (the typical ResNet/transformer 3x3 conv shape). Falls through to
-        // the per-channel kernel for any non-matching shape.
-        bool canUseOcBlock4 = UseFma
-            && outChannels >= 4 && (outChannels & 3) == 0
-            && padH == 1 && padW == 1
-            && dilationH == 1 && dilationW == 1;
+        // #209 close-parity A/B: select Conv3x3 variant.
+        // Pad=1 dilation=1 are required by the OcBlock kernels.
+        bool padOneNoDilation = padH == 1 && padW == 1 && dilationH == 1 && dilationW == 1;
+        bool canUseBlock4 = UseFma && padOneNoDilation && outChannels >= 4 && (outChannels & 3) == 0;
+        bool canUseBlock2 = UseFma && padOneNoDilation && outChannels >= 2 && (outChannels & 1) == 0;
+
+        // Auto policy: prefer the variant that gives ~one task per core.
+        //   - 16-core Ryzen, outChannels=32: per-channel = 32 tasks (2× cores),
+        //     block2 = 16 tasks (1× cores), block4 = 8 tasks (0.5× cores).
+        //     block2 maximizes parallelism without over-subscribing.
+        //   - With outChannels >> cores (e.g. 256 oc on 16 cores), per-channel
+        //     is fine; block2/block4 lose nothing on parallelism and gain
+        //     register-resident accumulator amortization.
+        Conv3x3Variant variant = ActiveConv3x3Variant;
+        if (variant == Conv3x3Variant.Auto)
+        {
+            int cores = Math.Max(1, Environment.ProcessorCount);
+            // Minimum tasks per core for healthy parallel utilization
+            int minTasks = cores;
+            if (canUseBlock4 && (outChannels / 4) >= minTasks)
+                variant = Conv3x3Variant.Block4;
+            else if (canUseBlock2 && (outChannels / 2) >= minTasks)
+                variant = Conv3x3Variant.Block2;
+            else
+                variant = Conv3x3Variant.PerChannel;
+        }
+        // Fallback if requested variant not applicable (wrong shape).
+        if (variant == Conv3x3Variant.Block4 && !canUseBlock4) variant = Conv3x3Variant.PerChannel;
+        if (variant == Conv3x3Variant.Block2 && !canUseBlock2) variant = Conv3x3Variant.PerChannel;
 
         for (int b = 0; b < batch; b++)
         {
             float* inputBatch = input + b * inChannels * height * width;
             float* outputBatch = output + b * outChannels * outHeight * outWidth;
 
-            if (canUseOcBlock4)
+            if (variant == Conv3x3Variant.Block4)
             {
                 int numBlocks = outChannels / 4;
                 if (useParallel)
@@ -90,12 +127,32 @@ internal static class SimdConvHelper
                 else
                 {
                     for (int ocb = 0; ocb < numBlocks; ocb++)
-                    {
                         Conv3x3Stride1Pad1_OcBlock4(
                             inputBatch, kernel + ocb * 4 * inChannels * 9,
                             outputBatch + ocb * 4 * outputSize,
                             inChannels, height, width, outHeight, outWidth);
-                    }
+                }
+            }
+            else if (variant == Conv3x3Variant.Block2)
+            {
+                int numBlocks = outChannels / 2;
+                if (useParallel)
+                {
+                    CpuParallelSettings.LightweightParallel(numBlocks, ocb =>
+                    {
+                        Conv3x3Stride1Pad1_OcBlock2(
+                            inputBatch, kernel + ocb * 2 * inChannels * 9,
+                            outputBatch + ocb * 2 * outputSize,
+                            inChannels, height, width, outHeight, outWidth);
+                    });
+                }
+                else
+                {
+                    for (int ocb = 0; ocb < numBlocks; ocb++)
+                        Conv3x3Stride1Pad1_OcBlock2(
+                            inputBatch, kernel + ocb * 2 * inChannels * 9,
+                            outputBatch + ocb * 2 * outputSize,
+                            inChannels, height, width, outHeight, outWidth);
                 }
             }
             else if (useParallel)
@@ -112,13 +169,125 @@ internal static class SimdConvHelper
             else
             {
                 for (int oc = 0; oc < outChannels; oc++)
-                {
                     Conv3x3Stride1SingleChannel(
                         inputBatch, kernel + oc * inChannels * 9,
                         outputBatch + oc * outputSize,
                         inChannels, height, width, outHeight, outWidth,
                         padH, padW, dilationH, dilationW);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 2-oc-blocked variant of <see cref="Conv3x3Stride1Pad1_OcBlock4"/>.
+    /// Holds 2 accumulators per chunk for better parallelism granularity
+    /// when outChannels / 2 ≈ core count (e.g. outChannels=32 on 16 cores
+    /// gives 16 tasks vs 8 with the 4-oc variant).
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3Stride1Pad1_OcBlock2(
+        float* input,
+        float* kBlock,   // [2, inChannels, 9]
+        float* outBlock, // [2, outHeight, outWidth]
+        int inChannels, int height, int width,
+        int outHeight, int outWidth)
+    {
+        int ocStride = outHeight * outWidth;
+        int icSpatialStride = height * width;
+
+        for (int oc = 0; oc < 2; oc++)
+            new Span<float>(outBlock + oc * ocStride, ocStride).Clear();
+
+        for (int oc = 0; oc < 2; oc++)
+        {
+            float* outChan = outBlock + oc * ocStride;
+            float* kChan = kBlock + oc * inChannels * 9;
+            ProcessConv3x3BoundaryRowAllIc(input, kChan, outChan,
+                inChannels, icSpatialStride, height, width, outWidth, oh: 0);
+            if (outHeight > 1)
+                ProcessConv3x3BoundaryRowAllIc(input, kChan, outChan,
+                    inChannels, icSpatialStride, height, width, outWidth, oh: outHeight - 1);
+        }
+
+        for (int oh = 1; oh < outHeight - 1; oh++)
+        {
+            int ihTop = oh - 1;
+            // Left boundary col
+            for (int oc = 0; oc < 2; oc++)
+            {
+                float* outChan = outBlock + oc * ocStride;
+                float* kChan = kBlock + oc * inChannels * 9;
+                outChan[oh * outWidth + 0] = ScalarConv3x3At(input, kChan,
+                    inChannels, icSpatialStride, height, width, oh, 0, 1, 1);
+            }
+
+            int owStart = 1, owEnd = outWidth - 1;
+            int owSimdEnd = owStart + ((owEnd - owStart) & ~7);
+
+            for (int ow = owStart; ow < owSimdEnd; ow += 8)
+            {
+                int iw = ow - 1;
+                var acc0 = Vector256<float>.Zero;
+                var acc1 = Vector256<float>.Zero;
+
+                for (int ic = 0; ic < inChannels; ic++)
+                {
+                    float* inputChan = input + ic * icSpatialStride;
+                    var r0_0 = Avx.LoadVector256(inputChan + ihTop       * width + iw);
+                    var r0_1 = Avx.LoadVector256(inputChan + ihTop       * width + iw + 1);
+                    var r0_2 = Avx.LoadVector256(inputChan + ihTop       * width + iw + 2);
+                    var r1_0 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw);
+                    var r1_1 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw + 1);
+                    var r1_2 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw + 2);
+                    var r2_0 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw);
+                    var r2_1 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw + 1);
+                    var r2_2 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw + 2);
+
+                    float* k0 = kBlock + 0 * inChannels * 9 + ic * 9;
+                    float* k1 = kBlock + 1 * inChannels * 9 + ic * 9;
+
+                    acc0 = Fma.MultiplyAdd(r0_0, Vector256.Create(k0[0]), acc0);
+                    acc0 = Fma.MultiplyAdd(r0_1, Vector256.Create(k0[1]), acc0);
+                    acc0 = Fma.MultiplyAdd(r0_2, Vector256.Create(k0[2]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_0, Vector256.Create(k0[3]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_1, Vector256.Create(k0[4]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_2, Vector256.Create(k0[5]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_0, Vector256.Create(k0[6]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_1, Vector256.Create(k0[7]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_2, Vector256.Create(k0[8]), acc0);
+
+                    acc1 = Fma.MultiplyAdd(r0_0, Vector256.Create(k1[0]), acc1);
+                    acc1 = Fma.MultiplyAdd(r0_1, Vector256.Create(k1[1]), acc1);
+                    acc1 = Fma.MultiplyAdd(r0_2, Vector256.Create(k1[2]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_0, Vector256.Create(k1[3]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_1, Vector256.Create(k1[4]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_2, Vector256.Create(k1[5]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_0, Vector256.Create(k1[6]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_1, Vector256.Create(k1[7]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_2, Vector256.Create(k1[8]), acc1);
                 }
+
+                Avx.Store(outBlock + 0 * ocStride + oh * outWidth + ow, acc0);
+                Avx.Store(outBlock + 1 * ocStride + oh * outWidth + ow, acc1);
+            }
+
+            for (int ow = owSimdEnd; ow < owEnd; ow++)
+            {
+                for (int oc = 0; oc < 2; oc++)
+                {
+                    float* outChan = outBlock + oc * ocStride;
+                    float* kChan = kBlock + oc * inChannels * 9;
+                    outChan[oh * outWidth + ow] = ScalarConv3x3At(input, kChan,
+                        inChannels, icSpatialStride, height, width, oh, ow, 1, 1);
+                }
+            }
+
+            for (int oc = 0; oc < 2; oc++)
+            {
+                float* outChan = outBlock + oc * ocStride;
+                float* kChan = kBlock + oc * inChannels * 9;
+                outChan[oh * outWidth + outWidth - 1] = ScalarConv3x3At(input, kChan,
+                    inChannels, icSpatialStride, height, width, oh, outWidth - 1, 1, 1);
             }
         }
     }
