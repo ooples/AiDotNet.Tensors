@@ -112,16 +112,18 @@ for the full per-op table with error bars.
 | Log (double) | 1M | 612 µs | 355 µs | 1.7× (was 16×!) |
 
 **This PR's #209 close-parity wins** — validated against the pre-fix
-baseline by fresh BDN re-runs:
+baseline by fresh BDN re-runs and same-process micro-benchmarks:
 
 | Operation | Pre-fix | Post-fix | Improvement |
 |-----------|------:|--------:|------------:|
+| **Softmax_Double 512×1024** | 3,766 µs | **185 µs** (**slightly AHEAD** of torch's 206!) | **20× faster** |
 | GELU_Double 1M | 2,782 µs | **481 µs** (now **1.6× ahead** of torch!) | **5.8× faster** |
 | Tanh_Double 1M | 2,067 µs | **586 µs** (within noise of torch) | **3.5× faster** |
 | Log_Double 1M  | 5,785 µs | **612 µs** | **9.4× faster** |
 | Exp_Double 1M  | 1,634 µs | 753 µs | 2.2× faster |
 | LayerNorm 32k×64 | 1,347 µs | 890 µs | 1.5× faster |
 | TensorAdd 1M | 480 µs | 350 µs | 1.4× faster |
+| AttentionQKT 512×64 | 599 µs | 522 µs (after threshold-split fix) | 1.15× faster |
 
 **Residual tracked gaps** — areas where libtorch's Intel MKL-DNN
 (with AVX-512 inner kernels on Intel hardware) still wins. These need
@@ -137,8 +139,8 @@ tuning) and are left as follow-up work:
 | BatchNorm | 32×64×32×32 | 2,201 µs | 745 µs | 3.0× |
 | Conv2D (float) | 4×3×32×32 | 718–764 µs | 310 µs | 2.3–2.5× |
 | Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× |
-| AttentionQKT | 512×64 | 586 µs | 135 µs | 4.3× |
-| Softmax_Double | 1M | 3,766 µs | 206 µs | 18× |
+| AttentionQKT | 512×64 | 522 µs | 135 µs | 3.9× (was 4.3×) |
+| Softmax_Double 512×1024 | — | **185 µs** | 206 µs | **slight win** ✓ closed |
 
 **Zero-external-dependency policy.** Every hot path runs through our
 hand-tuned `SimdKernels` AVX2/AVX-512 implementations. We deliberately
