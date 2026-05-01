@@ -343,4 +343,67 @@ public class NormConvAccuracyTests
                 Assert.Equal(first[i], r[i]);
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Softmax (double) — guards the new SoftmaxRowDoubleUnsafe SIMD kernel.
+    // Reference: scalar double-precision max → exp(x-max) → divide.
+    // ─────────────────────────────────────────────────────────────────
+
+    private static double[] DeterministicDoubleData(int count, int seed)
+    {
+        var rng = new Random(seed);
+        var d = new double[count];
+        for (int i = 0; i < count; i++) d[i] = rng.NextDouble() * 4.0 - 2.0; // [-2, 2]
+        return d;
+    }
+
+    private static void SoftmaxDoubleReference(double[] input, int rows, int cols, double[] output)
+    {
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            double maxVal = double.NegativeInfinity;
+            for (int j = 0; j < cols; j++) if (input[off + j] > maxVal) maxVal = input[off + j];
+            double sumExp = 0;
+            for (int j = 0; j < cols; j++) { double e = Math.Exp(input[off + j] - maxVal); output[off + j] = e; sumExp += e; }
+            if (sumExp == 0.0) continue;
+            double invSum = 1.0 / sumExp;
+            for (int j = 0; j < cols; j++) output[off + j] *= invSum;
+        }
+    }
+
+    [Theory]
+    [InlineData(512, 1024)]   // BDN benchmark shape
+    [InlineData(1, 16)]       // edge: 1 row
+    [InlineData(1, 1)]        // edge: 1×1 (sums to 1, single output is 1.0)
+    [InlineData(4, 13)]       // edge: prime axis size (tail handling)
+    [InlineData(64, 256)]     // medium
+    public void Softmax_Double_FloatMatchesReference(int rows, int cols)
+    {
+        var inputData = DeterministicDoubleData(rows * cols, seed: 19_001);
+        var input = new Tensor<double>(inputData, new[] { rows, cols });
+        var actualResult = E.Softmax(input, axis: -1);
+        var actual = actualResult.GetDataArray();
+
+        var expected = new double[rows * cols];
+        SoftmaxDoubleReference(inputData, rows, cols, expected);
+
+        // Tighter tolerance for double-precision reference (1e-12 absolute, 1e-10 relative)
+        // since FastExpDouble256 is accurate to ~1e-12 ULP per element.
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double diff = Math.Abs(expected[i] - actual[i]);
+            double scale = Math.Max(1.0, Math.Max(Math.Abs(expected[i]), Math.Abs(actual[i])));
+            Assert.True(diff <= 1e-12 + 1e-10 * scale,
+                $"i={i}: expected={expected[i]:G17}, actual={actual[i]:G17}, diff={diff:G17}");
+        }
+
+        // Sanity: each row sums to 1.0 (within numerical precision)
+        for (int r = 0; r < rows; r++)
+        {
+            double rowSum = 0;
+            for (int j = 0; j < cols; j++) rowSum += actual[r * cols + j];
+            Assert.True(Math.Abs(rowSum - 1.0) < 1e-10, $"row {r}: sum={rowSum:G17}");
+        }
+    }
 }

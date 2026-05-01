@@ -6729,6 +6729,115 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Double-precision Softmax row using AVX2 + FastExpDouble256.
+        /// Three-pass form: SIMD max reduction → SIMD subtract+exp+sum → SIMD multiply by invSum.
+        /// All passes use 4-way unrolled Vector256&lt;double&gt; (16 doubles/iter).
+        /// Closes the 18× Softmax_Double gap to libtorch's MKL-routed kernel.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static unsafe void SoftmaxRowDoubleUnsafe(double* input, double* output, int length)
+        {
+            int j;
+#if NET5_0_OR_GREATER
+            // Pass 1: SIMD max (4x unrolled Vector256<double> = 16 doubles/iter)
+            double maxVal = double.NegativeInfinity;
+            j = 0;
+            if (Avx2.IsSupported && length >= 16)
+            {
+                var vm0 = Vector256.Create(double.NegativeInfinity);
+                var vm1 = vm0; var vm2 = vm0; var vm3 = vm0;
+                int simdLen = length & ~15;
+                for (; j < simdLen; j += 16)
+                {
+                    vm0 = Avx.Max(vm0, Avx.LoadVector256(input + j));
+                    vm1 = Avx.Max(vm1, Avx.LoadVector256(input + j + 4));
+                    vm2 = Avx.Max(vm2, Avx.LoadVector256(input + j + 8));
+                    vm3 = Avx.Max(vm3, Avx.LoadVector256(input + j + 12));
+                }
+                vm0 = Avx.Max(Avx.Max(vm0, vm1), Avx.Max(vm2, vm3));
+                // Horizontal max of 4 doubles
+                var hi = vm0.GetUpper();
+                var lo = vm0.GetLower();
+                var pmax = Sse2.Max(hi, lo);
+                double a0 = pmax.GetElement(0);
+                double a1 = pmax.GetElement(1);
+                maxVal = a0 > a1 ? a0 : a1;
+            }
+            for (; j < length; j++)
+                if (input[j] > maxVal) maxVal = input[j];
+
+            // Pass 2: output[j] = exp(input[j] - max), accumulate sum.
+            // 4x unrolled Vector256<double> with FastExpDouble256.
+            double sumExp = 0.0;
+            j = 0;
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                var vMaxBc = Vector256.Create(maxVal);
+                var vsum0 = Vector256<double>.Zero;
+                var vsum1 = Vector256<double>.Zero;
+                var vsum2 = Vector256<double>.Zero;
+                var vsum3 = Vector256<double>.Zero;
+                int simdLen = length & ~15;
+                for (; j < simdLen; j += 16)
+                {
+                    var e0 = FastExpDouble256(Avx.Subtract(Avx.LoadVector256(input + j),       vMaxBc));
+                    var e1 = FastExpDouble256(Avx.Subtract(Avx.LoadVector256(input + j + 4),   vMaxBc));
+                    var e2 = FastExpDouble256(Avx.Subtract(Avx.LoadVector256(input + j + 8),   vMaxBc));
+                    var e3 = FastExpDouble256(Avx.Subtract(Avx.LoadVector256(input + j + 12),  vMaxBc));
+                    Avx.Store(output + j,      e0);
+                    Avx.Store(output + j + 4,  e1);
+                    Avx.Store(output + j + 8,  e2);
+                    Avx.Store(output + j + 12, e3);
+                    vsum0 = Avx.Add(vsum0, e0);
+                    vsum1 = Avx.Add(vsum1, e1);
+                    vsum2 = Avx.Add(vsum2, e2);
+                    vsum3 = Avx.Add(vsum3, e3);
+                }
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                // Horizontal sum of 4 doubles
+                var hi = vsum0.GetUpper();
+                var lo = vsum0.GetLower();
+                var sum2 = Sse2.Add(hi, lo);
+                sumExp = sum2.GetElement(0) + sum2.GetElement(1);
+            }
+            for (; j < length; j++)
+            {
+                double e = Math.Exp(input[j] - maxVal);
+                output[j] = e;
+                sumExp += e;
+            }
+
+            // Pass 3: output[j] *= 1 / sumExp (SIMD multiply, 4x unrolled).
+            if (sumExp == 0.0) return;
+            double invSum = 1.0 / sumExp;
+            j = 0;
+            if (Avx.IsSupported && length >= 16)
+            {
+                var vInvSum = Vector256.Create(invSum);
+                int simdLen = length & ~15;
+                for (; j < simdLen; j += 16)
+                {
+                    Avx.Store(output + j,      Avx.Multiply(Avx.LoadVector256(output + j),      vInvSum));
+                    Avx.Store(output + j + 4,  Avx.Multiply(Avx.LoadVector256(output + j + 4),  vInvSum));
+                    Avx.Store(output + j + 8,  Avx.Multiply(Avx.LoadVector256(output + j + 8),  vInvSum));
+                    Avx.Store(output + j + 12, Avx.Multiply(Avx.LoadVector256(output + j + 12), vInvSum));
+                }
+            }
+#else
+            // Scalar fallback for net471 / no-AVX
+            double maxVal = double.NegativeInfinity;
+            for (j = 0; j < length; j++) if (input[j] > maxVal) maxVal = input[j];
+            double sumExp = 0.0;
+            for (j = 0; j < length; j++) { double e = Math.Exp(input[j] - maxVal); output[j] = e; sumExp += e; }
+            if (sumExp == 0.0) return;
+            double invSum = 1.0 / sumExp;
+            j = 0;
+#endif
+            for (; j < length; j++)
+                output[j] *= invSum;
+        }
+
+        /// <summary>
         /// Computes log_softmax for a single contiguous row using unsafe pointers.
         /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
         /// Uses inline FastExp256 to avoid per-call overhead.

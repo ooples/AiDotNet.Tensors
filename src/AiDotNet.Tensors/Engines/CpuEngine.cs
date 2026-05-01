@@ -14813,7 +14813,9 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Double SIMD fast path for last-axis softmax
+        // Double SIMD fast path for last-axis softmax — parallel + Vector256<double>
+        // via FastExpDouble256. Mirrors the float path's structure: PersistentParallelExecutor
+        // chunks rows across cores, each row uses SoftmaxRowDoubleUnsafe.
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
@@ -14823,25 +14825,34 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 double* pIn = (double*)pinIn.Pointer;
                 double* pOut = (double*)pinOut.Pointer;
-                for (int row = 0; row < outerSize; row++)
+                int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+                bool useParallel = outerSize >= 4 && outerSize * axisSize >= 16384;
+                if (useParallel)
                 {
-                    double* rIn = pIn + row * axisSize;
-                    double* rOut = pOut + row * axisSize;
-                    // Find max
-                    double maxVal = double.NegativeInfinity;
-                    for (int j = 0; j < axisSize; j++)
-                        if (rIn[j] > maxVal) maxVal = rIn[j];
-                    // Exp(x - max) and sum
-                    double sumExp = 0;
-                    for (int j = 0; j < axisSize; j++)
+                    int numChunks = Math.Min(maxThreads, outerSize);
+                    int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
+                    IntPtr ipIn = (IntPtr)pIn;
+                    IntPtr ipOut = (IntPtr)pOut;
+                    int axisSz = axisSize;
+                    int outerSz = outerSize;
+                    Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
                     {
-                        rOut[j] = Math.Exp(rIn[j] - maxVal);
-                        sumExp += rOut[j];
-                    }
-                    // Normalize
-                    double invSum = 1.0 / sumExp;
-                    for (int j = 0; j < axisSize; j++)
-                        rOut[j] *= invSum;
+                        int startRow = chunk * rowsPerChunk;
+                        int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
+                        for (int row = startRow; row < endRow; row++)
+                            SimdKernels.SoftmaxRowDoubleUnsafe(
+                                (double*)ipIn + row * axisSz,
+                                (double*)ipOut + row * axisSz,
+                                axisSz);
+                    });
+                }
+                else
+                {
+                    for (int row = 0; row < outerSize; row++)
+                        SimdKernels.SoftmaxRowDoubleUnsafe(
+                            pIn + row * axisSize,
+                            pOut + row * axisSize,
+                            axisSize);
                 }
             }
             DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
