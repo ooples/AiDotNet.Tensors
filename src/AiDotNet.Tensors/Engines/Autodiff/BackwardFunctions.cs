@@ -362,29 +362,18 @@ internal static class BackwardFunctions<T>
     /// Work threshold (M·K·N) above which the float32 backward MatMul prefers
     /// <see cref="SimdGemm"/> over <see cref="BlasProvider.TryGemmEx"/>. The
     /// goal is "take SimdGemm only when it will actually run parallel" —
-    /// SimdGemm has its own internal parallel gate (≥2 Mi work-elements,
-    /// scaled up to 20 Mi by core count), so anything below that runs
-    /// sequentially inside SimdGemm and offers no advantage over BLAS.
+    /// SimdGemm has its own internal parallel gate, so anything below that
+    /// runs sequentially inside SimdGemm and offers no advantage over BLAS.
+    /// We reference <see cref="SimdGemm.ParallelWorkThreshold"/> directly
+    /// so the two stay in lockstep — drifting them is the dispatch bug.
     ///
     /// On installs with a parallel native BLAS, BLAS already uses many cores
     /// and we don't need SimdGemm. On installs whose BLAS provider is
     /// single-threaded (Microsoft.ML/CRT BLAS lacks internal Parallel.For on
     /// some runtimes), SimdGemm overtakes BLAS — but only at shapes large
-    /// enough that SimdGemm itself parallelizes. So the threshold is mirrored
-    /// from <c>SimdGemm.ParallelWorkThreshold</c> at runtime.
+    /// enough that SimdGemm itself parallelizes.
     /// </summary>
-    private static readonly long MatMulBackwardSimdThreshold = ComputeSimdGemmParallelThreshold();
-
-    private static long ComputeSimdGemmParallelThreshold()
-    {
-        // Mirrors SimdGemm.ComputeParallelWorkThreshold so the backward path
-        // takes SimdGemm exactly when SimdGemm itself will go parallel.
-        int cores = Math.Max(1, Environment.ProcessorCount);
-        long scaled = (20L * 1024 * 1024 / 16) * cores;
-        if (scaled < 2L * 1024 * 1024) scaled = 2L * 1024 * 1024;
-        if (scaled > 20L * 1024 * 1024) scaled = 20L * 1024 * 1024;
-        return scaled;
-    }
+    private static long MatMulBackwardSimdThreshold => SimdGemm.ParallelWorkThreshold;
 
     /// <summary>d(A@B)/dA = grad @ B^T, d(A@B)/dB = A^T @ grad</summary>
     internal static void MatMulBackward(
@@ -413,30 +402,32 @@ internal static class BackwardFunctions<T>
                 int K = inputs[0]._shape[1];     // inner dim (cols of A = rows of B)
                 int N = inputs[1]._shape[1];     // cols of B and gradOutput
 
-                // Pool gradient buffers via AutoTensorCache — zero allocation on steps 2+.
-                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                var gradAData = (float[])(object)gradATensor.GetDataArray();
-                var gradBData = (float[])(object)gradBTensor.GetDataArray();
-
-                // Parallel SimdGemm path: bypasses single-threaded BLAS providers
-                // when work is large enough to amortize task spawn cost.
                 long backwardWork = (long)M * K * N;
-                if (backwardWork >= MatMulBackwardSimdThreshold)
+                bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+                if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
                 {
-                    // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. B is stored row-major [K,N] (ldb=N), transB=true.
-                    SimdGemm.Sgemm(dCArr, N, false, bArr, N, true, gradAData.AsSpan(0, M * K), M, N, K);
-                    // gradB[K,N] = Aᵀ[K,M] · dC[M,N]. A is stored row-major [M,K] (lda=K), transA=true.
-                    SimdGemm.Sgemm(aArr, K, true, dCArr, N, false, gradBData.AsSpan(0, K * N), K, M, N);
+                    // Defer rentals until we know a fast path will use them — the
+                    // alternative leaks AutoTensorCache buffers if both paths
+                    // decline (BLAS not available + below SIMD threshold), since
+                    // the engine fallback below allocates its own gradient tensors.
+                    var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                    var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                    var gradAData = (float[])(object)gradATensor.GetDataArray();
+                    var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
-                    return;
-                }
+                    if (backwardWork >= MatMulBackwardSimdThreshold)
+                    {
+                        // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. B is stored row-major [K,N] (ldb=N), transB=true.
+                        SimdGemm.Sgemm(dCArr, N, false, bArr, N, true, gradAData.AsSpan(0, M * K), M, N, K);
+                        // gradB[K,N] = Aᵀ[K,M] · dC[M,N]. A is stored row-major [M,K] (lda=K), transA=true.
+                        SimdGemm.Sgemm(aArr, K, true, dCArr, N, false, gradBData.AsSpan(0, K * N), K, M, N);
 
-                // BLAS fast path (may be single-threaded depending on provider):
-                if (BlasProvider.IsAvailable)
-                {
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                        return;
+                    }
+
+                    // BLAS fast path (may be single-threaded depending on provider):
                     bool okA = BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, N, true, gradAData, 0, K);
                     bool okB = BlasProvider.TryGemmEx(K, N, M,
                         aArr, 0, K, true, dCArr, 0, N, false, gradBData, 0, N);
@@ -447,7 +438,10 @@ internal static class BackwardFunctions<T>
                         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
                         return;
                     }
-                    // Either GEMM refused — fall through to generic path
+                    // BLAS refused — return buffers to the cache before falling through
+                    // so the engine fallback's allocator hits a warm pool next call.
+                    Helpers.AutoTensorCache.Return(gradATensor);
+                    Helpers.AutoTensorCache.Return(gradBTensor);
                 }
             }
         }
@@ -494,35 +488,32 @@ internal static class BackwardFunctions<T>
                 int K = inputs[0]._shape[1];
                 int N = inputs[1]._shape[0];
 
-                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                var gradAData = (float[])(object)gradATensor.GetDataArray();
-                var gradBData = (float[])(object)gradBTensor.GetDataArray();
-
-                // Parallel SimdGemm path: prefers SimdGemm over single-threaded BLAS
-                // when work crosses SimdGemm's parallel gate.
                 long backwardWork = (long)M * K * N;
-                if (backwardWork >= MatMulBackwardSimdThreshold)
+                bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+                if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
                 {
-                    // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                    SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
-                    // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                    SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
+                    var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                    var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                    var gradAData = (float[])(object)gradATensor.GetDataArray();
+                    var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
-                    return;
-                }
+                    if (backwardWork >= MatMulBackwardSimdThreshold)
+                    {
+                        // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
+                        SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
+                        // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
+                        SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
 
-                // BLAS fast path (may be single-threaded depending on provider):
-                if (BlasProvider.IsAvailable)
-                {
-                    // gradA[M,K] = gradC[M,N] · B[N,K]    (no transposes)
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                        return;
+                    }
+
+                    // BLAS fast path (may be single-threaded depending on provider):
                     bool okA = BlasProvider.TryGemmEx(M, K, N,
                         dCArr, 0, N, false,
                         bArr, 0, K, false,
                         gradAData, 0, K);
-                    // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transpose first operand)
                     bool okB = BlasProvider.TryGemmEx(N, K, M,
                         dCArr, 0, N, true,
                         aArr, 0, K, false,
@@ -534,6 +525,9 @@ internal static class BackwardFunctions<T>
                         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
                         return;
                     }
+                    // BLAS refused — return buffers before falling through.
+                    Helpers.AutoTensorCache.Return(gradATensor);
+                    Helpers.AutoTensorCache.Return(gradBTensor);
                 }
             }
         }
@@ -2257,6 +2251,14 @@ internal static class BackwardFunctions<T>
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
+            // Decide which fast path will run BEFORE renting any buffers.
+            long backwardWork = (long)M * K * N;
+            bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+
+            if (!willTryFastPath)
+                goto fusedReluFallback;
+
             // Step 1: Fused ReLU mask — pool the masked gradient buffer
             var maskedTensor = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { M, N });
             var maskedArr = maskedTensor.GetDataArray();
@@ -2271,23 +2273,24 @@ internal static class BackwardFunctions<T>
             var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
             var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
 
-            long backwardWork = (long)M * K * N;
             if (backwardWork >= MatMulBackwardSimdThreshold)
             {
                 // Parallel SimdGemm — bypass possibly-single-threaded BLAS.
                 SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
                 SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
             }
-            else if (BlasProvider.IsAvailable)
-            {
-                if (!BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K))
-                    goto fusedReluFallback;
-                if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N))
-                    goto fusedReluFallback;
-            }
             else
             {
-                goto fusedReluFallback;
+                // tryBlas == true here.
+                if (!BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K)
+                    || !BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N))
+                {
+                    // Return rented buffers before falling through.
+                    Helpers.AutoTensorCache.Return(maskedTensor);
+                    Helpers.AutoTensorCache.Return(gradInput);
+                    Helpers.AutoTensorCache.Return(gradWeight);
+                    goto fusedReluFallback;
+                }
             }
 
             // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass, pooled buffer
@@ -2336,17 +2339,29 @@ internal static class BackwardFunctions<T>
         var inArr = (float[])(object)inputs[0].GetDataArray();
         var wArr = (float[])(object)inputs[1].GetDataArray();
 
-        // gradInput / gradWeight buffers — pooled to keep zero-alloc on steps 2+.
-        var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-        var gradInputArr = (float[])(object)gradInput.GetDataArray();
-        var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-        var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
-
         // Prefer parallel SimdGemm over single-threaded BLAS at large work sizes —
         // mirrors the gate in MatMulBackward / FusedLinearBackwardCore. The
         // dispatcher functions already verified GradientTape<T>.Current is null
         // before getting here (BLAS path is only taken outside higher-order AD).
         long backwardWork = (long)M * K * N;
+        bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+        bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+
+        if (!willTryFastPath)
+        {
+            // No fast path applies — fall back to engine-based backward immediately
+            // without renting buffers we won't use.
+            var maskedTensorEarly = new Tensor<T>((T[])(object)maskedArr, new[] { M, N });
+            FusedLinearActivationBackwardFallback(maskedTensorEarly, inputs, grads, engine);
+            return;
+        }
+
+        // Defer rentals until we're committed to a fast path.
+        var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+        var gradInputArr = (float[])(object)gradInput.GetDataArray();
+        var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+        var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
+
         bool used = false;
 
         if (backwardWork >= MatMulBackwardSimdThreshold)
@@ -2357,8 +2372,9 @@ internal static class BackwardFunctions<T>
             SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
             used = true;
         }
-        else if (BlasProvider.IsAvailable)
+        else
         {
+            // tryBlas == true here.
             bool okInput = BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
             bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
             used = okInput && okWeight;
@@ -2366,7 +2382,9 @@ internal static class BackwardFunctions<T>
 
         if (!used)
         {
-            // No fast path took — fall back to engine-based backward.
+            // BLAS refused — return rented buffers before falling through.
+            Helpers.AutoTensorCache.Return(gradInput);
+            Helpers.AutoTensorCache.Return(gradWeight);
             var maskedTensor = new Tensor<T>((T[])(object)maskedArr, new[] { M, N });
             FusedLinearActivationBackwardFallback(maskedTensor, inputs, grads, engine);
             return;
@@ -3783,13 +3801,21 @@ internal static class BackwardFunctions<T>
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
-            // Pool gradient buffers via AutoTensorCache — zero alloc on steps 2+
+            long backwardWork = (long)M * K * N;
+            bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+
+            if (!willTryFastPath)
+                goto fusedFallback;
+
+            // Defer rentals until we're committed to a fast path so they don't leak
+            // when we fall through to the engine fallback (which allocates its own
+            // gradient tensors).
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
             var gradInputArr = (float[])(object)inputGrad.GetDataArray();
             var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
 
-            long backwardWork = (long)M * K * N;
             bool used = false;
 
             if (backwardWork >= MatMulBackwardSimdThreshold)
@@ -3802,15 +3828,21 @@ internal static class BackwardFunctions<T>
                 SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
                 used = true;
             }
-            else if (BlasProvider.IsAvailable)
+            else
             {
+                // tryBlas == true here.
                 bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
                 bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
                 used = okInput && okWeight;
             }
 
             if (!used)
-                goto fusedFallback; // No fast path took — use engine fallback
+            {
+                // Return rented buffers before falling through.
+                Helpers.AutoTensorCache.Return(inputGrad);
+                Helpers.AutoTensorCache.Return(weightGrad);
+                goto fusedFallback;
+            }
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
