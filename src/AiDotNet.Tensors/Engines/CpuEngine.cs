@@ -8138,10 +8138,14 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Double fast path: pointer-based SIMD Sigmoid with polynomial approximation.
+        // Double fast path: pointer-based SIMD Sigmoid with FastExpDouble256.
         // NOTE: TensorPrimitives.Sigmoid for double regressed 12× in BENCHMARK
         // RESULTS (530 µs → 6,121 µs at 1M elements) — staying on the in-house
         // path until the framework path improves.
+        //
+        // Switched from Parallel.For to ParallelComputeBound (persistent
+        // pool, ~5 µs dispatch vs Parallel.For's ~50 µs) — closes part of
+        // the residual Sigmoid_Double gap to libtorch.
         if (typeof(T) == typeof(double))
         {
             var srcMem = AsDoubleMemory(tensor.Data);
@@ -8150,31 +8154,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
             double* pDst = (double*)pinDst.Pointer;
-
-            // Parallel chunking for compute-bound sigmoid (lower threshold than bandwidth-bound)
-            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 64_000));
-            if (sigChunks >= 2)
-            {
-                int chunkSize = (length + sigChunks - 1) / sigChunks;
-                chunkSize = (chunkSize + 15) & ~15;
-                IntPtr ipSrc = (IntPtr)pSrc;
-                IntPtr ipDst = (IntPtr)pDst;
-                int len = length;
-
-                Parallel.For(0, sigChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, len - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.SigmoidUnsafe((double*)ipSrc + start, (double*)ipDst + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
-            }
+            ParallelComputeBound(pSrc, pDst, length, SimdKernels.SigmoidUnsafe);
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
