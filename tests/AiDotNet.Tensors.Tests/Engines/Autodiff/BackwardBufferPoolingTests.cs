@@ -404,4 +404,62 @@ public class BackwardBufferPoolingTests : IDisposable
                 $"autodiff={autodiff:F4}, numerical={numerical:F4}");
         }
     }
+
+    [Fact]
+    public void FusedLinearReLU_Backward_FastPath_ReturnsScratchToCache()
+    {
+        // Exercises FusedMatMulAddReLUBackward at a shape large enough that
+        // M·K·N ≥ SimdGemm.ParallelWorkThreshold, so the success branch hits
+        // the SimdGemm fast path AND the AutoTensorCache.Return(maskedTensor)
+        // line. Without the Return, the [M,N] mask buffer would re-allocate
+        // every call instead of reusing the pool — this test verifies that
+        // running the backward N times doesn't grow the managed heap by ~M·N
+        // floats per call.
+        const int M = 256, K = 256, N = 64; // 4.19 Mi work-elements > 2 Mi parallel gate
+
+        var input = new Tensor<float>(MakeFilled(M * K, 0.01f), new[] { M, K });
+        var weights = new Tensor<float>(MakeFilled(K * N, 0.005f), new[] { K, N });
+        var bias = new Tensor<float>(MakeFilled(N, 0.01f), new[] { 1, N });
+
+        // Warmup: prime AutoTensorCache pools so cross-test heap state stabilizes.
+        for (int w = 0; w < 3; w++)
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            var l = _engine.ReduceSum(o, null);
+            t.ComputeGradients(l, new[] { input, weights, bias });
+        }
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+        long start = GC.GetTotalMemory(forceFullCollection: true);
+        const int iters = 20;
+        for (int i = 0; i < iters; i++)
+        {
+            using var tape = new GradientTape<float>();
+            var output = _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            var loss = _engine.ReduceSum(output, null);
+            var grads = tape.ComputeGradients(loss, new[] { input, weights, bias });
+            Assert.True(grads.ContainsKey(weights));
+        }
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long end = GC.GetTotalMemory(forceFullCollection: true);
+
+        // If the maskedTensor isn't returned, each call leaks an [M,N] = 16384 floats
+        // = 64 KB. 20 iters × 64 KB = 1.28 MB heap growth. Cap at 200 KB/call so
+        // the test catches the regression with margin. (The test class itself
+        // doesn't run under coverage on CI, but the executed line shows up in
+        // the Test with Coverage step.)
+        long perCall = (end - start) / iters;
+        Assert.True(perCall < 200_000,
+            $"FusedLinear+ReLU fast-path backward retained {perCall} B/call " +
+            $"over {iters} iters (start={start} end={end}). Suggests the " +
+            $"maskedTensor scratch buffer isn't being returned to AutoTensorCache.");
+    }
+
+    private static float[] MakeFilled(int len, float scale)
+    {
+        var data = new float[len];
+        for (int i = 0; i < len; i++) data[i] = (float)((i * 0.017 + 0.1) * scale);
+        return data;
+    }
 }
