@@ -24,6 +24,44 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunConv2DDouble()
+    {
+        Console.WriteLine("=== Conv2D<double> micro-benchmark ===");
+        var engine = new CpuEngine();
+        var shapes = new (int b, int ic, int h, int w, int oc)[]
+        {
+            (1, 3, 32, 32, 16),     // BDN Conv2D_Double benchmark shape
+            (1, 16, 64, 64, 32),    // larger ResNet
+            (4, 3, 32, 32, 16),     // batched
+        };
+        foreach (var (b, ic, h, w, oc) in shapes)
+        {
+            var rng = new Random(42);
+            var inputData = new double[b * ic * h * w];
+            var kernelData = new double[oc * ic * 9];
+            for (int i = 0; i < inputData.Length; i++)  inputData[i]  = rng.NextDouble() * 2 - 1;
+            for (int i = 0; i < kernelData.Length; i++) kernelData[i] = rng.NextDouble() * 2 - 1;
+            var input = new Tensor<double>(inputData, new[] { b, ic, h, w });
+            var kernel = new Tensor<double>(kernelData, new[] { oc, ic, 3, 3 });
+
+            for (int i = 0; i < 10; i++) { var rWarm = engine.Conv2D(input, kernel, 1, 1, 1); _ = rWarm; }
+            const int iters = 50;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                var rMeas = engine.Conv2D(input, kernel, 1, 1, 1);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double mean = samples.Average();
+            double min = samples.Min();
+            Console.WriteLine($"  Shape [{b},{ic},{h},{w}]→[{oc},3,3]:  mean={mean,8:F1} µs   min={min,8:F1} µs");
+        }
+        Console.WriteLine();
+    }
+
     public static void RunMatMul()
     {
         Console.WriteLine("=== MatMul (TensorMatMul, float) micro-benchmark ===");

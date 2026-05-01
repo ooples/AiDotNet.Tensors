@@ -55,6 +55,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-conv2d-double")
+        {
+            Conv2DAbBench.RunConv2DDouble();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
