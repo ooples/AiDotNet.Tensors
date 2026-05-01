@@ -7330,6 +7330,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // Threshold: direct kernel for ≤4M FMAs (the BDN shape is 0.44M),
             // im2col+GEMM for larger (where its better cache reuse dominates
             // the lack of row-pairing in the direct kernel).
+#if !NET471
+            // SimdConvHelper.Conv3x3Stride1Double is gated on AVX2/FMA intrinsics
+            // (System.Runtime.Intrinsics is unavailable on net471 — the file is
+            // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
+            // fall through to the im2col+GEMM path below.
             long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
@@ -7354,6 +7359,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 AutoTracer.RecordOp("Conv2D", result, eng => result);
                 return result;
             }
+#endif
 
             Conv2DWithIm2ColDouble(
                 input as Tensor<double> ?? throw new InvalidCastException(),
