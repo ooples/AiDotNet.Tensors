@@ -194,6 +194,75 @@ public class MathInvariantExtendedTests
     [Fact] public void Gather_KnownValues() { var src = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60 }, [3, 2]); var idx = new Tensor<int>(new[] { 1, 2 }, new[] { 2 }); var r = E.TensorGather(src, idx, 0).GetDataArray(); Assert.Equal(30f, r[0], Tol); Assert.Equal(40f, r[1], Tol); Assert.Equal(50f, r[2], Tol); }
     [Fact] public void IndexSelect_Shape() { var src = R([10, 4], 1); var idx = new Tensor<int>(new[] { 0, 2, 5 }, new[] { 3 }); Assert.Equal(new[] { 3, 4 }, E.TensorIndexSelect(src, idx, 0).Shape.ToArray()); }
     [Fact] public void ScatterAdd_IncreasesDim() { var dst = C(0f, [5, 4]); var src = R([3, 4], 1); var idx = new Tensor<int>(new[] { 0, 2, 4 }, new[] { 3 }); var r = E.TensorScatterAdd(dst, idx, src, 0); Assert.Equal(new[] { 5, 4 }, r.Shape.ToArray()); }
+    [Fact] public void ScatterAdd_Axis1_AddsAlongInner()
+    {
+        var dst = new Tensor<float>(new float[] { 0, 0, 0, 0,  0, 0, 0, 0 }, new[] { 2, 4 });
+        var src = new Tensor<float>(new float[] { 1, 2,  3, 4 }, new[] { 2, 2 });
+        var idx = new Tensor<int>(new[] { 1, 3 }, new[] { 2 });
+        var r = E.TensorScatterAdd(dst, idx, src, 1).GetDataArray();
+        Assert.Equal(new[] { 0f, 1f, 0f, 2f,  0f, 3f, 0f, 4f }, r);
+    }
+    [Fact] public void ScatterAdd_3D_Axis1_RankAware()
+    {
+        // dst[2,5,3] zero; src[2,2,3]={1..12}; idx=[0,4]; expect dst[:,0,:]+=src[:,0,:], dst[:,4,:]+=src[:,1,:].
+        var dst = C(0f, [2, 5, 3]);
+        var src = new Tensor<float>(Enumerable.Range(1, 12).Select(i => (float)i).ToArray(), new[] { 2, 2, 3 });
+        var idx = new Tensor<int>(new[] { 0, 4 }, new[] { 2 });
+        var r = E.TensorScatterAdd(dst, idx, src, 1).GetDataArray();
+        // outer=0: row0=[1,2,3], row4=[4,5,6]. outer=1: row0=[7,8,9], row4=[10,11,12].
+        Assert.Equal(1f, r[0]); Assert.Equal(2f, r[1]); Assert.Equal(3f, r[2]);
+        Assert.Equal(4f, r[12]); Assert.Equal(5f, r[13]); Assert.Equal(6f, r[14]);
+        Assert.Equal(7f, r[15]); Assert.Equal(8f, r[16]); Assert.Equal(9f, r[17]);
+        Assert.Equal(10f, r[27]); Assert.Equal(11f, r[28]); Assert.Equal(12f, r[29]);
+    }
+    [Fact] public void ScatterAdd_NegativeAxis_NormalizedFromTrailing()
+    {
+        // axis=-1 must equal axis=lastdim.
+        var dst = C(0f, [2, 4]);
+        var src = new Tensor<float>(new float[] { 1, 2,  3, 4 }, new[] { 2, 2 });
+        var idx = new Tensor<int>(new[] { 1, 3 }, new[] { 2 });
+        var rNeg = E.TensorScatterAdd(dst, idx, src, -1).GetDataArray();
+        var rPos = E.TensorScatterAdd(dst, idx, src, 1).GetDataArray();
+        Assert.Equal(rPos, rNeg);
+    }
+    [Fact] public void ScatterAdd_DuplicateIndices_Accumulate()
+    {
+        // PyTorch index_add: duplicate indices accumulate into the same row.
+        var dst = C(0f, [3, 2]);
+        var src = new Tensor<float>(new float[] { 1, 1,  2, 2,  3, 3 }, new[] { 3, 2 });
+        var idx = new Tensor<int>(new[] { 0, 0, 1 }, new[] { 3 });
+        var r = E.TensorScatterAdd(dst, idx, src, 0).GetDataArray();
+        Assert.Equal(new[] { 3f, 3f,  3f, 3f,  0f, 0f }, r);
+    }
+    [Fact] public void ScatterAdd_OutOfRangeIndex_Throws()
+    {
+        // Match PyTorch's index_add_ contract: out-of-range indices throw,
+        // never silently drop the update.
+        var dst = C(0f, [3, 2]);
+        var src = R([2, 2], 1);
+        var negIdx = new Tensor<int>(new[] { -1, 0 }, new[] { 2 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => E.TensorScatterAdd(dst, negIdx, src, 0));
+        var oobIdx = new Tensor<int>(new[] { 0, 5 }, new[] { 2 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => E.TensorScatterAdd(dst, oobIdx, src, 0));
+    }
+    [Fact] public void MatMulTransposed_MatchesMaterializedTranspose()
+    {
+        // C[M,N] = A[M,K] · Bᵀ where B is stored as [N,K]. Result must equal
+        // MatMul(A, Transpose(B)) for the materialized fallback path.
+        var a = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 }); // [M=2, K=3]
+        var b = new Tensor<float>(new float[] { 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 }, new[] { 4, 3 }); // [N=4, K=3]
+        var fast = E.TensorMatMulTransposed(a, b).GetDataArray();
+        var bT = E.TensorTranspose(b);
+        var slow = E.TensorMatMul(a, bT).GetDataArray();
+        Assert.Equal(slow.Length, fast.Length);
+        for (int i = 0; i < slow.Length; i++) Assert.Equal(slow[i], fast[i], Tol);
+    }
+    [Fact] public void MatMulTransposed_KMismatch_Throws()
+    {
+        var a = R([2, 3], 1);    // [M=2, K=3]
+        var b = R([4, 5], 2);    // [N=4, K=5] — mismatched K
+        Assert.Throws<ArgumentException>(() => E.TensorMatMulTransposed(a, b));
+    }
 
     // ================================================================
     // TensorLerp (3)

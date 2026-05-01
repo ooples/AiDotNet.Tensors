@@ -1097,6 +1097,9 @@ public sealed partial class WebGpuBackend
             A, indices, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => true; // WebGPU shader uses bitcast<f32>(i32(idx))
+
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         => ArgMax(A, indices, outerSize, reduceSize);
 

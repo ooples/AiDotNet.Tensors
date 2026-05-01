@@ -119,6 +119,15 @@ public sealed partial class WebGpuBackend
         return C;
     }
 
+    /// <inheritdoc/>
+    public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1f, float beta = 0f)
+    {
+        // Routes through the WGSL gemm_transposed_simple kernel which
+        // reads B with the [N, K] index pattern — no materialized
+        // transpose copy.
+        MatMulTransposedAsync(A, B, C, M, N, K, alpha, beta).GetAwaiter().GetResult();
+    }
+
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1f, float beta = 0f)
     {
         // BatchedGemmSource: binding(0)=A, binding(1)=B, binding(2)=C, uniform: batch_size, M, N, K, alpha, beta, pad, pad

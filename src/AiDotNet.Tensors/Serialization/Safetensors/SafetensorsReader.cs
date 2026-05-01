@@ -198,8 +198,9 @@ public sealed class SafetensorsReader : IDisposable
         long byteLen = entry.ByteLength;
         if (byteLen > int.MaxValue)
             throw new InvalidOperationException(
-                $"Tensor '{name}' is {byteLen} bytes — cannot fit in a single byte[]. " +
-                $"Use the streaming overload (TODO) or split the load into chunks.");
+                $"Tensor '{name}' is {byteLen} bytes — exceeds the {int.MaxValue}-byte single-array limit. " +
+                $"Use ReadRawBytesStreaming(name, destination) to copy directly into a destination Stream, or " +
+                $"ReadRawBytesChunked(name, chunkBytes) to enumerate fixed-size chunks.");
 
         var buf = new byte[byteLen];
         // Lock around the seek+read pair so two concurrent reads on
@@ -219,6 +220,138 @@ public sealed class SafetensorsReader : IDisposable
             }
         }
         return buf;
+    }
+
+    /// <summary>
+    /// Streams the tensor's raw byte payload into a caller-provided
+    /// destination stream. Bypasses the int.MaxValue single-array cap so
+    /// safetensors weights larger than 2 GiB can be loaded — typical for
+    /// Llama-2 70B (~140 GiB) sharded files where a single shard's
+    /// largest tensor exceeds the limit.
+    /// </summary>
+    public void ReadRawBytesStreaming(string name, Stream destination, int bufferSize = 1 << 20)
+    {
+        ThrowIfDisposed();
+        if (name is null) throw new ArgumentNullException(nameof(name));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        // Fail fast on a non-writable destination — clearer than the
+        // NotSupportedException Write() would throw mid-stream.
+        if (!destination.CanWrite)
+            throw new ArgumentException("Destination stream must be writable.", nameof(destination));
+        if (bufferSize <= 0) throw new ArgumentOutOfRangeException(nameof(bufferSize), "bufferSize must be > 0.");
+        if (!_entries.TryGetValue(name, out var entry))
+            throw new KeyNotFoundException($"Tensor '{name}' not found.");
+
+        // Hold _streamLock only across the seek+read pair. Releasing
+        // before destination.Write lets concurrent reads on the same
+        // SafetensorsReader make progress instead of serializing on
+        // a slow output destination (e.g., a network pipe).
+        //
+        // Rent the staging buffer from ArrayPool<byte>.Shared rather
+        // than allocating fresh — repeated large-model loads call this
+        // method once per tensor, and the default 1 MiB allocation per
+        // call adds avoidable GC pressure. Mirror ChunkedIterator's
+        // try/finally pattern so the buffer is always returned, even
+        // on exception (mid-read EOF, disposal race, destination
+        // write failure).
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
+        {
+            long remaining = entry.ByteLength;
+            long position = _dataBlockStart + entry.DataOffsetStart;
+            while (remaining > 0)
+            {
+                ThrowIfDisposed();
+                int want = (int)Math.Min(bufferSize, remaining);
+                int got;
+                lock (_streamLock)
+                {
+                    _stream.Seek(position, SeekOrigin.Begin);
+                    got = 0;
+                    while (got < want)
+                    {
+                        int n = _stream.Read(buf, got, want - got);
+                        if (n == 0)
+                            throw new EndOfStreamException(
+                                $"Unexpected EOF while streaming tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
+                        got += n;
+                    }
+                }
+                destination.Write(buf, 0, got);
+                position += got;
+                remaining -= got;
+            }
+        }
+        finally
+        {
+            // ArrayPool.Return: clearArray=false because the next
+            // caller will overwrite from the start before reading.
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// Enumerates the tensor's raw bytes as fixed-size chunks. Each yielded
+    /// segment is owned by the iterator (a single rented buffer from
+    /// <see cref="ArrayPool{T}.Shared"/> is reused) — copy out before pulling
+    /// the next chunk. Skips the 2 GiB single-array cap and avoids
+    /// materializing the full payload.
+    /// </summary>
+    public IEnumerable<ArraySegment<byte>> ReadRawBytesChunked(string name, int chunkBytes = 1 << 20)
+    {
+        ThrowIfDisposed();
+        if (name is null) throw new ArgumentNullException(nameof(name));
+        if (chunkBytes <= 0) throw new ArgumentOutOfRangeException(nameof(chunkBytes), "chunkBytes must be > 0.");
+        if (!_entries.TryGetValue(name, out var entry))
+            throw new KeyNotFoundException($"Tensor '{name}' not found.");
+        return ChunkedIterator(entry, chunkBytes, name);
+    }
+
+    private IEnumerable<ArraySegment<byte>> ChunkedIterator(SafetensorsTensorEntry entry, int chunkBytes, string name)
+    {
+        // Single rented buffer reused across all yielded chunks (matches the
+        // XML doc above). The caller MUST copy out before pulling the next
+        // chunk — the segment's underlying array is overwritten on each
+        // iteration. Returned to the pool on enumerator dispose.
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkBytes);
+        try
+        {
+            long remaining = entry.ByteLength;
+            long position = _dataBlockStart + entry.DataOffsetStart;
+            while (remaining > 0)
+            {
+                // Re-check disposal on every chunk. Iterator yields are deferred
+                // — without this, an already-disposed reader would still pump
+                // bytes from a closed stream (UB) or from a stream the caller
+                // has reused for another tensor.
+                ThrowIfDisposed();
+                int want = (int)Math.Min(chunkBytes, remaining);
+                int got;
+                // Hold the stream lock only across the seek+read pair so
+                // multiple chunked iterators can interleave on the same
+                // reader without corrupting each other's stream positions.
+                lock (_streamLock)
+                {
+                    _stream.Seek(position, SeekOrigin.Begin);
+                    got = 0;
+                    while (got < want)
+                    {
+                        int n = _stream.Read(buf, got, want - got);
+                        if (n == 0)
+                            throw new EndOfStreamException(
+                                $"Unexpected EOF while chunked-reading tensor '{name}' — {remaining} bytes remaining of {entry.ByteLength}.");
+                        got += n;
+                    }
+                }
+                yield return new ArraySegment<byte>(buf, 0, got);
+                position += got;
+                remaining -= got;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+        }
     }
 
     private static (long DataBlockStart, Dictionary<string, SafetensorsTensorEntry> Entries, Dictionary<string, string> Metadata)

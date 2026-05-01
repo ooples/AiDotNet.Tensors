@@ -135,6 +135,26 @@ public interface IDirectGpuBackend : IDisposable
     IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K);
 
     /// <summary>
+    /// Matrix multiplication where the right operand is treated as transposed:
+    /// <c>C = A · Bᵀ</c>. <paramref name="A"/> is [M, K] row-major, <paramref name="B"/>
+    /// is stored as [N, K] row-major (rows are the contracted K dim), and
+    /// <paramref name="C"/> is [M, N]. Skips the materialized transpose copy
+    /// the user-pattern would otherwise do (Q · Kᵀ in attention is the
+    /// canonical case). Backends route through their native BLAS's transB
+    /// flag (cuBLAS / rocBLAS / MPS / CLBlast) or a custom kernel
+    /// (Vulkan / WebGPU).
+    /// </summary>
+    /// <param name="A">GPU buffer for matrix A (M x K).</param>
+    /// <param name="B">GPU buffer for matrix B stored as (N x K) row-major.</param>
+    /// <param name="C">GPU buffer for output matrix C (M x N).</param>
+    /// <param name="M">Rows of A and C.</param>
+    /// <param name="N">Rows of B and columns of C.</param>
+    /// <param name="K">Columns of A and columns of B (the contracted dim).</param>
+    /// <param name="alpha">Scalar multiplier for A·Bᵀ.</param>
+    /// <param name="beta">Scalar multiplier for C (existing contents).</param>
+    void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f);
+
+    /// <summary>
     /// Batched matrix multiplication for many small matrices: C[i] = alpha * A[i] * B[i] + beta * C[i]
     /// </summary>
     /// <remarks>
@@ -1884,6 +1904,17 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="outerSize">Number of rows.</param>
     /// <param name="reduceSize">Number of columns.</param>
     void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize);
+
+    /// <summary>
+    /// True iff <see cref="ArgMaxAxis"/> writes indices into the float
+    /// output buffer as raw int32 bit patterns (e.g. WebGPU's
+    /// <c>bitcast&lt;f32&gt;(i32(idx))</c>, Vulkan's
+    /// <c>Int32BitsToSingleCompat</c>). False when indices are written
+    /// with a value cast (<c>(float)idx</c>) — the case for CUDA, HIP,
+    /// OpenCL, and Metal kernels. The host-side reader must use the
+    /// matching deserialization or every index above ~16M is corrupted.
+    /// </summary>
+    bool ArgMaxIndicesAreBitReinterpreted { get; }
 
     #endregion
 

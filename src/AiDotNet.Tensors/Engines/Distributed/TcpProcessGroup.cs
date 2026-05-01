@@ -94,56 +94,113 @@ public sealed class TcpProcessGroup : IProcessGroup
             // Coordinator binds, accepts (worldSize - 1) connections.
             var bindAddr = ResolveBindAddress(host);
             _listener = new TcpListener(bindAddr, port);
+            // Set SO_REUSEADDR so the bind succeeds even if the chosen
+            // port is still in TIME_WAIT from a recently-closed socket.
+            // This is the typical case when callers allocate a port via
+            // a "let the OS pick a free port" probe (open listener →
+            // get port → close listener → return port → bind here):
+            // on Linux the port stays in TIME_WAIT for ~60s after the
+            // probe's close, and TcpListener.Start() without
+            // SO_REUSEADDR fails with AddressAlreadyInUse. Setting it
+            // mirrors the Gloo / NCCL convention for rendezvous
+            // sockets and is safe for our use because the listener
+            // is short-lived and bound to a specific (loopback or
+            // user-supplied) IP — not a wildcard interface.
+            _listener.Server.SetSocketOption(
+                SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             _listener.Start();
             _clients = new TcpClient[worldSize];
             _clientStreams = new Stream[worldSize];
             // We don't have a self-socket; we keep _clients[0] = null.
-            for (int r = 1; r < worldSize; r++)
+            //
+            // Accept connections IN PARALLEL: spawn one background task
+            // per expected peer that does (Accept → ReadInt32(peerRank) →
+            // store in slot). The previous serial loop blocked on
+            // ReadInt32 for the FIRST accepted connection — if that
+            // peer's task hadn't been scheduled yet (thread-pool
+            // starvation common on shared CI runners), every later
+            // peer's Accept also stalled, even though their connections
+            // were already pending in the OS backlog. Parallel accept
+            // means each peer's handshake progresses independently;
+            // the coord blocks only as long as the SLOWEST peer takes
+            // to send 4 bytes after its TCP connection establishes.
+            var listener = _listener;
+            var clients = _clients;
+            var streams = _clientStreams;
+            var acceptTasks = new System.Threading.Tasks.Task[worldSize - 1];
+            int remainingMs = (int)Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds);
+            for (int i = 0; i < worldSize - 1; i++)
             {
-                if (DateTime.UtcNow >= deadline)
-                    throw new TimeoutException(
-                        $"TcpProcessGroup coordinator timed out waiting for rank {r}.");
-                if (!WaitForConnection(_listener, TimeSpan.FromSeconds(1))) { r--; continue; }
-                var c = _listener.AcceptTcpClient();
-                c.NoDelay = true;
-                var s = (Stream)c.GetStream();
-                // Each peer sends its rank as its first 4 bytes.
-                int peerRank = ReadInt32(s);
-                if (peerRank < 1 || peerRank >= worldSize || _clients[peerRank] != null)
-                    throw new InvalidOperationException(
-                        $"Invalid peer rank {peerRank} on coordinator handshake.");
-                _clients[peerRank] = c;
-                _clientStreams[peerRank] = s;
+                acceptTasks[i] = System.Threading.Tasks.Task.Run(() =>
+                {
+                    var c = listener.AcceptTcpClient();
+                    c.NoDelay = true;
+                    var s = (Stream)c.GetStream();
+                    int peerRank = ReadInt32(s);
+                    if (peerRank < 1 || peerRank >= worldSize)
+                        throw new InvalidOperationException(
+                            $"Invalid peer rank {peerRank} on coordinator handshake.");
+                    // Slot ownership is contested across accept tasks;
+                    // use atomic exchange so duplicate-rank registrations
+                    // surface as a clean InvalidOperationException
+                    // instead of silently overwriting and leaking the
+                    // earlier socket.
+                    lock (clients!)
+                    {
+                        if (clients[peerRank] != null)
+                            throw new InvalidOperationException(
+                                $"Duplicate peer rank {peerRank} on coordinator handshake.");
+                        clients[peerRank] = c;
+                        streams![peerRank] = s;
+                    }
+                });
             }
+            if (!System.Threading.Tasks.Task.WaitAll(acceptTasks, remainingMs))
+                throw new TimeoutException(
+                    $"TcpProcessGroup coordinator timed out waiting for {worldSize - 1} peer(s).");
+            // Surface any per-task fault (Task.WaitAll already throws
+            // AggregateException when the timeout doesn't expire and a
+            // task faulted, but we still call .Wait() on each so the
+            // surfaced exception loses no inner-detail).
+            foreach (var t in acceptTasks) t.Wait();
         }
         else
         {
             // Non-coordinator: connect, send our rank.
-            // TcpClient is single-use — once ConnectAsync completes (whether
-            // it succeeds, refuses, or times out), the instance can't be
-            // re-connected. The previous loop reused one TcpClient across
-            // retries which deadlocked when rank 0 hadn't bound yet on the
-            // first attempt. We allocate a fresh client per iteration and
-            // dispose the failed ones to release the socket handle.
+            // TcpClient is single-use — once Connect completes (whether
+            // it succeeds or refuses), the instance can't be re-connected.
+            // We allocate a fresh client per iteration and dispose
+            // the failed ones to release the socket handle.
+            //
+            // We use SYNCHRONOUS Connect rather than ConnectAsync+Wait(2s)
+            // because the previous timeout pattern produced phantom
+            // accepted-then-RST connections on the coord side: if
+            // ConnectAsync's underlying TCP handshake established AFTER
+            // our 2s wait expired, we'd dispose the attempt (RST the
+            // socket) but the coord's listener had already enqueued the
+            // connection. The coord's accept task then read EOF on the
+            // first byte and threw "Connection closed mid-frame",
+            // taking down the whole construction. Synchronous Connect
+            // returns ONLY when the handshake is fully complete or
+            // fails — no in-flight ambiguity, no phantom connections.
+            // On loopback Connect is microseconds; on real networks
+            // it inherits the OS connect timeout, which is bounded by
+            // the outer `deadline` check.
             while (DateTime.UtcNow < deadline)
             {
                 var attempt = new TcpClient();
                 try
                 {
-                    var connectTask = attempt.ConnectAsync(host, port);
-                    if (connectTask.Wait(TimeSpan.FromSeconds(2)) && attempt.Connected)
+                    attempt.Connect(host, port);
+                    if (attempt.Connected)
                     {
                         _coordSocket = attempt;
                         break;
                     }
-                    // Either timed out (Wait returned false) or completed
-                    // unsuccessfully — close this attempt and retry with
-                    // a fresh socket on the next iteration.
                     attempt.Dispose();
                     Thread.Sleep(50);
                 }
-                catch (Exception ex) when (ex is SocketException
-                                            || ex is AggregateException ae && ae.InnerException is SocketException)
+                catch (SocketException)
                 {
                     // Connection refused / unreachable — coordinator hasn't
                     // bound yet. Backoff and retry with a fresh client.

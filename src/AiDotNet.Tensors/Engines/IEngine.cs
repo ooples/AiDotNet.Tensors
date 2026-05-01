@@ -3196,6 +3196,23 @@ public interface IEngine
     Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>
+    /// Computes <c>A · Bᵀ</c> without materializing the transposed B —
+    /// the canonical attention-score pattern <c>scores = Q · Kᵀ</c>. Saves
+    /// the transpose-copy (≈ K bytes per call) and routes through SimdGemm's
+    /// <c>transB=true</c> kernel directly. For a [M,K] · [N,K]ᵀ → [M,N] op,
+    /// the user passes A as [M,K] and B as [N,K] (i.e., already in the
+    /// "rows are the K dim" layout that arises naturally from a transformer's
+    /// K projection output before the swap-to-Kᵀ step).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="a">Left operand, shape <c>[..., M, K]</c>.</param>
+    /// <param name="b">Right operand stored row-major as <c>[..., N, K]</c>;
+    /// will be treated as if transposed (i.e., contracted over its last dim
+    /// against <paramref name="a"/>'s last dim).</param>
+    /// <returns>Result of shape <c>[..., M, N]</c>.</returns>
+    Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
     /// Performs 2D max pooling with asymmetric pool size and stride, returning max indices for backpropagation.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

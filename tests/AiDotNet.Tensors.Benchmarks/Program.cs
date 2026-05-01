@@ -20,6 +20,53 @@ class Program
             return;
         }
 
+        // #209 close-parity: A/B test the Conv3x3Stride1 variants
+        // (per-channel, 2-oc-blocked, 4-oc-blocked) on shared shapes
+        // in the same process. Faster turnaround than full BDN.
+        if (args[0] == "--ab-conv2d")
+        {
+            Conv2DAbBench.Run();
+            return;
+        }
+
+        // Softmax<double> micro-benchmark — same-process measurement
+        // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
+        if (args[0] == "--ab-softmax-double")
+        {
+            Conv2DAbBench.RunSoftmaxDouble();
+            return;
+        }
+
+        if (args[0] == "--ab-attention-qkt")
+        {
+            Conv2DAbBench.RunAttentionQkt();
+            return;
+        }
+
+        if (args[0] == "--ab-layernorm")
+        {
+            Conv2DAbBench.RunLayerNorm();
+            return;
+        }
+
+        if (args[0] == "--ab-matmul")
+        {
+            Conv2DAbBench.RunMatMul();
+            return;
+        }
+
+        if (args[0] == "--ab-conv2d-double")
+        {
+            Conv2DAbBench.RunConv2DDouble();
+            return;
+        }
+
+        if (args[0] == "--ab-binary-ops")
+        {
+            Conv2DAbBench.RunBinaryOps();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {

@@ -821,7 +821,16 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_BatchNorm()
-        => _cpuEngine.BatchNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+    {
+        // Apples-to-apples: torch uses `using var result` which immediately
+        // recycles via libtorch's caching allocator. Mirror that by pool-returning
+        // the result + mean/variance tensors so the ArrayPool stays warm.
+        var r = _cpuEngine.BatchNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5,
+            out var bnMean, out var bnVar);
+        TensorPool.Return(r);
+        TensorPool.Return(bnMean);
+        TensorPool.Return(bnVar);
+    }
 
     [Benchmark]
     public void TorchSharp_BatchNorm()
@@ -833,13 +842,36 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_LayerNorm()
-        => _cpuEngine.LayerNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
+    {
+        // LayerNorm normalizes over the trailing dims that match gamma's
+        // shape; gamma is [channels], so the input must have channels as
+        // its last dim. Reshape NCHW → (N*H*W, C) so the per-element
+        // (mean, var) is computed across the channel axis — the standard
+        // transformer-style layer-norm contract that gamma=[channels]
+        // implies. Without this reshape AiDotNet's LayerNorm threw a
+        // shape-mismatch (channels at axis 1, not last) and the
+        // benchmark recorded NA.
+        var reshaped = _cpuEngine.Reshape(_aiNormInput!, new[] { 32 * 32 * 32, 64 });
+        var r = _cpuEngine.LayerNorm(reshaped, _aiNormGamma!, _aiNormBeta!, 1e-5,
+            out var lnMean, out var lnVar);
+        // Apples-to-apples with torch's `using var result`: pool-return so
+        // the ArrayPool stays warm across BDN iterations (was producing 8.6 MB
+        // alloc/iter vs torch's 168 B because the un-returned tensors forced
+        // Gen0/Gen1/Gen2 collections every call).
+        TensorPool.Return(r);
+        TensorPool.Return(lnMean);
+        TensorPool.Return(lnVar);
+    }
 
     [Benchmark]
     public void TorchSharp_LayerNorm()
     {
+        // Match the AiDotNet shape contract: normalize over the last dim
+        // (channels) of the (N*H*W, C) reshape. PyTorch's normalized_shape
+        // is just [C].
+        using var reshaped = _torchNormInput!.reshape(32 * 32 * 32, 64);
         using var result = torch.nn.functional.layer_norm(
-            _torchNormInput!, new long[] { 64, 32, 32 }, _torchNormWeight, _torchNormBias, eps: 1e-5);
+            reshaped, new long[] { 64 }, _torchNormWeight, _torchNormBias, eps: 1e-5);
         ConsumeTorchResult(result);
     }
 
@@ -932,11 +964,13 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     public void AiDotNet_AttentionQKT()
     {
-        // Q @ K^T for attention scores (512x64 @ 64x512 = 512x512)
-        var keyT = _cpuEngine.TensorTranspose(_aiKeyMatrix!);
-        var result = _cpuEngine.TensorMatMul(_aiQueryMatrix!, keyT);
+        // Q @ K^T for attention scores (512x64 @ 64x512 = 512x512).
+        // _aiKeyMatrix is stored as [N, K] = [512, 64] so the user-pattern
+        // Transpose(K) + MatMul(Q, K^T) is equivalent to MatMulTransposed(Q, K)
+        // — the new method skips materializing the transpose and routes
+        // through SimdGemm.Sgemm(transB=true) directly.
+        var result = _cpuEngine.TensorMatMulTransposed(_aiQueryMatrix!, _aiKeyMatrix!);
         TensorPool.Return(result);
-        TensorPool.Return(keyT);
     }
 
     [Benchmark]

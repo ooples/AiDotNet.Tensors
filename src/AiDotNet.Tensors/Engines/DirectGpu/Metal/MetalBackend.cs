@@ -516,6 +516,44 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// <summary>
     /// General matrix multiplication: C = alpha * A * B + beta * C
     /// </summary>
+    /// <inheritdoc/>
+    public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        ThrowIfDisposed();
+        // The matmul_tiled_transposed kernel writes C unconditionally
+        // (no β·C blend). Fail fast on β != 0 rather than silently
+        // discarding the existing C contents.
+        if (Math.Abs(beta) > 1e-7f)
+            throw new NotSupportedException(
+                "Metal MatMulTransposed currently supports only beta == 0. " +
+                "For beta != 0, route through TensorMatMul(A, Transpose(B)).");
+        if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer || C is not MetalGpuBuffer cBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        // Custom tiled kernel that reads B with the [N, K] → Bᵀ index pattern.
+        // Skips the materialized transpose copy that the generic Gemm + a
+        // separate transpose dispatch would do.
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "matmul_tiled_transposed");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(N, M);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBuffer(cBuffer, 2);
+        encoder.SetBytes((uint)M, 3);
+        encoder.SetBytes((uint)N, 4);
+        encoder.SetBytes((uint)K, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+
+        if (Math.Abs(alpha - 1.0f) > 1e-7f)
+            Scale(cBuffer, cBuffer, alpha, M * N);
+        // beta-blend with prior C contents not implemented for the transposed
+        // path yet; callers that need beta!=0 fall back through the generic
+        // Gemm + materialize-transpose path. (Not wired here; CPU dispatcher
+        // handles that case via TensorMatMul(a, transpose(b))).
+    }
+
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         ThrowIfDisposed();
@@ -1587,6 +1625,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// <summary>
     /// ArgMax along axis for batched data using GPU kernel.
     /// </summary>
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // Metal kernel uses (float)cast
+
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();

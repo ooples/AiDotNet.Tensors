@@ -409,6 +409,68 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
     }
 
+    /// <summary>
+    /// Backward for <c>C = A · Bᵀ</c> (i.e. <c>TensorMatMulTransposed</c>).
+    /// A is [M,K], B is stored as [N,K] (rows are the K dim), C is [M,N].
+    /// Gradients:
+    ///   gradA = gradC · B           (no transposes — regular matmul)
+    ///   gradB = gradCᵀ · A          (first operand transposed)
+    /// Note this is NOT the same as <see cref="MatMulBackward"/>, which
+    /// assumes <c>C = A · B</c> — registering the wrong one would silently
+    /// emit incorrect gradients for the attention-Q·Kᵀ fast path.
+    /// </summary>
+    internal static void MatMulTransposedBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // BLAS fast path: A: [M,K], B: [N,K] (stored row-major), gradC: [M,N].
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2 && BlasProvider.IsAvailable)
+        {
+            var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
+            var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
+            var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
+            if (dCArr is not null && aArr is not null && bArr is not null)
+            {
+                int M = inputs[0]._shape[0];
+                int K = inputs[0]._shape[1];
+                int N = inputs[1]._shape[0];
+
+                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                var gradAData = (float[])(object)gradATensor.GetDataArray();
+                var gradBData = (float[])(object)gradBTensor.GetDataArray();
+
+                // gradA[M,K] = gradC[M,N] · B[N,K]    (no transposes)
+                bool okA = BlasProvider.TryGemmEx(M, K, N,
+                    dCArr, 0, N, false,
+                    bArr, 0, K, false,
+                    gradAData, 0, K);
+                // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transpose first operand)
+                bool okB = BlasProvider.TryGemmEx(N, K, M,
+                    dCArr, 0, N, true,
+                    aArr, 0, K, false,
+                    gradBData, 0, K);
+
+                if (okA && okB)
+                {
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                    return;
+                }
+            }
+        }
+
+        // Generic fallback: gradA = gradOut · B, gradB = gradOutᵀ · A.
+        // No transpose on B (it's already in [N,K] form), but we need
+        // gradOutᵀ for gradB.
+        var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
+        var gradOutT = TransposeLastTwoDims(gradOutput, engine);
+        var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
+    }
+
     /// <summary>d(A^T)/dA = transpose(grad)</summary>
     internal static void TransposeBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

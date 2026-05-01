@@ -949,6 +949,42 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             "cublasSgemm");
     }
 
+    public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        ValidateGemmArgs(A, B, C, M, N, K);
+
+        using var _ = PushContext();
+        float alphaVal = alpha;
+        float betaVal = beta;
+
+        // Row-major C[M,N] = A[M,K] · Bᵀ. Memory equivalences (column-
+        // major view of the same bytes):
+        //   B_row[N,K] === B_col[K,N]   (lda = K)
+        //   A_row[M,K] === A_col[K,M]   (lda = K)
+        //   C_row[M,N] === C_col[N,M]   (lda = N)
+        // We need cuBLAS to compute C_col[N,M] = B_col[K,N]ᵀ · A_col[K,M]
+        // because (A · Bᵀ)_row === (B · Aᵀ)_col. So:
+        //   op(A_cu = my B) = Transpose → N×K
+        //   op(B_cu = my A) = None      → K×M
+        //   m_cu=N, n_cu=M, k_cu=K, ldA=K, ldB=K, ldC=N.
+        // Earlier version had the transpose flags swapped — produced
+        // wrong results for any non-square input.
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasSgemm(
+                _cublasHandle,
+                CublasOperation.Transpose,   // op(my B) — transposed, becomes N×K
+                CublasOperation.None,        // op(my A) — no transpose, stays K×M
+                N, M, K,
+                ref alphaVal,
+                B.Handle, K,                 // lda for B_col[K,N] = K
+                A.Handle, K,                 // ldb for A_col[K,M] = K
+                ref betaVal,
+                C.Handle, N),                // ldc for C_col[N,M] = N
+            "cublasSgemm(MatMulTransposed)");
+    }
+
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);
@@ -9484,6 +9520,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
             "cuMemcpyDtoD(strided)");
     }
+
+    /// <inheritdoc/>
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // CUDA kernel uses (float)cast
 
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {

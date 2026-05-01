@@ -702,6 +702,22 @@ internal static class Im2ColHelper
         int k,
         int n)
     {
+        // EXPERIMENT (rejected by --ab-conv2d-double):
+        // Tried adding explicit Vector256<double> 4-way unrolled FMA + parallel
+        // dispatch to close the Conv2D_Double 3.8× gap to torch (438 µs vs 115).
+        // A/B verdict on the BDN shape [1,3,32,32]→[16,3,3] (0.4M FMAs):
+        //   scalar:  460 µs (RyuJIT auto-vectorizes the simple axpy)
+        //   SIMD:    459 µs (no improvement)
+        // On a larger experimental shape [1,16,64,64]→[32,3,3] (18.9M FMAs):
+        //   scalar:  5201 µs
+        //   SIMD:   18098 µs (3.5× REGRESSION — likely intrinsics defeated
+        //     RyuJIT's auto-prefetch and out-of-order scheduling)
+        // Lesson: for simple axpy patterns, the JIT's auto-vectorizer is
+        // already optimal. The Conv2D_Double gap is structural — the float
+        // path uses register-resident Conv3x3 (no im2col), but doubles
+        // route through this im2col+GEMM path. Closing further requires a
+        // Conv3x3SingleChannel<double> kernel, mirroring the float design.
+
         const int BlockSize = 64;
 
         c.Clear();
@@ -709,15 +725,12 @@ internal static class Im2ColHelper
         for (int ii = 0; ii < m; ii += BlockSize)
         {
             int iEnd = Math.Min(ii + BlockSize, m);
-
             for (int kk = 0; kk < k; kk += BlockSize)
             {
                 int kEnd = Math.Min(kk + BlockSize, k);
-
                 for (int jj = 0; jj < n; jj += BlockSize)
                 {
                     int jEnd = Math.Min(jj + BlockSize, n);
-
                     for (int i = ii; i < iEnd; i++)
                     {
                         for (int kIdx = kk; kIdx < kEnd; kIdx++)
@@ -725,11 +738,8 @@ internal static class Im2ColHelper
                             double aik = a[i * k + kIdx];
                             int bRowOffset = kIdx * n + jj;
                             int cRowOffset = i * n + jj;
-
                             for (int j = 0; j < jEnd - jj; j++)
-                            {
                                 c[cRowOffset + j] += aik * b[bRowOffset + j];
-                            }
                         }
                     }
                 }

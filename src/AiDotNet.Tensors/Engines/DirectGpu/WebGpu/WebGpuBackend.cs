@@ -598,8 +598,47 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     #region Matrix Operations
 
     /// <summary>
-    /// General matrix multiplication: C = alpha * A * B + beta * C
+    /// C = A · Bᵀ where B is stored row-major as [N, K]. Uses the
+    /// dedicated <c>gemm_transposed_simple</c> WGSL kernel so the
+    /// transpose copy is skipped.
     /// </summary>
+    public async Task MatMulTransposedAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)A;
+        var bBuffer = (WebGpuBuffer)B;
+        var cBuffer = (WebGpuBuffer)C;
+        var pipelineId = await GetOrCreatePipelineAsync("MatMulTransposed", WebGpuKernels.MatMulSource, "gemm_transposed_simple");
+        var paramsData = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(K),
+            alpha,
+            beta, 0, 0, 0
+        };
+        using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        // Compute total in long to catch overflow, then cap-check against
+        // the device's 1D dispatch capacity (max workgroups × workgroup
+        // size of 256). Without this, large matrices would silently drop
+        // tail items or attempt to dispatch an out-of-range workgroup
+        // count. A real impl would route oversize problems through a
+        // tiled fallback; we fail fast for now.
+        long total = (long)M * N;
+        const long workgroupSize = 256;
+        const long maxWorkgroupsPerDim = 65535;
+        long maxItems = maxWorkgroupsPerDim * workgroupSize;
+        if (total <= 0 || total > maxItems)
+            throw new ArgumentOutOfRangeException(
+                nameof(M),
+                $"MatMulTransposedAsync: M*N = {total} exceeds the 1D dispatch capacity of {maxItems}. " +
+                "A tiled fallback is required for matrices this large.");
+        var (wg, _) = _device.CalculateWorkgroups1D((int)total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     public async Task GemmAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         ThrowIfNotInitialized();
