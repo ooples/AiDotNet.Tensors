@@ -36,7 +36,12 @@ internal static class SimdConvHelper
 
     private static Conv3x3Variant ParseConv3x3VariantFromEnv()
     {
-        var v = Environment.GetEnvironmentVariable("AIDOTNET_CONV3X3_VARIANT");
+        // Normalise to lowercase so "Block4" / "BLOCK4" / "PerChannel" all
+        // resolve. Other env-var parsers in this repo (e.g. MatrixMultiplyHelper.ReadEnvBool,
+        // OpenClBackend.InitDiagnosticOutput) are case-insensitive; matching
+        // that convention avoids surprising failures when users copy-paste
+        // a variant name with a different casing into their CI / shell config.
+        var v = Environment.GetEnvironmentVariable("AIDOTNET_CONV3X3_VARIANT")?.ToLowerInvariant();
         return v switch
         {
             "per-channel" or "perchannel" or "per_channel" => Conv3x3Variant.PerChannel,
