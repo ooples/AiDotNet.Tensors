@@ -47,6 +47,231 @@ internal static class SimdConvHelper
     }
 
     /// <summary>
+    /// Check if SIMD-optimized double-precision convolution is available.
+    /// Currently only 3×3 stride=1 (the most common ResNet/transformer pattern).
+    /// </summary>
+    public static bool CanUseSimdConvDouble(int kernelH, int kernelW, int strideH, int strideW)
+    {
+        if (!UseAvx2 || !UseFma) return false;
+        return kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1;
+    }
+
+    /// <summary>
+    /// Performs 3x3 convolution with stride=1 dilation=1 for double precision.
+    /// Register-resident Vector256&lt;double&gt; (4 doubles/vec) inner kernel.
+    /// Mirrors the float Conv3x3Stride1 design — eliminates the im2col+GEMM
+    /// detour that was the cause of the 3.8× gap to libtorch on Conv2D_Double.
+    /// </summary>
+    public static unsafe void Conv3x3Stride1Double(
+        double* input, double* kernel, double* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW, int dilationH, int dilationW)
+    {
+        int outHeight = height + 2 * padH - (dilationH * 2 + 1) + 1;
+        int outWidth = width + 2 * padW - (dilationW * 2 + 1) + 1;
+        int outputSize = outHeight * outWidth;
+
+        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+
+        for (int b = 0; b < batch; b++)
+        {
+            double* inputBatch = input + b * inChannels * height * width;
+            double* outputBatch = output + b * outChannels * outHeight * outWidth;
+
+            if (useParallel)
+            {
+                CpuParallelSettings.LightweightParallel(outChannels, oc =>
+                {
+                    Conv3x3Stride1SingleChannelDouble(
+                        inputBatch, kernel + oc * inChannels * 9,
+                        outputBatch + oc * outputSize,
+                        inChannels, height, width, outHeight, outWidth, padH, padW, dilationH, dilationW);
+                });
+            }
+            else
+            {
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    Conv3x3Stride1SingleChannelDouble(
+                        inputBatch, kernel + oc * inChannels * 9,
+                        outputBatch + oc * outputSize,
+                        inChannels, height, width, outHeight, outWidth, padH, padW, dilationH, dilationW);
+                }
+            }
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3Stride1SingleChannelDouble(
+        double* input, double* kernelOc, double* outputChannel,
+        int inChannels, int height, int width, int outHeight, int outWidth,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        int outputSize = outHeight * outWidth;
+        new Span<double>(outputChannel, outputSize).Clear();
+
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            double* inputChannel = input + ic * height * width;
+            double* kernelChannel = kernelOc + ic * 9;
+            Conv3x3SingleChannelFmaDouble(inputChannel, kernelChannel, outputChannel,
+                height, width, outHeight, outWidth, padH, padW, dilationH, dilationW);
+        }
+    }
+
+    /// <summary>
+    /// Per-(ic, oc) Vector256&lt;double&gt; 3×3 conv. Loads 9 broadcasted kernel
+    /// values, then sweeps the output rows with 4-double FMA accumulators.
+    /// Boundary rows/cols use a scalar fallback for correctness.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3SingleChannelFmaDouble(
+        double* input, double* kernel, double* output,
+        int height, int width, int outHeight, int outWidth,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        // 9 broadcasted kernel values held across the entire (oh, ow) sweep.
+        Vector256<double> k00 = Vector256.Create(kernel[0]);
+        Vector256<double> k01 = Vector256.Create(kernel[1]);
+        Vector256<double> k02 = Vector256.Create(kernel[2]);
+        Vector256<double> k10 = Vector256.Create(kernel[3]);
+        Vector256<double> k11 = Vector256.Create(kernel[4]);
+        Vector256<double> k12 = Vector256.Create(kernel[5]);
+        Vector256<double> k20 = Vector256.Create(kernel[6]);
+        Vector256<double> k21 = Vector256.Create(kernel[7]);
+        Vector256<double> k22 = Vector256.Create(kernel[8]);
+
+        if (dilationH == 1 && dilationW == 1)
+        {
+            int ohStart = padH > 0 ? padH : 0;
+            int ohEnd = outHeight - (padH > 0 ? padH : 0);
+            if (ohEnd > outHeight) ohEnd = outHeight;
+
+            // Top boundary rows
+            for (int topOh = 0; topOh < ohStart && topOh < outHeight; topOh++)
+                ProcessBoundaryRowDouble(input, kernel, output + topOh * outWidth,
+                    height, width, outWidth, topOh, padH, padW);
+
+            // Interior rows: SIMD sweep on 4-double output chunks.
+            // Edge cols (left ow < padW, right ow >= outWidth - padW - 3)
+            // handled by scalar fallback.
+            for (int oh = ohStart; oh < ohEnd; oh++)
+            {
+                int ih0 = oh - padH;
+                double* inputRow0 = input + ih0       * width;
+                double* inputRow1 = input + (ih0 + 1) * width;
+                double* inputRow2 = input + (ih0 + 2) * width;
+                double* outputRow = output + oh * outWidth;
+
+                int owStart = padW > 0 ? padW : 0;
+                int owEnd = outWidth - (padW > 0 ? padW : 0) - 3;
+
+                // Left boundary cols
+                for (int leftOw = 0; leftOw < owStart && leftOw < outWidth; leftOw++)
+                    outputRow[leftOw] += ScalarConv3x3Double(input, kernel, height, width, oh, leftOw, padH, padW);
+
+                int ow = owStart;
+                for (; ow < owEnd; ow += 4)
+                {
+                    int iw = ow - padW;
+                    Vector256<double> r0_0 = Avx.LoadVector256(inputRow0 + iw);
+                    Vector256<double> r0_1 = Avx.LoadVector256(inputRow0 + iw + 1);
+                    Vector256<double> r0_2 = Avx.LoadVector256(inputRow0 + iw + 2);
+                    Vector256<double> r1_0 = Avx.LoadVector256(inputRow1 + iw);
+                    Vector256<double> r1_1 = Avx.LoadVector256(inputRow1 + iw + 1);
+                    Vector256<double> r1_2 = Avx.LoadVector256(inputRow1 + iw + 2);
+                    Vector256<double> r2_0 = Avx.LoadVector256(inputRow2 + iw);
+                    Vector256<double> r2_1 = Avx.LoadVector256(inputRow2 + iw + 1);
+                    Vector256<double> r2_2 = Avx.LoadVector256(inputRow2 + iw + 2);
+
+                    Vector256<double> acc = Fma.MultiplyAdd(r0_0, k00, Vector256<double>.Zero);
+                    acc = Fma.MultiplyAdd(r0_1, k01, acc);
+                    acc = Fma.MultiplyAdd(r0_2, k02, acc);
+                    acc = Fma.MultiplyAdd(r1_0, k10, acc);
+                    acc = Fma.MultiplyAdd(r1_1, k11, acc);
+                    acc = Fma.MultiplyAdd(r1_2, k12, acc);
+                    acc = Fma.MultiplyAdd(r2_0, k20, acc);
+                    acc = Fma.MultiplyAdd(r2_1, k21, acc);
+                    acc = Fma.MultiplyAdd(r2_2, k22, acc);
+
+                    Vector256<double> current = Avx.LoadVector256(outputRow + ow);
+                    Avx.Store(outputRow + ow, Avx.Add(current, acc));
+                }
+
+                // Right boundary cols (scalar)
+                for (; ow < outWidth; ow++)
+                    outputRow[ow] += ScalarConv3x3Double(input, kernel, height, width, oh, ow, padH, padW);
+            }
+
+            // Bottom boundary rows
+            for (int bottomOh = ohEnd; bottomOh < outHeight; bottomOh++)
+                ProcessBoundaryRowDouble(input, kernel, output + bottomOh * outWidth,
+                    height, width, outWidth, bottomOh, padH, padW);
+        }
+        else
+        {
+            // Dilation: scalar fallback (rare path)
+            for (int oh = 0; oh < outHeight; oh++)
+                for (int ow = 0; ow < outWidth; ow++)
+                    output[oh * outWidth + ow] += ScalarConv3x3DoubleDilated(
+                        input, kernel, height, width, oh, ow, padH, padW, dilationH, dilationW);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe double ScalarConv3x3Double(
+        double* input, double* kernel,
+        int height, int width, int oh, int ow, int padH, int padW)
+    {
+        double sum = 0;
+        int ihBase = oh - padH;
+        int iwBase = ow - padW;
+        for (int kh = 0; kh < 3; kh++)
+        {
+            int ih = ihBase + kh;
+            if (ih < 0 || ih >= height) continue;
+            for (int kw = 0; kw < 3; kw++)
+            {
+                int iw = iwBase + kw;
+                if (iw < 0 || iw >= width) continue;
+                sum += input[ih * width + iw] * kernel[kh * 3 + kw];
+            }
+        }
+        return sum;
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe double ScalarConv3x3DoubleDilated(
+        double* input, double* kernel,
+        int height, int width, int oh, int ow, int padH, int padW, int dilationH, int dilationW)
+    {
+        double sum = 0;
+        int ihBase = oh - padH;
+        int iwBase = ow - padW;
+        for (int kh = 0; kh < 3; kh++)
+        {
+            int ih = ihBase + kh * dilationH;
+            if (ih < 0 || ih >= height) continue;
+            for (int kw = 0; kw < 3; kw++)
+            {
+                int iw = iwBase + kw * dilationW;
+                if (iw < 0 || iw >= width) continue;
+                sum += input[ih * width + iw] * kernel[kh * 3 + kw];
+            }
+        }
+        return sum;
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe void ProcessBoundaryRowDouble(
+        double* input, double* kernel, double* outputRow,
+        int height, int width, int outWidth, int oh, int padH, int padW)
+    {
+        for (int ow = 0; ow < outWidth; ow++)
+            outputRow[ow] += ScalarConv3x3Double(input, kernel, height, width, oh, ow, padH, padW);
+    }
+
+    /// <summary>
     /// Check if SIMD-optimized convolution is available for this configuration.
     /// </summary>
     public static bool CanUseSimdConv(int kernelH, int kernelW, int strideH, int strideW)

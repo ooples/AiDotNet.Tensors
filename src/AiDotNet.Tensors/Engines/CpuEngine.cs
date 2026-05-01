@@ -7319,6 +7319,42 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use im2col + GEMM for double (same approach as float, with double BLAS)
         if (typeof(T) == typeof(double))
         {
+            // #209 close-parity: 3×3 stride=1 dilation=1 fast path for double.
+            // Mirrors the float path's SimdConvHelper.Conv3x3Stride1 — register-
+            // resident Vector256<double> inner kernel, no im2col allocation.
+            //
+            // A/B-tested with --ab-conv2d-double:
+            //   [1,3,32,32]→[16,3,3]  (442K FMAs):  460 → 385 µs (1.2× faster)
+            //   [4,3,32,32]→[16,3,3]  (1.77M FMAs): 1632 → 1483 µs (1.1× faster)
+            //   [1,16,64,64]→[32,3,3] (18.9M FMAs): 5201 → 18228 µs (3.5× SLOWER)
+            // Threshold: direct kernel for ≤4M FMAs (the BDN shape is 0.44M),
+            // im2col+GEMM for larger (where its better cache reuse dominates
+            // the lack of row-pairing in the direct kernel).
+            long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
+            if (kernelHeight == 3 && kernelWidth == 3
+                && stride == 1 && padding > 0 && dilation == 1
+                && convFmas <= 4_000_000L
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
+            {
+                var dInput  = (Tensor<double>)(object)input;
+                var dKernel = (Tensor<double>)(object)kernel;
+                var dResult = (Tensor<double>)(object)result;
+                using var pinIn = dInput.Data.Pin();
+                using var pinK  = dKernel.Data.Pin();
+                using var pinO  = dResult.Data.Pin();
+                unsafe
+                {
+                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                        (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
+                        batch, inChannels, height, width,
+                        outChannels, padding, padding, dilation, dilation);
+                }
+                DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
+                    BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
+                AutoTracer.RecordOp("Conv2D", result, eng => result);
+                return result;
+            }
+
             Conv2DWithIm2ColDouble(
                 input as Tensor<double> ?? throw new InvalidCastException(),
                 kernel as Tensor<double> ?? throw new InvalidCastException(),
