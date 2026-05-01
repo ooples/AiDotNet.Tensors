@@ -902,58 +902,98 @@ internal static class SimdConvHelper
         int outChannels, int inChannels, int spatialSize)
     {
         // 1x1 conv is GEMM: output[oc, spatial] = sum_ic(kernel[oc, ic] * input[ic, spatial])
-        const int BlockSize = 32;
+        //
+        // #209 close-parity: register-resident accumulator across the ic loop.
+        // Previously this loop did `output[oc, s] += kernel[oc, ic] * input[ic, s]`,
+        // re-loading and re-storing the output row on every ic iteration —
+        // a load+fma+store round-trip that bottlenecks on L1 bandwidth instead
+        // of FMA throughput. The new form holds the accumulator vector in a
+        // ymm register, FMAs across all ic values, then stores ONCE at the
+        // end. Same idea as the Conv3x3Stride1Pad1_OcBlock4 fast path.
+        //
+        // 4-oc unrolling: when outChannels >= 4, hold 4 accumulator vectors
+        // per spatial chunk and reuse the input load 4× (saves 75% of input
+        // reads from memory).
 
         // Clear output
         new Span<float>(output, outChannels * spatialSize).Clear();
 
-        // Block over output channels
-        for (int ocBlock = 0; ocBlock < outChannels; ocBlock += BlockSize)
+        if (UseFma && outChannels >= 4 && (outChannels & 3) == 0)
         {
-            int ocEnd = Math.Min(ocBlock + BlockSize, outChannels);
-
-            // Block over input channels
-            for (int icBlock = 0; icBlock < inChannels; icBlock += BlockSize)
+            // 4-oc-blocked path: process 4 output channels per inner iteration.
+            int spatialEnd8 = spatialSize - 7;
+            for (int ocb = 0; ocb < outChannels; ocb += 4)
             {
-                int icEnd = Math.Min(icBlock + BlockSize, inChannels);
+                float* out0 = output + (ocb + 0) * spatialSize;
+                float* out1 = output + (ocb + 1) * spatialSize;
+                float* out2 = output + (ocb + 2) * spatialSize;
+                float* out3 = output + (ocb + 3) * spatialSize;
+                float* k0 = kernel + (ocb + 0) * inChannels;
+                float* k1 = kernel + (ocb + 1) * inChannels;
+                float* k2 = kernel + (ocb + 2) * inChannels;
+                float* k3 = kernel + (ocb + 3) * inChannels;
 
-                // Process this block
-                for (int oc = ocBlock; oc < ocEnd; oc++)
+                int s = 0;
+                for (; s < spatialEnd8; s += 8)
                 {
-                    float* outputChannel = output + oc * spatialSize;
-                    float* kernelRow = kernel + oc * inChannels;
-
-                    for (int ic = icBlock; ic < icEnd; ic++)
+                    Vector256<float> acc0 = Vector256<float>.Zero;
+                    Vector256<float> acc1 = Vector256<float>.Zero;
+                    Vector256<float> acc2 = Vector256<float>.Zero;
+                    Vector256<float> acc3 = Vector256<float>.Zero;
+                    for (int ic = 0; ic < inChannels; ic++)
                     {
-                        float kVal = kernelRow[ic];
-                        float* inputChannel = input + ic * spatialSize;
-
-                        Vector256<float> kVec = Vector256.Create(kVal);
-
-                        int s = 0;
-                        int vectorEnd = spatialSize - 7;
-
-                        for (; s < vectorEnd; s += 8)
-                        {
-                            Vector256<float> inVec = Avx.LoadVector256(inputChannel + s);
-                            Vector256<float> outVec = Avx.LoadVector256(outputChannel + s);
-
-                            if (UseFma)
-                            {
-                                Avx.Store(outputChannel + s, Fma.MultiplyAdd(inVec, kVec, outVec));
-                            }
-                            else
-                            {
-                                Avx.Store(outputChannel + s, Avx.Add(outVec, Avx.Multiply(inVec, kVec)));
-                            }
-                        }
-
-                        for (; s < spatialSize; s++)
-                        {
-                            outputChannel[s] += kVal * inputChannel[s];
-                        }
+                        Vector256<float> inVec = Avx.LoadVector256(input + ic * spatialSize + s);
+                        acc0 = Fma.MultiplyAdd(inVec, Vector256.Create(k0[ic]), acc0);
+                        acc1 = Fma.MultiplyAdd(inVec, Vector256.Create(k1[ic]), acc1);
+                        acc2 = Fma.MultiplyAdd(inVec, Vector256.Create(k2[ic]), acc2);
+                        acc3 = Fma.MultiplyAdd(inVec, Vector256.Create(k3[ic]), acc3);
                     }
+                    Avx.Store(out0 + s, acc0);
+                    Avx.Store(out1 + s, acc1);
+                    Avx.Store(out2 + s, acc2);
+                    Avx.Store(out3 + s, acc3);
                 }
+                // Tail: scalar over remaining spatial elements
+                for (; s < spatialSize; s++)
+                {
+                    float a0 = 0f, a1 = 0f, a2 = 0f, a3 = 0f;
+                    for (int ic = 0; ic < inChannels; ic++)
+                    {
+                        float v = input[ic * spatialSize + s];
+                        a0 += v * k0[ic]; a1 += v * k1[ic];
+                        a2 += v * k2[ic]; a3 += v * k3[ic];
+                    }
+                    out0[s] = a0; out1[s] = a1; out2[s] = a2; out3[s] = a3;
+                }
+            }
+            return;
+        }
+
+        // Fallback: per-oc register-resident accumulator (still better than
+        // the previous load+fma+store round-trip).
+        int spatialEnd8b = spatialSize - 7;
+        for (int oc = 0; oc < outChannels; oc++)
+        {
+            float* outChan = output + oc * spatialSize;
+            float* kRow = kernel + oc * inChannels;
+            int s = 0;
+            for (; s < spatialEnd8b; s += 8)
+            {
+                Vector256<float> acc = Vector256<float>.Zero;
+                for (int ic = 0; ic < inChannels; ic++)
+                {
+                    Vector256<float> inVec = Avx.LoadVector256(input + ic * spatialSize + s);
+                    Vector256<float> kVec = Vector256.Create(kRow[ic]);
+                    acc = UseFma ? Fma.MultiplyAdd(inVec, kVec, acc) : Avx.Add(acc, Avx.Multiply(inVec, kVec));
+                }
+                Avx.Store(outChan + s, acc);
+            }
+            for (; s < spatialSize; s++)
+            {
+                float a = 0f;
+                for (int ic = 0; ic < inChannels; ic++)
+                    a += kRow[ic] * input[ic * spatialSize + s];
+                outChan[s] = a;
             }
         }
     }
