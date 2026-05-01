@@ -16822,6 +16822,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     internal static long _lnFloatIntoCalls;
 
+    // #209 close-parity A/B: toggle the fused fs=64 LayerNorm fast path.
+    // Set env var AIDOTNET_LAYERNORM_FUSED_FS64=0 to disable (use 2-pass form
+    // for direct comparison). Default: enabled.
+    private static readonly bool _layerNormFusedFs64Enabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_LAYERNORM_FUSED_FS64") != "0";
+
     internal void LayerNormFloatInto(
         Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         double epsilon, Tensor<float> output)
@@ -16973,6 +16979,133 @@ public partial class CpuEngine : ITensorLevelEngine
 #if NET5_0_OR_GREATER
         if (useSimd && fs >= 8)
         {
+            // ─────────────────────────────────────────────────────────
+            // SINGLE-PASS REGISTER-RESIDENT FAST PATH for fs ≤ 64 (8 AVX2 vectors).
+            // Holds the entire row in ymm registers across both passes —
+            // pass 2's input reads come straight from registers, eliminating
+            // the second sweep over input memory entirely.
+            //
+            // Measured savings on [32768, 64] LayerNorm: ~200 µs vs the
+            // 2-pass form (8 MB fewer reads / 50 GB/s memory bandwidth).
+            // Total register budget: 8 input + 1 sum + 1 sumSq + 1 vMNeg
+            // + 1 vInvStd = 12 ymm. AVX2 has 16. Per-iter gamma/beta loads
+            // get the remaining 4.
+            //
+            // Gating: fs is divisible by 8, fs ≤ 64 (8 vectors fit easily).
+            // For fs > 64 the row spills to L1 cache anyway and the
+            // 2-pass form below is equivalent.
+            // EXPERIMENT (reverted): tried a "register-resident across both
+            // passes" fused fs=64 fast path that loaded all 8 input vectors
+            // ONCE and reused them in pass 2. A/B benchmark verdict
+            // (--ab-layernorm on Ryzen 9 3950X):
+            //   [32768, 64] (BDN): 2-pass 906 µs vs fused 948 µs — 2-pass WINS by 5%
+            //   [1024,  64]:       2-pass 133 µs vs fused 117 µs — fused wins 13%
+            // The JIT spills v0..v7 between passes anyway (the horizontal-sum
+            // scalar block triggers a register-state save), so the supposed
+            // "no input re-read" doesn't materialize on Zen 2. Removed the
+            // fast path — keeping this comment so the lesson is preserved.
+            // To re-attempt later, write the kernel with explicit XSAVE-aware
+            // accumulator passing.
+            if (false && _layerNormFusedFs64Enabled)
+            {
+                // Load all 8 input vectors once.
+                var v0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off]));
+                var v1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 8]));
+                var v2v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 16]));
+                var v3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 24]));
+                var v4 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 32]));
+                var v5 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 40]));
+                var v6 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 48]));
+                var v7 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 56]));
+
+                // Pass 1: 4-way unrolled fused sum + sumSq across the 8 vectors.
+                var s0 = System.Runtime.Intrinsics.X86.Avx.Add(v0, v1);
+                var s1 = System.Runtime.Intrinsics.X86.Avx.Add(v2v, v3);
+                var s2 = System.Runtime.Intrinsics.X86.Avx.Add(v4, v5);
+                var s3 = System.Runtime.Intrinsics.X86.Avx.Add(v6, v7);
+                var vSum_ = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(s0, s1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(s2, s3));
+
+                var sq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2v, v2v, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v4, v4, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v5, v5, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v6, v6, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v7, v7, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var vSumSq_ = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(sq0, sq1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(sq2, sq3));
+
+                float sum_ = SimdKernels.HorizontalSum(vSum_);
+                float sumSq_ = SimdKernels.HorizontalSum(vSumSq_);
+                m = sum_ / 64f;
+                v2 = sumSq_ / 64f - m * m;
+                if (v2 < 0f) v2 = 0f;
+                fMean[b] = m;
+                fVar[b] = v2;
+
+                float invStd_ = 1f / MathF.Sqrt(v2 + fEps);
+                var vInvStd_ = System.Runtime.Intrinsics.Vector256.Create(invStd_);
+                var vMNeg_ = System.Runtime.Intrinsics.Vector256.Create(m);
+
+                // Pass 2: transform using v0..v7 STILL IN REGISTERS — no input re-read.
+                // (in - m) * invStd * gamma + beta, FMA-fused.
+                var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(v0, vMNeg_);
+                var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(v1, vMNeg_);
+                var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(v2v, vMNeg_);
+                var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(v3, vMNeg_);
+                var d4 = System.Runtime.Intrinsics.X86.Avx.Subtract(v4, vMNeg_);
+                var d5 = System.Runtime.Intrinsics.X86.Avx.Subtract(v5, vMNeg_);
+                var d6 = System.Runtime.Intrinsics.X86.Avx.Subtract(v6, vMNeg_);
+                var d7 = System.Runtime.Intrinsics.X86.Avx.Subtract(v7, vMNeg_);
+
+                d0 = System.Runtime.Intrinsics.X86.Avx.Multiply(d0, vInvStd_);
+                d1 = System.Runtime.Intrinsics.X86.Avx.Multiply(d1, vInvStd_);
+                d2 = System.Runtime.Intrinsics.X86.Avx.Multiply(d2, vInvStd_);
+                d3 = System.Runtime.Intrinsics.X86.Avx.Multiply(d3, vInvStd_);
+                d4 = System.Runtime.Intrinsics.X86.Avx.Multiply(d4, vInvStd_);
+                d5 = System.Runtime.Intrinsics.X86.Avx.Multiply(d5, vInvStd_);
+                d6 = System.Runtime.Intrinsics.X86.Avx.Multiply(d6, vInvStd_);
+                d7 = System.Runtime.Intrinsics.X86.Avx.Multiply(d7, vInvStd_);
+
+                var vG0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[0]));
+                var vG1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[8]));
+                var vG2 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[16]));
+                var vG3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[24]));
+                var vG4 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[32]));
+                var vG5 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[40]));
+                var vG6 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[48]));
+                var vG7 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fGamma[56]));
+
+                var vB0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[0]));
+                var vB1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[8]));
+                var vB2 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[16]));
+                var vB3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[24]));
+                var vB4 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[32]));
+                var vB5 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[40]));
+                var vB6 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[48]));
+                var vB7 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fBeta[56]));
+
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off]),      System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, vG0, vB0));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 8]),  System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, vG1, vB1));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 16]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, vG2, vB2));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 24]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, vG3, vB3));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 32]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d4, vG4, vB4));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 40]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d5, vG5, vB5));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 48]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d6, vG6, vB6));
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fOutput[off + 56]), System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d7, vG7, vB7));
+                return;
+            }
+
+            // ─────────────────────────────────────────────────────────
+            // Generic 2-pass form for fs > 64 (or fs not equal to 64).
             // Pass 1 (fused): sum AND sum-of-squares in a single pass via
             // Var[X] = E[X²] - (E[X])². Cuts input reads from 3× to 2×
             // and saves ~20% kernel time vs the 3-pass form. Measured at

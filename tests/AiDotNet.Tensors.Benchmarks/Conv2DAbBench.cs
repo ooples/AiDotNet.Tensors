@@ -24,6 +24,49 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunLayerNorm()
+    {
+        Console.WriteLine("=== LayerNorm micro-benchmark ===");
+        var engine = new CpuEngine();
+        var shapes = new (int batch, int features)[]
+        {
+            (32768, 64),    // BDN benchmark
+            (1, 768),       // BERT [1, 768]
+            (1024, 64),     // small batch
+            (4096, 128),    // medium
+            (1, 1024),      // larger feature
+        };
+        foreach (var (batch, fs) in shapes)
+        {
+            var rng = new Random(42);
+            var inp = new float[batch * fs];
+            var gam = new float[fs];
+            var bet = new float[fs];
+            for (int i = 0; i < inp.Length; i++) inp[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < gam.Length; i++) gam[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < bet.Length; i++) bet[i] = (float)(rng.NextDouble() * 2 - 1);
+            var input = new Tensor<float>(inp, new[] { batch, fs });
+            var gamma = new Tensor<float>(gam, new[] { fs });
+            var beta  = new Tensor<float>(bet, new[] { fs });
+
+            for (int i = 0; i < 10; i++) { var rWarm = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _); _ = rWarm; }
+            const int iters = 50;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                var rMeas = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double mean = samples.Average();
+            double min = samples.Min();
+            Console.WriteLine($"  Shape [{batch},{fs}]:  mean={mean,8:F1} µs   min={min,8:F1} µs");
+        }
+        Console.WriteLine();
+    }
+
     public static void RunAttentionQkt()
     {
         Console.WriteLine("=== AttentionQKT (Q · Kᵀ) micro-benchmark ===");

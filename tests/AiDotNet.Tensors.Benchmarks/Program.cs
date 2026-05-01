@@ -43,6 +43,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-layernorm")
+        {
+            Conv2DAbBench.RunLayerNorm();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
