@@ -24,6 +24,48 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunBinaryOps()
+    {
+        Console.WriteLine("=== Binary tensor ops (Add/Subtract/Multiply/Divide) micro-bench ===");
+        var engine = new CpuEngine();
+        var sizes = new[] { 100_000, 1_000_000 };
+        foreach (var n in sizes)
+        {
+            var rng = new Random(42);
+            var aData = new float[n]; var bData = new float[n];
+            for (int i = 0; i < n; i++) { aData[i] = (float)(rng.NextDouble() * 2 - 1); bData[i] = (float)(rng.NextDouble() * 2 - 1) + 0.5f; }
+            var a = new Tensor<float>(aData, new[] { n });
+            var b = new Tensor<float>(bData, new[] { n });
+
+            var ops = new (string name, Func<Tensor<float>> op)[]
+            {
+                ("TensorAdd     ", () => engine.TensorAdd(a, b)),
+                ("TensorSubtract", () => engine.TensorSubtract(a, b)),
+                ("TensorMultiply", () => engine.TensorMultiply(a, b)),
+                ("TensorDivide  ", () => engine.TensorDivide(a, b)),
+            };
+            Console.WriteLine($"--- size = {n:N0} ---");
+            foreach (var (name, op) in ops)
+            {
+                for (int i = 0; i < 10; i++) { var rWarm = op(); _ = rWarm; }
+                const int iters = 50;
+                var samples = new double[iters];
+                var sw = new Stopwatch();
+                for (int i = 0; i < iters; i++)
+                {
+                    sw.Restart();
+                    var rMeas = op();
+                    sw.Stop();
+                    samples[i] = sw.Elapsed.TotalMicroseconds;
+                }
+                double mean = samples.Average();
+                double min = samples.Min();
+                Console.WriteLine($"  {name}:  mean={mean,8:F1} µs   min={min,8:F1} µs");
+            }
+            Console.WriteLine();
+        }
+    }
+
     public static void RunConv2DDouble()
     {
         Console.WriteLine("=== Conv2D<double> micro-benchmark ===");

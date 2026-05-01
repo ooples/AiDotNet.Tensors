@@ -61,6 +61,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-binary-ops")
+        {
+            Conv2DAbBench.RunBinaryOps();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
