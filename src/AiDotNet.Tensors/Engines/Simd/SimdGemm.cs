@@ -706,7 +706,15 @@ internal static partial class SimdGemm
     //   8 cores: 10.48 Mi
     //  16 cores: 20 Mi   (iter 2 cap — unchanged)
     //  32 cores: 20 Mi   (capped)
-    private static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
+    /// <summary>
+    /// Work threshold (M·K·N) at and above which the SGEMM dispatch will run
+    /// the kernel in parallel via Parallel.For. Below this, the kernel runs
+    /// sequentially regardless of <see cref="UseParallelGemm"/>. Exposed
+    /// internally so callers (e.g. backward MatMul fast paths in
+    /// <c>BackwardFunctions</c>) can mirror the gate exactly instead of
+    /// hardcoding a duplicate value that drifts when this changes.
+    /// </summary>
+    internal static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
 
     private static long ComputeParallelWorkThreshold()
     {
