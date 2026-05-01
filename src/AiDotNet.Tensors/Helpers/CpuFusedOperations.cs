@@ -176,7 +176,19 @@ public static class CpuFusedOperations
             (activation == FusedActivationType.None
              || activation == FusedActivationType.ReLU))
         {
-            if (totalPlanes >= 4)
+            // Per-plane work is `hw` elements ≈ hw/8 AVX256 vector ops.
+            // For ResNet-style shapes (C=256, hw=14×14=196) per-plane
+            // work is ~50 ns — the Parallel.For dispatch + sync cost
+            // (~1 µs per task in a contested thread pool) is >>
+            // the work it dispatches, and the fused path becomes
+            // slower than the unfused (Conv + BroadcastAdd) reference.
+            // CI runners with 2-4 vCPUs see this as a 5× regression.
+            // Gate parallelism on TOTAL element count: only spin up
+            // workers when the work amortises the dispatch overhead.
+            // 65536 ≈ 8 µs of SIMD work — a comfortable floor.
+            const long ParallelElementThreshold = 65536L;
+            long totalElements = (long)totalPlanes * hw;
+            if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
                 Parallel.For(0, totalPlanes, p =>
                     ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
@@ -378,7 +390,19 @@ public static class CpuFusedOperations
             (activation == FusedActivationType.None
              || activation == FusedActivationType.ReLU))
         {
-            if (totalPlanes >= 4)
+            // Same parallel-dispatch threshold rationale as the float
+            // overload above. Doubles process half the lanes per AVX
+            // register but the dispatch overhead is identical, so the
+            // crossover point in element count is roughly the same.
+            // Without this gate, ResNet-style [1, 64, 14, 14] inputs
+            // (12544 elements) trigger a Parallel.For across 64 tiny
+            // tasks and the fused path slows down 5× on CI runners
+            // with limited vCPUs vs the unfused (Conv + BroadcastAdd)
+            // reference — the exact regression issue #251 introduced
+            // this fast path to AVOID.
+            const long ParallelElementThreshold = 65536L;
+            long totalElements = (long)totalPlanes * hw;
+            if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
                 Parallel.For(0, totalPlanes, p =>
                     ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU));

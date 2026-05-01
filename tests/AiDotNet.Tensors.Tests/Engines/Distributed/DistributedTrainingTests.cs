@@ -593,7 +593,6 @@ public class DistributedTrainingTests
         const int worldSize = 4;
         var endpoint = $"127.0.0.1:{port}";
         int reachedBarrier = 0;
-        var rankExceptions = new Exception?[worldSize];
 
         var tasks = new Task[worldSize];
         for (int i = 0; i < worldSize; i++)
@@ -601,34 +600,12 @@ public class DistributedTrainingTests
             int rank = i;
             tasks[i] = Task.Run(() =>
             {
-                try
-                {
-                    using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
-                    pg.Barrier();
-                    System.Threading.Interlocked.Increment(ref reachedBarrier);
-                }
-                catch (Exception ex)
-                {
-                    rankExceptions[rank] = ex;
-                }
+                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+                pg.Barrier();
+                System.Threading.Interlocked.Increment(ref reachedBarrier);
             });
         }
-        // 60s rather than 20s — 4-rank TCP coordination on shared CI
-        // runners (slow vCPU + competing-port-binds + thermal throttling)
-        // routinely needs more than 20s to complete the bind/connect/
-        // accept/handshake sequence × 4 ranks. The 3-rank tests above
-        // rarely hit the limit; the 4-rank case exposes the cliff.
-        bool completed = Task.WaitAll(tasks, TimeSpan.FromSeconds(60));
-        if (!completed)
-        {
-            // Without this diagnostic the bare Assert.True(false) just
-            // says "Expected True / Actual False" with zero context.
-            var status = string.Join(", ", tasks.Select((t, r) => $"rank{r}={t.Status}"));
-            var thrown = string.Join("; ", rankExceptions
-                .Select((e, r) => e is null ? null : $"rank{r}: {e.GetType().Name}: {e.Message}")
-                .Where(s => s is not null));
-            Assert.Fail($"TcpProcessGroup barrier timed out after 60s. Tasks: [{status}]. Errors: [{thrown}].");
-        }
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
         Assert.Equal(worldSize, reachedBarrier);
     }
 
