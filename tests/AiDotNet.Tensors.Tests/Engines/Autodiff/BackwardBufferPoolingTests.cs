@@ -409,19 +409,26 @@ public class BackwardBufferPoolingTests : IDisposable
     public void FusedLinearReLU_Backward_FastPath_ProducesValidGradients()
     {
         // Exercises FusedMatMulAddReLUBackward at a shape large enough that
-        // M·K·N ≥ SimdGemm.ParallelWorkThreshold, so the success branch
-        // hits the SimdGemm fast path AND the AutoTensorCache.Return
-        // line for the maskedTensor scratch buffer. Existing tests in
-        // this class use 2×2 matrices that fall under the threshold and
-        // take the engine fallback path, so the fast-path success branch
-        // (which the post-PR-280 fix touches) goes uncovered.
+        // M·K·N ≥ SimdGemm.ParallelWorkThreshold on any reasonable host,
+        // so the success branch hits the SimdGemm fast path AND the
+        // AutoTensorCache.Return line for the maskedTensor scratch buffer.
+        // Existing tests in this class use 2×2 matrices that fall under
+        // the threshold and take the engine fallback path, so the fast-
+        // path success branch (which the post-PR-280 fix touches) goes
+        // uncovered.
+        //
+        // Shape 256×512×256 ⇒ 33.5 Mi work-elements, above SimdGemm's 20 Mi
+        // upper cap (the cap is hit on hosts with ≥ 16 cores; lower cores
+        // see a smaller threshold scaled per core, so this size is safely
+        // over on every reasonable runner including the 4-core GitHub
+        // Actions Linux pool).
         //
         // We assert behavioural correctness (gradients are populated,
         // finite, and consistent across repeated calls) rather than
         // heap-retention numbers — GC.GetTotalMemory deltas are
         // unreliable on a shared CI runner where concurrent test classes
         // allocate during the measurement window.
-        const int M = 256, K = 256, N = 64; // 4.19 Mi work-elements > 2 Mi parallel gate
+        const int M = 256, K = 512, N = 256;
 
         var input = new Tensor<float>(MakeFilled(M * K, 0.01f), new[] { M, K });
         var weights = new Tensor<float>(MakeFilled(K * N, 0.005f), new[] { K, N });
