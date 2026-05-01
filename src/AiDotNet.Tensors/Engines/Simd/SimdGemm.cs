@@ -923,6 +923,18 @@ internal static partial class SimdGemm
                 && k <= SmallMatmulKThreshold
                 && (n % 8 == 0))
             {
+                // #209 close-parity: parallel-M dispatcher for medium shapes.
+                // SgemmDirect itself is single-threaded; for 256³ MatMul (16M FMAs)
+                // that left 15 cores idle. Parallel-M splits the outer-M loop
+                // across cores via PersistentParallelExecutor (~5 µs dispatch).
+                // Gate at 4M FMAs + m >= 64 (enough Mr=6 blocks to slice).
+                if (allowParallel
+                    && directWork >= ParallelDirectWorkThreshold
+                    && m >= ParallelDirectMinM)
+                {
+                    SgemmDirectParallelM(a, lda, b, ldb, c, m, k, n, clearedOutput);
+                    return;
+                }
                 SgemmDirect(a, lda, b, ldb, c, m, k, n, clearedOutput);
                 return;
             }
@@ -953,7 +965,17 @@ internal static partial class SimdGemm
                             bT[p * n + j] = b[bRowStart + p];
                         }
                     }
-                    SgemmDirect(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
+                    // Same parallel-M dispatch as the !transB branch above.
+                    if (allowParallel
+                        && directWork >= ParallelDirectWorkThreshold
+                        && m >= ParallelDirectMinM)
+                    {
+                        SgemmDirectParallelM(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
+                    }
+                    else
+                    {
+                        SgemmDirect(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
+                    }
                 }
                 finally
                 {
@@ -1014,14 +1036,21 @@ internal static partial class SimdGemm
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
 
-    // For transB=true (e.g. AttentionQKT Q·K^T), keep the original 8M
-    // threshold. The pre-transpose + SgemmDirect path is single-threaded;
-    // above 8M FMAs the parallel SgemmTiled path wins despite its packing
-    // overhead. Validated by --ab-attention-qkt: at 16.8M FMAs single-thread
-    // SgemmDirect hits 57 GFLOPS (near AVX2 single-core peak), but torch's
-    // parallel kernel is at 248 GFLOPS — only parallelism closes that gap.
-    private const long SmallMatmulWorkThresholdTransB = 8L * 1024 * 1024;
+    // For transB=true (e.g. AttentionQKT Q·K^T), now that SgemmDirect has
+    // a parallel-M dispatcher (SgemmDirectParallelM), the pre-transpose +
+    // SgemmDirect path is no longer single-threaded for medium shapes.
+    // Restored to 32M to match the !transB threshold — AttentionQKT
+    // 512×64 (16.8M FMAs) takes pre-transpose + parallel SgemmDirect.
+    private const long SmallMatmulWorkThresholdTransB = 32L * 1024 * 1024;
     private const int SmallMatmulKThreshold = 512;
+
+    // #209 close-parity: parallel-M SgemmDirect threshold.
+    // A/B-tuned (--ab-attention-qkt): at 4M FMAs the dispatch overhead
+    // dominated and 256×64 attention regressed 114→157 µs. At 8M FMAs the
+    // crossover stabilizes — 16M+ shapes win 1.2-2.3× from parallelism.
+    // m ≥ 64 ensures ≥10 Mr=6 blocks to slice across the 16-core pool.
+    private const long ParallelDirectWorkThreshold = 8L * 1024 * 1024;  // 8M FMAs
+    private const int ParallelDirectMinM = 64;
 
     /// <summary>
     /// Scalar GEMM fallback with stride/transpose support.
@@ -1324,6 +1353,118 @@ internal static partial class SimdGemm
                             pARow, lda, pBroot + j, ldb, pCRow + j, n,
                             k, mcActual: mcTail, ncActual: ncTail);
                     }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// #209 close-parity: parallel-M wrapper around SgemmDirect's tile loop.
+    /// Distributes the outer-M loop's Mr=6 blocks across cores via the
+    /// persistent thread pool. Each chunk handles a contiguous range of
+    /// Mr-row blocks; chunks write to disjoint output rows (no contention).
+    ///
+    /// <para>Skips the JIT fat-kernel path (one-shot machine-code blob for
+    /// the entire [mFull, n] region) — that path was tuned for sub-µs
+    /// dispatch but is single-threaded; for medium shapes parallelism wins
+    /// more than P/Invoke amortization.</para>
+    ///
+    /// <para>Uses store-only kernels (DirectKernel6x16Store / MaskedStore)
+    /// because callers go through SgemmAddInternal with clearedOutput=true
+    /// (the outer Sgemm clears C). Accumulating callers stay on
+    /// single-threaded SgemmDirect.</para>
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmDirectParallelM(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c,
+        int m, int k, int n,
+        bool clearedOutput)
+    {
+        // Fall back to single-threaded for the accumulate path — it's a
+        // rare entry point (SgemmAdd with non-cleared C) and parallelizing
+        // it would race on read-modify-write of C.
+        if (!clearedOutput)
+        {
+            SgemmDirect(a, lda, b, ldb, c, m, k, n, clearedOutput);
+            return;
+        }
+
+        int mFull = (m / Mr) * Mr;
+        int numFullBlocks = mFull / Mr;     // count of complete Mr-row blocks
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, numFullBlocks);
+        if (numChunks <= 1)
+        {
+            // Not enough work to parallelize meaningfully.
+            SgemmDirect(a, lda, b, ldb, c, m, k, n, clearedOutput);
+            return;
+        }
+        int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+
+        // Pin the root pointers ONCE before the parallel dispatch — each worker
+        // computes its tile range using offsets, no per-worker Pin().
+        fixed (float* pAroot = a, pBroot = b, pCroot = c)
+        {
+            IntPtr ipA = (IntPtr)pAroot;
+            IntPtr ipB = (IntPtr)pBroot;
+            IntPtr ipC = (IntPtr)pCroot;
+            int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
+
+            Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            {
+                int blockStart = chunk * blocksPerChunk;
+                int blockEnd = Math.Min(blockStart + blocksPerChunk, numFullBlocks);
+                if (blockStart >= blockEnd) return;
+
+                int iStart = blockStart * Mr;
+                int iEnd = blockEnd * Mr;
+
+                float* pA = (float*)ipA;
+                float* pB = (float*)ipB;
+                float* pC = (float*)ipC;
+                int nFull = (nCap / Nr) * Nr;
+
+                for (int i = iStart; i < iEnd; i += Mr)
+                {
+                    float* pARow = pA + i * ldaCap;
+                    float* pCRow = pC + i * nCap;
+
+                    int j = 0;
+                    for (; j + Nr <= nCap; j += Nr)
+                    {
+                        DirectKernel6x16Store(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap, kCap);
+                    }
+                    int ncTail = nCap - j;
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                            kCap, mcActual: Mr, ncActual: ncTail);
+                    }
+                }
+            });
+
+            // Handle the M-edge (≤ Mr-1 leftover rows) on the calling thread.
+            int mcTail = m - mFull;
+            if (mcTail > 0)
+            {
+                float* pARow = pAroot + mFull * lda;
+                float* pCRow = pCroot + mFull * n;
+                int j = 0;
+                for (; j + Nr <= n; j += Nr)
+                {
+                    DirectKernelMxNMaskedStore(
+                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                        k, mcActual: mcTail, ncActual: Nr);
+                }
+                int ncTail = n - j;
+                if (ncTail > 0)
+                {
+                    DirectKernelMxNMaskedStore(
+                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
+                        k, mcActual: mcTail, ncActual: ncTail);
                 }
             }
         }

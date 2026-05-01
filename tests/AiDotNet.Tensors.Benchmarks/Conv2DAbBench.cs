@@ -24,6 +24,49 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 internal static class Conv2DAbBench
 {
+    public static void RunMatMul()
+    {
+        Console.WriteLine("=== MatMul (TensorMatMul, float) micro-benchmark ===");
+        var engine = new CpuEngine();
+        var shapes = new (int M, int K, int N)[]
+        {
+            (256, 256, 256),    // 16.8M FMAs — current SgemmDirect target
+            (512, 512, 512),    // 134M FMAs — SgemmTiled with Mc=192
+            (128, 128, 128),    // 2.1M FMAs — small, probably below parallel threshold
+            (768, 768, 768),    // 453M FMAs — SgemmTiled
+            (256, 64, 256),     // 4.2M FMAs — attention shape
+        };
+        foreach (var (M, K, N) in shapes)
+        {
+            var rng = new Random(42);
+            var aData = new float[M * K];
+            var bData = new float[K * N];
+            for (int i = 0; i < aData.Length; i++) aData[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < bData.Length; i++) bData[i] = (float)(rng.NextDouble() * 2 - 1);
+            var a = new Tensor<float>(aData, new[] { M, K });
+            var b = new Tensor<float>(bData, new[] { K, N });
+
+            for (int i = 0; i < 10; i++) { var rWarm = engine.TensorMatMul(a, b); _ = rWarm; }
+            const int iters = 50;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                var rMeas = engine.TensorMatMul(a, b);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double mean = samples.Average();
+            double min = samples.Min();
+            long workFmas = (long)M * K * N;
+            double gflops = workFmas * 2.0 / (min * 1000.0);
+            Console.WriteLine($"  Shape [{M},{K}]×[{K},{N}] ({workFmas / 1_000_000.0:F1}M FMAs):  " +
+                              $"mean={mean,8:F1} µs   min={min,8:F1} µs   ({gflops,5:F1} GFLOPS)");
+        }
+        Console.WriteLine();
+    }
+
     public static void RunLayerNorm()
     {
         Console.WriteLine("=== LayerNorm micro-benchmark ===");

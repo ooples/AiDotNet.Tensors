@@ -49,6 +49,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-matmul")
+        {
+            Conv2DAbBench.RunMatMul();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
