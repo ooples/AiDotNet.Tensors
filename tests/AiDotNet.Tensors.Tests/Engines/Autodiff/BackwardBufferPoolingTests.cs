@@ -432,7 +432,12 @@ public class BackwardBufferPoolingTests : IDisposable
         for (int step = 0; step < 5; step++)
         {
             using var tape = new GradientTape<float>();
-            var output = _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            // FusedLinearReLU registers FusedMatMulAddReLUBackward — the
+            // function that owns the maskedTensor scratch buffer this fix
+            // returns to the cache. _engine.FusedLinear(..., ReLU) takes a
+            // different code path (FusedLinearWithActivationBackward) that
+            // doesn't have the mask buffer at all.
+            var output = _engine.FusedLinearReLU(input, weights, bias);
             var loss = _engine.ReduceSum(output, null);
             var grads = tape.ComputeGradients(loss, new[] { input, weights, bias });
 
