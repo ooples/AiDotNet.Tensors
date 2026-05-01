@@ -167,31 +167,40 @@ public sealed class TcpProcessGroup : IProcessGroup
         else
         {
             // Non-coordinator: connect, send our rank.
-            // TcpClient is single-use — once ConnectAsync completes (whether
-            // it succeeds, refuses, or times out), the instance can't be
-            // re-connected. The previous loop reused one TcpClient across
-            // retries which deadlocked when rank 0 hadn't bound yet on the
-            // first attempt. We allocate a fresh client per iteration and
-            // dispose the failed ones to release the socket handle.
+            // TcpClient is single-use — once Connect completes (whether
+            // it succeeds or refuses), the instance can't be re-connected.
+            // We allocate a fresh client per iteration and dispose
+            // the failed ones to release the socket handle.
+            //
+            // We use SYNCHRONOUS Connect rather than ConnectAsync+Wait(2s)
+            // because the previous timeout pattern produced phantom
+            // accepted-then-RST connections on the coord side: if
+            // ConnectAsync's underlying TCP handshake established AFTER
+            // our 2s wait expired, we'd dispose the attempt (RST the
+            // socket) but the coord's listener had already enqueued the
+            // connection. The coord's accept task then read EOF on the
+            // first byte and threw "Connection closed mid-frame",
+            // taking down the whole construction. Synchronous Connect
+            // returns ONLY when the handshake is fully complete or
+            // fails — no in-flight ambiguity, no phantom connections.
+            // On loopback Connect is microseconds; on real networks
+            // it inherits the OS connect timeout, which is bounded by
+            // the outer `deadline` check.
             while (DateTime.UtcNow < deadline)
             {
                 var attempt = new TcpClient();
                 try
                 {
-                    var connectTask = attempt.ConnectAsync(host, port);
-                    if (connectTask.Wait(TimeSpan.FromSeconds(2)) && attempt.Connected)
+                    attempt.Connect(host, port);
+                    if (attempt.Connected)
                     {
                         _coordSocket = attempt;
                         break;
                     }
-                    // Either timed out (Wait returned false) or completed
-                    // unsuccessfully — close this attempt and retry with
-                    // a fresh socket on the next iteration.
                     attempt.Dispose();
                     Thread.Sleep(50);
                 }
-                catch (Exception ex) when (ex is SocketException
-                                            || ex is AggregateException ae && ae.InnerException is SocketException)
+                catch (SocketException)
                 {
                     // Connection refused / unreachable — coordinator hasn't
                     // bound yet. Backoff and retry with a fresh client.
