@@ -377,8 +377,17 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Float32 + 2D fast path: compute transposed GEMMs into pooled buffers, then accumulate.
-        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2)
+        // Float32 + 2D fast paths (SimdGemm and BLAS): compute transposed GEMMs
+        // into pooled buffers, then accumulate. Both bypass engine recording
+        // (the kernels write directly to managed arrays without going through
+        // any tape-aware op), so they're gated on no-active-tape — when a tape
+        // is recording we want createGraph=true and Hvp-style higher-order AD
+        // to stay on the engine path so each gradient computation is itself
+        // recorded into the outer tape. Rentals also live behind the gate so
+        // the recording path doesn't pay AutoTensorCache lookups it won't use.
+        if (typeof(T) == typeof(float)
+            && inputs[0].Rank == 2 && inputs[1].Rank == 2
+            && GradientTape<T>.Current is null)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
@@ -396,11 +405,10 @@ internal static class BackwardFunctions<T>
                 var gradAData = (float[])(object)gradATensor.GetDataArray();
                 var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                // Parallel SimdGemm path: bypasses single-threaded BLAS providers when
-                // no tape is recording (createGraph=true would need engine ops to wire
-                // gradients into the outer tape — that path stays on the engine below).
+                // Parallel SimdGemm path: bypasses single-threaded BLAS providers
+                // when work is large enough to amortize task spawn cost.
                 long backwardWork = (long)M * K * N;
-                if (GradientTape<T>.Current is null && backwardWork >= MatMulBackwardSimdThreshold)
+                if (backwardWork >= MatMulBackwardSimdThreshold)
                 {
                     // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. B is stored row-major [K,N] (ldb=N), transB=true.
                     SimdGemm.Sgemm(dCArr, N, false, bArr, N, true, gradAData.AsSpan(0, M * K), M, N, K);

@@ -628,39 +628,54 @@ public sealed class GradientTape<T> : IDisposable
         // the intermediate (a pooled output buffer, a weak-ref
         // tracker, debugging hook, …) the gradient stays live too.
         // Source tensors keep .Grad — that's the optimizer's input.
+        // Tensors registered via RetainGrad() also keep .Grad — that's the
+        // user's explicit request to retain gradients on a non-leaf tensor.
         if (!_options.Persistent)
         {
             // Build a set of source tensors for O(1) sourcehood check.
-            // Skip the set construction when no sources were specified
-            // (caller wants the full grads dict), since we can't
-            // safely null .Grad on anything in that mode.
+            // sources == null means the caller wants the full grads dict,
+            //   so we can't safely null .Grad on anything.
+            // sources != null (even if empty) means the caller specified
+            //   the protected set explicitly — clear .Grad on everything
+            //   else, including the case where the explicit set is empty.
             HashSet<Tensor<T>>? sourceSet = null;
-            if (sources is not null && sources.Count > 0)
+            if (sources is not null)
             {
                 sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources) sourceSet.Add(s);
             }
+            // Local helper: should this tensor keep its .Grad?
+            // True when sources mode is off (sourceSet null), when the tensor
+            // is a source, or when the user retained grads on it explicitly.
+            bool ShouldKeepGrad(Tensor<T> t)
+            {
+                if (sourceSet is null) return true;
+                if (sourceSet.Contains(t)) return true;
+                if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
+                return false;
+            }
             foreach (var node in topoOrder)
             {
                 node.Output.GradFn = null;
-                if (sourceSet is not null && !sourceSet.Contains(node.Output))
+                if (!ShouldKeepGrad(node.Output))
                     node.Output.Grad = null;
-                if (node.Input0 is not null)
-                {
-                    node.Input0.GradFn = null;
-                    if (sourceSet is not null && !sourceSet.Contains(node.Input0))
-                        node.Input0.Grad = null;
-                }
+
+                // Input0 is non-nullable on GradNode<T>; the recorder
+                // always populates it.
+                node.Input0.GradFn = null;
+                if (!ShouldKeepGrad(node.Input0))
+                    node.Input0.Grad = null;
+
                 if (node.Input1 is not null)
                 {
                     node.Input1.GradFn = null;
-                    if (sourceSet is not null && !sourceSet.Contains(node.Input1))
+                    if (!ShouldKeepGrad(node.Input1))
                         node.Input1.Grad = null;
                 }
                 if (node.Input2 is not null)
                 {
                     node.Input2.GradFn = null;
-                    if (sourceSet is not null && !sourceSet.Contains(node.Input2))
+                    if (!ShouldKeepGrad(node.Input2))
                         node.Input2.Grad = null;
                 }
                 if (node.InputsOverflow is not null)
@@ -669,7 +684,7 @@ public sealed class GradientTape<T> : IDisposable
                     {
                         if (inp is null) continue;
                         inp.GradFn = null;
-                        if (sourceSet is not null && !sourceSet.Contains(inp))
+                        if (!ShouldKeepGrad(inp))
                             inp.Grad = null;
                     }
                 }

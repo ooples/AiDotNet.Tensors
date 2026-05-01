@@ -13,6 +13,15 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>
+/// Defines the non-parallel collection for <see cref="GradientTapeLeakTests"/>.
+/// The leak ceiling assertions read process-wide <c>GC.GetTotalMemory</c>, so
+/// concurrent test allocations on other threads inflate the measured delta and
+/// can either fail the budget for unrelated reasons or hide a real regression.
+/// </summary>
+[CollectionDefinition("GradientTapeLeakTests", DisableParallelization = true)]
+public class GradientTapeLeakTestsCollection { }
+
+/// <summary>
 /// Issue #279 leak repro. Mirrors a single transformer encoder block —
 /// QKV projections, scaled-dot-product attention, output projection,
 /// FFN — wired up with autograd recording so every saved-for-backward
@@ -21,6 +30,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// strict ceiling that catches both the original leak and any future
 /// regression.
 /// </summary>
+[Collection("GradientTapeLeakTests")]
 public class GradientTapeLeakTests
 {
     private readonly ITestOutputHelper _output;
