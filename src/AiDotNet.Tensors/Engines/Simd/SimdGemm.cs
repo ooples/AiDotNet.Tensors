@@ -64,6 +64,27 @@ internal static partial class SimdGemm
     private const int SmallMc = 128;
     private const int LargeMc = 192;
     private const long AdaptiveMcWorkThreshold = 3_000_000_000L; // 3G FMAs
+
+    // #209 close-parity: for medium-sized SQUARE GEMMs (e.g. 512³ at 134M FMAs)
+    // Salykova's Ryzen tuning recommends Mc=192-400 — larger panels reduce
+    // packing overhead. Keep SmallMc for non-square / batched shapes (those
+    // were tuned at iter 31 to use Mc=128 for parallelism granularity).
+    // Reference: salykova.github.io/matmul-cpu — Mc 200-400 for AVX2 Ryzen.
+    private const long SquareMediumWorkLow = 64_000_000L;   // 64M (256³ + headroom)
+    private const long SquareMediumWorkHigh = 1_500_000_000L; // 1.5G
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ChooseAdaptiveMc(int m, int k, int n)
+    {
+        long work = (long)m * k * n;
+        if (work >= AdaptiveMcWorkThreshold) return LargeMc;
+        // Square-shape medium regime: 512³, 768³ etc. fit all 3 operands in
+        // L3 (Zen 2 is 16 MB shared) and benefit from a larger A panel that
+        // reduces outer-loop packing iterations.
+        if (m == n && n == k && work >= SquareMediumWorkLow && work <= SquareMediumWorkHigh)
+            return LargeMc;
+        return SmallMc;
+    }
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
 
@@ -113,7 +134,7 @@ internal static partial class SimdGemm
     /// </summary>
     private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
     {
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
         int numPcIters = (k + Kc - 1) / Kc;
@@ -192,7 +213,7 @@ internal static partial class SimdGemm
         }
 
         _prePackedBCache.TryGetValue(b, out var existing);
-        int expectedMc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int expectedMc = ChooseAdaptiveMc(m, k, n);
         PrePackedB cached;
         if (existing is null
             || existing.K != k || existing.N != n
@@ -253,7 +274,7 @@ internal static partial class SimdGemm
     {
         float scale = Int8Quantizer.ComputeSymmetricScale(b);
 
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
         int numPcIters = (k + Kc - 1) / Kc;
@@ -333,7 +354,7 @@ internal static partial class SimdGemm
         }
 
         _int8PrePackedBCache.TryGetValue(b, out var existing);
-        int expectedMc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int expectedMc = ChooseAdaptiveMc(m, k, n);
         Int8PrePackedB cached;
         if (existing is null
             || existing.K != k || existing.N != n
@@ -1741,7 +1762,7 @@ internal static partial class SimdGemm
         // 2D dispatch overhead). Large m (≥ 2048) uses LargeMc=192 for Square
         // 4608²'s L2 saturation win (0.95× of MKL). Shadowed as `Mc` locally
         // so the rest of SgemmTiled's body reads unchanged.
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
             && UseParallelGemm
@@ -1861,7 +1882,7 @@ internal static partial class SimdGemm
         int nrPerWorker = (numNrBlocks + numWorkers - 1) / numWorkers;
 
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
 
         // Pre-pack A (shared across all workers, m is small so only 1 Mc block)
         int firstMc = Math.Min(Mc, m);
@@ -1979,7 +2000,7 @@ internal static partial class SimdGemm
         int numRowBlocks, float[] packedBBuf)
     {
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
 
         // Pack B once (shared across all M workers, read-only)
         PackB(b, packedBBuf, n, pc, kc, jc, nc);
@@ -2061,7 +2082,7 @@ internal static partial class SimdGemm
         int numRowBlocks, int numColSubBlocks)
     {
         // Iter 33: adaptive Mc (must match SgemmTiled's choice for consistency)
-        int Mc = ((long)m * k * n >= AdaptiveMcWorkThreshold) ? LargeMc : SmallMc;
+        int Mc = ChooseAdaptiveMc(m, k, n);
 
         // colSubSize: number of B columns per sub-block, rounded down to a multiple
         // of Nr so MacroKernel's Nr panel loop stays clean. The last sub absorbs the
