@@ -36,7 +36,12 @@ public class GradientTapeLeakTests
     private readonly ITestOutputHelper _output;
     public GradientTapeLeakTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    // Diagnostic helper retained for manual leak investigation. It writes
+    // tracking output to the test runner but asserts nothing — running it
+    // in CI just spends runtime without exercising any contract — so it's
+    // skipped by default and unskipped only when an engineer is chasing a
+    // specific leak signature.
+    [Fact(Skip = "Diagnostic-only — unskip locally when triaging a leak. No assertions, prints WeakReference live counts.")]
     public void Diagnostic_FindLeakSource()
     {
         // Diagnostic test: track all live Tensor<float> instances

@@ -359,18 +359,32 @@ internal static class BackwardFunctions<T>
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Threshold (in FMAs ≈ 2·M·K·N flops / 2) above which the float32 backward
-    /// MatMul prefers the in-process parallel <see cref="SimdGemm"/> path over
-    /// <see cref="BlasProvider.TryGemmEx"/>. The provider may dispatch to a
-    /// single-threaded BLAS install (Microsoft.ML/CRT BLAS lacks Parallel.For
-    /// internally on some runtimes), which silently caps backward throughput
-    /// to one core during training. SimdGemm is guaranteed parallel on shapes
-    /// at or above its own internal threshold, so we use it directly when the
-    /// work is large enough to amortize task spawn cost. 4096 FMAs ≈ a 16×16×16
-    /// matmul — small enough that anything resembling a transformer FFN
-    /// (≥256×768×768 ≈ 150M FMAs) crosses it by orders of magnitude.
+    /// Work threshold (M·K·N) above which the float32 backward MatMul prefers
+    /// <see cref="SimdGemm"/> over <see cref="BlasProvider.TryGemmEx"/>. The
+    /// goal is "take SimdGemm only when it will actually run parallel" —
+    /// SimdGemm has its own internal parallel gate (≥2 Mi work-elements,
+    /// scaled up to 20 Mi by core count), so anything below that runs
+    /// sequentially inside SimdGemm and offers no advantage over BLAS.
+    ///
+    /// On installs with a parallel native BLAS, BLAS already uses many cores
+    /// and we don't need SimdGemm. On installs whose BLAS provider is
+    /// single-threaded (Microsoft.ML/CRT BLAS lacks internal Parallel.For on
+    /// some runtimes), SimdGemm overtakes BLAS — but only at shapes large
+    /// enough that SimdGemm itself parallelizes. So the threshold is mirrored
+    /// from <c>SimdGemm.ParallelWorkThreshold</c> at runtime.
     /// </summary>
-    private const long MatMulBackwardSimdThreshold = 4096L;
+    private static readonly long MatMulBackwardSimdThreshold = ComputeSimdGemmParallelThreshold();
+
+    private static long ComputeSimdGemmParallelThreshold()
+    {
+        // Mirrors SimdGemm.ComputeParallelWorkThreshold so the backward path
+        // takes SimdGemm exactly when SimdGemm itself will go parallel.
+        int cores = Math.Max(1, Environment.ProcessorCount);
+        long scaled = (20L * 1024 * 1024 / 16) * cores;
+        if (scaled < 2L * 1024 * 1024) scaled = 2L * 1024 * 1024;
+        if (scaled > 20L * 1024 * 1024) scaled = 20L * 1024 * 1024;
+        return scaled;
+    }
 
     /// <summary>d(A@B)/dA = grad @ B^T, d(A@B)/dB = A^T @ grad</summary>
     internal static void MatMulBackward(
