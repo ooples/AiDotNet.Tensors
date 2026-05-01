@@ -55,12 +55,50 @@ internal static class SimdConvHelper
 
         bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
 
+        // #209 close-parity: 4-oc-blocked fast path (oneDNN's nb_oc_blocking=4
+        // strategy). Holds 4 output-channel accumulators in registers across
+        // the input-channel reduction, eliminating the per-ic load+add+store
+        // round-trip on the output buffer that the per-channel kernel does.
+        // Reference: oneDNN/src/cpu/x64/jit_avx2_conv_kernel_f32.cpp
+        //
+        // Gating: requires outChannels % 4 == 0, padH=padW=1, no dilation
+        // (the typical ResNet/transformer 3x3 conv shape). Falls through to
+        // the per-channel kernel for any non-matching shape.
+        bool canUseOcBlock4 = UseFma
+            && outChannels >= 4 && (outChannels & 3) == 0
+            && padH == 1 && padW == 1
+            && dilationH == 1 && dilationW == 1;
+
         for (int b = 0; b < batch; b++)
         {
             float* inputBatch = input + b * inChannels * height * width;
             float* outputBatch = output + b * outChannels * outHeight * outWidth;
 
-            if (useParallel)
+            if (canUseOcBlock4)
+            {
+                int numBlocks = outChannels / 4;
+                if (useParallel)
+                {
+                    CpuParallelSettings.LightweightParallel(numBlocks, ocb =>
+                    {
+                        Conv3x3Stride1Pad1_OcBlock4(
+                            inputBatch, kernel + ocb * 4 * inChannels * 9,
+                            outputBatch + ocb * 4 * outputSize,
+                            inChannels, height, width, outHeight, outWidth);
+                    });
+                }
+                else
+                {
+                    for (int ocb = 0; ocb < numBlocks; ocb++)
+                    {
+                        Conv3x3Stride1Pad1_OcBlock4(
+                            inputBatch, kernel + ocb * 4 * inChannels * 9,
+                            outputBatch + ocb * 4 * outputSize,
+                            inChannels, height, width, outHeight, outWidth);
+                    }
+                }
+            }
+            else if (useParallel)
             {
                 CpuParallelSettings.LightweightParallel(outChannels, oc =>
                 {
@@ -82,6 +120,229 @@ internal static class SimdConvHelper
                         padH, padW, dilationH, dilationW);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// 3×3 stride=1 padding=1 dilation=1 conv that processes 4 output channels
+    /// at a time. For each (oh, ow_chunk) position it holds 4 AVX2 accumulators
+    /// in registers across the entire input-channel reduction loop, then writes
+    /// 4 outputs once at the end. This eliminates the output round-trip
+    /// (load+add+store per ic per chunk) that the per-channel kernel does.
+    ///
+    /// <para>Mirrors oneDNN's <c>jit_avx2_conv_kernel_f32</c> structure:
+    /// <c>nb_oc_blocking = 4</c>, accumulators stay register-resident through
+    /// the ic reduction. AVX2 has 16 ymm registers; we use 4 for accumulators
+    /// + 9 for 3×3 input vectors per ic = 13 ymm budget — fits without spills.</para>
+    ///
+    /// <para>Boundary rows (oh = 0, oh = outHeight-1) and the 8-aligned tail
+    /// of each row are handled by a scalar fallback for correctness; the
+    /// interior dominates the FLOPs at ResNet/transformer shapes
+    /// (e.g. 64×64 = 4096 outputs, 62×56 = 3472 are interior, 85% of work).</para>
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3Stride1Pad1_OcBlock4(
+        float* input,    // [inChannels, height, width]
+        float* kBlock,   // [4, inChannels, 9] — 4 output channels' kernels (3×3 each)
+        float* outBlock, // [4, outHeight, outWidth] — 4 output channels' outputs
+        int inChannels, int height, int width,
+        int outHeight, int outWidth)
+    {
+        int ocStride = outHeight * outWidth;
+        int icSpatialStride = height * width;
+
+        // Clear all 4 output channels.
+        for (int oc = 0; oc < 4; oc++)
+            new Span<float>(outBlock + oc * ocStride, ocStride).Clear();
+
+        // Boundary rows: top (oh=0) and bottom (oh=outHeight-1) need
+        // padding-aware kernel position skipping. Delegate to the existing
+        // scalar fallback per-channel for correctness.
+        for (int oc = 0; oc < 4; oc++)
+        {
+            float* outChan = outBlock + oc * ocStride;
+            float* kChan = kBlock + oc * inChannels * 9;
+
+            // Top boundary row
+            ProcessConv3x3BoundaryRowAllIc(input, kChan, outChan,
+                inChannels, icSpatialStride, height, width, outWidth, oh: 0);
+            // Bottom boundary row (only if distinct from top)
+            if (outHeight > 1)
+            {
+                ProcessConv3x3BoundaryRowAllIc(input, kChan, outChan,
+                    inChannels, icSpatialStride, height, width, outWidth, oh: outHeight - 1);
+            }
+        }
+
+        // Interior rows: oh in [1, outHeight - 2]. For these rows ih = oh - 1,
+        // ih+1, ih+2 are all in-bounds (no top/bottom boundary), but the
+        // left and right ow boundaries still need scalar handling.
+        // Interior cols where ow_chunk + 8 <= outWidth-1 and ow_chunk >= 1
+        // are the SIMD fast path.
+        for (int oh = 1; oh < outHeight - 1; oh++)
+        {
+            int ihTop = oh - 1; // padH=1
+            // Process the leftmost output column ow=0 with scalar (boundary).
+            for (int oc = 0; oc < 4; oc++)
+            {
+                float* outChan = outBlock + oc * ocStride;
+                float* kChan = kBlock + oc * inChannels * 9;
+                outChan[oh * outWidth + 0] = ScalarConv3x3At(input, kChan,
+                    inChannels, icSpatialStride, height, width, oh, 0, 1, 1);
+            }
+
+            // Interior columns: ow from 1 to outWidth - 2, processed in chunks
+            // of 8. The chunk requires ih, ih+1, ih+2 input rows × ow-1, ow,
+            // ow+1 column offsets — all in-bounds at padding=1 + interior oh.
+            int owStart = 1;
+            int owEnd = outWidth - 1; // exclusive — last col is right boundary
+            int owSimdEnd = owStart + ((owEnd - owStart) & ~7);
+
+            for (int ow = owStart; ow < owSimdEnd; ow += 8)
+            {
+                int iw = ow - 1; // padW=1, kernel column 0 starts at iw
+
+                // Hold 4 oc accumulators across the ic reduction.
+                var acc0 = Vector256<float>.Zero;
+                var acc1 = Vector256<float>.Zero;
+                var acc2 = Vector256<float>.Zero;
+                var acc3 = Vector256<float>.Zero;
+
+                for (int ic = 0; ic < inChannels; ic++)
+                {
+                    float* inputChan = input + ic * icSpatialStride;
+                    // Load 9 input vectors (3 input rows × 3 column offsets) ONCE
+                    // per ic — these are shared across all 4 output channels.
+                    var r0_0 = Avx.LoadVector256(inputChan + ihTop       * width + iw);
+                    var r0_1 = Avx.LoadVector256(inputChan + ihTop       * width + iw + 1);
+                    var r0_2 = Avx.LoadVector256(inputChan + ihTop       * width + iw + 2);
+                    var r1_0 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw);
+                    var r1_1 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw + 1);
+                    var r1_2 = Avx.LoadVector256(inputChan + (ihTop + 1) * width + iw + 2);
+                    var r2_0 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw);
+                    var r2_1 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw + 1);
+                    var r2_2 = Avx.LoadVector256(inputChan + (ihTop + 2) * width + iw + 2);
+
+                    // For each of the 4 output channels: broadcast the 9 kernel
+                    // values for THIS (oc, ic) pair and FMA into the corresponding
+                    // accumulator. This is the loop-tiling pattern PyTorch's
+                    // oneDNN AVX2 kernel uses (jit_avx2_conv_kernel_f32).
+                    float* k0 = kBlock + 0 * inChannels * 9 + ic * 9;
+                    float* k1 = kBlock + 1 * inChannels * 9 + ic * 9;
+                    float* k2 = kBlock + 2 * inChannels * 9 + ic * 9;
+                    float* k3 = kBlock + 3 * inChannels * 9 + ic * 9;
+
+                    acc0 = Fma.MultiplyAdd(r0_0, Vector256.Create(k0[0]), acc0);
+                    acc0 = Fma.MultiplyAdd(r0_1, Vector256.Create(k0[1]), acc0);
+                    acc0 = Fma.MultiplyAdd(r0_2, Vector256.Create(k0[2]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_0, Vector256.Create(k0[3]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_1, Vector256.Create(k0[4]), acc0);
+                    acc0 = Fma.MultiplyAdd(r1_2, Vector256.Create(k0[5]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_0, Vector256.Create(k0[6]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_1, Vector256.Create(k0[7]), acc0);
+                    acc0 = Fma.MultiplyAdd(r2_2, Vector256.Create(k0[8]), acc0);
+
+                    acc1 = Fma.MultiplyAdd(r0_0, Vector256.Create(k1[0]), acc1);
+                    acc1 = Fma.MultiplyAdd(r0_1, Vector256.Create(k1[1]), acc1);
+                    acc1 = Fma.MultiplyAdd(r0_2, Vector256.Create(k1[2]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_0, Vector256.Create(k1[3]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_1, Vector256.Create(k1[4]), acc1);
+                    acc1 = Fma.MultiplyAdd(r1_2, Vector256.Create(k1[5]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_0, Vector256.Create(k1[6]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_1, Vector256.Create(k1[7]), acc1);
+                    acc1 = Fma.MultiplyAdd(r2_2, Vector256.Create(k1[8]), acc1);
+
+                    acc2 = Fma.MultiplyAdd(r0_0, Vector256.Create(k2[0]), acc2);
+                    acc2 = Fma.MultiplyAdd(r0_1, Vector256.Create(k2[1]), acc2);
+                    acc2 = Fma.MultiplyAdd(r0_2, Vector256.Create(k2[2]), acc2);
+                    acc2 = Fma.MultiplyAdd(r1_0, Vector256.Create(k2[3]), acc2);
+                    acc2 = Fma.MultiplyAdd(r1_1, Vector256.Create(k2[4]), acc2);
+                    acc2 = Fma.MultiplyAdd(r1_2, Vector256.Create(k2[5]), acc2);
+                    acc2 = Fma.MultiplyAdd(r2_0, Vector256.Create(k2[6]), acc2);
+                    acc2 = Fma.MultiplyAdd(r2_1, Vector256.Create(k2[7]), acc2);
+                    acc2 = Fma.MultiplyAdd(r2_2, Vector256.Create(k2[8]), acc2);
+
+                    acc3 = Fma.MultiplyAdd(r0_0, Vector256.Create(k3[0]), acc3);
+                    acc3 = Fma.MultiplyAdd(r0_1, Vector256.Create(k3[1]), acc3);
+                    acc3 = Fma.MultiplyAdd(r0_2, Vector256.Create(k3[2]), acc3);
+                    acc3 = Fma.MultiplyAdd(r1_0, Vector256.Create(k3[3]), acc3);
+                    acc3 = Fma.MultiplyAdd(r1_1, Vector256.Create(k3[4]), acc3);
+                    acc3 = Fma.MultiplyAdd(r1_2, Vector256.Create(k3[5]), acc3);
+                    acc3 = Fma.MultiplyAdd(r2_0, Vector256.Create(k3[6]), acc3);
+                    acc3 = Fma.MultiplyAdd(r2_1, Vector256.Create(k3[7]), acc3);
+                    acc3 = Fma.MultiplyAdd(r2_2, Vector256.Create(k3[8]), acc3);
+                }
+
+                // Store all 4 accumulators ONCE at the end of the ic reduction.
+                Avx.Store(outBlock + 0 * ocStride + oh * outWidth + ow, acc0);
+                Avx.Store(outBlock + 1 * ocStride + oh * outWidth + ow, acc1);
+                Avx.Store(outBlock + 2 * ocStride + oh * outWidth + ow, acc2);
+                Avx.Store(outBlock + 3 * ocStride + oh * outWidth + ow, acc3);
+            }
+
+            // Tail: scalar interior columns from owSimdEnd to outWidth-2.
+            for (int ow = owSimdEnd; ow < owEnd; ow++)
+            {
+                for (int oc = 0; oc < 4; oc++)
+                {
+                    float* outChan = outBlock + oc * ocStride;
+                    float* kChan = kBlock + oc * inChannels * 9;
+                    outChan[oh * outWidth + ow] = ScalarConv3x3At(input, kChan,
+                        inChannels, icSpatialStride, height, width, oh, ow, 1, 1);
+                }
+            }
+
+            // Right boundary col (ow = outWidth - 1, scalar with boundary check).
+            for (int oc = 0; oc < 4; oc++)
+            {
+                float* outChan = outBlock + oc * ocStride;
+                float* kChan = kBlock + oc * inChannels * 9;
+                outChan[oh * outWidth + outWidth - 1] = ScalarConv3x3At(input, kChan,
+                    inChannels, icSpatialStride, height, width, oh, outWidth - 1, 1, 1);
+            }
+        }
+    }
+
+    /// <summary>Scalar 3×3 conv at one output position with full boundary handling.</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe float ScalarConv3x3At(
+        float* input, float* kernelOc,
+        int inChannels, int icSpatialStride, int height, int width,
+        int oh, int ow, int padH, int padW)
+    {
+        float sum = 0f;
+        int ihBase = oh - padH;
+        int iwBase = ow - padW;
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            float* inputChan = input + ic * icSpatialStride;
+            float* kChan = kernelOc + ic * 9;
+            for (int kh = 0; kh < 3; kh++)
+            {
+                int ih = ihBase + kh;
+                if (ih < 0 || ih >= height) continue;
+                for (int kw = 0; kw < 3; kw++)
+                {
+                    int iw = iwBase + kw;
+                    if (iw < 0 || iw >= width) continue;
+                    sum += inputChan[ih * width + iw] * kChan[kh * 3 + kw];
+                }
+            }
+        }
+        return sum;
+    }
+
+    /// <summary>Process a full boundary row (oh = 0 or oh = outHeight-1) for one output channel.</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void ProcessConv3x3BoundaryRowAllIc(
+        float* input, float* kernelOc, float* outChan,
+        int inChannels, int icSpatialStride,
+        int height, int width, int outWidth, int oh)
+    {
+        for (int ow = 0; ow < outWidth; ow++)
+        {
+            outChan[oh * outWidth + ow] += ScalarConv3x3At(input, kernelOc,
+                inChannels, icSpatialStride, height, width, oh, ow, 1, 1);
         }
     }
 
