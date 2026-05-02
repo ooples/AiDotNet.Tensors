@@ -24607,6 +24607,129 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <inheritdoc/>
+    public virtual void TensorPermuteInto<T>(Tensor<T> output, Tensor<T> tensor, int[] axes)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (axes == null) throw new ArgumentNullException(nameof(axes));
+        if (axes.Length != tensor._shape.Length)
+            throw new ArgumentException("Axes length must match tensor rank");
+        if (output._shape.Length != axes.Length)
+            throw new ArgumentException("Output rank must match axes length");
+        if (output.Length != tensor.Length)
+            throw new ArgumentException(
+                $"Output length ({output.Length}) does not match input length ({tensor.Length}).");
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int expected = tensor._shape[axes[i]];
+            if (output._shape[i] != expected)
+                throw new ArgumentException(
+                    $"Output shape mismatch at axis {i}: expected {expected}, got {output._shape[i]}.");
+        }
+
+        // Permute by copying strided source into row-major output. We walk
+        // the OUTPUT in row-major order (linear index 0..N) and for each
+        // output index compute the corresponding source linear index from
+        // the inverse-permutation strides. That keeps the destination
+        // write pattern stride-1 (cache-friendly) while the source read
+        // pattern follows whatever the permutation dictates — exactly the
+        // tradeoff strided-permute kernels make.
+        var srcShape = tensor._shape;
+        int rank = axes.Length;
+        var srcStrides = new int[rank];
+        // Row-major contiguous source strides
+        srcStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            srcStrides[d] = srcStrides[d + 1] * srcShape[d + 1];
+
+        // For each output axis i, the corresponding source axis is axes[i].
+        // Walking output in row-major: increment along axis i contributes
+        // srcStrides[axes[i]] doubles to the source linear index.
+        var permutedSrcStrides = new int[rank];
+        for (int i = 0; i < rank; i++)
+            permutedSrcStrides[i] = srcStrides[axes[i]];
+
+        var dstShape = output._shape;
+        var srcSpan = tensor.Data.Span;
+        var dstSpan = output.Data.Span;
+
+        // For rank ≤ 4 (the diffusion / transformer hot path), unroll the
+        // index walk into nested loops; for higher ranks, fall back to a
+        // generic odometer loop.
+        if (rank == 4)
+        {
+            int d0 = dstShape[0], d1 = dstShape[1], d2 = dstShape[2], d3 = dstShape[3];
+            int s0 = permutedSrcStrides[0], s1 = permutedSrcStrides[1], s2 = permutedSrcStrides[2], s3 = permutedSrcStrides[3];
+            int dstIdx = 0;
+            for (int i0 = 0; i0 < d0; i0++)
+            {
+                int b0 = i0 * s0;
+                for (int i1 = 0; i1 < d1; i1++)
+                {
+                    int b1 = b0 + i1 * s1;
+                    for (int i2 = 0; i2 < d2; i2++)
+                    {
+                        int b2 = b1 + i2 * s2;
+                        for (int i3 = 0; i3 < d3; i3++)
+                        {
+                            dstSpan[dstIdx++] = srcSpan[b2 + i3 * s3];
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if (rank == 3)
+        {
+            int d0 = dstShape[0], d1 = dstShape[1], d2 = dstShape[2];
+            int s0 = permutedSrcStrides[0], s1 = permutedSrcStrides[1], s2 = permutedSrcStrides[2];
+            int dstIdx = 0;
+            for (int i0 = 0; i0 < d0; i0++)
+            {
+                int b0 = i0 * s0;
+                for (int i1 = 0; i1 < d1; i1++)
+                {
+                    int b1 = b0 + i1 * s1;
+                    for (int i2 = 0; i2 < d2; i2++)
+                        dstSpan[dstIdx++] = srcSpan[b1 + i2 * s2];
+                }
+            }
+            return;
+        }
+
+        if (rank == 2)
+        {
+            int d0 = dstShape[0], d1 = dstShape[1];
+            int s0 = permutedSrcStrides[0], s1 = permutedSrcStrides[1];
+            int dstIdx = 0;
+            for (int i0 = 0; i0 < d0; i0++)
+            {
+                int b0 = i0 * s0;
+                for (int i1 = 0; i1 < d1; i1++)
+                    dstSpan[dstIdx++] = srcSpan[b0 + i1 * s1];
+            }
+            return;
+        }
+
+        // Generic odometer fallback for rank ≥ 5 / rank 1.
+        var idx = new int[rank];
+        int total = output.Length;
+        for (int dstIdxG = 0; dstIdxG < total; dstIdxG++)
+        {
+            int srcIdx = 0;
+            for (int d = 0; d < rank; d++) srcIdx += idx[d] * permutedSrcStrides[d];
+            dstSpan[dstIdxG] = srcSpan[srcIdx];
+            // increment odometer
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                if (++idx[d] < dstShape[d]) break;
+                idx[d] = 0;
+            }
+        }
+    }
+
     public virtual Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

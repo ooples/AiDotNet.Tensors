@@ -12573,6 +12573,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <inheritdoc/>
+    public override void TensorPermuteInto<T>(Tensor<T> output, Tensor<T> tensor, int[] axes)
+    {
+        if (!TryGetBackend(out var backend))
+        {
+            base.TensorPermuteInto(output, tensor, axes);
+            return;
+        }
+
+        // Validation mirrors the CPU path so backend kernels see a clean
+        // contract.
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (axes is null) throw new ArgumentNullException(nameof(axes));
+        if (axes.Length != tensor.Shape._dims.Length)
+            throw new ArgumentException("Axes length must match tensor rank");
+        if (output.Length != tensor.Length)
+            throw new ArgumentException(
+                $"Output length ({output.Length}) does not match input length ({tensor.Length}).");
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int expected = tensor.Shape._dims[axes[i]];
+            if (output.Shape._dims[i] != expected)
+                throw new ArgumentException(
+                    $"Output shape mismatch at axis {i}: expected {expected}, got {output.Shape._dims[i]}.");
+        }
+
+        try
+        {
+            // CUDA / HIP / Metal / OpenCL / Vulkan / WebGpu all already
+            // implement Permute(input, output, shape, axes) — the GPU
+            // kernels were written around an explicit destination buffer
+            // from day one, so the Into form just plumbs an output buffer
+            // through, downloads the result back to the caller's CPU-side
+            // array, and skips the new-Tensor allocation.
+            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
+            // FinishGpuOp materializes the GPU result into a typed CPU array
+            // (handling float vs double conversion through the type-aware
+            // path that TensorPermute itself uses); copy that into the
+            // caller's pre-allocated tensor's underlying storage so the
+            // caller's view stays valid without re-wrapping.
+            var data = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            // FinishGpuOp returns a freshly-materialized array; copy into
+            // output's existing array (the whole point of *Into is to keep
+            // the caller's tensor identity stable for repeated calls).
+            var dst = output.GetDataArray();
+            if (!ReferenceEquals(dst, data))
+                Array.Copy(data, 0, dst, 0, output.Length);
+        }
+        catch (Exception)
+        {
+            // Any backend hiccup (allocation failure, kernel launch error)
+            // — fall back to the CPU strided-copy.
+            base.TensorPermuteInto(output, tensor, axes);
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated normalization (BatchNorm, LayerNorm, GroupNorm, InstanceNorm, RMSNorm)
     // ──────────────────────────────────────────────────────────────
