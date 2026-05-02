@@ -767,23 +767,110 @@ internal static class Im2ColHelper
         int mBlocks = (m + BlockSize - 1) / BlockSize;
         int nBlocks = (n + BlockSize - 1) / BlockSize;
         int totalTiles = mBlocks * nBlocks;
+
+        // B-repacking: B's natural row stride is n (e.g. 4096 doubles = 32 KB
+        // for SD-class shapes), so successive kIdx values inside a tile sit
+        // far apart in memory. The prefetcher misses on those long strides
+        // and successive cache loads end up issuing cold misses to L2/L3.
+        // Pre-pack B into per-(K-block, N-block) tiles laid out contiguously
+        // (size = Kc × Nc doubles = 32 KB each) so the inner kernel reads
+        // its tile of B sequentially with stride 1 across both kIdx and j.
+        // Cost: one copy of B (≤ K × N doubles ≈ 92 MB for SD 320→320);
+        // amortized across the m/Mc outer-loop reuses (here m=320,
+        // mBlocks=5, so each B-tile is read 5 times and the pack pays for
+        // itself the first time after the parallel.For starts).
+        int kBlocks = (k + BlockSize - 1) / BlockSize;
+        int packStride = BlockSize * BlockSize;
+        var packedB = new double[(long)kBlocks * nBlocks * packStride];
+        unsafe
+        {
+            fixed (double* bPtr = b)
+            fixed (double* pbPtr = packedB)
+            {
+                double* bBase = bPtr;
+                double* pbBase = pbPtr;
+                System.Threading.Tasks.Parallel.For(0, kBlocks * nBlocks, packTile =>
+                {
+                    int kBlk = packTile / nBlocks;
+                    int nBlk = packTile % nBlocks;
+                    int kk = kBlk * BlockSize;
+                    int jj = nBlk * BlockSize;
+                    int kEnd = Math.Min(kk + BlockSize, k);
+                    int jEnd = Math.Min(jj + BlockSize, n);
+                    int kLen = kEnd - kk;
+                    int jLen = jEnd - jj;
+                    double* dst = pbBase + (long)packTile * packStride;
+                    // Pack as [kLen rows × jLen cols] contiguous, so within
+                    // a tile the layout matches what the kernel walks.
+                    for (int kIdx = 0; kIdx < kLen; kIdx++)
+                    {
+                        double* src = bBase + (kk + kIdx) * n + jj;
+                        double* dstRow = dst + kIdx * BlockSize;
+                        for (int j = 0; j < jLen; j++)
+                            dstRow[j] = src[j];
+                    }
+                });
+            }
+        }
+
         unsafe
         {
             fixed (double* aPtr = a)
-            fixed (double* bPtr = b)
             fixed (double* cPtr = c)
+            fixed (double* pbPtr = packedB)
             {
-                double* aBase = aPtr, bBase = bPtr, cBase = cPtr;
+                double* aBase = aPtr, cBase = cPtr, pbBase = pbPtr;
+                int kBlocksLocal = kBlocks;
+                int nBlocksLocal = nBlocks;
                 System.Threading.Tasks.Parallel.For(0, totalTiles, tile =>
                 {
-                    int mBlk = tile / nBlocks;
-                    int nBlk = tile % nBlocks;
+                    int mBlk = tile / nBlocksLocal;
+                    int nBlk = tile % nBlocksLocal;
                     int ii = mBlk * BlockSize;
                     int jj = nBlk * BlockSize;
                     int iEnd = Math.Min(ii + BlockSize, m);
                     int jEnd = Math.Min(jj + BlockSize, n);
-                    MultiplyBlockedDoubleTilePtr(aBase, bBase, cBase, ii, iEnd, jj, jEnd, k, n, BlockSize);
+                    // Iterate K-blocks; for each, read the packed B tile that
+                    // matches (kBlk, nBlk). Per-tile B is contiguous 64×64.
+                    for (int kBlk = 0; kBlk < kBlocksLocal; kBlk++)
+                    {
+                        int kk = kBlk * BlockSize;
+                        int kEnd = Math.Min(kk + BlockSize, k);
+                        double* packedTile = pbBase + ((long)kBlk * nBlocksLocal + nBlk) * packStride;
+                        MultiplyPackedTilePtr(
+                            aBase, packedTile, cBase,
+                            ii, iEnd, jj, jEnd, kk, kEnd, k, n);
+                    }
                 });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inner kernel for the packed-B path. The B-tile is contiguous
+    /// [BlockSize × BlockSize] doubles, so the inner j loop reads stride-1
+    /// from the packed buffer and the kIdx step is just += BlockSize
+    /// (one cache line worth of doubles). RyuJIT auto-vectorizes the
+    /// inner axpy as well.
+    /// </summary>
+    private static unsafe void MultiplyPackedTilePtr(
+        double* a, double* packedB, double* c,
+        int ii, int iEnd, int jj, int jEnd, int kk, int kEnd,
+        int k, int n)
+    {
+        int width = jEnd - jj;
+        int kLen = kEnd - kk;
+        const int BlockSize = 64;
+        for (int i = ii; i < iEnd; i++)
+        {
+            double* aRow = a + (long)i * k + kk;
+            double* cRow = c + (long)i * n + jj;
+            for (int kIdx = 0; kIdx < kLen; kIdx++)
+            {
+                double aik = aRow[kIdx];
+                double* bRow = packedB + kIdx * BlockSize;
+                for (int j = 0; j < width; j++)
+                    cRow[j] += aik * bRow[j];
             }
         }
     }
