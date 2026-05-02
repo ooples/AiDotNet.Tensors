@@ -103,6 +103,98 @@ public static class SparseAutograd
         return output;
     }
 
+    /// <summary>Tape-aware sparse · dense matmul that produces a
+    /// PATTERN-PRESERVING sparse gradient on the sparse side. Use this
+    /// when the sparse tensor is a registered trainable parameter
+    /// (typical: <c>SparseLinearLayer&lt;T&gt;</c> + sparse-aware
+    /// <see cref="ParameterBuffer{T}"/>) — the produced gradient's
+    /// <see cref="SparseTensor{T}.Values"/> length matches the original
+    /// pattern's <c>NonZeroCount</c>, so the parameter buffer can store
+    /// it as a flat values vector without materialising the dense matrix.
+    /// Avoids the O(rows·columns) memory allocation that
+    /// <see cref="SparseMatMulRecord{T}"/> incurs in its backward.
+    /// </summary>
+    /// <param name="a">Sparse left operand. Must be the registered
+    /// trainable-parameter SparseTensor — the gradient is keyed against
+    /// this exact instance, so reusing a different SparseTensor with the
+    /// same pattern won't accumulate gradients correctly.</param>
+    /// <param name="b">Dense right operand.</param>
+    public static Tensor<T> SparsePatternPreservingMatMulRecord<T>(
+        SparseTensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        var output = SparseOps.SparseMatMul(a, b);
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        // Snapshot the COO pattern so backward can construct the sparse
+        // gradient with the same row/column indices as A.
+        var coo = a.ToCoo();
+        DifferentiableOps.RecordBinary(
+            "SparsePatternPreservingMatMul",
+            output,
+            a,    // sparse parameter — gradient accumulator keyed here
+            b,
+            SparsePatternPreservingMatMulBackward,
+            savedState: new object[]
+            {
+                coo.RowIndices,
+                coo.ColumnIndices,
+                a.Rows,
+                a.Columns,
+            });
+        return output;
+    }
+
+    private static void SparsePatternPreservingMatMulBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        // Y = A_sparse · B (pattern P fixed)
+        // dB = A^T · dY  (dense form: standard SpMM with transposed A)
+        // dA[i,j] for non-zero (i,j) ∈ P:
+        //     dA[i,j] = sum_k B[j,k] · dY[i,k]
+        // Pack the dA values in COO order matching the saved pattern.
+        var aSparse = (SparseTensor<T>)inputs[0];
+        var b = inputs[1];
+        var rowIndices = (int[])savedState[0];
+        var colIndices = (int[])savedState[1];
+        int rows = (int)savedState[2];
+        int columns = (int)savedState[3];
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int nnz = rowIndices.Length;
+        int innerK = b._shape[1];
+
+        // Compute dA over the pattern only — never materialises the
+        // dense O(rows × columns) gradient.
+        var gradValues = new T[nnz];
+        for (int idx = 0; idx < nnz; idx++)
+        {
+            int i = rowIndices[idx];
+            int j = colIndices[idx];
+            T sum = ops.Zero;
+            for (int k = 0; k < innerK; k++)
+            {
+                sum = ops.Add(sum, ops.Multiply(b[j, k], gradOutput[i, k]));
+            }
+            gradValues[idx] = sum;
+        }
+        var sparseGradA = new SparseTensor<T>(rows, columns, rowIndices, colIndices, gradValues);
+        AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
+
+        // dB is dense (full out × in); same as the standard SparseMatMul backward.
+        var aT = aSparse.ToDense();
+        aT = engine.TensorTranspose(aT);
+        var gradB = engine.TensorMatMul(aT, gradOutput);
+        AccumulateGrad(b, gradB, gradAccumulator, engine);
+        _ = output;
+    }
+
     private static void SparseMatMulBackward<T>(
         Tensor<T> gradOutput,
         Tensor<T>[] inputs,
