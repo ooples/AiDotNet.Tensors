@@ -198,9 +198,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
             GlobalMemoryBytes = (long)totalMem;
             // Issue #285: per-allocation cap. CUDA has no formal cap attribute;
             // practical limit is the largest contiguous free block. We use
-            // total VRAM as the upper bound and let the chunker fall back if
-            // a specific allocation fails (cudaErrorOutOfMemory propagates as
-            // GpuBufferTooLargeException via the buffer ctor guard).
+            // total VRAM as the upper bound. NOTE: this means the cap guard
+            // only catches obviously-impossible requests (> total VRAM). If
+            // a smaller-than-VRAM allocation hits cudaErrorOutOfMemory due
+            // to fragmentation, the existing CheckCudaResult path surfaces
+            // it as a generic CUDA error — the chunker won't catch that.
+            // Translating cuMemAlloc OOM → GpuBufferTooLargeException is
+            // tracked as follow-up work.
             MaxBufferAllocBytes = (long)totalMem;
 
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");

@@ -1361,12 +1361,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (totalElements <= 1) return null; // can't chunk a scalar
 
         long bytesPerElement = sizeof(float);
-        long maxElementsPerChunk = capBytes / bytesPerElement;
-        if (maxElementsPerChunk < 1) return null;
-        // Account for both input AND output buffers fitting under the cap
-        // simultaneously. Conservative: each chunk allocates two buffers, so
-        // we halve the per-chunk element budget to leave headroom.
-        long chunkElements = Math.Max(1, maxElementsPerChunk / 2);
+        // The cap is per single allocation, not across simultaneously-live
+        // buffers. Each chunk's input and output buffers are separate
+        // allocations and can each be up to the cap; what matters is that
+        // either single buffer fits.
+        long chunkElements = Math.Max(1, capBytes / bytesPerElement);
+        if (chunkElements < 1) return null;
         int chunkCount = (int)((totalElements + chunkElements - 1) / chunkElements);
 
         var options = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current;
@@ -1392,7 +1392,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufferIn = new OwnedBuffer(backend.AllocateBuffer(slice), ownsBuffer: true);
             using var bufferOut = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-            op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+            // Mirror the AutocastScope behaviour from TryRunUnaryGpu: when
+            // autocast is enabled, run the kernel on fp16 and convert back
+            // to fp32 for the downloaded result. Without this the chunked
+            // fallback would silently change numeric / perf behaviour vs
+            // the normal GPU path.
+            var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
+            if (fp16Input is not null)
+            {
+                using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                op(backend, fp16Input, fp16Out.Buffer, len);
+                backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
+                fp16Input.Dispose();
+            }
+            else
+            {
+                op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+            }
             var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
             Array.Copy(chunkResult, 0, resultFloat, offset, len);
         }
@@ -1468,10 +1484,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int totalElements = left.Length;
         if (totalElements <= 1) return null;
 
-        // Three buffers per chunk (A, B, C). Conservatively divide by 3.
-        long maxElementsPerChunk = capBytes / sizeof(float) / 3;
-        if (maxElementsPerChunk < 1) return null;
-        long chunkElements = Math.Max(1, maxElementsPerChunk);
+        // Cap is per single allocation, not across all three live buffers.
+        // Each of A, B, C is a separate allocation and can each be up to the
+        // cap independently — what matters is that the largest single buffer
+        // fits.
+        long chunkElements = Math.Max(1, capBytes / sizeof(float));
+        if (chunkElements < 1) return null;
         int chunkCount = (int)((totalElements + chunkElements - 1) / chunkElements);
 
         var options = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current;
@@ -1500,7 +1518,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bA = new OwnedBuffer(backend.AllocateBuffer(sliceL), ownsBuffer: true);
             using var bB = new OwnedBuffer(backend.AllocateBuffer(sliceR), ownsBuffer: true);
             using var bC = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-            op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
+            // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
+            // chunked fallback doesn't silently change numeric/perf behaviour
+            // when autocast is enabled.
+            var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
+            var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
+            if (fp16A is not null && fp16B is not null)
+            {
+                using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                op(backend, fp16A, fp16B, fp16Out.Buffer, len);
+                backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
+                fp16A.Dispose();
+                fp16B.Dispose();
+            }
+            else
+            {
+                fp16A?.Dispose();
+                fp16B?.Dispose();
+                op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
+            }
             var chunkResult = backend.DownloadBuffer(bC.Buffer);
             Array.Copy(chunkResult, 0, resultFloat, offset, len);
         }

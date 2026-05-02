@@ -90,8 +90,22 @@ public sealed class GpuFallbackOptions
 
     // ── Internal accessors that apply the industry-standard defaults ──
 
+    /// <summary>
+    /// Resolves the effective per-allocation cap. When a user-supplied
+    /// override (<see cref="MaxBufferBytes"/>) is set and is lower than
+    /// the device's reported cap, the override wins; when it's greater
+    /// than the device cap, the device cap wins (the device's actual
+    /// rejection is the hard limit and we can't allocate past it).
+    /// When no override is set, returns the device cap unchanged.
+    /// </summary>
     internal long EffectiveMaxBufferBytes(long deviceCap)
-        => MaxBufferBytes ?? deviceCap;
+    {
+        if (!MaxBufferBytes.HasValue) return deviceCap;
+        long userCap = MaxBufferBytes.Value;
+        // If device cap is unknown (deviceCap == 0) trust the user value.
+        if (deviceCap <= 0) return userCap;
+        return Math.Min(userCap, deviceCap);
+    }
 
     internal GpuChunkingPolicy EffectiveChunkingPolicy
         => ChunkingPolicy ?? GpuChunkingPolicy.AutoChunk;
@@ -119,12 +133,15 @@ public static class GpuFallbackOptionsHolder
     private static GpuFallbackOptions _current = GpuFallbackOptions.Default;
 
     /// <summary>
-    /// The currently-active fallback options. Reading is cheap (one volatile
-    /// read on the static reference); never null.
+    /// The currently-active fallback options. Reading and writing both go
+    /// through <see cref="System.Threading.Volatile"/> so a writer thread's
+    /// update is visible to other threads without explicit
+    /// synchronisation. Never returns null — assigning null resets to
+    /// <see cref="GpuFallbackOptions.Default"/>.
     /// </summary>
     public static GpuFallbackOptions Current
     {
-        get => _current;
-        set => _current = value ?? GpuFallbackOptions.Default;
+        get => System.Threading.Volatile.Read(ref _current);
+        set => System.Threading.Volatile.Write(ref _current, value ?? GpuFallbackOptions.Default);
     }
 }

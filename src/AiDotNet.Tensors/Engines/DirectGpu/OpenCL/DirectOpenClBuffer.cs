@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuBufferSizeGuard.EnsureFits(
                 backend: "OpenCL",
                 requestedBytes: requestedBytes,
-                cap: cap > 0 ? (long)cap : 0,
+                deviceCap: cap > 0 ? (long)cap : 0,
                 deviceName: !string.IsNullOrEmpty(context.DeviceBoardName)
                     ? context.DeviceBoardName
                     : context.DeviceName);

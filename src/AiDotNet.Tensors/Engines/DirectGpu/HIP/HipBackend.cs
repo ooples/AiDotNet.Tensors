@@ -240,7 +240,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             GlobalMemoryBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
             LocalMemoryBytes = (long)(ulong)_deviceProps.SharedMemPerBlock;
             // Issue #285: same approach as CUDA — total VRAM as conservative
-            // upper bound; per-call OOM surfaces as GpuBufferTooLargeException.
+            // upper bound. The guard only catches requests > total VRAM;
+            // mid-size allocations that fail due to fragmentation surface
+            // as a generic HIP error via CheckError, NOT as
+            // GpuBufferTooLargeException. Translating hipErrorOutOfMemory
+            // into the typed exception is tracked as follow-up work.
             MaxBufferAllocBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
 
             // Detect architecture from GCN arch name

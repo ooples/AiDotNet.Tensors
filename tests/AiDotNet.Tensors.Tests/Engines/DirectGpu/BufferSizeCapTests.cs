@@ -173,6 +173,81 @@ public class BufferSizeCapTests
     }
 
     [Fact]
+    public void EnsureFits_AppliesUserOverride_LowerCapWins()
+    {
+        // Regression for review-comment #9: GpuFallbackOptions.MaxBufferBytes
+        // override must actually be applied by the size guard. Set the user
+        // override to a value LOWER than the device cap and confirm the guard
+        // throws when requestedBytes > userOverride but <= deviceCap.
+        var prev = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions
+            {
+                MaxBufferBytes = 1024, // user-override cap
+            };
+            // Device cap = 4096 (large), user override = 1024 → effective cap = 1024.
+            // Request 2048 → should throw.
+            var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
+                InvokeEnsureFits("OpenCL", requestedBytes: 2048, cap: 4096, deviceName: "X"));
+            Assert.Equal(1024, ex.DeviceMaxAllocBytes); // exception reports the EFFECTIVE cap
+            Assert.Equal(2048, ex.RequestedBytes);
+
+            // Same device cap, request 512 → fits under user override.
+            InvokeEnsureFits("OpenCL", requestedBytes: 512, cap: 4096, deviceName: "X");
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = prev;
+        }
+    }
+
+    [Fact]
+    public void EnsureFits_DeviceCapLowerThanUserOverride_DeviceWins()
+    {
+        // When user override > device cap, the device cap is the hard limit
+        // (we can't allocate past it). Effective cap = min(device, user).
+        var prev = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions
+            {
+                MaxBufferBytes = 100_000_000_000, // user wants huge cap
+            };
+            // Device cap = 1024 wins.
+            var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
+                InvokeEnsureFits("OpenCL", requestedBytes: 2048, cap: 1024, deviceName: "X"));
+            Assert.Equal(1024, ex.DeviceMaxAllocBytes);
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = prev;
+        }
+    }
+
+    [Fact]
+    public void EnsureFits_UserOverride_TrustedWhenDeviceCapUnknown()
+    {
+        // When the device cap query failed (cap == 0) but user supplied an
+        // override, the user value is used as the cap.
+        var prev = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions
+            {
+                MaxBufferBytes = 256,
+            };
+            var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
+                InvokeEnsureFits("OpenCL", requestedBytes: 1024, cap: 0, deviceName: "X"));
+            Assert.Equal(256, ex.DeviceMaxAllocBytes);
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = prev;
+        }
+    }
+
+    [Fact]
     public void Holder_RoundTripsCustomOptions()
     {
         var prev = GpuFallbackOptionsHolder.Current;
