@@ -8,6 +8,32 @@ using System.Runtime.InteropServices;
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     /// <summary>
+    /// Helper for issue #285 — validates a requested allocation size against
+    /// the device's <c>CL_DEVICE_MAX_MEM_ALLOC_SIZE</c> before calling
+    /// <c>clCreateBuffer</c>. Allocations above the cap return
+    /// <c>CL_INVALID_BUFFER_SIZE (-61)</c> with no further information; this
+    /// throws a typed <see cref="GpuBufferTooLargeException"/> so dispatch
+    /// shims can catch it and fall back to a CPU path or chunked execution.
+    /// </summary>
+    internal static class DirectOpenClBufferGuards
+    {
+        internal static void EnsureFits(DirectOpenClContext context, long requestedBytes)
+        {
+            ulong cap = context.MaxMemAllocSize;
+            // MaxMemAllocSize == 0 means the query failed at context init —
+            // skip the guard rather than wrongly reject every allocation. The
+            // underlying clCreateBuffer call will still surface any error.
+            GpuBufferSizeGuard.EnsureFits(
+                backend: "OpenCL",
+                requestedBytes: requestedBytes,
+                cap: cap > 0 ? (long)cap : 0,
+                deviceName: !string.IsNullOrEmpty(context.DeviceBoardName)
+                    ? context.DeviceBoardName
+                    : context.DeviceName);
+        }
+    }
+
+    /// <summary>
     /// OpenCL buffer wrapper using pure P/Invoke. No managed GPU runtime dependency.
     /// </summary>
     internal sealed class DirectOpenClBuffer : IDisposable
@@ -27,6 +53,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = data.Length;
+            DirectOpenClBufferGuards.EnsureFits(context, (long)data.Length * sizeof(float));
 
             GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
             try
@@ -54,6 +81,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = size;
+            DirectOpenClBufferGuards.EnsureFits(context, (long)size * sizeof(float));
 
             _buffer = OpenClNativeBindings.CreateBuffer(
                 context.Context,
@@ -173,6 +201,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = data.Length;
+            DirectOpenClBufferGuards.EnsureFits(context, data.Length);
 
             GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
             try
@@ -200,6 +229,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = size;
+            DirectOpenClBufferGuards.EnsureFits(context, size);
 
             _buffer = OpenClNativeBindings.CreateBuffer(
                 context.Context,
@@ -288,6 +318,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = data.Length;
+            DirectOpenClBufferGuards.EnsureFits(context, (long)data.Length * sizeof(int));
 
             GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
             try
@@ -315,6 +346,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _context = context;
             _length = size;
+            DirectOpenClBufferGuards.EnsureFits(context, (long)size * sizeof(int));
 
             _buffer = OpenClNativeBindings.CreateBuffer(
                 context.Context,

@@ -102,6 +102,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// </summary>
     public long LocalMemoryBytes => (long)(_device?.MaxThreadgroupMemoryLength ?? 32768);
 
+    /// <summary>
+    /// Issue #285: Metal exposes <c>MTLDevice.maxBufferLength</c> as the
+    /// per-allocation cap, but our current wrapper doesn't surface it.
+    /// Use <c>RecommendedMaxWorkingSetSize</c> as a conservative upper bound
+    /// for now — per-call OOM (Metal returns nil from <c>newBufferWithLength:</c>)
+    /// surfaces as <see cref="GpuBufferTooLargeException"/> via the buffer
+    /// ctor guard.
+    /// </summary>
+    public long MaxBufferAllocBytes => (long)(_device?.RecommendedMaxWorkingSetSize ?? 0);
+
     public double TheoreticalGflops { get; }
 
     #endregion
@@ -347,6 +357,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             throw new ArgumentException("Data cannot be null or empty", nameof(data));
         }
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
         return new MetalGpuBuffer(_device, data);
     }
@@ -362,6 +374,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive");
         }
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("Metal", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
         return new MetalGpuBuffer(_device, size);
     }
@@ -448,6 +462,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive");
         }
+        GpuBufferSizeGuard.EnsureFits("Metal", size, MaxBufferAllocBytes, DeviceName);
 
         // For byte buffers, we allocate as floats and use size/4
         // This is a simplification - proper implementation would use separate byte buffers
@@ -466,6 +481,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive");
         }
+        GpuBufferSizeGuard.EnsureFits("Metal", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         // Metal can store int32 in the same buffer format as float32
         return new MetalGpuBuffer(_device, size);
@@ -482,6 +498,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         {
             throw new ArgumentException("Data cannot be null or empty", nameof(data));
         }
+        GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         // Convert int array to float array for buffer allocation
         var floatData = new float[data.Length];

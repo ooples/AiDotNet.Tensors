@@ -46,6 +46,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public ulong LocalMemSize { get; private set; }
 
         /// <summary>
+        /// Maximum bytes the device allows in a single buffer allocation
+        /// (<c>CL_DEVICE_MAX_MEM_ALLOC_SIZE</c>). The OpenCL spec guarantees
+        /// this is at least <c>max(GlobalMemSize / 4, 128 MiB)</c>, but the
+        /// real cap on consumer GPUs is often substantially lower than the
+        /// total VRAM. Issue #285: blindly calling clCreateBuffer with a
+        /// size above this returns <c>CL_INVALID_BUFFER_SIZE (-61)</c>;
+        /// this value lets callers validate ahead of time and fall back
+        /// gracefully to CPU or chunked execution.
+        /// </summary>
+        public ulong MaxMemAllocSize { get; private set; }
+
+        /// <summary>
         /// GPU memory bandwidth in bytes/second (approximate).
         /// </summary>
         public ulong MemoryBandwidth { get; private set; }
@@ -181,6 +193,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             MaxComputeUnits = OpenClNativeBindings.GetDeviceInfoUInt(_device, OpenClNativeBindings.CL_DEVICE_MAX_COMPUTE_UNITS);
             GlobalMemSize = OpenClNativeBindings.GetDeviceInfoULong(_device, OpenClNativeBindings.CL_DEVICE_GLOBAL_MEM_SIZE);
             LocalMemSize = OpenClNativeBindings.GetDeviceInfoULong(_device, OpenClNativeBindings.CL_DEVICE_LOCAL_MEM_SIZE);
+            // Per-allocation cap (issue #285) — query at context init so the
+            // hot allocation path (DirectOpenClBuffer ctor) can guard against
+            // CL_INVALID_BUFFER_SIZE (-61) without a syscall per allocation.
+            MaxMemAllocSize = OpenClNativeBindings.GetDeviceInfoULong(_device, OpenClNativeBindings.CL_DEVICE_MAX_MEM_ALLOC_SIZE);
 
             // Get work group capabilities
             MaxWorkGroupSize = (ulong)OpenClNativeBindings.GetDeviceInfoSizeT(_device, OpenClNativeBindings.CL_DEVICE_MAX_WORK_GROUP_SIZE);

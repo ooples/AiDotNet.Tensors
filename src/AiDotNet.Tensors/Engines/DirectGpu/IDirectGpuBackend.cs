@@ -61,6 +61,25 @@ public interface IDirectGpuBackend : IDisposable
     long LocalMemoryBytes { get; }
 
     /// <summary>
+    /// Gets the maximum size in bytes of a SINGLE buffer allocation on this
+    /// device. This is independent of <see cref="GlobalMemoryBytes"/> — even
+    /// when total VRAM is large, GPU drivers cap individual allocations
+    /// (OpenCL's <c>CL_DEVICE_MAX_MEM_ALLOC_SIZE</c>, CUDA's per-allocation
+    /// virtual address window, Metal's <c>maxBufferLength</c>, Vulkan's
+    /// <c>maxStorageBufferRange</c>, WebGPU's <c>maxBufferSize</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>Issue #285: blindly requesting an allocation above this cap
+    /// produces an opaque driver error (e.g. <c>CL_INVALID_BUFFER_SIZE = -61</c>).
+    /// Engine dispatch shims should validate against this value and fall
+    /// through to a chunked or CPU path instead of crashing.</para>
+    /// <para>Returns 0 when the cap is unknown / not queryable; callers
+    /// should treat 0 as "skip the validation, let the native call fail
+    /// with its own error if any."</para>
+    /// </remarks>
+    long MaxBufferAllocBytes { get; }
+
+    /// <summary>
     /// Gets the estimated theoretical peak FP32 GFLOPS for this GPU.
     /// Computed from clock rate, compute units, and FP32 cores per compute unit.
     /// </summary>

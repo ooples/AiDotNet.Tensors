@@ -82,6 +82,7 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
+        GpuBufferSizeGuard.EnsureFits("WebGPU", size, MaxBufferAllocBytes, DeviceName);
         // WebGPU buffers are float32-addressed. Allocate enough floats to hold the byte count.
         // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
         int floatCount = (size + sizeof(float) - 1) / sizeof(float);
@@ -91,12 +92,14 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateIntBuffer(int size)
     {
         EnsureInitialized();
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(size);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         EnsureInitialized();
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
             floatData[i] = BitConverter.Int32BitsToSingle(data[i]);

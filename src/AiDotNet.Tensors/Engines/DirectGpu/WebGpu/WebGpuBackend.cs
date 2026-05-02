@@ -90,6 +90,13 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     /// </summary>
     public long LocalMemoryBytes => 16384L;
 
+    /// <summary>
+    /// Issue #285: WebGPU's <c>GPUSupportedLimits.maxBufferSize</c> is the
+    /// per-allocation cap. Default minimum is 256 MiB per the spec; modern
+    /// browsers expose substantially more.
+    /// </summary>
+    public long MaxBufferAllocBytes => _device.MaxBufferSize;
+
     public double TheoreticalGflops { get; }
 
     /// <summary>
@@ -150,6 +157,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public IGpuBuffer AllocateBuffer(int elementCount)
     {
         ThrowIfNotInitialized();
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)elementCount * sizeof(float), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(elementCount);
     }
 
@@ -161,6 +170,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         ThrowIfNotInitialized();
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(data);
     }
 

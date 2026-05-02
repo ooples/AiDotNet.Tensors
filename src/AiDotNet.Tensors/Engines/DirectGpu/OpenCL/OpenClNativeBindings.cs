@@ -89,6 +89,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public const uint CL_DEVICE_VENDOR = 0x102C;
         public const uint CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002;
         public const uint CL_DEVICE_GLOBAL_MEM_SIZE = 0x101F;
+        public const uint CL_DEVICE_MAX_MEM_ALLOC_SIZE = 0x1010;
         public const uint CL_DEVICE_LOCAL_MEM_SIZE = 0x1023;
         public const uint CL_DEVICE_MAX_WORK_GROUP_SIZE = 0x1004;
         public const uint CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS = 0x1003;
