@@ -24633,6 +24633,41 @@ public partial class CpuEngine : ITensorLevelEngine
         if (output.Length != tensor.Length)
             throw new ArgumentException(
                 $"Output length ({output.Length}) does not match input length ({tensor.Length}).");
+
+        // Rank-0 short-circuit: a 0-d tensor permutes trivially via a single
+        // scalar copy. Without this, the contiguous-stride init below indexes
+        // srcStrides[rank - 1] which is out of bounds.
+        if (axes.Length == 0)
+        {
+            if (output.Length > 0 && tensor.Length > 0)
+                output.Data.Span[0] = tensor.Data.Span[0];
+            return;
+        }
+
+        // Validate that `axes` is a real permutation: every entry must be in
+        // [0, rank) and every axis index must appear exactly once. Without
+        // this check, a malformed array like [0, 0, 2, 3] would silently
+        // produce wrong output (axis 0 sampled twice, axis 1 dropped) and a
+        // negative or out-of-range entry would later throw
+        // IndexOutOfRangeException from `srcStrides[axes[i]]` instead of the
+        // ArgumentException callers expect.
+        int rankCheck = axes.Length;
+        Span<bool> seen = rankCheck <= 32
+            ? stackalloc bool[rankCheck]
+            : new bool[rankCheck];
+        for (int i = 0; i < rankCheck; i++)
+        {
+            int a = axes[i];
+            if (a < 0 || a >= rankCheck)
+                throw new ArgumentException(
+                    $"Axes[{i}] = {a} is out of range [0, {rankCheck}).", nameof(axes));
+            if (seen[a])
+                throw new ArgumentException(
+                    $"Axes is not a valid permutation: axis {a} appears more than once.",
+                    nameof(axes));
+            seen[a] = true;
+        }
+
         for (int i = 0; i < axes.Length; i++)
         {
             int expected = tensor._shape[axes[i]];
@@ -24640,6 +24675,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 throw new ArgumentException(
                     $"Output shape mismatch at axis {i}: expected {expected}, got {output._shape[i]}.");
         }
+
+        // The dense walk below assumes both tensors are dense row-major
+        // (contiguous, zero storage offset). Strided views — created by
+        // .Slice(...) / .Transpose(...) without subsequent .Contiguous() —
+        // carry their own stride table and storage offset, and indexing
+        // tensor.Data.Span / output.Data.Span directly would read or write
+        // the wrong elements. Reject those explicitly so callers can either
+        // call .Contiguous() up front or pass dense tensors.
+        if (!(tensor.IsContiguous && tensor._storageOffset == 0))
+            throw new ArgumentException(
+                "TensorPermuteInto requires a dense row-major source tensor; " +
+                "call .Contiguous() on strided views before passing them in.",
+                nameof(tensor));
+        if (!(output.IsContiguous && output._storageOffset == 0))
+            throw new ArgumentException(
+                "TensorPermuteInto requires a dense row-major output tensor; " +
+                "non-contiguous outputs cannot be written into via the dense " +
+                "fast-path (the strided write would corrupt the underlying buffer).",
+                nameof(output));
 
         // Permute by copying strided source into row-major output. We walk
         // the OUTPUT in row-major order (linear index 0..N) and for each

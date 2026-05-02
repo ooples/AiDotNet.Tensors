@@ -818,10 +818,16 @@ internal static class Im2ColHelper
 
     /// <summary>
     /// Pack B into per-(K-block, N-block) contiguous tiles, then run the
-    /// 2-D-tile parallel GEMM consuming those packed tiles. Both phases are
-    /// dispatched through CpuParallelSettings (instead of raw Parallel.For)
-    /// so the host's <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/>
-    /// cap is honoured — matches every other parallel kernel in this file.
+    /// 2-D-tile parallel GEMM consuming those packed tiles. Both phases
+    /// dispatch through <see cref="PersistentParallelExecutor"/>, the same
+    /// pre-spawned worker pool that <c>SimdGemm</c> uses. Compared to
+    /// <c>Parallel.For</c>, this skips per-call ThreadPool queueing and
+    /// CountdownEvent allocation — non-trivial savings on the diffusion
+    /// hot path where the GEMM is invoked tens of thousands of times per
+    /// model. The chunk count is bounded above by
+    /// <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> so a host
+    /// that capped parallelism (e.g. shared-tenant CI runner, deterministic-
+    /// mode tests) is honoured.
     /// </summary>
     private static void RunPackedGemmDouble(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
@@ -830,6 +836,15 @@ internal static class Im2ColHelper
         int parallelDegree, double[] packed)
     {
         int packTaskCount = kBlocks * nBlocks;
+
+        // The executor uses Environment.ProcessorCount - 1 workers; cap the
+        // chunk count at min(taskCount, parallelDegree) so a host with a
+        // lower MaxDegreeOfParallelism doesn't oversubscribe — a chunk
+        // executes serially across many tiles, so fewer chunks = fewer
+        // concurrent workers.
+        int packChunks = Math.Max(1, Math.Min(packTaskCount, parallelDegree));
+        int gemmChunks = Math.Max(1, Math.Min(totalTiles, parallelDegree));
+
         unsafe
         {
             fixed (double* bPtr = b)
@@ -842,26 +857,38 @@ internal static class Im2ColHelper
                 int nLocal = n;
                 int blockSizeLocal = BlockSize;
                 int packStrideLocal = packStride;
-                Parallel.For(
-                    0, packTaskCount,
-                    new ParallelOptions { MaxDegreeOfParallelism = parallelDegree },
-                    packTile =>
+                int packTaskCountLocal = packTaskCount;
+                int packChunksLocal = packChunks;
+                IntPtr ipB = (IntPtr)bBase;
+                IntPtr ipPb = (IntPtr)pbBase;
+
+                PersistentParallelExecutor.Instance.Execute(packChunksLocal, chunk =>
                 {
-                    int kBlk = packTile / nBlocksLocal;
-                    int nBlk = packTile % nBlocksLocal;
-                    int kk = kBlk * blockSizeLocal;
-                    int jj = nBlk * blockSizeLocal;
-                    int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
-                    int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
-                    int kLen = kEnd - kk;
-                    int jLen = jEnd - jj;
-                    double* dst = pbBase + (long)packTile * packStrideLocal;
-                    for (int kIdx = 0; kIdx < kLen; kIdx++)
+                    int chunkSize = (packTaskCountLocal + packChunksLocal - 1) / packChunksLocal;
+                    int taskStart = chunk * chunkSize;
+                    int taskEnd = Math.Min(taskStart + chunkSize, packTaskCountLocal);
+                    if (taskStart >= taskEnd) return;
+
+                    double* bChunk = (double*)ipB;
+                    double* pbChunk = (double*)ipPb;
+                    for (int packTile = taskStart; packTile < taskEnd; packTile++)
                     {
-                        double* src = bBase + (kk + kIdx) * nLocal + jj;
-                        double* dstRow = dst + kIdx * blockSizeLocal;
-                        for (int j = 0; j < jLen; j++)
-                            dstRow[j] = src[j];
+                        int kBlk = packTile / nBlocksLocal;
+                        int nBlk = packTile % nBlocksLocal;
+                        int kk = kBlk * blockSizeLocal;
+                        int jj = nBlk * blockSizeLocal;
+                        int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
+                        int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
+                        int kLen = kEnd - kk;
+                        int jLen = jEnd - jj;
+                        double* dst = pbChunk + (long)packTile * packStrideLocal;
+                        for (int kIdx = 0; kIdx < kLen; kIdx++)
+                        {
+                            double* src = bChunk + (kk + kIdx) * nLocal + jj;
+                            double* dstRow = dst + kIdx * blockSizeLocal;
+                            for (int j = 0; j < jLen; j++)
+                                dstRow[j] = src[j];
+                        }
                     }
                 });
             }
@@ -881,25 +908,37 @@ internal static class Im2ColHelper
                 int nLocal = n;
                 int blockSizeLocal = BlockSize;
                 int packStrideLocal = packStride;
-                Parallel.For(
-                    0, totalTiles,
-                    new ParallelOptions { MaxDegreeOfParallelism = parallelDegree },
-                    tile =>
+                int totalTilesLocal = totalTiles;
+                int gemmChunksLocal = gemmChunks;
+                IntPtr ipA = (IntPtr)aBase, ipC = (IntPtr)cBase, ipPb = (IntPtr)pbBase;
+
+                PersistentParallelExecutor.Instance.Execute(gemmChunksLocal, chunk =>
                 {
-                    int mBlk = tile / nBlocksLocal;
-                    int nBlk = tile % nBlocksLocal;
-                    int ii = mBlk * blockSizeLocal;
-                    int jj = nBlk * blockSizeLocal;
-                    int iEnd = Math.Min(ii + blockSizeLocal, mLocal);
-                    int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
-                    for (int kBlk = 0; kBlk < kBlocksLocal; kBlk++)
+                    int chunkSize = (totalTilesLocal + gemmChunksLocal - 1) / gemmChunksLocal;
+                    int tileStart = chunk * chunkSize;
+                    int tileEnd = Math.Min(tileStart + chunkSize, totalTilesLocal);
+                    if (tileStart >= tileEnd) return;
+
+                    double* aChunk = (double*)ipA;
+                    double* cChunk = (double*)ipC;
+                    double* pbChunk = (double*)ipPb;
+                    for (int tile = tileStart; tile < tileEnd; tile++)
                     {
-                        int kk = kBlk * blockSizeLocal;
-                        int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
-                        double* packedTile = pbBase + ((long)kBlk * nBlocksLocal + nBlk) * packStrideLocal;
-                        MultiplyPackedTilePtr(
-                            aBase, packedTile, cBase,
-                            ii, iEnd, jj, jEnd, kk, kEnd, kLocal, nLocal);
+                        int mBlk = tile / nBlocksLocal;
+                        int nBlk = tile % nBlocksLocal;
+                        int ii = mBlk * blockSizeLocal;
+                        int jj = nBlk * blockSizeLocal;
+                        int iEnd = Math.Min(ii + blockSizeLocal, mLocal);
+                        int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
+                        for (int kBlk = 0; kBlk < kBlocksLocal; kBlk++)
+                        {
+                            int kk = kBlk * blockSizeLocal;
+                            int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
+                            double* packedTile = pbChunk + ((long)kBlk * nBlocksLocal + nBlk) * packStrideLocal;
+                            MultiplyPackedTilePtr(
+                                aChunk, packedTile, cChunk,
+                                ii, iEnd, jj, jEnd, kk, kEnd, kLocal, nLocal);
+                        }
                     }
                 });
             }

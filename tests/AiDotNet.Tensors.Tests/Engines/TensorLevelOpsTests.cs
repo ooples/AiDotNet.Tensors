@@ -5,6 +5,18 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+/// <summary>
+/// xUnit collection definition that serializes any test mutating the process-
+/// global <c>CpuParallelSettings.MaxDegreeOfParallelism</c>. xUnit runs test
+/// classes in parallel by default, so without this serialization a parallel
+/// test reading the static setting could race with the conv2d gate test
+/// changing it, producing flakes or leaking the temporary value into
+/// unrelated tests. All members of this collection run sequentially.
+/// </summary>
+[CollectionDefinition("CpuParallelSettings", DisableParallelization = true)]
+public sealed class CpuParallelSettingsCollection { }
+
+[Collection("CpuParallelSettings")]
 public class TensorLevelOpsTests
 {
     private readonly CpuEngine _engine = new();
@@ -589,6 +601,13 @@ public class TensorLevelOpsTests
     /// caller reuses a non-zero pre-allocated output buffer (the fast path
     /// no longer pre-clears output, and the kernel itself clears each
     /// output channel inside its per-oc loop).
+    ///
+    /// Shape is sized so total FMAs are well above the OLD <c>&lt;= 4 M</c>
+    /// direct-kernel cutoff: 64 × 16 × 9 × 32 × 32 ≈ 9.4 M FMAs for the
+    /// minimum-MDOP case (oc = 64, ic = 16, 32×32). On CI hosts with
+    /// MaxDegreeOfParallelism &gt; 32, oc grows with MDOP, pushing FMAs
+    /// further above the cutoff. Without this sizing, a regression to the
+    /// old gate would still satisfy the assertion.
     /// </summary>
     [Fact]
     public void Conv2DInto_Double_DirectKernelBranch_NonZeroOutput_MatchesConv2D()
@@ -599,8 +618,8 @@ public class TensorLevelOpsTests
         // (we set MaxDegreeOfParallelism = ProcessorCount which is at most 32
         // on common CI hosts), guaranteeing the direct-kernel branch fires.
         int oc = Math.Max(64, 2 * global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
-        var input  = new Tensor<double>(new[] { 1, 8, 16, 16 });
-        var kernel = new Tensor<double>(new[] { oc, 8, 3, 3 });
+        var input  = new Tensor<double>(new[] { 1, 16, 32, 32 });
+        var kernel = new Tensor<double>(new[] { oc, 16, 3, 3 });
         var rng = new Random(123);
         for (int i = 0; i < input.Length; i++)  input[i]  = rng.NextDouble() - 0.5;
         for (int i = 0; i < kernel.Length; i++) kernel[i] = rng.NextDouble() - 0.5;
@@ -663,6 +682,98 @@ public class TensorLevelOpsTests
         {
             global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = saved;
         }
+    }
+
+    #endregion
+
+    #region TensorPermuteInto
+
+    /// <summary>
+    /// Rank-4 permute-into matches the allocating TensorPermute output
+    /// element-wise. Validates the dense-walk fast-path used by SD-attention
+    /// where (B, S, H, D) ↔ (B, H, S, D) is a hot path.
+    /// </summary>
+    [Fact]
+    public void TensorPermuteInto_Rank4_MatchesTensorPermute()
+    {
+        var engine = new CpuEngine();
+        var rng = new Random(42);
+        var src = new Tensor<float>(new[] { 2, 3, 4, 5 });
+        for (int i = 0; i < src.Length; i++) src[i] = (float)rng.NextDouble();
+
+        var axes = new[] { 0, 2, 1, 3 };
+        var refOut = engine.TensorPermute(src, axes).Contiguous();
+        var dst = new Tensor<float>(new[] { 2, 4, 3, 5 });
+        engine.TensorPermuteInto(dst, src, axes);
+
+        for (int i = 0; i < refOut.Length; i++)
+            Assert.Equal(refOut[i], dst[i]);
+    }
+
+    /// <summary>Rank-3, rank-2, and the generic rank-5 odometer fallback.</summary>
+    [Theory]
+    [InlineData(new[] { 3, 4, 5 }, new[] { 2, 0, 1 }, new[] { 5, 3, 4 })]
+    [InlineData(new[] { 6, 7 }, new[] { 1, 0 }, new[] { 7, 6 })]
+    [InlineData(new[] { 2, 2, 2, 2, 2 }, new[] { 4, 3, 2, 1, 0 }, new[] { 2, 2, 2, 2, 2 })]
+    public void TensorPermuteInto_Various_MatchTensorPermute(int[] inShape, int[] axes, int[] outShape)
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(inShape);
+        for (int i = 0; i < src.Length; i++) src[i] = i;
+        var refOut = engine.TensorPermute(src, axes).Contiguous();
+        var dst = new Tensor<float>(outShape);
+        engine.TensorPermuteInto(dst, src, axes);
+        for (int i = 0; i < refOut.Length; i++)
+            Assert.Equal(refOut[i], dst[i]);
+    }
+
+    /// <summary>
+    /// Invalid permutations must surface as ArgumentException, not
+    /// IndexOutOfRangeException — callers depend on the same exception
+    /// surface as TensorPermute.
+    /// </summary>
+    [Fact]
+    public void TensorPermuteInto_DuplicateAxis_ThrowsArgumentException()
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(new[] { 2, 3, 4 });
+        var dst = new Tensor<float>(new[] { 2, 2, 2 });
+        Assert.Throws<ArgumentException>(() =>
+            engine.TensorPermuteInto(dst, src, new[] { 0, 0, 1 }));
+    }
+
+    [Fact]
+    public void TensorPermuteInto_OutOfRangeAxis_ThrowsArgumentException()
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(new[] { 2, 3, 4 });
+        var dst = new Tensor<float>(new[] { 2, 3, 4 });
+        Assert.Throws<ArgumentException>(() =>
+            engine.TensorPermuteInto(dst, src, new[] { 0, 1, 5 }));
+        Assert.Throws<ArgumentException>(() =>
+            engine.TensorPermuteInto(dst, src, new[] { 0, 1, -1 }));
+    }
+
+    [Fact]
+    public void TensorPermuteInto_RankMismatch_ThrowsArgumentException()
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(new[] { 2, 3, 4 });
+        var dst = new Tensor<float>(new[] { 2, 3 });
+        Assert.Throws<ArgumentException>(() =>
+            engine.TensorPermuteInto(dst, src, new[] { 0, 1, 2 }));
+    }
+
+    [Fact]
+    public void TensorPermuteInto_Rank0_CopiesScalar()
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(Array.Empty<int>());
+        if (src.Length == 0) return; // some Tensor builds disallow rank-0 entirely
+        src[0] = 7.5f;
+        var dst = new Tensor<float>(Array.Empty<int>());
+        engine.TensorPermuteInto(dst, src, Array.Empty<int>());
+        Assert.Equal(7.5f, dst[0]);
     }
 
     #endregion
