@@ -284,6 +284,190 @@ public class SparseAwareParameterBufferTests
     /// SparseLinearLayer can train via TrainWithTape with a sparse-aware
     /// ParameterBuffer.
     /// </summary>
+    /// <summary>
+    /// Pattern-preserving SpGeMM (sparse · sparse) backward: produces
+    /// SPARSE gradients on BOTH sides matching their respective patterns.
+    /// Verifies dA and dB values against the analytic formulas.
+    ///
+    /// A is 2×3 with pattern (0,0), (0,1), (1,2); values 1, 2, 3.
+    /// B is 3×2 with pattern (0,0), (1,0), (2,1); values 4, 5, 6.
+    /// Forward dense Y = A·B at (0,0) = 1·4 + 2·5 = 14, etc.
+    /// </summary>
+    [Fact]
+    public void SparsePatternPreservingSpGeMMRecord_BothSidesGetPatternMatchingSparseGrads()
+    {
+        var a = new SparseTensor<float>(2, 3,
+            new[] { 0, 0, 1 }, new[] { 0, 1, 2 }, new[] { 1f, 2f, 3f });
+        var b = new SparseTensor<float>(3, 2,
+            new[] { 0, 1, 2 }, new[] { 0, 0, 1 }, new[] { 4f, 5f, 6f });
+
+        using var tape = new GradientTape<float>();
+        var output = SparseAutograd.SparsePatternPreservingSpGeMMRecord(a, b);
+        var loss = _engine.ReduceSum(output, axes: null, keepDims: false);
+        var grads = tape.ComputeGradients(loss, new Tensor<float>[] { a, b });
+
+        Assert.True(grads.ContainsKey(a));
+        Assert.True(grads.ContainsKey(b));
+        var gradA = (SparseTensor<float>)grads[a];
+        var gradB = (SparseTensor<float>)grads[b];
+
+        Assert.Equal(3, gradA.NonZeroCount);
+        Assert.Equal(3, gradB.NonZeroCount);
+
+        // gradOut is all-ones; dA[i,j] = sum_k B[j,k] · 1 = sum_k B[j,k].
+        //   pattern (0,0): row 0 of B has only B[0,0]=4 → dA = 4
+        //   pattern (0,1): row 1 of B has only B[1,0]=5 → dA = 5
+        //   pattern (1,2): row 2 of B has only B[2,1]=6 → dA = 6
+        Assert.Equal(4f, gradA[0, 0], 5);
+        Assert.Equal(5f, gradA[0, 1], 5);
+        Assert.Equal(6f, gradA[1, 2], 5);
+
+        // dB[j,k] = sum_i A[i,j] · 1 = sum over i where (i,j) ∈ A.
+        //   pattern (0,0): col 0 of A has only A[0,0]=1 → dB = 1
+        //   pattern (1,0): col 1 of A has only A[0,1]=2 → dB = 2
+        //   pattern (2,1): col 2 of A has only A[1,2]=3 → dB = 3
+        Assert.Equal(1f, gradB[0, 0], 5);
+        Assert.Equal(2f, gradB[1, 0], 5);
+        Assert.Equal(3f, gradB[2, 1], 5);
+    }
+
+    /// <summary>
+    /// Variable-sparsity-pattern in-place rebuild: same NonZeroCount,
+    /// new positions. Mirrors dynamic-sparse training (SET / RigL /
+    /// RigL+ / threshold pruning) where the sparsity ratio stays fixed
+    /// but the active connections move between optimizer steps.
+    /// </summary>
+    [Fact]
+    public void RebuildSparsePattern_SameNonZeroCount_InPlaceUpdate()
+    {
+        var oldPattern = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 3, 3 }, oldPattern),
+        });
+
+        var span = buffer.GetSparseValuesSpan(0);
+        span[0] = 1f; span[1] = 2f; span[2] = 3f;
+
+        // Rebuild pattern: same nnz=3 but different positions.
+        var newPattern = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 2, 0, 1 });
+        buffer.RebuildSparsePattern(0, newPattern, new float[] { 7f, 8f, 9f });
+
+        Assert.Equal(3, buffer.GetSparseLayout(0)!.NonZeroCount);
+        var view = (SparseTensor<float>)buffer.CreateView(0);
+        Assert.Equal(7f, view[0, 2]);
+        Assert.Equal(8f, view[1, 0]);
+        Assert.Equal(9f, view[2, 1]);
+        // Old positions are now structural zero.
+        Assert.Equal(0f, view[0, 0]);
+    }
+
+    /// <summary>
+    /// RebuildSparsePattern rejects a new pattern whose NonZeroCount
+    /// differs — caller must use ResizeSparseLeaf for that.
+    /// </summary>
+    [Fact]
+    public void RebuildSparsePattern_NonZeroCountMismatch_Throws()
+    {
+        var oldPattern = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 3, 3 }, oldPattern),
+        });
+
+        var biggerPattern = new SparsityLayout(3, 3,
+            new[] { 0, 1, 2, 0 }, new[] { 0, 1, 2, 1 });
+        Assert.Throws<ArgumentException>(() =>
+            buffer.RebuildSparsePattern(0, biggerPattern));
+    }
+
+    /// <summary>
+    /// ResizeSparseLeaf — full variable-pattern support: NonZeroCount
+    /// can grow or shrink. Buffer is reallocated; subsequent leaves'
+    /// offsets shift by the delta. Other leaves' values preserved.
+    /// </summary>
+    [Fact]
+    public void ResizeSparseLeaf_GrowSlot_PreservesOtherLeavesAndShiftsOffsets()
+    {
+        var pattern0 = new SparsityLayout(3, 3, new[] { 0, 1 }, new[] { 0, 1 });   // nnz=2
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 3, 3 }, pattern0),     // sparse, nnz=2
+            new ParameterLayout(new[] { 4 }),                  // dense, size=4
+        });
+
+        // Seed: sparse leaf 0 with [1, 2], dense leaf 1 with [10, 20, 30, 40].
+        var s0 = buffer.GetSparseValuesSpan(0);
+        s0[0] = 1f; s0[1] = 2f;
+        var d1 = buffer.CreateView(1);
+        d1[0] = 10f; d1[1] = 20f; d1[2] = 30f; d1[3] = 40f;
+
+        Assert.Equal(0, buffer.GetOffset(0));   // first leaf always at offset 0
+        Assert.Equal(2, buffer.GetOffset(1));   // dense leaf starts after sparse nnz=2
+
+        // Grow the sparse leaf to nnz=5.
+        var newPattern = new SparsityLayout(3, 3,
+            new[] { 0, 0, 1, 1, 2 }, new[] { 0, 1, 0, 2, 2 });
+        buffer.ResizeSparseLeaf(0, newPattern,
+            new float[] { 100f, 200f, 300f, 400f, 500f });
+
+        // Leaf 0 now has nnz=5; leaf 1's offset shifts by +3.
+        Assert.Equal(5, buffer.GetSparseLayout(0)!.NonZeroCount);
+        Assert.Equal(0, buffer.GetOffset(0));
+        Assert.Equal(5, buffer.GetOffset(1));
+
+        // Sparse values updated.
+        var view0 = (SparseTensor<float>)buffer.CreateView(0);
+        Assert.Equal(100f, view0[0, 0]);
+        Assert.Equal(200f, view0[0, 1]);
+        Assert.Equal(300f, view0[1, 0]);
+        Assert.Equal(400f, view0[1, 2]);
+        Assert.Equal(500f, view0[2, 2]);
+
+        // Dense leaf preserved across resize.
+        var view1 = buffer.CreateView(1);
+        Assert.Equal(10f, view1[0]);
+        Assert.Equal(20f, view1[1]);
+        Assert.Equal(30f, view1[2]);
+        Assert.Equal(40f, view1[3]);
+
+        // Total size grew by delta.
+        Assert.Equal(9, buffer.TotalSize); // 5 (sparse new) + 4 (dense)
+    }
+
+    /// <summary>
+    /// ResizeSparseLeaf shrinking case (NonZeroCount decreases).
+    /// </summary>
+    [Fact]
+    public void ResizeSparseLeaf_ShrinkSlot_ShiftsOffsetsBack()
+    {
+        var pattern0 = new SparsityLayout(3, 3,
+            new[] { 0, 0, 1, 2 }, new[] { 0, 1, 1, 2 });   // nnz=4
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 3, 3 }, pattern0),     // sparse, nnz=4
+            new ParameterLayout(new[] { 2 }),                  // dense, size=2
+        });
+
+        var d1 = buffer.CreateView(1);
+        d1[0] = 7f; d1[1] = 9f;
+
+        var newPattern = new SparsityLayout(3, 3, new[] { 0, 2 }, new[] { 0, 2 }); // nnz=2
+        buffer.ResizeSparseLeaf(0, newPattern, new float[] { 11f, 22f });
+
+        Assert.Equal(2, buffer.GetSparseLayout(0)!.NonZeroCount);
+        Assert.Equal(2, buffer.GetOffset(1)); // shifted back from 4 to 2
+        Assert.Equal(4, buffer.TotalSize);    // 2 sparse + 2 dense
+
+        var view0 = (SparseTensor<float>)buffer.CreateView(0);
+        Assert.Equal(11f, view0[0, 0]);
+        Assert.Equal(22f, view0[2, 2]);
+
+        var view1 = buffer.CreateView(1);
+        Assert.Equal(7f, view1[0]);
+        Assert.Equal(9f, view1[1]);
+    }
+
     [Fact]
     public void SparsePatternPreservingMatMul_IntegratesWithSparseAwareBuffer()
     {

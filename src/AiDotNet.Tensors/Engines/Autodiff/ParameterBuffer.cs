@@ -57,12 +57,17 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 public sealed class ParameterBuffer<T>
 {
-    private readonly TensorStorage<T> _storage;
-    private readonly Vector<T> _data;
+    // Most fields are immutable post-construction in the original API.
+    // ResizeSparseLeaf is the one operation that can replace _data /
+    // _storage / _totalSize (when a sparse leaf's NonZeroCount changes
+    // and the buffer must grow/shrink). All other code paths treat
+    // these as readonly-after-ctor.
+    private TensorStorage<T> _storage;
+    private Vector<T> _data;
     private readonly int[] _offsets;
     private readonly int[][] _shapes;
     private readonly SparsityLayout?[] _sparseLayouts;
-    private readonly int _totalSize;
+    private int _totalSize;
 
     // Held by callers that need to atomically swap, observe, and restore
     // the buffer's contents — most importantly TensorFunc.FunctionalCall.
@@ -271,6 +276,146 @@ public sealed class ParameterBuffer<T>
             ?? throw new InvalidOperationException(
                 $"Parameter {index} is dense; use CreateView instead.");
         return _data.AsSpan().Slice(_offsets[index], sparse.NonZeroCount);
+    }
+
+    /// <summary>
+    /// Replaces a sparse leaf's pattern in place when the new pattern
+    /// has the SAME <c>NonZeroCount</c> as the current one. Use this for
+    /// dynamic-sparsity training where the sparsity ratio is fixed but
+    /// the active positions move between optimizer steps (rigid pruning,
+    /// SET / RigL / threshold-based dynamic-sparse training).
+    /// </summary>
+    /// <remarks>
+    /// <para>The buffer slot is unchanged in size and offset, so other
+    /// leaves' offsets are unaffected. <paramref name="newValues"/> is
+    /// optional — if omitted the existing values stay in place at their
+    /// new pattern positions, which the caller must understand (the
+    /// position–value association is now relative to the new indices).
+    /// </para>
+    /// <para>For pattern changes that also alter the count, use
+    /// <see cref="ResizeSparseLeaf"/> which reallocates the buffer.</para>
+    /// </remarks>
+    public void RebuildSparsePattern(int index, SparsityLayout newLayout, ReadOnlySpan<T> newValues = default)
+    {
+        if (newLayout is null) throw new ArgumentNullException(nameof(newLayout));
+        var current = _sparseLayouts[index]
+            ?? throw new InvalidOperationException(
+                $"Parameter {index} is dense; cannot replace its sparsity pattern.");
+
+        if (newLayout.Rows != current.Rows || newLayout.Columns != current.Columns)
+            throw new ArgumentException(
+                $"New pattern dense shape [{newLayout.Rows}, {newLayout.Columns}] must match " +
+                $"existing [{current.Rows}, {current.Columns}]; use ResizeSparseLeaf for shape changes.",
+                nameof(newLayout));
+        if (newLayout.NonZeroCount != current.NonZeroCount)
+            throw new ArgumentException(
+                $"RebuildSparsePattern requires the new NonZeroCount ({newLayout.NonZeroCount}) " +
+                $"to match the existing ({current.NonZeroCount}). Use ResizeSparseLeaf for size changes.",
+                nameof(newLayout));
+
+        _sparseLayouts[index] = newLayout;
+
+        if (!newValues.IsEmpty)
+        {
+            if (newValues.Length != newLayout.NonZeroCount)
+                throw new ArgumentException(
+                    $"newValues length ({newValues.Length}) must equal NonZeroCount " +
+                    $"({newLayout.NonZeroCount}).",
+                    nameof(newValues));
+            var dst = _data.AsWritableSpan().Slice(_offsets[index], newLayout.NonZeroCount);
+            newValues.CopyTo(dst);
+        }
+    }
+
+    /// <summary>
+    /// Replaces a sparse leaf's layout AND reallocates the buffer to
+    /// accommodate the new <c>NonZeroCount</c>. Other leaves' values
+    /// are preserved; their offsets shift to reflect the new sparse
+    /// slot size. Use this for fully variable-pattern training (positions
+    /// AND count both change) — e.g. when a model dynamically prunes /
+    /// regrows connections.
+    /// </summary>
+    /// <remarks>
+    /// <para>Cost: <see cref="O(TotalSize)"/> for the buffer copy and
+    /// <see cref="O(Count)"/> for the offset rebuild. Tensor views
+    /// returned by previous <see cref="CreateView"/> calls are
+    /// invalidated — re-create them after this method returns.</para>
+    /// </remarks>
+    public void ResizeSparseLeaf(int index, SparsityLayout newLayout, ReadOnlySpan<T> newValues = default)
+    {
+        if (newLayout is null) throw new ArgumentNullException(nameof(newLayout));
+        var current = _sparseLayouts[index]
+            ?? throw new InvalidOperationException(
+                $"Parameter {index} is dense; cannot resize a dense slot via this API.");
+
+        if (newLayout.Rows != current.Rows || newLayout.Columns != current.Columns)
+            throw new ArgumentException(
+                $"New pattern dense shape [{newLayout.Rows}, {newLayout.Columns}] must match " +
+                $"existing [{current.Rows}, {current.Columns}].",
+                nameof(newLayout));
+
+        if (!newValues.IsEmpty && newValues.Length != newLayout.NonZeroCount)
+            throw new ArgumentException(
+                $"newValues length ({newValues.Length}) must equal NonZeroCount " +
+                $"({newLayout.NonZeroCount}).",
+                nameof(newValues));
+
+        int oldNnz = current.NonZeroCount;
+        int newNnz = newLayout.NonZeroCount;
+        int delta = newNnz - oldNnz;
+
+        if (delta == 0)
+        {
+            // No size change — fall through to the in-place rebuild path.
+            RebuildSparsePattern(index, newLayout, newValues);
+            return;
+        }
+
+        // Reallocate the underlying vector with the new total size.
+        // Preserve every other leaf's contents at their (possibly shifted)
+        // new offsets. The new sparse leaf's slot lives at the SAME
+        // offset as before; subsequent leaves shift by `delta`.
+        int newTotal = checked(_totalSize + delta);
+        var newData = new Vector<T>(newTotal);
+        var oldSpan = _data.AsSpan();
+        var newSpan = newData.AsWritableSpan();
+
+        // Copy everything before the resized slot (unchanged).
+        int prefixLen = _offsets[index];
+        if (prefixLen > 0)
+            oldSpan.Slice(0, prefixLen).CopyTo(newSpan.Slice(0, prefixLen));
+
+        // Fill the resized slot with newValues if provided, else zeros.
+        if (!newValues.IsEmpty)
+        {
+            newValues.CopyTo(newSpan.Slice(_offsets[index], newNnz));
+        }
+        // (Default case: leave zeros — Vector<T> allocates zero-initialized.)
+
+        // Copy the suffix (everything after the resized slot) to its new
+        // offset. The sparse leaf's slot grew/shrunk by `delta`, so the
+        // suffix starts `delta` positions later in the new buffer.
+        int oldSuffixStart = _offsets[index] + oldNnz;
+        int newSuffixStart = _offsets[index] + newNnz;
+        int suffixLen = _totalSize - oldSuffixStart;
+        if (suffixLen > 0)
+            oldSpan.Slice(oldSuffixStart, suffixLen).CopyTo(newSpan.Slice(newSuffixStart, suffixLen));
+
+        // Replace the storage. Existing tensor views obtained via
+        // CreateView before this Resize point at the OLD vector and are
+        // now stale — callers must re-create views after a Resize. The
+        // buffer's own read paths (CreateView, GetSparseValuesSpan, ...)
+        // use _data which we update here.
+        _data = newData;
+        _storage = new TensorStorage<T>(newData);
+        _totalSize = newTotal;
+
+        _sparseLayouts[index] = newLayout;
+        // Shift subsequent offsets by delta.
+        for (int i = index + 1; i < _offsets.Length; i++)
+        {
+            _offsets[i] += delta;
+        }
     }
 
     /// <summary>
