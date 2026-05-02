@@ -353,14 +353,6 @@ public class SparseAwareParameterBufferTests
     }
 
     /// <summary>
-    /// End-to-end + ParameterBuffer integration: the sparse gradient
-    /// produced by SparsePatternPreservingMatMulRecord flows through
-    /// ParameterBuffer.FlattenGradients and lands in the right slot
-    /// without densification. This is the load-bearing test proving
-    /// SparseLinearLayer can train via TrainWithTape with a sparse-aware
-    /// ParameterBuffer.
-    /// </summary>
-    /// <summary>
     /// Pattern-preserving SpGeMM (sparse · sparse) backward: produces
     /// SPARSE gradients on BOTH sides matching their respective patterns.
     /// Verifies dA and dB values against the analytic formulas.

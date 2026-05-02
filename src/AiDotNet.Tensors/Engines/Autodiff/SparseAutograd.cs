@@ -127,9 +127,15 @@ public static class SparseAutograd
         var output = SparseOps.SparseMatMul(a, b);
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
-        // Snapshot the COO pattern so backward can construct the sparse
-        // gradient with the same row/column indices as A.
+        // Snapshot BOTH the COO pattern AND the values aligned with that
+        // pattern. Backward computes dB by iterating non-zeros of A, and
+        // the values must match the index order — but if A is stored in
+        // CSR/BSR/etc. its DataVector ordering is NOT aligned with the
+        // COO indices we save. ToCoo() materialises both in the right
+        // order; snapshot the values once via ToArray() (single copy)
+        // so the rest is allocation-free at backward time.
         var coo = a.ToCoo();
+        var aValuesSnapshot = coo.DataVector.ToArray();
         DifferentiableOps.RecordBinary(
             "SparsePatternPreservingMatMul",
             output,
@@ -142,6 +148,7 @@ public static class SparseAutograd
                 coo.ColumnIndices,
                 a.Rows,
                 a.Columns,
+                aValuesSnapshot,
             });
         return output;
     }
@@ -165,6 +172,7 @@ public static class SparseAutograd
         var colIndices = (int[])savedState[1];
         int rows = (int)savedState[2];
         int columns = (int)savedState[3];
+        var aValues = (T[])savedState[4];
 
         var ops = MathHelper.GetNumericOperations<T>();
         int nnz = rowIndices.Length;
@@ -192,16 +200,17 @@ public static class SparseAutograd
         // dense [columns × innerK] gradient. This avoids the O(rows × columns)
         // densification that materialising A and transposing it would
         // incur — the whole memory-efficiency point of the
-        // pattern-preserving op. Pulls A's values from saved state? — no,
-        // A is the trainable parameter, so its current values
-        // (which the user hasn't yet updated this step) are still the
-        // ones used in forward. Read them via the sparse indexer.
+        // pattern-preserving op. The values used here MUST be the
+        // forward-time snapshot (`aValues`, captured during record in
+        // COO order matching `rowIndices` / `colIndices`); reading
+        // aSparse.DataVector directly would assume COO ordering, but
+        // CSR/BSR-stored sparse tensors return values in a different
+        // order. The snapshot fixes that misalignment.
         var gradB = new Tensor<T>(new[] { columns, innerK });
         var gradBSpan = gradB.AsWritableSpan();
         // gradB starts zero (Tensor ctor zero-fills); accumulate
         //   gradB[j, k] += A_value[idx] · dY[i, k]    where (i, j) ∈ pattern_A
         // Equivalent to A^T · dY without materialising the dense A.
-        var aValues = aSparse.DataVector.AsSpan().Slice(aSparse._storageOffset, nnz);
         for (int idx = 0; idx < nnz; idx++)
         {
             int i = rowIndices[idx];
@@ -429,10 +438,12 @@ public static class SparseAutograd
         // The sparse-aware backward needs B's values to compute dA and
         // A's values to compute dB. Snapshot prevents in-place weight
         // updates between forward + backward from corrupting gradients.
+        // ToArray() already allocates a fresh copy — the previous
+        // ToArray().Clone() was a redundant second copy.
         var aCoo = a.ToCoo();
         var bCoo = b.ToCoo();
-        var aValuesSnapshot = (T[])aCoo.DataVector.ToArray().Clone();
-        var bValuesSnapshot = (T[])bCoo.DataVector.ToArray().Clone();
+        var aValuesSnapshot = aCoo.DataVector.ToArray();
+        var bValuesSnapshot = bCoo.DataVector.ToArray();
 
         DifferentiableOps.RecordBinary(
             "SparsePatternPreservingSpGeMM",

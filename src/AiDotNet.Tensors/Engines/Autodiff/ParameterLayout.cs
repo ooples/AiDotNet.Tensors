@@ -101,8 +101,10 @@ public sealed class ParameterLayout
 
 /// <summary>
 /// Captures a sparse parameter's fixed pattern: COO row/column indices.
-/// Indices are captured by reference at construction; the caller must
-/// not mutate them while the owning buffer is live.
+/// The constructor takes its OWN COPIES of the supplied index arrays
+/// (via <see cref="System.Array.Clone"/>), so subsequent mutations to
+/// the caller's arrays do not affect this layout. The fixed-pattern
+/// contract is enforced by ownership, not by caller discipline.
 /// </summary>
 public sealed class SparsityLayout
 {
@@ -114,13 +116,17 @@ public sealed class SparsityLayout
 
     /// <summary>
     /// Row indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. Captured by reference; do not mutate.
+    /// <see cref="NonZeroCount"/>. This is the layout's own copy, taken
+    /// at construction; mutating the caller's source array after
+    /// construction has no effect here.
     /// </summary>
     public int[] RowIndices { get; }
 
     /// <summary>
     /// Column indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. Captured by reference; do not mutate.
+    /// <see cref="NonZeroCount"/>. This is the layout's own copy, taken
+    /// at construction; mutating the caller's source array after
+    /// construction has no effect here.
     /// </summary>
     public int[] ColumnIndices { get; }
 

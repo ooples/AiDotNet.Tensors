@@ -298,6 +298,17 @@ public sealed class ParameterBuffer<T>
     /// new pattern positions, which the caller must understand (the
     /// position–value association is now relative to the new indices).
     /// </para>
+    /// <para>
+    /// <b>View invalidation:</b> any <see cref="SparseTensor{T}"/>
+    /// instances obtained via <see cref="CreateView"/> before this call
+    /// were constructed with the old pattern's RowIndices /
+    /// ColumnIndices baked in — they will continue to interpret the
+    /// (now-shared) values slot using the OLD coordinates. Callers
+    /// MUST re-fetch views via <see cref="CreateView"/> after rebuilding
+    /// the pattern. (The same contract applies to
+    /// <see cref="ResizeSparseLeaf"/>, where the buffer reallocation
+    /// makes view invalidation even more obvious.)
+    /// </para>
     /// <para>For pattern changes that also alter the count, use
     /// <see cref="ResizeSparseLeaf"/> which reallocates the buffer.</para>
     /// </remarks>

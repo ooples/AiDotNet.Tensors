@@ -241,7 +241,13 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (offset + length > Length)
             throw new ArgumentOutOfRangeException(nameof(length),
                 $"Slice [{offset}, {offset + length}) extends beyond vector length {Length}.");
-        return new Vector<T>(_memory.Slice(offset, length), false);
+        // GPU-resident / lazy vectors leave _memory empty until CPU
+        // access. Slicing _memory directly would silently slice
+        // Memory<T>.Empty and throw on subsequent reads. Force
+        // materialisation through AsWritableMemory() so the slice is
+        // backed by real CPU storage. Mirrors the behaviour AsSpan() /
+        // AsMemory() use on the same lazy-allocation path.
+        return new Vector<T>(AsWritableMemory().Slice(offset, length), false);
     }
 
     /// <summary>
