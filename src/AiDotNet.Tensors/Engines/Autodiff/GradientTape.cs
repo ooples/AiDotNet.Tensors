@@ -121,6 +121,12 @@ public sealed class GradientTape<T> : IDisposable
 
         SetCurrentTape(this);
         System.Threading.Interlocked.Increment(ref DifferentiableOps._anyTapeActive);
+        // Per-thread counter — used to suppress AutoTracer for THIS thread's
+        // tape lifecycle without affecting unrelated inference threads. The
+        // ThreadStatic field is incremented before backward starts and stays
+        // > 0 until Dispose, including the backward walk where _current
+        // is temporarily null. See DifferentiableOps._threadTapeDepth.
+        DifferentiableOps._threadTapeDepth++;
     }
 
     /// <summary>
@@ -991,6 +997,7 @@ public sealed class GradientTape<T> : IDisposable
         // clear replay suppression that an outer tape still needs.
         Compilation.AutoTrainingCompiler.ReplayMode = _savedReplayMode;
         System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
+        DifferentiableOps._threadTapeDepth--;
         SetCurrentTape(_parent);
         // Defensively null the cached delegate chain. For non-persistent
         // tapes it's already null; this protects against any path that

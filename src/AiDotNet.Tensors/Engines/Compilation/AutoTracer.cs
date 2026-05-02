@@ -43,15 +43,16 @@ internal static class AutoTracer
     internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
         if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return null;
-        // Don't return compiled plans during the entire GradientTape lifecycle
-        // (forward AND backward). _anyTapeActive stays > 0 from tape construction
-        // through Dispose, so this gate is true for the whole training step. The
-        // narrower IsRecording<T>() check returns false during backward (the
-        // current tape is suspended for the backward walk), which would let
-        // backward ops replay compiled plans — bypassing autograd. Issue #283:
-        // and worse, the matching RecordOp side captures forward intermediates
-        // in closures during backward, pinning them past tape Dispose.
-        if (Autodiff.DifferentiableOps.AnyTapeActive()) return null;
+        // Don't return compiled plans during this thread's GradientTape lifecycle
+        // (forward AND backward). The narrower IsRecording<T>() check returns
+        // false during backward (Current is suspended for the backward walk),
+        // which would let backward ops replay compiled plans — bypassing
+        // autograd. Issue #283: the matching RecordOp side captures forward
+        // intermediates in closures during backward, pinning them past tape
+        // Dispose. Use _threadTapeDepth (ThreadStatic) so a training thread
+        // doesn't suppress AutoTracer on unrelated inference threads in the
+        // same process.
+        if (Autodiff.DifferentiableOps.ThreadTapeActive()) return null;
         return State.TryGetPlan<T>(opName, outputShape, paramHash);
     }
 
@@ -67,18 +68,19 @@ internal static class AutoTracer
     internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate, long paramHash = 0)
     {
         if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return;
-        // Skip recording for the ENTIRE GradientTape lifecycle, not just while
-        // the tape is "currently recording" (Current != null). During the
-        // backward walk the tape suspends Current to null so backward ops
-        // don't append to it; with only the IsRecording<T>() check, AutoTracer
-        // would happily record those backward ops here, capturing the forward
-        // intermediates they consume in `replayDelegate`'s closure. Those
-        // closures sit in _currentSequence until they hit the 128-op cap or
-        // a pattern-match clears them — which is exactly the residual ~400 KB
-        // /call leak signature reported in #283. AnyTapeActive() returns true
-        // for the whole tape lifetime (constructor → Dispose), so this gate
-        // covers forward AND backward.
-        if (Autodiff.DifferentiableOps.AnyTapeActive()) return;
+        // Skip recording for the ENTIRE GradientTape lifecycle on this thread,
+        // not just while the tape is "currently recording" (Current != null).
+        // During the backward walk the tape suspends Current to null so backward
+        // ops don't append to it; with only the IsRecording<T>() check,
+        // AutoTracer would happily record those backward ops here, capturing
+        // the forward intermediates they consume in `replayDelegate`'s closure.
+        // Those closures sit in _currentSequence until they hit the 128-op cap
+        // or a pattern-match clears them — exactly the residual ~400 KB/call
+        // leak signature reported in #283. _threadTapeDepth (ThreadStatic) is
+        // > 0 for this thread's whole tape lifetime (constructor → Dispose);
+        // it does NOT trigger on unrelated inference threads that share the
+        // process with a separate training thread.
+        if (Autodiff.DifferentiableOps.ThreadTapeActive()) return;
         State.RecordOp(opName, result._shape, replayDelegate, paramHash);
     }
 }

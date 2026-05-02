@@ -4,6 +4,7 @@
 #nullable disable
 
 using System;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -105,14 +106,15 @@ public class GradientTapeLeakTests
         var lnBeta = MakeTensor(new[] { Dim }, 0.01f, 8);
         var sources = new[] { wq, wk, wv, wo, w1, w2, lnGamma, lnBeta };
 
-        // Track forward intermediates from a SINGLE step (local fn captures this list).
-        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
-
-        // Warmup so JIT/pool effects don't pollute the WeakReference window.
-        for (int w = 0; w < 5; w++) RunOneStep(track: false);
+        // Warmup via a non-inlined static helper so the JIT can't extend the
+        // step's local lifetimes past the call boundary — a common false-
+        // positive trap in WeakReference-based leak tests.
+        for (int w = 0; w < 5; w++)
+            Issue283Step_TransformerBlock(engine, sources, Batch * Seq, Dim, lnGamma, lnBeta, wq, wk, wv, wo, w1, w2, null);
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
-        RunOneStep(track: true);
+        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
+        Issue283Step_TransformerBlock(engine, sources, Batch * Seq, Dim, lnGamma, lnBeta, wq, wk, wv, wo, w1, w2, trackedRefs);
 
         // Force GC twice with finalizers between to give the runtime every
         // chance to release the intermediates.
@@ -137,45 +139,60 @@ public class GradientTapeLeakTests
             $"survived Gen2 GC after GradientTape.Dispose. Surviving labels: " +
             string.Join(", ", survivors));
 
-        void RunOneStep(bool track)
-        {
-            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
-            using var tape = new GradientTape<float>();
-            var xNorm = engine.TensorLayerNorm(x, lnGamma, lnBeta, epsilon: 1e-5);
-            var q = engine.TensorMatMul(xNorm, wq);
-            var k = engine.TensorMatMul(xNorm, wk);
-            var v = engine.TensorMatMul(xNorm, wv);
-            var scores = engine.TensorMatMulTransposed(q, k);
-            var attn = engine.Softmax(scores, axis: -1);
-            var ctx = engine.TensorMatMul(attn, v);
-            var proj = engine.TensorMatMul(ctx, wo);
-            var residual = engine.TensorAdd(x, proj);
-            var h1 = engine.TensorMatMul(residual, w1);
-            var h2 = engine.ReLU(h1);
-            var h3 = engine.TensorMatMul(h2, w2);
-            var loss = engine.ReduceSum(h3, null);
-            var grads = tape.ComputeGradients(loss, sources: sources);
+    }
 
-            if (track)
-            {
-                trackedRefs.Add(("x-input", new System.WeakReference(x)));
-                trackedRefs.Add(("xNorm", new System.WeakReference(xNorm)));
-                trackedRefs.Add(("q", new System.WeakReference(q)));
-                trackedRefs.Add(("k", new System.WeakReference(k)));
-                trackedRefs.Add(("v", new System.WeakReference(v)));
-                trackedRefs.Add(("scores", new System.WeakReference(scores)));
-                trackedRefs.Add(("attn-softmax", new System.WeakReference(attn)));
-                trackedRefs.Add(("ctx", new System.WeakReference(ctx)));
-                trackedRefs.Add(("proj", new System.WeakReference(proj)));
-                trackedRefs.Add(("residual", new System.WeakReference(residual)));
-                trackedRefs.Add(("h1", new System.WeakReference(h1)));
-                trackedRefs.Add(("h2-relu", new System.WeakReference(h2)));
-                trackedRefs.Add(("h3", new System.WeakReference(h3)));
-                trackedRefs.Add(("loss", new System.WeakReference(loss)));
-                // Do NOT track sources — they're expected to survive.
-            }
-            // grads goes out of scope at end of this method
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Issue283Step_TransformerBlock(
+        IEngine engine,
+        Tensor<float>[] sources,
+        int rows, int dim,
+        Tensor<float> lnGamma, Tensor<float> lnBeta,
+        Tensor<float> wq, Tensor<float> wk, Tensor<float> wv, Tensor<float> wo,
+        Tensor<float> w1, Tensor<float> w2,
+        System.Collections.Generic.List<(string label, System.WeakReference wr)> trackedRefs)
+    {
+        // [NoInlining] guarantees this method's frame is gone (and its locals
+        // dead) before the caller's GC.Collect — the standard discipline for
+        // WeakReference-based leak tests on a JIT that may otherwise inline
+        // local functions and keep their captures alive across the call.
+        var x = MakeTensor(new[] { rows, dim }, 1.0f, 99);
+        using var tape = new GradientTape<float>();
+        var xNorm = engine.TensorLayerNorm(x, lnGamma, lnBeta, epsilon: 1e-5);
+        var q = engine.TensorMatMul(xNorm, wq);
+        var k = engine.TensorMatMul(xNorm, wk);
+        var v = engine.TensorMatMul(xNorm, wv);
+        var scores = engine.TensorMatMulTransposed(q, k);
+        var attn = engine.Softmax(scores, axis: -1);
+        var ctx = engine.TensorMatMul(attn, v);
+        var proj = engine.TensorMatMul(ctx, wo);
+        var residual = engine.TensorAdd(x, proj);
+        var h1 = engine.TensorMatMul(residual, w1);
+        var h2 = engine.ReLU(h1);
+        var h3 = engine.TensorMatMul(h2, w2);
+        var loss = engine.ReduceSum(h3, null);
+        var grads = tape.ComputeGradients(loss, sources: sources);
+
+        if (trackedRefs is not null)
+        {
+            trackedRefs.Add(("x-input", new System.WeakReference(x)));
+            trackedRefs.Add(("xNorm", new System.WeakReference(xNorm)));
+            trackedRefs.Add(("q", new System.WeakReference(q)));
+            trackedRefs.Add(("k", new System.WeakReference(k)));
+            trackedRefs.Add(("v", new System.WeakReference(v)));
+            trackedRefs.Add(("scores", new System.WeakReference(scores)));
+            trackedRefs.Add(("attn-softmax", new System.WeakReference(attn)));
+            trackedRefs.Add(("ctx", new System.WeakReference(ctx)));
+            trackedRefs.Add(("proj", new System.WeakReference(proj)));
+            trackedRefs.Add(("residual", new System.WeakReference(residual)));
+            trackedRefs.Add(("h1", new System.WeakReference(h1)));
+            trackedRefs.Add(("h2-relu", new System.WeakReference(h2)));
+            trackedRefs.Add(("h3", new System.WeakReference(h3)));
+            trackedRefs.Add(("loss", new System.WeakReference(loss)));
+            // Do NOT track sources — they're expected to survive.
         }
+        // All locals (including grads) go out of scope at method exit; the JIT
+        // cannot extend their lifetime past the return because [NoInlining]
+        // pins the frame as a real call boundary.
     }
 
     [Fact]
@@ -364,11 +381,13 @@ public class GradientTapeLeakTests
         var wv = MakeTensor(new[] { Dim, Dim }, 0.1f, 3);
         var sources = new[] { wq, wk, wv };
 
-        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
-
-        for (int w = 0; w < 3; w++) Step(track: false);
+        for (int w = 0; w < 3; w++)
+            Issue283Step_AnomalyMode(engine, sources, Batch * Seq, Dim, wq, wk, wv, null);
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        Step(track: true);
+
+        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
+        Issue283Step_AnomalyMode(engine, sources, Batch * Seq, Dim, wq, wk, wv, trackedRefs);
+
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
@@ -379,33 +398,37 @@ public class GradientTapeLeakTests
         foreach (var s in survivors) _output.WriteLine($"  - {s}");
         Assert.True(survivors.Count == 0,
             $"Anomaly-mode tape-walk path leaked {survivors.Count} forward intermediates: {string.Join(", ", survivors)}");
+    }
 
-        void Step(bool track)
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Issue283Step_AnomalyMode(
+        IEngine engine, Tensor<float>[] sources, int rows, int dim,
+        Tensor<float> wq, Tensor<float> wk, Tensor<float> wv,
+        System.Collections.Generic.List<(string label, System.WeakReference wr)> trackedRefs)
+    {
+        var x = MakeTensor(new[] { rows, dim }, 1.0f, 99);
+        using var tape = new GradientTape<float>();
+        tape.DetectAnomaly = true; // ← forces tape-walk path
+        var q = engine.TensorMatMul(x, wq);
+        var k = engine.TensorMatMul(x, wk);
+        var v = engine.TensorMatMul(x, wv);
+        var scores = engine.TensorMatMulTransposed(q, k);
+        var attn = engine.Softmax(scores, axis: -1);
+        var ctx = engine.TensorMatMul(attn, v);
+        var loss = engine.ReduceSum(ctx, null);
+        var grads = tape.ComputeGradients(loss, sources: sources);
+        Assert.True(grads.ContainsKey(wq));
+
+        if (trackedRefs is not null)
         {
-            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
-            using var tape = new GradientTape<float>();
-            tape.DetectAnomaly = true; // ← forces tape-walk path
-            var q = engine.TensorMatMul(x, wq);
-            var k = engine.TensorMatMul(x, wk);
-            var v = engine.TensorMatMul(x, wv);
-            var scores = engine.TensorMatMulTransposed(q, k);
-            var attn = engine.Softmax(scores, axis: -1);
-            var ctx = engine.TensorMatMul(attn, v);
-            var loss = engine.ReduceSum(ctx, null);
-            var grads = tape.ComputeGradients(loss, sources: sources);
-            Assert.True(grads.ContainsKey(wq));
-
-            if (track)
-            {
-                trackedRefs.Add(("x", new System.WeakReference(x)));
-                trackedRefs.Add(("q", new System.WeakReference(q)));
-                trackedRefs.Add(("k", new System.WeakReference(k)));
-                trackedRefs.Add(("v", new System.WeakReference(v)));
-                trackedRefs.Add(("scores", new System.WeakReference(scores)));
-                trackedRefs.Add(("attn", new System.WeakReference(attn)));
-                trackedRefs.Add(("ctx", new System.WeakReference(ctx)));
-                trackedRefs.Add(("loss", new System.WeakReference(loss)));
-            }
+            trackedRefs.Add(("x", new System.WeakReference(x)));
+            trackedRefs.Add(("q", new System.WeakReference(q)));
+            trackedRefs.Add(("k", new System.WeakReference(k)));
+            trackedRefs.Add(("v", new System.WeakReference(v)));
+            trackedRefs.Add(("scores", new System.WeakReference(scores)));
+            trackedRefs.Add(("attn", new System.WeakReference(attn)));
+            trackedRefs.Add(("ctx", new System.WeakReference(ctx)));
+            trackedRefs.Add(("loss", new System.WeakReference(loss)));
         }
     }
 
@@ -486,11 +509,13 @@ public class GradientTapeLeakTests
         var w = MakeTensor(new[] { Dim, Dim }, 0.1f, 1);
         var sources = new[] { w };
 
-        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
-
-        for (int i = 0; i < 3; i++) Step(track: false);
+        for (int i = 0; i < 3; i++)
+            Issue283Step_SequentialTapes(engine, sources, Dim, w, null);
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        Step(track: true);
+
+        var trackedRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
+        Issue283Step_SequentialTapes(engine, sources, Dim, w, trackedRefs);
+
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
         var survivors = new System.Collections.Generic.List<string>();
@@ -500,61 +525,70 @@ public class GradientTapeLeakTests
         foreach (var s in survivors) _output.WriteLine($"  - {s}");
         Assert.True(survivors.Count == 0,
             $"Sequential-tape config leaked {survivors.Count} intermediates: {string.Join(", ", survivors)}");
+    }
 
-        void Step(bool track)
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Issue283Step_SequentialTapes(
+        IEngine engine, Tensor<float>[] sources, int dim, Tensor<float> w,
+        System.Collections.Generic.List<(string label, System.WeakReference wr)> trackedRefs)
+    {
+        // Two sequential tapes — the second runs AFTER the first disposes.
+        // This is the most common multi-step training pattern.
+        Tensor<float> x1, x2, y1, y2;
+        using (var tape1 = new GradientTape<float>())
         {
-            // Two sequential tapes — the second runs AFTER the first disposes.
-            // This is the most common multi-step training pattern.
-            Tensor<float> x1, x2, y1, y2;
-            using (var tape1 = new GradientTape<float>())
-            {
-                x1 = MakeTensor(new[] { Dim, Dim }, 1.0f, 100);
-                y1 = engine.TensorMatMul(x1, w);
-                var loss1 = engine.ReduceSum(y1, null);
-                var g1 = tape1.ComputeGradients(loss1, sources);
-                Assert.True(g1.ContainsKey(w));
-            }
-            using (var tape2 = new GradientTape<float>())
-            {
-                x2 = MakeTensor(new[] { Dim, Dim }, 1.0f, 200);
-                y2 = engine.TensorMatMul(x2, w);
-                var loss2 = engine.ReduceSum(y2, null);
-                var g2 = tape2.ComputeGradients(loss2, sources);
-                Assert.True(g2.ContainsKey(w));
-            }
-            if (track)
-            {
-                trackedRefs.Add(("x1", new System.WeakReference(x1)));
-                trackedRefs.Add(("y1", new System.WeakReference(y1)));
-                trackedRefs.Add(("x2", new System.WeakReference(x2)));
-                trackedRefs.Add(("y2", new System.WeakReference(y2)));
-            }
+            x1 = MakeTensor(new[] { dim, dim }, 1.0f, 100);
+            y1 = engine.TensorMatMul(x1, w);
+            var loss1 = engine.ReduceSum(y1, null);
+            var g1 = tape1.ComputeGradients(loss1, sources);
+            Assert.True(g1.ContainsKey(w));
+        }
+        using (var tape2 = new GradientTape<float>())
+        {
+            x2 = MakeTensor(new[] { dim, dim }, 1.0f, 200);
+            y2 = engine.TensorMatMul(x2, w);
+            var loss2 = engine.ReduceSum(y2, null);
+            var g2 = tape2.ComputeGradients(loss2, sources);
+            Assert.True(g2.ContainsKey(w));
+        }
+        if (trackedRefs is not null)
+        {
+            trackedRefs.Add(("x1", new System.WeakReference(x1)));
+            trackedRefs.Add(("y1", new System.WeakReference(y1)));
+            trackedRefs.Add(("x2", new System.WeakReference(x2)));
+            trackedRefs.Add(("y2", new System.WeakReference(y2)));
         }
     }
 
     [Fact]
-    public void Inference_NoTape_AutoTracerStillRecords()
+    public void Inference_NoTape_ThreadTapeDepthRemainsZero()
     {
-        // Negative test for the fix: AutoTracer must still work for
-        // inference (no GradientTape active). The fix only suppresses
-        // AutoTracer DURING tape lifecycle — once the tape is disposed,
-        // a fresh inference path should be eligible for compilation.
+        // Negative test for the fix: the per-thread gate that suppresses
+        // AutoTracer (DifferentiableOps._threadTapeDepth) MUST stay at 0
+        // when no GradientTape is active on this thread. If a future change
+        // accidentally increments without a balancing decrement, AutoTracer
+        // would silently stop recording for inference too.
+        Assert.Equal(0, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+
+        // Take a tape lifecycle round-trip to confirm the counter increments
+        // and decrements correctly.
+        Assert.Equal(0, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+        using (var tape = new GradientTape<float>())
+        {
+            Assert.Equal(1, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+            using (var nested = new GradientTape<float>())
+            {
+                Assert.Equal(2, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+            }
+            Assert.Equal(1, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+        }
+        Assert.Equal(0, AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps._threadTapeDepth);
+
+        // And the inference path itself still works after a tape lifecycle.
         var engine = AiDotNetEngine.Current;
         const int Dim = 64;
         var a = MakeTensor(new[] { Dim, Dim }, 0.1f, 1);
         var b = MakeTensor(new[] { Dim, Dim }, 0.1f, 2);
-
-        // Warmup: register the op pattern in AutoTracer's sequence.
-        // No tape — AutoTracer SHOULD record.
-        for (int i = 0; i < 5; i++)
-        {
-            var c = engine.TensorMatMul(a, b);
-            Assert.True(c.Length > 0);
-        }
-
-        // We don't have a public inspector to verify "AutoTracer recorded N
-        // ops", but the absence-of-throw + correctness check is enough to
-        // confirm the inference path executes normally.
         var result = engine.TensorMatMul(a, b);
         Assert.Equal(new[] { Dim, Dim }, result.Shape.ToArray());
     }
@@ -575,14 +609,13 @@ public class GradientTapeLeakTests
         var w = MakeTensor(new[] { Dim, Dim }, 0.1f, 1);
         var sources = new[] { w };
 
-        var intermediateRefs = new System.Collections.Generic.List<(string, System.WeakReference)>();
-
         // Warmup
-        for (int i = 0; i < 3; i++) Step(track: false);
+        for (int i = 0; i < 3; i++)
+            Issue283Step_OptimizerPattern(engine, sources, Dim, w, null);
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
-        // Tracked step.
-        Step(track: true);
+        var intermediateRefs = new System.Collections.Generic.List<(string label, System.WeakReference wr)>();
+        Issue283Step_OptimizerPattern(engine, sources, Dim, w, intermediateRefs);
 
         // Simulate optimizer step that reads .Grad — the user's consumer
         // does this. We then null .Grad to simulate a "zero_grad" cycle.
@@ -604,22 +637,25 @@ public class GradientTapeLeakTests
         Assert.True(survivors.Count == 0,
             $"Reading source.Grad pinned {survivors.Count} forward intermediates: " +
             string.Join(", ", survivors));
+    }
 
-        void Step(bool track)
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Issue283Step_OptimizerPattern(
+        IEngine engine, Tensor<float>[] sources, int dim, Tensor<float> w,
+        System.Collections.Generic.List<(string label, System.WeakReference wr)> trackedRefs)
+    {
+        var x = MakeTensor(new[] { dim, dim }, 1.0f, 99);
+        using var tape = new GradientTape<float>();
+        var y = engine.TensorMatMul(x, w);
+        var z = engine.ReLU(y);
+        var loss = engine.ReduceSum(z, null);
+        var grads = tape.ComputeGradients(loss, sources: sources);
+        if (trackedRefs is not null)
         {
-            var x = MakeTensor(new[] { Dim, Dim }, 1.0f, 99);
-            using var tape = new GradientTape<float>();
-            var y = engine.TensorMatMul(x, w);
-            var z = engine.ReLU(y);
-            var loss = engine.ReduceSum(z, null);
-            var grads = tape.ComputeGradients(loss, sources: sources);
-            if (track)
-            {
-                intermediateRefs.Add(("x", new System.WeakReference(x)));
-                intermediateRefs.Add(("y-matmul", new System.WeakReference(y)));
-                intermediateRefs.Add(("z-relu", new System.WeakReference(z)));
-                intermediateRefs.Add(("loss", new System.WeakReference(loss)));
-            }
+            trackedRefs.Add(("x", new System.WeakReference(x)));
+            trackedRefs.Add(("y-matmul", new System.WeakReference(y)));
+            trackedRefs.Add(("z-relu", new System.WeakReference(z)));
+            trackedRefs.Add(("loss", new System.WeakReference(loss)));
         }
     }
 
