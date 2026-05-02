@@ -7323,22 +7323,36 @@ public partial class CpuEngine : ITensorLevelEngine
             // Mirrors the float path's SimdConvHelper.Conv3x3Stride1 — register-
             // resident Vector256<double> inner kernel, no im2col allocation.
             //
-            // A/B-tested with --ab-conv2d-double:
+            // Original A/B-test (with serial im2col+GEMM as baseline):
             //   [1,3,32,32]→[16,3,3]  (442K FMAs):  460 → 385 µs (1.2× faster)
             //   [4,3,32,32]→[16,3,3]  (1.77M FMAs): 1632 → 1483 µs (1.1× faster)
             //   [1,16,64,64]→[32,3,3] (18.9M FMAs): 5201 → 18228 µs (3.5× SLOWER)
-            // Threshold: direct kernel for ≤4M FMAs (the BDN shape is 0.44M),
-            // im2col+GEMM for larger (where its better cache reuse dominates
-            // the lack of row-pairing in the direct kernel).
+            // The 18.9M FMA shape losing was driven by outChannels=32 — the
+            // direct kernel parallelizes per-output-channel, so 32 oc on a
+            // 32-core box gives at most 32 parallel tasks but the im2col+GEMM
+            // path's 2D-tile partition (M/64 × N/64) gives way more (and
+            // is now also parallelized on a separate path). For diffusion-
+            // class shapes (SD UNet ResBlock 320→320 @ 64×64, 3.77 GFMA)
+            // outChannels=320 gives 10× more parallelism than the original
+            // A/B baseline shape, so the direct kernel wins again.
+            //
+            // Updated gate (2026-05-02): allow the direct kernel when EITHER
+            //   (a) total FMAs are small (≤ 4 M, the BDN baseline), OR
+            //   (b) outChannels gives ≥ 2× ProcessorCount parallel tasks
+            //       so all cores have work and the no-im2col-blowup
+            //       memory-traffic win materializes.
 #if !NET471
             // SimdConvHelper.Conv3x3Stride1Double is gated on AVX2/FMA intrinsics
             // (System.Runtime.Intrinsics is unavailable on net471 — the file is
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
             // fall through to the im2col+GEMM path below.
             long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
+            int directKernelMinTasks = 2 * Math.Max(1, Environment.ProcessorCount);
+            bool directKernelFitsWell = convFmas <= 4_000_000L
+                || outChannels >= directKernelMinTasks;
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
-                && convFmas <= 4_000_000L
+                && directKernelFitsWell
                 && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
             {
                 var dInput  = (Tensor<double>)(object)input;
@@ -7486,9 +7500,48 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // Use im2col + GEMM for double
+        // Use im2col + GEMM for double, OR — for 3×3 stride=1 with enough
+        // outChannels to saturate the cores — the register-resident
+        // SimdConvHelper.Conv3x3Stride1Double kernel that skips im2col
+        // entirely. ConvolutionalLayer's inference path calls Conv2DInto
+        // (zero-alloc), so without this branch SD UNet ResBlocks never see
+        // the direct kernel even though Conv2D (allocating overload) does.
+        // Same gating logic as Conv2D: small shapes (≤4 M FMAs) or
+        // outChannels ≥ 2× ProcessorCount — both ensure the per-oc
+        // parallelism pays off without im2col's memory blowup.
         if (typeof(T) == typeof(double))
         {
+#if !NET471
+            long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
+            int directKernelMinTasksInto = 2 * Math.Max(1, Environment.ProcessorCount);
+            bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
+                || outChannels >= directKernelMinTasksInto;
+            if (kernelHeight == 3 && kernelWidth == 3
+                && stride == 1 && padding > 0 && dilation == 1
+                && directKernelFitsWellInto
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
+            {
+                var dInput  = (Tensor<double>)(object)input;
+                var dKernel = (Tensor<double>)(object)kernel;
+                var dOutput = (Tensor<double>)(object)output;
+                // Caller of Conv2DInto reuses output across calls — clear
+                // before accumulating since the direct kernel does
+                // output[oh,ow] += sum_{ic,kh,kw} conv contributions.
+                dOutput.Data.Span.Clear();
+                using var pinIn = dInput.Data.Pin();
+                using var pinK  = dKernel.Data.Pin();
+                using var pinO  = dOutput.Data.Pin();
+                unsafe
+                {
+                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                        (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
+                        batch, inChannels, height, width,
+                        outChannels, padding, padding, dilation, dilation);
+                }
+                return;
+            }
+#endif
+
             Conv2DWithIm2ColDouble(
                 input as Tensor<double> ?? throw new InvalidCastException(),
                 kernel as Tensor<double> ?? throw new InvalidCastException(),
