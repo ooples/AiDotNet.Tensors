@@ -406,35 +406,46 @@ public class BackwardBufferPoolingTests : IDisposable
     }
 
     [Fact]
-    public void FusedLinearReLU_Backward_FastPath_ProducesValidGradients()
+    public void FusedLinearReLU_Backward_AboveSimdGemmThreshold_ProducesValidGradients()
     {
-        // Exercises FusedMatMulAddReLUBackward at a shape large enough that
-        // M·K·N ≥ SimdGemm.ParallelWorkThreshold on any reasonable host,
-        // so the success branch hits the SimdGemm fast path AND the
-        // AutoTensorCache.Return line for the maskedTensor scratch buffer.
+        // Exercises FusedMatMulAddReLUBackward at a shape sized DIRECTLY
+        // from SimdGemm.ParallelWorkThreshold so M·K·N is always above the
+        // gate, no matter the runner core count (the threshold scales per-
+        // core and clamps to [2 Mi, 20 Mi] work-elements). The cube-root
+        // sizing keeps the matrices as small as possible while still
+        // crossing the gate, so this test stays cheap on CI instead of
+        // using the previous 256×512×256 = 33.5 Mi shape that was much
+        // larger than necessary.
+        //
         // Existing tests in this class use 2×2 matrices that fall under
         // the threshold and take the engine fallback path, so the fast-
         // path success branch (which the post-PR-280 fix touches) goes
-        // uncovered.
-        //
-        // Shape 256×512×256 ⇒ 33.5 Mi work-elements, above SimdGemm's 20 Mi
-        // upper cap (the cap is hit on hosts with ≥ 16 cores; lower cores
-        // see a smaller threshold scaled per core, so this size is safely
-        // over on every reasonable runner including the 4-core GitHub
-        // Actions Linux pool).
+        // uncovered without this case.
         //
         // We assert behavioural correctness (gradients are populated,
         // finite, and consistent across repeated calls) rather than
         // heap-retention numbers — GC.GetTotalMemory deltas are
         // unreliable on a shared CI runner where concurrent test classes
         // allocate during the measurement window.
-        const int M = 256, K = 512, N = 256;
+        long threshold = global::AiDotNet.Tensors.Engines.Simd.SimdGemm.ParallelWorkThreshold;
+        // Cube root with 25 % headroom so we land safely above the gate
+        // even after rounding down per dimension.
+        int dim = (int)Math.Ceiling(Math.Cbrt(threshold * 1.25));
+        // Round up to the next multiple of 16 so the per-dim sizes stay
+        // friendly to the vector kernel's micro-tile (Mr=6, Nr=16) without
+        // forcing huge edges.
+        dim = ((dim + 15) / 16) * 16;
+        int M = dim, K = dim, N = dim;
+        Assert.True((long)M * K * N >= threshold,
+            $"Test sizing math regressed: M*K*N = {(long)M * K * N} < threshold = {threshold}");
 
         var input = new Tensor<float>(MakeFilled(M * K, 0.01f), new[] { M, K });
         var weights = new Tensor<float>(MakeFilled(K * N, 0.005f), new[] { K, N });
         var bias = new Tensor<float>(MakeFilled(N, 0.01f), new[] { 1, N });
 
         float[]? referenceWeightGrad = null;
+        float[]? referenceBiasGrad = null;
+        float[]? referenceInputGrad = null;
 
         for (int step = 0; step < 5; step++)
         {
@@ -452,27 +463,55 @@ public class BackwardBufferPoolingTests : IDisposable
             Assert.True(grads.ContainsKey(bias), "bias gradient missing");
             Assert.True(grads.ContainsKey(input), "input gradient missing");
 
-            // Spot-check finiteness so a NaN/Inf from a buffer-reuse bug fails loudly.
-            for (int i = 0; i < grads[weights].Length; i += 256)
+            // Validate FULL finiteness across every gradient element so a
+            // NaN/Inf from a buffer-reuse bug anywhere in the K×N / M×K /
+            // 1×N grads fails loudly. Spot-checks (every Nth entry) let
+            // contiguous corruption slip through.
+            for (int i = 0; i < grads[weights].Length; i++)
                 Assert.True(!float.IsNaN(grads[weights].GetFlat(i)) && !float.IsInfinity(grads[weights].GetFlat(i)),
                     $"non-finite weight gradient at index {i}");
+            for (int i = 0; i < grads[bias].Length; i++)
+                Assert.True(!float.IsNaN(grads[bias].GetFlat(i)) && !float.IsInfinity(grads[bias].GetFlat(i)),
+                    $"non-finite bias gradient at index {i}");
+            for (int i = 0; i < grads[input].Length; i++)
+                Assert.True(!float.IsNaN(grads[input].GetFlat(i)) && !float.IsInfinity(grads[input].GetFlat(i)),
+                    $"non-finite input gradient at index {i}");
 
             if (step == 0)
             {
                 referenceWeightGrad = Enumerable.Range(0, grads[weights].Length)
                     .Select(i => grads[weights].GetFlat(i)).ToArray();
+                referenceBiasGrad = Enumerable.Range(0, grads[bias].Length)
+                    .Select(i => grads[bias].GetFlat(i)).ToArray();
+                referenceInputGrad = Enumerable.Range(0, grads[input].Length)
+                    .Select(i => grads[input].GetFlat(i)).ToArray();
                 continue;
             }
 
             // Gradient values must be identical across steps — if the
             // pooled scratch buffer leaks stale data into a subsequent
-            // call, this catches it.
-            for (int i = 0; i < referenceWeightGrad!.Length; i += 256)
+            // call, this catches it. Validate FULL gradient content for
+            // weights AND bias AND input across steps.
+            for (int i = 0; i < referenceWeightGrad!.Length; i++)
             {
                 float actual = grads[weights].GetFlat(i);
                 Assert.True(Math.Abs(actual - referenceWeightGrad[i]) <= 1e-3f,
-                    $"FusedLinear+ReLU fast-path weight gradient drifted at step {step}, " +
+                    $"FusedLinear+ReLU weight gradient drifted at step {step}, " +
                     $"index {i}: expected {referenceWeightGrad[i]}, got {actual}");
+            }
+            for (int i = 0; i < referenceBiasGrad!.Length; i++)
+            {
+                float actual = grads[bias].GetFlat(i);
+                Assert.True(Math.Abs(actual - referenceBiasGrad[i]) <= 1e-3f,
+                    $"FusedLinear+ReLU bias gradient drifted at step {step}, " +
+                    $"index {i}: expected {referenceBiasGrad[i]}, got {actual}");
+            }
+            for (int i = 0; i < referenceInputGrad!.Length; i++)
+            {
+                float actual = grads[input].GetFlat(i);
+                Assert.True(Math.Abs(actual - referenceInputGrad[i]) <= 1e-3f,
+                    $"FusedLinear+ReLU input gradient drifted at step {step}, " +
+                    $"index {i}: expected {referenceInputGrad[i]}, got {actual}");
             }
         }
     }
