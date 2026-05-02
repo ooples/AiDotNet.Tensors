@@ -29,6 +29,22 @@ internal static class DifferentiableOps
     internal static bool AnyTapeActive() => _anyTapeActive != 0;
 
     /// <summary>
+    /// Per-thread depth counter for active GradientTape lifecycles. Stays > 0
+    /// from <see cref="GradientTape{T}"/> constructor through <c>Dispose</c>
+    /// — including the backward walk during which <c>Current</c> is suspended
+    /// to null. Use this (not <see cref="AnyTapeActive"/>) when you need to
+    /// suppress an unrelated subsystem (e.g. AutoTracer) for the current
+    /// thread's tape lifetime without affecting inference threads sharing
+    /// the process.
+    /// </summary>
+    [ThreadStatic]
+    internal static int _threadTapeDepth;
+
+    /// <summary>Fast check: is any tape active on the calling thread (forward OR backward)?</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool ThreadTapeActive() => _threadTapeDepth > 0;
+
+    /// <summary>
     /// Thread-local check: is a tape active on the calling thread for the
     /// given numeric T? Use this when an op needs to switch dispatch paths
     /// (e.g. take a slower tape-aware branch) — using the cross-thread
