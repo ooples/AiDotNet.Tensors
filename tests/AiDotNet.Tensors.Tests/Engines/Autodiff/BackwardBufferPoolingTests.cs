@@ -429,8 +429,10 @@ public class BackwardBufferPoolingTests : IDisposable
         // allocate during the measurement window.
         long threshold = global::AiDotNet.Tensors.Engines.Simd.SimdGemm.ParallelWorkThreshold;
         // Cube root with 25 % headroom so we land safely above the gate
-        // even after rounding down per dimension.
-        int dim = (int)Math.Ceiling(Math.Cbrt(threshold * 1.25));
+        // even after rounding down per dimension. Math.Cbrt isn't available
+        // on net471, so use Math.Pow(x, 1.0/3.0) which is — accurate enough
+        // for sizing a test matrix (we round up afterwards anyway).
+        int dim = (int)Math.Ceiling(Math.Pow(threshold * 1.25, 1.0 / 3.0));
         // Round up to the next multiple of 16 so the per-dim sizes stay
         // friendly to the vector kernel's micro-tile (Mr=6, Nr=16) without
         // forcing huge edges.
