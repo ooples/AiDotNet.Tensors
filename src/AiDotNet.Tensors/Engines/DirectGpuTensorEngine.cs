@@ -1111,6 +1111,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Variant of <see cref="FinishGpuOp{T}"/> that registers the deferred-download
+    /// materializer directly against a caller-supplied destination array, so an
+    /// <c>*Into</c> API doesn't need to allocate an intermediate result array and
+    /// then copy. Used by <see cref="TensorPermuteInto{T}"/> and other in-place
+    /// GPU operations that want to avoid doubling per-call CPU memory traffic.
+    /// </summary>
+    /// <param name="backend">The GPU backend that owns <paramref name="outputBuffer"/>.</param>
+    /// <param name="outputBuffer">The GPU buffer to download from.</param>
+    /// <param name="destination">
+    /// Caller-supplied CPU array that the GPU result will be downloaded into when
+    /// the array is first read. Must have <see cref="Array.Length"/> &gt;=
+    /// <paramref name="elementCount"/>.
+    /// </param>
+    /// <param name="elementCount">Number of elements that will be written.</param>
+    private void DownloadGpuBufferInto<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, T[] destination, int elementCount)
+    {
+        var capturedBuffer = outputBuffer.Buffer;
+        var capturedBackend = backend;
+        Helpers.DeferredArrayMaterializer.Register(destination, arr =>
+        {
+            float[] floatData;
+            try
+            {
+                floatData = capturedBackend.DownloadBuffer(capturedBuffer);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new InvalidOperationException(
+                    "Deferred GPU download failed because the underlying buffer was " +
+                    "released before materialization. This typically indicates an " +
+                    "activation-cache eviction raced with a pending materializer " +
+                    "(issue #226).", ex);
+            }
+            var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+            Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
+        });
+        CacheActivation(destination, outputBuffer.Buffer, new[] { elementCount }, backend);
+    }
+
+    /// <summary>
     /// Creates a deferred Tensor from a raw GPU buffer. The buffer stays GPU-resident;
     /// the CPU array is only populated when code accesses the tensor data.
     /// Use this instead of bb.DownloadBuffer() in IEngine implementations to keep
@@ -12570,6 +12610,89 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception)
         {
             return base.TensorPermute(tensor, axes);
+        }
+    }
+
+    /// <inheritdoc/>
+    public override void TensorPermuteInto<T>(Tensor<T> output, Tensor<T> tensor, int[] axes)
+    {
+        if (!TryGetBackend(out var backend))
+        {
+            base.TensorPermuteInto(output, tensor, axes);
+            return;
+        }
+
+        // Validation mirrors the CPU path so backend kernels see a clean
+        // contract: rank match, valid permutation (no duplicate / out-of-
+        // range axes), output rank match, and shape consistency. Mirroring
+        // the ArgumentException surface keeps callers from having to handle
+        // IndexOutOfRangeException coming up from `axes[i]` indexing
+        // tensor.Shape._dims when the GPU path is selected.
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (axes is null) throw new ArgumentNullException(nameof(axes));
+        int rank = tensor.Shape._dims.Length;
+        if (axes.Length != rank)
+            throw new ArgumentException("Axes length must match tensor rank");
+        if (output.Shape._dims.Length != rank)
+            throw new ArgumentException("Output rank must match tensor rank");
+        if (output.Length != tensor.Length)
+            throw new ArgumentException(
+                $"Output length ({output.Length}) does not match input length ({tensor.Length}).");
+
+        // Validate `axes` is a real permutation: every entry in [0, rank)
+        // and every axis index appears exactly once.
+        if (rank > 0)
+        {
+            Span<bool> seen = rank <= 32 ? stackalloc bool[rank] : new bool[rank];
+            for (int i = 0; i < rank; i++)
+            {
+                int a = axes[i];
+                if (a < 0 || a >= rank)
+                    throw new ArgumentException(
+                        $"Axes[{i}] = {a} is out of range [0, {rank}).", nameof(axes));
+                if (seen[a])
+                    throw new ArgumentException(
+                        $"Axes is not a valid permutation: axis {a} appears more than once.",
+                        nameof(axes));
+                seen[a] = true;
+            }
+        }
+
+        for (int i = 0; i < rank; i++)
+        {
+            int expected = tensor.Shape._dims[axes[i]];
+            if (output.Shape._dims[i] != expected)
+                throw new ArgumentException(
+                    $"Output shape mismatch at axis {i}: expected {expected}, got {output.Shape._dims[i]}.");
+        }
+
+        try
+        {
+            // CUDA / HIP / Metal / OpenCL / Vulkan / WebGpu all already
+            // implement Permute(input, output, shape, axes) — the GPU
+            // kernels were written around an explicit destination buffer
+            // from day one, so the Into form just plumbs the caller's
+            // output buffer's existing array through. We download the
+            // result directly into output.GetDataArray() instead of into a
+            // freshly-allocated managed array, so the per-call allocation
+            // the API docs promise to skip is actually skipped on the hot
+            // path (FinishGpuOp's default behavior allocates and copies).
+            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
+            // Download directly into the caller's existing array. This
+            // keeps output's identity stable for repeated calls AND avoids
+            // the materialize-then-copy pattern that would otherwise
+            // double the per-call CPU memory traffic.
+            var dst = output.GetDataArray();
+            DownloadGpuBufferInto(backend, bufOut, dst, output.Length);
+        }
+        catch (Exception)
+        {
+            // Any backend hiccup (allocation failure, kernel launch error)
+            // — fall back to the CPU strided-copy.
+            base.TensorPermuteInto(output, tensor, axes);
         }
     }
 

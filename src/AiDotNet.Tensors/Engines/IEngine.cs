@@ -5698,6 +5698,27 @@ public interface IEngine
     Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes);
 
     /// <summary>
+    /// Permutes the dimensions of a tensor and writes the result into the
+    /// caller-supplied <paramref name="output"/>, avoiding the per-call
+    /// allocation that <see cref="TensorPermute"/> incurs. The output
+    /// tensor's shape must match the permuted source shape exactly.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="output">Pre-allocated destination tensor with the
+    /// permuted shape (i.e. <c>tensor.Shape[axes[i]]</c> for each i).</param>
+    /// <param name="tensor">The tensor whose dimensions will be permuted.</param>
+    /// <param name="axes">The new order of dimensions.</param>
+    /// <remarks>
+    /// Used by long-running pipelines (diffusion UNet attention blocks,
+    /// transformer blocks) that call permute O(layers × steps) times per
+    /// forward and would otherwise allocate a fresh result tensor each
+    /// call. Each backend's kernel was already structured around an
+    /// (input, output, shape, axes) signature, so the Into form just
+    /// exposes that to the engine layer without requiring new GPU kernels.
+    /// </remarks>
+    void TensorPermuteInto<T>(Tensor<T> output, Tensor<T> tensor, int[] axes);
+
+    /// <summary>
     /// Expands dimensions by inserting a new axis of size 1.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
