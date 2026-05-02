@@ -717,30 +717,165 @@ internal static class Im2ColHelper
         // path uses register-resident Conv3x3 (no im2col), but doubles
         // route through this im2col+GEMM path. Closing further requires a
         // Conv3x3SingleChannel<double> kernel, mirroring the float design.
+        //
+        // 2026-05-02 update — re-introduce Parallel.For on the outer M-block
+        // axis only. The earlier "parallel dispatch" rejection bundled
+        // Parallel.For with explicit SIMD intrinsics; the SIMD piece was the
+        // regression cause (defeated JIT auto-prefetch), not the parallelism.
+        // Profiling SD-style diffusion ResBlock convs at [1,320,64,64]→[320,3,3]
+        // (3.77 GFMA, 5232 ms scalar single-threaded ⇒ ~1.4 GFLOPS) showed
+        // every block of M is fully independent: each writes a disjoint slab
+        // of C, reads its own slab of A, and shares B read-only. Splitting
+        // across cores is embarrassingly parallel and preserves the JIT
+        // auto-vectorized inner axpy. Threshold at total FMAs ≥ 64 M to
+        // avoid Parallel.For overhead on small shapes (the original 0.4 M
+        // FMA BDN baseline stays on the serial path).
 
         const int BlockSize = 64;
 
         c.Clear();
 
-        for (int ii = 0; ii < m; ii += BlockSize)
+        long totalFmas = (long)m * (long)k * (long)n;
+        bool parallel = totalFmas >= 64L * 1024L * 1024L
+            && Environment.ProcessorCount > 1;
+
+        if (!parallel)
         {
-            int iEnd = Math.Min(ii + BlockSize, m);
-            for (int kk = 0; kk < k; kk += BlockSize)
+            for (int ii = 0; ii < m; ii += BlockSize)
             {
-                int kEnd = Math.Min(kk + BlockSize, k);
-                for (int jj = 0; jj < n; jj += BlockSize)
+                int iEnd = Math.Min(ii + BlockSize, m);
+                MultiplyBlockedDoubleRowSlabSpan(a, b, c, ii, iEnd, k, n, BlockSize);
+            }
+            return;
+        }
+
+        // Pin the three buffers so each thread can address its slab via raw
+        // pointers without violating the Span<T> stack-only rule (Spans can't
+        // cross lambda/anonymous-method boundaries — error CS9108).
+        //
+        // Partition the work across BOTH the outer M and outer N axes so we
+        // get enough independent tiles to saturate every core. Splitting on
+        // M alone gives only ⌈m/BlockSize⌉ tasks — for SD diffusion shapes
+        // (m = outChannels = 320, BlockSize = 64) that's just 5 tasks, which
+        // pinned the speedup to ≈2× on a 32-core box. Adding the N axis
+        // multiplies the task count to ⌈m/BlockSize⌉ × ⌈n/BlockSize⌉ — for
+        // m=320, n=4096 that's 5 × 64 = 320 independent (i,j) tiles, each
+        // writing a disjoint slab of C, so all cores can run flat-out.
+        // Splitting K would require atomic accumulation into C and is not
+        // worth the synchronization cost; keeping K serial inside each tile
+        // also preserves the JIT auto-vectorized inner axpy.
+        int mBlocks = (m + BlockSize - 1) / BlockSize;
+        int nBlocks = (n + BlockSize - 1) / BlockSize;
+        int totalTiles = mBlocks * nBlocks;
+        unsafe
+        {
+            fixed (double* aPtr = a)
+            fixed (double* bPtr = b)
+            fixed (double* cPtr = c)
+            {
+                double* aBase = aPtr, bBase = bPtr, cBase = cPtr;
+                System.Threading.Tasks.Parallel.For(0, totalTiles, tile =>
                 {
+                    int mBlk = tile / nBlocks;
+                    int nBlk = tile % nBlocks;
+                    int ii = mBlk * BlockSize;
+                    int jj = nBlk * BlockSize;
+                    int iEnd = Math.Min(ii + BlockSize, m);
                     int jEnd = Math.Min(jj + BlockSize, n);
-                    for (int i = ii; i < iEnd; i++)
+                    MultiplyBlockedDoubleTilePtr(aBase, bBase, cBase, ii, iEnd, jj, jEnd, k, n, BlockSize);
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pointer overload — single (i,j) tile. Iterates over all K blocks for
+    /// the given output tile so the whole inner reduction lives in this
+    /// task and can be JIT-auto-vectorized in place.
+    /// </summary>
+    private static unsafe void MultiplyBlockedDoubleTilePtr(
+        double* a, double* b, double* c,
+        int ii, int iEnd, int jj, int jEnd,
+        int k, int n,
+        int blockSize)
+    {
+        for (int kk = 0; kk < k; kk += blockSize)
+        {
+            int kEnd = Math.Min(kk + blockSize, k);
+            for (int i = ii; i < iEnd; i++)
+            {
+                for (int kIdx = kk; kIdx < kEnd; kIdx++)
+                {
+                    double aik = a[i * k + kIdx];
+                    int bRowOffset = kIdx * n + jj;
+                    int cRowOffset = i * n + jj;
+                    int width = jEnd - jj;
+                    for (int j = 0; j < width; j++)
+                        c[cRowOffset + j] += aik * b[bRowOffset + j];
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Span overload — handles the contiguous row range [ii, iEnd) of C
+    /// when called from the serial path (no thread crossing).
+    /// </summary>
+    private static void MultiplyBlockedDoubleRowSlabSpan(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        Span<double> c,
+        int ii, int iEnd,
+        int k, int n,
+        int blockSize)
+    {
+        for (int kk = 0; kk < k; kk += blockSize)
+        {
+            int kEnd = Math.Min(kk + blockSize, k);
+            for (int jj = 0; jj < n; jj += blockSize)
+            {
+                int jEnd = Math.Min(jj + blockSize, n);
+                for (int i = ii; i < iEnd; i++)
+                {
+                    for (int kIdx = kk; kIdx < kEnd; kIdx++)
                     {
-                        for (int kIdx = kk; kIdx < kEnd; kIdx++)
-                        {
-                            double aik = a[i * k + kIdx];
-                            int bRowOffset = kIdx * n + jj;
-                            int cRowOffset = i * n + jj;
-                            for (int j = 0; j < jEnd - jj; j++)
-                                c[cRowOffset + j] += aik * b[bRowOffset + j];
-                        }
+                        double aik = a[i * k + kIdx];
+                        int bRowOffset = kIdx * n + jj;
+                        int cRowOffset = i * n + jj;
+                        for (int j = 0; j < jEnd - jj; j++)
+                            c[cRowOffset + j] += aik * b[bRowOffset + j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pointer overload — same blocked+auto-vectorized kernel as the Span
+    /// version, but indexes raw pointers so it can be invoked from a
+    /// Parallel.For lambda where Spans aren't allowed to flow.
+    /// </summary>
+    private static unsafe void MultiplyBlockedDoubleRowSlabPtr(
+        double* a, double* b, double* c,
+        int ii, int iEnd,
+        int k, int n,
+        int blockSize)
+    {
+        for (int kk = 0; kk < k; kk += blockSize)
+        {
+            int kEnd = Math.Min(kk + blockSize, k);
+            for (int jj = 0; jj < n; jj += blockSize)
+            {
+                int jEnd = Math.Min(jj + blockSize, n);
+                for (int i = ii; i < iEnd; i++)
+                {
+                    for (int kIdx = kk; kIdx < kEnd; kIdx++)
+                    {
+                        double aik = a[i * k + kIdx];
+                        int bRowOffset = kIdx * n + jj;
+                        int cRowOffset = i * n + jj;
+                        for (int j = 0; j < jEnd - jj; j++)
+                            c[cRowOffset + j] += aik * b[bRowOffset + j];
                     }
                 }
             }
