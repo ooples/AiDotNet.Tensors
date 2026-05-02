@@ -218,6 +218,33 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Returns a new <see cref="Vector{T}"/> that shares storage with this
+    /// vector over the slice <c>[offset, offset + length)</c>. Mutations
+    /// to the returned vector are visible through the original vector and
+    /// vice versa — true zero-copy view, not a copy. Used by
+    /// <see cref="ParameterBuffer{T}"/>'s sparse-leaf <c>CreateView</c>
+    /// to hand out a <see cref="SparseTensor{T}"/> whose <c>Values</c>
+    /// stay live with the buffer.
+    /// </summary>
+    /// <param name="offset">First element index of the slice.</param>
+    /// <param name="length">Length of the slice.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="offset"/> or <paramref name="length"/>
+    /// is negative, or when the slice extends beyond this vector.
+    /// </exception>
+    public Vector<T> CreateSlice(int offset, int length)
+    {
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), "Length must be non-negative.");
+        if (offset + length > Length)
+            throw new ArgumentOutOfRangeException(nameof(length),
+                $"Slice [{offset}, {offset + length}) extends beyond vector length {Length}.");
+        return new Vector<T>(_memory.Slice(offset, length), false);
+    }
+
+    /// <summary>
     /// Creates a vector from pooled memory. The pooled array is tracked for return to the pool.
     /// </summary>
     /// <param name="memory">The sliced memory (exact size) to use as backing store.</param>

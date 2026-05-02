@@ -131,6 +131,45 @@ public class SparseTensor<T> : Tensor<T>
         BlockColSize = 0;
     }
 
+    /// <summary>
+    /// Creates a COO-format sparse tensor whose <c>Values</c> backing
+    /// vector is a caller-supplied <see cref="Vector{T}"/>. Use this
+    /// (paired with <see cref="Vector{T}.CreateSlice"/>) to construct
+    /// a sparse tensor that shares value storage with another vector —
+    /// the contract <see cref="ParameterBuffer{T}.CreateView"/> relies
+    /// on for live, zero-copy sparse views over the parameter buffer.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the <c>T[]</c> overload, this ctor does NOT wrap-then-copy:
+    /// mutations to the supplied vector are reflected in the sparse
+    /// tensor and vice versa. <paramref name="valuesVector"/> must have
+    /// length equal to <paramref name="rowIndices"/>.Length.
+    /// </remarks>
+    public SparseTensor(int rows, int columns, int[] rowIndices, int[] columnIndices, Vector<T> valuesVector)
+        : base(valuesVector ?? throw new ArgumentNullException(nameof(valuesVector)),
+               new[] { rows, columns }, isSparse: true)
+    {
+        if (rowIndices is null)
+            throw new ArgumentNullException(nameof(rowIndices));
+        if (columnIndices is null)
+            throw new ArgumentNullException(nameof(columnIndices));
+        if (rowIndices.Length != columnIndices.Length || rowIndices.Length != valuesVector.Length)
+            throw new ArgumentException(
+                "COO indices and values vector must have the same length: " +
+                $"rowIndices.Length={rowIndices.Length}, columnIndices.Length={columnIndices.Length}, " +
+                $"valuesVector.Length={valuesVector.Length}.");
+
+        Rows = rows;
+        Columns = columns;
+        RowIndices = rowIndices;
+        ColumnIndices = columnIndices;
+        RowPointers = Array.Empty<int>();
+        ColumnPointers = Array.Empty<int>();
+        Format = SparseStorageFormat.Coo;
+        BlockRowSize = 0;
+        BlockColSize = 0;
+    }
+
     private SparseTensor(int rows, int columns, SparseStorageFormat format,
         int[] rowIndices, int[] columnIndices, int[] rowPointers, int[] columnPointers, T[] values,
         int blockRowSize = 0, int blockColSize = 0)

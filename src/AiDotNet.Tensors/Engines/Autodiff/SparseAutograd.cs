@@ -168,7 +168,7 @@ public static class SparseAutograd
 
         var ops = MathHelper.GetNumericOperations<T>();
         int nnz = rowIndices.Length;
-        int innerK = b._shape[1];
+        int innerK = b.Shape[1];
 
         // Compute dA over the pattern only — never materialises the
         // dense O(rows × columns) gradient.
@@ -187,10 +187,34 @@ public static class SparseAutograd
         var sparseGradA = new SparseTensor<T>(rows, columns, rowIndices, colIndices, gradValues);
         AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
 
-        // dB is dense (full out × in); same as the standard SparseMatMul backward.
-        var aT = aSparse.ToDense();
-        aT = engine.TensorTranspose(aT);
-        var gradB = engine.TensorMatMul(aT, gradOutput);
+        // dB = A^T · dY computed as a sparse-transpose · dense matmul,
+        // i.e. iterate the sparse pattern of A and accumulate into a
+        // dense [columns × innerK] gradient. This avoids the O(rows × columns)
+        // densification that materialising A and transposing it would
+        // incur — the whole memory-efficiency point of the
+        // pattern-preserving op. Pulls A's values from saved state? — no,
+        // A is the trainable parameter, so its current values
+        // (which the user hasn't yet updated this step) are still the
+        // ones used in forward. Read them via the sparse indexer.
+        var gradB = new Tensor<T>(new[] { columns, innerK });
+        var gradBSpan = gradB.AsWritableSpan();
+        // gradB starts zero (Tensor ctor zero-fills); accumulate
+        //   gradB[j, k] += A_value[idx] · dY[i, k]    where (i, j) ∈ pattern_A
+        // Equivalent to A^T · dY without materialising the dense A.
+        var aValues = aSparse.DataVector.AsSpan().Slice(aSparse._storageOffset, nnz);
+        for (int idx = 0; idx < nnz; idx++)
+        {
+            int i = rowIndices[idx];
+            int j = colIndices[idx];
+            T aVal = aValues[idx];
+            int rowStart = j * innerK;
+            for (int k = 0; k < innerK; k++)
+            {
+                gradBSpan[rowStart + k] = ops.Add(
+                    gradBSpan[rowStart + k],
+                    ops.Multiply(aVal, gradOutput[i, k]));
+            }
+        }
         AccumulateGrad(b, gradB, gradAccumulator, engine);
         _ = output;
     }

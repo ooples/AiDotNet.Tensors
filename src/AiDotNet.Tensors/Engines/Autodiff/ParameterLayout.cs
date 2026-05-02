@@ -156,20 +156,27 @@ public sealed class SparsityLayout
 
         Rows = rows;
         Columns = columns;
-        RowIndices = rowIndices;
-        ColumnIndices = columnIndices;
+        // Clone caller-owned arrays so the fixed-pattern contract is
+        // enforced even if the caller mutates their copy after
+        // construction. Without the clones, an external mutation would
+        // silently desynchronise SparsityLayout from the buffer slots
+        // that depend on these indices being immutable.
+        RowIndices = (int[])rowIndices.Clone();
+        ColumnIndices = (int[])columnIndices.Clone();
     }
 
     /// <summary>
     /// Builds a layout from an existing <see cref="SparseTensor{T}"/>'s
-    /// COO pattern. The layout shares index arrays with the source
-    /// tensor — do not mutate them through either reference.
+    /// COO pattern. The layout takes its own COPY of the index arrays
+    /// (via the regular ctor) so subsequent mutations to the source
+    /// tensor's pattern don't desynchronise this layout.
     /// </summary>
     public static SparsityLayout FromSparseTensor<T>(SparseTensor<T> source)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         // ToCoo() guarantees RowIndices / ColumnIndices are populated
-        // regardless of the source's underlying storage format.
+        // regardless of the source's underlying storage format. The
+        // SparsityLayout ctor will clone them for us.
         var coo = source.ToCoo();
         return new SparsityLayout(coo.Rows, coo.Columns, coo.RowIndices, coo.ColumnIndices);
     }

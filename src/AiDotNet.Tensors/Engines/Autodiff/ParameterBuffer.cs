@@ -130,21 +130,31 @@ public sealed class ParameterBuffer<T>
             _sparseLayouts[i] = layout.Sparse;
             _offsets[i] = offset;
 
-            // Dense slot size = product of dense shape; sparse slot size =
-            // pattern's NonZeroCount. The dense-shape validation still runs
-            // for sparse leaves (we want a sane semantic shape recorded for
-            // shape-inference and serialization paths) but the buffer
-            // allocation uses the cheaper sparse count.
-            long size = 1;
+            // Dense leaves: validate shape dimensions are non-negative AND
+            // the dense product fits in int (since the buffer slot is
+            // sized by that product).
+            // Sparse leaves: the buffer slot is sized by NonZeroCount, NOT
+            // the dense product. Only validate non-negativity of each dim
+            // (so callers can declare e.g. a 1M × 1M sparse parameter with
+            // 100 non-zeros without tripping the dense int.MaxValue
+            // overflow check that would otherwise defeat the entire
+            // memory-efficiency promise of sparse leaves).
             foreach (int dim in _shapes[i])
             {
                 if (dim < 0)
                     throw new ArgumentException($"Shape dimension must be non-negative, got {dim} in parameter {i}.");
-                size *= dim;
-                if (size > int.MaxValue)
-                    throw new OverflowException(
-                        $"Parameter {i} dense shape produces more than {int.MaxValue} elements. " +
-                        "ParameterBuffer uses int indexing; reduce parameter sizes or use multiple buffers.");
+            }
+            if (!layout.IsSparse)
+            {
+                long denseSize = 1;
+                foreach (int dim in _shapes[i])
+                {
+                    denseSize *= dim;
+                    if (denseSize > int.MaxValue)
+                        throw new OverflowException(
+                            $"Parameter {i} dense shape produces more than {int.MaxValue} elements. " +
+                            "ParameterBuffer uses int indexing; reduce parameter sizes or use multiple buffers.");
+                }
             }
 
             long bufferElements = layout.BufferElementCount;
@@ -235,20 +245,16 @@ public sealed class ParameterBuffer<T>
             return new Tensor<T>(_data, shape, strides, _offsets[index], _storage);
         }
 
-        // Sparse leaf: build a SparseTensor whose Values array is a
-        // dedicated copy of the buffer slice. The SparseTensor ctor wraps
-        // the values via Vector<T>.Wrap, which takes the array reference —
-        // we deliberately copy here so the SparseTensor's storage isn't
-        // aliased to the buffer's TensorStorage (which would let two
-        // different storage objects view the same memory and break
-        // tape-side identity comparisons). Updates flow back to the buffer
-        // through CopyFrom(IReadOnlyList<Tensor<T>>) at end-of-step or
-        // through the explicit values-vector accessors below.
-        var values = new T[sparse.NonZeroCount];
-        var bufferSpan = _data.AsSpan().Slice(_offsets[index], sparse.NonZeroCount);
-        bufferSpan.CopyTo(values);
+        // Sparse leaf: zero-copy view. Vector<T>.CreateSlice wraps a
+        // window of the buffer's underlying memory (no allocation, no
+        // copy), and the SparseTensor(Vector<T>) ctor takes that vector
+        // directly without re-wrapping. Mutations to the buffer flow
+        // into the returned SparseTensor's Values, and vice versa —
+        // matches the dense-leaf contract where CreateView returns a
+        // live view of the buffer.
+        var valuesVector = _data.CreateSlice(_offsets[index], sparse.NonZeroCount);
         return new SparseTensor<T>(sparse.Rows, sparse.Columns,
-            sparse.RowIndices, sparse.ColumnIndices, values);
+            sparse.RowIndices, sparse.ColumnIndices, valuesVector);
     }
 
     /// <summary>
@@ -576,18 +582,26 @@ public sealed class ParameterBuffer<T>
 
                 if (grad is SparseTensor<T> sparseGrad
                     && sparseGrad.Rows == sparseLayout.Rows
-                    && sparseGrad.Columns == sparseLayout.Columns
-                    && PatternsMatch(sparseGrad.ToCoo(), sparseLayout))
+                    && sparseGrad.Columns == sparseLayout.Columns)
                 {
+                    // ToCoo can allocate / canonicalize ordering, so call
+                    // it ONCE and reuse the result for both pattern check
+                    // and value copy. Hot path on every backward step.
                     var coo = sparseGrad.ToCoo();
-                    var valuesSrc = coo.DataVector.AsSpan()
-                        .Slice(coo._storageOffset, sparseLayout.NonZeroCount);
-                    valuesSrc.CopyTo(dst);
+                    if (PatternsMatch(coo, sparseLayout))
+                    {
+                        var valuesSrc = coo.DataVector.AsSpan()
+                            .Slice(coo._storageOffset, sparseLayout.NonZeroCount);
+                        valuesSrc.CopyTo(dst);
+                        continue;
+                    }
+                    // Pattern mismatch — fall through to dense projection.
                 }
-                else
                 {
-                    // Dense gradient: gather at pattern positions. Use the
-                    // multi-dim indexer so strided / view tensors work.
+                    // Dense gradient (or pattern-mismatched sparse that
+                    // fell through above): gather at pattern positions.
+                    // Use the multi-dim indexer so strided / view tensors
+                    // work.
                     Tensor<T> denseGrad = grad.IsSparse
                         ? ((SparseTensor<T>)grad).ToDense()
                         : grad;

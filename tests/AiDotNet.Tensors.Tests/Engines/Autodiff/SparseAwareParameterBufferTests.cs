@@ -83,6 +83,82 @@ public class SparseAwareParameterBufferTests
     }
 
     /// <summary>
+    /// True zero-copy contract for sparse leaves: writes to the buffer
+    /// flow through to a previously-obtained CreateView, AND writes to
+    /// the SparseTensor's underlying values vector flow back to the
+    /// buffer. Mirrors the dense-leaf contract that callers depend on.
+    /// </summary>
+    [Fact]
+    public void CreateView_SparseLeaf_IsLiveZeroCopyView()
+    {
+        var pattern = new SparsityLayout(3, 3,
+            new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 3, 3 }, pattern),
+        });
+
+        // Get a view, then mutate the buffer.
+        var view = (SparseTensor<float>)buffer.CreateView(0);
+        var bufferSpan = buffer.GetSparseValuesSpan(0);
+        bufferSpan[0] = 11f;
+        bufferSpan[1] = 22f;
+        bufferSpan[2] = 33f;
+
+        // The view sees the new values WITHOUT being re-fetched.
+        Assert.Equal(11f, view[0, 0]);
+        Assert.Equal(22f, view[1, 1]);
+        Assert.Equal(33f, view[2, 2]);
+
+        // Writes through the view's underlying values vector flow back
+        // into the buffer.
+        view.DataVector.AsWritableSpan()[0] = 100f;
+        Assert.Equal(100f, buffer.GetSparseValuesReadOnlySpan(0)[0]);
+    }
+
+    /// <summary>
+    /// SparsityLayout clones index arrays so external mutations to the
+    /// caller's array don't desynchronise the layout from buffer slots
+    /// that depend on its indices being immutable.
+    /// </summary>
+    [Fact]
+    public void SparsityLayout_Ctor_ClonesIndexArrays()
+    {
+        var rowIdx = new[] { 0, 1, 2 };
+        var colIdx = new[] { 0, 1, 2 };
+        var layout = new SparsityLayout(3, 3, rowIdx, colIdx);
+
+        // Mutate the caller's arrays — must not affect the layout.
+        rowIdx[0] = 99;
+        colIdx[0] = 99;
+
+        Assert.Equal(0, layout.RowIndices[0]);
+        Assert.Equal(0, layout.ColumnIndices[0]);
+    }
+
+    /// <summary>
+    /// Sparse-only buffer with a very large dense semantic shape: the
+    /// dense product would exceed int.MaxValue but the buffer should
+    /// allocate based on NonZeroCount only. The whole point of sparse
+    /// leaves is to express huge sparse matrices without paying dense
+    /// memory cost.
+    /// </summary>
+    [Fact]
+    public void Ctor_SparseLeaf_LargeDenseShape_DoesNotOverflowOnDenseProduct()
+    {
+        // 50,000 × 50,000 = 2.5e9 (overflows int) — but only 4 non-zeros.
+        var pattern = new SparsityLayout(50_000, 50_000,
+            new[] { 0, 1, 2, 3 }, new[] { 0, 1, 2, 3 });
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 50_000, 50_000 }, pattern),
+        });
+
+        Assert.Equal(4, buffer.TotalSize);
+        Assert.True(buffer.IsSparse(0));
+    }
+
+    /// <summary>
     /// CreateView for a sparse leaf returns a SparseTensor whose Values
     /// reflect the buffer's current contents at the layout's pattern
     /// positions, with the recorded RowIndices / ColumnIndices.
