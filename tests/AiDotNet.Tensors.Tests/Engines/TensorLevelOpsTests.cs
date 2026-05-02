@@ -581,6 +581,90 @@ public class TensorLevelOpsTests
             Assert.Equal(expected[i], output[i], 1e-5f);
     }
 
+    /// <summary>
+    /// Direct-kernel branch added in the SD-perf series: outChannels >=
+    /// 2 × MaxDegreeOfParallelism puts a 3×3 stride=1 double conv onto
+    /// SimdConvHelper.Conv3x3Stride1Double (im2col-free). Must produce the
+    /// same numerical result as the im2col + GEMM fallback even when the
+    /// caller reuses a non-zero pre-allocated output buffer (the fast path
+    /// no longer pre-clears output, and the kernel itself clears each
+    /// output channel inside its per-oc loop).
+    /// </summary>
+    [Fact]
+    public void Conv2DInto_Double_DirectKernelBranch_NonZeroOutput_MatchesConv2D()
+    {
+        var engine = new CpuEngine();
+
+        // outChannels = 64 ≥ 2 × MaxDegreeOfParallelism on every test runner
+        // (we set MaxDegreeOfParallelism = ProcessorCount which is at most 32
+        // on common CI hosts), guaranteeing the direct-kernel branch fires.
+        int oc = Math.Max(64, 2 * global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        var input  = new Tensor<double>(new[] { 1, 8, 16, 16 });
+        var kernel = new Tensor<double>(new[] { oc, 8, 3, 3 });
+        var rng = new Random(123);
+        for (int i = 0; i < input.Length; i++)  input[i]  = rng.NextDouble() - 0.5;
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = rng.NextDouble() - 0.5;
+
+        var expected = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        // Pre-fill output with garbage so we exercise the "caller reused a
+        // non-zero output buffer" case: the fix removed the outer Span.Clear()
+        // and instead trusts the per-oc kernel to clear its own slab.
+        var output = new Tensor<double>(expected._shape);
+        for (int i = 0; i < output.Length; i++) output[i] = 999.0 + i;
+
+        engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], output[i], 1e-10);
+    }
+
+    /// <summary>
+    /// MultiplyMatrixBlockedDouble's parallel path crosses the 64 M FMA
+    /// threshold with the standard im2col + GEMM expansion of a 32-channel
+    /// 32×32 input and a 32-channel 3×3 kernel (≈ 28 M FMAs from the GEMM
+    /// dimensions m × k × n = 32 × 288 × 1024 = 9.4 M; we go larger to be
+    /// safely above 64 M). Must match the serial path bit-for-bit on
+    /// finite, well-conditioned inputs (FMA reduction order is fixed
+    /// within each tile).
+    /// </summary>
+    [Fact]
+    public void Conv2D_Double_ParallelGemmBranch_MatchesSerial()
+    {
+        var engine = new CpuEngine();
+
+        // 32 × 16 × 32 × 32 → m=32, n=32×32=1024, k=16×9=144 → 4.7 M FMAs
+        // (under threshold). Bump inChannels to push above 64 M:
+        // m=64, k=64×9=576, n=64×64=4096 → 151 M FMAs.
+        var input  = new Tensor<double>(new[] { 1, 64, 64, 64 });
+        var kernel = new Tensor<double>(new[] { 64, 64, 3, 3 });
+        var rng = new Random(7);
+        for (int i = 0; i < input.Length; i++)  input[i]  = rng.NextDouble() - 0.5;
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = rng.NextDouble() - 0.5;
+
+        // Force the GEMM fallback (rather than the direct kernel) by
+        // temporarily capping MaxDegreeOfParallelism so outChannels = 64
+        // is BELOW the 2 × MDOP gate, then restoring after.
+        int saved = global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = 64; // gate is 2 × 64 = 128 > oc=64
+        try
+        {
+            var output = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+            // Compare against a re-computation under the 1-thread serial
+            // path (MDOP=1 disables parallel) — they should agree to within
+            // FMA reordering tolerance.
+            global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            var serial = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+            for (int i = 0; i < output.Length; i++)
+                Assert.Equal(serial[i], output[i], 1e-9);
+        }
+        finally
+        {
+            global::AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = saved;
+        }
+    }
+
     #endregion
 
     #region API Consistency

@@ -7338,16 +7338,24 @@ public partial class CpuEngine : ITensorLevelEngine
             //
             // Updated gate (2026-05-02): allow the direct kernel when EITHER
             //   (a) total FMAs are small (≤ 4 M, the BDN baseline), OR
-            //   (b) outChannels gives ≥ 2× ProcessorCount parallel tasks
-            //       so all cores have work and the no-im2col-blowup
-            //       memory-traffic win materializes.
+            //   (b) outChannels gives ≥ 2× the parallel-task budget so all
+            //       workers have work and the no-im2col-blowup memory-traffic
+            //       win materializes.
+            // The parallel-task budget is read from CpuParallelSettings.MaxDegreeOfParallelism
+            // — Conv3x3Stride1Double's per-oc parallelism dispatches via the
+            // same setting (CpuParallelSettings.LightweightParallel), so a
+            // host that capped MaxDegreeOfParallelism (shared CI runner,
+            // deterministic-mode tests) gets a consistent gate decision.
+            // Using Environment.ProcessorCount here would over-route into
+            // the direct kernel on capped hosts where it'd actually
+            // task-starve.
 #if !NET471
             // SimdConvHelper.Conv3x3Stride1Double is gated on AVX2/FMA intrinsics
             // (System.Runtime.Intrinsics is unavailable on net471 — the file is
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
             // fall through to the im2col+GEMM path below.
             long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
-            int directKernelMinTasks = 2 * Math.Max(1, Environment.ProcessorCount);
+            int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
             bool directKernelFitsWell = convFmas <= 4_000_000L
                 || outChannels >= directKernelMinTasks;
             if (kernelHeight == 3 && kernelWidth == 3
@@ -7507,13 +7515,16 @@ public partial class CpuEngine : ITensorLevelEngine
         // (zero-alloc), so without this branch SD UNet ResBlocks never see
         // the direct kernel even though Conv2D (allocating overload) does.
         // Same gating logic as Conv2D: small shapes (≤4 M FMAs) or
-        // outChannels ≥ 2× ProcessorCount — both ensure the per-oc
-        // parallelism pays off without im2col's memory blowup.
+        // outChannels ≥ 2× CpuParallelSettings.MaxDegreeOfParallelism —
+        // both ensure the per-oc parallelism pays off without im2col's
+        // memory blowup, while honouring host-side thread caps the same
+        // way the kernel itself does (it dispatches via
+        // CpuParallelSettings.LightweightParallel internally).
         if (typeof(T) == typeof(double))
         {
 #if !NET471
             long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
-            int directKernelMinTasksInto = 2 * Math.Max(1, Environment.ProcessorCount);
+            int directKernelMinTasksInto = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
             bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
                 || outChannels >= directKernelMinTasksInto;
             if (kernelHeight == 3 && kernelWidth == 3
@@ -7524,10 +7535,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dInput  = (Tensor<double>)(object)input;
                 var dKernel = (Tensor<double>)(object)kernel;
                 var dOutput = (Tensor<double>)(object)output;
-                // Caller of Conv2DInto reuses output across calls — clear
-                // before accumulating since the direct kernel does
-                // output[oh,ow] += sum_{ic,kh,kw} conv contributions.
-                dOutput.Data.Span.Clear();
+                // No outer Span.Clear() — Conv3x3Stride1SingleChannelDouble
+                // does `new Span<double>(outputChannel, outputSize).Clear()`
+                // on each per-oc slab before accumulating, so an extra
+                // full-tensor Clear here is a wasted memory pass (~10 MB
+                // at SD shapes per call). The direct kernel owns its
+                // initialization of every byte it writes.
                 using var pinIn = dInput.Data.Pin();
                 using var pinK  = dKernel.Data.Pin();
                 using var pinO  = dOutput.Data.Pin();

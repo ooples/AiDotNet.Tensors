@@ -718,26 +718,37 @@ internal static class Im2ColHelper
         // route through this im2col+GEMM path. Closing further requires a
         // Conv3x3SingleChannel<double> kernel, mirroring the float design.
         //
-        // 2026-05-02 update — re-introduce Parallel.For on the outer M-block
-        // axis only. The earlier "parallel dispatch" rejection bundled
-        // Parallel.For with explicit SIMD intrinsics; the SIMD piece was the
-        // regression cause (defeated JIT auto-prefetch), not the parallelism.
-        // Profiling SD-style diffusion ResBlock convs at [1,320,64,64]→[320,3,3]
-        // (3.77 GFMA, 5232 ms scalar single-threaded ⇒ ~1.4 GFLOPS) showed
-        // every block of M is fully independent: each writes a disjoint slab
-        // of C, reads its own slab of A, and shares B read-only. Splitting
-        // across cores is embarrassingly parallel and preserves the JIT
-        // auto-vectorized inner axpy. Threshold at total FMAs ≥ 64 M to
-        // avoid Parallel.For overhead on small shapes (the original 0.4 M
-        // FMA BDN baseline stays on the serial path).
+        // 2026-05-02 update — re-introduce parallelism. The earlier
+        // "parallel dispatch" rejection bundled Parallel.For with explicit
+        // SIMD intrinsics; the SIMD piece was the regression cause
+        // (defeated JIT auto-prefetch), not the parallelism. Profiling
+        // SD-style diffusion ResBlock convs at [1,320,64,64]→[320,3,3]
+        // (3.77 GFMA, 5232 ms scalar single-threaded ⇒ ~1.4 GFLOPS)
+        // showed every (i, j) tile of C is fully independent: each writes a
+        // disjoint slab, reads its own slab of A, and shares B read-only.
+        // Splitting across cores is embarrassingly parallel and preserves
+        // the JIT auto-vectorized inner axpy. We split the work across BOTH
+        // the outer M AND outer N axes so the task count
+        // (⌈m/BlockSize⌉ × ⌈n/BlockSize⌉) is large enough to saturate every
+        // worker thread — splitting on M alone gives only ⌈m/BlockSize⌉
+        // tasks, which capped speedup at ≈2× for SD shapes on a 32-core box.
+        // Threshold at total FMAs ≥ 64 M to avoid parallel-dispatch overhead
+        // on small shapes (the original 0.4 M FMA BDN baseline stays on
+        // the serial path). Dispatch routes through CpuParallelSettings —
+        // its MaxDegreeOfParallelism honours host-side thread caps and
+        // matches what every other parallel kernel in this file uses.
 
         const int BlockSize = 64;
 
         c.Clear();
 
         long totalFmas = (long)m * (long)k * (long)n;
-        bool parallel = totalFmas >= 64L * 1024L * 1024L
-            && Environment.ProcessorCount > 1;
+        // Use CpuParallelSettings so a host that capped MaxDegreeOfParallelism
+        // (e.g. shared-tenant CI runner, deterministic-mode tests) is
+        // honoured here — Environment.ProcessorCount would over-subscribe
+        // those workloads.
+        int parallelDegree = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+        bool parallel = totalFmas >= 64L * 1024L * 1024L && parallelDegree > 1;
 
         if (!parallel)
         {
@@ -775,37 +786,80 @@ internal static class Im2ColHelper
         // Pre-pack B into per-(K-block, N-block) tiles laid out contiguously
         // (size = Kc × Nc doubles = 32 KB each) so the inner kernel reads
         // its tile of B sequentially with stride 1 across both kIdx and j.
-        // Cost: one copy of B (≤ K × N doubles ≈ 92 MB for SD 320→320);
-        // amortized across the m/Mc outer-loop reuses (here m=320,
-        // mBlocks=5, so each B-tile is read 5 times and the pack pays for
-        // itself the first time after the parallel.For starts).
+        //
+        // The packed-B buffer is RENTED from a thread-static pool keyed by
+        // size and returned at the end of this call, so we don't allocate a
+        // fresh ~94 MB array on every fallback GEMM. Repeat calls at the
+        // same shape (every conv inside one UNet forward) reuse the same
+        // pool slot — zero managed-heap pressure after the first call.
         int kBlocks = (k + BlockSize - 1) / BlockSize;
         int packStride = BlockSize * BlockSize;
-        var packedB = new double[(long)kBlocks * nBlocks * packStride];
+        long packedLen = (long)kBlocks * nBlocks * packStride;
+        if (packedLen > int.MaxValue)
+        {
+            // Fall back to per-call allocation for the (rare) > 16 GB
+            // packed buffer case where ArrayPool would refuse anyway.
+            RunPackedGemmDouble(a, b, c, m, k, n, BlockSize, kBlocks, nBlocks,
+                                packStride, totalTiles, parallelDegree, packed: new double[packedLen]);
+            return;
+        }
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var packedB = pool.Rent((int)packedLen);
+        try
+        {
+            RunPackedGemmDouble(a, b, c, m, k, n, BlockSize, kBlocks, nBlocks,
+                                packStride, totalTiles, parallelDegree, packedB);
+        }
+        finally
+        {
+            pool.Return(packedB);
+        }
+    }
+
+    /// <summary>
+    /// Pack B into per-(K-block, N-block) contiguous tiles, then run the
+    /// 2-D-tile parallel GEMM consuming those packed tiles. Both phases are
+    /// dispatched through CpuParallelSettings (instead of raw Parallel.For)
+    /// so the host's <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/>
+    /// cap is honoured — matches every other parallel kernel in this file.
+    /// </summary>
+    private static void RunPackedGemmDouble(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n, int BlockSize,
+        int kBlocks, int nBlocks, int packStride, int totalTiles,
+        int parallelDegree, double[] packed)
+    {
+        int packTaskCount = kBlocks * nBlocks;
         unsafe
         {
             fixed (double* bPtr = b)
-            fixed (double* pbPtr = packedB)
+            fixed (double* pbPtr = packed)
             {
                 double* bBase = bPtr;
                 double* pbBase = pbPtr;
-                System.Threading.Tasks.Parallel.For(0, kBlocks * nBlocks, packTile =>
+                int nBlocksLocal = nBlocks;
+                int kLocal = k;
+                int nLocal = n;
+                int blockSizeLocal = BlockSize;
+                int packStrideLocal = packStride;
+                Parallel.For(
+                    0, packTaskCount,
+                    new ParallelOptions { MaxDegreeOfParallelism = parallelDegree },
+                    packTile =>
                 {
-                    int kBlk = packTile / nBlocks;
-                    int nBlk = packTile % nBlocks;
-                    int kk = kBlk * BlockSize;
-                    int jj = nBlk * BlockSize;
-                    int kEnd = Math.Min(kk + BlockSize, k);
-                    int jEnd = Math.Min(jj + BlockSize, n);
+                    int kBlk = packTile / nBlocksLocal;
+                    int nBlk = packTile % nBlocksLocal;
+                    int kk = kBlk * blockSizeLocal;
+                    int jj = nBlk * blockSizeLocal;
+                    int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
+                    int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
                     int kLen = kEnd - kk;
                     int jLen = jEnd - jj;
-                    double* dst = pbBase + (long)packTile * packStride;
-                    // Pack as [kLen rows × jLen cols] contiguous, so within
-                    // a tile the layout matches what the kernel walks.
+                    double* dst = pbBase + (long)packTile * packStrideLocal;
                     for (int kIdx = 0; kIdx < kLen; kIdx++)
                     {
-                        double* src = bBase + (kk + kIdx) * n + jj;
-                        double* dstRow = dst + kIdx * BlockSize;
+                        double* src = bBase + (kk + kIdx) * nLocal + jj;
+                        double* dstRow = dst + kIdx * blockSizeLocal;
                         for (int j = 0; j < jLen; j++)
                             dstRow[j] = src[j];
                     }
@@ -817,29 +871,35 @@ internal static class Im2ColHelper
         {
             fixed (double* aPtr = a)
             fixed (double* cPtr = c)
-            fixed (double* pbPtr = packedB)
+            fixed (double* pbPtr = packed)
             {
                 double* aBase = aPtr, cBase = cPtr, pbBase = pbPtr;
                 int kBlocksLocal = kBlocks;
                 int nBlocksLocal = nBlocks;
-                System.Threading.Tasks.Parallel.For(0, totalTiles, tile =>
+                int mLocal = m;
+                int kLocal = k;
+                int nLocal = n;
+                int blockSizeLocal = BlockSize;
+                int packStrideLocal = packStride;
+                Parallel.For(
+                    0, totalTiles,
+                    new ParallelOptions { MaxDegreeOfParallelism = parallelDegree },
+                    tile =>
                 {
                     int mBlk = tile / nBlocksLocal;
                     int nBlk = tile % nBlocksLocal;
-                    int ii = mBlk * BlockSize;
-                    int jj = nBlk * BlockSize;
-                    int iEnd = Math.Min(ii + BlockSize, m);
-                    int jEnd = Math.Min(jj + BlockSize, n);
-                    // Iterate K-blocks; for each, read the packed B tile that
-                    // matches (kBlk, nBlk). Per-tile B is contiguous 64×64.
+                    int ii = mBlk * blockSizeLocal;
+                    int jj = nBlk * blockSizeLocal;
+                    int iEnd = Math.Min(ii + blockSizeLocal, mLocal);
+                    int jEnd = Math.Min(jj + blockSizeLocal, nLocal);
                     for (int kBlk = 0; kBlk < kBlocksLocal; kBlk++)
                     {
-                        int kk = kBlk * BlockSize;
-                        int kEnd = Math.Min(kk + BlockSize, k);
-                        double* packedTile = pbBase + ((long)kBlk * nBlocksLocal + nBlk) * packStride;
+                        int kk = kBlk * blockSizeLocal;
+                        int kEnd = Math.Min(kk + blockSizeLocal, kLocal);
+                        double* packedTile = pbBase + ((long)kBlk * nBlocksLocal + nBlk) * packStrideLocal;
                         MultiplyPackedTilePtr(
                             aBase, packedTile, cBase,
-                            ii, iEnd, jj, jEnd, kk, kEnd, k, n);
+                            ii, iEnd, jj, jEnd, kk, kEnd, kLocal, nLocal);
                     }
                 });
             }
@@ -912,38 +972,6 @@ internal static class Im2ColHelper
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
         Span<double> c,
-        int ii, int iEnd,
-        int k, int n,
-        int blockSize)
-    {
-        for (int kk = 0; kk < k; kk += blockSize)
-        {
-            int kEnd = Math.Min(kk + blockSize, k);
-            for (int jj = 0; jj < n; jj += blockSize)
-            {
-                int jEnd = Math.Min(jj + blockSize, n);
-                for (int i = ii; i < iEnd; i++)
-                {
-                    for (int kIdx = kk; kIdx < kEnd; kIdx++)
-                    {
-                        double aik = a[i * k + kIdx];
-                        int bRowOffset = kIdx * n + jj;
-                        int cRowOffset = i * n + jj;
-                        for (int j = 0; j < jEnd - jj; j++)
-                            c[cRowOffset + j] += aik * b[bRowOffset + j];
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Pointer overload — same blocked+auto-vectorized kernel as the Span
-    /// version, but indexes raw pointers so it can be invoked from a
-    /// Parallel.For lambda where Spans aren't allowed to flow.
-    /// </summary>
-    private static unsafe void MultiplyBlockedDoubleRowSlabPtr(
-        double* a, double* b, double* c,
         int ii, int iEnd,
         int k, int n,
         int blockSize)
