@@ -2306,6 +2306,11 @@ internal static class BackwardFunctions<T>
                         pB[j] += rowPtr[j];
                 }
             }
+            // maskedTensor was a temporary scratch buffer — return it to the
+            // cache so the next call's [M,N] mask rental hits a warm pool.
+            // gradInput/gradWeight/gradBias will be handed off to the grads
+            // dict by the AccumulateGrad calls below; do NOT return them.
+            Helpers.AutoTensorCache.Return(maskedTensor);
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
