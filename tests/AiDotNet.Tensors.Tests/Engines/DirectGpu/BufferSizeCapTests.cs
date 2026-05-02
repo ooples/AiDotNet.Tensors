@@ -12,6 +12,18 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+/// <summary>
+/// Several tests in this class mutate
+/// <see cref="GpuFallbackOptionsHolder.Current"/>, which is process-wide.
+/// Without the non-parallel collection an unrelated test running on
+/// another thread could observe the mutated value, producing flaky
+/// failures. The xUnit collection definition below disables parallel
+/// execution for this class so the holder mutation is safe.
+/// </summary>
+[CollectionDefinition("BufferSizeCapTests", DisableParallelization = true)]
+public class BufferSizeCapTestsCollection { }
+
+[Collection("BufferSizeCapTests")]
 public class BufferSizeCapTests
 {
     // ───────────────────────────────────────────────────────────────────

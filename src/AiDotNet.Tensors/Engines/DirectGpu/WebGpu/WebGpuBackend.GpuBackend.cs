@@ -82,13 +82,16 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
-        // WebGPU buffers are float32-addressed. Round up to floats and check
-        // the cap against the actual allocation, not the requested byte count.
-        int floatCount = (size + sizeof(float) - 1) / sizeof(float);
-        long actualBytes = (long)floatCount * sizeof(float);
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
+        // WebGPU buffers are float32-addressed. Round up in long-space first
+        // to avoid overflow when `size` is near int.MaxValue, then check the
+        // actual allocation byte count against the cap.
+        long floatCountLong = ((long)size + sizeof(float) - 1) / sizeof(float);
+        long actualBytes = floatCountLong * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("WebGPU", actualBytes, MaxBufferAllocBytes, DeviceName);
         // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
-        return new WebGpuBuffer(floatCount);
+        return new WebGpuBuffer(checked((int)floatCountLong));
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)

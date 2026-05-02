@@ -2867,6 +2867,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)size;
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", size, MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc (byte buffer)");
@@ -5192,6 +5194,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
@@ -5207,6 +5211,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");

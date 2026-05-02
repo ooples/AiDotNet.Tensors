@@ -405,6 +405,7 @@ public static class MetalNativeBindings
         public static readonly IntPtr MaxThreadsPerThreadgroup = RegisterSelector("maxThreadsPerThreadgroup");
         public static readonly IntPtr MaxThreadgroupMemoryLength = RegisterSelector("maxThreadgroupMemoryLength");
         public static readonly IntPtr RecommendedMaxWorkingSetSize = RegisterSelector("recommendedMaxWorkingSetSize");
+        public static readonly IntPtr MaxBufferLength = RegisterSelector("maxBufferLength");
         public static readonly IntPtr CurrentAllocatedSize = RegisterSelector("currentAllocatedSize");
         public static readonly IntPtr SupportsFamily = RegisterSelector("supportsFamily:");
         public static readonly IntPtr RegistryID = RegisterSelector("registryID");

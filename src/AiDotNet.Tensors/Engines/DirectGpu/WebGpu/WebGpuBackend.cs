@@ -91,11 +91,15 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public long LocalMemoryBytes => 16384L;
 
     /// <summary>
-    /// Issue #285: WebGPU's <c>GPUSupportedLimits.maxBufferSize</c> is the
-    /// per-allocation cap. Default minimum is 256 MiB per the spec; modern
-    /// browsers expose substantially more.
+    /// Issue #285: practical per-allocation cap for WebGPU storage buffers
+    /// (the kind compute pipelines bind). The cap is the minimum of two
+    /// limits because a buffer over either limit fails downstream:
+    /// <c>maxBufferSize</c> caps allocation, and
+    /// <c>maxStorageBufferBindingSize</c> caps the size that can be bound
+    /// to a compute pipeline. Reporting the lesser of the two means the
+    /// guard catches both failure modes ahead of allocation.
     /// </summary>
-    public long MaxBufferAllocBytes => _device.MaxBufferSize;
+    public long MaxBufferAllocBytes => System.Math.Min(_device.MaxBufferSize, _device.MaxStorageBufferBindingSize);
 
     public double TheoreticalGflops { get; }
 

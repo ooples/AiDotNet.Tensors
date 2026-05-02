@@ -273,6 +273,8 @@ public sealed unsafe partial class VulkanBackend
     public IGpuBuffer AllocateIntBuffer(int size)
     {
         EnsureInitialized();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
         return VulkanGpuBuffer.Create(size);
     }
@@ -310,13 +312,13 @@ public sealed unsafe partial class VulkanBackend
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
         // Vulkan storage buffers are float32-typed, so the actual allocation
-        // is `floatCount * sizeof(float)` bytes — round up `size` to a float
-        // boundary BEFORE checking the cap so the guard sees the bytes that
-        // will really be allocated.
-        int floatCount = (size + sizeof(float) - 1) / sizeof(float);
-        long actualBytes = (long)floatCount * sizeof(float);
+        // is `floatCount * sizeof(float)` bytes. Round up in long-space
+        // first to avoid overflow when `size` is near int.MaxValue, then
+        // check the actual byte count against the cap.
+        long floatCountLong = ((long)size + sizeof(float) - 1) / sizeof(float);
+        long actualBytes = floatCountLong * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("Vulkan", actualBytes, MaxBufferAllocBytes, DeviceName);
-        return VulkanGpuBuffer.Create(floatCount);
+        return VulkanGpuBuffer.Create(checked((int)floatCountLong));
     }
 
     #endregion

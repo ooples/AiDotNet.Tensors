@@ -103,17 +103,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public long LocalMemoryBytes => (long)(_device?.MaxThreadgroupMemoryLength ?? 32768);
 
     /// <summary>
-    /// Issue #285: Metal exposes <c>MTLDevice.maxBufferLength</c> as the
-    /// per-allocation cap, but our current wrapper doesn't surface it.
-    /// Use <c>RecommendedMaxWorkingSetSize</c> as a conservative upper bound
-    /// for now — the guard catches requests > total working-set size only.
-    /// A smaller-than-WSS allocation that fails (Metal returns nil from
-    /// <c>newBufferWithLength:</c>) currently surfaces as a generic
-    /// <c>NullReferenceException</c>, NOT as <see cref="GpuBufferTooLargeException"/>.
-    /// Querying the real <c>maxBufferLength</c> attribute and translating
-    /// nil-buffer returns into the typed exception is tracked as follow-up.
+    /// Issue #285: per-allocation cap from <c>MTLDevice.maxBufferLength</c>.
+    /// This is the hard limit Metal enforces on a single
+    /// <c>newBufferWithLength:</c> call; it can be substantially smaller
+    /// than <see cref="GlobalMemoryBytes"/> (recommendedMaxWorkingSetSize)
+    /// on Apple Silicon and discrete-GPU Macs alike. NOTE: a request
+    /// smaller than this cap that still fails (e.g. due to fragmentation
+    /// or transient memory pressure) returns nil from
+    /// <c>newBufferWithLength:</c>, which our wrapper surfaces as a
+    /// generic <c>NullReferenceException</c> — translating that into
+    /// <see cref="GpuBufferTooLargeException"/> is follow-up work.
     /// </summary>
-    public long MaxBufferAllocBytes => (long)(_device?.RecommendedMaxWorkingSetSize ?? 0);
+    public long MaxBufferAllocBytes => (long)(_device?.MaxBufferLength ?? 0);
 
     public double TheoreticalGflops { get; }
 
@@ -466,13 +467,17 @@ public sealed partial class MetalBackend : IDirectGpuBackend
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive");
         }
 
-        // For byte buffers, we allocate as floats and use size/4. Validate
-        // against the cap using the rounded-up actual byte count, not the
-        // requested logical byte count.
-        var floatSize = (size + 3) / 4;
-        long actualBytes = (long)floatSize * sizeof(float);
+        // For byte buffers, we allocate as floats and use size/4. Round up
+        // in long-space first (size could be near int.MaxValue and `size + 3`
+        // would overflow if done in int), then check the actual allocation
+        // bytes against the cap.
+        long floatSizeLong = ((long)size + 3) / 4;
+        long actualBytes = floatSizeLong * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("Metal", actualBytes, MaxBufferAllocBytes, DeviceName);
-        return new MetalGpuBuffer(_device, floatSize);
+        // After the cap check, the float-count is guaranteed to fit in int
+        // (because actualBytes <= MaxBufferAllocBytes <= long.MaxValue and
+        // floatSizeLong * 4 <= int.MaxValue when actualBytes is reasonable).
+        return new MetalGpuBuffer(_device, checked((int)floatSizeLong));
     }
 
     /// <summary>

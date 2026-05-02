@@ -100,9 +100,12 @@ public sealed class GpuFallbackOptions
     /// </summary>
     internal long EffectiveMaxBufferBytes(long deviceCap)
     {
-        if (!MaxBufferBytes.HasValue) return deviceCap;
+        // Treat non-positive overrides as "unset" — silently ignore the
+        // value rather than collapsing the effective cap to 0 (which would
+        // reject every allocation).
+        if (!MaxBufferBytes.HasValue || MaxBufferBytes.Value <= 0) return deviceCap;
         long userCap = MaxBufferBytes.Value;
-        // If device cap is unknown (deviceCap == 0) trust the user value.
+        // If device cap is unknown (deviceCap <= 0) trust the user value.
         if (deviceCap <= 0) return userCap;
         return Math.Min(userCap, deviceCap);
     }
@@ -111,7 +114,17 @@ public sealed class GpuFallbackOptions
         => ChunkingPolicy ?? GpuChunkingPolicy.AutoChunk;
 
     internal int EffectiveMaxChunkCount
-        => MaxChunkCount ?? 64;
+    {
+        get
+        {
+            // Treat non-positive values as "unset" — falling back to the
+            // documented default of 64 — rather than allowing 0 or negative
+            // values to either disable chunking entirely or trigger
+            // pathological negative-bound loops in the chunker.
+            if (!MaxChunkCount.HasValue || MaxChunkCount.Value <= 0) return 64;
+            return MaxChunkCount.Value;
+        }
+    }
 }
 
 /// <summary>

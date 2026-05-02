@@ -90,6 +90,15 @@ public sealed class MetalDevice : IDisposable
     public ulong RecommendedMaxWorkingSetSize { get; }
 
     /// <summary>
+    /// Gets the maximum size in bytes of a SINGLE Metal buffer
+    /// (<c>MTLDevice.maxBufferLength</c>). This is the per-allocation cap
+    /// for <c>newBufferWithLength:</c>; it can be substantially smaller
+    /// than <see cref="RecommendedMaxWorkingSetSize"/> on consumer Macs.
+    /// Issue #285.
+    /// </summary>
+    public ulong MaxBufferLength { get; }
+
+    /// <summary>
     /// Gets the current allocated memory size in bytes.
     /// </summary>
     public ulong CurrentAllocatedSize
@@ -195,6 +204,7 @@ public sealed class MetalDevice : IDisposable
 
             // Get recommended working set size
             RecommendedMaxWorkingSetSize = SendMessageULongReturn(_device, Selectors.RecommendedMaxWorkingSetSize);
+            MaxBufferLength = SendMessageULongReturn(_device, Selectors.MaxBufferLength);
 
             // Get registry ID
             RegistryID = SendMessageULongReturn(_device, Selectors.RegistryID);
