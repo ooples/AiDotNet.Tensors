@@ -92,9 +92,19 @@ public sealed class ProfilerSession : IDisposable
     public void Step()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(ProfilerSession));
-        int prev = _stepIndex;
-        int next = prev + 1;
-        _stepIndex = next;
+        int prev;
+        int next;
+        // Update _stepIndex under _bufferGate so RecordInstant's phase
+        // check (also under the lock) cannot observe a torn or stale
+        // value during the transition. Without this serialisation the
+        // accept-bool returned by RecordInstant could disagree with
+        // what actually landed in the queue.
+        lock (_bufferGate)
+        {
+            prev = _stepIndex;
+            next = prev + 1;
+            _stepIndex = next;
+        }
 
         if (_schedule is null) return;
         // Drop the warmup-window samples before the measured window opens. Without
@@ -144,19 +154,51 @@ public sealed class ProfilerSession : IDisposable
     /// <summary>
     /// Records an instantaneous event (no duration). Useful for one-shot
     /// markers like "autotune cache miss" or "recompile triggered".
+    /// Returns <c>true</c> when the event was accepted and enqueued;
+    /// <c>false</c> when it was dropped because the session is disposed,
+    /// CPU capture is disabled (<see cref="ProfilerActivities.None"/>),
+    /// or the schedule phase is <see cref="ProfilerSchedulePhase.Wait"/>
+    /// or <see cref="ProfilerSchedulePhase.Stopped"/>. Callers that
+    /// dedupe against an outer fallback marker need this distinction
+    /// so a no-op record doesn't suppress the outer event.
+    ///
+    /// <para><b>Atomicity:</b> the schedule-phase check and the queue
+    /// enqueue happen inside the same <c>_bufferGate</c> lock as
+    /// <see cref="Step"/>'s <c>_stepIndex</c> update. A concurrent
+    /// <see cref="Step"/> cannot flip the phase between this method's
+    /// check and its enqueue, so the returned bool is consistent with
+    /// what actually landed in the queue.</para>
     /// </summary>
-    public void RecordInstant(string name, string category, IReadOnlyDictionary<string, string>? args = null)
+    public bool RecordInstant(string name, string category, IReadOnlyDictionary<string, string>? args = null)
     {
-        if (_disposed) return;
-        if (!IsCpuCaptureEnabled()) return;
-        var phase = CurrentPhase;
-        if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return;
+        if (_disposed) return false;
+        if (!IsCpuCaptureEnabled()) return false;
 
+        // Build the event timestamp/payload outside the lock to minimise
+        // lock-hold time. Phase classification and enqueue happen under
+        // _bufferGate so a concurrent Step() can't desynchronise them.
         long ts = TicksToMicros(Stopwatch.GetTimestamp() - _sessionStartTicks);
-        EnqueueEvent(TraceEvent.Instant(
-            name, category, ts,
-            _processId, System.Environment.CurrentManagedThreadId,
-            args));
+        int threadId = System.Environment.CurrentManagedThreadId;
+        TraceEvent ev = TraceEvent.Instant(name, category, ts, _processId, threadId, args);
+
+        lock (_bufferGate)
+        {
+            // Re-read disposal under the lock — Dispose may have raced.
+            if (_disposed) return false;
+            var phase = CurrentPhase;
+            if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return false;
+
+            // Inline the enqueue body so we don't re-enter the lock via
+            // EnqueueEvent (re-entrant locks work but inlining makes the
+            // accept/drop transaction unambiguous in one critical section).
+            if (++_eventCount > _maxEvents)
+            {
+                if (_events.TryDequeue(out _)) _eventCount--;
+                else _eventCount--;
+            }
+            _events.Enqueue(ev);
+            return true;
+        }
     }
 
     /// <summary>
