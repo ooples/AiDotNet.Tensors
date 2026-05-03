@@ -135,7 +135,17 @@ public static class SparseAutograd
         // order; snapshot the values once via ToArray() (single copy)
         // so the rest is allocation-free at backward time.
         var coo = a.ToCoo();
-        var aValuesSnapshot = coo.DataVector.ToArray();
+        // Snapshot exactly the values aligned with the COO indices, not the
+        // full backing buffer. DataVector.ToArray() returns the whole
+        // memory the Vector wraps; if the sparse tensor were ever a view
+        // into a larger storage (current code paths don't do this, but a
+        // future Slice() / View() helper might), a full ToArray would
+        // include unrelated regions and backward would consume misaligned
+        // values when iterating COO indices. AsSpan().Slice(offset, count)
+        // keeps the snapshot strictly aligned with the saved RowIndices.
+        var aValuesSnapshot = coo.DataVector.AsSpan()
+            .Slice(coo._storageOffset, coo.RowIndices.Length)
+            .ToArray();
         DifferentiableOps.RecordBinary(
             "SparsePatternPreservingMatMul",
             output,
@@ -442,8 +452,16 @@ public static class SparseAutograd
         // ToArray().Clone() was a redundant second copy.
         var aCoo = a.ToCoo();
         var bCoo = b.ToCoo();
-        var aValuesSnapshot = aCoo.DataVector.ToArray();
-        var bValuesSnapshot = bCoo.DataVector.ToArray();
+        // See note on the matching pattern in SparsePatternPreservingMatMulRecord
+        // — slice strictly to the COO non-zero count via _storageOffset so any
+        // future SparseTensor view path can't leak unrelated buffer regions
+        // into the snapshot.
+        var aValuesSnapshot = aCoo.DataVector.AsSpan()
+            .Slice(aCoo._storageOffset, aCoo.RowIndices.Length)
+            .ToArray();
+        var bValuesSnapshot = bCoo.DataVector.AsSpan()
+            .Slice(bCoo._storageOffset, bCoo.RowIndices.Length)
+            .ToArray();
 
         DifferentiableOps.RecordBinary(
             "SparsePatternPreservingSpGeMM",
