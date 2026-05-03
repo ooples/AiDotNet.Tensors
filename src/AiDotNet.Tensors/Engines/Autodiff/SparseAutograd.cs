@@ -103,6 +103,141 @@ public static class SparseAutograd
         return output;
     }
 
+    /// <summary>Tape-aware sparse · dense matmul that produces a
+    /// PATTERN-PRESERVING sparse gradient on the sparse side. Use this
+    /// when the sparse tensor is a registered trainable parameter
+    /// (typical: <c>SparseLinearLayer&lt;T&gt;</c> + sparse-aware
+    /// <see cref="ParameterBuffer{T}"/>) — the produced gradient's
+    /// <see cref="SparseTensor{T}.Values"/> length matches the original
+    /// pattern's <c>NonZeroCount</c>, so the parameter buffer can store
+    /// it as a flat values vector without materialising the dense matrix.
+    /// Avoids the O(rows·columns) memory allocation that
+    /// <see cref="SparseMatMulRecord{T}"/> incurs in its backward.
+    /// </summary>
+    /// <param name="a">Sparse left operand. Must be the registered
+    /// trainable-parameter SparseTensor — the gradient is keyed against
+    /// this exact instance, so reusing a different SparseTensor with the
+    /// same pattern won't accumulate gradients correctly.</param>
+    /// <param name="b">Dense right operand.</param>
+    public static Tensor<T> SparsePatternPreservingMatMulRecord<T>(
+        SparseTensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        var output = SparseOps.SparseMatMul(a, b);
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        // Snapshot BOTH the COO pattern AND the values aligned with that
+        // pattern. Backward computes dB by iterating non-zeros of A, and
+        // the values must match the index order — but if A is stored in
+        // CSR/BSR/etc. its DataVector ordering is NOT aligned with the
+        // COO indices we save. ToCoo() materialises both in the right
+        // order; snapshot the values once via ToArray() (single copy)
+        // so the rest is allocation-free at backward time.
+        var coo = a.ToCoo();
+        // Snapshot exactly the values aligned with the COO indices, not the
+        // full backing buffer. DataVector.ToArray() returns the whole
+        // memory the Vector wraps; if the sparse tensor were ever a view
+        // into a larger storage (current code paths don't do this, but a
+        // future Slice() / View() helper might), a full ToArray would
+        // include unrelated regions and backward would consume misaligned
+        // values when iterating COO indices. AsSpan().Slice(offset, count)
+        // keeps the snapshot strictly aligned with the saved RowIndices.
+        var aValuesSnapshot = coo.DataVector.AsSpan()
+            .Slice(coo._storageOffset, coo.RowIndices.Length)
+            .ToArray();
+        DifferentiableOps.RecordBinary(
+            "SparsePatternPreservingMatMul",
+            output,
+            a,    // sparse parameter — gradient accumulator keyed here
+            b,
+            SparsePatternPreservingMatMulBackward,
+            savedState: new object[]
+            {
+                coo.RowIndices,
+                coo.ColumnIndices,
+                a.Rows,
+                a.Columns,
+                aValuesSnapshot,
+            });
+        return output;
+    }
+
+    private static void SparsePatternPreservingMatMulBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        // Y = A_sparse · B (pattern P fixed)
+        // dB = A^T · dY  (dense form: standard SpMM with transposed A)
+        // dA[i,j] for non-zero (i,j) ∈ P:
+        //     dA[i,j] = sum_k B[j,k] · dY[i,k]
+        // Pack the dA values in COO order matching the saved pattern.
+        var aSparse = (SparseTensor<T>)inputs[0];
+        var b = inputs[1];
+        var rowIndices = (int[])savedState[0];
+        var colIndices = (int[])savedState[1];
+        int rows = (int)savedState[2];
+        int columns = (int)savedState[3];
+        var aValues = (T[])savedState[4];
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int nnz = rowIndices.Length;
+        int innerK = b.Shape[1];
+
+        // Compute dA over the pattern only — never materialises the
+        // dense O(rows × columns) gradient.
+        var gradValues = new T[nnz];
+        for (int idx = 0; idx < nnz; idx++)
+        {
+            int i = rowIndices[idx];
+            int j = colIndices[idx];
+            T sum = ops.Zero;
+            for (int k = 0; k < innerK; k++)
+            {
+                sum = ops.Add(sum, ops.Multiply(b[j, k], gradOutput[i, k]));
+            }
+            gradValues[idx] = sum;
+        }
+        var sparseGradA = new SparseTensor<T>(rows, columns, rowIndices, colIndices, gradValues);
+        AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
+
+        // dB = A^T · dY computed as a sparse-transpose · dense matmul,
+        // i.e. iterate the sparse pattern of A and accumulate into a
+        // dense [columns × innerK] gradient. This avoids the O(rows × columns)
+        // densification that materialising A and transposing it would
+        // incur — the whole memory-efficiency point of the
+        // pattern-preserving op. The values used here MUST be the
+        // forward-time snapshot (`aValues`, captured during record in
+        // COO order matching `rowIndices` / `colIndices`); reading
+        // aSparse.DataVector directly would assume COO ordering, but
+        // CSR/BSR-stored sparse tensors return values in a different
+        // order. The snapshot fixes that misalignment.
+        var gradB = new Tensor<T>(new[] { columns, innerK });
+        var gradBSpan = gradB.AsWritableSpan();
+        // gradB starts zero (Tensor ctor zero-fills); accumulate
+        //   gradB[j, k] += A_value[idx] · dY[i, k]    where (i, j) ∈ pattern_A
+        // Equivalent to A^T · dY without materialising the dense A.
+        for (int idx = 0; idx < nnz; idx++)
+        {
+            int i = rowIndices[idx];
+            int j = colIndices[idx];
+            T aVal = aValues[idx];
+            int rowStart = j * innerK;
+            for (int k = 0; k < innerK; k++)
+            {
+                gradBSpan[rowStart + k] = ops.Add(
+                    gradBSpan[rowStart + k],
+                    ops.Multiply(aVal, gradOutput[i, k]));
+            }
+        }
+        AccumulateGrad(b, gradB, gradAccumulator, engine);
+        _ = output;
+    }
+
     private static void SparseMatMulBackward<T>(
         Tensor<T> gradOutput,
         Tensor<T>[] inputs,
@@ -287,6 +422,155 @@ public static class SparseAutograd
     /// materialisation of the CSR product so downstream tape ops compose;
     /// backward routes through the dense matmul Jacobian and is keyed on
     /// the dense views supplied by the caller.</summary>
+    /// <summary>Pattern-preserving sparse · sparse matmul. Backward
+    /// produces SPARSE gradients on both sides — values computed only at
+    /// each operand's own non-zero pattern, not as a full dense matrix.
+    /// Use this when both A and B are registered trainable parameters
+    /// (typical: a sparse-sparse projection chain). The output is
+    /// densified for downstream tape composition (matches the dense-grad
+    /// SpGeMM variant); the gradient flowing back into A and B is
+    /// pattern-preserving sparse and integrates with sparse-aware
+    /// <see cref="ParameterBuffer{T}"/> slots without densification.
+    /// </summary>
+    /// <param name="a">Sparse left operand (also the gradient target —
+    /// must be the same SparseTensor instance the caller registered).</param>
+    /// <param name="b">Sparse right operand (same identity rule).</param>
+    public static Tensor<T> SparsePatternPreservingSpGeMMRecord<T>(
+        SparseTensor<T> a, SparseTensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        var sparseOut = SparseOps.SparseSpGeMM(a, b);
+        var output = sparseOut.ToDense();
+        if (DifferentiableOps._anyTapeActive == 0) return output;
+
+        // Snapshot patterns AND values for both operands at forward time.
+        // The sparse-aware backward needs B's values to compute dA and
+        // A's values to compute dB. Snapshot prevents in-place weight
+        // updates between forward + backward from corrupting gradients.
+        // ToArray() already allocates a fresh copy — the previous
+        // ToArray().Clone() was a redundant second copy.
+        var aCoo = a.ToCoo();
+        var bCoo = b.ToCoo();
+        // See note on the matching pattern in SparsePatternPreservingMatMulRecord
+        // — slice strictly to the COO non-zero count via _storageOffset so any
+        // future SparseTensor view path can't leak unrelated buffer regions
+        // into the snapshot.
+        var aValuesSnapshot = aCoo.DataVector.AsSpan()
+            .Slice(aCoo._storageOffset, aCoo.RowIndices.Length)
+            .ToArray();
+        var bValuesSnapshot = bCoo.DataVector.AsSpan()
+            .Slice(bCoo._storageOffset, bCoo.RowIndices.Length)
+            .ToArray();
+
+        DifferentiableOps.RecordBinary(
+            "SparsePatternPreservingSpGeMM",
+            output,
+            a,
+            b,
+            SparsePatternPreservingSpGeMMBackward,
+            savedState: new object[]
+            {
+                aCoo.RowIndices, aCoo.ColumnIndices, a.Rows, a.Columns, aValuesSnapshot,
+                bCoo.RowIndices, bCoo.ColumnIndices, b.Rows, b.Columns, bValuesSnapshot,
+            });
+        return output;
+    }
+
+    private static void SparsePatternPreservingSpGeMMBackward<T>(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        object[] savedState,
+        IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradAccumulator)
+    {
+        // Y_dense = A_sparse · B_sparse  (then densified for tape composition)
+        // dA at non-zero (i,j) ∈ pattern_A:
+        //     dA[i,j] = sum_k B[j,k] · gradOut[i,k]
+        //   where B[j,k] is read via the sparse indexer (zero for
+        //   structural zeros, snapshot value for non-zero positions).
+        //   Equivalently: gather only over the k positions where (j,k) is
+        //   in pattern_B, then sum sparse_B(j,k) · gradOut(i,k).
+        // dB at non-zero (j,k) ∈ pattern_B:
+        //     dB[j,k] = sum_i A[i,j] · gradOut[i,k]
+        var aSparse = (SparseTensor<T>)inputs[0];
+        var bSparse = (SparseTensor<T>)inputs[1];
+        var aRowIdx = (int[])savedState[0];
+        var aColIdx = (int[])savedState[1];
+        int aRows = (int)savedState[2];
+        int aCols = (int)savedState[3];
+        var aValues = (T[])savedState[4];
+        var bRowIdx = (int[])savedState[5];
+        var bColIdx = (int[])savedState[6];
+        int bRows = (int)savedState[7];
+        int bCols = (int)savedState[8];
+        var bValues = (T[])savedState[9];
+
+        var ops = MathHelper.GetNumericOperations<T>();
+
+        // Build a B-row → list-of-(col, value) lookup so dA's per-(i,j)
+        // sum only scans the actual non-zeros in row j of B (not the
+        // structural zeros). O(nnz_B) total work to build.
+        var bByRow = new System.Collections.Generic.List<(int col, T val)>[bRows];
+        for (int idx = 0; idx < bRowIdx.Length; idx++)
+        {
+            int row = bRowIdx[idx];
+            (bByRow[row] ??= new System.Collections.Generic.List<(int, T)>())
+                .Add((bColIdx[idx], bValues[idx]));
+        }
+
+        int nnzA = aRowIdx.Length;
+        var gradAValues = new T[nnzA];
+        for (int idx = 0; idx < nnzA; idx++)
+        {
+            int i = aRowIdx[idx];
+            int j = aColIdx[idx];
+            T sum = ops.Zero;
+            var bRow = bByRow[j];
+            if (bRow is not null)
+            {
+                foreach (var (k, bVal) in bRow)
+                {
+                    sum = ops.Add(sum, ops.Multiply(bVal, gradOutput[i, k]));
+                }
+            }
+            gradAValues[idx] = sum;
+        }
+        var sparseGradA = new SparseTensor<T>(aRows, aCols, aRowIdx, aColIdx, gradAValues);
+        AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
+
+        // dB symmetric: build A-col → list-of-(row, value).
+        var aByCol = new System.Collections.Generic.List<(int row, T val)>[aCols];
+        for (int idx = 0; idx < aRowIdx.Length; idx++)
+        {
+            int col = aColIdx[idx];
+            (aByCol[col] ??= new System.Collections.Generic.List<(int, T)>())
+                .Add((aRowIdx[idx], aValues[idx]));
+        }
+
+        int nnzB = bRowIdx.Length;
+        var gradBValues = new T[nnzB];
+        for (int idx = 0; idx < nnzB; idx++)
+        {
+            int j = bRowIdx[idx];
+            int k = bColIdx[idx];
+            T sum = ops.Zero;
+            var aCol = aByCol[j];
+            if (aCol is not null)
+            {
+                foreach (var (i, aVal) in aCol)
+                {
+                    sum = ops.Add(sum, ops.Multiply(aVal, gradOutput[i, k]));
+                }
+            }
+            gradBValues[idx] = sum;
+        }
+        var sparseGradB = new SparseTensor<T>(bRows, bCols, bRowIdx, bColIdx, gradBValues);
+        AccumulateGrad(bSparse, sparseGradB, gradAccumulator, engine);
+        _ = output;
+    }
+
     public static Tensor<T> SparseSpGeMMRecord<T>(SparseTensor<T> a, SparseTensor<T> b,
         Tensor<T> aDense, Tensor<T> bDense)
     {
