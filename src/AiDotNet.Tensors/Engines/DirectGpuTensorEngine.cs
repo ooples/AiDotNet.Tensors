@@ -1368,7 +1368,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// whether this method already recorded a Profiler fallback event so
     /// the outer dispatcher doesn't double-log.
     /// </summary>
-    private T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
+    internal T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
     {
         emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
@@ -1501,7 +1501,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// chunking strategy as <see cref="TryRunUnaryChunked"/>; works for any
     /// shape because element-wise ops have a 1:1 input-to-output mapping.
     /// </summary>
-    private T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
+    internal T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
     {
         emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
