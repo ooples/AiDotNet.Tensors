@@ -97,6 +97,8 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateIntBuffer(int size)
     {
         EnsureInitialized();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(size);
     }
@@ -104,6 +106,8 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)

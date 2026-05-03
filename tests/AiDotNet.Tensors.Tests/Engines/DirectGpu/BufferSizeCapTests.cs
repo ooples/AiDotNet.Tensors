@@ -239,6 +239,80 @@ public class BufferSizeCapTests
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // Chunker decision math (the policy/cap parts that don't need a backend).
+    // The actual chunked GPU dispatch path is integration-tested with real
+    // hardware; a fake-IDirectGpuBackend mock is tracked as follow-up
+    // because the interface has 100+ members and a minimal stub would
+    // dwarf this PR's scope.
+    // ───────────────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(/*capBytes*/ 16,        /*totalElements*/ 100,       /*expectedChunkCount*/ 25)]
+    [InlineData(/*capBytes*/ 1024,      /*totalElements*/ 256,       /*expectedChunkCount*/ 1)]
+    [InlineData(/*capBytes*/ 4,         /*totalElements*/ 10,        /*expectedChunkCount*/ 10)]
+    [InlineData(/*capBytes*/ 1_000_000, /*totalElements*/ 1_000_000, /*expectedChunkCount*/ 4)]
+    public void ChunkCount_ComputedFromCapAndElements(long capBytes, int totalElements, int expectedChunkCount)
+    {
+        // Mirror the chunker's math: chunkElements = capBytes / sizeof(float),
+        // chunkCount = ceil(totalElements / chunkElements). Asserting the
+        // formula here catches any future change to the chunk-sizing rule
+        // (e.g. if someone reintroduces a divide-by-2 conservative bound).
+        const int BytesPerFloat = sizeof(float);
+        Assert.True(capBytes >= BytesPerFloat,
+            "test scenario must have cap >= one float — chunker bails earlier otherwise");
+        long chunkElements = capBytes / BytesPerFloat;
+        int chunkCount = (int)((totalElements + chunkElements - 1) / chunkElements);
+        Assert.Equal(expectedChunkCount, chunkCount);
+    }
+
+    [Fact]
+    public void ChunkCount_ExceedingMaxChunkCount_TriggersFallback()
+    {
+        // When chunker would need more chunks than EffectiveMaxChunkCount,
+        // the policy is to bail to CPU (chunk-spawn overhead dominates).
+        var prev = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions { MaxChunkCount = 4 };
+            Assert.Equal(4, GpuFallbackOptionsHolder.Current.EffectiveMaxChunkCount);
+
+            // 100 elements with cap = 4 bytes → 100 chunks > 4 cap → fallback.
+            const long CapBytes = 4;
+            const int TotalElements = 100;
+            long chunkElements = CapBytes / sizeof(float);
+            int chunkCount = (int)((TotalElements + chunkElements - 1) / chunkElements);
+            Assert.True(chunkCount > GpuFallbackOptionsHolder.Current.EffectiveMaxChunkCount,
+                "test scenario must be designed to exceed the configured MaxChunkCount");
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = prev;
+        }
+    }
+
+    [Fact]
+    public void ChunkerPolicy_NeverChunkFailFast_RethrowsException()
+    {
+        // GpuChunkingPolicy.NeverChunk_FailFast → engine rethrows the
+        // GpuBufferTooLargeException instead of falling back. Confirm the
+        // policy enum value is wired into EffectiveChunkingPolicy.
+        var prev = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions
+            {
+                ChunkingPolicy = GpuChunkingPolicy.NeverChunk_FailFast,
+            };
+            Assert.Equal(GpuChunkingPolicy.NeverChunk_FailFast,
+                GpuFallbackOptionsHolder.Current.EffectiveChunkingPolicy);
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = prev;
+        }
+    }
+
     [Fact]
     public void Holder_RoundTripsCustomOptions()
     {

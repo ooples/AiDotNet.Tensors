@@ -76,9 +76,12 @@ public sealed class GpuBufferTooLargeException : InvalidOperationException
 
     private static string BytesToHuman(long bytes)
     {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("F1") + " KiB";
-        if (bytes < 1024L * 1024 * 1024) return (bytes / (1024.0 * 1024)).ToString("F1") + " MiB";
-        return (bytes / (1024.0 * 1024 * 1024)).ToString("F2") + " GiB";
+        // Culture-invariant formatting — log files and structured tooling
+        // depend on stable decimal separators across locales.
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        if (bytes < 1024) return bytes.ToString(inv) + " B";
+        if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("F1", inv) + " KiB";
+        if (bytes < 1024L * 1024 * 1024) return (bytes / (1024.0 * 1024)).ToString("F1", inv) + " MiB";
+        return (bytes / (1024.0 * 1024 * 1024)).ToString("F2", inv) + " GiB";
     }
 }

@@ -1257,7 +1257,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var options = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current;
         var policy = options.EffectiveChunkingPolicy;
         if (policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.NeverChunk_FailFast)
-            throw ex;
+            // Preserve original stack trace via ExceptionDispatchInfo (this
+            // method received the exception across a stack frame, so a bare
+            // `throw;` isn't available — `throw ex;` would reset the trace).
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
         // Issue #285 — emit a structured event so users / tooling see the
         // fallback. Skip when the chunker already recorded its own
         // reason-specific event (e.g. cpu_fallback_chunks_N_exceeds_M) to
@@ -1306,18 +1309,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // (element-wise ops decompose trivially via leading-dim split);
             // fall through to CPU if the chunker bails or policy disallows.
             var policy = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current.EffectiveChunkingPolicy;
-            bool chunkerRan = false;
+            bool chunkerEmittedEvent = false;
             if (policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AutoChunk
                 || policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AlwaysChunk)
             {
-                chunkerRan = true;
-                var chunked = TryRunUnaryChunked(backend, input, op, ex);
+                var chunked = TryRunUnaryChunked(backend, input, op, ex, out chunkerEmittedEvent);
                 if (chunked is not null) return chunked;
             }
-            // The chunker emits its own reason-specific event when it bails
-            // (cpu_fallback_chunks_N_exceeds_M); don't double-log the generic
-            // cpu_fallback event in that case.
-            return HandleBufferTooLarge<T>(ex, opName: "TryRunUnary", eventAlreadyEmitted: chunkerRan);
+            // Skip the generic cpu_fallback event ONLY when the chunker
+            // actually emitted its own reason-specific event. The chunker
+            // can return null without emitting (cap <= 0, non-float type,
+            // single-element tensor) — in that case the generic event is
+            // still the right signal that work moved to CPU.
+            return HandleBufferTooLarge<T>(ex, opName: "TryRunUnary", eventAlreadyEmitted: chunkerEmittedEvent);
         }
     }
 
@@ -1352,17 +1356,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Issue #285: chunked element-wise GPU dispatch when a single allocation
-    /// would exceed the per-allocation cap. Splits the tensor's leading dim
-    /// into K chunks so each chunk's buffer fits, runs the op K times, and
-    /// concatenates the result. Returns null when the op cannot be chunked
-    /// (chunk count > MaxChunkCount, scalar input, or per-chunk allocation
-    /// still too large), in which case the caller falls through to CPU.
+    /// would exceed the per-allocation cap. Splits the flattened contiguous
+    /// buffer by element count into K chunks so each chunk's buffer fits,
+    /// runs the op K times, and concatenates the result. This works for any
+    /// shape because element-wise ops have a 1:1 map between input and
+    /// output elements — preserving the flat layout preserves correctness.
+    /// Returns null when the op cannot be chunked (chunk count >
+    /// MaxChunkCount, scalar input, non-float element type, or per-element
+    /// cap below sizeof(float)), in which case the caller falls through to
+    /// CPU. The <paramref name="emittedEvent"/> out flag tells the caller
+    /// whether this method already recorded a Profiler fallback event so
+    /// the outer dispatcher doesn't double-log.
     /// </summary>
-    private T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+    private T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
     {
-        // Element-wise ops are 1:1 between input and output elements — every
-        // contiguous slice of the input maps to the same slice of the output.
-        // We split along the largest unit-stride contiguous chunk that fits.
+        emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
         if (capBytes <= 0) return null;
         int totalElements = input.Length;
@@ -1386,6 +1394,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Too many chunks — overhead per dispatch dominates. CPU fallback.
             EmitBufferCapEvent(ex, "TryRunUnary",
                 decision: $"cpu_fallback_chunks_{chunkCount}_exceeds_{options.EffectiveMaxChunkCount}");
+            emittedEvent = true;
             return null;
         }
 
@@ -1394,6 +1403,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var resultFloat = new float[totalElements];
         EmitBufferCapEvent(ex, "TryRunUnary", decision: $"chunked_{chunkCount}");
+        emittedEvent = true;
         for (int c = 0; c < chunkCount; c++)
         {
             int offset = c * (int)chunkElements;
@@ -1443,15 +1453,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
             var policy = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current.EffectiveChunkingPolicy;
-            bool chunkerRan = false;
+            bool chunkerEmittedEvent = false;
             if (policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AutoChunk
                 || policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AlwaysChunk)
             {
-                chunkerRan = true;
-                var chunked = TryRunBinaryChunked(backend, left, right, op, ex);
+                var chunked = TryRunBinaryChunked(backend, left, right, op, ex, out chunkerEmittedEvent);
                 if (chunked is not null) return chunked;
             }
-            return HandleBufferTooLarge<T>(ex, opName: "TryRunBinary", eventAlreadyEmitted: chunkerRan);
+            return HandleBufferTooLarge<T>(ex, opName: "TryRunBinary", eventAlreadyEmitted: chunkerEmittedEvent);
         }
     }
 
@@ -1488,10 +1497,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Issue #285: chunked binary element-wise dispatch.
+    /// Issue #285: chunked binary element-wise dispatch. Same flat-element
+    /// chunking strategy as <see cref="TryRunUnaryChunked"/>; works for any
+    /// shape because element-wise ops have a 1:1 input-to-output mapping.
     /// </summary>
-    private T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+    private T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
     {
+        emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
         if (capBytes <= 0) return null;
         int totalElements = left.Length;
@@ -1510,6 +1522,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             EmitBufferCapEvent(ex, "TryRunBinary",
                 decision: $"cpu_fallback_chunks_{chunkCount}_exceeds_{options.EffectiveMaxChunkCount}");
+            emittedEvent = true;
             return null;
         }
 
@@ -1519,6 +1532,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var resultFloat = new float[totalElements];
         EmitBufferCapEvent(ex, "TryRunBinary", decision: $"chunked_{chunkCount}");
+        emittedEvent = true;
         for (int c = 0; c < chunkCount; c++)
         {
             int offset = c * (int)chunkElements;

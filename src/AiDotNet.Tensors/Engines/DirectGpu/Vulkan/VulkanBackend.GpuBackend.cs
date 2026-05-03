@@ -198,6 +198,8 @@ public sealed unsafe partial class VulkanBackend
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
         if (_transfer is null)
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
         // Issue #285: per-allocation cap check before VkBuffer creation.
@@ -282,6 +284,8 @@ public sealed unsafe partial class VulkanBackend
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
