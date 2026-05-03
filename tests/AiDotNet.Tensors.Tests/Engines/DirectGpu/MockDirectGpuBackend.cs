@@ -52,6 +52,14 @@ internal sealed class MockGpuBuffer : IGpuBuffer
 internal sealed class MockBackendState
 {
     public long MaxBufferAllocBytes { get; set; } = long.MaxValue;
+    /// <summary>
+    /// Total device memory — semantically separate from the per-allocation
+    /// cap. Tests that care about the distinction (e.g. activation-cache
+    /// sizing logic that uses VRAM, not per-allocation cap) can override
+    /// this independently. Defaults to long.MaxValue — same as the cap —
+    /// so existing tests don't have to set both.
+    /// </summary>
+    public long GlobalMemoryBytes { get; set; } = long.MaxValue;
     public string DeviceName { get; set; } = "MockDevice";
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
@@ -89,7 +97,7 @@ public class MockDirectGpuBackend : DispatchProxy
             case "get_DeviceName": return _state.DeviceName;
             case "get_DeviceVendor": return _state.DeviceVendor;
             case "get_ComputeUnits": return 1;
-            case "get_GlobalMemoryBytes": return _state.MaxBufferAllocBytes;
+            case "get_GlobalMemoryBytes": return _state.GlobalMemoryBytes;
             case "get_LocalMemoryBytes": return 0L;
             case "get_MaxBufferAllocBytes": return _state.MaxBufferAllocBytes;
             case "get_TheoreticalGflops": return 0.0;

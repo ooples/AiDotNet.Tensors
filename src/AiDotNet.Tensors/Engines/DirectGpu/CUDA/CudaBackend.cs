@@ -90,8 +90,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     /// <summary>
     /// CUDA does not expose a fixed per-allocation cap as a device attribute —
     /// in practice individual <c>cudaMalloc</c> calls are limited by the
-    /// largest contiguous free VRAM block. We use total free memory at init
-    /// as a conservative upper bound. Issue #285.
+    /// largest contiguous free VRAM block. We use the device's TOTAL VRAM
+    /// (from <c>cuDeviceTotalMem</c>) as a conservative upper bound — a
+    /// hard ceiling rather than a "current free memory" tracker. Issue #285.
     /// </summary>
     public long MaxBufferAllocBytes { get; }
     public double TheoreticalGflops { get; private set; }
