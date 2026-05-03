@@ -420,51 +420,69 @@ public class SparseCompletenessTests
     }
 
     /// <summary>
-    /// SparseSampledAddMM backward includes a per-element indexer
-    /// fallback for non-contiguous gradOutput. The forward currently
-    /// enforces contiguous b, so this path is exercised only when
-    /// gradOutput becomes non-contiguous (rare in practice — most
-    /// reductions return contiguous tensors). Build a synthetic
-    /// non-contiguous gradOutput by transposing twice; the [N, K]→[K, N]
-    /// →[N, K] route reorders strides without changing storage. The
-    /// fallback must produce exactly the same dA/dB as the contiguous
-    /// path against a contiguous gradOutput of equal content.
+    /// <see cref="SparseAutograd.SparsePatternPreservingMatMulRecord{T}"/>'s
+    /// backward has a contiguous-rank-2 fast path (<c>b</c> sliced via
+    /// span) and an indexer-based fallback for non-contiguous inputs.
+    /// Run the same problem twice — once with a contiguous <c>b</c>
+    /// (fast path) and once with a logically-equal non-contiguous <c>b</c>
+    /// (slow path) — and assert the resulting gradients are identical.
+    /// Equivalence guarantees the optimisation is purely a perf change.
+    ///
+    /// <para>The non-contiguous <c>b</c> is constructed by building the
+    /// transposed shape contiguously and calling <c>Transpose([1,0])</c>
+    /// once: that returns a stride-permuted view (rank-2, non-contig)
+    /// that's logically equal to the contiguous <c>b</c>. The reviewer
+    /// noted that <c>Transpose</c> twice would round-trip back to
+    /// contiguous (zero-copy stride permutation is its own inverse on
+    /// rank-2), so we transpose exactly once.</para>
     /// </summary>
     [Fact]
-    public void SparseAutograd_SparseSampledAddMM_BackwardEquivalentForBothPaths()
+    public void SparseAutograd_SparsePatternPreservingMatMul_FastAndSlowPathsAgree()
     {
-        // Smoke-style equivalence: run the existing pattern-preserving
-        // workload with strict numeric equality between the contiguous
-        // fast path and a recomputed reference. Exact gradient values
-        // are exercised by SparseAutograd_SparseSampledAddMM_PreservesPatternInGradient
-        // above; this test guards against accidental drift between the
-        // two branches by requiring bit-identical gradients on two
-        // independent runs of the same problem (any residual variability
-        // would fail).
-        var pattern = SmallA();
-        var aDense = MakeDense(new float[,]
-        {
-            { 0.5f, 1.5f }, { 2.5f, -0.25f }, { 0.0f, 0.75f }, { 1.25f, -2.0f },
-        });
-        var bDense = MakeDense(new float[,]
-        {
-            { 1.0f, 0.5f, 1.5f, -1.0f }, { -0.25f, 1.0f, 0.0f, 0.75f },
-        });
-        var c = new Tensor<float>(new[] { 4, 4 });
+        var a = SmallA(); // sparse [4,4]
 
+        // Contiguous b: shape [4, 2], row-major.
+        var bContig = MakeDense(new float[,]
+        {
+            { 1.0f, 0.5f },
+            { -0.25f, 1.5f },
+            { 0.75f, -1.0f },
+            { 2.0f, 0.0f },
+        });
+
+        // Non-contiguous b with the SAME logical content as bContig:
+        // build the transposed shape [2, 4] contiguously then call
+        // Transpose([1,0]) → returns a view with shape [4, 2] and
+        // strides [1, 2] instead of [2, 1] (non-contiguous).
+        var bTContig = MakeDense(new float[,]
+        {
+            { 1.0f, -0.25f, 0.75f, 2.0f },
+            { 0.5f, 1.5f, -1.0f, 0.0f },
+        });
+        var bNonContig = bTContig.Transpose(new[] { 1, 0 });
+        Assert.False(bNonContig.IsContiguous, "test setup: bNonContig must take the slow path");
+        Assert.Equal(new[] { 4, 2 }, bNonContig._shape);
+        // Sanity: the logical content matches.
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 2; j++)
+                Assert.Equal(bContig[i, j], bNonContig[i, j]);
+
+        // Run #1 — fast path (b contiguous).
         using var tape1 = new GradientTape<float>();
-        var s1 = SparseAutograd.SparseSampledAddMMRecord(pattern, aDense, bDense, c, alpha: 1f, beta: 1f);
-        var l1 = _engine.ReduceSum(s1, null);
-        var g1 = tape1.ComputeGradients(l1, new[] { aDense, bDense, c });
+        var out1 = SparseAutograd.SparsePatternPreservingMatMulRecord(a, bContig);
+        var l1 = _engine.ReduceSum(out1, null);
+        var g1 = tape1.ComputeGradients(l1, new[] { bContig });
 
+        // Run #2 — slow path (b non-contiguous).
         using var tape2 = new GradientTape<float>();
-        var s2 = SparseAutograd.SparseSampledAddMMRecord(pattern, aDense, bDense, c, alpha: 1f, beta: 1f);
-        var l2 = _engine.ReduceSum(s2, null);
-        var g2 = tape2.ComputeGradients(l2, new[] { aDense, bDense, c });
+        var out2 = SparseAutograd.SparsePatternPreservingMatMulRecord(a, bNonContig);
+        var l2 = _engine.ReduceSum(out2, null);
+        var g2 = tape2.ComputeGradients(l2, new[] { bNonContig });
 
-        AssertDenseEqual(g1[aDense], g2[aDense]);
-        AssertDenseEqual(g1[bDense], g2[bDense]);
-        AssertDenseEqual(g1[c], g2[c]);
+        // Forward outputs must agree (sanity).
+        AssertDenseEqual(out1, out2);
+        // Gradient through b must agree across both paths.
+        AssertDenseEqual(g1[bContig], g2[bNonContig]);
     }
 
     private static void AssertDenseEqual(Tensor<float> expected, Tensor<float> actual)

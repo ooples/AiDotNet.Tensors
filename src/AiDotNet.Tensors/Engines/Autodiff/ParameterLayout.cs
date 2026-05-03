@@ -37,15 +37,37 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 public sealed class ParameterLayout
 {
+    private readonly int[] _denseShape;
+
     /// <summary>
     /// The dense semantic shape of the parameter. For sparse leaves this
     /// is the shape of the underlying dense matrix the sparse pattern
     /// projects onto (e.g. <c>[rows, columns]</c>); for dense leaves it
-    /// is the actual storage shape. The array is the layout's own clone;
-    /// callers may safely inspect it but mutations do not affect the
-    /// layout's behavior (they are caller-local).
+    /// is the actual storage shape. Returns a <em>fresh clone</em> on
+    /// every access so callers cannot mutate the layout's backing
+    /// storage through this property; <see cref="BufferElementCount"/>
+    /// computes against the private backing field, so even if a caller
+    /// retained the array reference and wrote to it, derived values
+    /// stay correct.
     /// </summary>
-    public int[] DenseShape { get; }
+    public int[] DenseShape => (int[])_denseShape.Clone();
+
+    /// <summary>
+    /// Returns the layout's <c>DenseShape</c> as a non-allocating
+    /// <see cref="ReadOnlySpan{T}"/> over the backing storage. Internal
+    /// callers (e.g. <see cref="ParameterBuffer{T}"/>) prefer this over
+    /// the public <see cref="DenseShape"/> getter to avoid the per-call
+    /// clone allocation. NEVER expose externally — the span aliases the
+    /// layout's own storage and breaking the immutability contract is
+    /// only safe inside the assembly.
+    /// </summary>
+    internal ReadOnlySpan<int> DenseShapeSpan => _denseShape;
+
+    /// <summary>
+    /// Length of the dense shape. Cheap when callers only need the rank
+    /// — avoids the per-call clone allocation of <see cref="DenseShape"/>.
+    /// </summary>
+    public int Rank => _denseShape.Length;
 
     /// <summary>
     /// Sparsity layout when the parameter is sparse, or <c>null</c> for
@@ -68,7 +90,7 @@ public sealed class ParameterLayout
         // Clone so the layout's shape can't be mutated via the caller's
         // array after construction. The fixed-shape contract is enforced
         // by ownership rather than caller discipline.
-        DenseShape = (int[])denseShape.Clone();
+        _denseShape = (int[])denseShape.Clone();
         Sparse = null;
     }
 
@@ -91,7 +113,7 @@ public sealed class ParameterLayout
                 nameof(denseShape));
         // Clone after validation so the layout retains an immutable copy
         // even if the caller mutates their array afterwards.
-        DenseShape = (int[])denseShape.Clone();
+        _denseShape = (int[])denseShape.Clone();
     }
 
     /// <summary>
@@ -105,7 +127,11 @@ public sealed class ParameterLayout
         {
             if (Sparse is { } s) return s.NonZeroCount;
             long product = 1;
-            foreach (int d in DenseShape) product *= d;
+            // Iterate the private backing field directly so this
+            // computation never depends on the public DenseShape getter
+            // — even a hostile caller mutating a previously-returned
+            // clone cannot perturb BufferElementCount.
+            foreach (int d in _denseShape) product *= d;
             return product;
         }
     }
@@ -116,9 +142,12 @@ public sealed class ParameterLayout
 /// The constructor takes its OWN COPIES of the supplied index arrays
 /// (via <see cref="System.Array.Clone"/>), so subsequent mutations to
 /// the caller's arrays do not affect this layout. The fixed-pattern
-/// contract is enforced by ownership: external code can only inspect
-/// the indices through <see cref="System.ReadOnlyMemory{T}"/> views,
-/// not through a writeable <c>int[]</c> reference.
+/// contract is enforced by ownership: the public
+/// <see cref="RowIndices"/> / <see cref="ColumnIndices"/> properties
+/// return a <em>fresh copy on every access</em>, so even
+/// <see cref="System.Runtime.InteropServices.MemoryMarshal.TryGetArray{T}(System.ReadOnlyMemory{T},out System.ArraySegment{T})"/>
+/// can only recover the per-call snapshot — never the layout's own
+/// backing arrays.
 /// </summary>
 public sealed class SparsityLayout
 {
@@ -133,36 +162,40 @@ public sealed class SparsityLayout
 
     /// <summary>
     /// Row indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. Exposed as <see cref="System.ReadOnlyMemory{T}"/>
-    /// so callers cannot mutate the layout's storage; use
-    /// <c>RowIndices.Span[k]</c> for indexed access or
-    /// <c>RowIndices.ToArray()</c> for a writeable copy.
+    /// <see cref="NonZeroCount"/>. Returns a <em>fresh
+    /// <see cref="System.ReadOnlyMemory{T}"/> over a per-call array
+    /// copy</em>, so even
+    /// <see cref="System.Runtime.InteropServices.MemoryMarshal.TryGetArray{T}(System.ReadOnlyMemory{T},out System.ArraySegment{T})"/>
+    /// cannot reach the layout's backing storage. If you need
+    /// allocation-free indexed access from inside the assembly, use
+    /// <see cref="RowIndicesSpan"/>.
     /// </summary>
-    public ReadOnlyMemory<int> RowIndices => _rowIndices;
+    public ReadOnlyMemory<int> RowIndices => new ReadOnlyMemory<int>((int[])_rowIndices.Clone());
 
     /// <summary>
     /// Column indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. Exposed as <see cref="System.ReadOnlyMemory{T}"/>
-    /// so callers cannot mutate the layout's storage; use
-    /// <c>ColumnIndices.Span[k]</c> for indexed access or
-    /// <c>ColumnIndices.ToArray()</c> for a writeable copy.
+    /// <see cref="NonZeroCount"/>. Same copy-on-access semantics as
+    /// <see cref="RowIndices"/>; pair with
+    /// <see cref="ColumnIndicesSpan"/> when calling from inside the
+    /// assembly to avoid the per-call allocation.
     /// </summary>
-    public ReadOnlyMemory<int> ColumnIndices => _columnIndices;
+    public ReadOnlyMemory<int> ColumnIndices => new ReadOnlyMemory<int>((int[])_columnIndices.Clone());
 
     /// <summary>
-    /// Internal accessor for the underlying row-index <c>int[]</c>.
-    /// Used by <see cref="ParameterBuffer{T}.CreateView"/> when handing
-    /// the indices to <see cref="SparseTensor{T}"/> constructors that
-    /// require a backing array. NEVER expose externally — mutating the
-    /// returned array breaks the layout's immutability contract.
+    /// Allocation-free <see cref="ReadOnlySpan{T}"/> over the underlying
+    /// row-index storage. Internal callers iterating the pattern in a
+    /// hot loop should use this instead of <see cref="RowIndices"/> to
+    /// avoid the per-call clone. NEVER expose externally — the span
+    /// aliases the layout's own storage and is only safe inside the
+    /// assembly.
     /// </summary>
-    internal int[] RowIndicesArray => _rowIndices;
+    internal ReadOnlySpan<int> RowIndicesSpan => _rowIndices;
 
     /// <summary>
-    /// Internal accessor for the underlying column-index <c>int[]</c>.
-    /// Same caveats as <see cref="RowIndicesArray"/>.
+    /// Allocation-free <see cref="ReadOnlySpan{T}"/> over the underlying
+    /// column-index storage. Same caveats as <see cref="RowIndicesSpan"/>.
     /// </summary>
-    internal int[] ColumnIndicesArray => _columnIndices;
+    internal ReadOnlySpan<int> ColumnIndicesSpan => _columnIndices;
 
     /// <summary>Number of non-zero values stored.</summary>
     public int NonZeroCount => _rowIndices.Length;

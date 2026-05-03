@@ -253,12 +253,19 @@ public sealed class ParameterBuffer<T>
         // matches the dense-leaf contract where CreateView returns a
         // live view of the buffer.
         var valuesVector = _data.CreateSlice(_offsets[index], sparse.NonZeroCount);
-        // RowIndicesArray / ColumnIndicesArray are internal accessors that
-        // hand SparseTensor the layout's own backing int[] without an
-        // extra defensive copy. The layout's immutability is preserved
-        // because SparseTensor only reads the index arrays.
+        // Defensive copy of the index arrays before handing them to
+        // SparseTensor: the SparseTensor ctor stores int[] by reference
+        // and exposes mutable RowIndices/ColumnIndices properties, so a
+        // caller could otherwise rewrite the layout's pattern through
+        // a returned view. Cloning via Span.ToArray() gives SparseTensor
+        // its own arrays, isolated from the layout's storage. Cost is
+        // O(NonZeroCount) per CreateView call — acceptable since
+        // CreateView is typically called once per parameter at training
+        // setup, not in a per-step hot loop.
         return new SparseTensor<T>(sparse.Rows, sparse.Columns,
-            sparse.RowIndicesArray, sparse.ColumnIndicesArray, valuesVector);
+            sparse.RowIndicesSpan.ToArray(),
+            sparse.ColumnIndicesSpan.ToArray(),
+            valuesVector);
     }
 
     /// <summary>
@@ -497,11 +504,12 @@ public sealed class ParameterBuffer<T>
                         $"layout NonZeroCount ({sparseLayout.NonZeroCount}). The sparsity pattern " +
                         "is fixed at construction time.",
                         nameof(parameters));
-                // Hoist the ReadOnlySpan views once so the property
-                // dispatch and ReadOnlyMemory→Span conversion don't run
-                // on every k.
-                var layoutRows = sparseLayout.RowIndices.Span;
-                var layoutCols = sparseLayout.ColumnIndices.Span;
+                // Hoist the no-alloc internal spans once so each k
+                // iteration is span-bounded indexing — using the public
+                // RowIndices.Span path would allocate a fresh int[]
+                // copy on every property access.
+                var layoutRows = sparseLayout.RowIndicesSpan;
+                var layoutCols = sparseLayout.ColumnIndicesSpan;
                 for (int k = 0; k < sparseLayout.NonZeroCount; k++)
                 {
                     if (coo.RowIndices[k] != layoutRows[k]
@@ -635,8 +643,10 @@ public sealed class ParameterBuffer<T>
                             $"Sparse leaf {i} dense gradient shape " +
                             $"[{denseGrad.Shape[0]}, {denseGrad.Shape[1]}] does not match layout " +
                             $"[{sparseLayout.Rows}, {sparseLayout.Columns}].");
-                    var layoutRows = sparseLayout.RowIndices.Span;
-                    var layoutCols = sparseLayout.ColumnIndices.Span;
+                    // Use the no-alloc internal spans; the public
+                    // RowIndices.Span path would clone on every access.
+                    var layoutRows = sparseLayout.RowIndicesSpan;
+                    var layoutCols = sparseLayout.ColumnIndicesSpan;
                     for (int k = 0; k < sparseLayout.NonZeroCount; k++)
                     {
                         dst[k] = denseGrad[layoutRows[k], layoutCols[k]];
@@ -664,10 +674,11 @@ public sealed class ParameterBuffer<T>
     private static bool PatternsMatch(SparseTensor<T> coo, SparsityLayout layout)
     {
         if (coo.RowIndices.Length != layout.NonZeroCount) return false;
-        // Take spans once outside the loop so the property dispatch and
-        // ReadOnlyMemory→ReadOnlySpan conversion don't run on every k.
-        var layoutRows = layout.RowIndices.Span;
-        var layoutCols = layout.ColumnIndices.Span;
+        // Use the no-alloc internal spans; the public RowIndices.Span
+        // path would clone the underlying int[] on every property
+        // access.
+        var layoutRows = layout.RowIndicesSpan;
+        var layoutCols = layout.ColumnIndicesSpan;
         for (int k = 0; k < layout.NonZeroCount; k++)
         {
             if (coo.RowIndices[k] != layoutRows[k]
