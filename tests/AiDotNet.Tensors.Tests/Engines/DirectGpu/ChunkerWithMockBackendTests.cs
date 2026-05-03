@@ -335,5 +335,116 @@ public class ChunkerWithMockBackendTests
         Assert.Null(result);
         Assert.False(emitted);
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Profiler-active-but-event-dropped paths.
+    //
+    // Per PR #289 review: a session can be active (Profiler.Current is
+    // non-null) yet still drop a RecordInstant call because:
+    //   1. ProfilerActivities.None — CPU capture is disabled.
+    //   2. Schedule phase is Wait or Stopped — outside the recording
+    //      window.
+    //   3. Session is disposed — already torn down.
+    // The chunker must report emittedEvent = false in all three cases
+    // so the outer dispatcher's generic cpu_fallback marker is NOT
+    // suppressed; otherwise telemetry is silently lost for
+    // profiled-but-currently-inactive sessions.
+    // ───────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void TryRunUnaryChunked_SessionActiveButActivitiesNone_ReturnsFalseEmitted()
+    {
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        // Session exists but Activities = None means RecordInstant is
+        // a no-op even though Profiler.Current is non-null.
+        using var session = Profiler.Profile(new ProfilerOptions
+        {
+            Activities = ProfilerActivities.None,
+        });
+
+        var result = engine.TryRunUnaryChunked<float>(backend, input,
+            (b, bIn, bOut, len) =>
+            {
+                state.UnaryOpCalls++;
+                var bufferIn = (MockGpuBuffer)bIn;
+                var bufferOut = (MockGpuBuffer)bOut;
+                for (int i = 0; i < len; i++) bufferOut.Data[i] = bufferIn.Data[i];
+            },
+            ex,
+            out bool emitted);
+
+        Assert.NotNull(result);                 // chunker still dispatches
+        Assert.Equal(2, state.UnaryOpCalls);    // both chunks ran
+        Assert.False(emitted, "ProfilerActivities.None drops RecordInstant; emittedEvent must be false so the outer fallback marker is not suppressed");
+        Assert.Equal(0, session.EventCount - 1); // only the metadata prologue is in the queue
+    }
+
+    [Fact]
+    public void TryRunUnaryChunked_SessionActiveButScheduleInWait_ReturnsFalseEmitted()
+    {
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        // Schedule with wait=10 means we sit in the Wait phase for the
+        // first 10 steps; RecordInstant short-circuits in this phase
+        // even though the session is otherwise live.
+        using var session = Profiler.Profile(new ProfilerOptions
+        {
+            Activities = ProfilerActivities.Cpu,
+            Schedule = new ProfilerSchedule(wait: 10, warmup: 0, active: 1, repeat: 1),
+        });
+
+        Assert.Equal(ProfilerSchedulePhase.Wait, session.CurrentPhase);
+
+        var result = engine.TryRunUnaryChunked<float>(backend, input,
+            (b, bIn, bOut, len) => state.UnaryOpCalls++,
+            ex,
+            out bool emitted);
+
+        Assert.NotNull(result);
+        Assert.False(emitted, "schedule phase Wait drops RecordInstant; emittedEvent must be false");
+    }
+
+    [Fact]
+    public void TryRunBinaryChunked_SessionActiveButActivitiesNone_ReturnsFalseEmitted()
+    {
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        using var session = Profiler.Profile(new ProfilerOptions
+        {
+            Activities = ProfilerActivities.None,
+        });
+
+        var result = engine.TryRunBinaryChunked<float>(backend, left, right,
+            (b, bA, bB, bC, len) =>
+            {
+                state.BinaryOpCalls++;
+                var ba = (MockGpuBuffer)bA;
+                var bb = (MockGpuBuffer)bB;
+                var bc = (MockGpuBuffer)bC;
+                for (int i = 0; i < len; i++) bc.Data[i] = ba.Data[i] + bb.Data[i];
+            },
+            ex,
+            out bool emitted);
+
+        Assert.NotNull(result);
+        Assert.False(emitted, "ProfilerActivities.None drops RecordInstant; emittedEvent must be false");
+    }
 }
 #endif

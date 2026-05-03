@@ -128,10 +128,17 @@ public static class Profiler
     }
 
     /// <summary>Records an instantaneous event on the active session.
-    /// No-op when no session is active.</summary>
-    public static void RecordInstant(string name, string category = "instant", IReadOnlyDictionary<string, string>? args = null)
+    /// Returns <c>true</c> when the event was accepted; <c>false</c> when
+    /// no session is active or the active session dropped the event
+    /// (CPU capture disabled, schedule phase Wait/Stopped, disposed).
+    /// Callers tracking de-duplication against an outer fallback need
+    /// the bool: only suppressing the outer event when the inner event
+    /// was actually recorded prevents silent telemetry loss.</summary>
+    public static bool RecordInstant(string name, string category = "instant", IReadOnlyDictionary<string, string>? args = null)
     {
-        Current?.RecordInstant(name, category, args);
+        var session = Current;
+        if (session is null) return false;
+        return session.RecordInstant(name, category, args);
     }
 
     /// <summary>

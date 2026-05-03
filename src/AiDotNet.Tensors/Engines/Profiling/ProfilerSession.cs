@@ -144,19 +144,27 @@ public sealed class ProfilerSession : IDisposable
     /// <summary>
     /// Records an instantaneous event (no duration). Useful for one-shot
     /// markers like "autotune cache miss" or "recompile triggered".
+    /// Returns <c>true</c> when the event was accepted and enqueued;
+    /// <c>false</c> when it was dropped because the session is disposed,
+    /// CPU capture is disabled (<see cref="ProfilerActivities.None"/>),
+    /// or the schedule phase is <see cref="ProfilerSchedulePhase.Wait"/>
+    /// or <see cref="ProfilerSchedulePhase.Stopped"/>. Callers that
+    /// dedupe against an outer fallback marker need this distinction
+    /// so a no-op record doesn't suppress the outer event.
     /// </summary>
-    public void RecordInstant(string name, string category, IReadOnlyDictionary<string, string>? args = null)
+    public bool RecordInstant(string name, string category, IReadOnlyDictionary<string, string>? args = null)
     {
-        if (_disposed) return;
-        if (!IsCpuCaptureEnabled()) return;
+        if (_disposed) return false;
+        if (!IsCpuCaptureEnabled()) return false;
         var phase = CurrentPhase;
-        if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return;
+        if (phase != ProfilerSchedulePhase.Active && phase != ProfilerSchedulePhase.Warmup) return false;
 
         long ts = TicksToMicros(Stopwatch.GetTimestamp() - _sessionStartTicks);
         EnqueueEvent(TraceEvent.Instant(
             name, category, ts,
             _processId, System.Environment.CurrentManagedThreadId,
             args));
+        return true;
     }
 
     /// <summary>

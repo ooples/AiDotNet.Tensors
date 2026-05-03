@@ -1272,19 +1272,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Records a "gpu.fallback.buffer_cap" Profiler event. Returns true
-    /// when the profiler was active and accepted the event; false when no
-    /// session was active and nothing was recorded. Callers that track
-    /// "did this dispatch already log a decision?" must use the return
-    /// value, not assume an event always lands — the de-dup logic in
-    /// HandleBufferTooLarge depends on this distinction.
+    /// when the active profiler session actually accepted and enqueued
+    /// the event; false when nothing was recorded — either because no
+    /// session is active, OR because the active session dropped the
+    /// event (CPU capture disabled via <c>ProfilerActivities.None</c>,
+    /// schedule phase in <c>Wait</c>/<c>Stopped</c>, or session disposed).
+    /// Callers that track "did this dispatch already log a decision?"
+    /// must use the return value: only suppress the outer fallback
+    /// marker when the inner event was *actually* recorded — otherwise
+    /// telemetry is silently lost for profiled-but-inactive sessions.
     /// </summary>
     private bool EmitBufferCapEvent(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, string opName, string decision)
     {
-        // Zero-overhead when no profiler session is active. When the user
-        // enables one via PredictionModelBuilder.ConfigureProfiling, the
-        // event lands in PredictionModelResult.ProfilingReport.
+        // Zero-overhead fast-path when no profiler session is active.
+        // RecordInstant would itself short-circuit, but checking up front
+        // avoids the dictionary allocation below for the common no-session
+        // case where the event is going to be dropped anyway.
         if (Profiling.Profiler.Current is null) return false;
-        Profiling.Profiler.RecordInstant(
+        // RecordInstant returns true only when the event landed; that
+        // means the session is active, CPU capture is enabled, and the
+        // schedule phase is Active or Warmup. False means the session
+        // existed but dropped this specific event — in which case we
+        // must NOT report success, otherwise the outer dispatcher's
+        // generic cpu_fallback marker gets suppressed and the user sees
+        // no record of the fallback at all.
+        return Profiling.Profiler.RecordInstant(
             "gpu.fallback.buffer_cap",
             category: "gpu_dispatch",
             args: new System.Collections.Generic.Dictionary<string, string>
@@ -1296,7 +1308,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 ["cap_bytes"] = ex.DeviceMaxAllocBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["decision"] = decision,
             });
-        return true;
     }
 
     /// <summary>
