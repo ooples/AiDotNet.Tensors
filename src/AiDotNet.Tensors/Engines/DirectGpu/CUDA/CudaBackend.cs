@@ -5192,6 +5192,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
 
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
+        // Issue #285: per-allocation cap check before cuMemAlloc.
+        GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(int);
@@ -5204,12 +5206,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
 
         using var _ = PushContext();
         int size = data.Length;
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(data), "Buffer size must be positive.");
         ulong byteSize = (ulong)size * sizeof(int);
+        // Issue #285: per-allocation cap check before cuMemAlloc.
+        GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
 
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
 

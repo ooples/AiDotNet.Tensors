@@ -1404,36 +1404,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var resultFloat = new float[totalElements];
         EmitBufferCapEvent(ex, "TryRunUnary", decision: $"chunked_{chunkCount}");
         emittedEvent = true;
-        for (int c = 0; c < chunkCount; c++)
+        // Wrap the chunk loop so any per-chunk failure (allocation OOM,
+        // kernel dispatch, download error) cleanly falls through to CPU
+        // instead of propagating and crashing the user's training step.
+        // Re-throw GpuBufferTooLargeException specifically so the outer
+        // dispatcher's policy (NeverChunk_FailFast) still works.
+        try
         {
-            int offset = c * (int)chunkElements;
-            int len = (int)Math.Min(chunkElements, totalElements - offset);
-            var slice = new float[len];
-            Array.Copy(inputFloat, offset, slice, 0, len);
+            for (int c = 0; c < chunkCount; c++)
+            {
+                int offset = c * (int)chunkElements;
+                int len = (int)Math.Min(chunkElements, totalElements - offset);
+                var slice = new float[len];
+                Array.Copy(inputFloat, offset, slice, 0, len);
 
-            using var bufferIn = new OwnedBuffer(backend.AllocateBuffer(slice), ownsBuffer: true);
-            using var bufferOut = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-            // Mirror the AutocastScope behaviour from TryRunUnaryGpu: when
-            // autocast is enabled, run the kernel on fp16 and convert back
-            // to fp32 for the downloaded result. Without this the chunked
-            // fallback would silently change numeric / perf behaviour vs
-            // the normal GPU path.
-            var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
-            if (fp16Input is not null)
-            {
-                using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                op(backend, fp16Input, fp16Out.Buffer, len);
-                backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
-                fp16Input.Dispose();
+                using var bufferIn = new OwnedBuffer(backend.AllocateBuffer(slice), ownsBuffer: true);
+                using var bufferOut = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                // Mirror the AutocastScope behaviour from TryRunUnaryGpu: when
+                // autocast is enabled, run the kernel on fp16 and convert back
+                // to fp32 for the downloaded result. Without this the chunked
+                // fallback would silently change numeric / perf behaviour vs
+                // the normal GPU path.
+                var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
+                if (fp16Input is not null)
+                {
+                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                    op(backend, fp16Input, fp16Out.Buffer, len);
+                    backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
+                    fp16Input.Dispose();
+                }
+                else
+                {
+                    op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+                }
+                var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
+                Array.Copy(chunkResult, 0, resultFloat, offset, len);
             }
-            else
-            {
-                op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
-            }
-            var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
-            Array.Copy(chunkResult, 0, resultFloat, offset, len);
+            return (T[])(object)resultFloat;
         }
-        return (T[])(object)resultFloat;
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException)
+        {
+            // Sub-chunk also too large — let the outer dispatcher decide
+            // policy (rethrow under NeverChunk_FailFast, CPU otherwise).
+            throw;
+        }
+        catch (Exception)
+        {
+            // OOM / kernel dispatch / download errors during the chunk loop:
+            // emit a cpu_fallback event for telemetry and let the outer
+            // dispatcher route to CPU.
+            EmitBufferCapEvent(ex, "TryRunUnary", decision: "cpu_fallback_chunk_dispatch_error");
+            return null;
+        }
     }
 
     /// <summary>
@@ -1533,41 +1555,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var resultFloat = new float[totalElements];
         EmitBufferCapEvent(ex, "TryRunBinary", decision: $"chunked_{chunkCount}");
         emittedEvent = true;
-        for (int c = 0; c < chunkCount; c++)
+        // Wrap the chunk loop so any per-chunk failure cleanly falls through
+        // to CPU instead of crashing the user's training step. See the same
+        // pattern in TryRunUnaryChunked for the rationale.
+        try
         {
-            int offset = c * (int)chunkElements;
-            int len = (int)Math.Min(chunkElements, totalElements - offset);
-            var sliceL = new float[len];
-            var sliceR = new float[len];
-            Array.Copy(leftFloat, offset, sliceL, 0, len);
-            Array.Copy(rightFloat, offset, sliceR, 0, len);
+            for (int c = 0; c < chunkCount; c++)
+            {
+                int offset = c * (int)chunkElements;
+                int len = (int)Math.Min(chunkElements, totalElements - offset);
+                var sliceL = new float[len];
+                var sliceR = new float[len];
+                Array.Copy(leftFloat, offset, sliceL, 0, len);
+                Array.Copy(rightFloat, offset, sliceR, 0, len);
 
-            using var bA = new OwnedBuffer(backend.AllocateBuffer(sliceL), ownsBuffer: true);
-            using var bB = new OwnedBuffer(backend.AllocateBuffer(sliceR), ownsBuffer: true);
-            using var bC = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-            // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
-            // chunked fallback doesn't silently change numeric/perf behaviour
-            // when autocast is enabled.
-            var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
-            var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
-            if (fp16A is not null && fp16B is not null)
-            {
-                using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                op(backend, fp16A, fp16B, fp16Out.Buffer, len);
-                backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
-                fp16A.Dispose();
-                fp16B.Dispose();
+                using var bA = new OwnedBuffer(backend.AllocateBuffer(sliceL), ownsBuffer: true);
+                using var bB = new OwnedBuffer(backend.AllocateBuffer(sliceR), ownsBuffer: true);
+                using var bC = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
+                // chunked fallback doesn't silently change numeric/perf behaviour
+                // when autocast is enabled.
+                var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
+                var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
+                if (fp16A is not null && fp16B is not null)
+                {
+                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                    op(backend, fp16A, fp16B, fp16Out.Buffer, len);
+                    backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
+                    fp16A.Dispose();
+                    fp16B.Dispose();
+                }
+                else
+                {
+                    fp16A?.Dispose();
+                    fp16B?.Dispose();
+                    op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
+                }
+                var chunkResult = backend.DownloadBuffer(bC.Buffer);
+                Array.Copy(chunkResult, 0, resultFloat, offset, len);
             }
-            else
-            {
-                fp16A?.Dispose();
-                fp16B?.Dispose();
-                op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
-            }
-            var chunkResult = backend.DownloadBuffer(bC.Buffer);
-            Array.Copy(chunkResult, 0, resultFloat, offset, len);
+            return (T[])(object)resultFloat;
         }
-        return (T[])(object)resultFloat;
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException)
+        {
+            // Sub-chunk also too large — let the outer dispatcher decide
+            // policy (rethrow under NeverChunk_FailFast, CPU otherwise).
+            throw;
+        }
+        catch (Exception)
+        {
+            EmitBufferCapEvent(ex, "TryRunBinary", decision: "cpu_fallback_chunk_dispatch_error");
+            return null;
+        }
     }
 
     // Legacy T[] overloads kept for backward compatibility with IEngine explicit implementations
@@ -1631,17 +1670,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return null;
 
-        using var bufferA = GetOrAllocateBuffer(backend, input);
-        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        // Issue #285: scalar ops are element-wise, so an over-cap allocation
+        // here should also fall through to CPU per the configured policy
+        // (no chunked path for scalar ops yet — chunking would need to be
+        // added to TryRunScalarChunked; tracked as follow-up).
         try
         {
-            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-            return FinishGpuOp<T>(backend, bufferB, input.Length);
+            using var bufferA = GetOrAllocateBuffer(backend, input);
+            var bufferB = AllocateOutputBuffer(backend, input.Length);
+            try
+            {
+                op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+                return FinishGpuOp<T>(backend, bufferB, input.Length);
+            }
+            catch
+            {
+                bufferB.Dispose();
+                throw;
+            }
         }
-        catch
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            bufferB.Dispose();
-            throw;
+            return HandleBufferTooLarge<T>(ex, "TryRunScalar");
         }
     }
 
@@ -1655,18 +1705,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (left.Length != right.Length)
             return null;
 
-        using var bufferA = AllocateBufferFromSpan(backend, left);
-        using var bufferB = AllocateBufferFromSpan(backend, right);
-        var bufferC = AllocateOutputBuffer(backend, left.Length);
         try
         {
-            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-            return FinishGpuOp<T>(backend, bufferC, left.Length);
+            using var bufferA = AllocateBufferFromSpan(backend, left);
+            using var bufferB = AllocateBufferFromSpan(backend, right);
+            var bufferC = AllocateOutputBuffer(backend, left.Length);
+            try
+            {
+                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                return FinishGpuOp<T>(backend, bufferC, left.Length);
+            }
+            catch
+            {
+                bufferC.Dispose();
+                throw;
+            }
         }
-        catch
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            bufferC.Dispose();
-            throw;
+            return HandleBufferTooLarge<T>(ex, "TryRunBinarySpan");
         }
     }
 
@@ -1678,17 +1735,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return null;
 
-        using var bufferA = AllocateBufferFromSpan(backend, input);
-        var bufferB = AllocateOutputBuffer(backend, input.Length);
         try
         {
-            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-            return FinishGpuOp<T>(backend, bufferB, input.Length);
+            using var bufferA = AllocateBufferFromSpan(backend, input);
+            var bufferB = AllocateOutputBuffer(backend, input.Length);
+            try
+            {
+                op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+                return FinishGpuOp<T>(backend, bufferB, input.Length);
+            }
+            catch
+            {
+                bufferB.Dispose();
+                throw;
+            }
         }
-        catch
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            bufferB.Dispose();
-            throw;
+            return HandleBufferTooLarge<T>(ex, "TryRunScalarSpan");
         }
     }
 
