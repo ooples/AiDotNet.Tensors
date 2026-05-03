@@ -64,6 +64,46 @@ public class ChunkerWithMockBackendTests
     }
 
     [Fact]
+    public void TryRunUnaryChunked_NoProfilerSession_DispatchesAndReportsFalseEmitted()
+    {
+        // Mirror image of the above SplitsAcrossCap test: same workload,
+        // identical chunker behaviour expected, but Profiler.Current is
+        // null. Verifies the zero-overhead-when-off contract — the
+        // chunker still produces the correct result, but emittedEvent
+        // stays false so the outer dispatcher's generic cpu_fallback
+        // marker is NOT suppressed.
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, new[] { 12 });
+        var ex = new GpuBufferTooLargeException("Mock", requestedBytes: 48, deviceMaxAllocBytes: 16, deviceName: "MockDevice");
+
+        // Sanity: no session is active. The collection-level isolation
+        // (DisableParallelization) plus the using-statements in the
+        // other tests guarantee this is true at this point.
+        Assert.Null(Profiler.Current);
+
+        var result = engine.TryRunUnaryChunked<float>(backend, input,
+            (b, bIn, bOut, len) =>
+            {
+                state.UnaryOpCalls++;
+                var bufferIn = (MockGpuBuffer)bIn;
+                var bufferOut = (MockGpuBuffer)bOut;
+                for (int i = 0; i < len; i++) bufferOut.Data[i] = bufferIn.Data[i] * 2;
+            },
+            ex,
+            out bool emitted);
+
+        Assert.NotNull(result);
+        Assert.Equal(12, result!.Length);
+        for (int i = 0; i < 12; i++)
+            Assert.Equal((i + 1) * 2f, result[i]);
+        Assert.Equal(3, state.UnaryOpCalls);
+        Assert.False(emitted, "no profiler session ⇒ no event landed ⇒ emittedEvent must be false");
+    }
+
+    [Fact]
     public void TryRunUnaryChunked_ChunkCountExceedsMax_ReturnsNullAndEmits()
     {
         // Cap = 4 bytes (1 element per chunk), 100 elements → 100 chunks.

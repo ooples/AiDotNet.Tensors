@@ -1480,8 +1480,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // OOM / kernel dispatch / download errors during the chunk loop:
             // emit a cpu_fallback event for telemetry and let the outer
-            // dispatcher route to CPU.
-            EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
+            // dispatcher route to CPU. OR-into emittedEvent so that even
+            // if the earlier "chunked_N" event was dropped (e.g. session
+            // entered Wait phase between the two records) the outer
+            // dispatcher still suppresses its own marker when this one
+            // lands — otherwise we'd double-log the fallback.
+            emittedEvent |= EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
             return null;
         }
     }
@@ -1631,7 +1635,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
-            EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
+            // OR-into emittedEvent: see the matching unary catch block
+            // for the rationale — accumulating prevents a double-log
+            // when the earlier "chunked_N" event was dropped but this
+            // one landed.
+            emittedEvent |= EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
             return null;
         }
     }
