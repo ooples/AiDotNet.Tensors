@@ -191,16 +191,50 @@ public static class SparseAutograd
         // Compute dA over the pattern only — never materialises the
         // dense O(rows × columns) gradient.
         var gradValues = new T[nnz];
-        for (int idx = 0; idx < nnz; idx++)
+
+        // Fast path: when both b and gradOutput are contiguous rank-2
+        // tensors we can slice each row once via the underlying flat
+        // span instead of paying for the per-element indexer's
+        // bounds-and-stride math on every (idx, k). This is a hot path
+        // in sampled-addmm backward — a sparsity-N x innerK loop over
+        // millions of pattern entries is the typical workload.
+        bool bFastPath = b.IsContiguous && b.Shape.Length == 2;
+        bool gFastPath = gradOutput.IsContiguous && gradOutput.Shape.Length == 2;
+        if (bFastPath && gFastPath)
         {
-            int i = rowIndices[idx];
-            int j = colIndices[idx];
-            T sum = ops.Zero;
-            for (int k = 0; k < innerK; k++)
+            var bSpan = b.AsSpan();
+            var gSpan = gradOutput.AsSpan();
+            int bRowStride = b.Shape[1];
+            int gRowStride = gradOutput.Shape[1];
+            for (int idx = 0; idx < nnz; idx++)
             {
-                sum = ops.Add(sum, ops.Multiply(b[j, k], gradOutput[i, k]));
+                int i = rowIndices[idx];
+                int j = colIndices[idx];
+                var bRow = bSpan.Slice(j * bRowStride, innerK);
+                var gRow = gSpan.Slice(i * gRowStride, innerK);
+                T sum = ops.Zero;
+                for (int k = 0; k < innerK; k++)
+                {
+                    sum = ops.Add(sum, ops.Multiply(bRow[k], gRow[k]));
+                }
+                gradValues[idx] = sum;
             }
-            gradValues[idx] = sum;
+        }
+        else
+        {
+            // Non-contiguous fallback uses the indexer; correctness is
+            // preserved at the cost of per-element stride math.
+            for (int idx = 0; idx < nnz; idx++)
+            {
+                int i = rowIndices[idx];
+                int j = colIndices[idx];
+                T sum = ops.Zero;
+                for (int k = 0; k < innerK; k++)
+                {
+                    sum = ops.Add(sum, ops.Multiply(b[j, k], gradOutput[i, k]));
+                }
+                gradValues[idx] = sum;
+            }
         }
         var sparseGradA = new SparseTensor<T>(rows, columns, rowIndices, colIndices, gradValues);
         AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
@@ -221,17 +255,43 @@ public static class SparseAutograd
         // gradB starts zero (Tensor ctor zero-fills); accumulate
         //   gradB[j, k] += A_value[idx] · dY[i, k]    where (i, j) ∈ pattern_A
         // Equivalent to A^T · dY without materialising the dense A.
-        for (int idx = 0; idx < nnz; idx++)
+        // Same span fast path as the dA loop above: when gradOutput is
+        // contiguous rank-2 we slice the row once per idx and iterate
+        // with span access. gradBSpan is already a writable span over
+        // freshly-allocated contiguous storage, so writes are span-fast.
+        if (gFastPath)
         {
-            int i = rowIndices[idx];
-            int j = colIndices[idx];
-            T aVal = aValues[idx];
-            int rowStart = j * innerK;
-            for (int k = 0; k < innerK; k++)
+            var gOutSpan = gradOutput.AsSpan();
+            int gOutRowStride = gradOutput.Shape[1];
+            for (int idx = 0; idx < nnz; idx++)
             {
-                gradBSpan[rowStart + k] = ops.Add(
-                    gradBSpan[rowStart + k],
-                    ops.Multiply(aVal, gradOutput[i, k]));
+                int i = rowIndices[idx];
+                int j = colIndices[idx];
+                T aVal = aValues[idx];
+                int rowStart = j * innerK;
+                var gOutRow = gOutSpan.Slice(i * gOutRowStride, innerK);
+                for (int k = 0; k < innerK; k++)
+                {
+                    gradBSpan[rowStart + k] = ops.Add(
+                        gradBSpan[rowStart + k],
+                        ops.Multiply(aVal, gOutRow[k]));
+                }
+            }
+        }
+        else
+        {
+            for (int idx = 0; idx < nnz; idx++)
+            {
+                int i = rowIndices[idx];
+                int j = colIndices[idx];
+                T aVal = aValues[idx];
+                int rowStart = j * innerK;
+                for (int k = 0; k < innerK; k++)
+                {
+                    gradBSpan[rowStart + k] = ops.Add(
+                        gradBSpan[rowStart + k],
+                        ops.Multiply(aVal, gradOutput[i, k]));
+                }
             }
         }
         AccumulateGrad(b, gradB, gradAccumulator, engine);

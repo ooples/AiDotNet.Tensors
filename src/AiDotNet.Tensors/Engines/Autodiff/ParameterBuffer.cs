@@ -253,8 +253,12 @@ public sealed class ParameterBuffer<T>
         // matches the dense-leaf contract where CreateView returns a
         // live view of the buffer.
         var valuesVector = _data.CreateSlice(_offsets[index], sparse.NonZeroCount);
+        // RowIndicesArray / ColumnIndicesArray are internal accessors that
+        // hand SparseTensor the layout's own backing int[] without an
+        // extra defensive copy. The layout's immutability is preserved
+        // because SparseTensor only reads the index arrays.
         return new SparseTensor<T>(sparse.Rows, sparse.Columns,
-            sparse.RowIndices, sparse.ColumnIndices, valuesVector);
+            sparse.RowIndicesArray, sparse.ColumnIndicesArray, valuesVector);
     }
 
     /// <summary>
@@ -493,15 +497,20 @@ public sealed class ParameterBuffer<T>
                         $"layout NonZeroCount ({sparseLayout.NonZeroCount}). The sparsity pattern " +
                         "is fixed at construction time.",
                         nameof(parameters));
+                // Hoist the ReadOnlySpan views once so the property
+                // dispatch and ReadOnlyMemory→Span conversion don't run
+                // on every k.
+                var layoutRows = sparseLayout.RowIndices.Span;
+                var layoutCols = sparseLayout.ColumnIndices.Span;
                 for (int k = 0; k < sparseLayout.NonZeroCount; k++)
                 {
-                    if (coo.RowIndices[k] != sparseLayout.RowIndices[k]
-                        || coo.ColumnIndices[k] != sparseLayout.ColumnIndices[k])
+                    if (coo.RowIndices[k] != layoutRows[k]
+                        || coo.ColumnIndices[k] != layoutCols[k])
                     {
                         throw new ArgumentException(
                             $"Parameter {i} COO pattern at index {k} differs from layout " +
                             $"(source [{coo.RowIndices[k]}, {coo.ColumnIndices[k]}] vs layout " +
-                            $"[{sparseLayout.RowIndices[k]}, {sparseLayout.ColumnIndices[k]}]). " +
+                            $"[{layoutRows[k]}, {layoutCols[k]}]). " +
                             "Sparsity pattern is fixed.",
                             nameof(parameters));
                     }
@@ -626,9 +635,11 @@ public sealed class ParameterBuffer<T>
                             $"Sparse leaf {i} dense gradient shape " +
                             $"[{denseGrad.Shape[0]}, {denseGrad.Shape[1]}] does not match layout " +
                             $"[{sparseLayout.Rows}, {sparseLayout.Columns}].");
+                    var layoutRows = sparseLayout.RowIndices.Span;
+                    var layoutCols = sparseLayout.ColumnIndices.Span;
                     for (int k = 0; k < sparseLayout.NonZeroCount; k++)
                     {
-                        dst[k] = denseGrad[sparseLayout.RowIndices[k], sparseLayout.ColumnIndices[k]];
+                        dst[k] = denseGrad[layoutRows[k], layoutCols[k]];
                     }
                 }
                 continue;
@@ -653,10 +664,14 @@ public sealed class ParameterBuffer<T>
     private static bool PatternsMatch(SparseTensor<T> coo, SparsityLayout layout)
     {
         if (coo.RowIndices.Length != layout.NonZeroCount) return false;
+        // Take spans once outside the loop so the property dispatch and
+        // ReadOnlyMemory→ReadOnlySpan conversion don't run on every k.
+        var layoutRows = layout.RowIndices.Span;
+        var layoutCols = layout.ColumnIndices.Span;
         for (int k = 0; k < layout.NonZeroCount; k++)
         {
-            if (coo.RowIndices[k] != layout.RowIndices[k]
-                || coo.ColumnIndices[k] != layout.ColumnIndices[k])
+            if (coo.RowIndices[k] != layoutRows[k]
+                || coo.ColumnIndices[k] != layoutCols[k])
                 return false;
         }
         return true;

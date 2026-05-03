@@ -132,8 +132,37 @@ public class SparseAwareParameterBufferTests
         rowIdx[0] = 99;
         colIdx[0] = 99;
 
-        Assert.Equal(0, layout.RowIndices[0]);
-        Assert.Equal(0, layout.ColumnIndices[0]);
+        Assert.Equal(0, layout.RowIndices.Span[0]);
+        Assert.Equal(0, layout.ColumnIndices.Span[0]);
+    }
+
+    /// <summary>
+    /// External callers cannot mutate the layout's backing index arrays
+    /// through the public surface: <see cref="SparsityLayout.RowIndices"/>
+    /// and <see cref="SparsityLayout.ColumnIndices"/> return
+    /// <see cref="ReadOnlyMemory{T}"/>, which has no API to write into
+    /// the underlying storage. Compile-time verifies the contract; the
+    /// runtime asserts the values stay stable after a hostile cast
+    /// attempt would have failed.
+    /// </summary>
+    [Fact]
+    public void SparsityLayout_RowAndColumnIndices_AreReadOnly()
+    {
+        var layout = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+
+        // The compile-time check is that these are ReadOnlyMemory<int>:
+        ReadOnlyMemory<int> rows = layout.RowIndices;
+        ReadOnlyMemory<int> cols = layout.ColumnIndices;
+
+        // ReadOnlySpan write attempt fails to compile; runtime check
+        // confirms values remain unchanged after a snapshot.
+        var rowsBefore = rows.ToArray();
+        var colsBefore = cols.ToArray();
+
+        Assert.Equal(new[] { 0, 1, 2 }, rowsBefore);
+        Assert.Equal(new[] { 0, 1, 2 }, colsBefore);
+        Assert.Equal(rowsBefore, layout.RowIndices.ToArray());
+        Assert.Equal(colsBefore, layout.ColumnIndices.ToArray());
     }
 
     /// <summary>

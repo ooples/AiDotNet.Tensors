@@ -26,11 +26,14 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// while still preserving the dense shape for shape inference and
 /// serialization.</para>
 ///
-/// <para><b>Sparsity pattern immutability:</b> The pattern's row and
-/// column index arrays are captured by reference at layout creation and
-/// must not be mutated afterwards. Mutating them while the buffer is
-/// live would desynchronize <see cref="ParameterBuffer{T}.CreateView"/>
-/// from the actual storage layout.</para>
+/// <para><b>Immutability:</b> Both the dense shape and the sparsity
+/// pattern are cloned at construction so layouts are immutable by
+/// ownership: subsequent mutations to caller-supplied arrays cannot
+/// desynchronize <see cref="ParameterBuffer{T}.CreateView"/> from the
+/// actual storage layout. The public <c>DenseShape</c> getter exposes
+/// the layout's own copy; sparse pattern indices are exposed only via
+/// <see cref="System.ReadOnlyMemory{T}"/> views to prevent external
+/// mutation of the layout's storage.</para>
 /// </remarks>
 public sealed class ParameterLayout
 {
@@ -38,7 +41,9 @@ public sealed class ParameterLayout
     /// The dense semantic shape of the parameter. For sparse leaves this
     /// is the shape of the underlying dense matrix the sparse pattern
     /// projects onto (e.g. <c>[rows, columns]</c>); for dense leaves it
-    /// is the actual storage shape.
+    /// is the actual storage shape. The array is the layout's own clone;
+    /// callers may safely inspect it but mutations do not affect the
+    /// layout's behavior (they are caller-local).
     /// </summary>
     public int[] DenseShape { get; }
 
@@ -59,7 +64,11 @@ public sealed class ParameterLayout
     /// </summary>
     public ParameterLayout(int[] denseShape)
     {
-        DenseShape = denseShape ?? throw new ArgumentNullException(nameof(denseShape));
+        if (denseShape is null) throw new ArgumentNullException(nameof(denseShape));
+        // Clone so the layout's shape can't be mutated via the caller's
+        // array after construction. The fixed-shape contract is enforced
+        // by ownership rather than caller discipline.
+        DenseShape = (int[])denseShape.Clone();
         Sparse = null;
     }
 
@@ -69,7 +78,7 @@ public sealed class ParameterLayout
     /// </summary>
     public ParameterLayout(int[] denseShape, SparsityLayout sparse)
     {
-        DenseShape = denseShape ?? throw new ArgumentNullException(nameof(denseShape));
+        if (denseShape is null) throw new ArgumentNullException(nameof(denseShape));
         Sparse = sparse ?? throw new ArgumentNullException(nameof(sparse));
         if (denseShape.Length != 2)
             throw new ArgumentException(
@@ -80,6 +89,9 @@ public sealed class ParameterLayout
                 $"Dense shape [{denseShape[0]}, {denseShape[1]}] does not match sparse pattern " +
                 $"[{sparse.Rows}, {sparse.Columns}].",
                 nameof(denseShape));
+        // Clone after validation so the layout retains an immutable copy
+        // even if the caller mutates their array afterwards.
+        DenseShape = (int[])denseShape.Clone();
     }
 
     /// <summary>
@@ -104,10 +116,15 @@ public sealed class ParameterLayout
 /// The constructor takes its OWN COPIES of the supplied index arrays
 /// (via <see cref="System.Array.Clone"/>), so subsequent mutations to
 /// the caller's arrays do not affect this layout. The fixed-pattern
-/// contract is enforced by ownership, not by caller discipline.
+/// contract is enforced by ownership: external code can only inspect
+/// the indices through <see cref="System.ReadOnlyMemory{T}"/> views,
+/// not through a writeable <c>int[]</c> reference.
 /// </summary>
 public sealed class SparsityLayout
 {
+    private readonly int[] _rowIndices;
+    private readonly int[] _columnIndices;
+
     /// <summary>Dense matrix row count.</summary>
     public int Rows { get; }
 
@@ -116,22 +133,39 @@ public sealed class SparsityLayout
 
     /// <summary>
     /// Row indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. This is the layout's own copy, taken
-    /// at construction; mutating the caller's source array after
-    /// construction has no effect here.
+    /// <see cref="NonZeroCount"/>. Exposed as <see cref="System.ReadOnlyMemory{T}"/>
+    /// so callers cannot mutate the layout's storage; use
+    /// <c>RowIndices.Span[k]</c> for indexed access or
+    /// <c>RowIndices.ToArray()</c> for a writeable copy.
     /// </summary>
-    public int[] RowIndices { get; }
+    public ReadOnlyMemory<int> RowIndices => _rowIndices;
 
     /// <summary>
     /// Column indices of the non-zero positions, in COO order. Length =
-    /// <see cref="NonZeroCount"/>. This is the layout's own copy, taken
-    /// at construction; mutating the caller's source array after
-    /// construction has no effect here.
+    /// <see cref="NonZeroCount"/>. Exposed as <see cref="System.ReadOnlyMemory{T}"/>
+    /// so callers cannot mutate the layout's storage; use
+    /// <c>ColumnIndices.Span[k]</c> for indexed access or
+    /// <c>ColumnIndices.ToArray()</c> for a writeable copy.
     /// </summary>
-    public int[] ColumnIndices { get; }
+    public ReadOnlyMemory<int> ColumnIndices => _columnIndices;
+
+    /// <summary>
+    /// Internal accessor for the underlying row-index <c>int[]</c>.
+    /// Used by <see cref="ParameterBuffer{T}.CreateView"/> when handing
+    /// the indices to <see cref="SparseTensor{T}"/> constructors that
+    /// require a backing array. NEVER expose externally — mutating the
+    /// returned array breaks the layout's immutability contract.
+    /// </summary>
+    internal int[] RowIndicesArray => _rowIndices;
+
+    /// <summary>
+    /// Internal accessor for the underlying column-index <c>int[]</c>.
+    /// Same caveats as <see cref="RowIndicesArray"/>.
+    /// </summary>
+    internal int[] ColumnIndicesArray => _columnIndices;
 
     /// <summary>Number of non-zero values stored.</summary>
-    public int NonZeroCount => RowIndices.Length;
+    public int NonZeroCount => _rowIndices.Length;
 
     /// <summary>
     /// Builds a layout from explicit row/column index arrays. The arrays
@@ -167,8 +201,8 @@ public sealed class SparsityLayout
         // construction. Without the clones, an external mutation would
         // silently desynchronise SparsityLayout from the buffer slots
         // that depend on these indices being immutable.
-        RowIndices = (int[])rowIndices.Clone();
-        ColumnIndices = (int[])columnIndices.Clone();
+        _rowIndices = (int[])rowIndices.Clone();
+        _columnIndices = (int[])columnIndices.Clone();
     }
 
     /// <summary>
