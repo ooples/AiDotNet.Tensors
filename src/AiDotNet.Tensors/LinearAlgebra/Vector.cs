@@ -238,9 +238,13 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
         if (length < 0)
             throw new ArgumentOutOfRangeException(nameof(length), "Length must be non-negative.");
-        if (offset + length > Length)
+        // Overflow-safe end check: with offset>=0 and length>=0, computing
+        // `offset + length` may wrap past int.MaxValue and silently pass
+        // the comparison. Phrase it as `length > Length - offset` so both
+        // sides stay in [0, int.MaxValue] for any valid offset.
+        if (length > Length - offset)
             throw new ArgumentOutOfRangeException(nameof(length),
-                $"Slice [{offset}, {offset + length}) extends beyond vector length {Length}.");
+                $"Slice [offset={offset}, length={length}) extends beyond vector length {Length}.");
         // GPU-resident / lazy vectors leave _memory empty until CPU
         // access. Slicing _memory directly would silently slice
         // Memory<T>.Empty and throw on subsequent reads. Force

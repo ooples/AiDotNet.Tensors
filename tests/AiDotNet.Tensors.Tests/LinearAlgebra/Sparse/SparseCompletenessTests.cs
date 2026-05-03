@@ -419,6 +419,72 @@ public class SparseCompletenessTests
             }
     }
 
+    /// <summary>
+    /// <see cref="SparseAutograd.SparsePatternPreservingMatMulRecord{T}"/>'s
+    /// backward has a contiguous-rank-2 fast path (<c>b</c> sliced via
+    /// span) and an indexer-based fallback for non-contiguous inputs.
+    /// Run the same problem twice — once with a contiguous <c>b</c>
+    /// (fast path) and once with a logically-equal non-contiguous <c>b</c>
+    /// (slow path) — and assert the resulting gradients are identical.
+    /// Equivalence guarantees the optimisation is purely a perf change.
+    ///
+    /// <para>The non-contiguous <c>b</c> is constructed by building the
+    /// transposed shape contiguously and calling <c>Transpose([1,0])</c>
+    /// once: that returns a stride-permuted view (rank-2, non-contig)
+    /// that's logically equal to the contiguous <c>b</c>. The reviewer
+    /// noted that <c>Transpose</c> twice would round-trip back to
+    /// contiguous (zero-copy stride permutation is its own inverse on
+    /// rank-2), so we transpose exactly once.</para>
+    /// </summary>
+    [Fact]
+    public void SparseAutograd_SparsePatternPreservingMatMul_FastAndSlowPathsAgree()
+    {
+        var a = SmallA(); // sparse [4,4]
+
+        // Contiguous b: shape [4, 2], row-major.
+        var bContig = MakeDense(new float[,]
+        {
+            { 1.0f, 0.5f },
+            { -0.25f, 1.5f },
+            { 0.75f, -1.0f },
+            { 2.0f, 0.0f },
+        });
+
+        // Non-contiguous b with the SAME logical content as bContig:
+        // build the transposed shape [2, 4] contiguously then call
+        // Transpose([1,0]) → returns a view with shape [4, 2] and
+        // strides [1, 2] instead of [2, 1] (non-contiguous).
+        var bTContig = MakeDense(new float[,]
+        {
+            { 1.0f, -0.25f, 0.75f, 2.0f },
+            { 0.5f, 1.5f, -1.0f, 0.0f },
+        });
+        var bNonContig = bTContig.Transpose(new[] { 1, 0 });
+        Assert.False(bNonContig.IsContiguous, "test setup: bNonContig must take the slow path");
+        Assert.Equal(new[] { 4, 2 }, bNonContig._shape);
+        // Sanity: the logical content matches.
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 2; j++)
+                Assert.Equal(bContig[i, j], bNonContig[i, j]);
+
+        // Run #1 — fast path (b contiguous).
+        using var tape1 = new GradientTape<float>();
+        var out1 = SparseAutograd.SparsePatternPreservingMatMulRecord(a, bContig);
+        var l1 = _engine.ReduceSum(out1, null);
+        var g1 = tape1.ComputeGradients(l1, new[] { bContig });
+
+        // Run #2 — slow path (b non-contiguous).
+        using var tape2 = new GradientTape<float>();
+        var out2 = SparseAutograd.SparsePatternPreservingMatMulRecord(a, bNonContig);
+        var l2 = _engine.ReduceSum(out2, null);
+        var g2 = tape2.ComputeGradients(l2, new[] { bNonContig });
+
+        // Forward outputs must agree (sanity).
+        AssertDenseEqual(out1, out2);
+        // Gradient through b must agree across both paths.
+        AssertDenseEqual(g1[bContig], g2[bNonContig]);
+    }
+
     private static void AssertDenseEqual(Tensor<float> expected, Tensor<float> actual)
     {
         Assert.Equal(expected._shape, actual._shape);

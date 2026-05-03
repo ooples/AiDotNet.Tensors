@@ -132,8 +132,106 @@ public class SparseAwareParameterBufferTests
         rowIdx[0] = 99;
         colIdx[0] = 99;
 
-        Assert.Equal(0, layout.RowIndices[0]);
-        Assert.Equal(0, layout.ColumnIndices[0]);
+        Assert.Equal(0, layout.RowIndices.Span[0]);
+        Assert.Equal(0, layout.ColumnIndices.Span[0]);
+    }
+
+    /// <summary>
+    /// External callers cannot mutate the layout's backing index arrays
+    /// through the public surface: <see cref="SparsityLayout.RowIndices"/>
+    /// and <see cref="SparsityLayout.ColumnIndices"/> return a fresh
+    /// per-call <see cref="ReadOnlyMemory{T}"/> snapshot, so even
+    /// <see cref="System.Runtime.InteropServices.MemoryMarshal.TryGetArray{T}(ReadOnlyMemory{T},out System.ArraySegment{T})"/>
+    /// — which can recover the underlying <c>int[]</c> from an
+    /// array-backed <c>ReadOnlyMemory&lt;int&gt;</c> — only reaches the
+    /// per-call copy, never the layout's own storage.
+    /// </summary>
+    [Fact]
+    public void SparsityLayout_RowAndColumnIndices_NotReachableViaMemoryMarshal()
+    {
+        var layout = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+
+        // Snapshot the public properties twice. If they returned the
+        // layout's backing int[] directly, both calls would alias the
+        // same array; with copy-on-access semantics they're distinct.
+        var rows1 = layout.RowIndices;
+        var rows2 = layout.RowIndices;
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(rows1, out var seg1));
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(rows2, out var seg2));
+        Assert.NotSame(seg1.Array, seg2.Array);
+
+        // Hostile mutation through the recovered int[] must NOT corrupt
+        // the layout: the array we just mutated is the per-call copy,
+        // not the layout's storage.
+        seg1.Array![0] = 99;
+        Assert.Equal(0, layout.RowIndices.Span[0]);
+        Assert.Equal(0, layout.ColumnIndices.Span[0]);
+
+        // Same check for ColumnIndices.
+        var cols1 = layout.ColumnIndices;
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(cols1, out var colSeg1));
+        colSeg1.Array![0] = 99;
+        Assert.Equal(0, layout.ColumnIndices.Span[0]);
+    }
+
+    /// <summary>
+    /// <see cref="ParameterLayout.DenseShape"/> returns a fresh clone on
+    /// every access, so a caller cannot mutate <c>layout.DenseShape[i]</c>
+    /// to perturb <see cref="ParameterLayout.BufferElementCount"/> or
+    /// any <see cref="ParameterBuffer{T}"/> built from this layout.
+    /// </summary>
+    [Fact]
+    public void ParameterLayout_DenseShape_IsCloneOnAccess()
+    {
+        var layout = new ParameterLayout(new[] { 4, 8 });
+        long expectedElems = 4L * 8L;
+        Assert.Equal(expectedElems, ((object)layout).GetType()
+            .GetProperty("BufferElementCount", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(layout)!);
+
+        // Two consecutive reads must NOT alias — the getter clones.
+        var snap1 = layout.DenseShape;
+        var snap2 = layout.DenseShape;
+        Assert.NotSame(snap1, snap2);
+
+        // Mutation through a recovered reference must not affect the
+        // layout's stored shape or BufferElementCount.
+        snap1[0] = 99;
+        Assert.Equal(4, layout.DenseShape[0]);
+        Assert.Equal(expectedElems, ((object)layout).GetType()
+            .GetProperty("BufferElementCount", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(layout)!);
+    }
+
+    /// <summary>
+    /// <see cref="ParameterBuffer{T}.CreateView"/> for a sparse leaf
+    /// returns a <see cref="SparseTensor{T}"/> whose <c>RowIndices</c>
+    /// / <c>ColumnIndices</c> are defensive copies of the layout's
+    /// pattern. Mutating the returned view's index arrays must not
+    /// corrupt the layout's pattern, otherwise a later <c>CreateView</c>
+    /// or pattern-match check would silently observe wrong indices.
+    /// </summary>
+    [Fact]
+    public void ParameterBuffer_CreateView_IsolatesLayoutPatternFromViewMutation()
+    {
+        var pattern = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+        var layouts = new[] { new ParameterLayout(new[] { 3, 3 }, pattern) };
+        var buffer = new ParameterBuffer<float>(layouts);
+
+        var view = (SparseTensor<float>)buffer.CreateView(0);
+
+        // Mutate the view's index arrays — through the SparseTensor's
+        // own getters, which expose mutable int[].
+        view.RowIndices[0] = 99;
+        view.ColumnIndices[0] = 99;
+
+        // The layout's pattern must remain intact. A second CreateView
+        // call observes the original indices, not the mutation.
+        var view2 = (SparseTensor<float>)buffer.CreateView(0);
+        Assert.Equal(0, view2.RowIndices[0]);
+        Assert.Equal(0, view2.ColumnIndices[0]);
+        Assert.Equal(0, pattern.RowIndices.Span[0]);
+        Assert.Equal(0, pattern.ColumnIndices.Span[0]);
     }
 
     /// <summary>
