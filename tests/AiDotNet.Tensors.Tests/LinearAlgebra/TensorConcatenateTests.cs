@@ -2,6 +2,8 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -102,15 +104,21 @@ public class TensorConcatenateTests
     /// and 1." in xunit parallel test runs, even though the same call
     /// passed in isolation. This stress test issues many concat calls in
     /// parallel and verifies that 100% succeed with the expected shape.
-    /// Half the threads run inside an <c>AutoTracer</c>-affecting tape
-    /// scope so that GraphMode toggles are exercised concurrently with
-    /// the eager path.
+    /// Even-indexed threads run with <see cref="GraphMode"/> active and
+    /// odd-indexed threads run with a <see cref="GradientTape{T}"/>
+    /// open, so the engine's GraphMode replay-closure path AND the
+    /// tape-record path are both exercised concurrently with the eager
+    /// path — the original bug surfaced when sibling threads toggled
+    /// the same shape arrays mid-call from those branches.
     /// </summary>
     [Fact]
     public void Concatenate_Rank2_ConcurrentStress_AllSucceed()
     {
         const int parallelism = 32;
         const int iterationsPerThread = 500;
+        const int expectedRank = 2;
+        const int expectedDim0 = 1;
+        const int expectedDim1 = 2048;
 
         var engine = new CpuEngine();
         int successCount = 0;
@@ -124,6 +132,16 @@ public class TensorConcatenateTests
             int threadIdx = t;
             tasks[t] = Task.Run(() =>
             {
+                // Pick a mode for this entire thread:
+                //   threadIdx % 3 == 0 → eager (no scope)
+                //   threadIdx % 3 == 1 → GraphMode active
+                //   threadIdx % 3 == 2 → GradientTape open
+                // Splitting the population across all three modes makes
+                // sure the engine's Concatenate dispatch hits the
+                // GraphMode replay-closure and tape-record branches
+                // (both of which snapshot input shapes) concurrently
+                // with the eager path that calls Tensor<T>.Concatenate.
+                int mode = threadIdx % 3;
                 for (int i = 0; i < iterationsPerThread; i++)
                 {
                     try
@@ -131,19 +149,51 @@ public class TensorConcatenateTests
                         var a = new Tensor<double>([1, 768]);
                         var b = new Tensor<double>([1, 1280]);
                         int axis = a.Rank - 1;
-                        var r = engine.TensorConcatenate(new[] { a, b }, axis);
-                        if (r.Shape.Length == 2 && r.Shape[1] == 2048)
+
+                        Tensor<double> r;
+                        if (mode == 1)
+                        {
+                            using var graphScope = GraphMode.Enable();
+                            r = engine.TensorConcatenate(new[] { a, b }, axis);
+                        }
+                        else if (mode == 2)
+                        {
+                            using var tape = new GradientTape<double>();
+                            r = engine.TensorConcatenate(new[] { a, b }, axis);
+                        }
+                        else
+                        {
+                            r = engine.TensorConcatenate(new[] { a, b }, axis);
+                        }
+
+                        // Verify the FULL expected shape, not just dim1.
+                        // Indexing r.Shape[1] in the failure message is
+                        // unsafe when rank < 2 — format defensively so
+                        // the wrong-shape diagnostic never throws and
+                        // mask the underlying regression.
+                        if (r.Shape.Length == expectedRank
+                            && r.Shape[0] == expectedDim0
+                            && r.Shape[1] == expectedDim1)
+                        {
                             Interlocked.Increment(ref successCount);
+                        }
                         else
                         {
                             Interlocked.Increment(ref failCount);
-                            lock (fff) firstFailure ??= $"WRONG SHAPE: rank={r.Shape.Length}, dim1={r.Shape[1]}";
+                            lock (fff)
+                            {
+                                firstFailure ??=
+                                    $"WRONG SHAPE (mode={mode}): " +
+                                    $"rank={r.Shape.Length}, " +
+                                    $"shape=[{string.Join(", ", r.Shape)}], " +
+                                    $"expected=[{expectedDim0}, {expectedDim1}]";
+                            }
                         }
                     }
                     catch (Exception ex)
                     {
                         Interlocked.Increment(ref failCount);
-                        lock (fff) firstFailure ??= $"{ex.GetType().Name}: {ex.Message}";
+                        lock (fff) firstFailure ??= $"(mode={mode}) {ex.GetType().Name}: {ex.Message}";
                     }
                 }
             });

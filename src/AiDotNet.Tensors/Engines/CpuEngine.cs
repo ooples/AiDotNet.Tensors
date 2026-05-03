@@ -25943,16 +25943,27 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = (Tensor<T>[])tensors.Clone();
                 int capturedAxis = axis;
-                // Snapshot the first tensor's shape into our own array up front,
-                // then derive everything else from that snapshot. The shape array
-                // is reachable from same-assembly callers, and re-reading it
-                // across the GraphMode replay closure was a documented race in
-                // issue #291. Locking the shape view to a single snapshot at
-                // record time avoids the closure observing a mid-mutation state
-                // when it replays.
-                var firstShapeSrc = tensors[0]._shape;
-                var firstShape = new int[firstShapeSrc.Length];
-                Array.Copy(firstShapeSrc, firstShape, firstShapeSrc.Length);
+                // Snapshot EVERY input's shape into our own arrays up front,
+                // then derive everything else from those snapshots. The shape
+                // array is reachable from same-assembly callers, and re-reading
+                // any input's _shape across the GraphMode replay closure was a
+                // documented race (issue #291). Snapshotting the first tensor
+                // alone is not enough — totalAxis is summed across all inputs,
+                // so a sibling thread mutating tensors[i]._shape between the
+                // first snapshot and the totalAxis loop could still produce a
+                // mismatched outShape. Snapshot the lot.
+                int n = tensors.Length;
+                var inputShapes = new int[n][];
+                for (int i = 0; i < n; i++)
+                {
+                    if (tensors[i] is null)
+                        throw new ArgumentException($"tensors[{i}] is null.", nameof(tensors));
+                    var src = tensors[i]._shape;
+                    var copy = new int[src.Length];
+                    Array.Copy(src, copy, src.Length);
+                    inputShapes[i] = copy;
+                }
+                var firstShape = inputShapes[0];
                 int rank = firstShape.Length;
                 int normAxis = axis < 0 ? rank + axis : axis;
                 if (normAxis < 0 || normAxis >= rank)
@@ -25962,7 +25973,16 @@ public partial class CpuEngine : ITensorLevelEngine
                         $"tensors[0].Shape = [{string.Join(", ", firstShape)}].");
                 var outShape = (int[])firstShape.Clone();
                 int totalAxis = 0;
-                foreach (var t in tensors) totalAxis += t._shape[normAxis];
+                for (int i = 0; i < n; i++)
+                {
+                    var shape = inputShapes[i];
+                    if (shape.Length != rank)
+                        throw new ArgumentException(
+                            $"All tensors must have the same rank. " +
+                            $"tensors[0] has rank {rank} (shape [{string.Join(", ", firstShape)}]), " +
+                            $"tensors[{i}] has rank {shape.Length} (shape [{string.Join(", ", shape)}]).");
+                    totalAxis += shape[normAxis];
+                }
                 outShape[normAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
                     (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },

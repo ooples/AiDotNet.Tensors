@@ -3423,11 +3423,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Create the new tensor
         Tensor<T> result = new Tensor<T>(newShape);
 
-        // Copy data from input tensors to the result tensor
+        // Copy data from input tensors to the result tensor. Pass the
+        // entry-snapshotted shape into CopyTensorSlice so the copy phase
+        // is also driven by frozen metadata — without this, a sibling
+        // thread mutating source._shape between validation and copy
+        // could still throw or copy a wrong extent (issue #291).
         int offset = 0;
         for (int i = 0; i < n; i++)
         {
-            CopyTensorSlice(tensors[i], result, axis, offset);
+            CopyTensorSlice(tensors[i], shapes[i], result, axis, offset);
             offset += shapes[i][axis];
         }
 
@@ -3438,32 +3442,47 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// Copies a slice from a source tensor to a destination tensor along a specified axis.
     /// </summary>
     /// <param name="source">The tensor to copy data from.</param>
+    /// <param name="sourceShape">An entry-snapshot of <paramref name="source"/>'s
+    /// shape. The recursive walk reads ranks and per-axis extents from this
+    /// frozen array rather than <c>source._shape</c>, so a same-assembly
+    /// shape mutation during the copy cannot make us read past the
+    /// destination buffer or skip elements.</param>
     /// <param name="destination">The tensor to copy data to.</param>
     /// <param name="axis">The axis along which to copy the slice.</param>
     /// <param name="destinationOffset">The offset in the destination tensor where the slice should be placed.</param>
     /// <remarks>
-    /// <para><b>For Beginners:</b> This helper method is used when joining tensors together. It takes data from one tensor 
+    /// <para><b>For Beginners:</b> This helper method is used when joining tensors together. It takes data from one tensor
     /// and places it at the correct position in another tensor.</para>
-    /// 
+    ///
     /// <para>The method uses recursion (a function calling itself) to navigate through all dimensions of the tensors
     /// and copy values one by one to the right locations.</para>
-    /// 
+    ///
     /// <para>This is a helper method used by the Concatenate method to combine multiple tensors.</para>
     /// </remarks>
-    private static void CopyTensorSlice(Tensor<T> source, Tensor<T> destination, int axis, int destinationOffset)
+    private static void CopyTensorSlice(Tensor<T> source, int[] sourceShape, Tensor<T> destination, int axis, int destinationOffset)
     {
-        int[] sourceIndices = new int[source.Rank];
+        int rank = sourceShape.Length;
+        int[] sourceIndices = new int[rank];
         int[] destIndices = new int[destination.Rank];
+        // Snapshot strides and storage offset alongside the shape so the
+        // computed flat index is also a function of the entry-time view
+        // metadata, not of the live tensor.
+        int[] sourceStrides = source._strides;
+        int sourceStorageOffset = source._storageOffset;
+        var sourceData = source._data;
 
         void CopyRecursive(int depth)
         {
-            if (depth == source.Rank)
+            if (depth == rank)
             {
-                destination[destIndices] = source[sourceIndices];
+                int srcFlat = sourceStorageOffset;
+                for (int d = 0; d < rank; d++)
+                    srcFlat += sourceIndices[d] * sourceStrides[d];
+                destination[destIndices] = sourceData[srcFlat];
                 return;
             }
 
-            int limit = depth == axis ? source._shape[depth] : destination._shape[depth];
+            int limit = sourceShape[depth];
             for (int i = 0; i < limit; i++)
             {
                 sourceIndices[depth] = i;
