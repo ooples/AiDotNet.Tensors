@@ -1270,12 +1270,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return null; // CPU fallback
     }
 
-    private void EmitBufferCapEvent(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, string opName, string decision)
+    /// <summary>
+    /// Records a "gpu.fallback.buffer_cap" Profiler event. Returns true
+    /// when the profiler was active and accepted the event; false when no
+    /// session was active and nothing was recorded. Callers that track
+    /// "did this dispatch already log a decision?" must use the return
+    /// value, not assume an event always lands — the de-dup logic in
+    /// HandleBufferTooLarge depends on this distinction.
+    /// </summary>
+    private bool EmitBufferCapEvent(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, string opName, string decision)
     {
         // Zero-overhead when no profiler session is active. When the user
         // enables one via PredictionModelBuilder.ConfigureProfiling, the
         // event lands in PredictionModelResult.ProfilingReport.
-        if (Profiling.Profiler.Current is null) return;
+        if (Profiling.Profiler.Current is null) return false;
         Profiling.Profiler.RecordInstant(
             "gpu.fallback.buffer_cap",
             category: "gpu_dispatch",
@@ -1288,13 +1296,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 ["cap_bytes"] = ex.DeviceMaxAllocBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["decision"] = decision,
             });
+        return true;
     }
 
     /// <summary>
     /// Tensor-aware TryRunUnary: checks GPU activation cache BEFORE triggering CPU materialization.
     /// This is the preferred path for chained GPU operations — avoids wasteful downloads.
     /// </summary>
-    private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
+    /// <remarks>
+    /// <paramref name="callerName"/> is captured automatically via
+    /// <see cref="System.Runtime.CompilerServices.CallerMemberNameAttribute"/>
+    /// so the Profiler events emitted on cap-miss carry the actual op
+    /// name (Relu, Gelu, Add, …) instead of the dispatcher label.
+    /// </remarks>
+    private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1313,7 +1329,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AutoChunk
                 || policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AlwaysChunk)
             {
-                var chunked = TryRunUnaryChunked(backend, input, op, ex, out chunkerEmittedEvent);
+                var chunked = TryRunUnaryChunked(backend, input, op, ex, out chunkerEmittedEvent, callerName);
                 if (chunked is not null) return chunked;
             }
             // Skip the generic cpu_fallback event ONLY when the chunker
@@ -1321,7 +1337,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // can return null without emitting (cap <= 0, non-float type,
             // single-element tensor) — in that case the generic event is
             // still the right signal that work moved to CPU.
-            return HandleBufferTooLarge<T>(ex, opName: "TryRunUnary", eventAlreadyEmitted: chunkerEmittedEvent);
+            return HandleBufferTooLarge<T>(ex, opName: callerName, eventAlreadyEmitted: chunkerEmittedEvent);
         }
     }
 
@@ -1368,7 +1384,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// whether this method already recorded a Profiler fallback event so
     /// the outer dispatcher doesn't double-log.
     /// </summary>
-    internal T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
+    internal T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent, string opName = "Unary")
     {
         emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
@@ -1392,9 +1408,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (chunkCount > options.EffectiveMaxChunkCount)
         {
             // Too many chunks — overhead per dispatch dominates. CPU fallback.
-            EmitBufferCapEvent(ex, "TryRunUnary",
+            // emittedEvent reflects WHETHER an event was actually recorded
+            // (false when no profiler session is active) so the outer
+            // dispatcher knows whether to record its own cpu_fallback marker.
+            emittedEvent = EmitBufferCapEvent(ex, opName,
                 decision: $"cpu_fallback_chunks_{chunkCount}_exceeds_{options.EffectiveMaxChunkCount}");
-            emittedEvent = true;
             return null;
         }
 
@@ -1402,8 +1420,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (inputArray is not float[] inputFloat) return null; // only float supported by this path
 
         var resultFloat = new float[totalElements];
-        EmitBufferCapEvent(ex, "TryRunUnary", decision: $"chunked_{chunkCount}");
-        emittedEvent = true;
+        emittedEvent = EmitBufferCapEvent(ex, opName, decision: $"chunked_{chunkCount}");
         // Wrap the chunk loop so any per-chunk failure (allocation OOM,
         // kernel dispatch, download error) cleanly falls through to CPU
         // instead of propagating and crashing the user's training step.
@@ -1453,7 +1470,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // OOM / kernel dispatch / download errors during the chunk loop:
             // emit a cpu_fallback event for telemetry and let the outer
             // dispatcher route to CPU.
-            EmitBufferCapEvent(ex, "TryRunUnary", decision: "cpu_fallback_chunk_dispatch_error");
+            EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
             return null;
         }
     }
@@ -1461,7 +1478,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Tensor-aware TryRunBinary: checks GPU activation cache BEFORE triggering CPU materialization.
     /// </summary>
-    private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1479,10 +1497,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AutoChunk
                 || policy == AiDotNet.Tensors.Engines.DirectGpu.GpuChunkingPolicy.AlwaysChunk)
             {
-                var chunked = TryRunBinaryChunked(backend, left, right, op, ex, out chunkerEmittedEvent);
+                var chunked = TryRunBinaryChunked(backend, left, right, op, ex, out chunkerEmittedEvent, callerName);
                 if (chunked is not null) return chunked;
             }
-            return HandleBufferTooLarge<T>(ex, opName: "TryRunBinary", eventAlreadyEmitted: chunkerEmittedEvent);
+            return HandleBufferTooLarge<T>(ex, opName: callerName, eventAlreadyEmitted: chunkerEmittedEvent);
         }
     }
 
@@ -1523,7 +1541,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// chunking strategy as <see cref="TryRunUnaryChunked"/>; works for any
     /// shape because element-wise ops have a 1:1 input-to-output mapping.
     /// </summary>
-    internal T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent)
+    internal T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent, string opName = "Binary")
     {
         emittedEvent = false;
         long capBytes = ex.DeviceMaxAllocBytes;
@@ -1542,9 +1560,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var options = AiDotNet.Tensors.Engines.DirectGpu.GpuFallbackOptionsHolder.Current;
         if (chunkCount > options.EffectiveMaxChunkCount)
         {
-            EmitBufferCapEvent(ex, "TryRunBinary",
+            emittedEvent = EmitBufferCapEvent(ex, opName,
                 decision: $"cpu_fallback_chunks_{chunkCount}_exceeds_{options.EffectiveMaxChunkCount}");
-            emittedEvent = true;
             return null;
         }
 
@@ -1553,8 +1570,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (leftArr is not float[] leftFloat || rightArr is not float[] rightFloat) return null;
 
         var resultFloat = new float[totalElements];
-        EmitBufferCapEvent(ex, "TryRunBinary", decision: $"chunked_{chunkCount}");
-        emittedEvent = true;
+        emittedEvent = EmitBufferCapEvent(ex, opName, decision: $"chunked_{chunkCount}");
         // Wrap the chunk loop so any per-chunk failure cleanly falls through
         // to CPU instead of crashing the user's training step. See the same
         // pattern in TryRunUnaryChunked for the rationale.
@@ -1604,13 +1620,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
-            EmitBufferCapEvent(ex, "TryRunBinary", decision: "cpu_fallback_chunk_dispatch_error");
+            EmitBufferCapEvent(ex, opName, decision: "cpu_fallback_chunk_dispatch_error");
             return null;
         }
     }
 
     // Legacy T[] overloads kept for backward compatibility with IEngine explicit implementations
-    private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1632,11 +1649,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            return HandleBufferTooLarge<T>(ex, "TryRunUnary[T]"); // CPU fallback (no chunking on legacy path)
+            return HandleBufferTooLarge<T>(ex, callerName); // CPU fallback (no chunking on legacy path)
         }
     }
 
-    private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1661,11 +1679,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            return HandleBufferTooLarge<T>(ex, "TryRunBinary[T]");
+            return HandleBufferTooLarge<T>(ex, callerName);
         }
     }
 
-    private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
+    private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1691,14 +1710,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            return HandleBufferTooLarge<T>(ex, "TryRunScalar");
+            return HandleBufferTooLarge<T>(ex, callerName);
         }
     }
 
     /// <summary>
     /// Span-based binary operation that avoids ToArray() allocation for matrix operations.
     /// </summary>
-    private T[]? TryRunBinarySpan<T>(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunBinarySpan<T>(ReadOnlySpan<T> left, ReadOnlySpan<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1723,14 +1743,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            return HandleBufferTooLarge<T>(ex, "TryRunBinarySpan");
+            return HandleBufferTooLarge<T>(ex, callerName);
         }
     }
 
     /// <summary>
     /// Span-based scalar operation that avoids ToArray() allocation for matrix operations.
     /// </summary>
-    private T[]? TryRunScalarSpan<T>(ReadOnlySpan<T> input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
+    private T[]? TryRunScalarSpan<T>(ReadOnlySpan<T> input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         if (!TryGetBackend(out var backend))
             return null;
@@ -1752,7 +1773,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
-            return HandleBufferTooLarge<T>(ex, "TryRunScalarSpan");
+            return HandleBufferTooLarge<T>(ex, callerName);
         }
     }
 

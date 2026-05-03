@@ -240,11 +240,10 @@ public class BufferSizeCapTests
     }
 
     // ───────────────────────────────────────────────────────────────────
-    // Chunker decision math (the policy/cap parts that don't need a backend).
-    // The actual chunked GPU dispatch path is integration-tested with real
-    // hardware; a fake-IDirectGpuBackend mock is tracked as follow-up
-    // because the interface has 100+ members and a minimal stub would
-    // dwarf this PR's scope.
+    // Chunker decision math — pure-formula tests for the chunk-count and
+    // policy logic. End-to-end chunker behaviour (dispatch, output
+    // correctness, error paths) is covered in ChunkerWithMockBackendTests
+    // via the DispatchProxy-based MockDirectGpuBackend.
     // ───────────────────────────────────────────────────────────────────
 
     [Theory]

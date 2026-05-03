@@ -10,6 +10,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.Profiling;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -35,6 +36,11 @@ public class ChunkerWithMockBackendTests
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, new[] { 12 });
         var ex = new GpuBufferTooLargeException("Mock", requestedBytes: 48, deviceMaxAllocBytes: 16, deviceName: "MockDevice");
+
+        // Profiler session must be active for emittedEvent to reflect a
+        // recorded event. Without it, the chunker still dispatches but
+        // emittedEvent stays false (zero-overhead-when-off contract).
+        using var session = Profiler.Profile();
 
         // Op: y[i] = x[i] * 2. The mock's MockGpuBuffer wraps the host
         // float[] directly, so we read in/write out via Data.
@@ -70,6 +76,7 @@ public class ChunkerWithMockBackendTests
         var ex = new GpuBufferTooLargeException("Mock", 400, 4, "MockDevice");
 
         var prev = GpuFallbackOptionsHolder.Current;
+        using var session = Profiler.Profile();
         try
         {
             GpuFallbackOptionsHolder.Current = new GpuFallbackOptions { MaxChunkCount = 4 };
@@ -168,6 +175,8 @@ public class ChunkerWithMockBackendTests
         var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
 
+        using var session = Profiler.Profile();
+
         var result = engine.TryRunBinaryChunked<float>(backend, left, right,
             (b, bA, bB, bC, len) =>
             {
@@ -200,6 +209,7 @@ public class ChunkerWithMockBackendTests
         var ex = new GpuBufferTooLargeException("Mock", 400, 4, "MockDevice");
 
         var prev = GpuFallbackOptionsHolder.Current;
+        using var session = Profiler.Profile();
         try
         {
             GpuFallbackOptionsHolder.Current = new GpuFallbackOptions { MaxChunkCount = 4 };
@@ -234,6 +244,8 @@ public class ChunkerWithMockBackendTests
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
 
+        using var session = Profiler.Profile();
+
         var result = engine.TryRunUnaryChunked<float>(backend, input,
             (b, bIn, bOut, len) =>
             {
@@ -259,6 +271,8 @@ public class ChunkerWithMockBackendTests
         var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        using var session = Profiler.Profile();
 
         var result = engine.TryRunBinaryChunked<float>(backend, left, right,
             (b, bA, bB, bC, len) =>
