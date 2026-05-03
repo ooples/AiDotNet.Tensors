@@ -220,6 +220,89 @@ public class ChunkerWithMockBackendTests
     }
 
     [Fact]
+    public void TryRunUnaryChunked_OpThrows_FallsThroughToCpu()
+    {
+        // Per PR #288 review: a per-chunk dispatch failure (kernel error,
+        // download error, OOM-during-loop, etc.) should fall through to
+        // CPU rather than propagate and crash the training step. The op
+        // delegate throws on the second chunk; the chunker catches and
+        // returns null + emits a cpu_fallback_chunk_dispatch_error event.
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        var result = engine.TryRunUnaryChunked<float>(backend, input,
+            (b, bIn, bOut, len) =>
+            {
+                state.UnaryOpCalls++;
+                if (state.UnaryOpCalls == 2)
+                    throw new InvalidOperationException("simulated kernel dispatch error");
+            },
+            ex,
+            out bool emitted);
+
+        Assert.Null(result);
+        Assert.Equal(2, state.UnaryOpCalls); // first chunk ran, second threw
+        Assert.True(emitted, "chunker emits an event before+after the failure");
+    }
+
+    [Fact]
+    public void TryRunBinaryChunked_OpThrows_FallsThroughToCpu()
+    {
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        var result = engine.TryRunBinaryChunked<float>(backend, left, right,
+            (b, bA, bB, bC, len) =>
+            {
+                state.BinaryOpCalls++;
+                if (state.BinaryOpCalls == 1)
+                    throw new InvalidOperationException("simulated dispatch error");
+            },
+            ex,
+            out bool emitted);
+
+        Assert.Null(result);
+        Assert.True(emitted);
+    }
+
+    [Fact]
+    public void TryRunUnaryChunked_FailFastPolicy_RethrowsSubChunkException()
+    {
+        // Edge case: with NeverChunk_FailFast, a sub-chunk that ALSO can't
+        // fit (GpuBufferTooLargeException raised during the chunk loop)
+        // should re-throw rather than be swallowed. Verifies the catch
+        // separates "buffer too large" (rethrow) from "dispatch error"
+        // (swallow → CPU).
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        var engine = new DirectGpuTensorEngine();
+
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        // Op delegate throws GpuBufferTooLargeException on first chunk —
+        // simulating a sub-allocation that's still too big somehow.
+        Assert.Throws<GpuBufferTooLargeException>(() =>
+            engine.TryRunUnaryChunked<float>(backend, input,
+                (b, bIn, bOut, len) =>
+                {
+                    state.UnaryOpCalls++;
+                    throw new GpuBufferTooLargeException("Mock", 999, 16, "MockDevice");
+                },
+                ex,
+                out bool _));
+    }
+
+    [Fact]
     public void TryRunBinaryChunked_ScalarTensor_ReturnsNullWithoutEmitting()
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 4 };
