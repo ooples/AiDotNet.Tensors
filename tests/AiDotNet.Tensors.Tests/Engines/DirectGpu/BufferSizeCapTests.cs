@@ -81,7 +81,7 @@ public class BufferSizeCapTests
     public void EnsureFits_ThrowsWhenOverCap()
     {
         var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
-            InvokeEnsureFits("OpenCL", requestedBytes: 2048, cap: 1024, deviceName: "X"));
+            GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 2048, deviceCap:1024, deviceName: "X"));
         Assert.Equal(2048, ex.RequestedBytes);
         Assert.Equal(1024, ex.DeviceMaxAllocBytes);
     }
@@ -90,20 +90,20 @@ public class BufferSizeCapTests
     public void EnsureFits_AllowsAtCap()
     {
         // Boundary: requestedBytes == cap is allowed (only > throws).
-        InvokeEnsureFits("OpenCL", requestedBytes: 1024, cap: 1024, deviceName: "X");
+        GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 1024, deviceCap:1024, deviceName: "X");
     }
 
     [Fact]
     public void EnsureFits_AllowsUnderCap()
     {
-        InvokeEnsureFits("OpenCL", requestedBytes: 512, cap: 1024, deviceName: "X");
+        GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 512, deviceCap:1024, deviceName: "X");
     }
 
     [Fact]
     public void EnsureFits_SkipsWhenCapIsZero()
     {
         // cap == 0 → skip validation (used when device cap query fails).
-        InvokeEnsureFits("OpenCL", requestedBytes: long.MaxValue, cap: 0, deviceName: "X");
+        GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: long.MaxValue, deviceCap:0, deviceName: "X");
     }
 
     [Fact]
@@ -111,28 +111,8 @@ public class BufferSizeCapTests
     {
         // requestedBytes <= 0 is non-sensical; guard skips and lets the
         // backend's native call surface its own error if any.
-        InvokeEnsureFits("OpenCL", requestedBytes: 0, cap: 1024, deviceName: "X");
-        InvokeEnsureFits("OpenCL", requestedBytes: -1, cap: 1024, deviceName: "X");
-    }
-
-    private static void InvokeEnsureFits(string backend, long requestedBytes, long cap, string deviceName)
-    {
-        // GpuBufferSizeGuard is internal; access via reflection to test from
-        // the test assembly without needing a public surface.
-        var type = typeof(GpuBufferTooLargeException).Assembly
-            .GetType("AiDotNet.Tensors.Engines.DirectGpu.GpuBufferSizeGuard")!;
-        var method = type.GetMethod("EnsureFits",
-            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)!;
-        try
-        {
-            method.Invoke(null, new object[] { backend, requestedBytes, cap, deviceName });
-        }
-        catch (System.Reflection.TargetInvocationException tie)
-            when (tie.InnerException is not null)
-        {
-            // Unwrap so callers see the original exception.
-            throw tie.InnerException;
-        }
+        GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 0, deviceCap:1024, deviceName: "X");
+        GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: -1, deviceCap:1024, deviceName: "X");
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -201,12 +181,12 @@ public class BufferSizeCapTests
             // Device cap = 4096 (large), user override = 1024 → effective cap = 1024.
             // Request 2048 → should throw.
             var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
-                InvokeEnsureFits("OpenCL", requestedBytes: 2048, cap: 4096, deviceName: "X"));
+                GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 2048, deviceCap:4096, deviceName: "X"));
             Assert.Equal(1024, ex.DeviceMaxAllocBytes); // exception reports the EFFECTIVE cap
             Assert.Equal(2048, ex.RequestedBytes);
 
             // Same device cap, request 512 → fits under user override.
-            InvokeEnsureFits("OpenCL", requestedBytes: 512, cap: 4096, deviceName: "X");
+            GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 512, deviceCap:4096, deviceName: "X");
         }
         finally
         {
@@ -228,7 +208,7 @@ public class BufferSizeCapTests
             };
             // Device cap = 1024 wins.
             var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
-                InvokeEnsureFits("OpenCL", requestedBytes: 2048, cap: 1024, deviceName: "X"));
+                GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 2048, deviceCap:1024, deviceName: "X"));
             Assert.Equal(1024, ex.DeviceMaxAllocBytes);
         }
         finally
@@ -250,7 +230,7 @@ public class BufferSizeCapTests
                 MaxBufferBytes = 256,
             };
             var ex = Assert.Throws<GpuBufferTooLargeException>(() =>
-                InvokeEnsureFits("OpenCL", requestedBytes: 1024, cap: 0, deviceName: "X"));
+                GpuBufferSizeGuard.EnsureFits("OpenCL", requestedBytes: 1024, deviceCap:0, deviceName: "X"));
             Assert.Equal(256, ex.DeviceMaxAllocBytes);
         }
         finally
@@ -275,26 +255,17 @@ public class BufferSizeCapTests
         }
     }
 
+    // Thin wrappers around the internal accessors so the call sites read
+    // naturally. The test assembly has InternalsVisibleTo so we can call
+    // these directly — no reflection (and no coverage-blind spots).
     private static long InvokeEffectiveMaxBufferBytes(GpuFallbackOptions opts, long deviceCap)
-    {
-        var m = typeof(GpuFallbackOptions).GetMethod("EffectiveMaxBufferBytes",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        return (long)m.Invoke(opts, new object[] { deviceCap })!;
-    }
+        => opts.EffectiveMaxBufferBytes(deviceCap);
 
     private static GpuChunkingPolicy InvokeEffectiveChunkingPolicy(GpuFallbackOptions opts)
-    {
-        var p = typeof(GpuFallbackOptions).GetProperty("EffectiveChunkingPolicy",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        return (GpuChunkingPolicy)p.GetValue(opts)!;
-    }
+        => opts.EffectiveChunkingPolicy;
 
     private static int InvokeEffectiveMaxChunkCount(GpuFallbackOptions opts)
-    {
-        var p = typeof(GpuFallbackOptions).GetProperty("EffectiveMaxChunkCount",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        return (int)p.GetValue(opts)!;
-    }
+        => opts.EffectiveMaxChunkCount;
 
     // ───────────────────────────────────────────────────────────────────
     // Smoke test: every backend now exposes MaxBufferAllocBytes via the
