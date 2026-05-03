@@ -81,6 +81,15 @@ public sealed class WebGpuDevice : IDisposable
     public long MaxBufferSize => _limits?.MaxBufferSize ?? 256 * 1024 * 1024; // 256MB default
 
     /// <summary>
+    /// Gets the maximum size in bytes that can be bound to a storage
+    /// buffer binding (<c>maxStorageBufferBindingSize</c>). For compute
+    /// storage buffers the practical per-buffer cap is the minimum of
+    /// <see cref="MaxBufferSize"/> and this value — a buffer larger than
+    /// this can be allocated but cannot be bound to a compute pipeline.
+    /// </summary>
+    public long MaxStorageBufferBindingSize => _limits?.MaxStorageBufferBindingSize ?? 128 * 1024 * 1024; // 128MB default
+
+    /// <summary>
     /// Gets the maximum workgroup size.
     /// </summary>
     public int MaxWorkgroupSize => _limits?.MaxComputeInvocationsPerWorkgroup ?? 256;

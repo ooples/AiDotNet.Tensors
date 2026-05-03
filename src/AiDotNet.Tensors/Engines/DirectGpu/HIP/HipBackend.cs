@@ -117,6 +117,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public int ComputeUnits { get; }
     public long GlobalMemoryBytes { get; }
     public long LocalMemoryBytes { get; }
+    /// <summary>
+    /// HIP / ROCm exposes no formal per-allocation cap — same story as CUDA.
+    /// We use total VRAM as the upper bound and let the chunker handle
+    /// hipErrorOutOfMemory on a per-call basis. Issue #285.
+    /// </summary>
+    public long MaxBufferAllocBytes { get; }
     public double TheoreticalGflops { get; }
 
     private void ReturnBufferToPool(HipGpuBuffer buffer)
@@ -233,6 +239,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             ComputeUnits = _deviceProps.MultiProcessorCount;
             GlobalMemoryBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
             LocalMemoryBytes = (long)(ulong)_deviceProps.SharedMemPerBlock;
+            // Issue #285: same approach as CUDA — total VRAM as conservative
+            // upper bound. The guard only catches requests > total VRAM;
+            // mid-size allocations that fail due to fragmentation surface
+            // as a generic HIP error via CheckError, NOT as
+            // GpuBufferTooLargeException. Translating hipErrorOutOfMemory
+            // into the typed exception is tracked as follow-up work.
+            MaxBufferAllocBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
 
             // Detect architecture from GCN arch name
             _architecture = DetectArchitecture(_deviceProps.GcnArchName, 0);
@@ -908,6 +921,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
         if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
         {
@@ -945,6 +960,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)(size * sizeof(float));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
@@ -2850,6 +2867,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)size;
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", size, MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc (byte buffer)");
@@ -5175,6 +5194,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     {
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
@@ -5190,6 +5211,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
+        // Issue #285: per-allocation cap check before hipMalloc.
+        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");

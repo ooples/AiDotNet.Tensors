@@ -120,6 +120,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     public long LocalMemoryBytes => _device.MaxSharedMemorySize;
 
+    /// <summary>
+    /// Issue #285: Vulkan's <c>VkPhysicalDeviceLimits.maxStorageBufferRange</c>
+    /// is the per-allocation (per-binding) cap. The spec guarantees at least
+    /// 128 MiB; modern desktop GPUs typically expose 2 GiB or more.
+    /// </summary>
+    public long MaxBufferAllocBytes => _device.MaxStorageBufferRange;
+
     public double TheoreticalGflops { get; }
 
     /// <summary>

@@ -90,6 +90,17 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     /// </summary>
     public long LocalMemoryBytes => 16384L;
 
+    /// <summary>
+    /// Issue #285: practical per-allocation cap for WebGPU storage buffers
+    /// (the kind compute pipelines bind). The cap is the minimum of two
+    /// limits because a buffer over either limit fails downstream:
+    /// <c>maxBufferSize</c> caps allocation, and
+    /// <c>maxStorageBufferBindingSize</c> caps the size that can be bound
+    /// to a compute pipeline. Reporting the lesser of the two means the
+    /// guard catches both failure modes ahead of allocation.
+    /// </summary>
+    public long MaxBufferAllocBytes => System.Math.Min(_device.MaxBufferSize, _device.MaxStorageBufferBindingSize);
+
     public double TheoreticalGflops { get; }
 
     /// <summary>
@@ -150,6 +161,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public IGpuBuffer AllocateBuffer(int elementCount)
     {
         ThrowIfNotInitialized();
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)elementCount * sizeof(float), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(elementCount);
     }
 
@@ -161,6 +174,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         ThrowIfNotInitialized();
+        // Issue #285: per-allocation cap check.
+        GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         return new WebGpuBuffer(data);
     }
 

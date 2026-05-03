@@ -105,6 +105,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public int ComputeUnits { get; }
         public long GlobalMemoryBytes { get; }
         public long LocalMemoryBytes { get; }
+        public long MaxBufferAllocBytes { get; }
         public double TheoreticalGflops { get; private set; }
 
         // IAsyncGpuBackend properties
@@ -185,6 +186,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
                 LocalMemoryBytes = (long)_context.LocalMemSize;
+                // Issue #285: per-allocation cap. Drivers cap individual buffers
+                // well below total VRAM (typical ~1 GB on consumer AMD/Intel).
+                MaxBufferAllocBytes = (long)_context.MaxMemAllocSize;
                 TheoreticalGflops = EstimateTheoreticalGflops();
 
                 // Store GPU capabilities for dynamic work group sizing
