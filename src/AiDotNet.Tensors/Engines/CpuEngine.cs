@@ -25943,10 +25943,23 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = (Tensor<T>[])tensors.Clone();
                 int capturedAxis = axis;
-                // Compute output shape: same as first tensor except along concat axis
-                var firstShape = tensors[0]._shape;
+                // Snapshot the first tensor's shape into our own array up front,
+                // then derive everything else from that snapshot. The shape array
+                // is reachable from same-assembly callers, and re-reading it
+                // across the GraphMode replay closure was a documented race in
+                // issue #291. Locking the shape view to a single snapshot at
+                // record time avoids the closure observing a mid-mutation state
+                // when it replays.
+                var firstShapeSrc = tensors[0]._shape;
+                var firstShape = new int[firstShapeSrc.Length];
+                Array.Copy(firstShapeSrc, firstShape, firstShapeSrc.Length);
                 int rank = firstShape.Length;
                 int normAxis = axis < 0 ? rank + axis : axis;
+                if (normAxis < 0 || normAxis >= rank)
+                    throw new ArgumentException(
+                        $"Invalid axis {axis} for tensor of rank {rank}. " +
+                        $"Axis must be in [0, {rank - 1}] (or [-{rank}, -1] for relative). " +
+                        $"tensors[0].Shape = [{string.Join(", ", firstShape)}].");
                 var outShape = (int[])firstShape.Clone();
                 int totalAxis = 0;
                 foreach (var t in tensors) totalAxis += t._shape[normAxis];

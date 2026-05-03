@@ -3368,29 +3368,56 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (tensors == null || tensors.Length == 0)
             throw new ArgumentException("At least one tensor must be provided for concatenation.");
 
-        int rank = tensors[0].Rank;
+        // Snapshot every input's _shape into our own local int[] up front. The
+        // _shape field reference is readonly per-tensor, but the array contents
+        // are reachable from same-assembly code, and re-reading them across the
+        // multi-step validation/copy below leaves room for an inconsistent view
+        // if a sibling thread is mid-mutation (issue #291). Validating + sizing +
+        // copying all against this local snapshot makes the function's behavior
+        // a function of its inputs at entry, not of any mutable global state.
+        int n = tensors.Length;
+        var shapes = new int[n][];
+        for (int i = 0; i < n; i++)
+        {
+            if (tensors[i] is null)
+                throw new ArgumentException($"tensors[{i}] is null.", nameof(tensors));
+            int[] src = tensors[i]._shape;
+            var copy = new int[src.Length];
+            Array.Copy(src, copy, src.Length);
+            shapes[i] = copy;
+        }
+
+        int rank = shapes[0].Length;
         if (axis < 0 || axis >= rank)
-            throw new ArgumentException($"Invalid axis. Must be between 0 and {rank - 1}.");
+            throw new ArgumentException(
+                $"Invalid axis {axis} for tensor of rank {rank}. " +
+                $"Axis must be in [0, {rank - 1}]. " +
+                $"tensors[0].Shape = [{string.Join(", ", shapes[0])}].");
 
         // Validate that all tensors have the same shape except for the concatenation axis
-        for (int i = 1; i < tensors.Length; i++)
+        for (int i = 1; i < n; i++)
         {
-            if (tensors[i].Rank != rank)
-                throw new ArgumentException("All tensors must have the same rank.");
+            if (shapes[i].Length != rank)
+                throw new ArgumentException(
+                    $"All tensors must have the same rank. " +
+                    $"tensors[0] has rank {rank} (shape [{string.Join(", ", shapes[0])}]), " +
+                    $"tensors[{i}] has rank {shapes[i].Length} (shape [{string.Join(", ", shapes[i])}]).");
 
             for (int j = 0; j < rank; j++)
             {
-                if (j != axis && tensors[i]._shape[j] != tensors[0]._shape[j])
-                    throw new ArgumentException("All tensors must have the same shape except for the concatenation axis.");
+                if (j != axis && shapes[i][j] != shapes[0][j])
+                    throw new ArgumentException(
+                        $"All tensors must have the same shape except along the concatenation axis. " +
+                        $"Mismatch at axis {j}: tensors[0][{j}]={shapes[0][j]}, tensors[{i}][{j}]={shapes[i][j]}.");
             }
         }
 
-        // Calculate the new shape
+        // Calculate the new shape from the snapshot
         int[] newShape = new int[rank];
-        Array.Copy(tensors[0]._shape, newShape, rank);
-        for (int i = 1; i < tensors.Length; i++)
+        Array.Copy(shapes[0], newShape, rank);
+        for (int i = 1; i < n; i++)
         {
-            newShape[axis] += tensors[i]._shape[axis];
+            newShape[axis] += shapes[i][axis];
         }
 
         // Create the new tensor
@@ -3398,10 +3425,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Copy data from input tensors to the result tensor
         int offset = 0;
-        for (int i = 0; i < tensors.Length; i++)
+        for (int i = 0; i < n; i++)
         {
             CopyTensorSlice(tensors[i], result, axis, offset);
-            offset += tensors[i]._shape[axis];
+            offset += shapes[i][axis];
         }
 
         return result;
