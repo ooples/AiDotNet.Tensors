@@ -728,9 +728,27 @@ public class DistributedTrainingTests
             if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
             if (!threads[i].Join(remaining))
             {
+                // A blocked worker on rank i is often the SYMPTOM of a
+                // sibling rank having thrown — e.g. rank 0 fails an
+                // Assert before reaching a barrier, leaving rank 1
+                // blocked in the collective forever. Surface any
+                // already-recorded worker exception in that case so
+                // the test report shows the real assertion/exception
+                // and not the synthetic "worker did not complete"
+                // message that would otherwise mask it.
+                for (int k = 0; k < workerCount; k++)
+                {
+                    if (threads[k].Join(TimeSpan.Zero) && errors[k] is { } recorded)
+                    {
+                        throw new Xunit.Sdk.XunitException(
+                            $"{opName}: rank {k} threw {recorded.GetType().Name}: {recorded.Message}\n{recorded.StackTrace}");
+                    }
+                }
+                // Genuine timeout — no worker has finished with an
+                // exception, which means we're in a real deadlock.
                 // Build a diagnostic that distinguishes "never started"
-                // (real scheduling problem) from "started but blocked"
-                // (genuine deadlock in the test logic).
+                // (scheduling problem — would surface as NEVER-STARTED)
+                // from "started but blocked" (deadlock in test logic).
                 var states = string.Join(", ", threads.Select((th, k) =>
                 {
                     var started = System.Threading.Volatile.Read(ref startedFlags[k]) ? "started" : "NEVER-STARTED";
