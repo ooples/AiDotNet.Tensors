@@ -17,10 +17,11 @@ namespace AiDotNet.Tensors.Tests.Engines.Distributed;
 ///
 /// <para>Tests use the in-process backend so the full multi-rank
 /// behavior is exercised inside a single test process. Each rank runs
-/// on a dedicated <see cref="Task"/>; collective ops resolve through
-/// shared barriers in <see cref="InProcessGroupCoordinator"/>. Behaviour
-/// is bit-identical to the network backend per the in-process backend's
-/// contract.</para>
+/// on a dedicated <see cref="Thread"/> (not a thread-pool task — see
+/// <see cref="RunWorkers"/> for the rationale); collective ops resolve
+/// through shared barriers in <see cref="InProcessGroupCoordinator"/>.
+/// Behaviour is bit-identical to the network backend per the in-process
+/// backend's contract.</para>
 /// </summary>
 public class DistributedTrainingTests
 {
@@ -506,21 +507,15 @@ public class DistributedTrainingTests
         var endpoint = $"127.0.0.1:{port}";
         var results = new float[worldSize][];
 
-        var tasks = new Task[worldSize];
-        for (int i = 0; i < worldSize; i++)
+        RunWorkers(worldSize, rank =>
         {
-            int rank = i;
-            tasks[i] = Task.Run(() =>
-            {
-                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
-                var t = new Tensor<float>(new[] { 4 });
-                for (int k = 0; k < 4; k++) t.AsWritableSpan()[k] = rank + 1; // rank 0:[1,1,1,1]; 1:[2,2,2,2]; 2:[3,3,3,3]
-                pg.AllReduce(t, ReduceOp.Avg);
-                results[rank] = new float[4];
-                t.AsSpan().CopyTo(results[rank]);
-            });
-        }
-        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+            using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+            var t = new Tensor<float>(new[] { 4 });
+            for (int k = 0; k < 4; k++) t.AsWritableSpan()[k] = rank + 1; // rank 0:[1,1,1,1]; 1:[2,2,2,2]; 2:[3,3,3,3]
+            pg.AllReduce(t, ReduceOp.Avg);
+            results[rank] = new float[4];
+            t.AsSpan().CopyTo(results[rank]);
+        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_AllReduce");
         for (int r = 0; r < worldSize; r++)
             for (int i = 0; i < 4; i++)
                 Assert.Equal(2.0f, results[r][i], precision: 4); // mean(1,2,3) = 2
@@ -560,24 +555,18 @@ public class DistributedTrainingTests
         var endpoint = $"127.0.0.1:{port}";
         var results = new float[worldSize][];
 
-        var tasks = new Task[worldSize];
-        for (int i = 0; i < worldSize; i++)
+        RunWorkers(worldSize, rank =>
         {
-            int rank = i;
-            tasks[i] = Task.Run(() =>
+            using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+            var t = new Tensor<float>(new[] { 3 });
+            if (rank == 1) // root is rank 1, not coord
             {
-                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
-                var t = new Tensor<float>(new[] { 3 });
-                if (rank == 1) // root is rank 1, not coord
-                {
-                    t.AsWritableSpan()[0] = 7; t.AsWritableSpan()[1] = 8; t.AsWritableSpan()[2] = 9;
-                }
-                pg.Broadcast(t, root: 1);
-                results[rank] = new float[3];
-                t.AsSpan().CopyTo(results[rank]);
-            });
-        }
-        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+                t.AsWritableSpan()[0] = 7; t.AsWritableSpan()[1] = 8; t.AsWritableSpan()[2] = 9;
+            }
+            pg.Broadcast(t, root: 1);
+            results[rank] = new float[3];
+            t.AsSpan().CopyTo(results[rank]);
+        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_Broadcast");
         for (int r = 0; r < worldSize; r++)
         {
             Assert.Equal(7, results[r][0]);
@@ -594,18 +583,12 @@ public class DistributedTrainingTests
         var endpoint = $"127.0.0.1:{port}";
         int reachedBarrier = 0;
 
-        var tasks = new Task[worldSize];
-        for (int i = 0; i < worldSize; i++)
+        RunWorkers(worldSize, rank =>
         {
-            int rank = i;
-            tasks[i] = Task.Run(() =>
-            {
-                using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
-                pg.Barrier();
-                System.Threading.Interlocked.Increment(ref reachedBarrier);
-            });
-        }
-        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)));
+            using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
+            pg.Barrier();
+            System.Threading.Interlocked.Increment(ref reachedBarrier);
+        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_Barrier");
         Assert.Equal(worldSize, reachedBarrier);
     }
 
@@ -620,26 +603,19 @@ public class DistributedTrainingTests
         var nonces = new[] { "alpha", "bravo", "charlie" };
         var assigned = new int?[worldSize];
 
-        var tasks = new Task[worldSize];
-        for (int i = 0; i < worldSize; i++)
+        RunWorkers(worldSize, idx =>
         {
-            int idx = i;
-            tasks[i] = Task.Run(() =>
+            var launcher = new ElasticLauncher(new ElasticLauncherOptions
             {
-                var launcher = new ElasticLauncher(new ElasticLauncherOptions
-                {
-                    WorldSize = worldSize,
-                    Backend = RendezvousBackend.Tcp,
-                    Endpoint = $"127.0.0.1:{port}",
-                    RendezvousTimeoutSeconds = 10,
-                });
-                var a = launcher.Rendezvous(nonces[idx]);
-                Assert.Equal(worldSize, a.WorldSize);
-                assigned[idx] = a.Rank;
+                WorldSize = worldSize,
+                Backend = RendezvousBackend.Tcp,
+                Endpoint = $"127.0.0.1:{port}",
+                RendezvousTimeoutSeconds = 10,
             });
-        }
-        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(15)),
-            "TCP rendezvous timed out — at least one worker did not converge.");
+            var a = launcher.Rendezvous(nonces[idx]);
+            Assert.Equal(worldSize, a.WorldSize);
+            assigned[idx] = a.Rank;
+        }, timeout: TimeSpan.FromSeconds(15), opName: "ElasticLauncher_TcpBackend_Rendezvous");
 
         // Sort by nonce — alpha=0, bravo=1, charlie=2.
         Assert.Equal(0, assigned[0]);
@@ -659,37 +635,135 @@ public class DistributedTrainingTests
     // ── Helpers ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Spawns <paramref name="worldSize"/> threads, hands each one a
-    /// rank handle, runs <paramref name="body"/> on every rank in
-    /// parallel, and propagates the first exception. Every test in this
-    /// file goes through here.
+    /// Runs <paramref name="worldSize"/> rank-indexed bodies on dedicated
+    /// background threads (NOT the thread pool) and joins them with a
+    /// timeout, propagating the first exception observed.
+    ///
+    /// <para><b>Why dedicated threads, not <see cref="Task.Run(Action)"/>:</b>
+    /// xunit runs test classes in parallel by default. Every distributed
+    /// test in this file spawns <c>worldSize</c> workers that block on
+    /// collective synchronisation (barriers, all-reduce, broadcast) —
+    /// each worker only makes progress when its siblings have ALSO
+    /// reached the rendezvous. Under <c>Task.Run</c>, those workers
+    /// queue onto the shared <see cref="ThreadPool"/>; when sibling
+    /// xunit tests are also running pool-backed work, the pool can be
+    /// saturated and the worker tasks remain in
+    /// <see cref="TaskStatus.WaitingToRun"/> indefinitely while the
+    /// pool's hill-climbing slowly ramps. By the time the test's
+    /// timeout fires the workers haven't even started — observed in
+    /// CI as <c>"Tasks status: [WaitingToRun, WaitingToRun]"</c>.
+    /// Dedicated <see cref="Thread"/> instances are scheduled directly
+    /// by the OS, bypass the pool entirely, and start immediately.
+    /// Cost is negligible (~1MB stack per worker for 2–8 workers per
+    /// test), and we get deterministic startup which is what these
+    /// barrier-style tests actually require.</para>
     /// </summary>
     private static void RunRanks(int worldSize, Action<int, IProcessGroup> body)
     {
         var groups = InProcessGroup.Create(worldSize);
-        var tasks = new Task[worldSize];
-        var errors = new Exception?[worldSize];
-        for (int r = 0; r < worldSize; r++)
+        try
         {
-            int rank = r;
-            tasks[r] = Task.Run(() =>
-            {
-                try { body(rank, groups[rank]); }
-                catch (Exception ex) { errors[rank] = ex; }
-                finally { groups[rank].Dispose(); }
-            });
+            RunWorkers(
+                worldSize,
+                rank =>
+                {
+                    try { body(rank, groups[rank]); }
+                    finally { groups[rank].Dispose(); }
+                },
+                timeout: TimeSpan.FromSeconds(30),
+                opName: "RunRanks");
         }
-        // Hard-fail on timeout — earlier versions of this helper let
-        // deadlocked workers silently report "passed" because the lambda
-        // hadn't thrown by the time WaitAll returned.
-        bool completed = Task.WaitAll(tasks, TimeSpan.FromSeconds(30));
-        if (!completed)
-            throw new Xunit.Sdk.XunitException(
-                $"Distributed test timed out after 30s — at least one rank deadlocked. " +
-                $"Tasks status: [{string.Join(", ", tasks.Select(t => t.Status))}].");
-        for (int r = 0; r < worldSize; r++)
-            if (errors[r] is { } e) throw new Xunit.Sdk.XunitException(
-                $"Rank {r} threw: {e.Message}\n{e.StackTrace}");
+        catch
+        {
+            // If RunWorkers threw before some ranks could dispose their
+            // group (e.g. a timeout where some workers never started),
+            // make sure we don't leak InProcessGroup state into the
+            // next test. RunWorkers already propagated; this is just
+            // defence-in-depth.
+            for (int r = 0; r < worldSize; r++)
+            {
+                try { groups[r].Dispose(); } catch { /* swallow secondary dispose errors */ }
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Spawns <paramref name="workerCount"/> dedicated background
+    /// threads (one per <paramref name="body"/> invocation indexed by
+    /// rank), joins them with <paramref name="timeout"/>, and propagates
+    /// the first exception observed on any worker. See <see cref="RunRanks"/>
+    /// for the rationale on dedicated-thread vs. thread-pool execution.
+    /// </summary>
+    private static void RunWorkers(int workerCount, Action<int> body, TimeSpan timeout, string opName)
+    {
+        if (workerCount <= 0) throw new ArgumentOutOfRangeException(nameof(workerCount));
+        var threads = new Thread[workerCount];
+        var errors = new Exception?[workerCount];
+        var startedFlags = new bool[workerCount];
+        for (int i = 0; i < workerCount; i++)
+        {
+            int idx = i;
+            var t = new Thread(() =>
+            {
+                System.Threading.Volatile.Write(ref startedFlags[idx], true);
+                try { body(idx); }
+                catch (Exception ex) { errors[idx] = ex; }
+            })
+            {
+                IsBackground = true,
+                Name = $"{opName}-worker-{idx}",
+            };
+            threads[i] = t;
+            t.Start();
+        }
+
+        // Join each thread with the per-call deadline. Using a shared
+        // deadline (not per-thread timeout) so a slow first worker
+        // doesn't hide that subsequent workers also missed.
+        var deadline = DateTime.UtcNow + timeout;
+        for (int i = 0; i < workerCount; i++)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
+            if (!threads[i].Join(remaining))
+            {
+                // A blocked worker on rank i is often the SYMPTOM of a
+                // sibling rank having thrown — e.g. rank 0 fails an
+                // Assert before reaching a barrier, leaving rank 1
+                // blocked in the collective forever. Surface any
+                // already-recorded worker exception in that case so
+                // the test report shows the real assertion/exception
+                // and not the synthetic "worker did not complete"
+                // message that would otherwise mask it.
+                for (int k = 0; k < workerCount; k++)
+                {
+                    if (threads[k].Join(TimeSpan.Zero) && errors[k] is { } recorded)
+                    {
+                        throw new Xunit.Sdk.XunitException(
+                            $"{opName}: rank {k} threw {recorded.GetType().Name}: {recorded.Message}\n{recorded.StackTrace}");
+                    }
+                }
+                // Genuine timeout — no worker has finished with an
+                // exception, which means we're in a real deadlock.
+                // Build a diagnostic that distinguishes "never started"
+                // (scheduling problem — would surface as NEVER-STARTED)
+                // from "started but blocked" (deadlock in test logic).
+                var states = string.Join(", ", threads.Select((th, k) =>
+                {
+                    var started = System.Threading.Volatile.Read(ref startedFlags[k]) ? "started" : "NEVER-STARTED";
+                    return $"#{k}={th.ThreadState}/{started}";
+                }));
+                throw new Xunit.Sdk.XunitException(
+                    $"{opName}: worker did not complete within {timeout.TotalSeconds:F0}s. " +
+                    $"Thread states: [{states}].");
+            }
+        }
+
+        for (int i = 0; i < workerCount; i++)
+            if (errors[i] is { } e)
+                throw new Xunit.Sdk.XunitException(
+                    $"{opName}: rank {i} threw {e.GetType().Name}: {e.Message}\n{e.StackTrace}");
     }
 
     private sealed class AdditionStage : PipelineStage<float>

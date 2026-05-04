@@ -25943,13 +25943,46 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = (Tensor<T>[])tensors.Clone();
                 int capturedAxis = axis;
-                // Compute output shape: same as first tensor except along concat axis
-                var firstShape = tensors[0]._shape;
+                // Snapshot EVERY input's shape into our own arrays up front,
+                // then derive everything else from those snapshots. The shape
+                // array is reachable from same-assembly callers, and re-reading
+                // any input's _shape across the GraphMode replay closure was a
+                // documented race (issue #291). Snapshotting the first tensor
+                // alone is not enough — totalAxis is summed across all inputs,
+                // so a sibling thread mutating tensors[i]._shape between the
+                // first snapshot and the totalAxis loop could still produce a
+                // mismatched outShape. Snapshot the lot.
+                int n = tensors.Length;
+                var inputShapes = new int[n][];
+                for (int i = 0; i < n; i++)
+                {
+                    if (tensors[i] is null)
+                        throw new ArgumentException($"tensors[{i}] is null.", nameof(tensors));
+                    var src = tensors[i]._shape;
+                    var copy = new int[src.Length];
+                    Array.Copy(src, copy, src.Length);
+                    inputShapes[i] = copy;
+                }
+                var firstShape = inputShapes[0];
                 int rank = firstShape.Length;
                 int normAxis = axis < 0 ? rank + axis : axis;
+                if (normAxis < 0 || normAxis >= rank)
+                    throw new ArgumentException(
+                        $"Invalid axis {axis} for tensor of rank {rank}. " +
+                        $"Axis must be in [0, {rank - 1}] (or [-{rank}, -1] for relative). " +
+                        $"tensors[0].Shape = [{string.Join(", ", firstShape)}].");
                 var outShape = (int[])firstShape.Clone();
                 int totalAxis = 0;
-                foreach (var t in tensors) totalAxis += t._shape[normAxis];
+                for (int i = 0; i < n; i++)
+                {
+                    var shape = inputShapes[i];
+                    if (shape.Length != rank)
+                        throw new ArgumentException(
+                            $"All tensors must have the same rank. " +
+                            $"tensors[0] has rank {rank} (shape [{string.Join(", ", firstShape)}]), " +
+                            $"tensors[{i}] has rank {shape.Length} (shape [{string.Join(", ", shape)}]).");
+                    totalAxis += shape[normAxis];
+                }
                 outShape[normAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
                     (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
