@@ -90,6 +90,34 @@ internal sealed class TensorStorage<T>
     }
 
     /// <summary>
+    /// Atomically claims sole ownership of this storage. Returns <c>true</c>
+    /// when the caller was the only ref-holder at the moment of the claim
+    /// (refcount was exactly 1, now 0); <c>false</c> when one or more
+    /// additional refs exist (refcount &gt; 1 stays unchanged).
+    ///
+    /// <para>After a successful claim the storage's refcount is 0 and any
+    /// concurrent <see cref="AddRef"/> will throw <see cref="ObjectDisposedException"/>;
+    /// the caller must NOT call <see cref="Release"/> on this storage
+    /// (that would underflow). The expected pattern is
+    /// <c>DropStorageForStreaming</c>: caller swaps in fresh storage and
+    /// abandons this one for GC.</para>
+    ///
+    /// <para>This is the atomic version of "check refcount == 1 then
+    /// swap". A naive read-then-swap is racy with <see cref="AddRef"/>
+    /// from a sibling <c>RebindStorageFrom</c>: between the read and the
+    /// swap, another thread could AddRef this storage, leaving the
+    /// caller swapping out shared bytes — its rebound peer would observe
+    /// the original storage and the two views would diverge. CAS-based
+    /// claim closes that window.</para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryClaimExclusive()
+    {
+        // CAS 1 → 0. Succeeds only when no other ref exists.
+        return Interlocked.CompareExchange(ref _refCount, 0, 1) == 1;
+    }
+
+    /// <summary>
     /// Gets the underlying data as a read-only span.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

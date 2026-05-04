@@ -49,9 +49,19 @@ public sealed class StreamingTensorPool : IDisposable
     // (good — they overlapped with foreground compute) from on-demand
     // reads (bad — the prefetch window was too short or the LRU evicted
     // the entry before Materialize hit it).
-    private long _prefetchHitCount;     // Materialize found bytes already resident from a prefetch
-    private long _prefetchMissCount;    // Materialize had to do the disk read on the hot path
+    //
+    // Hit/Miss counters are gated on a prefetch having been issued for
+    // the handle. Without this gate, every register-then-materialize
+    // pair would count as a "hit" (because the bytes are still resident
+    // from register), making the hit rate misleading for tuning the
+    // prefetch window. The _prefetchPending set tracks "I prefetched
+    // this; the next foreground read either uses it (hit) or had to
+    // re-read disk (miss)". Cleared on consumption so a stale prefetch
+    // doesn't keep counting future reads as hits.
+    private long _prefetchHitCount;     // Foreground Materialize after a prefetch found bytes resident
+    private long _prefetchMissCount;    // Foreground Materialize after a prefetch still had to read disk
     private long _prefetchIssueCount;   // Total Rehydrate calls flagged as isPrefetch=true
+    private readonly HashSet<long> _prefetchPending = new();
 
     public StreamingTensorPool(GpuOffloadOptions? options = null)
     {
@@ -82,6 +92,7 @@ public sealed class StreamingTensorPool : IDisposable
         {
             lock (_lock)
             {
+                ThrowIfDisposed();
                 int count = 0;
                 foreach (var entry in _entries.Values)
                 {
@@ -93,7 +104,10 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>Total registered entries (resident + paged out).</summary>
-    public int RegisteredEntryCount { get { lock (_lock) return _entries.Count; } }
+    public int RegisteredEntryCount
+    {
+        get { lock (_lock) { ThrowIfDisposed(); return _entries.Count; } }
+    }
 
     /// <summary>
     /// Returns true when the entry's bytes are currently in the resident
@@ -106,6 +120,7 @@ public sealed class StreamingTensorPool : IDisposable
     {
         lock (_lock)
         {
+            ThrowIfDisposed();
             return _entries.TryGetValue(handleId, out var entry) && entry.Data is not null;
         }
     }
@@ -139,11 +154,14 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>Bumps the last-access timestamp for a weight so the LRU
-    /// eviction policy keeps it resident.</summary>
+    /// eviction policy keeps it resident. Surfaces use-after-dispose as
+    /// <see cref="ObjectDisposedException"/> rather than silently
+    /// no-op'ing so callers don't keep operating on a dead pool.</summary>
     public void MarkAccessed(long handleId)
     {
         lock (_lock)
         {
+            ThrowIfDisposed();
             if (!_lruIndex.TryGetValue(handleId, out var node)) return;
             _lruOrder.Remove(node);
             _lruOrder.AddFirst(node);
@@ -183,21 +201,38 @@ public sealed class StreamingTensorPool : IDisposable
 
             if (isPrefetch)
             {
+                // Mark this handle as "prefetch was issued"; the next
+                // foreground read on this handle will resolve to either
+                // hit or miss based on whether the bytes are still
+                // resident at that point. Also bumps the issue counter.
                 _prefetchIssueCount++;
+                _prefetchPending.Add(handleId);
             }
-            else if (entry.Data is null)
+            else
             {
-                // Foreground Materialize that has to read from disk —
-                // either no prefetch was issued for this handle, or it
-                // hadn't completed in time, or LRU evicted between
-                // prefetch and use.
-                _prefetchMissCount++;
-            }
-            else if (entry.Data is not null)
-            {
-                // Foreground Materialize hit the resident set — a prefetch
-                // (or simply LRU keeping it warm) saved a disk read.
-                _prefetchHitCount++;
+                // Foreground read. Only count as hit/miss if a prefetch
+                // was actually issued for this handle — i.e., we're
+                // measuring prefetch effectiveness, not raw hot-cache
+                // residency. Reads that never had a prefetch (e.g.,
+                // register-then-immediately-materialize) don't enter
+                // either counter.
+                if (_prefetchPending.Remove(handleId))
+                {
+                    if (entry.Data is null)
+                    {
+                        // Prefetch was issued but the bytes aren't
+                        // resident anymore — either the prefetch never
+                        // completed in time, or LRU evicted the entry
+                        // between the prefetch and this foreground read.
+                        _prefetchMissCount++;
+                    }
+                    else
+                    {
+                        // Prefetch warmed the cache; foreground found the
+                        // bytes resident → real prefetch effectiveness.
+                        _prefetchHitCount++;
+                    }
+                }
             }
 
             if (entry.Data is null)
@@ -302,6 +337,11 @@ public sealed class StreamingTensorPool : IDisposable
                 _lruOrder.Remove(node);
                 _lruIndex.Remove(handleId);
             }
+            // Drop any pending prefetch state — handle IDs are monotonic
+            // so this is defensive, but it keeps the pending set bounded
+            // by live entries even when callers register/unregister at
+            // high churn.
+            _prefetchPending.Remove(handleId);
             string path = BackingPathFor(handleId);
             try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort */ }
         }
@@ -335,16 +375,27 @@ public sealed class StreamingTensorPool : IDisposable
             // ~30-40% disk-footprint reduction on near-Gaussian fp32
             // weights. UncompressedBytes is the rehydration target size;
             // PagedOutBytes is what's actually on disk.
+            //
+            // Memory-peak optimisation: stream-write the encoded bytes
+            // directly from the rented LZ4 buffer (no intermediate
+            // `new byte[encoded]` copy) and null out entry.Data
+            // immediately after the write. The previous code kept
+            // entry.Data + encodeBuf + toWrite all live across the
+            // disk write — for a 268 MB tensor that peaked at ~716 MB
+            // resident during eviction, reintroducing OOMs on the
+            // memory-bound models this feature is meant to help. After
+            // this change peak is entry.Data + encodeBuf ≈ ~536 MB,
+            // and entry.Data is freed BEFORE the write returns.
             string path = BackingPathFor(id);
             int uncompressed = entry.Data.Length;
-            byte[] toWrite;
+            int paged;
             bool compressed = false;
             if (_enableCompression)
             {
                 // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
-                // Rent from ArrayPool to avoid 2× transient allocation —
-                // for a 268 MB tensor, the unpooled path peaks at ~537 MB
-                // resident (encodeBuf + final toWrite) on every eviction.
+                // Rent from ArrayPool to keep the encode buffer pooled
+                // across evictions instead of allocating a fresh worst-
+                // case buffer each time.
                 int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
                 byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
                 try
@@ -352,16 +403,29 @@ public sealed class StreamingTensorPool : IDisposable
                     int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
                     if (encoded > 0 && encoded < uncompressed)
                     {
-                        toWrite = new byte[encoded];
-                        Array.Copy(encodeBuf, 0, toWrite, 0, encoded);
+                        // Stream-write only the encoded slice. FileStream
+                        // .Write copies (uncompressed + overhead) bytes
+                        // straight to disk — no intermediate byte[encoded]
+                        // copy. This is the dominant peak-memory win:
+                        // before this, we'd have allocated a third
+                        // copy-out buffer here.
+                        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            fs.Write(encodeBuf, 0, encoded);
+                        }
+                        paged = encoded;
                         compressed = true;
                     }
                     else
                     {
-                        // Compression didn't help (entropy too high or below
-                        // LZ4's break-even) — store raw to skip the decompress
-                        // cost on rehydrate.
-                        toWrite = entry.Data;
+                        // Compression didn't shrink the payload (entropy too
+                        // high or below LZ4's break-even) — write entry.Data
+                        // raw and flag IsCompressed=false so Rehydrate
+                        // doesn't try to decode. Same File.WriteAllBytes
+                        // path as the no-compression branch below.
+                        File.WriteAllBytes(path, entry.Data);
+                        paged = uncompressed;
+                        compressed = false;
                     }
                 }
                 finally
@@ -371,19 +435,24 @@ public sealed class StreamingTensorPool : IDisposable
             }
             else
             {
-                toWrite = entry.Data;
+                File.WriteAllBytes(path, entry.Data);
+                paged = uncompressed;
             }
-            File.WriteAllBytes(path, toWrite);
-            entry.PagedOutBytes = toWrite.Length;
+            // Free entry.Data IMMEDIATELY now that the bytes are durably
+            // on disk. Any further work (counter updates, LRU bookkeeping)
+            // doesn't need the resident copy. Holding it alive across
+            // the rest of this method (or worse, until the next eviction)
+            // would defeat the whole eviction.
+            entry.Data = null;
+            entry.PagedOutBytes = paged;
             entry.UncompressedBytes = uncompressed;
             entry.IsCompressed = compressed;
-            _diskWriteBytes += toWrite.Length;
+            _diskWriteBytes += paged;
             _evictionCount++;
-            _compressedBytesTotal += toWrite.Length;
+            _compressedBytesTotal += paged;
             _uncompressedBytesTotal += uncompressed;
             Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
             entry.ResidentBytes = 0;
-            entry.Data = null;
             _lruOrder.Remove(oldest);
             _lruIndex.Remove(id);
         }
@@ -447,22 +516,25 @@ public sealed class StreamingTensorPool : IDisposable
     {
         lock (_lock)
         {
+            ThrowIfDisposed();
             double ratio = _uncompressedBytesTotal > 0
                 ? (double)_compressedBytesTotal / _uncompressedBytesTotal
                 : 1.0;
-            return new StreamingPoolReport(
-                ResidentBytes: _residentBytes,
-                ResidentBytesPeak: _residentBytesPeak,
-                RegisteredEntryCount: _entries.Count,
-                DiskReadCount: _diskReadCount,
-                DiskReadBytes: _diskReadBytes,
-                DiskWriteBytes: _diskWriteBytes,
-                EvictionCount: _evictionCount,
-                CompressionRatio: ratio,
-                CompressionEnabled: _enableCompression,
-                PrefetchHitCount: _prefetchHitCount,
-                PrefetchMissCount: _prefetchMissCount,
-                PrefetchIssueCount: _prefetchIssueCount);
+            return new StreamingPoolReport
+            {
+                ResidentBytes = _residentBytes,
+                ResidentBytesPeak = _residentBytesPeak,
+                RegisteredEntryCount = _entries.Count,
+                DiskReadCount = _diskReadCount,
+                DiskReadBytes = _diskReadBytes,
+                DiskWriteBytes = _diskWriteBytes,
+                EvictionCount = _evictionCount,
+                CompressionRatio = ratio,
+                CompressionEnabled = _enableCompression,
+                PrefetchHitCount = _prefetchHitCount,
+                PrefetchMissCount = _prefetchMissCount,
+                PrefetchIssueCount = _prefetchIssueCount,
+            };
         }
     }
 }
@@ -471,50 +543,91 @@ public sealed class StreamingTensorPool : IDisposable
 /// Snapshot of streaming pool counters. Returned by
 /// <see cref="StreamingTensorPool.GetReport"/> and surfaced in
 /// AiDotNet's <c>PredictionModelResult.StreamingReport</c>.
+///
+/// <para><b>Default-instance contract:</b> <c>default(StreamingPoolReport)</c>
+/// and <c>new StreamingPoolReport()</c> both report
+/// <see cref="CompressionRatio"/> = <c>1.0</c> (the documented "no
+/// compression has run" value), not the all-zero-struct's <c>0.0</c>.
+/// This matters for consumers that surface telemetry before any
+/// streaming registration has happened — a 0.0 ratio would imply
+/// "perfect compression" which is misleading. The normalization is
+/// implemented by storing the raw ratio in a private field and
+/// returning <c>1.0</c> when it's <c>&lt;= 0</c>.</para>
 /// </summary>
-/// <param name="ResidentBytes">Currently resident bytes (uncompressed).</param>
-/// <param name="ResidentBytesPeak">Peak resident bytes observed since the
-/// pool was created. Helpful for tuning <see cref="GpuOffloadOptions.StreamingPoolMaxResidentBytes"/>
-/// — set the budget just above the peak to avoid eviction churn.</param>
-/// <param name="RegisteredEntryCount">Total entries in the pool (resident
-/// + paged out).</param>
-/// <param name="DiskReadCount">Number of times the backing store had to
-/// be read to rehydrate an entry. High values relative to entry count
-/// indicate the resident budget is too small / the prefetch window is
-/// too small relative to the access pattern.</param>
-/// <param name="DiskReadBytes">Total bytes read from the backing store.</param>
-/// <param name="DiskWriteBytes">Total bytes written to the backing store
-/// across all evictions (compressed size when compression is on).</param>
-/// <param name="EvictionCount">Number of eviction events. Each event may
-/// page out one entry.</param>
-/// <param name="CompressionRatio">Average compressed/uncompressed ratio
-/// across all evictions, weighted by uncompressed byte count. 1.0 when no
-/// compression has run; lower is better. Typical for fp32 weights:
-/// 0.6–0.7.</param>
-/// <param name="CompressionEnabled">Whether <see cref="GpuOffloadOptions.EnableCompression"/>
-/// was set when the pool was constructed.</param>
-/// <param name="PrefetchHitCount">Number of foreground
-/// <see cref="WeightRegistry.Materialize{T}"/> calls that found the
-/// bytes already resident — a prefetch (or LRU heat) saved a disk read.
-/// High hit rate = prefetch window is well-tuned.</param>
-/// <param name="PrefetchMissCount">Foreground Materialize calls that
-/// had to read from the backing store on the hot path. High miss rate
-/// = prefetch window is too short, or LRU evicted the entry before
-/// foreground reached it.</param>
-/// <param name="PrefetchIssueCount">Total
-/// <see cref="WeightRegistry.PrefetchAsync{T}"/> calls. PrefetchIssueCount
-/// far exceeding PrefetchHitCount indicates wasted prefetch work
-/// (rehydrated entries got evicted before being read).</param>
-public readonly record struct StreamingPoolReport(
-    long ResidentBytes,
-    long ResidentBytesPeak,
-    int RegisteredEntryCount,
-    long DiskReadCount,
-    long DiskReadBytes,
-    long DiskWriteBytes,
-    long EvictionCount,
-    double CompressionRatio,
-    bool CompressionEnabled,
-    long PrefetchHitCount,
-    long PrefetchMissCount,
-    long PrefetchIssueCount);
+public readonly record struct StreamingPoolReport
+{
+    /// <summary>Currently resident bytes (uncompressed).</summary>
+    public long ResidentBytes { get; init; }
+
+    /// <summary>Peak resident bytes observed since the pool was
+    /// created. Helpful for tuning
+    /// <see cref="GpuOffloadOptions.StreamingPoolMaxResidentBytes"/>
+    /// — set the budget just above the peak to avoid eviction churn.</summary>
+    public long ResidentBytesPeak { get; init; }
+
+    /// <summary>Total entries in the pool (resident + paged out).</summary>
+    public int RegisteredEntryCount { get; init; }
+
+    /// <summary>Number of times the backing store had to be read to
+    /// rehydrate an entry. High values relative to entry count
+    /// indicate the resident budget is too small / the prefetch
+    /// window is too small relative to the access pattern.</summary>
+    public long DiskReadCount { get; init; }
+
+    /// <summary>Total bytes read from the backing store.</summary>
+    public long DiskReadBytes { get; init; }
+
+    /// <summary>Total bytes written to the backing store across all
+    /// evictions (compressed size when compression is on).</summary>
+    public long DiskWriteBytes { get; init; }
+
+    /// <summary>Number of eviction events. Each event may page out
+    /// one entry.</summary>
+    public long EvictionCount { get; init; }
+
+    // Backing field for CompressionRatio. The default value of zero
+    // (from default(StreamingPoolReport)) is interpreted as "no
+    // compression has run" and surfaced as 1.0 by the property's
+    // getter. Real values from GetReport() are always > 0 (LZ4 never
+    // emits zero-byte output for non-empty input).
+    private readonly double _compressionRatioRaw;
+
+    /// <summary>Average compressed/uncompressed ratio across all
+    /// evictions, weighted by uncompressed byte count. <c>1.0</c> when
+    /// no compression has run; lower is better. Typical for fp32
+    /// weights: 0.6–0.7. Reading this on a default-constructed
+    /// instance returns <c>1.0</c> (not <c>0.0</c>) so consumers that
+    /// surface telemetry before any streaming registration don't
+    /// report a misleading "perfect compression" ratio.</summary>
+    public double CompressionRatio
+    {
+        get => _compressionRatioRaw <= 0.0 ? 1.0 : _compressionRatioRaw;
+        init => _compressionRatioRaw = value;
+    }
+
+    /// <summary>Whether <see cref="GpuOffloadOptions.EnableCompression"/>
+    /// was set when the pool was constructed.</summary>
+    public bool CompressionEnabled { get; init; }
+
+    /// <summary>Number of foreground
+    /// <see cref="WeightRegistry.Materialize{T}"/> calls on a handle
+    /// that had a prefetch in flight and found the bytes already
+    /// resident — a prefetch (or LRU heat following one) saved a disk
+    /// read. High hit rate = prefetch window is well-tuned. Reads on
+    /// handles that never had a prefetch issued are NOT counted here
+    /// — those are normal hot-cache reads, not prefetch hits.</summary>
+    public long PrefetchHitCount { get; init; }
+
+    /// <summary>Foreground Materialize calls that had a prefetch in
+    /// flight but had to read from the backing store anyway. High
+    /// miss rate = prefetch window is too short, or LRU evicted the
+    /// entry before foreground reached it. Reads on handles that
+    /// never had a prefetch issued are NOT counted here.</summary>
+    public long PrefetchMissCount { get; init; }
+
+    /// <summary>Total <see cref="WeightRegistry.PrefetchAsync{T}"/>
+    /// calls that resulted in actual prefetch work. PrefetchIssueCount
+    /// far exceeding PrefetchHitCount indicates wasted prefetch work
+    /// (rehydrated entries got evicted before being read).</summary>
+    public long PrefetchIssueCount { get; init; }
+}

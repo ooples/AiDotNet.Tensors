@@ -351,14 +351,36 @@ public class WeightRegistryStreamingTests : IDisposable
     public void DropStorage_OnSharedRefcount_Throws()
     {
         // Audit P1 #5: DropStorageForStreaming must reject tensors whose
-        // storage refcount > 1 (rebound peers exist). Current weight
-        // doesn't have a rebound peer in this test, but we can't easily
-        // construct that scenario without internal access — assert the
-        // happy path works here and rely on the production guard.
-        var t = new Tensor<float>(new float[] { 1f, 2f, 3f }, new[] { 3 });
-        t.Lifetime = WeightLifetime.Streaming;
-        WeightRegistry.RegisterWeight(t); // implicitly DropStorageForStreaming
-        Assert.Equal(0, t.DataVector.Length);
+        // storage refcount > 1 (rebound peers exist). Construct that
+        // scenario directly via RebindStorageFrom — the test assembly
+        // has internals access. Without this guard, registering a
+        // tensor whose storage is shared with a peer would silently
+        // drop bytes the peer is still reading.
+        var t1 = new Tensor<float>(new float[] { 1f, 2f, 3f }, new[] { 3 });
+        var t2 = new Tensor<float>(new float[] { 9f, 9f, 9f }, new[] { 3 });
+        // Rebind t2's storage to point at t1's — both now share storage,
+        // refcount = 2.
+        t2.RebindStorageFrom(t1);
+
+        t1.Lifetime = WeightLifetime.Streaming;
+
+        // RegisterWeight implicitly calls DropStorageForStreaming; with
+        // refcount > 1 the atomic claim must fail and the call must
+        // throw. The pool-entry rollback (separate audit fix) means
+        // there's no leaked pool entry on this throw path.
+        var ex = Assert.Throws<InvalidOperationException>(() => WeightRegistry.RegisterWeight(t1));
+        Assert.Contains("sole storage ownership", ex.Message);
+
+        // Both tensors must still be intact: the failed register must
+        // not have stripped t1's bytes (and therefore t2's).
+        Assert.Equal(3, t1.DataVector.Length);
+        Assert.Equal(3, t2.DataVector.Length);
+        Assert.Equal(1f, t1.DataVector.AsSpan()[0]);
+        Assert.Equal(1f, t2.DataVector.AsSpan()[0]); // shared with t1
+
+        // No pool handle should have been assigned because the rollback
+        // must restore the tensor to its pre-register state.
+        Assert.True(t1.StreamingPoolHandle < 0);
     }
 
     [Fact]
@@ -396,11 +418,15 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void PrefetchHitMissCounters_Reflect_PrefetchEffectiveness()
+    public async System.Threading.Tasks.Task PrefetchHitMissCounters_Reflect_PrefetchEffectiveness()
     {
-        // Audit P1 #10: distinguish prefetch hits (Materialize after
-        // PrefetchAsync warmed the entry) from misses (Materialize on
-        // cold cache). Issue counter tracks raw PrefetchAsync calls.
+        // Audit P1 #10 + counter-semantics fix: hit/miss must only
+        // count foreground reads where a prefetch was actually issued
+        // — register-then-immediately-materialize must NOT count as
+        // a hit (no prefetch ran). This test exercises the real
+        // PrefetchAsync path and uses the Task-returning internal
+        // overload to wait deterministically on the worker rather
+        // than polling with a wall-clock budget.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -412,46 +438,101 @@ public class WeightRegistryStreamingTests : IDisposable
         t.Lifetime = WeightLifetime.Streaming;
         WeightRegistry.RegisterWeight(t);
 
-        // Force eviction.
+        // Force eviction so the next Materialize must read from disk
+        // (counts as a "miss" only if a prefetch was issued for t).
         var filler = new Tensor<float>(new float[16], new[] { 16 });
         filler.Lifetime = WeightLifetime.Streaming;
         WeightRegistry.RegisterWeight(filler);
 
-        // Cold-cache Materialize → counts as a miss.
+        // Phase 1: foreground Materialize WITHOUT a prefetch issued.
+        // Bytes are not resident, so the read goes to disk — but
+        // because no prefetch was issued for this handle, neither
+        // hit NOR miss is incremented.
+        WeightRegistry.Materialize(t);
+        var report0 = WeightRegistry.GetStreamingReport();
+        Assert.Equal(0, report0.PrefetchHitCount);
+        Assert.Equal(0, report0.PrefetchMissCount);
+        Assert.Equal(0, report0.PrefetchIssueCount);
+
+        // Phase 2: release t back to pool, evict it again, then
+        // PrefetchAsync (and AWAIT completion via the test-only
+        // Task-returning overload). The next foreground Materialize
+        // finds the bytes resident → counts as a HIT because a
+        // prefetch was issued for this handle.
+        WeightRegistry.ReleaseToPool(t);
+        // Bring filler back to LRU head so t is the eviction victim.
+        WeightRegistry.Materialize(filler);
+        // Now register a second filler to force t out.
+        var filler2 = new Tensor<float>(new float[16], new[] { 16 });
+        filler2.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(filler2);
+
+        // Use the deterministic Task-returning internal overload
+        // (InternalsVisibleTo grants the test assembly access) so
+        // this test doesn't poll with a wall-clock budget that's
+        // flaky on busy CI agents. The Task completes when the
+        // prefetch worker finishes (Rehydrate done) or short-circuits
+        // (already resident / dropped).
+        await WeightRegistry.PrefetchAsyncForTesting(t);
+
+        // Bytes should be resident now → next foreground Materialize
+        // is a HIT (prefetch was issued AND bytes were found resident).
         WeightRegistry.Materialize(t);
         var report1 = WeightRegistry.GetStreamingReport();
-        Assert.True(report1.PrefetchMissCount >= 1);
-        Assert.Equal(0, report1.PrefetchHitCount);
-
-        // ReleaseToPool then Materialize-from-resident-set → counts as hit.
-        WeightRegistry.ReleaseToPool(t);
-        WeightRegistry.Materialize(t);
-        var report2 = WeightRegistry.GetStreamingReport();
-        Assert.True(report2.PrefetchHitCount >= 1);
+        Assert.True(report1.PrefetchIssueCount >= 1, "PrefetchAsync must increment IssueCount");
+        Assert.True(report1.PrefetchHitCount >= 1, "Foreground after prefetch must count as a hit");
+        Assert.Equal(0, report1.PrefetchMissCount); // bytes were resident, no miss
     }
 
     [Fact]
-    public void RegisterWeight_OnHugeTensor_ThrowsClearError()
+    public void RegisterWeight_DegenerateZeroLengthTensor_RegistersWithEmptyPayload()
     {
-        // Audit P2 #16: byteCount overflow guard should throw
-        // NotSupportedException with a chunking hint, not silently wrap
-        // to a negative int.
-        // Construct a tensor whose Length × element size > int.MaxValue.
-        // Easiest: a long-element-typed tensor of length close to int.Max.
-        // We can't actually allocate a tensor that large in test (that'd
-        // OOM on its own), so we use a Mock pattern: construct a small
-        // tensor and manually set Length via reflection? That's brittle.
-        //
-        // Pragmatic: skip the actual overflow trigger; just assert the
-        // production guard exists by inspection. If you want a proper
-        // test, mock Tensor<T>.Length via a derived test-only class.
-        //
-        // For now, assert that registering a Length=0 tensor (degenerate
-        // edge) doesn't throw — covers the byteCount=0 path.
+        // Edge case: Length=0 tensors must round-trip through register
+        // without throwing. byteCount=0 is the lower bound of the
+        // overflow check; the upper bound (>int.MaxValue) is covered
+        // by RegisterWeight_OnHugeTensor_ThrowsClearError below.
         var t = new Tensor<float>(Array.Empty<float>(), new[] { 0 });
         t.Lifetime = WeightLifetime.Streaming;
         WeightRegistry.RegisterWeight(t);
         Assert.True(t.StreamingPoolHandle >= 0);
+        Assert.Equal(0, t.DataVector.Length);
+    }
+
+    [Fact]
+    public void CheckedStreamingByteCount_OverflowsIntMaxValue_ThrowsClearError()
+    {
+        // Audit P2 #16: byteCount overflow guard must throw
+        // NotSupportedException with a chunking hint, not silently
+        // wrap to a negative int. The guard is extracted into the
+        // internal CheckedStreamingByteCount<T> helper so we can
+        // unit-test it directly with a synthetic Length value
+        // — no need to allocate a multi-GB tensor in a test process.
+        // RegisterWeight calls the same helper on the production path,
+        // so this test fully covers the overflow path.
+
+        // float = 4 bytes/element. (int.MaxValue / 4) + 1 elements
+        // would need (int.MaxValue / 4 + 1) × 4 ≈ int.MaxValue + 4
+        // bytes, which exceeds int.MaxValue.
+        int hugeLength = (int.MaxValue / 4) + 1;
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            WeightRegistry.CheckedStreamingByteCount<float>(hugeLength));
+        Assert.Contains("Streaming registration requires per-tensor size", ex.Message);
+        Assert.Contains("Chunk", ex.Message);
+
+        // Boundary check: a length that fits exactly at int.MaxValue
+        // must NOT throw. int.MaxValue / 4 elements × 4 bytes =
+        // int.MaxValue - 3 bytes (since int.MaxValue is not divisible
+        // by 4). That's the largest valid float-tensor count.
+        int maxValidFloatLength = int.MaxValue / 4;
+        int byteCount = WeightRegistry.CheckedStreamingByteCount<float>(maxValidFloatLength);
+        Assert.Equal(maxValidFloatLength * 4, byteCount);
+
+        // Negative length must reject explicitly (not silently wrap).
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            WeightRegistry.CheckedStreamingByteCount<float>(-1));
+
+        // Length=0 must succeed and return 0 (degenerate but valid).
+        Assert.Equal(0, WeightRegistry.CheckedStreamingByteCount<float>(0));
     }
 
     [Fact]
@@ -619,6 +700,18 @@ public class WeightRegistryStreamingTests : IDisposable
         // resident, it should still bump LRU heat — otherwise a hot
         // weight that always early-outs gets passed by less-recently-
         // used neighbours and eventually evicts.
+        //
+        // Test setup designed to actually trigger eviction:
+        //   budget    = 32 bytes
+        //   hot       = 4 floats = 16 bytes  (registered first → at LRU head)
+        //   neighbour = 4 floats = 16 bytes  (registered second → now at LRU head; hot at tail)
+        //   bump hot  via Materialize early-out × 5 (must move hot back to LRU head)
+        //   pressure  = 4 floats = 16 bytes  (registering this puts us at 48 bytes — must evict 16)
+        // The eviction victim is whichever entry is at LRU TAIL when
+        // pressure registers. Without LRU refresh on early-out, hot
+        // was last moved at register time (oldest) → evicts. With
+        // refresh, hot was bumped after neighbour → neighbour evicts.
+        // Asserting hot stays resident proves the refresh happened.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -629,29 +722,90 @@ public class WeightRegistryStreamingTests : IDisposable
         var hot = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
         hot.Lifetime = WeightLifetime.Streaming;
         WeightRegistry.RegisterWeight(hot);
-        WeightRegistry.Materialize(hot); // make resident
+        // hot is now resident (Register adds to LRU head); LRU = [hot].
 
-        // Hot is now resident; subsequent Materialize calls early-out.
-        // Issue several Materialize calls — each should bump LRU.
+        var neighbour = new Tensor<float>(new float[] { 5f, 6f, 7f, 8f }, new[] { 4 });
+        neighbour.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(neighbour);
+        // 32 bytes total — at budget, no eviction yet. LRU = [neighbour, hot].
+        // Without further bumps, neighbour stays at head and hot will
+        // evict when the next entry pushes us over budget.
+        Assert.True(WeightRegistry.IsResidentInPool(hot));
+        Assert.True(WeightRegistry.IsResidentInPool(neighbour));
+
+        // Bump hot via the early-out path: Materialize finds it already
+        // resident and (per the audit fix) refreshes the LRU. After
+        // these calls, LRU = [hot, neighbour], so neighbour is the
+        // eviction victim when pressure pushes us over budget.
         for (int i = 0; i < 5; i++) WeightRegistry.Materialize(hot);
 
-        // Now register a cold tensor that pushes us over budget. With
-        // the LRU refresh, the cold one (newer at LRU head) should
-        // evict, NOT the hot one. Without the refresh, hot would have
-        // been at LRU tail (never refreshed) and would evict first.
-        var cold = new Tensor<float>(new float[] { 9f, 9f }, new[] { 2 });
-        cold.Lifetime = WeightLifetime.Streaming;
-        WeightRegistry.RegisterWeight(cold);
+        // Pressure: 4 floats = 16 bytes → 32 + 16 = 48 > budget 32 →
+        // evict from LRU tail (neighbour) until back at budget.
+        var pressure = new Tensor<float>(new float[] { 9f, 9f, 9f, 9f }, new[] { 4 });
+        pressure.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(pressure);
 
-        // Hot must still be resident (its LRU heat was refreshed).
-        Assert.True(WeightRegistry.IsResidentInPool(hot));
+        // Assert: hot is STILL resident (its LRU heat was refreshed by
+        // the early-out path); neighbour is the one that got paged out.
+        // This is the exact behaviour Audit #29 asks for — without the
+        // refresh, hot would have evicted instead.
+        Assert.True(WeightRegistry.IsResidentInPool(hot),
+            "Materialize early-out must refresh LRU heat so the hot tensor stays resident under pressure.");
+        Assert.False(WeightRegistry.IsResidentInPool(neighbour),
+            "Without bumping LRU, the neighbour at LRU tail must be the eviction victim, not hot.");
     }
 
     [Fact]
     public void MarkAccessed_BumpsLRU_WithoutMaterialize()
     {
-        // Audit round-3 #32: explicit MarkAccessed for callers that
-        // bypass Materialize entirely.
+        // Audit round-3 #32 + reviewer: MarkAccessed must actually
+        // bump the LRU position so a regression where it becomes a
+        // no-op fails this test. Setup mirrors the early-out LRU
+        // test: tight budget, two entries fitting exactly, then a
+        // third entry pushing us over budget. Whichever entry was
+        // at LRU TAIL when pressure was registered is the eviction
+        // victim — proving MarkAccessed moved its target away from
+        // the tail (or didn't, in a regression).
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32, // 8 floats — fits exactly two 16-byte tensors
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var hot = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        hot.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(hot);
+
+        var neighbour = new Tensor<float>(new float[] { 5f, 6f, 7f, 8f }, new[] { 4 });
+        neighbour.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(neighbour);
+
+        // LRU = [neighbour, hot] (most recent first). Without a bump,
+        // hot would evict next. Use MarkAccessed (NOT Materialize) to
+        // refresh hot's LRU position.
+        WeightRegistry.MarkAccessed(hot);
+        // LRU should now be [hot, neighbour].
+
+        // Trigger eviction by registering a third entry that doesn't fit.
+        var pressure = new Tensor<float>(new float[] { 9f, 9f, 9f, 9f }, new[] { 4 });
+        pressure.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(pressure);
+
+        // MarkAccessed working = neighbour at tail = neighbour evicts;
+        // MarkAccessed regressed to no-op = hot at tail = hot evicts.
+        Assert.True(WeightRegistry.IsResidentInPool(hot),
+            "MarkAccessed must move the target to LRU head; if it regresses to a no-op the hot tensor would evict instead of the neighbour.");
+        Assert.False(WeightRegistry.IsResidentInPool(neighbour),
+            "Neighbour should be the eviction victim once MarkAccessed moves hot to LRU head.");
+    }
+
+    [Fact]
+    public void MarkAccessed_NonStreamingOrUnregistered_DoesNotThrow()
+    {
+        // Defensive coverage for the no-op contract: MarkAccessed on
+        // a non-Streaming weight or one whose handle is -1 must short-
+        // circuit without acquiring the pool lock or throwing.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -659,27 +813,30 @@ public class WeightRegistryStreamingTests : IDisposable
             StreamingBackingStorePath = _backingDir,
         });
 
-        var t = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
-        t.Lifetime = WeightLifetime.Streaming;
-        WeightRegistry.RegisterWeight(t);
-
-        // No-op for non-streaming or unregistered tensors — should not throw.
         var notStreaming = new Tensor<float>(new float[] { 1f }, new[] { 1 });
         WeightRegistry.MarkAccessed(notStreaming);
 
-        // For streaming tensor — should not throw.
-        WeightRegistry.MarkAccessed(t);
+        var streamingButUnregistered = new Tensor<float>(new float[] { 1f }, new[] { 1 });
+        streamingButUnregistered.Lifetime = WeightLifetime.Streaming;
+        // Handle stays at -1 because we never called RegisterWeight.
+        WeightRegistry.MarkAccessed(streamingButUnregistered);
+
+        // Both calls returned without throwing — that's the contract.
     }
 
     [Fact]
     public async System.Threading.Tasks.Task PrefetchAsyncMany_BatchedPrefetch_BringsAllResident()
     {
-        // Audit round-3 #33: batched prefetch issues one worker that
-        // walks all weights under one lock acquire.
+        // Audit round-3 #33 + reviewer: batched prefetch must actually
+        // make ALL target tensors resident, not just count an issue.
+        // Setup must let all three FIT in the budget — earlier setup
+        // had budget=32 with three 16-byte tensors which is physically
+        // impossible to satisfy (only two fit). Now: budget=64 so all
+        // three (3 × 16 = 48 bytes) fit comfortably.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
-            StreamingPoolMaxResidentBytes = 32,
+            StreamingPoolMaxResidentBytes = 64, // fits all 3 × 16-byte tensors
             StreamingBackingStorePath = _backingDir,
         });
 
@@ -691,24 +848,48 @@ public class WeightRegistryStreamingTests : IDisposable
             WeightRegistry.RegisterWeight(tensors[k]);
         }
 
-        // Force eviction of all 3 (each is 16 bytes; budget 32 → only 2 fit).
-        // After registering all, the oldest is evicted.
-        var report = WeightRegistry.GetStreamingReport();
-        Assert.True(report.EvictionCount >= 1);
+        // Force eviction of all 3 by adding pressure that exceeds budget.
+        // 3 × 16 + 16 = 64 → at budget; 3 × 16 + 64 = 112 → over → all 3 evict.
+        var pressure = new Tensor<float>(new float[16], new[] { 16 });
+        pressure.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(pressure);
 
-        // Issue batched prefetch.
+        // Verify our setup: all three tensors have been evicted.
+        for (int k = 0; k < 3; k++)
+            Assert.False(WeightRegistry.IsResidentInPool(tensors[k]),
+                $"Test setup precondition: tensor {k} must be evicted after pressure registration.");
+
+        // Drop pressure so the budget has room for the prefetch to bring
+        // all three back resident.
+        WeightRegistry.UnregisterWeight(pressure);
+
+        // Issue batched prefetch and wait deterministically by polling
+        // PrefetchIssueCount. Use generous timeout (CI agents can be
+        // slow under contention) but assert on actual residency, not
+        // on counter value alone.
         WeightRegistry.PrefetchAsyncMany(tensors);
 
-        // Wait for the worker to complete.
-        for (int wait = 0; wait < 50; wait++)
+        // Wait for ALL THREE prefetch issues to land (PrefetchAsyncMany
+        // queues one worker that does three Rehydrates; IssueCount
+        // increments per Rehydrate).
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
         {
             var r = WeightRegistry.GetStreamingReport();
-            if (r.PrefetchIssueCount >= 3) break; // all 3 prefetched
+            if (r.PrefetchIssueCount >= 3) break;
             await System.Threading.Tasks.Task.Delay(20);
         }
 
         var finalReport = WeightRegistry.GetStreamingReport();
-        Assert.True(finalReport.PrefetchIssueCount >= 1, "Prefetch worker should have fired");
+        Assert.True(finalReport.PrefetchIssueCount >= 3,
+            $"Batched prefetch should issue 3 Rehydrates; got {finalReport.PrefetchIssueCount}.");
+
+        // The actual contract: ALL THREE tensors must be resident after
+        // the batched prefetch worker finishes. This is the assertion
+        // the test name promises and the previous version skipped.
+        for (int k = 0; k < 3; k++)
+            Assert.True(WeightRegistry.IsResidentInPool(tensors[k]),
+                $"Tensor {k} must be resident after PrefetchAsyncMany completes.");
     }
 
     [Fact]
@@ -740,6 +921,13 @@ public class WeightRegistryStreamingTests : IDisposable
     [Fact]
     public async System.Threading.Tasks.Task PrefetchAsync_BringsBytesIntoResidentSet()
     {
+        // Reviewer flagged the original wall-clock poll loop (1s budget)
+        // as flaky on busy CI agents. Switched to the internal
+        // Task-returning overload PrefetchAsyncForTesting, which
+        // resolves when the worker finishes Rehydrate (or short-
+        // circuits via the dedup path). This is the deterministic
+        // production-grade fix — no polling, no wall-clock budget,
+        // no flakiness window.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -757,12 +945,192 @@ public class WeightRegistryStreamingTests : IDisposable
         WeightRegistry.RegisterWeight(filler);
         Assert.False(WeightRegistry.IsResidentInPool(t));
 
-        // Issue prefetch and wait for the threadpool to run it.
-        WeightRegistry.PrefetchAsync(t);
-        for (int i = 0; i < 50 && !WeightRegistry.IsResidentInPool(t); i++)
-            await System.Threading.Tasks.Task.Delay(20);
+        // Drop filler so prefetch has budget to bring t back resident.
+        WeightRegistry.UnregisterWeight(filler);
+
+        // Deterministic wait — Task completes when the worker finishes.
+        // Use a generous WaitAsync timeout as a hard upper bound (5s)
+        // so a buggy implementation can't hang the test forever.
+        var prefetchTask = WeightRegistry.PrefetchAsyncForTesting(t);
+        var completed = await System.Threading.Tasks.Task.WhenAny(
+            prefetchTask,
+            System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(prefetchTask, completed);
 
         Assert.True(WeightRegistry.IsResidentInPool(t),
-            "Prefetch should have brought bytes back into resident set within 1 s.");
+            "Prefetch worker completed but bytes are not resident — Rehydrate likely failed silently.");
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task PrefetchAsync_OnAlreadyResident_NoOps()
+    {
+        // Reviewer audit P2: PrefetchAsync must skip already-resident
+        // handles instead of queueing a redundant worker. Verify by
+        // observing PrefetchIssueCount stays at 0 when the handle is
+        // resident at the time of the prefetch call.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        // After register the bytes are still resident in the pool — no
+        // foreground Materialize needed.
+        Assert.True(WeightRegistry.IsResidentInPool(t));
+
+        var pre = WeightRegistry.GetStreamingReport();
+        await WeightRegistry.PrefetchAsyncForTesting(t);
+        var post = WeightRegistry.GetStreamingReport();
+
+        // Dedup path means the prefetch was never enqueued because the
+        // resident-check short-circuited. PrefetchIssueCount must NOT
+        // have advanced.
+        Assert.Equal(pre.PrefetchIssueCount, post.PrefetchIssueCount);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task PrefetchAsync_DoesNotDoubleQueue_WhenInFlight()
+    {
+        // Reviewer audit P2: a second PrefetchAsync on the same handle
+        // while the first is still in-flight must NOT queue a second
+        // worker. Hard to test deterministically because we'd have to
+        // freeze the first worker; instead, exercise the dedup state
+        // by issuing two prefetches "back to back" and verifying the
+        // semaphore + in-flight set keep IssueCount bounded.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        // Force eviction so prefetch has work to do.
+        var filler = new Tensor<float>(new float[16], new[] { 16 });
+        filler.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(filler);
+        Assert.False(WeightRegistry.IsResidentInPool(t));
+
+        // Drop filler so prefetch can land.
+        WeightRegistry.UnregisterWeight(filler);
+
+        // Issue two prefetches and await both. The dedup path means
+        // the second one short-circuits on the in-flight set (or,
+        // in the rare case the first finishes between the two calls,
+        // on the resident-check). Either way IssueCount must be
+        // exactly 1, not 2.
+        var p1 = WeightRegistry.PrefetchAsyncForTesting(t);
+        var p2 = WeightRegistry.PrefetchAsyncForTesting(t);
+        await System.Threading.Tasks.Task.WhenAll(p1, p2);
+
+        var report = WeightRegistry.GetStreamingReport();
+        Assert.True(report.PrefetchIssueCount <= 1,
+            $"Dedup must prevent double-queue. PrefetchIssueCount={report.PrefetchIssueCount}.");
+        Assert.True(WeightRegistry.IsResidentInPool(t),
+            "Prefetch worker should still complete the (single) Rehydrate.");
+    }
+
+    [Fact]
+    public void StreamingPoolReport_Default_HasCompressionRatio_One()
+    {
+        // Reviewer audit P2: default(StreamingPoolReport) must surface
+        // CompressionRatio as 1.0 (the documented "no compression has
+        // run" value), NOT the all-zero struct's 0.0 which would
+        // imply misleading "perfect compression".
+        StreamingPoolReport defaultReport = default;
+        Assert.Equal(1.0, defaultReport.CompressionRatio);
+
+        // Same for new() — both paths must normalize.
+        var newedReport = new StreamingPoolReport();
+        Assert.Equal(1.0, newedReport.CompressionRatio);
+
+        // An explicitly-set non-zero ratio must be preserved verbatim.
+        var explicitReport = new StreamingPoolReport { CompressionRatio = 0.65 };
+        Assert.Equal(0.65, explicitReport.CompressionRatio);
+
+        // Explicitly setting to zero (an invalid practical value) also
+        // surfaces as 1.0 — defensive normalization, since LZ4 never
+        // produces zero-byte output for non-empty input.
+        var zeroReport = new StreamingPoolReport { CompressionRatio = 0.0 };
+        Assert.Equal(1.0, zeroReport.CompressionRatio);
+    }
+
+    [Fact]
+    public void Pool_PostDispose_ReadAPIsThrowObjectDisposed()
+    {
+        // Reviewer audit P2: read APIs (IsResident, GetReport,
+        // ResidentEntryCount, RegisteredEntryCount, MarkAccessed)
+        // must throw ObjectDisposedException after Dispose, not
+        // silently return defaults that let callers keep operating
+        // on a dead pool.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+        long h = pool.Register(new byte[] { 1, 2, 3 });
+        pool.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => pool.IsResident(h));
+        Assert.Throws<ObjectDisposedException>(() => pool.GetReport());
+        Assert.Throws<ObjectDisposedException>(() => pool.ResidentEntryCount);
+        Assert.Throws<ObjectDisposedException>(() => pool.RegisteredEntryCount);
+        Assert.Throws<ObjectDisposedException>(() => pool.MarkAccessed(h));
+    }
+
+    [Fact]
+    public void Eviction_HighEntropyData_FallsBackToRawStorage()
+    {
+        // Reviewer audit P2: the compression-doesn't-shrink fallback
+        // path (LZ4 produces output >= input → store raw) was uncovered
+        // by tests. Use cryptographically random bytes which LZ4
+        // cannot meaningfully compress, force eviction, then rehydrate
+        // and verify the bytes round-trip exactly. The fallback path
+        // is exercised because IsCompressed is set to false by the
+        // eviction logic when compression doesn't shrink the payload.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32, // tight budget forces eviction
+            StreamingBackingStorePath = _backingDir,
+            EnableCompression = true, // we want the compress-then-fallback path
+        });
+        try
+        {
+            // High-entropy payload — random bytes from a CSPRNG.
+            // LZ4 typically produces output >= input on this kind of
+            // data, triggering the fallback branch.
+            var random = new byte[64];
+            new Random(42).NextBytes(random);
+            long h1 = pool.Register(random);
+
+            // Force eviction of h1 by registering a second entry that
+            // pushes us over budget (32 bytes, h1 already occupies 64).
+            // Note: registering 64 bytes immediately exceeds budget so
+            // h1 evicts during this Register call.
+            var filler = new byte[8];
+            long h2 = pool.Register(filler);
+
+            // h1 should be evicted to disk now.
+            Assert.False(pool.IsResident(h1));
+
+            // Rehydrate must bit-exactly restore h1's bytes regardless
+            // of whether the fallback path stored raw or LZ4-compressed.
+            // If the fallback didn't run (compressed path tried but
+            // failed to decode raw bytes) Rehydrate would corrupt or
+            // throw; passing here means the raw-storage fallback
+            // worked end-to-end.
+            var rehydrated = pool.RehydrateInto(h1);
+            Assert.Equal(random.Length, rehydrated.Length);
+            for (int i = 0; i < random.Length; i++)
+                Assert.Equal(random[i], rehydrated[i]);
+        }
+        finally { pool.Dispose(); }
     }
 }

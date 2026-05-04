@@ -181,25 +181,30 @@ public abstract class TensorBase<T> : IDisposable
                 "Streaming drop requires contiguous, non-view, zero-offset tensors. " +
                 "Weight tensors satisfy this; views and sliced tensors do not.");
 
+        // Atomically claim sole ownership of the current storage.
         // RebindStorageFrom (used by CompiledInferencePlan / MemoryPlanningPass)
-        // creates non-view tensors that share storage refcounts. Dropping
-        // here would leak the shared storage because Release decrements
-        // by 1 but the rebound peer still holds a refcount. Refuse loud
-        // instead of corrupt-quiet so callers register weights BEFORE any
-        // rebind operation.
-        if (_storage.RefCount > 1)
+        // creates peer tensors that share storage refcounts; dropping
+        // shared storage would leak the bytes the rebound peer is still
+        // reading. The previous implementation read RefCount then swapped,
+        // which is racy: a sibling AddRef between the read and the swap
+        // could leave us replacing storage that's been re-shared. CAS-based
+        // TryClaimExclusive closes that window — it succeeds only when
+        // refcount was exactly 1 at the moment of the claim, and after
+        // success any concurrent AddRef throws ObjectDisposedException.
+        if (!_storage.TryClaimExclusive())
             throw new InvalidOperationException(
                 $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
                 "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
                 "shares its storage.");
 
-        // Replace storage with an empty placeholder. We can't keep _storage's
-        // refcount on the old data because the whole point is to free those
-        // bytes — so Release the old storage and create a fresh empty one.
-        var oldStorage = _storage;
+        // Successful claim drove refcount 1 → 0. The old storage is now
+        // owned exclusively by this method and no other thread can take
+        // a fresh reference (AddRef would observe refcount == 0 and
+        // throw). Abandon it for GC and swap in fresh empty storage.
+        // Note: do NOT call Release on the claimed storage — refcount
+        // is already 0, Release would underflow.
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
-        oldStorage.Release();
     }
 
     /// <summary>

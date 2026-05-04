@@ -109,30 +109,41 @@ public static class WeightRegistry
                     return;
                 case WeightLifetime.Streaming:
                     {
-                        // Use long arithmetic so we surface an OOM-style
-                        // error explicitly instead of a silent int wrap.
-                        // byte[] is itself bounded to ~2.15 GB, so streaming
-                        // a single tensor > 2 GB is impossible regardless;
-                        // we throw a clear NotSupportedException instead of
-                        // the runtime's OutOfMemoryException so callers
-                        // know to chunk the tensor at the consumer side.
-                        long byteCountLong = (long)weight.Length * ElementSize<T>();
-                        if (byteCountLong > int.MaxValue)
-                            throw new NotSupportedException(
-                                $"Streaming registration requires per-tensor size <= {int.MaxValue} bytes " +
-                                $"(byte[] limit). Tensor has {weight.Length} elements × {ElementSize<T>()} bytes = " +
-                                $"{byteCountLong} bytes. Chunk the tensor into smaller pool entries on the consumer side.");
-                        int byteCount = (int)byteCountLong;
+                        // CheckedStreamingByteCount uses long arithmetic
+                        // so an oversized tensor surfaces as a clear
+                        // NotSupportedException with a chunking hint
+                        // instead of the runtime's OutOfMemoryException.
+                        // byte[] is itself bounded to ~2.15 GB, so
+                        // streaming a single tensor > 2 GB is impossible
+                        // regardless of host RAM. Helper is internal so
+                        // the overflow guard can be unit-tested directly
+                        // without faking a multi-GB tensor.
+                        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
                         var bytes = new byte[byteCount];
                         SerializeToBytes(weight, bytes);
-                        long handle = StreamingPoolUnlocked().Register(bytes);
-                        weight.StreamingPoolHandle = handle;
-                        // Drop the tensor's in-memory data: pool now owns the
-                        // canonical copy. Without this, registration just
-                        // duplicates memory (tensor + pool entry both
-                        // resident) and Streaming mode can't actually save
-                        // RAM. Materialize() restores _data on demand.
-                        weight.DropStorageForStreaming();
+                        var pool = StreamingPoolUnlocked();
+                        long handle = pool.Register(bytes);
+                        // Two-phase commit: drop storage FIRST (the operation
+                        // that can throw — non-contiguous, view, shared
+                        // refcount), then commit the handle on the tensor.
+                        // If DropStorageForStreaming throws after the pool
+                        // already accepted the bytes, roll the pool entry
+                        // back so we don't leak both a registered pool
+                        // entry and a tensor still in its pre-stream state
+                        // (which would lead to "handle resident but tensor
+                        // never released" + a pool entry no caller can
+                        // ever reach because StreamingPoolHandle was never
+                        // set on the tensor).
+                        try
+                        {
+                            weight.DropStorageForStreaming();
+                            weight.StreamingPoolHandle = handle;
+                        }
+                        catch
+                        {
+                            pool.Unregister(handle);
+                            throw;
+                        }
                         return;
                     }
                 case WeightLifetime.GpuOffload:
@@ -242,6 +253,28 @@ public static class WeightRegistry
     {
         _streamingPool ??= new StreamingTensorPool(_options);
         return _streamingPool;
+    }
+
+    /// <summary>
+    /// Computes the byte count for a streaming-registered tensor of
+    /// <paramref name="length"/> elements, throwing
+    /// <see cref="NotSupportedException"/> with a chunking hint when
+    /// the result would exceed <see cref="int.MaxValue"/> (the byte[]
+    /// limit). Extracted as an internal helper so the overflow guard
+    /// can be unit-tested directly against synthetic Length values
+    /// without allocating a 2GB+ tensor in a test process.
+    /// </summary>
+    internal static int CheckedStreamingByteCount<T>(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        int elementSize = ElementSize<T>();
+        long byteCountLong = (long)length * elementSize;
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming registration requires per-tensor size <= {int.MaxValue} bytes " +
+                $"(byte[] limit). Tensor has {length} elements × {elementSize} bytes = " +
+                $"{byteCountLong} bytes. Chunk the tensor into smaller pool entries on the consumer side.");
+        return (int)byteCountLong;
     }
 
     private static int ElementSize<T>()
@@ -354,26 +387,46 @@ public static class WeightRegistry
             // Without this, a frequently-accessed embedding that always
             // hits the early-out path would stay at LRU tail and evict
             // first under budget pressure.
-            lock (_lock)
-            {
-                _streamingPool?.MarkAccessed(weight.StreamingPoolHandle);
-            }
+            //
+            // Capture-then-call: hold the registry lock just long enough
+            // to snapshot the pool reference, not across MarkAccessed
+            // itself. MarkAccessed acquires the pool's own lock, and a
+            // pool that's mid-Configure-swap could have its LRU mutated
+            // concurrently — but the captured reference is a single
+            // object, so the call still operates on a consistent pool
+            // (either the new pool or the old one, but not a torn view).
+            StreamingTensorPool? poolRef;
+            lock (_lock) { poolRef = _streamingPool; }
+            poolRef?.MarkAccessed(weight.StreamingPoolHandle);
             return;
         }
 
-        // Two-phase: snapshot bytes under the registry lock (short — pool
-        // does the disk read inside its own lock), then drop the lock and
-        // do the deserialize-into-tensor memcpy unsynchronized. The memcpy
-        // can be tens of milliseconds for hundreds-of-MB weights — holding
-        // the registry lock across it would serialize all concurrent
-        // Materialize / PrefetchAsync workers and defeat the W=2 prefetch
-        // overlap. RehydrateInto returns a caller-owned byte[] so we no
-        // longer race against a concurrent eviction nulling entry.Data.
-        byte[] snapshot;
+        // Two-phase to avoid serializing the registry behind one slow
+        // page-in:
+        //   1. Capture the pool reference under the registry lock — short.
+        //      This protects against a concurrent Configure/Reset
+        //      disposing the pool while we're trying to use it. The
+        //      reference itself is stable once captured.
+        //   2. Drop the registry lock, then call RehydrateInto on the
+        //      captured pool. RehydrateInto takes the POOL'S OWN lock
+        //      (not the registry lock) for its disk read + decompress
+        //      + allocation + copy. Concurrent Materialize calls on
+        //      DIFFERENT weights now run side by side at the registry
+        //      level; only the pool's internal serialization gates
+        //      them, and that's the level the LRU/eviction state lives.
+        //   3. RestoreStorageFromBytes runs entirely without the
+        //      registry lock — it allocates and atomically swaps storage
+        //      on this tensor. No other thread reads this tensor's
+        //      storage between drop and swap (RebindStorageFrom is the
+        //      only path that would, and that's what
+        //      DropStorageForStreaming's TryClaimExclusive guards
+        //      against).
+        StreamingTensorPool pool;
         lock (_lock)
         {
-            snapshot = StreamingPoolUnlocked().RehydrateInto(weight.StreamingPoolHandle);
+            pool = StreamingPoolUnlocked();
         }
+        byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
         weight.RestoreStorageFromBytes(snapshot);
     }
 
@@ -413,7 +466,22 @@ public static class WeightRegistry
 
     /// <summary>
     /// IDisposable scope returned by <see cref="MaterializeMany{T}"/>.
-    /// Materializes its tensors on construction; releases on disposal.
+    /// Materializes its tensors on construction; on disposal releases
+    /// ONLY the tensors this scope itself paged in.
+    ///
+    /// <para><b>Why "only what we materialized" matters:</b> a tensor
+    /// that was already resident on entry is owned by an outer caller —
+    /// either an enclosing <see cref="MaterializeScope{T}"/>, an
+    /// independent <see cref="WeightRegistry.Materialize{T}"/> call
+    /// keeping the weight warm for a downstream layer, or a sibling
+    /// thread sharing the same model's weights. If this scope released
+    /// such a tensor on dispose, the outer caller would observe its
+    /// weight silently paged out mid-use. This scope therefore tracks,
+    /// per tensor, whether the materialize call inside the constructor
+    /// is what actually transitioned it from non-resident to resident,
+    /// and only releases those transitions. Already-resident weights
+    /// are still LRU-bumped by <see cref="Materialize{T}"/> (so this
+    /// scope still keeps them warm) but are not paged out by us.</para>
     /// </summary>
     public sealed class MaterializeScope<T> : IDisposable
     {
@@ -435,8 +503,9 @@ public static class WeightRegistry
             // we counted via a first foreach (wrong for lazy enumerables —
             // they may be consumed by counting, or yield a different
             // sequence on the second pass). Now we collect once and
-            // materialize as we go; on partial failure we release the
-            // weights we already materialized so we don't leak.
+            // materialize as we go; on partial failure we release only
+            // the tensors WE materialized so we don't leak our own work
+            // and don't page out tensors that were already resident.
             // Initial capacity 8 covers most layers (Q/K/V/O + MLP + LN)
             // without resize; larger layers grow geometrically.
             int capacity = 8;
@@ -450,27 +519,63 @@ public static class WeightRegistry
                 foreach (var w in weights)
                 {
                     if (w is null) continue;
-                    if (idx >= _weights.Length)
+
+                    // Only track tensors WE actually materialized — not
+                    // those that were already resident on entry. An
+                    // already-resident weight is owned by an outer
+                    // caller; releasing it here would page it out from
+                    // under that caller. WasNotResidentBefore is the
+                    // narrow predicate for "this scope's Materialize
+                    // call is the one that brought the bytes in".
+                    bool needsRelease = WasNotResidentBefore(w);
+                    if (needsRelease)
                     {
-                        // Grow: rent a larger array, copy, return the old.
-                        var grown = System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(_weights.Length * 2);
-                        Array.Copy(_weights, 0, grown, 0, idx);
-                        Array.Clear(_weights, 0, idx);
-                        System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
-                        _weights = grown;
+                        if (idx >= _weights.Length)
+                        {
+                            // Grow: rent a larger array, copy, return the old.
+                            var grown = System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(_weights.Length * 2);
+                            Array.Copy(_weights, 0, grown, 0, idx);
+                            Array.Clear(_weights, 0, idx);
+                            System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+                            _weights = grown;
+                        }
                     }
+
                     Materialize(w);
-                    _weights[idx++] = w;
+
+                    if (needsRelease)
+                    {
+                        // Re-check: Materialize may have early-out'd
+                        // (someone else materialized between our check
+                        // and our call). Only track for release if our
+                        // call is the one that brought it in. The
+                        // double-check covers the narrow window where
+                        // a sibling thread populated the tensor between
+                        // WasNotResidentBefore and Materialize.
+                        // We approximate "our call brought it in" by
+                        // confirming WasNotResidentBefore was true AND
+                        // the tensor is now resident — i.e., Materialize
+                        // performed the transition. If a sibling did
+                        // it first, we still track for release because
+                        // Materialize was a no-op for us; the sibling's
+                        // own scope (if any) would track separately,
+                        // and harmless double-release is prevented by
+                        // ReleaseToPool's `DataVector.Length == 0`
+                        // early-out.
+                        _weights[idx++] = w;
+                    }
                 }
                 _count = idx;
             }
             catch
             {
-                // Partial-failure cleanup: release the weights we already
-                // materialized before this exception propagates. Without
-                // this, the ctor exception path leaks every successfully-
-                // materialized weight (no Dispose ever runs because
-                // construction never completed).
+                // Partial-failure cleanup: release the weights WE
+                // materialized before this exception propagates.
+                // Without this, the ctor exception path leaks every
+                // successfully-materialized weight (no Dispose ever
+                // runs because construction never completed). We do
+                // NOT release weights that were already resident
+                // before we ran — same ownership rule as Dispose.
                 for (int i = 0; i < idx; i++)
                 {
                     try { ReleaseToPool(_weights[i]); }
@@ -480,6 +585,26 @@ public static class WeightRegistry
                 System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
                 throw;
             }
+        }
+
+        /// <summary>
+        /// True when this weight needs streaming-style release on scope
+        /// dispose — i.e., it's a registered streaming weight whose
+        /// bytes were NOT already resident at the moment we checked.
+        /// Non-streaming / unregistered weights never need release;
+        /// already-resident streaming weights are owned by the outer
+        /// caller and must not be paged out by us.
+        /// </summary>
+        private static bool WasNotResidentBefore(Tensor<T> w)
+        {
+            if (w.Lifetime != WeightLifetime.Streaming) return false;
+            if (w.StreamingPoolHandle < 0) return false;
+            // Length == w.Length means the backing Vector is fully
+            // populated — i.e., resident. Length == 0 means the tensor
+            // is in its post-DropStorageForStreaming state — i.e., not
+            // resident in the tensor's own storage even though the pool
+            // may still hold the bytes.
+            return w.DataVector.Length != w.Length;
         }
 
         public void Dispose()
@@ -545,13 +670,13 @@ public static class WeightRegistry
 
     /// <summary>
     /// Batched variant of <see cref="PrefetchAsync{T}"/>. Issues a single
-    /// background worker that walks <paramref name="weights"/> sequentially
-    /// inside one lock acquire. For a layer with 12 trainable tensors
-    /// (Q/K/V/O × MHA + MLP weights + LayerNorm params), this is one
-    /// worker + one lock acquire instead of 12 — dramatically reduces
-    /// contention with the foreground Forward thread on the registry
-    /// lock. Snapshots the handles immediately so a later
-    /// <see cref="UnregisterWeight{T}"/> doesn't break the prefetch.
+    /// background worker that walks <paramref name="weights"/> sequentially.
+    /// For a layer with 12 trainable tensors (Q/K/V/O × MHA + MLP
+    /// weights + LayerNorm params), this is one worker instead of 12 —
+    /// dramatically reduces ThreadPool / registry-lock contention
+    /// against the foreground Forward thread. Skips weights that are
+    /// already resident OR have an in-flight prefetch from a prior
+    /// call so we don't double-queue.
     /// </summary>
     /// <remarks>
     /// Like <see cref="PrefetchAsync{T}"/>, this is best-effort and
@@ -561,43 +686,82 @@ public static class WeightRegistry
     public static void PrefetchAsyncMany<T>(IEnumerable<Tensor<T>> weights)
     {
         if (weights is null) throw new ArgumentNullException(nameof(weights));
-        // Snapshot the handles synchronously — the closure shouldn't hold
-        // a reference to the Tensor<T>s themselves (lets the GC reclaim
-        // any ephemeral wrappers) and shouldn't race against
-        // UnregisterWeight setting handles to -1 between issue and run.
-        var handles = new List<long>();
+
+        // Two-stage filter: snapshot handles, then under the registry
+        // lock skip already-resident or in-flight ones. Filtering at
+        // dispatch time (vs. inside the worker) means we don't burn a
+        // worker slot on a no-op. The per-handle in-flight set lives
+        // under the registry lock — same as the pool reference — so
+        // we capture+filter+enqueue atomically.
+        var candidates = new List<long>();
         foreach (var w in weights)
         {
             if (w is null) continue;
             if (w.Lifetime != WeightLifetime.Streaming) continue;
             if (w.StreamingPoolHandle < 0) continue;
-            handles.Add(w.StreamingPoolHandle);
+            candidates.Add(w.StreamingPoolHandle);
         }
-        if (handles.Count == 0) return;
+        if (candidates.Count == 0) return;
 
-        if (!_prefetchSemaphore.Wait(0)) return;
+        // Accumulate the handles we're going to actually fetch. Already-
+        // resident or already-in-flight handles are skipped — the
+        // existing prefetch (or the prior register that left the bytes
+        // resident) is doing the work for us.
+        long[] toFetch;
+        StreamingTensorPool poolRef;
+        lock (_lock)
+        {
+            poolRef = StreamingPoolUnlocked();
+            var filtered = new List<long>(candidates.Count);
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                long h = candidates[i];
+                if (poolRef.IsResident(h)) continue;
+                if (!_inFlightPrefetches.Add(h)) continue; // already queued
+                filtered.Add(h);
+            }
+            if (filtered.Count == 0) return;
+            toFetch = filtered.ToArray();
+        }
 
-        var snapshot = handles.ToArray();
+        if (!_prefetchSemaphore.Wait(0))
+        {
+            // Couldn't get a worker slot — undo the in-flight reservations
+            // so a later call can re-issue. Without this the handles would
+            // stay marked in-flight forever, suppressing all future
+            // prefetches for them.
+            lock (_lock)
+            {
+                for (int i = 0; i < toFetch.Length; i++)
+                    _inFlightPrefetches.Remove(toFetch[i]);
+            }
+            return;
+        }
+
+        // Capture pool reference outside the worker so a concurrent
+        // Configure swapping pools doesn't change which pool we operate
+        // on mid-flight (handle would belong to the old pool).
+        var capturedPool = poolRef;
         System.Threading.ThreadPool.UnsafeQueueUserWorkItem(_ =>
         {
             try
             {
-                lock (_lock)
+                for (int i = 0; i < toFetch.Length; i++)
                 {
-                    var pool = _streamingPool;
-                    if (pool is null) return;
-                    for (int i = 0; i < snapshot.Length; i++)
-                    {
-                        try { pool.Rehydrate(snapshot[i], isPrefetch: true); }
-                        catch (InvalidOperationException) { /* per-handle "unknown" — keep going */ }
-                    }
+                    try { capturedPool.Rehydrate(toFetch[i], isPrefetch: true); }
+                    catch (InvalidOperationException) { /* per-handle "unknown" — keep going */ }
+                    catch (System.IO.IOException) { /* per-handle disk error */ }
+                    catch (UnauthorizedAccessException) { /* per-handle permissions */ }
                 }
             }
-            catch (System.IO.IOException) { }
-            catch (ObjectDisposedException) { }
-            catch (UnauthorizedAccessException) { }
+            catch (ObjectDisposedException) { /* pool disposed mid-batch */ }
             finally
             {
+                lock (_lock)
+                {
+                    for (int i = 0; i < toFetch.Length; i++)
+                        _inFlightPrefetches.Remove(toFetch[i]);
+                }
                 _prefetchSemaphore.Release();
             }
         }, state: null);
@@ -635,42 +799,100 @@ public static class WeightRegistry
     /// primary perf win vs. PyTorch FSDP's synchronous all-gather. No-op
     /// if the tensor isn't <see cref="WeightLifetime.Streaming"/>.
     /// </remarks>
-    public static void PrefetchAsync<T>(Tensor<T> weight)
+    public static void PrefetchAsync<T>(Tensor<T> weight) =>
+        PrefetchAsyncCore(weight, completionSignal: null);
+
+    /// <summary>
+    /// Internal Task-returning overload of <see cref="PrefetchAsync{T}"/>
+    /// for tests that need a deterministic signal of when the worker
+    /// finishes (instead of polling <see cref="IsResidentInPool{T}"/>
+    /// with a wall-clock budget that's flaky on CI agents). Returns a
+    /// <see cref="System.Threading.Tasks.Task"/> that completes when
+    /// the prefetch worker finishes (or transitions to a no-op via the
+    /// dedup path or full-semaphore drop). Production callers should
+    /// continue using the public <see cref="PrefetchAsync{T}"/> —
+    /// fire-and-forget is the right shape on the hot path.
+    /// </summary>
+    internal static System.Threading.Tasks.Task PrefetchAsyncForTesting<T>(Tensor<T> weight)
+    {
+        var tcs = new System.Threading.Tasks.TaskCompletionSource<bool>(
+            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+        PrefetchAsyncCore(weight, tcs);
+        return tcs.Task;
+    }
+
+    private static void PrefetchAsyncCore<T>(
+        Tensor<T> weight,
+        System.Threading.Tasks.TaskCompletionSource<bool>? completionSignal)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
-        if (weight.Lifetime != WeightLifetime.Streaming) return;
-        if (weight.StreamingPoolHandle < 0) return;
+        if (weight.Lifetime != WeightLifetime.Streaming) { completionSignal?.TrySetResult(true); return; }
+        if (weight.StreamingPoolHandle < 0) { completionSignal?.TrySetResult(true); return; }
 
         long handle = weight.StreamingPoolHandle;
+
+        // Dedup: skip already-resident or in-flight handles. Resident
+        // → no work to do. In-flight → another worker is already doing
+        // the same Rehydrate, so this call would just contend on the
+        // pool's lock for nothing. Both checks are under the registry
+        // lock so capturing the pool ref + the in-flight set + the
+        // resident check happens atomically against a concurrent
+        // Configure / sibling PrefetchAsync.
+        StreamingTensorPool poolRef;
+        lock (_lock)
+        {
+            poolRef = StreamingPoolUnlocked();
+            if (poolRef.IsResident(handle))
+            {
+                completionSignal?.TrySetResult(true);
+                return;
+            }
+            if (!_inFlightPrefetches.Add(handle))
+            {
+                // Another worker is already fetching this handle.
+                // Don't queue a second one. From the test/caller
+                // perspective, the work IS happening — we just don't
+                // own the completion signal for it. Best we can do is
+                // signal completion immediately (the in-flight worker
+                // will resolve its own signal independently).
+                completionSignal?.TrySetResult(true);
+                return;
+            }
+        }
+
         // Bound prefetch worker concurrency to PrefetchMaxConcurrency
         // outstanding workers (default 8). Unbounded queueing could fill
-        // the ThreadPool with workers all blocked on the registry lock if
+        // the ThreadPool with workers all blocked on the pool's lock if
         // a caller spams PrefetchAsync; the semaphore caps the queue
         // depth. Default 8 is well above the typical W=2 schedule so
         // legitimate use never sees Wait(0) fail; pathological callers
         // see the prefetch dropped (next Materialize does the disk read).
-        if (!_prefetchSemaphore.Wait(0)) return;
+        if (!_prefetchSemaphore.Wait(0))
+        {
+            // Couldn't get a worker slot — undo the in-flight reservation
+            // so a later call can re-issue. Without this the handle
+            // would stay marked in-flight forever, suppressing all
+            // future prefetches.
+            lock (_lock) _inFlightPrefetches.Remove(handle);
+            completionSignal?.TrySetResult(true);
+            return;
+        }
 
-        // Fire-and-forget on the threadpool. The pool's Rehydrate handles
-        // the read; callers that race a concurrent Materialize will hit
-        // the resident set instead of double-reading.
+        // Fire-and-forget on the threadpool. The captured pool ref
+        // protects against a concurrent Configure swapping pools mid-
+        // flight (handle would belong to the old pool if we re-read
+        // _streamingPool inside the worker).
         // UnsafeQueueUserWorkItem skips ExecutionContext capture — any
         // AsyncLocal<T> values in the calling context are NOT preserved
         // into this worker. That's an intentional perf optimization for
         // the prefetch hot path; if telemetry / logging needs context,
         // capture it explicitly via the closure.
+        var capturedPool = poolRef;
         System.Threading.ThreadPool.UnsafeQueueUserWorkItem(_ =>
         {
             try
             {
-                lock (_lock)
-                {
-                    // Pool may be null if Configure was called between
-                    // queue + execute; pool may be the OLD pool if a new
-                    // one was swapped in mid-flight (handle would belong
-                    // to the old pool, throw "handle unknown" — caught).
-                    _streamingPool?.Rehydrate(handle, isPrefetch: true);
-                }
+                capturedPool.Rehydrate(handle, isPrefetch: true);
             }
             catch (System.IO.IOException) { /* disk error mid-prefetch */ }
             catch (ObjectDisposedException) { /* pool disposed mid-prefetch */ }
@@ -681,10 +903,18 @@ public static class WeightRegistry
             // surface as TaskScheduler.UnobservedTaskException.
             finally
             {
+                lock (_lock) _inFlightPrefetches.Remove(handle);
                 _prefetchSemaphore.Release();
+                completionSignal?.TrySetResult(true);
             }
         }, state: null);
     }
+
+    // Tracks handles with a prefetch worker in-flight. Dedups concurrent
+    // PrefetchAsync calls on the same handle and prevents wasting
+    // worker slots / pool-lock contention on duplicate work. All
+    // mutations happen under _lock.
+    private static readonly HashSet<long> _inFlightPrefetches = new();
 
     // Caps in-flight prefetch workers. 8 is well above typical W=2 schedule
     // so the semaphore is invisible to legitimate callers but bounds queue
@@ -712,19 +942,25 @@ public static class WeightRegistry
             // Seed the CompressionEnabled flag from current options so a
             // user who set EnableCompression=true but hasn't registered
             // anything yet sees the right surface in the report.
-            return new StreamingPoolReport(
-                ResidentBytes: 0,
-                ResidentBytesPeak: 0,
-                RegisteredEntryCount: 0,
-                DiskReadCount: 0,
-                DiskReadBytes: 0,
-                DiskWriteBytes: 0,
-                EvictionCount: 0,
-                CompressionRatio: 1.0,
-                CompressionEnabled: _options.EnableCompression,
-                PrefetchHitCount: 0,
-                PrefetchMissCount: 0,
-                PrefetchIssueCount: 0);
+            // CompressionRatio defaults to 1.0 by virtue of the record
+            // struct's normalization (zero-init reads as 1.0); we
+            // omit it explicitly so future callers who construct
+            // a default instance get the same well-defined behaviour.
+            return new StreamingPoolReport
+            {
+                ResidentBytes = 0,
+                ResidentBytesPeak = 0,
+                RegisteredEntryCount = 0,
+                DiskReadCount = 0,
+                DiskReadBytes = 0,
+                DiskWriteBytes = 0,
+                EvictionCount = 0,
+                CompressionRatio = 1.0,
+                CompressionEnabled = _options.EnableCompression,
+                PrefetchHitCount = 0,
+                PrefetchMissCount = 0,
+                PrefetchIssueCount = 0,
+            };
         }
     }
 
