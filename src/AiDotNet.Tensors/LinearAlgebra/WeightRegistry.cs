@@ -347,7 +347,19 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
-        if (weight.DataVector.Length == weight.Length) return; // already resident
+        if (weight.DataVector.Length == weight.Length)
+        {
+            // Already resident — but still bump the pool's LRU heat so
+            // this hot weight doesn't get evicted in favor of cold ones.
+            // Without this, a frequently-accessed embedding that always
+            // hits the early-out path would stay at LRU tail and evict
+            // first under budget pressure.
+            lock (_lock)
+            {
+                _streamingPool?.MarkAccessed(weight.StreamingPoolHandle);
+            }
+            return;
+        }
 
         // Two-phase: snapshot bytes under the registry lock (short — pool
         // does the disk read inside its own lock), then drop the lock and
@@ -409,31 +421,65 @@ public static class WeightRegistry
         // Predict layer instantiates a scope, so on a 64-decoder PaLME
         // forward pass we'd otherwise allocate 64 Tensor<T>[] arrays per
         // step — pooling is meaningful at that frequency.
-        private readonly Tensor<T>[] _weights;
+        // Not readonly — the ctor's grow path replaces this when an
+        // unbounded enumerable yields more weights than the initial
+        // rental. After construction, the field is effectively immutable
+        // (only Dispose reads it).
+        private Tensor<T>[] _weights;
         private readonly int _count;
         private int _disposed; // 0 = live, 1 = disposed (Interlocked-guarded)
 
         internal MaterializeScope(IEnumerable<Tensor<T>> weights)
         {
-            // Snapshot to an array so disposal sees the same set even if
-            // the source enumerable was lazy / mutated mid-scope. We
-            // count first, allocate exactly, then materialize — avoids
-            // the List<T> intermediate growth and resize copies.
-            int count = 0;
-            if (weights is ICollection<Tensor<T>> c) count = c.Count;
-            else { foreach (var _w in weights) count++; }
+            // Single-pass enumeration with manual list growth. Previously
+            // we counted via a first foreach (wrong for lazy enumerables —
+            // they may be consumed by counting, or yield a different
+            // sequence on the second pass). Now we collect once and
+            // materialize as we go; on partial failure we release the
+            // weights we already materialized so we don't leak.
+            // Initial capacity 8 covers most layers (Q/K/V/O + MLP + LN)
+            // without resize; larger layers grow geometrically.
+            int capacity = 8;
+            if (weights is ICollection<Tensor<T>> c && c.Count > 0)
+                capacity = c.Count;
+            _weights = System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(capacity);
 
-            _weights = count == 0
-                ? Array.Empty<Tensor<T>>()
-                : System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(count);
             int idx = 0;
-            foreach (var w in weights)
+            try
             {
-                if (w is null) continue;
-                Materialize(w);
-                _weights[idx++] = w;
+                foreach (var w in weights)
+                {
+                    if (w is null) continue;
+                    if (idx >= _weights.Length)
+                    {
+                        // Grow: rent a larger array, copy, return the old.
+                        var grown = System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(_weights.Length * 2);
+                        Array.Copy(_weights, 0, grown, 0, idx);
+                        Array.Clear(_weights, 0, idx);
+                        System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+                        _weights = grown;
+                    }
+                    Materialize(w);
+                    _weights[idx++] = w;
+                }
+                _count = idx;
             }
-            _count = idx;
+            catch
+            {
+                // Partial-failure cleanup: release the weights we already
+                // materialized before this exception propagates. Without
+                // this, the ctor exception path leaks every successfully-
+                // materialized weight (no Dispose ever runs because
+                // construction never completed).
+                for (int i = 0; i < idx; i++)
+                {
+                    try { ReleaseToPool(_weights[i]); }
+                    catch { /* best-effort; original exception is the real signal */ }
+                }
+                Array.Clear(_weights, 0, idx);
+                System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+                throw;
+            }
         }
 
         public void Dispose()
@@ -442,16 +488,119 @@ public static class WeightRegistry
             // The standard `using` pattern is single-threaded but the
             // scope's reference can leak into other threads via DI etc.
             if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            for (int i = 0; i < _count; i++)
-                ReleaseToPool(_weights[i]);
-            // Clear the slots before returning to pool — the rented array
-            // may outlive this scope inside the pool, and we don't want to
-            // root the tensors past Dispose.
-            for (int i = 0; i < _count; i++)
-                _weights[i] = null!;
-            if (_weights.Length > 0)
+            // try/finally so a throwing ReleaseToPool doesn't leak the
+            // rest of the materialized weights AND doesn't leak the
+            // rented array. Collect throws into AggregateException so the
+            // caller sees all failures, not just the first.
+            List<Exception>? errors = null;
+            try
+            {
+                for (int i = 0; i < _count; i++)
+                {
+                    try { ReleaseToPool(_weights[i]); }
+                    catch (Exception ex)
+                    {
+                        (errors ??= new List<Exception>()).Add(ex);
+                    }
+                }
+            }
+            finally
+            {
+                Array.Clear(_weights, 0, _count);
                 System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+            }
+            if (errors is not null)
+                throw new AggregateException(
+                    "One or more ReleaseToPool calls failed during MaterializeScope.Dispose. " +
+                    "Subsequent weights were still released; the rented buffer was returned to the pool.",
+                    errors);
         }
+    }
+
+    /// <summary>
+    /// Bumps this weight's last-access timestamp in the pool's LRU
+    /// without doing a Rehydrate. Used to keep critical weights (token
+    /// embeddings, KV cache, etc.) at LRU head when their reads bypass
+    /// <see cref="Materialize{T}"/> (e.g., the tensor was already
+    /// resident from a prior Materialize and the caller skipped the
+    /// early-out path's automatic refresh).
+    /// </summary>
+    /// <remarks>
+    /// Materialize already calls MarkAccessed on the early-out (already-
+    /// resident) path. Use this only when reading a streaming tensor
+    /// without going through Materialize at all — e.g., a debug printout
+    /// that reads via <c>tensor.AsSpan()</c> on bytes that happen to be
+    /// resident.
+    /// </remarks>
+    public static void MarkAccessed<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming) return;
+        if (weight.StreamingPoolHandle < 0) return;
+        lock (_lock)
+        {
+            _streamingPool?.MarkAccessed(weight.StreamingPoolHandle);
+        }
+    }
+
+    /// <summary>
+    /// Batched variant of <see cref="PrefetchAsync{T}"/>. Issues a single
+    /// background worker that walks <paramref name="weights"/> sequentially
+    /// inside one lock acquire. For a layer with 12 trainable tensors
+    /// (Q/K/V/O × MHA + MLP weights + LayerNorm params), this is one
+    /// worker + one lock acquire instead of 12 — dramatically reduces
+    /// contention with the foreground Forward thread on the registry
+    /// lock. Snapshots the handles immediately so a later
+    /// <see cref="UnregisterWeight{T}"/> doesn't break the prefetch.
+    /// </summary>
+    /// <remarks>
+    /// Like <see cref="PrefetchAsync{T}"/>, this is best-effort and
+    /// silently drops when the prefetch semaphore is full (default 8
+    /// outstanding workers).
+    /// </remarks>
+    public static void PrefetchAsyncMany<T>(IEnumerable<Tensor<T>> weights)
+    {
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        // Snapshot the handles synchronously — the closure shouldn't hold
+        // a reference to the Tensor<T>s themselves (lets the GC reclaim
+        // any ephemeral wrappers) and shouldn't race against
+        // UnregisterWeight setting handles to -1 between issue and run.
+        var handles = new List<long>();
+        foreach (var w in weights)
+        {
+            if (w is null) continue;
+            if (w.Lifetime != WeightLifetime.Streaming) continue;
+            if (w.StreamingPoolHandle < 0) continue;
+            handles.Add(w.StreamingPoolHandle);
+        }
+        if (handles.Count == 0) return;
+
+        if (!_prefetchSemaphore.Wait(0)) return;
+
+        var snapshot = handles.ToArray();
+        System.Threading.ThreadPool.UnsafeQueueUserWorkItem(_ =>
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    var pool = _streamingPool;
+                    if (pool is null) return;
+                    for (int i = 0; i < snapshot.Length; i++)
+                    {
+                        try { pool.Rehydrate(snapshot[i], isPrefetch: true); }
+                        catch (InvalidOperationException) { /* per-handle "unknown" — keep going */ }
+                    }
+                }
+            }
+            catch (System.IO.IOException) { }
+            catch (ObjectDisposedException) { }
+            catch (UnauthorizedAccessException) { }
+            finally
+            {
+                _prefetchSemaphore.Release();
+            }
+        }, state: null);
     }
 
     /// <summary>
@@ -579,7 +728,18 @@ public static class WeightRegistry
         }
     }
 
-    /// <summary>For tests: drops all configured backends + flushes pool.</summary>
+    /// <summary>
+    /// Forcibly drops all configured backends + flushes pool, regardless
+    /// of whether tensors are still registered. After Reset, any tensor
+    /// with <see cref="Tensor{T}.StreamingPoolHandle"/> &gt;= 0 from the
+    /// previous pool is orphaned — Materialize on those will throw.
+    /// </summary>
+    /// <remarks>
+    /// Test path. Production callers should prefer <see cref="UnregisterWeight{T}"/>
+    /// on each live tensor and let Configure handle the swap (which has
+    /// a guard against the orphan-handle scenario). The doc on
+    /// <see cref="Configure"/> spells out the difference.
+    /// </remarks>
     public static void Reset()
     {
         lock (_lock)

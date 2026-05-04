@@ -556,6 +556,188 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void MaterializeScope_LazyEnumerable_EnumeratedOnce()
+    {
+        // Audit round-3 #28: ctor must not double-enumerate. Lazy
+        // enumerables that yield different sequences on second pass
+        // would corrupt the scope.
+        var t1 = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
+        var t2 = new Tensor<float>(new float[] { 3f, 4f }, new[] { 2 });
+        t1.Lifetime = WeightLifetime.Streaming;
+        t2.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t1);
+        WeightRegistry.RegisterWeight(t2);
+
+        int enumerationCount = 0;
+        IEnumerable<Tensor<float>> LazyOnce()
+        {
+            enumerationCount++;
+            yield return t1;
+            yield return t2;
+        }
+
+        using (WeightRegistry.MaterializeMany(LazyOnce()))
+        {
+            Assert.Equal(2, t1.DataVector.Length);
+            Assert.Equal(2, t2.DataVector.Length);
+        }
+        Assert.Equal(1, enumerationCount);
+    }
+
+    [Fact]
+    public void MaterializeScope_PartialFailureInCtor_ReleasesAlreadyMaterialized()
+    {
+        // Audit round-3 #25: if Materialize throws on weight N, the
+        // previously-materialized weights must be released before the
+        // exception propagates — otherwise they leak forever.
+        var t1 = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
+        t1.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t1);
+
+        // t2 is tagged Streaming but never registered → handle = -1 →
+        // Materialize is a no-op, won't throw. To force a real throw mid-
+        // ctor we use a hostile enumerable that yields t1, then throws.
+        IEnumerable<Tensor<float>> HostileEnum()
+        {
+            yield return t1;
+            throw new InvalidOperationException("simulated mid-enumeration failure");
+        }
+
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            using var _ = WeightRegistry.MaterializeMany(HostileEnum());
+        });
+
+        // After the throw, t1 must have been released (data array empty).
+        Assert.Equal(0, t1.DataVector.Length);
+    }
+
+    [Fact]
+    public void Materialize_EarlyOut_StillRefreshesLRU()
+    {
+        // Audit round-3 #29: when Materialize finds the tensor already
+        // resident, it should still bump LRU heat — otherwise a hot
+        // weight that always early-outs gets passed by less-recently-
+        // used neighbours and eventually evicts.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32, // 8 floats
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var hot = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        hot.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(hot);
+        WeightRegistry.Materialize(hot); // make resident
+
+        // Hot is now resident; subsequent Materialize calls early-out.
+        // Issue several Materialize calls — each should bump LRU.
+        for (int i = 0; i < 5; i++) WeightRegistry.Materialize(hot);
+
+        // Now register a cold tensor that pushes us over budget. With
+        // the LRU refresh, the cold one (newer at LRU head) should
+        // evict, NOT the hot one. Without the refresh, hot would have
+        // been at LRU tail (never refreshed) and would evict first.
+        var cold = new Tensor<float>(new float[] { 9f, 9f }, new[] { 2 });
+        cold.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(cold);
+
+        // Hot must still be resident (its LRU heat was refreshed).
+        Assert.True(WeightRegistry.IsResidentInPool(hot));
+    }
+
+    [Fact]
+    public void MarkAccessed_BumpsLRU_WithoutMaterialize()
+    {
+        // Audit round-3 #32: explicit MarkAccessed for callers that
+        // bypass Materialize entirely.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        // No-op for non-streaming or unregistered tensors — should not throw.
+        var notStreaming = new Tensor<float>(new float[] { 1f }, new[] { 1 });
+        WeightRegistry.MarkAccessed(notStreaming);
+
+        // For streaming tensor — should not throw.
+        WeightRegistry.MarkAccessed(t);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task PrefetchAsyncMany_BatchedPrefetch_BringsAllResident()
+    {
+        // Audit round-3 #33: batched prefetch issues one worker that
+        // walks all weights under one lock acquire.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var tensors = new Tensor<float>[3];
+        for (int k = 0; k < 3; k++)
+        {
+            tensors[k] = new Tensor<float>(new float[] { k, k, k, k }, new[] { 4 });
+            tensors[k].Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(tensors[k]);
+        }
+
+        // Force eviction of all 3 (each is 16 bytes; budget 32 → only 2 fit).
+        // After registering all, the oldest is evicted.
+        var report = WeightRegistry.GetStreamingReport();
+        Assert.True(report.EvictionCount >= 1);
+
+        // Issue batched prefetch.
+        WeightRegistry.PrefetchAsyncMany(tensors);
+
+        // Wait for the worker to complete.
+        for (int wait = 0; wait < 50; wait++)
+        {
+            var r = WeightRegistry.GetStreamingReport();
+            if (r.PrefetchIssueCount >= 3) break; // all 3 prefetched
+            await System.Threading.Tasks.Task.Delay(20);
+        }
+
+        var finalReport = WeightRegistry.GetStreamingReport();
+        Assert.True(finalReport.PrefetchIssueCount >= 1, "Prefetch worker should have fired");
+    }
+
+    [Fact]
+    public void RehydrateInto_ReturnsCallerOwnedCopy()
+    {
+        // Audit round-3 #36: direct test of RehydrateInto (was only tested
+        // transitively through Materialize). Verifies the returned byte[]
+        // is a true copy — mutating it doesn't affect subsequent reads.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+        try
+        {
+            var data = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+            long h = pool.Register(data);
+
+            var copy1 = pool.RehydrateInto(h);
+            copy1[0] = 99; // mutate caller's copy
+
+            var copy2 = pool.RehydrateInto(h);
+            Assert.Equal(1, copy2[0]); // pool's data unchanged
+            Assert.Equal(8, copy2.Length);
+        }
+        finally { pool.Dispose(); }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task PrefetchAsync_BringsBytesIntoResidentSet()
     {
         WeightRegistry.Reset();

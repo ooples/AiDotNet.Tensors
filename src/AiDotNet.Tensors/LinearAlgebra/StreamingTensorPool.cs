@@ -124,8 +124,15 @@ public sealed class StreamingTensorPool : IDisposable
             _entries[id] = entry;
             var node = _lruOrder.AddFirst(id);
             _lruIndex[id] = node;
-            _residentBytes += data.Length;
-            if (_residentBytes > _residentBytesPeak) _residentBytesPeak = _residentBytes;
+            // Use Interlocked for the long write so 32-bit hosts (net471
+            // x86) don't see torn reads from concurrent ResidentBytes
+            // accesses. Reads use Interlocked.Read for the same reason.
+            // Inside _lock, atomicity is already guaranteed for
+            // serialization, but the property accessor is lock-free.
+            Interlocked.Add(ref _residentBytes, data.Length);
+            long peak = Interlocked.Read(ref _residentBytesPeak);
+            long current = Interlocked.Read(ref _residentBytes);
+            if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
             EvictIfOverBudget();
             return id;
         }
@@ -229,8 +236,10 @@ public sealed class StreamingTensorPool : IDisposable
 
                 entry.Data = buffer;
                 entry.ResidentBytes = buffer.Length;
-                _residentBytes += buffer.Length;
-                if (_residentBytes > _residentBytesPeak) _residentBytesPeak = _residentBytes;
+                Interlocked.Add(ref _residentBytes, buffer.Length);
+                long peak = Interlocked.Read(ref _residentBytesPeak);
+                long current = Interlocked.Read(ref _residentBytes);
+                if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
                 // Re-add to LRU — the prior eviction removed it from
                 // _lruIndex/_lruOrder, so MarkAccessed and future eviction
                 // walks would silently skip the rehydrated entry.
@@ -286,7 +295,7 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             if (!_entries.TryGetValue(handleId, out var entry)) return;
-            _residentBytes -= entry.ResidentBytes;
+            Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
             _entries.Remove(handleId);
             if (_lruIndex.TryGetValue(handleId, out var node))
             {
@@ -372,7 +381,7 @@ public sealed class StreamingTensorPool : IDisposable
             _evictionCount++;
             _compressedBytesTotal += toWrite.Length;
             _uncompressedBytesTotal += uncompressed;
-            _residentBytes -= entry.ResidentBytes;
+            Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
             entry.ResidentBytes = 0;
             entry.Data = null;
             _lruOrder.Remove(oldest);
@@ -402,7 +411,9 @@ public sealed class StreamingTensorPool : IDisposable
             _entries.Clear();
             _lruOrder.Clear();
             _lruIndex.Clear();
-            _residentBytes = 0;
+            // Atomic write so the lock-free ResidentBytes property doesn't
+            // see torn values on 32-bit hosts (net471 x86 still ships).
+            Interlocked.Exchange(ref _residentBytes, 0);
         }
         // Backing-store deletion outside the lock — Directory.Delete on a
         // large pool can be slow, and there's no in-memory state to
