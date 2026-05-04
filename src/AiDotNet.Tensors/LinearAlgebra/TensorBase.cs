@@ -160,6 +160,164 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     /// <summary>
+    /// Drops this tensor's in-memory data, replacing it with an empty
+    /// <see cref="Vector{T}"/> placeholder. Used by
+    /// <c>WeightRegistry.ReleaseToPool</c> when streaming weights have
+    /// been registered with <see cref="StreamingTensorPool"/> — the pool
+    /// becomes the canonical owner of the bytes, and this tensor's
+    /// resident memory is freed until <see cref="RestoreStorageFromBytes"/>
+    /// is called.
+    /// </summary>
+    /// <remarks>
+    /// Must only be called on contiguous, zero-offset, non-view tensors.
+    /// Trainable weight tensors are exactly this — they're owned by one
+    /// layer, never sliced into views, and their <see cref="Length"/>
+    /// stays unchanged across drop/restore cycles.
+    /// </remarks>
+    internal void DropStorageForStreaming()
+    {
+        if (!IsContiguous || _storageOffset != 0 || IsView)
+            throw new InvalidOperationException(
+                "Streaming drop requires contiguous, non-view, zero-offset tensors. " +
+                "Weight tensors satisfy this; views and sliced tensors do not.");
+
+        // Atomically claim sole ownership of the current storage.
+        // RebindStorageFrom (used by CompiledInferencePlan / MemoryPlanningPass)
+        // creates peer tensors that share storage refcounts; dropping
+        // shared storage would leak the bytes the rebound peer is still
+        // reading. The previous implementation read RefCount then swapped,
+        // which is racy: a sibling AddRef between the read and the swap
+        // could leave us replacing storage that's been re-shared. CAS-based
+        // TryClaimExclusive closes that window — it succeeds only when
+        // refcount was exactly 1 at the moment of the claim, and after
+        // success any concurrent AddRef throws ObjectDisposedException.
+        if (!_storage.TryClaimExclusive())
+            throw new InvalidOperationException(
+                $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
+                "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
+                "shares its storage.");
+
+        // Successful claim drove refcount 1 → 0. The old storage is now
+        // owned exclusively by this method and no other thread can take
+        // a fresh reference (AddRef would observe refcount == 0 and
+        // throw). Abandon it for GC and swap in fresh empty storage.
+        // Note: do NOT call Release on the claimed storage — refcount
+        // is already 0, Release would underflow.
+        _data = Vector<T>.Empty();
+        _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
+    /// Restores this tensor's data from a serialized byte buffer (produced
+    /// by <c>WeightRegistry</c>'s SerializeToBytes path). Used by
+    /// <c>WeightRegistry.Materialize</c> after the streaming pool returned
+    /// the bytes from its resident set or paged them in from the backing
+    /// store. Buffer length must equal <see cref="Length"/> ×
+    /// element size; mismatch indicates a serialization bug.
+    /// </summary>
+    /// <param name="bytes">Serialized element data in little-endian
+    /// row-major order. Format must match <c>WeightRegistry</c>'s
+    /// SerializeToBytes (float / double / int / long / Half / BFloat16
+    /// fast paths).</param>
+    internal void RestoreStorageFromBytes(ReadOnlySpan<byte> bytes)
+    {
+        if (!IsContiguous || _storageOffset != 0 || IsView)
+            throw new InvalidOperationException(
+                "Streaming restore requires contiguous, non-view, zero-offset tensors.");
+
+        // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
+        // the latter throws ArgumentException for non-blittable types
+        // (Complex, Multivector) with a confusing native-interop message.
+        // ElementSizeForStreaming throws NotSupportedException with a
+        // clear "use a supported element type" message instead, matching
+        // WeightRegistry.SerializeToBytes' error contract.
+        int elementSize = ElementSizeForStreaming();
+        long expectedBytes = (long)Length * elementSize;
+        if (bytes.Length != expectedBytes)
+            throw new ArgumentException(
+                $"Streaming restore: buffer length {bytes.Length} does not match " +
+                $"expected {expectedBytes} bytes (Length={Length} × element size={elementSize}).");
+
+        // Construct a typed backing array, deserialize bytes into it via
+        // typed fast paths — same set WeightRegistry.SerializeToBytes
+        // covers — then wrap it back into a Vector<T>. We can't use
+        // MemoryMarshal.Cast on Span<T> directly because T isn't
+        // constrained to struct on TensorBase, so we go through typed
+        // arrays via the (T[])(object)typed[] cast that's safe at runtime
+        // when typeof(T) matches.
+        var fresh = DeserializeToVector(bytes, Length);
+
+        var oldStorage = _storage;
+        _data = fresh;
+        _storage = new TensorStorage<T>(_data);
+        oldStorage.Release();
+    }
+
+    private static int ElementSizeForStreaming()
+    {
+        if (typeof(T) == typeof(float)) return sizeof(float);
+        if (typeof(T) == typeof(double)) return sizeof(double);
+        if (typeof(T) == typeof(int)) return sizeof(int);
+        if (typeof(T) == typeof(long)) return sizeof(long);
+        if (typeof(T) == typeof(Half)) return 2;
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return 2;
+        throw new NotSupportedException(
+            $"Streaming requires element type T to be one of: float, double, int, long, Half, BFloat16. " +
+            $"Got {typeof(T).Name}.");
+    }
+
+    private static Vector<T> DeserializeToVector(ReadOnlySpan<byte> src, int length)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            var arr = new float[length];
+            src.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var arr = new double[length];
+            src.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        if (typeof(T) == typeof(int))
+        {
+            var arr = new int[length];
+            src.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        if (typeof(T) == typeof(long))
+        {
+            var arr = new long[length];
+            src.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        if (typeof(T) == typeof(Half))
+        {
+            var arr = new Half[length];
+            for (int i = 0; i < length; i++)
+            {
+                ushort raw = (ushort)(src[i * 2] | (src[i * 2 + 1] << 8));
+                arr[i] = AiDotNet.Tensors.NumericOperations.HalfBits.FromBits(raw);
+            }
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+        {
+            var arr = new AiDotNet.Tensors.NumericOperations.BFloat16[length];
+            for (int i = 0; i < length; i++)
+            {
+                ushort raw = (ushort)(src[i * 2] | (src[i * 2 + 1] << 8));
+                arr[i] = AiDotNet.Tensors.NumericOperations.BFloat16.FromRawBits(raw);
+            }
+            return Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        throw new NotSupportedException(
+            $"Streaming restore: no exact deserializer for element type {typeof(T).Name}. " +
+            "Supported: float, double, int, long, Half, BFloat16.");
+    }
+
+    /// <summary>
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
     /// </summary>

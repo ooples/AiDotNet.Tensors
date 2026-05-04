@@ -8,107 +8,50 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// Issue #276 sub-feature 2: backward replay coordinates with the
 /// streaming weight pool. Before the backward kernel for any op reads
 /// from one of its input tensors, the autodiff dispatcher calls
-/// <see cref="OnInputAccessed{T}"/> which routes to
-/// <see cref="StreamingTensorPool.MarkAccessed"/> /
-/// <see cref="StreamingTensorPool.Rehydrate"/> for any input that's
-/// registered with the pool.
+/// <see cref="OnInputAccessed{T}"/> which routes the streaming weights
+/// through <see cref="WeightRegistry.Materialize{T}"/>.
 ///
 /// <para>This is the integration glue that closes the loop: weight is
 /// tagged <see cref="WeightLifetime.Streaming"/> at construction →
-/// registered with <see cref="WeightRegistry"/> → its byte payload
-/// can evict from the pool when memory pressure rises → backward
-/// replay rehydrates it before the kernel needs it. Same pattern as
-/// DeepSpeed ZeRO-Offload's prefetch coordination.</para>
+/// registered with <see cref="WeightRegistry"/> (which drops the
+/// tensor's backing storage and hands canonical bytes to the pool) →
+/// pool may evict the bytes to disk under memory pressure → backward
+/// replay rehydrates them before the kernel needs them.</para>
+///
+/// <para><b>Why this delegates to <see cref="WeightRegistry.Materialize{T}"/>
+/// instead of doing the read itself:</b> <c>RegisterWeight</c> calls
+/// <c>DropStorageForStreaming</c> which replaces the tensor's backing
+/// <see cref="Vector{T}"/> with <see cref="Vector{T}.Empty"/>. After
+/// that point <see cref="Tensor{T}.AsWritableSpan"/> returns an empty
+/// span, so writing rehydrated bytes into the span (which an earlier
+/// implementation of this hook did via its own <c>DeserializeFromBytes</c>
+/// path) would either crash or silently no-op. <see cref="WeightRegistry.Materialize{T}"/>
+/// goes through <see cref="TensorBase{T}.RestoreStorageFromBytes"/>,
+/// which allocates a fresh <see cref="Vector{T}"/> of the right size
+/// and replaces the tensor's storage — that's the only path that
+/// correctly inflates a streaming weight back from the pool.</para>
 /// </summary>
 public static class StreamingAutogradHook
 {
     /// <summary>Called by the backward dispatcher before any kernel reads
     /// <paramref name="input"/>. Promotes the entry's LRU position; if
-    /// the entry has been evicted, rehydrates from the backing store.</summary>
+    /// the entry has been evicted, rehydrates from the backing store and
+    /// reinstates the tensor's backing storage.</summary>
     public static void OnInputAccessed<T>(Tensor<T> input)
     {
         if (input is null) return;
         if (input.Lifetime != WeightLifetime.Streaming) return;
         if (input.StreamingPoolHandle < 0) return;
-        var pool = WeightRegistry.StreamingPool;
-        // Mark accessed so the LRU keeps it resident; rehydrate if evicted.
-        pool.MarkAccessed(input.StreamingPoolHandle);
-        var bytes = pool.Rehydrate(input.StreamingPoolHandle);
-
-        // Deserialize the rehydrated bytes back into the Tensor<T>'s live
-        // storage. This is what closes the streaming-pool loop: when the
-        // pool evicts a weight, the Tensor<T> buffer goes stale; on next
-        // access we restore it from the backing-store snapshot.
-        DeserializeFromBytes(input, bytes);
-    }
-
-    private static void DeserializeFromBytes<T>(Tensor<T> tensor, ReadOnlySpan<byte> src)
-    {
-        var srcArr = src.ToArray();
-        var dstSpan = tensor.AsWritableSpan();
-        if (typeof(T) == typeof(float))
-        {
-            int expected = checked(dstSpan.Length * sizeof(float));
-            if (srcArr.Length != expected)
-                throw new InvalidOperationException(
-                    $"Streaming payload size mismatch for float tensor: expected {expected} bytes, got {srcArr.Length}.");
-            var typed = new float[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
-            for (int i = 0; i < dstSpan.Length; i++)
-                dstSpan[i] = (T)(object)typed[i];
-            return;
-        }
-        if (typeof(T) == typeof(double))
-        {
-            int expected = checked(dstSpan.Length * sizeof(double));
-            if (srcArr.Length != expected)
-                throw new InvalidOperationException(
-                    $"Streaming payload size mismatch for double tensor: expected {expected} bytes, got {srcArr.Length}.");
-            var typed = new double[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
-            for (int i = 0; i < dstSpan.Length; i++)
-                dstSpan[i] = (T)(object)typed[i];
-            return;
-        }
-        if (typeof(T) == typeof(int))
-        {
-            int expected = checked(dstSpan.Length * sizeof(int));
-            if (srcArr.Length != expected)
-                throw new InvalidOperationException(
-                    $"Streaming payload size mismatch for int tensor: expected {expected} bytes, got {srcArr.Length}.");
-            var typed = new int[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
-            for (int i = 0; i < dstSpan.Length; i++)
-                dstSpan[i] = (T)(object)typed[i];
-            return;
-        }
-        if (typeof(T) == typeof(long))
-        {
-            int expected = checked(dstSpan.Length * sizeof(long));
-            if (srcArr.Length != expected)
-                throw new InvalidOperationException(
-                    $"Streaming payload size mismatch for long tensor: expected {expected} bytes, got {srcArr.Length}.");
-            var typed = new long[dstSpan.Length];
-            Buffer.BlockCopy(srcArr, 0, typed, 0, expected);
-            for (int i = 0; i < dstSpan.Length; i++)
-                dstSpan[i] = (T)(object)typed[i];
-            return;
-        }
-        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
-        {
-            int expected = checked(dstSpan.Length * 2);
-            if (srcArr.Length != expected)
-                throw new InvalidOperationException(
-                    $"Streaming payload size mismatch for bfloat16 tensor: expected {expected} bytes, got {srcArr.Length}.");
-            for (int i = 0; i < dstSpan.Length; i++)
-            {
-                ushort raw = (ushort)(srcArr[i * 2] | (srcArr[i * 2 + 1] << 8));
-                dstSpan[i] = (T)(object)AiDotNet.Tensors.NumericOperations.BFloat16.FromRawBits(raw);
-            }
-            return;
-        }
-        throw new NotSupportedException(
-            $"Streaming rehydrate does not support tensor element type {typeof(T)}.");
+        // Materialize handles all three branches:
+        //   1. Already resident → bumps LRU (keeps hot weights warm).
+        //   2. Evicted → snapshots bytes under registry lock, then
+        //      drops the lock and calls RestoreStorageFromBytes
+        //      which allocates a fresh Vector and atomically swaps
+        //      the tensor's storage. This is the only path that
+        //      correctly rebuilds a streaming weight whose backing
+        //      Vector was replaced by Vector.Empty at register time.
+        //   3. Not registered (handle < 0) → no-op (already filtered above).
+        WeightRegistry.Materialize(input);
     }
 
     /// <summary>Called when a forward op records an entry; touches the
