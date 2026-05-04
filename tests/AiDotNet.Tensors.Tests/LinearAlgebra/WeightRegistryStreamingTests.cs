@@ -223,4 +223,128 @@ public class WeightRegistryStreamingTests : IDisposable
         WeightRegistry.Materialize(t); // should not throw, no-op
         Assert.Equal(2, t.DataVector.Length);
     }
+
+    [Fact]
+    public void Compression_RoundTrip_PreservesBytes()
+    {
+        // Reset to a small budget + compression on, so eviction happens.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32, // ~8 floats
+            StreamingBackingStorePath = _backingDir,
+            EnableCompression = true,
+        });
+
+        // Highly-redundant input compresses well — better signal for the
+        // ratio assertion than random bytes.
+        float[] expected = new float[256];
+        for (int i = 0; i < expected.Length; i++) expected[i] = (float)(i % 8);
+
+        var t = new Tensor<float>(expected, new[] { expected.Length });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        // Force eviction by registering a second large tensor.
+        var filler = new Tensor<float>(new float[64], new[] { 64 });
+        filler.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(filler);
+
+        // First tensor should be paged out to compressed backing file now.
+        Assert.False(WeightRegistry.IsResidentInPool(t));
+
+        // Materialize — must decompress and produce identical bytes.
+        WeightRegistry.Materialize(t);
+        var got = t.DataVector.AsSpan();
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], got[i]);
+
+        // GetReport: ratio should be < 1.0 because the redundant input
+        // compresses well; CompressionEnabled should be true.
+        var report = WeightRegistry.GetStreamingReport();
+        Assert.True(report.CompressionEnabled);
+        Assert.True(report.CompressionRatio < 1.0,
+            $"Expected compression ratio < 1.0 for redundant input, got {report.CompressionRatio:F3}.");
+        Assert.True(report.EvictionCount >= 1);
+        Assert.True(report.DiskWriteBytes > 0);
+        Assert.True(report.DiskReadCount >= 1);
+    }
+
+    [Fact]
+    public void Compression_Disabled_StoresRawBytes()
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32,
+            StreamingBackingStorePath = _backingDir,
+            EnableCompression = false,
+        });
+
+        float[] expected = { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f, 10f };
+        var t = new Tensor<float>(expected, new[] { expected.Length });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        var filler = new Tensor<float>(new float[16], new[] { 16 });
+        filler.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(filler);
+
+        WeightRegistry.Materialize(t);
+        var got = t.DataVector.AsSpan();
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], got[i]);
+
+        var report = WeightRegistry.GetStreamingReport();
+        Assert.False(report.CompressionEnabled);
+    }
+
+    [Fact]
+    public void GetStreamingReport_TracksResidentBytesPeak()
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = new Tensor<float>(new float[256], new[] { 256 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        var report = WeightRegistry.GetStreamingReport();
+        // 256 floats = 1024 bytes; resident set held all of it briefly.
+        Assert.True(report.ResidentBytesPeak >= 1024);
+        Assert.Equal(1, report.RegisteredEntryCount);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task PrefetchAsync_BringsBytesIntoResidentSet()
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 32,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+
+        // Force eviction.
+        var filler = new Tensor<float>(new float[16], new[] { 16 });
+        filler.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(filler);
+        Assert.False(WeightRegistry.IsResidentInPool(t));
+
+        // Issue prefetch and wait for the threadpool to run it.
+        WeightRegistry.PrefetchAsync(t);
+        for (int i = 0; i < 50 && !WeightRegistry.IsResidentInPool(t); i++)
+            await System.Threading.Tasks.Task.Delay(20);
+
+        Assert.True(WeightRegistry.IsResidentInPool(t),
+            "Prefetch should have brought bytes back into resident set within 1 s.");
+    }
 }

@@ -51,6 +51,25 @@ public sealed class GpuOffloadOptions
     /// <summary>Backing store path for the streaming pool. Null ⇒ use the
     /// system temp dir. Memory-mapped file is the default backing format.</summary>
     public string? StreamingBackingStorePath { get; set; }
+
+    /// <summary>
+    /// LZ4-compress weight bytes before writing them to the backing store.
+    /// On near-Gaussian fp32 weights this typically saves 30–40% of disk
+    /// footprint at ~3 GB/s decompress (negligible vs. NVMe bandwidth).
+    /// Default false to keep the basic streaming path identical to the
+    /// pre-compression behaviour; enable for memory-bound (562B) models.
+    /// </summary>
+    public bool EnableCompression { get; set; } = false;
+
+    /// <summary>
+    /// Number of layers to prefetch ahead of the current Forward / Backward
+    /// step. The schedule-aware prefetcher in <c>NeuralNetworkBase.Predict</c>
+    /// reads layer N+W's weights from disk in the background while layer N
+    /// computes — for typical CPU compute and NVMe bandwidth, W=2 fully
+    /// overlaps disk I/O with compute. Set to 0 to disable prefetch and
+    /// pay full disk-read latency on each layer's hot path. Default 2.
+    /// </summary>
+    public int PrefetchWindow { get; set; } = 2;
 }
 
 /// <summary>Memory-placement scheme for <see cref="WeightLifetime.GpuOffload"/> weights.</summary>

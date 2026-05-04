@@ -427,6 +427,20 @@ public static class WeightRegistry
         }, state: null);
     }
 
+    /// <summary>
+    /// Returns a snapshot of streaming-pool telemetry counters. Caller
+    /// typically reads this at end of inference / training pass and
+    /// surfaces it in <c>PredictionModelResult.StreamingReport</c>.
+    /// Returns <c>default</c> when no pool has been allocated yet.
+    /// </summary>
+    public static StreamingPoolReport GetStreamingReport()
+    {
+        lock (_lock)
+        {
+            return _streamingPool?.GetReport() ?? default;
+        }
+    }
+
     /// <summary>For tests: drops all configured backends + flushes pool.</summary>
     public static void Reset()
     {
