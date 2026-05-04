@@ -22,4 +22,15 @@ internal static class HalfBits
         return *(ushort*)&local;
 #endif
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe Half FromBits(ushort raw)
+    {
+#if NET5_0_OR_GREATER
+        return BitConverter.UInt16BitsToHalf(raw);
+#else
+        ushort local = raw;
+        return *(Half*)&local;
+#endif
+    }
 }

@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
@@ -92,6 +93,12 @@ public static class WeightRegistry
                         SerializeToBytes(weight, bytes);
                         long handle = StreamingPoolUnlocked().Register(bytes);
                         weight.StreamingPoolHandle = handle;
+                        // Drop the tensor's in-memory data: pool now owns the
+                        // canonical copy. Without this, registration just
+                        // duplicates memory (tensor + pool entry both
+                        // resident) and Streaming mode can't actually save
+                        // RAM. Materialize() restores _data on demand.
+                        weight.DropStorageForStreaming();
                         return;
                     }
                 case WeightLifetime.GpuOffload:
@@ -260,6 +267,164 @@ public static class WeightRegistry
             $"WeightRegistry: no exact serializer for element type {typeof(T).Name}. " +
             "Supported types: float, double, int, long, Half, BFloat16. " +
             "For other types, convert weights to a supported representation before tagging Lifetime.");
+    }
+
+    /// <summary>
+    /// Restores a streaming weight's in-memory data from the pool. If the
+    /// pool has already paged the bytes out to disk, the backing file is
+    /// read first. No-op for tensors that aren't <see cref="WeightLifetime.Streaming"/>
+    /// or whose data is already resident.
+    /// </summary>
+    /// <remarks>
+    /// Used by <c>NeuralNetworkBase.Predict</c> and <c>Backpropagate</c>:
+    /// before each layer's Forward / Backward, materialize that layer's
+    /// trainable tensors via <see cref="MaterializeMany{T}"/> (which wraps
+    /// this in a using-scope). After the layer finishes, call
+    /// <see cref="ReleaseToPool{T}"/> to free the bytes again.
+    /// </remarks>
+    public static void Materialize<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming) return;
+        if (weight.StreamingPoolHandle < 0) return;
+        if (weight.DataVector.Length == weight.Length) return; // already resident
+
+        ReadOnlySpan<byte> bytes;
+        lock (_lock)
+        {
+            bytes = StreamingPoolUnlocked().Rehydrate(weight.StreamingPoolHandle);
+            // Copy into the tensor's storage while we still hold the lock —
+            // the pool's resident byte array could be evicted by a
+            // concurrent Register on a different thread otherwise.
+            weight.RestoreStorageFromBytes(bytes);
+        }
+    }
+
+    /// <summary>
+    /// Drops a streaming weight's in-memory data, leaving the canonical
+    /// copy with the streaming pool. The tensor's <see cref="Tensor{T}.Length"/>
+    /// stays unchanged; subsequent reads must call <see cref="Materialize{T}"/>
+    /// first. No-op if the weight isn't <see cref="WeightLifetime.Streaming"/>
+    /// or hasn't been registered.
+    /// </summary>
+    public static void ReleaseToPool<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming) return;
+        if (weight.StreamingPoolHandle < 0) return;
+        if (weight.DataVector.Length == 0) return; // already released
+        weight.DropStorageForStreaming();
+    }
+
+    /// <summary>
+    /// Returns an <see cref="IDisposable"/> scope that materializes
+    /// <paramref name="weights"/> on construction and releases them on
+    /// disposal. Use around a layer's Forward to guarantee the tensors
+    /// are resident only for the duration of the call:
+    /// <code>
+    /// using (WeightRegistry.MaterializeMany(layer.GetParameterChunks()))
+    /// {
+    ///     output = layer.Forward(input);
+    /// }
+    /// </code>
+    /// </summary>
+    public static MaterializeScope<T> MaterializeMany<T>(IEnumerable<Tensor<T>> weights)
+    {
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        return new MaterializeScope<T>(weights);
+    }
+
+    /// <summary>
+    /// IDisposable scope returned by <see cref="MaterializeMany{T}"/>.
+    /// Materializes its tensors on construction; releases on disposal.
+    /// </summary>
+    public sealed class MaterializeScope<T> : IDisposable
+    {
+        private readonly Tensor<T>[] _weights;
+        private bool _disposed;
+
+        internal MaterializeScope(IEnumerable<Tensor<T>> weights)
+        {
+            // Snapshot to an array so disposal sees the same set even if
+            // the source enumerable was lazy / mutated mid-scope.
+            var list = new System.Collections.Generic.List<Tensor<T>>();
+            foreach (var w in weights)
+            {
+                if (w is null) continue;
+                Materialize(w);
+                list.Add(w);
+            }
+            _weights = list.ToArray();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            for (int i = 0; i < _weights.Length; i++)
+                ReleaseToPool(_weights[i]);
+        }
+    }
+
+    /// <summary>
+    /// Returns true when this weight's bytes are currently resident in
+    /// the streaming pool (no disk read needed on next
+    /// <see cref="Materialize{T}"/>). Used by
+    /// <c>NeuralNetworkBase.Backpropagate</c> to skip unnecessary
+    /// materialize calls during the forward→backward LRU bridge — after
+    /// forward, layers are at LRU head and backward starts there.
+    /// Returns false for non-Streaming or unregistered tensors.
+    /// </summary>
+    public static bool IsResidentInPool<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming) return false;
+        if (weight.StreamingPoolHandle < 0) return false;
+        lock (_lock)
+        {
+            return _streamingPool?.IsResident(weight.StreamingPoolHandle) ?? false;
+        }
+    }
+
+    /// <summary>
+    /// Issues a background read of <paramref name="weight"/>'s bytes from
+    /// the streaming pool's backing store into the resident set. Returns
+    /// immediately; the next <see cref="Materialize{T}"/> call should hit
+    /// the resident set.
+    /// </summary>
+    /// <remarks>
+    /// Called by <c>NeuralNetworkBase.Predict</c> for layer N+W while
+    /// layer N is computing — overlap of disk I/O with compute is the
+    /// primary perf win vs. PyTorch FSDP's synchronous all-gather. No-op
+    /// if the tensor isn't <see cref="WeightLifetime.Streaming"/>.
+    /// </remarks>
+    public static void PrefetchAsync<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming) return;
+        if (weight.StreamingPoolHandle < 0) return;
+
+        long handle = weight.StreamingPoolHandle;
+        // Fire-and-forget on the threadpool. The pool's Rehydrate handles
+        // the read; callers that race a concurrent Materialize will hit
+        // the resident set instead of double-reading. Prefetch is
+        // best-effort: any failure (handle unregistered between prefetch
+        // queue and run, backing file missing, etc.) is swallowed so
+        // Materialize can do the disk read on the hot path.
+        System.Threading.ThreadPool.UnsafeQueueUserWorkItem(_ =>
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    _streamingPool?.Rehydrate(handle);
+                }
+            }
+            catch
+            {
+                // Best-effort; let Materialize handle on the hot path.
+            }
+        }, state: null);
     }
 
     /// <summary>For tests: drops all configured backends + flushes pool.</summary>

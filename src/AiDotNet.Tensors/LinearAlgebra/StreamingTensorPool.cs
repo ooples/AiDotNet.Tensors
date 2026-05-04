@@ -69,6 +69,21 @@ public sealed class StreamingTensorPool : IDisposable
     /// <summary>Total registered entries (resident + paged out).</summary>
     public int RegisteredEntryCount { get { lock (_lock) return _entries.Count; } }
 
+    /// <summary>
+    /// Returns true when the entry's bytes are currently in the resident
+    /// set (no disk read needed on next <see cref="Rehydrate"/>). Used by
+    /// the LRU-bridge in <c>NeuralNetworkBase.Backpropagate</c> to skip
+    /// unnecessary materialize calls when forward already left the bytes
+    /// at LRU head.
+    /// </summary>
+    public bool IsResident(long handleId)
+    {
+        lock (_lock)
+        {
+            return _entries.TryGetValue(handleId, out var entry) && entry.Data is not null;
+        }
+    }
+
     /// <summary>Registers a weight buffer with the streaming pool. Returns a
     /// handle the caller stores on its <see cref="Tensor{T}"/> and uses for
     /// access through <see cref="MarkAccessed"/> / <see cref="Rehydrate{T}"/>.</summary>
