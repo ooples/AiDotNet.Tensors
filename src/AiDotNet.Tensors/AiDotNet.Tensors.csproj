@@ -109,7 +109,17 @@
     <!-- LZ4 compression for the streaming pool's backing store (#1222).
          ~30-40% disk-footprint reduction on near-Gaussian fp32 weights at
          ~3 GB/s decompress. K4os.Compression.LZ4 is the de-facto LZ4
-         binding for .NET; cross-TFM (net46+) and zero native deps. -->
+         binding for .NET; cross-TFM (net46+), 100% managed, zero native
+         deps. Supply-chain note: this is the project's first new external
+         runtime dep since the MKL.NET removal — LZ4 was deemed worth the
+         dep because (a) it's tiny (~80 KB), (b) it has no transitive
+         deps, (c) reimplementing LZ4 is a non-trivial CPU-perf undertaking
+         that would just reinvent the same algorithm. The dep is gated
+         behind GpuOffloadOptions.EnableCompression (default false), so
+         users who don't opt into compression don't load LZ4 at runtime
+         either. Alternatives considered + rejected: System.IO.Compression
+         GZip (built-in but ~3× slower decompress), no compression
+         (loses 30-40% disk-footprint reduction). -->
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
   </ItemGroup>
 

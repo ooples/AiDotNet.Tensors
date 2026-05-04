@@ -26,12 +26,33 @@ public static class WeightRegistry
     private static GpuOffloadOptions _options = new();
 
     /// <summary>Replaces the active options; must be called before any
-    /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.</summary>
+    /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.
+    /// Throws <see cref="InvalidOperationException"/> when the existing pool
+    /// has live registered handles — disposing it would orphan those
+    /// handles and any subsequent Materialize would throw "handle unknown".
+    /// Call <see cref="UnregisterWeight{T}"/> on all live tensors first,
+    /// or <see cref="Reset"/> to forcibly drop them (test path).
+    /// Throws <see cref="PlatformNotSupportedException"/> on big-endian
+    /// hosts — the streaming pool's serialization mixes Buffer.BlockCopy
+    /// (native endian) with hand-LE Half/BFloat16 codecs and is only
+    /// well-defined on little-endian platforms (x86/x64/ARM-LE).</summary>
     public static void Configure(GpuOffloadOptions options, IGpuOffloadAllocator? offloadAllocator = null)
     {
         if (options is null) throw new ArgumentNullException(nameof(options));
+        if (!BitConverter.IsLittleEndian)
+            throw new PlatformNotSupportedException(
+                "WeightRegistry / StreamingTensorPool requires a little-endian host. " +
+                "Big-endian platforms (legacy IBM Power, certain ARM modes) are not supported in v1.");
         lock (_lock)
         {
+            // Mid-flight guard: refuse to dispose a pool that holds live
+            // entries. Otherwise tensors registered against the old pool
+            // would silently break on Materialize.
+            if (_streamingPool is not null && _streamingPool.RegisteredEntryCount > 0)
+                throw new InvalidOperationException(
+                    $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.RegisteredEntryCount} " +
+                    "registered entries. Unregister all weights first, or call Reset() to forcibly drop them.");
+
             // Dispose the previous allocator before swapping — otherwise its
             // outstanding pinned/managed allocations + native context are
             // leaked. Skip disposal when the caller passes the same instance
@@ -88,7 +109,20 @@ public static class WeightRegistry
                     return;
                 case WeightLifetime.Streaming:
                     {
-                        int byteCount = weight.Length * ElementSize<T>();
+                        // Use long arithmetic so we surface an OOM-style
+                        // error explicitly instead of a silent int wrap.
+                        // byte[] is itself bounded to ~2.15 GB, so streaming
+                        // a single tensor > 2 GB is impossible regardless;
+                        // we throw a clear NotSupportedException instead of
+                        // the runtime's OutOfMemoryException so callers
+                        // know to chunk the tensor at the consumer side.
+                        long byteCountLong = (long)weight.Length * ElementSize<T>();
+                        if (byteCountLong > int.MaxValue)
+                            throw new NotSupportedException(
+                                $"Streaming registration requires per-tensor size <= {int.MaxValue} bytes " +
+                                $"(byte[] limit). Tensor has {weight.Length} elements × {ElementSize<T>()} bytes = " +
+                                $"{byteCountLong} bytes. Chunk the tensor into smaller pool entries on the consumer side.");
+                        int byteCount = (int)byteCountLong;
                         var bytes = new byte[byteCount];
                         SerializeToBytes(weight, bytes);
                         long handle = StreamingPoolUnlocked().Register(bytes);
@@ -111,7 +145,13 @@ public static class WeightRegistry
                             weight.Lifetime = WeightLifetime.Default;
                             return;
                         }
-                        int byteCount = weight.Length * ElementSize<T>();
+                        long offloadByteCountLong = (long)weight.Length * ElementSize<T>();
+                        if (offloadByteCountLong > int.MaxValue)
+                            throw new NotSupportedException(
+                                $"GpuOffload registration requires per-tensor size <= {int.MaxValue} bytes " +
+                                $"(stage byte[] limit). Tensor has {weight.Length} elements × {ElementSize<T>()} bytes = " +
+                                $"{offloadByteCountLong} bytes. Chunk the tensor on the consumer side.");
+                        int byteCount = (int)offloadByteCountLong;
                         var scheme = weight.Lifetime == WeightLifetime.GpuManaged
                             ? OffloadScheme.Managed : OffloadScheme.Pinned;
                         // Serialize FIRST so a SerializeToBytes failure (e.g.,
@@ -204,13 +244,33 @@ public static class WeightRegistry
         return _streamingPool;
     }
 
-    private static int ElementSize<T>() => System.Runtime.InteropServices.Marshal.SizeOf<T>();
+    private static int ElementSize<T>()
+    {
+        // Use typed fast-path sizes that agree with SerializeToBytes /
+        // TensorBase.ElementSizeForStreaming. Marshal.SizeOf<Half>() is
+        // host-dependent (returns 2 on .NET 5+, 4 on net471 polyfills),
+        // so deferring to it would mismatch the byte layout.
+        if (typeof(T) == typeof(float)) return sizeof(float);
+        if (typeof(T) == typeof(double)) return sizeof(double);
+        if (typeof(T) == typeof(int)) return sizeof(int);
+        if (typeof(T) == typeof(long)) return sizeof(long);
+        if (typeof(T) == typeof(Half)) return 2;
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return 2;
+        // Anything else: fall through to Marshal.SizeOf — these types
+        // can't actually be serialized (SerializeToBytes throws), but
+        // ElementSize is also used for the GpuOffload byteCount which
+        // applies to a wider set.
+        return System.Runtime.InteropServices.Marshal.SizeOf<T>();
+    }
 
     /// <summary>Serializes a tensor's elements to a raw byte buffer. We
     /// can't constrain T : unmanaged at the API level (Tensor&lt;T&gt; is
     /// generic over arbitrary numeric types including Complex / Multivector),
-    /// so this routes through reflection-friendly per-type fast paths and
-    /// a generic byte-by-byte fallback.</summary>
+    /// so this dispatches via per-type fast paths. For unsupported element
+    /// types (Complex, Multivector, etc.) we throw <see cref="NotSupportedException"/>
+    /// at the bottom — there is intentionally no generic fallback because a
+    /// byte-by-byte memcpy would silently lose data for non-blittable types.
+    /// </summary>
     private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst)
     {
         if (typeof(T) == typeof(float))
@@ -289,15 +349,20 @@ public static class WeightRegistry
         if (weight.StreamingPoolHandle < 0) return;
         if (weight.DataVector.Length == weight.Length) return; // already resident
 
-        ReadOnlySpan<byte> bytes;
+        // Two-phase: snapshot bytes under the registry lock (short — pool
+        // does the disk read inside its own lock), then drop the lock and
+        // do the deserialize-into-tensor memcpy unsynchronized. The memcpy
+        // can be tens of milliseconds for hundreds-of-MB weights — holding
+        // the registry lock across it would serialize all concurrent
+        // Materialize / PrefetchAsync workers and defeat the W=2 prefetch
+        // overlap. RehydrateInto returns a caller-owned byte[] so we no
+        // longer race against a concurrent eviction nulling entry.Data.
+        byte[] snapshot;
         lock (_lock)
         {
-            bytes = StreamingPoolUnlocked().Rehydrate(weight.StreamingPoolHandle);
-            // Copy into the tensor's storage while we still hold the lock —
-            // the pool's resident byte array could be evicted by a
-            // concurrent Register on a different thread otherwise.
-            weight.RestoreStorageFromBytes(bytes);
+            snapshot = StreamingPoolUnlocked().RehydrateInto(weight.StreamingPoolHandle);
         }
+        weight.RestoreStorageFromBytes(snapshot);
     }
 
     /// <summary>
@@ -340,29 +405,52 @@ public static class WeightRegistry
     /// </summary>
     public sealed class MaterializeScope<T> : IDisposable
     {
+        // Rented from the array pool to avoid per-scope allocation. Each
+        // Predict layer instantiates a scope, so on a 64-decoder PaLME
+        // forward pass we'd otherwise allocate 64 Tensor<T>[] arrays per
+        // step — pooling is meaningful at that frequency.
         private readonly Tensor<T>[] _weights;
-        private bool _disposed;
+        private readonly int _count;
+        private int _disposed; // 0 = live, 1 = disposed (Interlocked-guarded)
 
         internal MaterializeScope(IEnumerable<Tensor<T>> weights)
         {
             // Snapshot to an array so disposal sees the same set even if
-            // the source enumerable was lazy / mutated mid-scope.
-            var list = new System.Collections.Generic.List<Tensor<T>>();
+            // the source enumerable was lazy / mutated mid-scope. We
+            // count first, allocate exactly, then materialize — avoids
+            // the List<T> intermediate growth and resize copies.
+            int count = 0;
+            if (weights is ICollection<Tensor<T>> c) count = c.Count;
+            else { foreach (var _w in weights) count++; }
+
+            _weights = count == 0
+                ? Array.Empty<Tensor<T>>()
+                : System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(count);
+            int idx = 0;
             foreach (var w in weights)
             {
                 if (w is null) continue;
                 Materialize(w);
-                list.Add(w);
+                _weights[idx++] = w;
             }
-            _weights = list.ToArray();
+            _count = idx;
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-            for (int i = 0; i < _weights.Length; i++)
+            // Interlocked guard against double-Dispose from racing threads.
+            // The standard `using` pattern is single-threaded but the
+            // scope's reference can leak into other threads via DI etc.
+            if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            for (int i = 0; i < _count; i++)
                 ReleaseToPool(_weights[i]);
+            // Clear the slots before returning to pool — the rented array
+            // may outlive this scope inside the pool, and we don't want to
+            // root the tensors past Dispose.
+            for (int i = 0; i < _count; i++)
+                _weights[i] = null!;
+            if (_weights.Length > 0)
+                System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
         }
     }
 
@@ -405,39 +493,89 @@ public static class WeightRegistry
         if (weight.StreamingPoolHandle < 0) return;
 
         long handle = weight.StreamingPoolHandle;
+        // Bound prefetch worker concurrency to PrefetchMaxConcurrency
+        // outstanding workers (default 8). Unbounded queueing could fill
+        // the ThreadPool with workers all blocked on the registry lock if
+        // a caller spams PrefetchAsync; the semaphore caps the queue
+        // depth. Default 8 is well above the typical W=2 schedule so
+        // legitimate use never sees Wait(0) fail; pathological callers
+        // see the prefetch dropped (next Materialize does the disk read).
+        if (!_prefetchSemaphore.Wait(0)) return;
+
         // Fire-and-forget on the threadpool. The pool's Rehydrate handles
         // the read; callers that race a concurrent Materialize will hit
-        // the resident set instead of double-reading. Prefetch is
-        // best-effort: any failure (handle unregistered between prefetch
-        // queue and run, backing file missing, etc.) is swallowed so
-        // Materialize can do the disk read on the hot path.
+        // the resident set instead of double-reading.
+        // UnsafeQueueUserWorkItem skips ExecutionContext capture — any
+        // AsyncLocal<T> values in the calling context are NOT preserved
+        // into this worker. That's an intentional perf optimization for
+        // the prefetch hot path; if telemetry / logging needs context,
+        // capture it explicitly via the closure.
         System.Threading.ThreadPool.UnsafeQueueUserWorkItem(_ =>
         {
             try
             {
                 lock (_lock)
                 {
-                    _streamingPool?.Rehydrate(handle);
+                    // Pool may be null if Configure was called between
+                    // queue + execute; pool may be the OLD pool if a new
+                    // one was swapped in mid-flight (handle would belong
+                    // to the old pool, throw "handle unknown" — caught).
+                    _streamingPool?.Rehydrate(handle, isPrefetch: true);
                 }
             }
-            catch
+            catch (System.IO.IOException) { /* disk error mid-prefetch */ }
+            catch (ObjectDisposedException) { /* pool disposed mid-prefetch */ }
+            catch (InvalidOperationException) { /* handle unknown after Configure */ }
+            catch (UnauthorizedAccessException) { /* permissions changed */ }
+            // Don't catch OOM, ThreadAbort, AccessViolation — those are
+            // process-level signals that swallowing would hide. Let them
+            // surface as TaskScheduler.UnobservedTaskException.
+            finally
             {
-                // Best-effort; let Materialize handle on the hot path.
+                _prefetchSemaphore.Release();
             }
         }, state: null);
     }
+
+    // Caps in-flight prefetch workers. 8 is well above typical W=2 schedule
+    // so the semaphore is invisible to legitimate callers but bounds queue
+    // depth under pathological load. See PrefetchAsync for rationale.
+    private const int PrefetchMaxConcurrency = 8;
+    private static readonly System.Threading.SemaphoreSlim _prefetchSemaphore =
+        new(initialCount: PrefetchMaxConcurrency, maxCount: PrefetchMaxConcurrency);
 
     /// <summary>
     /// Returns a snapshot of streaming-pool telemetry counters. Caller
     /// typically reads this at end of inference / training pass and
     /// surfaces it in <c>PredictionModelResult.StreamingReport</c>.
-    /// Returns <c>default</c> when no pool has been allocated yet.
+    /// When no pool has been lazily-allocated yet (no streaming
+    /// registration has happened), returns a zeroed report seeded with
+    /// the configured <see cref="GpuOffloadOptions.EnableCompression"/>
+    /// flag so consumers can distinguish "compression-on-but-no-traffic"
+    /// from "compression-off".
     /// </summary>
     public static StreamingPoolReport GetStreamingReport()
     {
         lock (_lock)
         {
-            return _streamingPool?.GetReport() ?? default;
+            if (_streamingPool is not null)
+                return _streamingPool.GetReport();
+            // Seed the CompressionEnabled flag from current options so a
+            // user who set EnableCompression=true but hasn't registered
+            // anything yet sees the right surface in the report.
+            return new StreamingPoolReport(
+                ResidentBytes: 0,
+                ResidentBytesPeak: 0,
+                RegisteredEntryCount: 0,
+                DiskReadCount: 0,
+                DiskReadBytes: 0,
+                DiskWriteBytes: 0,
+                EvictionCount: 0,
+                CompressionRatio: 1.0,
+                CompressionEnabled: _options.EnableCompression,
+                PrefetchHitCount: 0,
+                PrefetchMissCount: 0,
+                PrefetchIssueCount: 0);
         }
     }
 

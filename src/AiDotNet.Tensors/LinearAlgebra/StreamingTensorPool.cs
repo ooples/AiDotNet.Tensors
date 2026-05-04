@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
@@ -44,14 +45,27 @@ public sealed class StreamingTensorPool : IDisposable
     private long _evictionCount;
     private long _compressedBytesTotal;
     private long _uncompressedBytesTotal;
+    // Prefetch effectiveness — distinguishes background prefetch reads
+    // (good — they overlapped with foreground compute) from on-demand
+    // reads (bad — the prefetch window was too short or the LRU evicted
+    // the entry before Materialize hit it).
+    private long _prefetchHitCount;     // Materialize found bytes already resident from a prefetch
+    private long _prefetchMissCount;    // Materialize had to do the disk read on the hot path
+    private long _prefetchIssueCount;   // Total Rehydrate calls flagged as isPrefetch=true
 
     public StreamingTensorPool(GpuOffloadOptions? options = null)
     {
         var opts = options ?? new GpuOffloadOptions();
         _maxResidentBytes = opts.StreamingPoolMaxResidentBytes;
         _enableCompression = opts.EnableCompression;
-        _backingDir = opts.StreamingBackingStorePath
-            ?? Path.Combine(Path.GetTempPath(), "aidotnet-streaming-pool-" + Guid.NewGuid().ToString("N"));
+        // Always append a Guid sub-directory — even when the caller
+        // supplies StreamingBackingStorePath. Two pools sharing the same
+        // base path would otherwise collide on streaming-{id}.bin
+        // filenames and either pool's Dispose() would delete the other's
+        // live files (the recursive-delete is unconditional). The Guid
+        // sub-dir makes Dispose safe to scope to this pool's lifetime.
+        string baseDir = opts.StreamingBackingStorePath ?? Path.GetTempPath();
+        _backingDir = Path.Combine(baseDir, "aidotnet-streaming-pool-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_backingDir);
     }
 
@@ -104,6 +118,7 @@ public sealed class StreamingTensorPool : IDisposable
         if (data is null) throw new ArgumentNullException(nameof(data));
         lock (_lock)
         {
+            ThrowIfDisposed();
             long id = _nextHandleId++;
             var entry = new Entry { Data = data, ResidentBytes = data.Length };
             _entries[id] = entry;
@@ -128,15 +143,55 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
-    /// <summary>Reads back a weight, bringing it back from the backing store
-    /// if it has been evicted. Returned span is valid until the next
-    /// eviction; callers should copy out before kernel dispatch.</summary>
-    public ReadOnlySpan<byte> Rehydrate(long handleId)
+    /// <summary>
+    /// Reads back a weight, bringing it back from the backing store if it
+    /// has been evicted. Returned span aliases the pool's internal byte[];
+    /// the array is rooted by the returned reference, so the bytes remain
+    /// valid for the span's lifetime even if the entry is later evicted
+    /// (eviction nulls <c>entry.Data</c> but the byte[] survives as long
+    /// as the caller holds it).
+    /// </summary>
+    /// <remarks>
+    /// Callers that need a stable independent copy should use
+    /// <see cref="RehydrateInto"/> instead — that path copies under the
+    /// pool lock, freeing the caller from coordinating with concurrent
+    /// pool mutations.
+    /// </remarks>
+    public ReadOnlySpan<byte> Rehydrate(long handleId) => Rehydrate(handleId, isPrefetch: false);
+
+    /// <summary>
+    /// Rehydrate variant that flags whether the call originated from
+    /// <see cref="WeightRegistry.PrefetchAsync{T}"/> (background) or from
+    /// <see cref="WeightRegistry.Materialize{T}"/> (foreground). Used to
+    /// derive prefetch effectiveness counters (hit / miss / issue) in
+    /// <see cref="StreamingPoolReport"/>.
+    /// </summary>
+    public ReadOnlySpan<byte> Rehydrate(long handleId, bool isPrefetch)
     {
         lock (_lock)
         {
+            ThrowIfDisposed();
             if (!_entries.TryGetValue(handleId, out var entry))
                 throw new InvalidOperationException($"Streaming pool: handle {handleId} is unknown.");
+
+            if (isPrefetch)
+            {
+                _prefetchIssueCount++;
+            }
+            else if (entry.Data is null)
+            {
+                // Foreground Materialize that has to read from disk —
+                // either no prefetch was issued for this handle, or it
+                // hadn't completed in time, or LRU evicted between
+                // prefetch and use.
+                _prefetchMissCount++;
+            }
+            else if (entry.Data is not null)
+            {
+                // Foreground Materialize hit the resident set — a prefetch
+                // (or simply LRU keeping it warm) saved a disk read.
+                _prefetchHitCount++;
+            }
 
             if (entry.Data is null)
             {
@@ -201,6 +256,29 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads a weight back into a freshly-allocated byte[] under the pool
+    /// lock. Faster path for callers who'd otherwise call Rehydrate then
+    /// copy out — this version avoids the second lock acquire and gives
+    /// the caller a buffer that's independent of the pool's resident set.
+    /// Used by <see cref="WeightRegistry.Materialize{T}"/> so the registry
+    /// lock can be released before the deserialize-into-tensor memcpy.
+    /// </summary>
+    public byte[] RehydrateInto(long handleId)
+    {
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            // Reuse Rehydrate to consolidate the resident-/paged-out
+            // codepaths, then snapshot the bytes into a caller-owned
+            // array before releasing the lock.
+            var span = Rehydrate(handleId);
+            var copy = new byte[span.Length];
+            span.CopyTo(copy);
+            return copy;
+        }
+    }
+
     /// <summary>Frees a weight + its backing-store file. Called at model
     /// dispose.</summary>
     public void Unregister(long handleId)
@@ -255,21 +333,31 @@ public sealed class StreamingTensorPool : IDisposable
             if (_enableCompression)
             {
                 // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
+                // Rent from ArrayPool to avoid 2× transient allocation —
+                // for a 268 MB tensor, the unpooled path peaks at ~537 MB
+                // resident (encodeBuf + final toWrite) on every eviction.
                 int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
-                var encodeBuf = new byte[maxOut];
-                int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
-                if (encoded > 0 && encoded < uncompressed)
+                byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
+                try
                 {
-                    toWrite = new byte[encoded];
-                    Array.Copy(encodeBuf, 0, toWrite, 0, encoded);
-                    compressed = true;
+                    int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
+                    if (encoded > 0 && encoded < uncompressed)
+                    {
+                        toWrite = new byte[encoded];
+                        Array.Copy(encodeBuf, 0, toWrite, 0, encoded);
+                        compressed = true;
+                    }
+                    else
+                    {
+                        // Compression didn't help (entropy too high or below
+                        // LZ4's break-even) — store raw to skip the decompress
+                        // cost on rehydrate.
+                        toWrite = entry.Data;
+                    }
                 }
-                else
+                finally
                 {
-                    // Compression didn't help (entropy too high or below
-                    // LZ4's break-even) — store raw to skip the decompress
-                    // cost on rehydrate.
-                    toWrite = entry.Data;
+                    ArrayPool<byte>.Shared.Return(encodeBuf);
                 }
             }
             else
@@ -292,14 +380,40 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    // Backing files are flat raw bytes (or LZ4-compressed bytes when
+    // EnableCompression is on). No magic header / version prefix —
+    // backing files are tied to a single pool's lifetime (deleted on
+    // Dispose), so cross-version compatibility doesn't apply. If the
+    // pool is ever extended to support persistent state across process
+    // restarts, add `[u32 magic][u32 version]` here and adjust Rehydrate
+    // to validate before LZ4Codec.Decode.
     private string BackingPathFor(long id) => Path.Combine(_backingDir, $"streaming-{id}.bin");
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Free resident byte[]s + LRU bookkeeping eagerly so Dispose
+            // doesn't leave the dictionary populated until GC. Without this,
+            // a long-lived host that swaps pools via Configure() would hold
+            // every old pool's resident bytes in memory until the next GC.
+            _entries.Clear();
+            _lruOrder.Clear();
+            _lruIndex.Clear();
+            _residentBytes = 0;
+        }
+        // Backing-store deletion outside the lock — Directory.Delete on a
+        // large pool can be slow, and there's no in-memory state to
+        // protect anymore.
         try { if (Directory.Exists(_backingDir)) Directory.Delete(_backingDir, recursive: true); }
         catch { /* best-effort */ }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(StreamingTensorPool));
     }
 
     private sealed class Entry
@@ -334,7 +448,10 @@ public sealed class StreamingTensorPool : IDisposable
                 DiskWriteBytes: _diskWriteBytes,
                 EvictionCount: _evictionCount,
                 CompressionRatio: ratio,
-                CompressionEnabled: _enableCompression);
+                CompressionEnabled: _enableCompression,
+                PrefetchHitCount: _prefetchHitCount,
+                PrefetchMissCount: _prefetchMissCount,
+                PrefetchIssueCount: _prefetchIssueCount);
         }
     }
 }
@@ -365,6 +482,18 @@ public sealed class StreamingTensorPool : IDisposable
 /// 0.6–0.7.</param>
 /// <param name="CompressionEnabled">Whether <see cref="GpuOffloadOptions.EnableCompression"/>
 /// was set when the pool was constructed.</param>
+/// <param name="PrefetchHitCount">Number of foreground
+/// <see cref="WeightRegistry.Materialize{T}"/> calls that found the
+/// bytes already resident — a prefetch (or LRU heat) saved a disk read.
+/// High hit rate = prefetch window is well-tuned.</param>
+/// <param name="PrefetchMissCount">Foreground Materialize calls that
+/// had to read from the backing store on the hot path. High miss rate
+/// = prefetch window is too short, or LRU evicted the entry before
+/// foreground reached it.</param>
+/// <param name="PrefetchIssueCount">Total
+/// <see cref="WeightRegistry.PrefetchAsync{T}"/> calls. PrefetchIssueCount
+/// far exceeding PrefetchHitCount indicates wasted prefetch work
+/// (rehydrated entries got evicted before being read).</param>
 public readonly record struct StreamingPoolReport(
     long ResidentBytes,
     long ResidentBytesPeak,
@@ -374,4 +503,7 @@ public readonly record struct StreamingPoolReport(
     long DiskWriteBytes,
     long EvictionCount,
     double CompressionRatio,
-    bool CompressionEnabled);
+    bool CompressionEnabled,
+    long PrefetchHitCount,
+    long PrefetchMissCount,
+    long PrefetchIssueCount);

@@ -181,6 +181,18 @@ public abstract class TensorBase<T> : IDisposable
                 "Streaming drop requires contiguous, non-view, zero-offset tensors. " +
                 "Weight tensors satisfy this; views and sliced tensors do not.");
 
+        // RebindStorageFrom (used by CompiledInferencePlan / MemoryPlanningPass)
+        // creates non-view tensors that share storage refcounts. Dropping
+        // here would leak the shared storage because Release decrements
+        // by 1 but the rebound peer still holds a refcount. Refuse loud
+        // instead of corrupt-quiet so callers register weights BEFORE any
+        // rebind operation.
+        if (_storage.RefCount > 1)
+            throw new InvalidOperationException(
+                $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
+                "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
+                "shares its storage.");
+
         // Replace storage with an empty placeholder. We can't keep _storage's
         // refcount on the old data because the whole point is to free those
         // bytes — so Release the old storage and create a fresh empty one.
@@ -208,7 +220,13 @@ public abstract class TensorBase<T> : IDisposable
             throw new InvalidOperationException(
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
 
-        int elementSize = System.Runtime.InteropServices.Marshal.SizeOf<T>();
+        // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
+        // the latter throws ArgumentException for non-blittable types
+        // (Complex, Multivector) with a confusing native-interop message.
+        // ElementSizeForStreaming throws NotSupportedException with a
+        // clear "use a supported element type" message instead, matching
+        // WeightRegistry.SerializeToBytes' error contract.
+        int elementSize = ElementSizeForStreaming();
         long expectedBytes = (long)Length * elementSize;
         if (bytes.Length != expectedBytes)
             throw new ArgumentException(
@@ -228,6 +246,19 @@ public abstract class TensorBase<T> : IDisposable
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
         oldStorage.Release();
+    }
+
+    private static int ElementSizeForStreaming()
+    {
+        if (typeof(T) == typeof(float)) return sizeof(float);
+        if (typeof(T) == typeof(double)) return sizeof(double);
+        if (typeof(T) == typeof(int)) return sizeof(int);
+        if (typeof(T) == typeof(long)) return sizeof(long);
+        if (typeof(T) == typeof(Half)) return 2;
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return 2;
+        throw new NotSupportedException(
+            $"Streaming requires element type T to be one of: float, double, int, long, Half, BFloat16. " +
+            $"Got {typeof(T).Name}.");
     }
 
     private static Vector<T> DeserializeToVector(ReadOnlySpan<byte> src, int length)
