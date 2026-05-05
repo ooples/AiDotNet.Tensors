@@ -246,10 +246,15 @@ public static class WeightRegistry
     ///      pool — that's when the reservation transitions to
     ///      resident bytes and the
     ///      <see cref="Tensor{T}.StreamingPoolHandle"/> is assigned.
-    /// If the caller bails between Allocate and Register, call
-    /// <see cref="StreamingTensorPool.ReleaseReservation"/> via the
-    /// stored <see cref="Tensor{T}.StreamingReservedBytes"/> to give
-    /// the headroom back.
+    /// If the caller bails between Allocate and Register (e.g. an
+    /// exception during weight initialization, or the layer is torn
+    /// down before its first forward), call
+    /// <see cref="UnregisterWeight{T}"/> with the allocated tensor to
+    /// release its reservation and return the headroom to the pool
+    /// budget. <see cref="Tensor{T}.StreamingReservedBytes"/> is
+    /// internal and not directly callable from external code —
+    /// <see cref="UnregisterWeight{T}"/> is the public cancellation
+    /// path.
     /// </returns>
     /// <remarks>
     /// <para>The eviction step is best-effort: the pool's
