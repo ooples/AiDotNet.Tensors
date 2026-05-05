@@ -234,18 +234,24 @@ namespace AiDotNet.Tensors.Engines.Optimization
 
         /// <summary>
         /// Parallel variant of <see cref="Tile2D{TAction}"/>: each
-        /// tile runs on a <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>
-        /// worker. Caller's <typeparamref name="TAction"/> must be
-        /// thread-safe — the helper passes the same struct value to
-        /// every worker (struct types are by-value-copied per call so
-        /// per-tile state stays independent).
+        /// tile runs on a worker dispatched via the repo's
+        /// <see cref="AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel"/>
+        /// path so the persistent worker pool and configured
+        /// <see cref="AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism"/>
+        /// cap are honoured (matches the convention used by
+        /// <see cref="AiDotNet.Tensors.Helpers.SimdConvHelper"/> and
+        /// <see cref="AiDotNet.Tensors.Helpers.Im2ColHelper"/>).
         ///
-        /// <para>Note: <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>
-        /// itself takes an <c>Action&lt;int&gt;</c>, but the work it
-        /// dispatches is one tile's worth of computation — that's
-        /// large enough to amortize the per-iteration delegate cost,
-        /// unlike the per-element case where the struct callback is
-        /// load-bearing.</para>
+        /// <para><b>Per-worker callback isolation</b>: each worker
+        /// makes its OWN copy of the struct callback before invoking,
+        /// so a callback with mutable instance state observes
+        /// per-worker semantics (no race on a shared closure field).
+        /// Same value-type semantics as the sequential
+        /// <see cref="Tile2D{TAction}"/>, just dispatched in parallel.
+        /// Callbacks that intentionally share state (e.g. accumulators
+        /// into a shared array passed by reference) need their own
+        /// thread-safety story; this helper guarantees the struct
+        /// itself isn't shared.</para>
         /// </summary>
         public static void ParallelTile2D<TAction>(
             int rows, int cols, int tileSize, TAction action)
@@ -255,19 +261,26 @@ namespace AiDotNet.Tensors.Engines.Optimization
             int numTilesI = (rows + tileSize - 1) / tileSize;
             int numTilesJ = (cols + tileSize - 1) / tileSize;
             int totalTiles = numTilesI * numTilesJ;
-            // Capture the struct once — Parallel.For closes over the
-            // outer scope, and we want every worker to see a fresh
-            // struct copy (value-type semantics) rather than a shared
-            // boxed reference.
-            TAction localAction = action;
-            Parallel.For(0, totalTiles, tileIdx =>
+            // Capture the original action ONCE so the closure has a
+            // single read-only reference. Each worker then COPIES the
+            // struct into its own local — value-type semantics mean
+            // the workers can't race on the same struct fields.
+            TAction sharedAction = action;
+            int sharedNumTilesJ = numTilesJ;
+            int sharedTileSize = tileSize;
+            int sharedRows = rows;
+            int sharedCols = cols;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel(totalTiles, tileIdx =>
             {
-                int ti = tileIdx / numTilesJ;
-                int tj = tileIdx % numTilesJ;
-                int iStart = ti * tileSize;
-                int iEnd = Math.Min(iStart + tileSize, rows);
-                int jStart = tj * tileSize;
-                int jEnd = Math.Min(jStart + tileSize, cols);
+                // Per-worker struct copy — assignment to a local copies
+                // the value-type, isolating mutations to this worker.
+                TAction localAction = sharedAction;
+                int ti = tileIdx / sharedNumTilesJ;
+                int tj = tileIdx % sharedNumTilesJ;
+                int iStart = ti * sharedTileSize;
+                int iEnd = Math.Min(iStart + sharedTileSize, sharedRows);
+                int jStart = tj * sharedTileSize;
+                int jEnd = Math.Min(jStart + sharedTileSize, sharedCols);
                 localAction.Invoke(iStart, iEnd, jStart, jEnd);
             });
         }
@@ -320,6 +333,132 @@ namespace AiDotNet.Tensors.Engines.Optimization
             // bounded by the dimension.
             var (t, _, _) = CacheOptimizer.ComputeOptimalTiling<T>(dimension, dimension, dimension);
             return t;
+        }
+
+        // ── [Obsolete] delegate-based compatibility shims ──────────────
+        //
+        // The previous public surface took Action<int> / Action<int,int,...>
+        // delegates. Issue #294 replaced those with struct-callback
+        // generics for JIT inlining. To avoid a hard source-break for
+        // package consumers, the old signatures are kept here as
+        // [Obsolete]-marked forwarding overloads that wrap the caller's
+        // delegate in a private DelegateAdapter struct. Compiler emits
+        // warning CS0618 with the migration hint pointing to the struct-
+        // callback path.
+
+        private readonly struct DelegateLoopAction : ILoopAction
+        {
+            private readonly Action<int> _fn;
+            public DelegateLoopAction(Action<int> fn) { _fn = fn; }
+            public void Invoke(int i) => _fn(i);
+        }
+
+        private readonly struct DelegateTile2DAction : ITile2DAction
+        {
+            private readonly Action<int, int, int, int> _fn;
+            public DelegateTile2DAction(Action<int, int, int, int> fn) { _fn = fn; }
+            public void Invoke(int i0, int i1, int j0, int j1) => _fn(i0, i1, j0, j1);
+        }
+
+        private readonly struct DelegateInterchangeAction : IInterchangeAction
+        {
+            private readonly Action<int, int> _fn;
+            public DelegateInterchangeAction(Action<int, int> fn) { _fn = fn; }
+            public void Invoke(int i, int j) => _fn(i, j);
+        }
+
+        private readonly struct DelegateStripAction : IStripAction
+        {
+            private readonly Action<int, int> _fn;
+            public DelegateStripAction(Action<int, int> fn) { _fn = fn; }
+            public void Invoke(int start, int end) => _fn(start, end);
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload that
+        /// takes <see cref="ITile2DAction"/> for JIT-inlined dispatch.
+        /// This delegate-based shim is retained for one transition
+        /// release; new code should not call it.</summary>
+        [Obsolete("Use Tile2D<TAction>(int, int, int, TAction) where TAction : struct, ITile2DAction. The delegate overload prevents JIT inlining of the inner body and was replaced in issue #294.")]
+        public static void Tile2D(int rows, int cols, int tileSize, Action<int, int, int, int> tileAction)
+        {
+            if (tileAction is null) throw new ArgumentNullException(nameof(tileAction));
+            Tile2D(rows, cols, tileSize, new DelegateTile2DAction(tileAction));
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload taking
+        /// <see cref="ILoopAction"/>.</summary>
+        [Obsolete("Use UnrollBy4<TAction>(int, TAction) where TAction : struct, ILoopAction. Replaced in issue #294 for JIT inlining.")]
+        public static void UnrollBy4(int length, Action<int> action)
+        {
+            if (action is null) throw new ArgumentNullException(nameof(action));
+            UnrollBy4(length, new DelegateLoopAction(action));
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload taking
+        /// <see cref="ILoopAction"/>.</summary>
+        [Obsolete("Use UnrollBy8<TAction>(int, TAction) where TAction : struct, ILoopAction. Replaced in issue #294 for JIT inlining.")]
+        public static void UnrollBy8(int length, Action<int> action)
+        {
+            if (action is null) throw new ArgumentNullException(nameof(action));
+            UnrollBy8(length, new DelegateLoopAction(action));
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload taking
+        /// <see cref="IStripAction"/>.</summary>
+        [Obsolete("Use StripMine<TAction>(int, int, TAction) where TAction : struct, IStripAction. Replaced in issue #294 for JIT inlining.")]
+        public static void StripMine(int totalSize, int stripSize, Action<int, int> stripAction)
+        {
+            if (stripAction is null) throw new ArgumentNullException(nameof(stripAction));
+            StripMine(totalSize, stripSize, new DelegateStripAction(stripAction));
+        }
+
+        /// <summary>[Obsolete] The variadic delegate-array form is
+        /// retained for one transition release. New code should compose
+        /// the operations into a single <see cref="ILoopAction"/>
+        /// struct callback to avoid the per-element delegate dispatch
+        /// over <c>actions.Length</c> entries.</summary>
+        [Obsolete("Use Fuse<TAction>(int, TAction) where TAction : struct, ILoopAction with a single composed callback. The variadic-delegate form pays delegate dispatch per (element, action) pair and was replaced in issue #294.")]
+        public static void Fuse(int length, params Action<int>[] actions)
+        {
+            if (actions is null) throw new ArgumentNullException(nameof(actions));
+            for (int i = 0; i < length; i++)
+                foreach (var a in actions) a(i);
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload taking
+        /// <see cref="IInterchangeAction"/>.</summary>
+        [Obsolete("Use OptimalOrder2D<TAction>(int, int, bool, TAction) where TAction : struct, IInterchangeAction. Replaced in issue #294 for JIT inlining.")]
+        public static void OptimalOrder2D(int rows, int cols, bool rowMajorAccess, Action<int, int> action)
+        {
+            if (action is null) throw new ArgumentNullException(nameof(action));
+            OptimalOrder2D(rows, cols, rowMajorAccess, new DelegateInterchangeAction(action));
+        }
+
+        /// <summary>[Obsolete] Use the struct-callback overload taking
+        /// <see cref="ITile2DAction"/>.</summary>
+        [Obsolete("Use ParallelTile2D<TAction>(int, int, int, TAction) where TAction : struct, ITile2DAction. Replaced in issue #294 for JIT inlining + per-worker struct isolation.")]
+        public static void ParallelTile2D(int rows, int cols, int tileSize, Action<int, int, int, int> tileAction)
+        {
+            if (tileAction is null) throw new ArgumentNullException(nameof(tileAction));
+            ParallelTile2D(rows, cols, tileSize, new DelegateTile2DAction(tileAction));
+        }
+
+        /// <summary>[Obsolete] Non-generic form deferred to a single
+        /// element size. Use the generic <see cref="DetermineOptimalTileSize{T}"/>
+        /// overload so the cache picker sees the right
+        /// <c>Unsafe.SizeOf&lt;T&gt;</c>.</summary>
+        [Obsolete("Use DetermineOptimalTileSize<T>(int) where T : unmanaged so the L1 picker uses the right element size for your tensor. The non-generic form assumes 4-byte elements.")]
+        public static int DetermineOptimalTileSize(int dimension, int elementSize = 4)
+        {
+            // Old behaviour: replicate the local sqrt(L1 / (2 * size))
+            // formula for source compat. New code should call the
+            // generic overload.
+            var caps = PlatformDetector.Capabilities;
+            int l1 = caps?.L1CacheSize ?? 32 * 1024;
+            int maxElems = l1 / Math.Max(1, 2 * elementSize);
+            int tile = 16;
+            while (tile * tile * 2 < maxElems && tile < dimension) tile *= 2;
+            return Math.Min(tile, dimension);
         }
     }
 }

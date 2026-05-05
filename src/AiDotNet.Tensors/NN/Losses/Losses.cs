@@ -36,6 +36,15 @@ public static class Losses
     public static Tensor<T> SmoothL1Loss<T>(Tensor<T> input, Tensor<T> target, double beta = 1.0,
         LossReduction reduction = LossReduction.Mean)
     {
+        // beta is the Huber transition point — must be non-negative.
+        // beta=0 collapses to plain L1; negative beta would silently
+        // add a constant offset to every element on both fast paths
+        // and the generic path, returning a value that doesn't
+        // correspond to any well-defined loss. Reject up front so
+        // both branches see only valid inputs.
+        if (beta < 0)
+            throw new ArgumentOutOfRangeException(nameof(beta), $"beta must be non-negative; got {beta}.");
+
         EnsureSameShape(input, target);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
@@ -124,6 +133,14 @@ public static class Losses
         bool full = false, double eps = 1e-6,
         LossReduction reduction = LossReduction.Mean)
     {
+        // eps is the variance floor before the log() — must be
+        // strictly positive. eps<=0 would feed a non-positive value
+        // into Math.Log on the primitive fast paths, producing -inf
+        // or NaN instead of a meaningful loss. Reject at entry so all
+        // branches share consistent input validation.
+        if (eps <= 0)
+            throw new ArgumentOutOfRangeException(nameof(eps), $"eps must be > 0; got {eps}.");
+
         EnsureSameShape(input, target);
         EnsureSameShape(input, variance);
         var ops = MathHelper.GetNumericOperations<T>();

@@ -18,6 +18,7 @@ layernorm | <b>x<f>
 bcederiv | <n>                             (BCE forward+backward)
 """
 
+import math
 import sys
 import time
 import statistics
@@ -128,7 +129,11 @@ def main():
         sys.exit(3)
 
     median = statistics.median(times)
-    p90 = sorted(times)[int(0.9 * len(times))]
+    # P90 via zero-based index: ceil(0.9·N)-1 selects the 90th-percentile
+    # element. The previous int(0.9·N) form was off-by-one — for N=10
+    # it landed on index 9 (the maximum), reporting an artificially
+    # high p90.
+    p90 = sorted(times)[max(0, math.ceil(0.9 * len(times)) - 1)]
     sys.stdout.write(f"{median:.6f},{p90:.6f},{iters}\n")
 
 

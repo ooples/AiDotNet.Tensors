@@ -130,11 +130,21 @@ namespace AiDotNet.Tensors.Engines.Optimization
         /// <summary>
         /// Streaming copy with hardware prefetch hints for the read
         /// stream. On x86 hosts with SSE we issue a <c>PREFETCHT0</c>
-        /// for cache-line-ahead source data; on ARM hosts with the
-        /// base feature we use the equivalent <c>prfm</c> instruction
-        /// via <see cref="Arm.PrefetchByCacheLine"/>. On platforms
-        /// without either intrinsic this devolves to a plain
-        /// <see cref="Span{T}.CopyTo"/>, which is already fast.
+        /// for cache-line-ahead source data — hides L2-miss latency on
+        /// streaming patterns ≥1KB. On non-x86 hosts (or below the
+        /// threshold), devolves to <see cref="Span{T}.CopyTo"/>, which
+        /// is already SIMD-vectorized via the BCL.
+        ///
+        /// <para><b>Overlap behaviour</b>: the prefetch path uses
+        /// forward-direction line-by-line copies which are NOT
+        /// overlap-safe — overlapping <paramref name="src"/> and
+        /// <paramref name="dst"/> spans where <paramref name="dst"/>
+        /// trails <paramref name="src"/> would clobber data still
+        /// pending read. The method detects overlap up front and
+        /// routes to <see cref="Span{T}.CopyTo"/>, which dispatches
+        /// to <c>Buffer.Memmove</c> (handles overlap correctly via
+        /// directional choice). Same overlap guarantee as
+        /// <see cref="Array.Copy(Array, Array, int)"/>.</para>
         ///
         /// <para>Generic over <c>T : unmanaged</c>. The prefetch stride
         /// is computed in cache-line units (64 bytes assumed) divided
@@ -157,22 +167,59 @@ namespace AiDotNet.Tensors.Engines.Optimization
             // (~100 cycles to hide L2 miss) is shorter than the inner
             // loop. Below 1KB the plain CopyTo's microcoded rep movsb
             // / SIMD store stream wins.
+            //
+            // Overlap check: if the spans overlap, our forward-direction
+            // line-by-line copy can clobber data the next iteration
+            // still needs to read. Detect overlap by comparing the
+            // underlying refs; when overlap exists, fall through to
+            // Span.CopyTo which routes to Buffer.Memmove (picks the
+            // correct copy direction).
             int byteCount = length * Unsafe.SizeOf<T>();
             // Only x86 SSE has a stable cross-runtime intrinsic for
             // PREFETCHT0 in .NET. ARM gets the plain SIMD-vectorized
             // CopyTo (BCL uses NEON internally where available); skipping
             // the manual prefetch is fine because ARM cores are
             // aggressive about hardware prefetch on streaming patterns.
-            if (byteCount >= 1024 && Sse.IsSupported)
+            if (byteCount >= 1024 && Sse.IsSupported && !SpansOverlap(src, dst))
             {
                 CopyWithPrefetchUnsafe(src, dst);
                 return;
             }
 #endif
             // Fallback: built-in copy is already SIMD-vectorized for
-            // unmanaged T on .NET 6+ and uses block copy on older targets.
+            // unmanaged T on .NET 6+ and overlap-safe via Buffer.Memmove
+            // (it picks forward or backward direction as needed).
             src.CopyTo(dst);
         }
+
+#if NETCOREAPP3_0_OR_GREATER || NET5_0_OR_GREATER
+        /// <summary>
+        /// True when the two spans share any byte of memory, i.e. a
+        /// forward-only line-by-line copy would clobber data still
+        /// needed for read. False for the common case of disjoint
+        /// arrays. Computes the byte-range intersection via
+        /// <see cref="MemoryMarshal.GetReference"/> + length without
+        /// allocating.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe bool SpansOverlap<T>(ReadOnlySpan<T> a, Span<T> b)
+            where T : unmanaged
+        {
+            ref T ra = ref MemoryMarshal.GetReference(a);
+            ref T rb = ref MemoryMarshal.GetReference(b);
+            // Convert refs to byte offsets in the GC heap. ByteOffset is
+            // safe across managed objects (works as long as the GC
+            // doesn't move the references mid-call — the spans pin the
+            // memory region for the call duration via the ref).
+            long delta = Unsafe.ByteOffset(ref ra, ref rb).ToInt64();
+            long aBytes = (long)a.Length * Unsafe.SizeOf<T>();
+            long bBytes = (long)b.Length * Unsafe.SizeOf<T>();
+            // a starts at 0; b starts at delta. Overlap iff
+            // [0, aBytes) ∩ [delta, delta + bBytes) ≠ ∅.
+            // i.e. delta < aBytes && delta + bBytes > 0.
+            return delta < aBytes && delta + bBytes > 0;
+        }
+#endif
 
 #if NETCOREAPP3_0_OR_GREATER || NET5_0_OR_GREATER
         /// <summary>
@@ -289,5 +336,71 @@ namespace AiDotNet.Tensors.Engines.Optimization
             if (totalLines <= cacheLinesAvailable) return totalLines * 0.05;    // fits in cache
             return totalLines * 0.8;                                            // strided + thrashing
         }
+
+        // ── [Obsolete] float[]-based compatibility shims ───────────────
+        //
+        // The previous public surface took plain float[] and an explicit
+        // length / elementSize parameter. Issue #294 generalized to
+        // ReadOnlySpan<T> / Span<T> / Unsafe.SizeOf<T> so the same APIs
+        // serve double / Half / int callers. The old signatures are
+        // kept here as [Obsolete]-marked forwarding shims to avoid a
+        // hard source-break for package consumers.
+
+        /// <summary>[Obsolete] Use the generic
+        /// <see cref="TransposeBlocked{T}(ReadOnlySpan{T}, Span{T}, int, int)"/>
+        /// overload. Forwards to the generic path with T = float.</summary>
+        [Obsolete("Use TransposeBlocked<T>(ReadOnlySpan<T>, Span<T>, int, int) where T : unmanaged. Replaced in issue #294 to support double/Half/int callers.")]
+        public static void TransposeBlocked(float[] src, float[] dst, int rows, int cols)
+        {
+            if (src is null) throw new ArgumentNullException(nameof(src));
+            if (dst is null) throw new ArgumentNullException(nameof(dst));
+            TransposeBlocked<float>(src.AsSpan(), dst.AsSpan(), rows, cols);
+        }
+
+        /// <summary>[Obsolete] Use the generic
+        /// <see cref="CopyWithPrefetch{T}(ReadOnlySpan{T}, Span{T})"/>
+        /// overload. Forwards to the generic path with T = float;
+        /// the old <paramref name="length"/> parameter is honoured by
+        /// slicing.</summary>
+        [Obsolete("Use CopyWithPrefetch<T>(ReadOnlySpan<T>, Span<T>) where T : unmanaged. Replaced in issue #294; the explicit length parameter is now carried by span lengths.")]
+        public static void CopyWithPrefetch(float[] src, float[] dst, int length)
+        {
+            if (src is null) throw new ArgumentNullException(nameof(src));
+            if (dst is null) throw new ArgumentNullException(nameof(dst));
+            if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+            if (src.Length < length) throw new ArgumentException("src too short for requested length.", nameof(src));
+            if (dst.Length < length) throw new ArgumentException("dst too short for requested length.", nameof(dst));
+            CopyWithPrefetch<float>(src.AsSpan(0, length), dst.AsSpan(0, length));
+        }
+
+        /// <summary>[Obsolete] Use the generic
+        /// <see cref="ComputeOptimalTiling{T}(int, int, int)"/>
+        /// overload. The old <paramref name="elementSize"/> parameter
+        /// is now derived via <see cref="Unsafe.SizeOf{T}"/>; this
+        /// shim assumes T = float (4 bytes) when the caller passes
+        /// the historical default.</summary>
+        [Obsolete("Use ComputeOptimalTiling<T>(int, int, int) where T : unmanaged. The element-size argument is now carried by T's size; this shim defaults to float.")]
+        public static (int tileM, int tileN, int tileK) ComputeOptimalTiling(int m, int n, int k, int elementSize = 4)
+        {
+            // Old behaviour: pick a tile such that 3 blocks fit in L1.
+            // We replicate the historical formula here rather than
+            // routing through ComputeOptimalTiling<float> to preserve
+            // exact byte-for-byte compatibility with callers that
+            // passed elementSize ≠ 4.
+            var caps = PlatformDetector.Capabilities;
+            int l1 = caps?.L1CacheSize ?? 32 * 1024;
+            int maxTileSize = (int)Math.Sqrt(l1 / (3.0 * Math.Max(1, elementSize)));
+            int tile = 1;
+            while (tile * 2 <= maxTileSize) tile *= 2;
+            tile = Math.Max(tile, 16);
+            return (Math.Min(tile, m), Math.Min(tile, n), Math.Min(tile, k));
+        }
+
+        /// <summary>[Obsolete] Use the generic
+        /// <see cref="EstimateCacheMisses{T}(int, int, int, int)"/>
+        /// overload. The element size is now derived from T.</summary>
+        [Obsolete("Use EstimateCacheMisses<T>(int, int, int, int) where T : unmanaged. Replaced in issue #294 so the elements-per-line math uses the actual element size, not a hardcoded sizeof(float).")]
+        public static double EstimateCacheMisses(int dataSize, int accessStride, int cacheSize, int cacheLineSize)
+            => EstimateCacheMisses<float>(dataSize, accessStride, cacheSize, cacheLineSize);
     }
 }

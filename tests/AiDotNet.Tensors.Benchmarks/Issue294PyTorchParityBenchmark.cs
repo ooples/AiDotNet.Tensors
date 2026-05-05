@@ -64,6 +64,32 @@ internal static class Issue294PyTorchParityBenchmark
         }
         Console.WriteLine();
 
+        // ── Conv2D: small + big ──────────────────────────────────────
+        // Small: ResNet-style residual block conv (single image,
+        // 64 channels, 56×56, 3×3 kernel). Big: ImageNet-style stem
+        // conv (single image, 3 → 64 channels, 224×224, 7×7 stride 2).
+        // Both common shapes in the issue's "Conv2D (small + big)"
+        // line item.
+        Console.WriteLine("--- Conv2D (single image) ---");
+        Console.WriteLine($"{"Shape",-30} {"AiDotNet (ms)",-15} {"PyTorch (ms)",-15} {"Speedup",-10}");
+        var convShapes = new[]
+        {
+            (n: 1, c: 64, h: 56, w: 56, oc: 64, kh: 3, kw: 3, stride: 1, pad: 1, label: "1x64x56x56 / 64x64x3x3 s1p1"),
+            (n: 1, c: 3, h: 224, w: 224, oc: 64, kh: 7, kw: 7, stride: 2, pad: 3, label: "1x3x224x224 / 64x3x7x7 s2p3"),
+        };
+        foreach (var s in convShapes)
+        {
+            double aiMs = TimeConv2D(engine, s.n, s.c, s.h, s.w, s.oc, s.kh, s.kw, s.stride, s.pad,
+                warmup: 3, iters: 10);
+            string args = $"{s.n}x{s.c}x{s.h}x{s.w};{s.oc}x{s.c}x{s.kh}x{s.kw};{s.stride};{s.pad}";
+            var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
+                "conv2d", args, warmup: 3, iters: 10);
+            string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
+            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            Console.WriteLine($"{s.label,-30} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
+        }
+        Console.WriteLine();
+
         // ── FlashAttention: 3 seq lengths ────────────────────────────
         Console.WriteLine("--- FlashAttention<float> (rank-4 [B=2, H=4, Sq, D=32]) ---");
         Console.WriteLine($"{"Sq",-8} {"AiDotNet (ms)",-15} {"PyTorch (ms)",-15} {"Speedup",-10}");
@@ -120,6 +146,24 @@ internal static class Issue294PyTorchParityBenchmark
         for (int i = 0; i < warmup; i++) engine.TensorMatMul(a, b);
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++) engine.TensorMatMul(a, b);
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / iters;
+    }
+
+    private static double TimeConv2D(CpuEngine engine,
+        int n, int c, int h, int w, int oc, int kh, int kw, int stride, int pad,
+        int warmup, int iters)
+    {
+        var rng = new Random(5);
+        var xData = new float[n * c * h * w];
+        var kData = new float[oc * c * kh * kw];
+        for (int i = 0; i < xData.Length; i++) xData[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < kData.Length; i++) kData[i] = (float)(rng.NextDouble() * 2 - 1);
+        var x = new Tensor<float>(xData, new[] { n, c, h, w });
+        var kT = new Tensor<float>(kData, new[] { oc, c, kh, kw });
+        for (int i = 0; i < warmup; i++) engine.Conv2D(x, kT, stride: stride, padding: pad);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++) engine.Conv2D(x, kT, stride: stride, padding: pad);
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds / iters;
     }

@@ -84,8 +84,13 @@ public static class FlashAttention<T> where T : unmanaged
         // single-precision but wrong for AMD Zen / ARM / double-
         // precision workloads. CacheOptimizer.ComputeOptimalTiling<T>
         // is the single source of truth across the codebase.
-        if (blockSizeQ == 0) blockSizeQ = ResolveDefaultBlockSize(headDim);
-        if (blockSizeKV == 0) blockSizeKV = ResolveDefaultBlockSize(headDim);
+        // blockSizeQ caps the Q-tile along Sq; blockSizeKV caps the
+        // KV-tile along Sk. Pass the relevant SEQUENCE dim (not
+        // headDim) so a small-head long-sequence shape (e.g. D=16,
+        // Sq=512) gets a 64-tile, not a 16-tile that would multiply
+        // block-loop overhead 4× over the historical default.
+        if (blockSizeQ == 0) blockSizeQ = ResolveDefaultBlockSize(Sq);
+        if (blockSizeKV == 0) blockSizeKV = ResolveDefaultBlockSize(Sk);
         if (blockSizeQ < 0) throw new ArgumentOutOfRangeException(nameof(blockSizeQ));
         if (blockSizeKV < 0) throw new ArgumentOutOfRangeException(nameof(blockSizeKV));
 
@@ -167,8 +172,9 @@ public static class FlashAttention<T> where T : unmanaged
             out int batchProduct, out int Sq, out int Sk, out int headDim, out int Dv,
             out int[] prefixShape, out int[] biasPrefixShape, out int[] biasPrefixStrides);
 
-        if (blockSizeQ == 0) blockSizeQ = ResolveDefaultBlockSize(headDim);
-        if (blockSizeKV == 0) blockSizeKV = ResolveDefaultBlockSize(headDim);
+        // Cap by sequence dim, not headDim — see Forward.
+        if (blockSizeQ == 0) blockSizeQ = ResolveDefaultBlockSize(Sq);
+        if (blockSizeKV == 0) blockSizeKV = ResolveDefaultBlockSize(Sk);
         if (blockSizeQ < 0) throw new ArgumentOutOfRangeException(nameof(blockSizeQ));
         if (blockSizeKV < 0) throw new ArgumentOutOfRangeException(nameof(blockSizeKV));
 
@@ -225,31 +231,33 @@ public static class FlashAttention<T> where T : unmanaged
     }
 
     /// <summary>
-    /// L1-aware default block size for FlashAttention's Q/KV tiles.
-    /// Delegates to <see cref="AiDotNet.Tensors.Engines.Optimization.CacheOptimizer.ComputeOptimalTiling{T}"/>
+    /// L1-aware default block size for FlashAttention's Q/KV tiles
+    /// along the SEQUENCE axis. <paramref name="seqDim"/> is the
+    /// sequence dim being tiled (Sq for Q-tiles, Sk for KV-tiles);
+    /// the returned tile is bounded by it so we never dispatch a
+    /// tile larger than the matrix dimension itself.
+    ///
+    /// <para>Delegates to <see cref="AiDotNet.Tensors.Engines.Optimization.CacheOptimizer.ComputeOptimalTiling{T}"/>
     /// for the float / double primitives — matching the rest of the
     /// codebase's tile-sizing convention. For other T (BFloat16 /
-    /// Half) we fall back to 64, which is the historical default and
-    /// matches FlashAttention2's hardcoded value.
+    /// Half) falls back to 64, which is the historical default and
+    /// matches FlashAttention2's hardcoded value.</para>
     /// </summary>
-    private static int ResolveDefaultBlockSize(int headDim)
+    private static int ResolveDefaultBlockSize(int seqDim)
     {
-        // Cap by headDim so the tile is never larger than the matrix
-        // dim (would dispatch a tile of shape [hd, hd] when only one
-        // tile-of-headDim fits).
         if (typeof(T) == typeof(float))
         {
             var (m, _, _) = AiDotNet.Tensors.Engines.Optimization.CacheOptimizer
-                .ComputeOptimalTiling<float>(headDim, headDim, headDim);
+                .ComputeOptimalTiling<float>(seqDim, seqDim, seqDim);
             return Math.Max(16, Math.Min(m, 128));
         }
         if (typeof(T) == typeof(double))
         {
             var (m, _, _) = AiDotNet.Tensors.Engines.Optimization.CacheOptimizer
-                .ComputeOptimalTiling<double>(headDim, headDim, headDim);
+                .ComputeOptimalTiling<double>(seqDim, seqDim, seqDim);
             return Math.Max(16, Math.Min(m, 128));
         }
-        return 64;
+        return Math.Max(16, Math.Min(64, seqDim));
     }
 
     /// <summary>
