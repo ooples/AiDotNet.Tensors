@@ -200,6 +200,98 @@ public static class WeightRegistry
         }
     }
 
+    /// <summary>
+    /// Allocates a tensor whose storage is going to be paged through the
+    /// streaming pool, reserving headroom for it in advance. Caller
+    /// initializes weights into the returned (materialized) tensor and
+    /// then calls <see cref="RegisterWeight{T}"/> as usual; the
+    /// difference vs. plain <c>new Tensor&lt;T&gt;(shape)</c> is that the
+    /// pool evicts LRU resident entries to disk BEFORE this method
+    /// allocates, so for a long sequence of large allocations the pool
+    /// budget bounds peak GC-heap occupancy. Without this, allocating
+    /// 64 MHA layers' worth of weights at 2.1 GB each on the lazy
+    /// materialization path peaks at 134 GB resident before any register
+    /// runs — exactly the OOM mode #1222 / PaLM-E 562B exhibits.
+    /// </summary>
+    /// <typeparam name="T">Numeric element type for the tensor.</typeparam>
+    /// <param name="shape">Per-axis dimensions for the new tensor. Same
+    /// contract as <see cref="Tensor{T}(int[])"/>.</param>
+    /// <returns>A materialized tensor with zero-initialized storage and
+    /// <see cref="WeightLifetime.Streaming"/> already set on the
+    /// instance. Caller is expected to:
+    ///   1. Initialize weights (Xavier / He / etc.).
+    ///   2. Call <see cref="RegisterWeight{T}"/> to commit it to the
+    ///      pool — that's when storage is dropped + the
+    ///      <see cref="Tensor{T}.StreamingPoolHandle"/> is assigned.
+    /// </returns>
+    /// <remarks>
+    /// <para>No-op fallback when streaming isn't configured (i.e.
+    /// <see cref="Configure"/> hasn't run yet): falls back to a plain
+    /// <c>new Tensor&lt;T&gt;(shape)</c> with <see cref="WeightLifetime.Default"/>
+    /// — the caller's initialization + register flow becomes a regular
+    /// non-streaming registration, identical to pre-streaming behaviour.</para>
+    /// <para>The eviction step is best-effort: the pool's
+    /// <see cref="StreamingTensorPool.EvictUntilFreeBytes"/> walks the
+    /// LRU until either the requested headroom is available OR the LRU
+    /// is empty (i.e. nothing more to evict). In the latter case the
+    /// allocation still proceeds — the goal is to reduce the peak,
+    /// not eliminate the possibility of OOM. Pool-budget tuning is the
+    /// caller's responsibility.</para>
+    /// </remarks>
+    public static Tensor<T> AllocateRegistered<T>(int[] shape)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        // Compute byte count up-front so we can evict the right amount
+        // BEFORE the GC heap takes the hit. CheckedStreamingByteCount
+        // surfaces oversize-tensor errors as a clear NotSupportedException
+        // with a chunking hint instead of OOM.
+        long elements = 1L;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            int dim = shape[i];
+            if (dim < 0)
+                throw new ArgumentException($"shape[{i}] must be non-negative; got {dim}", nameof(shape));
+            elements = checked(elements * dim);
+        }
+
+        lock (_lock)
+        {
+            // Streaming not configured — fall through to plain new Tensor.
+            // Lifetime stays Default so RegisterWeight (if the caller
+            // calls it later) is a no-op, exactly like the pre-streaming
+            // path.
+            if (_options is null) return new Tensor<T>(shape);
+
+            // Best-effort eviction. CheckedStreamingByteCount takes int
+            // length and surfaces oversize as NotSupportedException; cast
+            // long→int is safe iff elements <= int.MaxValue. Larger
+            // tensors can't be streamed at all (byte[] is itself bounded
+            // to ~2.15 GB), so reject upfront with the same chunking-
+            // hint error the post-allocate path would have surfaced.
+            if (elements > 0)
+            {
+                if (elements > int.MaxValue)
+                    throw new NotSupportedException(
+                        $"AllocateRegistered: per-tensor element count {elements} exceeds the " +
+                        $"int.MaxValue ({int.MaxValue}) bound that the streaming pool's byte[] " +
+                        "buffer can represent. Chunk the tensor into smaller pool entries on " +
+                        "the consumer side.");
+                int byteCount = CheckedStreamingByteCount<T>((int)elements);
+                var pool = StreamingPoolUnlocked();
+                pool.EvictUntilFreeBytes(byteCount);
+            }
+
+            // Allocate AFTER eviction has paged out competitors.
+            // The tensor's storage hits the GC heap here — there's no
+            // way to skip that without a full storage-from-pool
+            // refactor — but at least competing weights have been
+            // paged to disk so we're not on top of the previous
+            // 64 layers' weights.
+            var tensor = new Tensor<T>(shape) { Lifetime = WeightLifetime.Streaming };
+            return tensor;
+        }
+    }
+
     /// <summary>Unregisters and frees backing storage.</summary>
     public static void UnregisterWeight<T>(Tensor<T> weight)
     {

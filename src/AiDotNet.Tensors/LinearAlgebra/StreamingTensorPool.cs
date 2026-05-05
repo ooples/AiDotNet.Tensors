@@ -347,115 +347,185 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pages LRU entries to disk until either the requested
+    /// <paramref name="byteCount"/> bytes of headroom are available
+    /// under <see cref="_maxResidentBytes"/> OR the LRU is empty.
+    /// Best-effort: returns whether the requested headroom was secured.
+    /// Used by <see cref="WeightRegistry.AllocateRegistered{T}"/> so a
+    /// long sequence of large weight allocations bounds peak GC-heap
+    /// occupancy by the pool budget.
+    /// </summary>
+    /// <param name="byteCount">Bytes of headroom to make available.</param>
+    /// <returns>True if the pool now has at least
+    /// <paramref name="byteCount"/> bytes of free budget; false if it
+    /// emptied its LRU and still doesn't (caller's allocation may push
+    /// the pool past budget; <see cref="EvictIfOverBudget"/> on the
+    /// next register will recover).</returns>
+    /// <remarks>
+    /// <para>byteCount &lt;= 0 is a no-op. Invariant on entry/exit:
+    /// caller holds <see cref="_lock"/>.</para>
+    /// </remarks>
+    public bool EvictUntilFreeBytes(long byteCount)
+    {
+        if (byteCount <= 0) return true;
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            // "Free bytes available" = budget - currently-resident.
+            // We loop until either we have at least byteCount free, OR
+            // the LRU is empty (best-effort: if the caller asked for
+            // more than the entire budget can hold, we drain the LRU
+            // and return false to signal the request can't be fully
+            // satisfied; caller's allocation will then push the pool
+            // past budget, and the next register's EvictIfOverBudget
+            // can't recover that scenario either — callers are
+            // expected to not request more than the budget itself).
+            while (_maxResidentBytes - _residentBytes < byteCount && _lruOrder.Count > 0)
+            {
+                if (!EvictOneLruEntry(protectedHandleId: null)) break;
+            }
+            return _maxResidentBytes - _residentBytes >= byteCount;
+        }
+    }
+
+    /// <summary>
+    /// Evicts a single LRU entry to disk. Returns true if an entry was
+    /// evicted, false if the LRU is empty (or only contains the
+    /// protected handle). Extracted so <see cref="EvictIfOverBudget"/>
+    /// and <see cref="EvictUntilFreeBytes"/> share the same eviction
+    /// machinery without duplicating the LZ4-encode + stream-write
+    /// path.
+    /// </summary>
+    /// <remarks>Caller already holds <see cref="_lock"/>.</remarks>
+    private bool EvictOneLruEntry(long? protectedHandleId)
+    {
+        // Caller already holds _lock.
+        if (_lruOrder.Count == 0) return false;
+        var oldest = _lruOrder.Last;
+        while (oldest is not null && protectedHandleId.HasValue && oldest.Value == protectedHandleId.Value)
+            oldest = oldest.Previous;
+        if (oldest is null) return false;
+        return EvictNodeInternal(oldest);
+    }
+
     private void EvictIfOverBudget(long? protectedHandleId = null)
     {
         // Caller already holds _lock.
         while (_residentBytes > _maxResidentBytes && _lruOrder.Count > 0)
         {
-            // Tail of LRU is least-recently-used. Walk forward (toward more
-            // recent) past the protected entry so a single tensor exceeding
-            // the budget doesn't page itself back out during rehydrate.
-            var oldest = _lruOrder.Last;
-            while (oldest is not null && protectedHandleId.HasValue && oldest.Value == protectedHandleId.Value)
-                oldest = oldest.Previous;
-            if (oldest is null) break; // only the protected entry remains
-            long id = oldest.Value;
+            if (!EvictOneLruEntry(protectedHandleId)) break;
+        }
+    }
 
-            if (!_entries.TryGetValue(id, out var entry) || entry.Data is null)
-            {
-                // Stale LRU node (entry already evicted/unregistered) — drop.
-                _lruOrder.Remove(oldest);
-                _lruIndex.Remove(id);
-                continue;
-            }
+    /// <summary>
+    /// Pages a single LRU entry to disk. Extracted from
+    /// <see cref="EvictIfOverBudget"/> so
+    /// <see cref="EvictUntilFreeBytes"/> can drive the same eviction
+    /// machinery via a different stop condition (free bytes vs. budget).
+    /// Returns true if an entry was evicted; false if the LRU is empty
+    /// or contains only the protected handle.
+    /// </summary>
+    /// <remarks>Caller already holds <see cref="_lock"/>.</remarks>
+    private bool EvictNodeInternal(LinkedListNode<long> oldest)
+    {
+        long id = oldest.Value;
 
-            // Page out: write to backing store, drop resident reference,
-            // remove from LRU index (Rehydrate re-adds it). When
-            // EnableCompression is true, LZ4-compress before writing —
-            // ~30-40% disk-footprint reduction on near-Gaussian fp32
-            // weights. UncompressedBytes is the rehydration target size;
-            // PagedOutBytes is what's actually on disk.
-            //
-            // Memory-peak optimisation: stream-write the encoded bytes
-            // directly from the rented LZ4 buffer (no intermediate
-            // `new byte[encoded]` copy) and null out entry.Data
-            // immediately after the write. The previous code kept
-            // entry.Data + encodeBuf + toWrite all live across the
-            // disk write — for a 268 MB tensor that peaked at ~716 MB
-            // resident during eviction, reintroducing OOMs on the
-            // memory-bound models this feature is meant to help. After
-            // this change peak is entry.Data + encodeBuf ≈ ~536 MB,
-            // and entry.Data is freed BEFORE the write returns.
-            string path = BackingPathFor(id);
-            int uncompressed = entry.Data.Length;
-            int paged;
-            bool compressed = false;
-            if (_enableCompression)
-            {
-                // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
-                // Rent from ArrayPool to keep the encode buffer pooled
-                // across evictions instead of allocating a fresh worst-
-                // case buffer each time.
-                int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
-                byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
-                try
-                {
-                    int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
-                    if (encoded > 0 && encoded < uncompressed)
-                    {
-                        // Stream-write only the encoded slice. FileStream
-                        // .Write copies (uncompressed + overhead) bytes
-                        // straight to disk — no intermediate byte[encoded]
-                        // copy. This is the dominant peak-memory win:
-                        // before this, we'd have allocated a third
-                        // copy-out buffer here.
-                        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
-                        {
-                            fs.Write(encodeBuf, 0, encoded);
-                        }
-                        paged = encoded;
-                        compressed = true;
-                    }
-                    else
-                    {
-                        // Compression didn't shrink the payload (entropy too
-                        // high or below LZ4's break-even) — write entry.Data
-                        // raw and flag IsCompressed=false so Rehydrate
-                        // doesn't try to decode. Same File.WriteAllBytes
-                        // path as the no-compression branch below.
-                        File.WriteAllBytes(path, entry.Data);
-                        paged = uncompressed;
-                        compressed = false;
-                    }
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(encodeBuf);
-                }
-            }
-            else
-            {
-                File.WriteAllBytes(path, entry.Data);
-                paged = uncompressed;
-            }
-            // Free entry.Data IMMEDIATELY now that the bytes are durably
-            // on disk. Any further work (counter updates, LRU bookkeeping)
-            // doesn't need the resident copy. Holding it alive across
-            // the rest of this method (or worse, until the next eviction)
-            // would defeat the whole eviction.
-            entry.Data = null;
-            entry.PagedOutBytes = paged;
-            entry.UncompressedBytes = uncompressed;
-            entry.IsCompressed = compressed;
-            _diskWriteBytes += paged;
-            _evictionCount++;
-            _compressedBytesTotal += paged;
-            _uncompressedBytesTotal += uncompressed;
-            Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
-            entry.ResidentBytes = 0;
+        if (!_entries.TryGetValue(id, out var entry) || entry.Data is null)
+        {
+            // Stale LRU node (entry already evicted/unregistered) — drop.
             _lruOrder.Remove(oldest);
             _lruIndex.Remove(id);
+            return true; // we did make progress — try the next iteration
         }
+
+        // Page out: write to backing store, drop resident reference,
+        // remove from LRU index (Rehydrate re-adds it). When
+        // EnableCompression is true, LZ4-compress before writing —
+        // ~30-40% disk-footprint reduction on near-Gaussian fp32
+        // weights. UncompressedBytes is the rehydration target size;
+        // PagedOutBytes is what's actually on disk.
+        //
+        // Memory-peak optimisation: stream-write the encoded bytes
+        // directly from the rented LZ4 buffer (no intermediate
+        // `new byte[encoded]` copy) and null out entry.Data
+        // immediately after the write. The previous code kept
+        // entry.Data + encodeBuf + toWrite all live across the
+        // disk write — for a 268 MB tensor that peaked at ~716 MB
+        // resident during eviction, reintroducing OOMs on the
+        // memory-bound models this feature is meant to help. After
+        // this change peak is entry.Data + encodeBuf ≈ ~536 MB,
+        // and entry.Data is freed BEFORE the write returns.
+        string path = BackingPathFor(id);
+        int uncompressed = entry.Data.Length;
+        int paged;
+        bool compressed = false;
+        if (_enableCompression)
+        {
+            // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
+            // Rent from ArrayPool to keep the encode buffer pooled
+            // across evictions instead of allocating a fresh worst-
+            // case buffer each time.
+            int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
+            byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
+            try
+            {
+                int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
+                if (encoded > 0 && encoded < uncompressed)
+                {
+                    // Stream-write only the encoded slice. FileStream
+                    // .Write copies (uncompressed + overhead) bytes
+                    // straight to disk — no intermediate byte[encoded]
+                    // copy. This is the dominant peak-memory win:
+                    // before this, we'd have allocated a third
+                    // copy-out buffer here.
+                    using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        fs.Write(encodeBuf, 0, encoded);
+                    }
+                    paged = encoded;
+                    compressed = true;
+                }
+                else
+                {
+                    // Compression didn't shrink the payload (entropy too
+                    // high or below LZ4's break-even) — write entry.Data
+                    // raw and flag IsCompressed=false so Rehydrate
+                    // doesn't try to decode. Same File.WriteAllBytes
+                    // path as the no-compression branch below.
+                    File.WriteAllBytes(path, entry.Data);
+                    paged = uncompressed;
+                    compressed = false;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(encodeBuf);
+            }
+        }
+        else
+        {
+            File.WriteAllBytes(path, entry.Data);
+            paged = uncompressed;
+        }
+        // Free entry.Data IMMEDIATELY now that the bytes are durably
+        // on disk. Any further work (counter updates, LRU bookkeeping)
+        // doesn't need the resident copy. Holding it alive across
+        // the rest of this method (or worse, until the next eviction)
+        // would defeat the whole eviction.
+        entry.Data = null;
+        entry.PagedOutBytes = paged;
+        entry.UncompressedBytes = uncompressed;
+        entry.IsCompressed = compressed;
+        _diskWriteBytes += paged;
+        _evictionCount++;
+        _compressedBytesTotal += paged;
+        _uncompressedBytesTotal += uncompressed;
+        Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
+        entry.ResidentBytes = 0;
+        _lruOrder.Remove(oldest);
+        _lruIndex.Remove(id);
+        return true;
     }
 
     // Backing files are flat raw bytes (or LZ4-compressed bytes when

@@ -1133,4 +1133,170 @@ public class WeightRegistryStreamingTests : IDisposable
         }
         finally { pool.Dispose(); }
     }
+
+    // -------- AllocateRegistered<T> + EvictUntilFreeBytes (#1222 follow-on) --------
+
+    [Fact]
+    public void AllocateRegistered_AfterReset_StillReturnsStreamingLifetime()
+    {
+        // Reset() leaves _options at a default GpuOffloadOptions (not
+        // null), so AllocateRegistered's contract is preserved across
+        // Reset: it always returns a Streaming-lifetime tensor with
+        // materialized storage. The "fall back to Default Tensor" path
+        // exists only for the brief window before any Configure call
+        // at process startup — not normally testable from here.
+        WeightRegistry.Reset();
+
+        var t = WeightRegistry.AllocateRegistered<float>(new[] { 16, 16 });
+
+        Assert.Equal(WeightLifetime.Streaming, t.Lifetime);
+        Assert.Equal(16 * 16, t.Length);
+        Assert.True(t.DataVector.Length > 0,
+            "AllocateRegistered should leave storage materialized for caller "
+            + "to initialize before RegisterWeight.");
+    }
+
+    [Fact]
+    public void AllocateRegistered_WithStreamingConfigured_ReturnsStreamingLifetimeTensor()
+    {
+        var t = WeightRegistry.AllocateRegistered<float>(new[] { 8, 8 });
+
+        // Streaming-configured path: lifetime is set, storage is
+        // materialized (caller has yet to RegisterWeight). The contract
+        // is "ready for caller to initialize then register".
+        Assert.Equal(WeightLifetime.Streaming, t.Lifetime);
+        Assert.Equal(64, t.Length);
+        Assert.True(t.DataVector.Length > 0,
+            "AllocateRegistered should return a materialized tensor so callers "
+            + "can initialize weights into it before calling RegisterWeight.");
+    }
+
+    [Fact]
+    public void AllocateRegistered_LongSequence_BoundsPeakResidency()
+    {
+        // The whole point of AllocateRegistered: a long sequence of
+        // large allocations + registers should stay bounded by the pool
+        // budget instead of peaking at the cumulative weight size.
+        // Simulate PaLM-E's MHA-layer pattern: 4 weights per "layer",
+        // 16 "layers", each weight 64 KB. Cumulative = 64 KB × 4 × 16 =
+        // 4 MB. Pool budget set to 256 KB by the fixture override below.
+        // Without eviction-on-allocate, peak resident would be 4 MB
+        // (everything alive); with it, resident should plateau near
+        // the 256 KB budget.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 256L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        long peakResidentBytes = 0;
+        for (int layer = 0; layer < 16; layer++)
+        {
+            for (int matrix = 0; matrix < 4; matrix++)
+            {
+                // 64 KB per matrix at fp32 = 16384 elements = 128×128.
+                var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 128 });
+                // Initialize (write into materialized storage). DataVector
+                // is the underlying Vector; AsWritableSpan exposes the
+                // writable mutable view that AsSpan (read-only) does not.
+                var span = t.DataVector.AsWritableSpan();
+                for (int i = 0; i < span.Length; i++) span[i] = (float)((layer * 4 + matrix + i) % 7);
+                // Register: serializes + drops + commits to pool.
+                WeightRegistry.RegisterWeight(t);
+
+                long resident = WeightRegistry.GetStreamingReport().ResidentBytes;
+                if (resident > peakResidentBytes) peakResidentBytes = resident;
+            }
+        }
+
+        // Pool resident should be bounded by budget (256 KB) plus a
+        // small slop for the most recent allocation that triggered
+        // eviction. Peak shouldn't approach the cumulative 4 MB total.
+        Assert.True(peakResidentBytes <= 384L * 1024,
+            $"AllocateRegistered + RegisterWeight should bound peak resident "
+            + $"to ~budget (256 KB), but peak was {peakResidentBytes} bytes "
+            + $"({peakResidentBytes / 1024.0:F1} KB). If this exceeds 384 KB "
+            + "(budget + ~50% slop for the last register), eviction-on-allocate "
+            + "isn't running, or EvictUntilFreeBytes isn't getting the "
+            + "caller-requested headroom.");
+    }
+
+    [Fact]
+    public void AllocateRegistered_OversizeShape_ThrowsClearError()
+    {
+        // Per-tensor bytecount is bounded by int.MaxValue (the byte[]
+        // limit). Asking for 2.5 GB of fp32 (~625M elements) should
+        // throw NotSupportedException with a chunking hint, not OOM
+        // somewhere deep in the pool.
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            WeightRegistry.AllocateRegistered<float>(new[] { 1_000_000_000 }));
+        Assert.Contains("Chunk", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AllocateRegistered_NegativeShape_Throws()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            WeightRegistry.AllocateRegistered<float>(new[] { -1, 16 }));
+    }
+
+    [Fact]
+    public void EvictUntilFreeBytes_DirectCall_PagesLruEntries()
+    {
+        // Direct StreamingTensorPool test — no AllocateRegistered
+        // wrapper. Register some entries, then ask for headroom equal
+        // to half the budget and verify resident drops accordingly.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 4096L,
+            StreamingBackingStorePath = _backingDir,
+        });
+        try
+        {
+            // 4 × 1 KB entries = 4 KB resident, exactly at budget.
+            for (int i = 0; i < 4; i++)
+            {
+                var bytes = new byte[1024];
+                pool.Register(bytes);
+            }
+            Assert.Equal(4096L, pool.ResidentBytes);
+
+            // Ask for 2 KB of headroom. Pool should evict 2 LRU entries.
+            bool secured = pool.EvictUntilFreeBytes(2048L);
+            Assert.True(secured,
+                "EvictUntilFreeBytes should secure 2 KB headroom from a "
+                + "4 KB pool with 4 evictable entries.");
+            Assert.True(pool.ResidentBytes <= 2048L,
+                $"After EvictUntilFreeBytes(2048), resident should be <= 2048; got {pool.ResidentBytes}.");
+        }
+        finally { pool.Dispose(); }
+    }
+
+    [Fact]
+    public void EvictUntilFreeBytes_RequestExceedsBudget_BestEffortReturnsFalse()
+    {
+        // Asking for more headroom than the budget itself should
+        // empty the LRU and return false — caller's allocation will
+        // push the pool past budget, but EvictIfOverBudget on the
+        // next register catches up.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 4096L,
+            StreamingBackingStorePath = _backingDir,
+        });
+        try
+        {
+            for (int i = 0; i < 4; i++) pool.Register(new byte[1024]);
+
+            // Ask for 8 KB headroom — exceeds the 4 KB budget. Even
+            // after evicting all 4 entries, can't satisfy → false.
+            bool secured = pool.EvictUntilFreeBytes(8192L);
+            Assert.False(secured,
+                "EvictUntilFreeBytes(8192) > budget(4096) should empty the "
+                + "LRU and return false (best-effort signal).");
+            Assert.Equal(0L, pool.ResidentBytes);
+        }
+        finally { pool.Dispose(); }
+    }
 }
