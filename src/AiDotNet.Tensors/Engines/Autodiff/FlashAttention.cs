@@ -390,16 +390,25 @@ public static class FlashAttention<T> where T : unmanaged
         return offset;
     }
 
-    // ── Float kernel (paper-faithful Dao 2023, AVX2/FMA SIMD) ───────────
+    // ── Float kernel (paper-faithful Dao 2023, GEMM-dispatch + AVX2/FMA SIMD) ──
     //
-    // Inner kernel uses Vector256<float> primitives from
-    // FlashAttentionFloatSimd: dot product (FMA), online-softmax row
-    // max + exp (FastExp256), V accumulate (FMA), final normalize.
-    // Loop shape and online-softmax invariants are unchanged from the
-    // scalar reference — only the per-element arithmetic is vectorized.
-    // The pre-existing FusedAttention.FlashAttentionForwardPtr proved
-    // out the same SIMD pattern; we add LogSumExp + bias + queryOffset
-    // here.
+    // Score tile and PV update are dispatched through SimdGemm —
+    // AiDotNet's BLIS-style FMA register-tiled SGEMM (Avx512Sgemm
+    // when available, AVX2 otherwise). Per-row online-softmax + alpha
+    // rescale stays on FlashAttentionFloatSimd's Vector256<float>
+    // primitives (FastExp256, HorizontalMax, broadcast multiply).
+    //
+    // Why GEMM-dispatch beats per-row dot products:
+    //   - Score: qLen × kLen separate 32-element dot products = 4096
+    //     per-call dispatches with limited cache reuse on K. SgemmAdd
+    //     batches the same work as one register-tiled call with K
+    //     reused across all qLen output rows.
+    //   - PV:    qLen × Dv updates accumulating across kLen V rows.
+    //     Same locality argument; SgemmAdd uses MKL-class blocking.
+    //
+    // The remaining SIMD primitives handle the per-row work that
+    // GEMM can't subsume: bias add, causal mask, online softmax max
+    // + FastExp + alpha rescale.
 
     private static unsafe void ForwardFloat(
         float[] q, float[] k, float[] v, float[]? bias,
@@ -412,8 +421,12 @@ public static class FlashAttention<T> where T : unmanaged
         int Bc = Math.Min(blockSizeKV, Sk);
         var mRow = new float[Br];
         var lRow = new float[Br];
+        // oBlock and sBlockPacked are sized Br × Dv and Br × Bc respectively.
+        // sBlockPacked is the score buffer with row stride kLen at the
+        // largest tile (Bc); when kLen < Bc we use a fresh per-call
+        // packing — see the K-loop body. oBlock is Br × Dv contiguous;
+        // when qLen < Br we use the prefix.
         var oBlock = new float[Br * Dv];
-        var sBlock = new float[Br * Bc];
 
         fixed (float* pQ = q)
         fixed (float* pK = k)
@@ -421,7 +434,6 @@ public static class FlashAttention<T> where T : unmanaged
         fixed (float* pO = o)
         fixed (float* pLse = lse)
         fixed (float* pBias = bias)
-        fixed (float* pSBlock = sBlock)
         fixed (float* pOBlock = oBlock)
         {
             for (int b = 0; b < batchProduct; b++)
@@ -451,46 +463,76 @@ public static class FlashAttention<T> where T : unmanaged
                         int kLen = kEnd - kStart;
                         if (isCausal && kStart > queryOffset + qEnd - 1) break;
 
-                        // ── Score tile: S[ii, jj] = (Q[ii] · K[jj]) * scale (+ bias)
-                        // ── with optional causal mask. Inner dot is SIMD.
-                        for (int ii = 0; ii < qLen; ii++)
+                        // Per-tile score buffer: contiguous [qLen, kLen].
+                        // Allocated freshly per K-block iteration so SimdGemm.Sgemm
+                        // can write with row stride = kLen (the API has no ldc
+                        // parameter; ldc is implicitly n).
+                        var sTile = new float[qLen * kLen];
+
+                        // ── Score tile: S = Q_block @ K_block^T * scale
+                        // Sgemm overwrite-version with stride+transpose: A=Q has
+                        // row stride headDim, B=K has row stride headDim and is
+                        // transposed; result is C=S with row stride kLen.
+                        // Multi-thousand-element FMA register-tiled kernel —
+                        // dramatically better cache reuse than qLen*kLen
+                        // separate per-row dot products.
+                        var qSpan = new ReadOnlySpan<float>(q, qBase + qStart * headDim, qLen * headDim);
+                        var kSpan = new ReadOnlySpan<float>(k, kBase + kStart * headDim, kLen * headDim);
+                        AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
+                            qSpan, headDim, transA: false,
+                            kSpan, headDim, transB: true,
+                            sTile, qLen, headDim, kLen);
+
+                        // ── Apply scale + bias + causal mask in-place on S.
+                        // Vector256<float> multiply for scale; per-row add for
+                        // bias; scalar mask for causal positions (rare branch).
+                        fixed (float* pSTile = sTile)
                         {
-                            float* qRowPtr = pQ + qBase + (qStart + ii) * headDim;
-                            float* sRowPtr = pSBlock + ii * Bc;
-                            for (int jj = 0; jj < kLen; jj++)
+                            ApplyScaleBiasMaskFloat(
+                                pSTile, qLen, kLen, scale,
+                                bias is null ? null : pBias + biasBase + qStart * Sk,
+                                Sk, kStart,
+                                isCausal, queryOffset, qStart);
+
+                            // ── Per-row online softmax. Sets sTile[ii, :] in
+                            // place to p_jj = exp(s_jj - mNew); returns alpha
+                            // (rescale factor) and lUpdate (partial denominator).
+                            // Per-row alpha rescale of oBlock follows
+                            // immediately so the SgemmAdd below can batch the
+                            // P @ V accumulation in a single call.
+                            for (int ii = 0; ii < qLen; ii++)
                             {
-                                float* kRowPtr = pK + kBase + (kStart + jj) * headDim;
-                                float dot = FlashAttentionFloatSimd.DotProduct(qRowPtr, kRowPtr, headDim);
-                                float score = dot * scale;
-                                if (bias is not null)
-                                    score += pBias[biasBase + (qStart + ii) * Sk + (kStart + jj)];
-                                if (isCausal && (kStart + jj) > queryOffset + qStart + ii)
-                                    score = float.NegativeInfinity;
-                                sRowPtr[jj] = score;
+                                float* sRowPtr = pSTile + ii * kLen;
+                                float* oRowPtr = pOBlock + ii * Dv;
+
+                                FlashAttentionFloatSimd.RowMaxAndExp(
+                                    sRowPtr, kLen, mRow[ii],
+                                    out float mNew, out float alpha, out float lUpdate);
+
+                                // Rescale O[ii] by alpha — broadcast multiply
+                                // across the Dv axis. NormalizeRow's API is
+                                // "multiply by scalar" so we can reuse it.
+                                if (alpha != 1f)
+                                    FlashAttentionFloatSimd.NormalizeRow(oRowPtr, alpha, Dv);
+
+                                mRow[ii] = mNew;
+                                lRow[ii] = alpha * lRow[ii] + lUpdate;
                             }
                         }
 
-                        // ── Online softmax + accumulate P · V per Q row.
-                        // RowMaxAndExp does row-max (Avx.Max + HorizontalMax)
-                        // then in-place exp (FastExp256) returning alpha and
-                        // the partial denominator. RescaleAndAccumulatePV
-                        // does the FMA-vectorized output update.
-                        for (int ii = 0; ii < qLen; ii++)
-                        {
-                            float* sRowPtr = pSBlock + ii * Bc;
-                            float* oRowPtr = pOBlock + ii * Dv;
-
-                            FlashAttentionFloatSimd.RowMaxAndExp(
-                                sRowPtr, kLen, mRow[ii],
-                                out float mNew, out float alpha, out float lUpdate);
-
-                            FlashAttentionFloatSimd.RescaleAndAccumulatePV(
-                                oRowPtr, alpha,
-                                sRowPtr, pV + vBase, kStart, kLen, Dv, Dv);
-
-                            mRow[ii] = mNew;
-                            lRow[ii] = alpha * lRow[ii] + lUpdate;
-                        }
+                        // ── PV: oBlock += P @ V_block via SgemmAdd (β=1
+                        // semantic). P is sTile with row stride kLen;
+                        // V_block is v[vBase + kStart*Dv...] with row
+                        // stride Dv; output oBlock has row stride Dv.
+                        // SgemmAdd is the C += A·B BLAS-3 form — one
+                        // register-tiled FMA dispatch instead of qLen*kLen
+                        // per-row broadcast-FMAs.
+                        var vSpan = new ReadOnlySpan<float>(v, vBase + kStart * Dv, kLen * Dv);
+                        var oSpan = new Span<float>(oBlock, 0, qLen * Dv);
+                        AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmAdd(
+                            sTile, kLen, transA: false,
+                            vSpan, Dv, transB: false,
+                            oSpan, qLen, kLen, Dv);
                     }
 
                     // ── Finalize: normalize by l, save LogSumExp = m + log(l).
@@ -499,11 +541,86 @@ public static class FlashAttention<T> where T : unmanaged
                         float invL = lRow[ii] == 0f ? 0f : 1f / lRow[ii];
                         float* oRowPtr = pO + oBase + (qStart + ii) * Dv;
                         float* oBlockRowPtr = pOBlock + ii * Dv;
-                        // Copy oBlock → output then normalize.
                         for (int d = 0; d < Dv; d++) oRowPtr[d] = oBlockRowPtr[d];
                         FlashAttentionFloatSimd.NormalizeRow(oRowPtr, invL, Dv);
                         pLse[lseBase + qStart + ii] = mRow[ii] + MathF.Log(lRow[ii] == 0f ? 1e-30f : lRow[ii]);
                     }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies score-scale + optional bias + optional causal mask to a
+    /// freshly-computed S tile in place. Vector256-multiply for scale;
+    /// per-row add for bias (bias stride = Sk); scalar set-to-NegInf
+    /// for the causal mask. Factored out of <see cref="ForwardFloat"/>
+    /// to keep the GEMM-dispatch loop body readable.
+    /// </summary>
+    private static unsafe void ApplyScaleBiasMaskFloat(
+        float* sTile, int qLen, int kLen, float scale,
+        float* biasRowBase, int biasRowStride, int kStart,
+        bool isCausal, int queryOffset, int qStart)
+    {
+        // Scale + optional bias in one pass.
+        for (int ii = 0; ii < qLen; ii++)
+        {
+            float* sRow = sTile + ii * kLen;
+            int jj = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && kLen >= 8)
+            {
+                var vScale = System.Runtime.Intrinsics.Vector256.Create(scale);
+                int bulkEnd = kLen - (kLen & 7);
+                if (biasRowBase is not null)
+                {
+                    float* biasRow = biasRowBase + ii * biasRowStride + kStart;
+                    for (; jj < bulkEnd; jj += 8)
+                    {
+                        var s = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sRow + jj);
+                        var bv = System.Runtime.Intrinsics.X86.Avx.LoadVector256(biasRow + jj);
+                        if (System.Runtime.Intrinsics.X86.Fma.IsSupported)
+                            s = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(s, vScale, bv);
+                        else
+                            s = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Multiply(s, vScale), bv);
+                        System.Runtime.Intrinsics.X86.Avx.Store(sRow + jj, s);
+                    }
+                }
+                else
+                {
+                    for (; jj < bulkEnd; jj += 8)
+                    {
+                        var s = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sRow + jj);
+                        s = System.Runtime.Intrinsics.X86.Avx.Multiply(s, vScale);
+                        System.Runtime.Intrinsics.X86.Avx.Store(sRow + jj, s);
+                    }
+                }
+            }
+#endif
+            if (biasRowBase is not null)
+            {
+                float* biasRow = biasRowBase + ii * biasRowStride + kStart;
+                for (; jj < kLen; jj++) sRow[jj] = sRow[jj] * scale + biasRow[jj];
+            }
+            else
+            {
+                for (; jj < kLen; jj++) sRow[jj] *= scale;
+            }
+        }
+
+        // Causal mask — rare branch; skip the entire loop when not
+        // requested. Per-row scalar set-to-NegInf for keys beyond
+        // the visible position. This must run AFTER scale+bias because
+        // a NegInf score must dominate any finite bias.
+        if (isCausal)
+        {
+            for (int ii = 0; ii < qLen; ii++)
+            {
+                float* sRow = sTile + ii * kLen;
+                int maxVisible = queryOffset + qStart + ii; // inclusive
+                for (int jj = 0; jj < kLen; jj++)
+                {
+                    if ((kStart + jj) > maxVisible) sRow[jj] = float.NegativeInfinity;
                 }
             }
         }
