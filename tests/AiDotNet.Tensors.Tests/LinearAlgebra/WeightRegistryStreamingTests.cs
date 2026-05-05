@@ -1134,14 +1134,14 @@ public class WeightRegistryStreamingTests : IDisposable
         finally { pool.Dispose(); }
     }
 
-    // -------- AllocateRegistered<T> + EvictUntilFreeBytes (#1222 follow-on) --------
+    // -------- AllocateStreaming<T> + EvictUntilFreeBytes (#1222 follow-on) --------
 
     [Fact]
-    public void AllocateRegistered_AfterReset_StillReturnsStreamingLifetime()
+    public void AllocateStreaming_AfterReset_StillReturnsStreamingLifetime()
     {
         // Reset() re-initializes _options to a fresh default
         // GpuOffloadOptions (it's never null — the field-initializer
-        // and Reset both assign new instances), so AllocateRegistered's
+        // and Reset both assign new instances), so AllocateStreaming's
         // contract is unconditional: it always returns a Streaming-
         // lifetime tensor with materialized storage. There is no
         // "streaming not configured" fallback to a Default-lifetime
@@ -1149,19 +1149,19 @@ public class WeightRegistryStreamingTests : IDisposable
         // "not configured".
         WeightRegistry.Reset();
 
-        var t = WeightRegistry.AllocateRegistered<float>(new[] { 16, 16 });
+        var t = WeightRegistry.AllocateStreaming<float>(new[] { 16, 16 });
 
         Assert.Equal(WeightLifetime.Streaming, t.Lifetime);
         Assert.Equal(16 * 16, t.Length);
         Assert.True(t.DataVector.Length > 0,
-            "AllocateRegistered should leave storage materialized for caller "
+            "AllocateStreaming should leave storage materialized for caller "
             + "to initialize before RegisterWeight.");
     }
 
     [Fact]
-    public void AllocateRegistered_WithStreamingConfigured_ReturnsStreamingLifetimeTensor()
+    public void AllocateStreaming_WithStreamingConfigured_ReturnsStreamingLifetimeTensor()
     {
-        var t = WeightRegistry.AllocateRegistered<float>(new[] { 8, 8 });
+        var t = WeightRegistry.AllocateStreaming<float>(new[] { 8, 8 });
 
         // Streaming-configured path: lifetime is set, storage is
         // materialized (caller has yet to RegisterWeight). The contract
@@ -1169,14 +1169,14 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(WeightLifetime.Streaming, t.Lifetime);
         Assert.Equal(64, t.Length);
         Assert.True(t.DataVector.Length > 0,
-            "AllocateRegistered should return a materialized tensor so callers "
+            "AllocateStreaming should return a materialized tensor so callers "
             + "can initialize weights into it before calling RegisterWeight.");
     }
 
     [Fact]
-    public void AllocateRegistered_LongSequence_BoundsPeakResidency()
+    public void AllocateStreaming_LongSequence_BoundsPeakResidency()
     {
-        // The whole point of AllocateRegistered: a long sequence of
+        // The whole point of AllocateStreaming: a long sequence of
         // large allocations + registers should stay bounded by the pool
         // budget instead of peaking at the cumulative weight size.
         // Simulate PaLM-E's MHA-layer pattern: 4 weights per "layer",
@@ -1186,7 +1186,7 @@ public class WeightRegistryStreamingTests : IDisposable
         // (everything alive); with it, resident should plateau near
         // the 256 KB budget.
         //
-        // Also samples ResidentBytes BETWEEN AllocateRegistered and
+        // Also samples ResidentBytes BETWEEN AllocateStreaming and
         // RegisterWeight to prove eviction-on-allocate is the load-
         // bearing step — a regression that stops calling ReserveBytes
         // before allocation would still pass the post-Register peak
@@ -1208,7 +1208,7 @@ public class WeightRegistryStreamingTests : IDisposable
             for (int matrix = 0; matrix < 4; matrix++)
             {
                 // 64 KB per matrix at fp32 = 16384 elements = 128×128.
-                var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 128 });
+                var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 128 });
 
                 // Sample BEFORE RegisterWeight: this is what a regression
                 // that stops evicting on Allocate would inflate. The
@@ -1238,7 +1238,7 @@ public class WeightRegistryStreamingTests : IDisposable
         // small slop for the most recent allocation that triggered
         // eviction. Peak shouldn't approach the cumulative 4 MB total.
         Assert.True(peakResidentBytesPostRegister <= 384L * 1024,
-            $"AllocateRegistered + RegisterWeight should bound peak resident "
+            $"AllocateStreaming + RegisterWeight should bound peak resident "
             + $"to ~budget (256 KB), but peak was {peakResidentBytesPostRegister} bytes "
             + $"({peakResidentBytesPostRegister / 1024.0:F1} KB). If this exceeds 384 KB "
             + "(budget + ~50% slop for the last register), eviction-on-allocate "
@@ -1253,23 +1253,95 @@ public class WeightRegistryStreamingTests : IDisposable
         // (full budget) as a defensive ceiling because the very first
         // few iterations may not have evicted yet.
         Assert.True(peakResidentBytesPostAllocate <= 256L * 1024,
-            $"AllocateRegistered must page out enough LRU entries to fit the "
+            $"AllocateStreaming must page out enough LRU entries to fit the "
             + $"reservation, leaving resident bytes <= budget (256 KB). Peak post-"
             + $"Allocate resident was {peakResidentBytesPostAllocate} bytes "
             + $"({peakResidentBytesPostAllocate / 1024.0:F1} KB). If this exceeds "
-            + "256 KB, AllocateRegistered isn't running its eviction-on-allocate "
+            + "256 KB, AllocateStreaming isn't running its eviction-on-allocate "
             + "step before returning the tensor — a regression #1222 was meant to "
             + "prevent.");
     }
 
     [Fact]
-    public void AllocateRegistered_UnsupportedType_ThrowsBeforeChurningPool()
+    public void AllocateStreaming_LongSequence_BoundsManagedLiveSet()
     {
-        // Type gate: AllocateRegistered<decimal> must reject upfront so
+        // Direct GC-heap measurement: ResidentBytes only counts pool-
+        // registered bytes, so a regression that stopped pre-evicting
+        // on Allocate could keep ResidentBytes flat while the LIVE
+        // managed heap (still-rooted byte[] buffers awaiting registration)
+        // grows linearly across the layer sequence. This test forces a
+        // full GC after each layer to collect dropped byte[]s, then
+        // measures the actual live working set against the pool budget.
+        //
+        // Methodology: force a full GC at the end of each layer (when
+        // the previous iteration's tensor has been registered and its
+        // GC byte[] has been dropped via DropStorageForStreaming). After
+        // the collection, GetTotalMemory reports only LIVE references
+        // — not uncollected garbage. The peak live-set is then a clean
+        // proxy for "how big can the heap get under sustained
+        // allocation".
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 256L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        // Baseline: drain pre-existing test allocator state.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        long heapBaseline = GC.GetTotalMemory(forceFullCollection: true);
+
+        long peakLiveSetDelta = 0;
+        for (int layer = 0; layer < 16; layer++)
+        {
+            for (int matrix = 0; matrix < 4; matrix++)
+            {
+                var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 128 });
+                var span = t.DataVector.AsWritableSpan();
+                for (int i = 0; i < span.Length; i++) span[i] = (float)((layer * 4 + matrix + i) % 7);
+                WeightRegistry.RegisterWeight(t);
+            }
+            // After each layer (4 weights), force a full collection so
+            // dropped byte[]s from the just-finished iteration are
+            // collected. Then measure: the heap size now reflects only
+            // LIVE state (pool's resident byte[]s + LRU bookkeeping +
+            // backing files' file handles) — a regression that left
+            // uncollected weights on the heap would still grow this
+            // measurement linearly because their references would still
+            // exist somewhere.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long heapLive = GC.GetTotalMemory(forceFullCollection: true);
+            long delta = heapLive - heapBaseline;
+            if (delta > peakLiveSetDelta) peakLiveSetDelta = delta;
+        }
+
+        // Cumulative weight sum is 4 MB. Without AllocateStreaming the
+        // managed live-set would grow ~4 MB. With AllocateStreaming the
+        // pool drops weights to disk so live-set plateaus at ~budget
+        // (256 KB) plus per-iteration overhead. Generous ceiling: 4×
+        // budget = 1 MB, still well below the 4 MB regression case.
+        Assert.True(peakLiveSetDelta < 1024L * 1024,
+            $"Managed live-set delta should plateau near the pool budget "
+            + $"(256 KB) since AllocateStreaming pages out competing weights "
+            + $"before each new GC byte[] lands, but peak live-set was "
+            + $"{peakLiveSetDelta} bytes ({peakLiveSetDelta / 1024.0:F1} KB). "
+            + "If this exceeds 1 MB after a forced full GC, "
+            + "AllocateStreaming isn't pacing the managed heap against the "
+            + "pool budget — the OOM mode #1222 was meant to prevent.");
+    }
+
+    [Fact]
+    public void AllocateStreaming_UnsupportedType_ThrowsBeforeChurningPool()
+    {
+        // Type gate: AllocateStreaming<decimal> must reject upfront so
         // the pool's eviction loop doesn't run on behalf of a tensor
         // RegisterWeight would later refuse to serialize. Pre-fill the
         // pool to budget; assert resident doesn't change after the
-        // failed AllocateRegistered call.
+        // failed AllocateStreaming call.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -1280,13 +1352,13 @@ public class WeightRegistryStreamingTests : IDisposable
         // Pre-fill the pool with 4 KB of registered weights.
         for (int i = 0; i < 2; i++)
         {
-            var t = WeightRegistry.AllocateRegistered<float>(new[] { 512 }); // 2 KB
+            var t = WeightRegistry.AllocateStreaming<float>(new[] { 512 }); // 2 KB
             WeightRegistry.RegisterWeight(t);
         }
         long residentBefore = WeightRegistry.GetStreamingReport().ResidentBytes;
 
         var ex = Assert.Throws<NotSupportedException>(() =>
-            WeightRegistry.AllocateRegistered<decimal>(new[] { 16 }));
+            WeightRegistry.AllocateStreaming<decimal>(new[] { 16 }));
         Assert.Contains("not supported", ex.Message, StringComparison.OrdinalIgnoreCase);
 
         long residentAfter = WeightRegistry.GetStreamingReport().ResidentBytes;
@@ -1294,10 +1366,10 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void AllocateRegistered_ConcurrentCallers_RespectBudget()
+    public void AllocateStreaming_ConcurrentCallers_RespectBudget()
     {
         // Race regression: without the reservation mechanism, two
-        // concurrent AllocateRegistered calls would both pass the same
+        // concurrent AllocateStreaming calls would both pass the same
         // headroom check and overshoot the budget by the second
         // tensor's byte count. With ReserveBytes counted against the
         // budget, the second caller's eviction sees the first caller's
@@ -1314,38 +1386,61 @@ public class WeightRegistryStreamingTests : IDisposable
         // evict to make room.
         for (int i = 0; i < 4; i++)
         {
-            var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 }); // 16 KB
+            var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 32 }); // 16 KB
             WeightRegistry.RegisterWeight(t);
         }
         Assert.True(WeightRegistry.GetStreamingReport().ResidentBytes <= 64L * 1024);
 
-        // Race two AllocateRegistered calls. Each requests 16 KB. With
+        // Race two AllocateStreaming calls. Each requests 16 KB. With
         // a 64 KB budget already at 64 KB resident, both must trigger
         // eviction; the reservation accounting prevents them seeing the
         // same headroom.
-        var allocs = new Tensor<float>[2];
-        var threads = new System.Threading.Thread[2];
-        for (int i = 0; i < 2; i++)
+        //
+        // Synchronize the two threads on a Barrier BEFORE the actual
+        // AllocateStreaming call so they enter the reservation path
+        // concurrently — without this, one thread can complete the
+        // entire reserve+allocate path before the other ever starts,
+        // making the race the test claims to cover schedule-dependent
+        // and easy to miss in CI. The Barrier forces real overlap on
+        // the reservation gate.
+        const int threadCount = 2;
+        var allocs = new Tensor<float>[threadCount];
+        var threads = new System.Threading.Thread[threadCount];
+        var barrier = new System.Threading.Barrier(threadCount);
+        var exceptions = new Exception?[threadCount];
+        for (int i = 0; i < threadCount; i++)
         {
             int idx = i;
             threads[i] = new System.Threading.Thread(() =>
             {
-                allocs[idx] = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 });
+                try
+                {
+                    barrier.SignalAndWait();
+                    allocs[idx] = WeightRegistry.AllocateStreaming<float>(new[] { 128, 32 });
+                }
+                catch (Exception ex)
+                {
+                    exceptions[idx] = ex;
+                }
             });
         }
         foreach (var th in threads) th.Start();
         foreach (var th in threads) th.Join();
+        for (int i = 0; i < threadCount; i++)
+            if (exceptions[i] is not null)
+                throw new Xunit.Sdk.XunitException(
+                    $"Thread {i} threw during concurrent AllocateStreaming: {exceptions[i]}");
 
         long resident = WeightRegistry.GetStreamingReport().ResidentBytes;
         long reserved = WeightRegistry.StreamingPool.ReservedBytes;
         // resident already paged out to make room for the reservations;
-        // reserved should reflect the sum of both AllocateRegistered
+        // reserved should reflect the sum of both AllocateStreaming
         // requests (32 KB). Total resident + reserved must respect the
         // budget within a small slop (the budget is best-effort under
         // concurrent eviction since the LRU list is mutated under-lock
         // but the GC heap allocations happen post-lock).
         Assert.True(resident + reserved <= 64L * 1024 + 16L * 1024,
-            $"After concurrent AllocateRegistered, resident({resident}) + reserved({reserved}) "
+            $"After concurrent AllocateStreaming, resident({resident}) + reserved({reserved}) "
             + $"must respect budget ({64 * 1024}) within slop. Sum = {resident + reserved}.");
 
         // Now register both — releases reservations, commits residency.
@@ -1360,11 +1455,16 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void ReserveBytes_DirectCall_BlocksConcurrentAllocators()
+    public void ReserveBytes_AccumulatesAcrossSequentialCalls_TriggersEvictionWhenBudgetFull()
     {
-        // Direct StreamingTensorPool test: ReserveBytes pages LRU
-        // entries to make room AND records the reservation so a
-        // subsequent ReserveBytes call sees it.
+        // Direct StreamingTensorPool test: ReserveBytes accumulates
+        // across sequential calls — a second reserve sees the first's
+        // _reservedBytes in the free-bytes calculation, so it must
+        // page LRU entries to make additional room. This is the
+        // single-threaded sibling of the concurrent-Allocators test
+        // above; together they validate the budget invariant under
+        // both scheduling models. Sequential cumulative accounting +
+        // concurrent overlap == correct reservation bookkeeping.
         var pool = new StreamingTensorPool(new GpuOffloadOptions
         {
             StreamingPoolMaxResidentBytes = 4096L,
@@ -1401,7 +1501,7 @@ public class WeightRegistryStreamingTests : IDisposable
     [Fact]
     public void UnregisterWeight_AllocatedButNotRegistered_ReleasesReservation()
     {
-        // Public cancellation path for the "AllocateRegistered then bail
+        // Public cancellation path for the "AllocateStreaming then bail
         // before RegisterWeight" case. StreamingReservedBytes is
         // internal so external callers can't release it directly;
         // UnregisterWeight is the supported escape hatch.
@@ -1412,7 +1512,7 @@ public class WeightRegistryStreamingTests : IDisposable
             StreamingBackingStorePath = _backingDir,
         });
 
-        var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 }); // 16 KB
+        var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 32 }); // 16 KB
         long reservedBefore = WeightRegistry.StreamingPool.ReservedBytes;
         Assert.True(reservedBefore >= 16L * 1024);
 
@@ -1441,7 +1541,7 @@ public class WeightRegistryStreamingTests : IDisposable
             StreamingBackingStorePath = _backingDir,
         });
 
-        var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 });
+        var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 32 });
         WeightRegistry.RegisterWeight(t);
 
         Assert.Equal(0L, t.StreamingReservedBytes);
@@ -1476,28 +1576,28 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void AllocateRegistered_OversizeShape_ThrowsClearError()
+    public void AllocateStreaming_OversizeShape_ThrowsClearError()
     {
         // Per-tensor bytecount is bounded by int.MaxValue (the byte[]
         // limit). Asking for 2.5 GB of fp32 (~625M elements) should
         // throw NotSupportedException with a chunking hint, not OOM
         // somewhere deep in the pool.
         var ex = Assert.Throws<NotSupportedException>(() =>
-            WeightRegistry.AllocateRegistered<float>(new[] { 1_000_000_000 }));
+            WeightRegistry.AllocateStreaming<float>(new[] { 1_000_000_000 }));
         Assert.Contains("Chunk", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void AllocateRegistered_NegativeShape_Throws()
+    public void AllocateStreaming_NegativeShape_Throws()
     {
         Assert.Throws<ArgumentException>(() =>
-            WeightRegistry.AllocateRegistered<float>(new[] { -1, 16 }));
+            WeightRegistry.AllocateStreaming<float>(new[] { -1, 16 }));
     }
 
     [Fact]
     public void EvictUntilFreeBytes_DirectCall_PagesLruEntries()
     {
-        // Direct StreamingTensorPool test — no AllocateRegistered
+        // Direct StreamingTensorPool test — no AllocateStreaming
         // wrapper. Register some entries, then ask for headroom equal
         // to half the budget and verify resident drops accordingly.
         var pool = new StreamingTensorPool(new GpuOffloadOptions
@@ -1527,12 +1627,14 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void EvictUntilFreeBytes_RequestExceedsBudget_BestEffortReturnsFalse()
+    public void EvictUntilFreeBytes_RequestExceedsBudget_ShortCircuitsWithoutFlushingLru()
     {
-        // Asking for more headroom than the budget itself should
-        // empty the LRU and return false — caller's allocation will
-        // push the pool past budget, but EvictIfOverBudget on the
-        // next register catches up.
+        // Asking for more headroom than the entire budget can never
+        // succeed even with a full LRU drain, so EvictUntilFreeBytes
+        // short-circuits: returns false immediately without touching
+        // the LRU. Without this, an oversize request would flush every
+        // warm weight to disk for nothing, forcing a round of
+        // foreground rehydrates afterward.
         var pool = new StreamingTensorPool(new GpuOffloadOptions
         {
             StreamingPoolMaxResidentBytes = 4096L,
@@ -1541,14 +1643,16 @@ public class WeightRegistryStreamingTests : IDisposable
         try
         {
             for (int i = 0; i < 4; i++) pool.Register(new byte[1024]);
+            long residentBefore = pool.ResidentBytes;
+            Assert.Equal(4096L, residentBefore);
 
-            // Ask for 8 KB headroom — exceeds the 4 KB budget. Even
-            // after evicting all 4 entries, can't satisfy → false.
+            // Ask for 8 KB headroom — exceeds the 4 KB budget. Pool
+            // bails immediately without evicting; resident is unchanged.
             bool secured = pool.EvictUntilFreeBytes(8192L);
             Assert.False(secured,
-                "EvictUntilFreeBytes(8192) > budget(4096) should empty the "
-                + "LRU and return false (best-effort signal).");
-            Assert.Equal(0L, pool.ResidentBytes);
+                "EvictUntilFreeBytes(8192) > budget(4096) should return false "
+                + "without touching the LRU.");
+            Assert.Equal(residentBefore, pool.ResidentBytes);
         }
         finally { pool.Dispose(); }
     }

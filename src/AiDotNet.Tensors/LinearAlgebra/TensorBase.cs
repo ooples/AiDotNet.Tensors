@@ -560,7 +560,7 @@ public abstract class TensorBase<T> : IDisposable
 
     /// <summary>
     /// Bytes the streaming pool has pre-reserved against its budget on
-    /// behalf of this tensor between <c>WeightRegistry.AllocateRegistered</c>
+    /// behalf of this tensor between <c>WeightRegistry.AllocateStreaming</c>
     /// and the matching <c>WeightRegistry.RegisterWeight</c>. Used to
     /// prevent a TOCTOU race where two concurrent allocate-then-register
     /// flows both pass the pre-allocate eviction gate but together push
