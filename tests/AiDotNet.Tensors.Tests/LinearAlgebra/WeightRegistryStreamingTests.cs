@@ -1552,6 +1552,54 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void Configure_WithOutstandingReservations_ThrowsCleanly()
+    {
+        // Mid-flight Configure-swap protection: if AllocateStreaming has
+        // recorded a reservation but RegisterWeight/UnregisterWeight
+        // hasn't run yet, swapping the pool would orphan that
+        // reservation's accounting on the new pool. Configure must
+        // reject this state with a clear error so callers know to
+        // complete or abandon the in-flight allocation first.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 64L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        // Allocate but don't register: leaves an outstanding reservation
+        // on the current pool's _reservedBytes ledger.
+        var t = WeightRegistry.AllocateStreaming<float>(new[] { 128, 32 });
+        Assert.True(WeightRegistry.StreamingPool.ReservedBytes > 0);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            WeightRegistry.Configure(new GpuOffloadOptions
+            {
+                StreamingPoolMaxResidentBytes = 128L * 1024,
+                StreamingBackingStorePath = _backingDir,
+            }));
+        Assert.Contains("outstanding reservations", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // Cleanup: cancel the reservation so subsequent tests start clean.
+        WeightRegistry.UnregisterWeight(t);
+    }
+
+    [Fact]
+    public void AllocateStreaming_OverflowingProductBeforeIntMaxCheck_ThrowsClearError()
+    {
+        // Regression: an earlier revision did `checked(elements * dim)`
+        // inside the loop and only compared against int.MaxValue
+        // afterwards. A pathologically large shape like
+        // [int.MaxValue, int.MaxValue, 3] would trip OverflowException
+        // first, masking the documented chunking-hint NotSupportedException.
+        // The fix moves the bound check INSIDE the loop so the contract
+        // surfaces correctly regardless of how large the shape is.
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            WeightRegistry.AllocateStreaming<float>(new[] { int.MaxValue, int.MaxValue, 3 }));
+        Assert.Contains("Chunk", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ReleaseReservation_MoreThanReserved_FloorsAtZero()
     {
         // Defensive: double-release must not turn into negative

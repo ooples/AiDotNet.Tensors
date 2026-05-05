@@ -52,6 +52,20 @@ public static class WeightRegistry
                 throw new InvalidOperationException(
                     $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.RegisteredEntryCount} " +
                     "registered entries. Unregister all weights first, or call Reset() to forcibly drop them.");
+            // Same for outstanding reservations from in-flight
+            // AllocateStreaming calls that haven't yet hit RegisterWeight.
+            // Swapping the pool here would orphan those reservations: the
+            // tensor still carries StreamingReservedBytes but the pool
+            // that recorded it is gone, so RegisterWeight / UnregisterWeight
+            // would later release bytes against the WRONG pool — corrupting
+            // the new pool's _reservedBytes accounting and letting later
+            // allocators overshoot the budget.
+            if (_streamingPool is not null && _streamingPool.ReservedBytes > 0)
+                throw new InvalidOperationException(
+                    $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.ReservedBytes} " +
+                    "bytes of outstanding reservations from AllocateStreaming calls that haven't yet " +
+                    "called RegisterWeight (or UnregisterWeight). Complete or abandon those allocations first, " +
+                    "or call Reset() to forcibly drop them.");
 
             // Dispose the previous allocator before swapping — otherwise its
             // outstanding pinned/managed allocations + native context are
@@ -291,27 +305,35 @@ public static class WeightRegistry
                 "supported by the streaming pool. Supported types: float, double, int, long, " +
                 "Half, BFloat16. Use plain `new Tensor<T>(shape)` for non-streamable types.");
         // Compute byte count up-front so we can reserve the right amount
-        // BEFORE the GC heap takes the hit. CheckedStreamingByteCount
-        // surfaces oversize-tensor errors as a clear NotSupportedException
-        // with a chunking hint instead of OOM.
+        // BEFORE the GC heap takes the hit. Check the int.MaxValue bound
+        // INSIDE the loop instead of relying on `checked` overflow at
+        // the end — `checked(int.MaxValue * int.MaxValue * 3)` would
+        // throw OverflowException, masking the cleaner chunking-hint
+        // error this method's contract promises. By short-circuiting on
+        // each dim multiply we surface the oversize case as
+        // NotSupportedException with the documented message regardless
+        // of how pathologically large the shape is.
         long elements = 1L;
         for (int i = 0; i < shape.Length; i++)
         {
             int dim = shape[i];
             if (dim < 0)
                 throw new ArgumentException($"shape[{i}] must be non-negative; got {dim}", nameof(shape));
-            elements = checked(elements * dim);
+            // Guard against int.MaxValue bound BEFORE the multiply so
+            // `checked` doesn't fire first. elements * dim could exceed
+            // int.MaxValue even when elements <= int.MaxValue (e.g.
+            // elements=int.MaxValue, dim=2). Compare in long arithmetic.
+            if (dim > 0 && elements > int.MaxValue / dim)
+            {
+                throw new NotSupportedException(
+                    $"AllocateStreaming: per-tensor element count exceeds the " +
+                    $"int.MaxValue ({int.MaxValue}) bound that the streaming pool's byte[] " +
+                    "buffer can represent (overflow at shape[" + i + "]). Chunk the tensor " +
+                    "into smaller pool entries on the consumer side.");
+            }
+            elements *= dim;
         }
 
-        // CheckedStreamingByteCount enforces the int.MaxValue (byte[])
-        // bound; long elements > int.MaxValue rejects with a clear
-        // chunking-hint error.
-        if (elements > int.MaxValue)
-            throw new NotSupportedException(
-                $"AllocateStreaming: per-tensor element count {elements} exceeds the " +
-                $"int.MaxValue ({int.MaxValue}) bound that the streaming pool's byte[] " +
-                "buffer can represent. Chunk the tensor into smaller pool entries on " +
-                "the consumer side.");
         int byteCount = elements > 0 ? CheckedStreamingByteCount<T>((int)elements) : 0;
 
         // Phase 1: under registry lock, take a stable reference to the
