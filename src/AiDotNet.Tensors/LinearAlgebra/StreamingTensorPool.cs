@@ -33,6 +33,16 @@ public sealed class StreamingTensorPool : IDisposable
     private long _residentBytes;
     private long _residentBytesPeak;
     private long _nextHandleId = 1;
+    // Pre-allocated headroom the pool has promised to outstanding
+    // AllocateRegistered callers but that hasn't yet landed in
+    // _residentBytes (the caller is still initializing the GC byte[]
+    // before calling RegisterWeight). Eviction's free-bytes calculation
+    // adds this to _residentBytes so a second concurrent
+    // AllocateRegistered can't pass the same headroom-check the first
+    // one did. Decremented on RegisterWeight (or on direct
+    // ReleaseReservation when the caller bails before Register).
+    // Always written under _lock.
+    private long _reservedBytes;
     private readonly long _maxResidentBytes;
     private readonly string _backingDir;
     private readonly bool _enableCompression;
@@ -352,9 +362,10 @@ public sealed class StreamingTensorPool : IDisposable
     /// <paramref name="byteCount"/> bytes of headroom are available
     /// under <see cref="_maxResidentBytes"/> OR the LRU is empty.
     /// Best-effort: returns whether the requested headroom was secured.
-    /// Used by <see cref="WeightRegistry.AllocateRegistered{T}"/> so a
-    /// long sequence of large weight allocations bounds peak GC-heap
-    /// occupancy by the pool budget.
+    /// Used internally by <see cref="ReserveBytes"/>; external callers
+    /// (e.g., <see cref="WeightRegistry.AllocateRegistered{T}"/>) should
+    /// use <see cref="ReserveBytes"/> instead so the headroom they
+    /// secured is held against concurrent allocators.
     /// </summary>
     /// <param name="byteCount">Bytes of headroom to make available.</param>
     /// <returns>True if the pool now has at least
@@ -363,8 +374,10 @@ public sealed class StreamingTensorPool : IDisposable
     /// the pool past budget; <see cref="EvictIfOverBudget"/> on the
     /// next register will recover).</returns>
     /// <remarks>
-    /// <para>byteCount &lt;= 0 is a no-op. Invariant on entry/exit:
-    /// caller holds <see cref="_lock"/>.</para>
+    /// <para>byteCount &lt;= 0 is a no-op. The free-bytes calculation
+    /// includes <see cref="_reservedBytes"/> so a concurrent
+    /// AllocateRegistered (whose reservation hasn't yet been committed
+    /// via Register) can't double-spend the same headroom.</para>
     /// </remarks>
     public bool EvictUntilFreeBytes(long byteCount)
     {
@@ -372,21 +385,93 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            // "Free bytes available" = budget - currently-resident.
-            // We loop until either we have at least byteCount free, OR
-            // the LRU is empty (best-effort: if the caller asked for
-            // more than the entire budget can hold, we drain the LRU
-            // and return false to signal the request can't be fully
-            // satisfied; caller's allocation will then push the pool
-            // past budget, and the next register's EvictIfOverBudget
-            // can't recover that scenario either — callers are
-            // expected to not request more than the budget itself).
-            while (_maxResidentBytes - _residentBytes < byteCount && _lruOrder.Count > 0)
-            {
-                if (!EvictOneLruEntry(protectedHandleId: null)) break;
-            }
-            return _maxResidentBytes - _residentBytes >= byteCount;
+            return EvictUntilFreeBytesUnlocked(byteCount);
         }
+    }
+
+    /// <summary>Caller already holds <see cref="_lock"/>. Same contract as
+    /// <see cref="EvictUntilFreeBytes"/>.</summary>
+    private bool EvictUntilFreeBytesUnlocked(long byteCount)
+    {
+        // "Free bytes available" = budget - resident - reserved. We loop
+        // until either we have at least byteCount free, OR the LRU is
+        // empty (best-effort: if the caller asked for more than the
+        // entire budget can hold, we drain the LRU and return false to
+        // signal the request can't be fully satisfied at this moment).
+        // Including _reservedBytes is what closes the TOCTOU race
+        // between concurrent AllocateRegistered calls — without it,
+        // both callers would observe the same headroom and overshoot.
+        while (_maxResidentBytes - _residentBytes - _reservedBytes < byteCount && _lruOrder.Count > 0)
+        {
+            if (!EvictOneLruEntry(protectedHandleId: null)) break;
+        }
+        return _maxResidentBytes - _residentBytes - _reservedBytes >= byteCount;
+    }
+
+    /// <summary>
+    /// Atomically pages out LRU entries to free at least
+    /// <paramref name="byteCount"/> bytes of headroom AND records the
+    /// reservation against <see cref="_reservedBytes"/> so a concurrent
+    /// caller can't pass the same eviction gate. The caller is expected
+    /// to either commit the reservation by calling
+    /// <see cref="WeightRegistry.RegisterWeight{T}"/> (which subtracts
+    /// from <see cref="_reservedBytes"/> then adds to
+    /// <see cref="_residentBytes"/>) or release it by calling
+    /// <see cref="ReleaseReservation"/> directly.
+    /// </summary>
+    /// <param name="byteCount">Bytes of headroom to reserve. Non-positive
+    /// is a no-op (returns true).</param>
+    /// <returns>True if the reservation was secured under budget; false
+    /// when the request exceeds the entire budget (LRU drained, can't
+    /// satisfy). False reservations are still recorded — the caller
+    /// will cause a transient overshoot until the next Register's
+    /// <see cref="EvictIfOverBudget"/> walk catches up.</returns>
+    public bool ReserveBytes(long byteCount)
+    {
+        if (byteCount <= 0) return true;
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            bool secured = EvictUntilFreeBytesUnlocked(byteCount);
+            _reservedBytes += byteCount;
+            return secured;
+        }
+    }
+
+    /// <summary>
+    /// Releases bytes previously reserved via <see cref="ReserveBytes"/>.
+    /// Called either by the matching
+    /// <see cref="WeightRegistry.RegisterWeight{T}"/> (just before the
+    /// committed bytes land in <see cref="_residentBytes"/>) or directly
+    /// when the caller bails before Register and needs to give the
+    /// headroom back to the budget.
+    /// </summary>
+    /// <param name="byteCount">Bytes to release. Non-positive is a no-op.</param>
+    public void ReleaseReservation(long byteCount)
+    {
+        if (byteCount <= 0) return;
+        lock (_lock)
+        {
+            // No ThrowIfDisposed here: a tensor that was reserved against
+            // an old pool but never registered may be released after a
+            // Configure swap. The reservation accounting is best-effort
+            // bookkeeping — it doesn't affect resident bytes once the
+            // pool is disposed.
+            if (_disposed) return;
+            _reservedBytes -= byteCount;
+            // Floor at zero — defensive against double-release. Bumping
+            // a "release without reserve" exception would turn a
+            // bookkeeping mistake into a tensor leak, which is worse.
+            if (_reservedBytes < 0) _reservedBytes = 0;
+        }
+    }
+
+    /// <summary>Outstanding reservations from in-flight
+    /// <see cref="WeightRegistry.AllocateRegistered{T}"/> calls. Exposed
+    /// for tests; production code shouldn't depend on the value.</summary>
+    public long ReservedBytes
+    {
+        get { lock (_lock) return _reservedBytes; }
     }
 
     /// <summary>
@@ -500,7 +585,13 @@ public sealed class StreamingTensorPool : IDisposable
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(encodeBuf);
+                // clearArray:true so the next renter doesn't observe the
+                // previous tenant's serialized weight bytes — these are
+                // model parameters, often proprietary, and a downstream
+                // consumer renting the same buffer would see them
+                // unzeroed. The clear cost is amortized against the
+                // disk write latency anyway.
+                ArrayPool<byte>.Shared.Return(encodeBuf, clearArray: true);
             }
         }
         else
