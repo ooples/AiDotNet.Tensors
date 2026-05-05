@@ -1399,6 +1399,59 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void UnregisterWeight_AllocatedButNotRegistered_ReleasesReservation()
+    {
+        // Public cancellation path for the "AllocateRegistered then bail
+        // before RegisterWeight" case. StreamingReservedBytes is
+        // internal so external callers can't release it directly;
+        // UnregisterWeight is the supported escape hatch.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 64L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 }); // 16 KB
+        long reservedBefore = WeightRegistry.StreamingPool.ReservedBytes;
+        Assert.True(reservedBefore >= 16L * 1024);
+
+        // Caller decides not to register (e.g. exception during weight
+        // initialization, lazy layer torn down before forward, etc.)
+        WeightRegistry.UnregisterWeight(t);
+
+        long reservedAfter = WeightRegistry.StreamingPool.ReservedBytes;
+        Assert.Equal(reservedBefore - 16L * 1024, reservedAfter);
+    }
+
+    [Fact]
+    public void UnregisterWeight_RegisteredTensor_DoesNotDoubleReleaseReservation()
+    {
+        // Sanity: the normal path (Allocate → Register → Unregister)
+        // releases the reservation in RegisterWeight (clearing
+        // StreamingReservedBytes). Unregister must not then try to
+        // release zero bytes from the pool. Under the floor-at-zero
+        // contract this would be harmless, but the more surgical check
+        // is that the tensor's StreamingReservedBytes is observed at 0
+        // after Register and stays at 0 after Unregister.
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 64L * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        var t = WeightRegistry.AllocateRegistered<float>(new[] { 128, 32 });
+        WeightRegistry.RegisterWeight(t);
+
+        Assert.Equal(0L, t.StreamingReservedBytes);
+        long reservedBeforeUnregister = WeightRegistry.StreamingPool.ReservedBytes;
+        WeightRegistry.UnregisterWeight(t);
+        long reservedAfterUnregister = WeightRegistry.StreamingPool.ReservedBytes;
+        Assert.Equal(reservedBeforeUnregister, reservedAfterUnregister);
+    }
+
+    [Fact]
     public void ReleaseReservation_MoreThanReserved_FloorsAtZero()
     {
         // Defensive: double-release must not turn into negative

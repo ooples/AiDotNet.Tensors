@@ -308,9 +308,10 @@ public static class WeightRegistry
             // and never set to null (Configure rejects null; Reset
             // assigns a fresh default), so there is no "streaming not
             // configured" state to fall back from. Always-on contract.
+            StreamingTensorPool? pool = null;
             if (byteCount > 0)
             {
-                var pool = StreamingPoolUnlocked();
+                pool = StreamingPoolUnlocked();
                 pool.ReserveBytes(byteCount);
             }
 
@@ -319,16 +320,42 @@ public static class WeightRegistry
             // tensor's storage hits the GC heap here — there's no way
             // to skip that without a full storage-from-pool refactor —
             // but at least the budget invariant is enforced.
-            var tensor = new Tensor<T>(shape)
+            // Roll back the reservation if the constructor or property
+            // initializer throws (e.g. OOM on the GC byte[] allocation,
+            // or a future ctor-arg validation rejecting the shape):
+            // without this catch, the reserved headroom would leak and
+            // the pool's _reservedBytes would drift up by byteCount on
+            // every failed AllocateRegistered, eventually starving the
+            // budget for legitimate allocators.
+            try
             {
-                Lifetime = WeightLifetime.Streaming,
-                StreamingReservedBytes = byteCount,
-            };
-            return tensor;
+                return new Tensor<T>(shape)
+                {
+                    Lifetime = WeightLifetime.Streaming,
+                    StreamingReservedBytes = byteCount,
+                };
+            }
+            catch
+            {
+                pool?.ReleaseReservation(byteCount);
+                throw;
+            }
         }
     }
 
-    /// <summary>Unregisters and frees backing storage.</summary>
+    /// <summary>
+    /// Unregisters and frees backing storage. Also serves as the public
+    /// cancellation path for tensors that were produced by
+    /// <see cref="AllocateRegistered{T}"/> but never went on to
+    /// <see cref="RegisterWeight{T}"/>: callers in that "allocated but
+    /// abandoned" state pass the tensor to UnregisterWeight to give the
+    /// pool's reserved headroom back to the budget. Without this path,
+    /// <see cref="Tensor{T}.StreamingReservedBytes"/> would be inaccessible
+    /// to external callers (it is internal so external code can't
+    /// desync the pool's bookkeeping by mutating it directly), so the
+    /// reservation would stay stranded for the rest of the process'
+    /// lifetime.
+    /// </summary>
     public static void UnregisterWeight<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
@@ -337,6 +364,18 @@ public static class WeightRegistry
         // outstanding allocations.
         lock (_lock)
         {
+            // Allocated-but-never-registered tensors carry a non-zero
+            // StreamingReservedBytes and a -1 StreamingPoolHandle. Give
+            // the reservation back to the pool. Tensors that DID go
+            // through RegisterWeight already had their reservation
+            // released there (and StreamingReservedBytes cleared to 0),
+            // so this is a no-op for the normal path.
+            long reserved = weight.StreamingReservedBytes;
+            if (reserved > 0 && weight.StreamingPoolHandle < 0)
+            {
+                _streamingPool?.ReleaseReservation(reserved);
+                weight.StreamingReservedBytes = 0;
+            }
             if (weight.StreamingPoolHandle >= 0)
             {
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
