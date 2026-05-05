@@ -559,6 +559,18 @@ public abstract class TensorBase<T> : IDisposable
     public long StreamingPoolHandle { get; internal set; } = -1;
 
     /// <summary>
+    /// Bytes the streaming pool has pre-reserved against its budget on
+    /// behalf of this tensor between <c>WeightRegistry.AllocateStreaming</c>
+    /// and the matching <c>WeightRegistry.RegisterWeight</c>. Used to
+    /// prevent a TOCTOU race where two concurrent allocate-then-register
+    /// flows both pass the pre-allocate eviction gate but together push
+    /// resident bytes past budget before either Register lands. Owned by
+    /// <see cref="WeightRegistry"/>; setter is internal so external code
+    /// can't desync the pool's <c>_reservedBytes</c> bookkeeping.
+    /// </summary>
+    internal long StreamingReservedBytes { get; set; }
+
+    /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is
     /// <see cref="WeightLifetime.GpuOffload"/> or
     /// <see cref="WeightLifetime.GpuManaged"/>. Owned by

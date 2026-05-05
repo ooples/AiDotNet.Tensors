@@ -52,6 +52,20 @@ public static class WeightRegistry
                 throw new InvalidOperationException(
                     $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.RegisteredEntryCount} " +
                     "registered entries. Unregister all weights first, or call Reset() to forcibly drop them.");
+            // Same for outstanding reservations from in-flight
+            // AllocateStreaming calls that haven't yet hit RegisterWeight.
+            // Swapping the pool here would orphan those reservations: the
+            // tensor still carries StreamingReservedBytes but the pool
+            // that recorded it is gone, so RegisterWeight / UnregisterWeight
+            // would later release bytes against the WRONG pool — corrupting
+            // the new pool's _reservedBytes accounting and letting later
+            // allocators overshoot the budget.
+            if (_streamingPool is not null && _streamingPool.ReservedBytes > 0)
+                throw new InvalidOperationException(
+                    $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.ReservedBytes} " +
+                    "bytes of outstanding reservations from AllocateStreaming calls that haven't yet " +
+                    "called RegisterWeight (or UnregisterWeight). Complete or abandon those allocations first, " +
+                    "or call Reset() to forcibly drop them.");
 
             // Dispose the previous allocator before swapping — otherwise its
             // outstanding pinned/managed allocations + native context are
@@ -122,6 +136,21 @@ public static class WeightRegistry
                         var bytes = new byte[byteCount];
                         SerializeToBytes(weight, bytes);
                         var pool = StreamingPoolUnlocked();
+                        // If this tensor was produced by AllocateStreaming,
+                        // it carries the reservation byteCount the pool
+                        // pre-evicted on its behalf. Release the
+                        // reservation BEFORE Register so the pool's
+                        // budget check sees the same byteCount land in
+                        // _residentBytes that came out of _reservedBytes —
+                        // net-zero on the budget rather than counting
+                        // double. Tensors not produced by AllocateStreaming
+                        // have StreamingReservedBytes == 0 (no-op).
+                        long reserved = weight.StreamingReservedBytes;
+                        if (reserved > 0)
+                        {
+                            pool.ReleaseReservation(reserved);
+                            weight.StreamingReservedBytes = 0;
+                        }
                         long handle = pool.Register(bytes);
                         // Two-phase commit: drop storage FIRST (the operation
                         // that can throw — non-contiguous, view, shared
@@ -200,7 +229,178 @@ public static class WeightRegistry
         }
     }
 
-    /// <summary>Unregisters and frees backing storage.</summary>
+    /// <summary>
+    /// Allocates a tensor whose storage will be paged through the
+    /// streaming pool, reserving budget headroom for it in advance.
+    /// "Streaming" not "Registered" — the returned tensor is
+    /// pre-reserved against the pool budget but NOT yet registered;
+    /// callers must still invoke <see cref="RegisterWeight{T}"/> to
+    /// commit it to the pool.
+    ///
+    /// <para>The pool evicts LRU resident entries to disk BEFORE this
+    /// method allocates AND records a reservation so a concurrent
+    /// allocator can't pass the same eviction gate. For a long sequence
+    /// of large allocations the pool budget therefore bounds peak
+    /// GC-heap occupancy. Without this, allocating 64 MHA layers' worth
+    /// of weights at 2.1 GB each on the lazy materialization path peaks
+    /// at 134 GB resident before any register runs — exactly the OOM
+    /// mode #1222 / PaLM-E 562B exhibits.</para>
+    /// </summary>
+    /// <typeparam name="T">Numeric element type. Must be one of the
+    /// streamable types (float, double, int, long, Half, BFloat16);
+    /// other types throw <see cref="NotSupportedException"/> upfront so
+    /// the pool's eviction loop doesn't churn the LRU on behalf of a
+    /// tensor that <see cref="RegisterWeight{T}"/> would later refuse
+    /// to serialize anyway.</typeparam>
+    /// <param name="shape">Per-axis dimensions for the new tensor. Same
+    /// contract as <see cref="Tensor{T}(int[])"/>.</param>
+    /// <returns>A materialized tensor with zero-initialized storage and
+    /// <see cref="WeightLifetime.Streaming"/> already set on the
+    /// instance. Caller is expected to:
+    ///   1. Initialize weights (Xavier / He / etc.).
+    ///   2. Call <see cref="RegisterWeight{T}"/> to commit it to the
+    ///      pool — that's when the reservation transitions to
+    ///      resident bytes and
+    ///      <see cref="Tensor{T}.StreamingPoolHandle"/> is assigned.
+    /// If the caller bails between Allocate and Register (e.g. an
+    /// exception during weight initialization, or the layer is torn
+    /// down before its first forward), call
+    /// <see cref="UnregisterWeight{T}"/> with the allocated tensor to
+    /// release its reservation and return the headroom to the pool
+    /// budget. <see cref="Tensor{T}.StreamingReservedBytes"/> is
+    /// internal and not directly callable from external code —
+    /// <see cref="UnregisterWeight{T}"/> is the public cancellation
+    /// path.
+    /// </returns>
+    /// <remarks>
+    /// <para>The eviction step is best-effort: the pool's reservation
+    /// helper walks the LRU until either the requested headroom is
+    /// available OR the LRU is empty (or the request exceeds the
+    /// entire budget — short-circuit). In any of those cases the
+    /// allocation still proceeds — the goal is to reduce the peak,
+    /// not eliminate the possibility of OOM. Pool-budget tuning is
+    /// the caller's responsibility.</para>
+    /// <para>Locking: the registry-wide <c>_lock</c> is held only long
+    /// enough to take a stable reference to the streaming pool and
+    /// reserve budget. The actual <c>new Tensor&lt;T&gt;(shape)</c>
+    /// runs OUTSIDE the lock so concurrent <see cref="RegisterWeight{T}"/>
+    /// / <see cref="UnregisterWeight{T}"/> calls aren't blocked for the
+    /// (potentially multi-hundred-MB) GC heap allocation. The pool's
+    /// own lock guarantees the reservation is atomic; releasing it on
+    /// allocation failure also goes through the pool's lock, not the
+    /// registry's.</para>
+    /// </remarks>
+    public static Tensor<T> AllocateStreaming<T>(int[] shape)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        // Reject unsupported element types BEFORE we touch the pool.
+        // Without this gate, AllocateStreaming<decimal>(...) would
+        // happily evict resident weights to make room for a tensor
+        // that RegisterWeight would later refuse with
+        // NotSupportedException — turning the user's type mistake into
+        // a pool-churn DoS that pages out warm weights for no reason.
+        if (!IsStreamableType<T>())
+            throw new NotSupportedException(
+                $"WeightRegistry.AllocateStreaming: element type {typeof(T).Name} is not " +
+                "supported by the streaming pool. Supported types: float, double, int, long, " +
+                "Half, BFloat16. Use plain `new Tensor<T>(shape)` for non-streamable types.");
+        // Compute byte count up-front so we can reserve the right amount
+        // BEFORE the GC heap takes the hit. Check the int.MaxValue bound
+        // INSIDE the loop instead of relying on `checked` overflow at
+        // the end — `checked(int.MaxValue * int.MaxValue * 3)` would
+        // throw OverflowException, masking the cleaner chunking-hint
+        // error this method's contract promises. By short-circuiting on
+        // each dim multiply we surface the oversize case as
+        // NotSupportedException with the documented message regardless
+        // of how pathologically large the shape is.
+        long elements = 1L;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            int dim = shape[i];
+            if (dim < 0)
+                throw new ArgumentException($"shape[{i}] must be non-negative; got {dim}", nameof(shape));
+            // Guard against int.MaxValue bound BEFORE the multiply so
+            // `checked` doesn't fire first. elements * dim could exceed
+            // int.MaxValue even when elements <= int.MaxValue (e.g.
+            // elements=int.MaxValue, dim=2). Compare in long arithmetic.
+            if (dim > 0 && elements > int.MaxValue / dim)
+            {
+                throw new NotSupportedException(
+                    $"AllocateStreaming: per-tensor element count exceeds the " +
+                    $"int.MaxValue ({int.MaxValue}) bound that the streaming pool's byte[] " +
+                    "buffer can represent (overflow at shape[" + i + "]). Chunk the tensor " +
+                    "into smaller pool entries on the consumer side.");
+            }
+            elements *= dim;
+        }
+
+        int byteCount = elements > 0 ? CheckedStreamingByteCount<T>((int)elements) : 0;
+
+        // Phase 1: under registry lock, take a stable reference to the
+        // streaming pool. The pool's own lock will then guard the
+        // reservation atomically. We MUST NOT hold the registry lock
+        // across the GC heap allocation below — for the multi-hundred-MB
+        // tensors this API targets, that would block all unrelated
+        // RegisterWeight / UnregisterWeight calls for the full
+        // allocation duration (or the duration of an OOM throw).
+        StreamingTensorPool? pool;
+        lock (_lock)
+        {
+            // _options is field-initialized to `new GpuOffloadOptions()`
+            // and never set to null (Configure rejects null; Reset
+            // assigns a fresh default), so there is no "streaming not
+            // configured" state to fall back from. Always-on contract.
+            pool = byteCount > 0 ? StreamingPoolUnlocked() : null;
+        }
+
+        // Phase 2: reservation — atomic via the pool's own lock.
+        // Concurrent AllocateStreaming calls each see each other's
+        // reservation in EvictUntilFreeBytesUnlocked's free-bytes
+        // calculation, so neither overshoots budget.
+        pool?.ReserveBytes(byteCount);
+
+        // Phase 3: allocate OUTSIDE both locks. The tensor's storage
+        // hits the GC heap here — there's no way to skip that without
+        // a full storage-from-pool refactor — but the registry lock
+        // is now free for unrelated registry traffic, and the pool's
+        // budget invariant is enforced by the reservation we already
+        // recorded.
+        //
+        // Roll back the reservation if the constructor or property
+        // initializer throws (e.g. OOM on the GC byte[] allocation,
+        // or a future ctor-arg validation rejecting the shape):
+        // without this catch, the reserved headroom would leak and
+        // the pool's _reservedBytes would drift up by byteCount on
+        // every failed AllocateStreaming, eventually starving the
+        // budget for legitimate allocators.
+        try
+        {
+            return new Tensor<T>(shape)
+            {
+                Lifetime = WeightLifetime.Streaming,
+                StreamingReservedBytes = byteCount,
+            };
+        }
+        catch
+        {
+            pool?.ReleaseReservation(byteCount);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Unregisters and frees backing storage. Also serves as the public
+    /// cancellation path for tensors that were produced by
+    /// <see cref="AllocateStreaming{T}"/> but never went on to
+    /// <see cref="RegisterWeight{T}"/>: callers in that "allocated but
+    /// abandoned" state pass the tensor to UnregisterWeight to give the
+    /// pool's reserved headroom back to the budget. Without this path,
+    /// <see cref="Tensor{T}.StreamingReservedBytes"/> would be inaccessible
+    /// to external callers (it is internal so external code can't
+    /// desync the pool's bookkeeping by mutating it directly), so the
+    /// reservation would stay stranded for the rest of the process's
+    /// lifetime.
+    /// </summary>
     public static void UnregisterWeight<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
@@ -209,6 +409,18 @@ public static class WeightRegistry
         // outstanding allocations.
         lock (_lock)
         {
+            // Allocated-but-never-registered tensors carry a non-zero
+            // StreamingReservedBytes and a -1 StreamingPoolHandle. Give
+            // the reservation back to the pool. Tensors that DID go
+            // through RegisterWeight already had their reservation
+            // released there (and StreamingReservedBytes cleared to 0),
+            // so this is a no-op for the normal path.
+            long reserved = weight.StreamingReservedBytes;
+            if (reserved > 0 && weight.StreamingPoolHandle < 0)
+            {
+                _streamingPool?.ReleaseReservation(reserved);
+                weight.StreamingReservedBytes = 0;
+            }
             if (weight.StreamingPoolHandle >= 0)
             {
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
@@ -277,18 +489,47 @@ public static class WeightRegistry
         return (int)byteCountLong;
     }
 
-    private static int ElementSize<T>()
+    /// <summary>
+    /// Single source of truth for the streamable-type table. Returns the
+    /// per-element byte size when <typeparamref name="T"/> is one of
+    /// the supported types; returns 0 when <typeparamref name="T"/> is
+    /// not streamable. <see cref="IsStreamableType{T}"/>,
+    /// <see cref="ElementSize{T}"/>, and <see cref="SerializeToBytes{T}"/>
+    /// all derive from this helper so adding a new streamable type is
+    /// a single-place change.
+    /// </summary>
+    /// <remarks>
+    /// Marshal.SizeOf&lt;Half&gt;() is host-dependent (returns 2 on
+    /// .NET 5+, 4 on net471 polyfills), so deferring to it would
+    /// mismatch the byte layout SerializeToBytes / RestoreStorageFromBytes
+    /// expect. The hand-coded sizes here agree with those codecs.
+    /// </remarks>
+    private static int StreamableTypeSize<T>()
     {
-        // Use typed fast-path sizes that agree with SerializeToBytes /
-        // TensorBase.ElementSizeForStreaming. Marshal.SizeOf<Half>() is
-        // host-dependent (returns 2 on .NET 5+, 4 on net471 polyfills),
-        // so deferring to it would mismatch the byte layout.
         if (typeof(T) == typeof(float)) return sizeof(float);
         if (typeof(T) == typeof(double)) return sizeof(double);
         if (typeof(T) == typeof(int)) return sizeof(int);
         if (typeof(T) == typeof(long)) return sizeof(long);
         if (typeof(T) == typeof(Half)) return 2;
         if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return 2;
+        return 0; // not streamable
+    }
+
+    /// <summary>
+    /// True when <typeparamref name="T"/> can be losslessly serialized to
+    /// the streaming pool's byte buffer. Derived from
+    /// <see cref="StreamableTypeSize{T}"/> — extending the supported set
+    /// requires adding to that one method. Used by
+    /// <see cref="AllocateStreaming{T}"/> to fail fast before the pool's
+    /// eviction loop churns the LRU and by <see cref="SerializeToBytes{T}"/>
+    /// as the contract gate.
+    /// </summary>
+    internal static bool IsStreamableType<T>() => StreamableTypeSize<T>() > 0;
+
+    private static int ElementSize<T>()
+    {
+        int sz = StreamableTypeSize<T>();
+        if (sz > 0) return sz;
         // Anything else: fall through to Marshal.SizeOf — these types
         // can't actually be serialized (SerializeToBytes throws), but
         // ElementSize is also used for the GpuOffload byteCount which

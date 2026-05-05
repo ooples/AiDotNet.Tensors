@@ -30,8 +30,69 @@ public sealed class VulkanOffloadAllocator : IGpuOffloadAllocator
     private uint _hostVisibleDeviceLocalMemTypeIndex = uint.MaxValue; // Pinned scheme (ReBAR)
     private readonly object _lock = new();
     private bool _disposed;
+    // IsAvailable cache. The loader-probe is necessary but not
+    // sufficient — a host can have the Vulkan ICD installed yet no
+    // physical device exposed (CI runners, VMs, headless boxes). The
+    // first call to IsAvailable does a one-shot device-enumeration
+    // probe and caches the result so subsequent calls are O(1).
+    // _availabilityProbed=false until the first IsAvailable read.
+    private static int _availabilityProbed; // 0 / 1
+    private static bool _availabilityResult;
 
-    public bool IsAvailable => VulkanLoaderProbe.IsAvailable;
+    public bool IsAvailable
+    {
+        get
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref _availabilityProbed, 1, 0) == 0)
+            {
+                _availabilityResult = VulkanLoaderProbe.IsAvailable && ProbeHasPhysicalDevice();
+            }
+            return _availabilityResult;
+        }
+    }
+
+    /// <summary>
+    /// Confirms at least one Vulkan physical device is enumerable. The
+    /// loader probe (vkEnumerateInstanceVersion) only verifies the DLL is
+    /// resolvable; on hosts with the Vulkan ICD installed but no
+    /// Vulkan-capable GPU (CI, headless VMs, llvmpipe-only) the
+    /// allocator's first <see cref="EnsureDevice"/> would otherwise fail
+    /// at vkEnumeratePhysicalDevices, after the test already passed the
+    /// IsAvailable gate. This probe runs that enumeration once at
+    /// startup so IsAvailable is honest about whether Allocate can
+    /// succeed.
+    /// </summary>
+    private static bool ProbeHasPhysicalDevice()
+    {
+        IntPtr device = IntPtr.Zero;
+        IntPtr instance = IntPtr.Zero;
+        try
+        {
+            var setup = VulkanInstanceSetup.CreateMinimal();
+            device = setup.Device;
+            instance = setup.Instance;
+            return device != IntPtr.Zero;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            // CreateMinimal allocates an instance + device on success;
+            // tear them down so the probe doesn't leak the handles for
+            // the process lifetime. The real allocator's Allocate will
+            // recreate them via its own EnsureDevice on first use.
+            if (device != IntPtr.Zero)
+            {
+                try { VulkanInstanceSetup.vkDestroyDevice(device, IntPtr.Zero); } catch { }
+            }
+            if (instance != IntPtr.Zero)
+            {
+                try { VulkanInstanceSetup.vkDestroyInstance(instance, IntPtr.Zero); } catch { }
+            }
+        }
+    }
 
     private void EnsureDevice()
     {
