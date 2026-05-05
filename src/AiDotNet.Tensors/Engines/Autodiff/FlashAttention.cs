@@ -382,9 +382,18 @@ public static class FlashAttention<T> where T : unmanaged
         return offset;
     }
 
-    // ── Float kernel (paper-faithful Dao 2023) ──────────────────────────
+    // ── Float kernel (paper-faithful Dao 2023, AVX2/FMA SIMD) ───────────
+    //
+    // Inner kernel uses Vector256<float> primitives from
+    // FlashAttentionFloatSimd: dot product (FMA), online-softmax row
+    // max + exp (FastExp256), V accumulate (FMA), final normalize.
+    // Loop shape and online-softmax invariants are unchanged from the
+    // scalar reference — only the per-element arithmetic is vectorized.
+    // The pre-existing FusedAttention.FlashAttentionForwardPtr proved
+    // out the same SIMD pattern; we add LogSumExp + bias + queryOffset
+    // here.
 
-    private static void ForwardFloat(
+    private static unsafe void ForwardFloat(
         float[] q, float[] k, float[] v, float[]? bias,
         float[] o, float[] lse,
         int batchProduct, int Sq, int Sk, int headDim, int Dv,
@@ -398,96 +407,101 @@ public static class FlashAttention<T> where T : unmanaged
         var oBlock = new float[Br * Dv];
         var sBlock = new float[Br * Bc];
 
-        for (int b = 0; b < batchProduct; b++)
+        fixed (float* pQ = q)
+        fixed (float* pK = k)
+        fixed (float* pV = v)
+        fixed (float* pO = o)
+        fixed (float* pLse = lse)
+        fixed (float* pBias = bias)
+        fixed (float* pSBlock = sBlock)
+        fixed (float* pOBlock = oBlock)
         {
-            int qBase = b * Sq * headDim;
-            int kBase = b * Sk * headDim;
-            int vBase = b * Sk * Dv;
-            int oBase = b * Sq * Dv;
-            int lseBase = b * Sq;
-            int biasBase = bias is not null ? BiasPrefixOffsetFor(b, prefixShape, biasPrefixStrides) : 0;
-
-            for (int qStart = 0; qStart < Sq; qStart += Br)
+            for (int b = 0; b < batchProduct; b++)
             {
-                int qEnd = Math.Min(qStart + Br, Sq);
-                int qLen = qEnd - qStart;
+                int qBase = b * Sq * headDim;
+                int kBase = b * Sk * headDim;
+                int vBase = b * Sk * Dv;
+                int oBase = b * Sq * Dv;
+                int lseBase = b * Sq;
+                int biasBase = bias is not null ? BiasPrefixOffsetFor(b, prefixShape, biasPrefixStrides) : 0;
 
-                for (int i = 0; i < qLen; i++)
+                for (int qStart = 0; qStart < Sq; qStart += Br)
                 {
-                    mRow[i] = float.NegativeInfinity;
-                    lRow[i] = 0f;
-                }
-                Array.Clear(oBlock, 0, qLen * Dv);
+                    int qEnd = Math.Min(qStart + Br, Sq);
+                    int qLen = qEnd - qStart;
 
-                for (int kStart = 0; kStart < Sk; kStart += Bc)
-                {
-                    int kEnd = Math.Min(kStart + Bc, Sk);
-                    int kLen = kEnd - kStart;
-                    if (isCausal && kStart > queryOffset + qEnd - 1) break;
-
-                    // S = Q @ K^T * scale
-                    for (int ii = 0; ii < qLen; ii++)
+                    for (int i = 0; i < qLen; i++)
                     {
-                        int qRow = qBase + (qStart + ii) * headDim;
-                        for (int jj = 0; jj < kLen; jj++)
+                        mRow[i] = float.NegativeInfinity;
+                        lRow[i] = 0f;
+                    }
+                    Array.Clear(oBlock, 0, qLen * Dv);
+
+                    for (int kStart = 0; kStart < Sk; kStart += Bc)
+                    {
+                        int kEnd = Math.Min(kStart + Bc, Sk);
+                        int kLen = kEnd - kStart;
+                        if (isCausal && kStart > queryOffset + qEnd - 1) break;
+
+                        // ── Score tile: S[ii, jj] = (Q[ii] · K[jj]) * scale (+ bias)
+                        // ── with optional causal mask. Inner dot is SIMD.
+                        for (int ii = 0; ii < qLen; ii++)
                         {
-                            int kRow = kBase + (kStart + jj) * headDim;
-                            float acc = 0f;
-                            for (int d = 0; d < headDim; d++) acc += q[qRow + d] * k[kRow + d];
-                            float score = acc * scale;
-                            if (bias is not null)
-                                score += bias[biasBase + (qStart + ii) * Sk + (kStart + jj)];
-                            if (isCausal && (kStart + jj) > queryOffset + qStart + ii)
-                                score = float.NegativeInfinity;
-                            sBlock[ii * Bc + jj] = score;
+                            float* qRowPtr = pQ + qBase + (qStart + ii) * headDim;
+                            float* sRowPtr = pSBlock + ii * Bc;
+                            for (int jj = 0; jj < kLen; jj++)
+                            {
+                                float* kRowPtr = pK + kBase + (kStart + jj) * headDim;
+                                float dot = FlashAttentionFloatSimd.DotProduct(qRowPtr, kRowPtr, headDim);
+                                float score = dot * scale;
+                                if (bias is not null)
+                                    score += pBias[biasBase + (qStart + ii) * Sk + (kStart + jj)];
+                                if (isCausal && (kStart + jj) > queryOffset + qStart + ii)
+                                    score = float.NegativeInfinity;
+                                sRowPtr[jj] = score;
+                            }
+                        }
+
+                        // ── Online softmax + accumulate P · V per Q row.
+                        // RowMaxAndExp does row-max (Avx.Max + HorizontalMax)
+                        // then in-place exp (FastExp256) returning alpha and
+                        // the partial denominator. RescaleAndAccumulatePV
+                        // does the FMA-vectorized output update.
+                        for (int ii = 0; ii < qLen; ii++)
+                        {
+                            float* sRowPtr = pSBlock + ii * Bc;
+                            float* oRowPtr = pOBlock + ii * Dv;
+
+                            FlashAttentionFloatSimd.RowMaxAndExp(
+                                sRowPtr, kLen, mRow[ii],
+                                out float mNew, out float alpha, out float lUpdate);
+
+                            FlashAttentionFloatSimd.RescaleAndAccumulatePV(
+                                oRowPtr, alpha,
+                                sRowPtr, pV + vBase, kStart, kLen, Dv, Dv);
+
+                            mRow[ii] = mNew;
+                            lRow[ii] = alpha * lRow[ii] + lUpdate;
                         }
                     }
 
-                    // Online softmax + accumulate P @ V.
+                    // ── Finalize: normalize by l, save LogSumExp = m + log(l).
                     for (int ii = 0; ii < qLen; ii++)
                     {
-                        int sRowBase = ii * Bc;
-                        float rowMax = float.NegativeInfinity;
-                        for (int jj = 0; jj < kLen; jj++)
-                            if (sBlock[sRowBase + jj] > rowMax) rowMax = sBlock[sRowBase + jj];
-                        float mPrev = mRow[ii];
-                        float mNew = Math.Max(mPrev, rowMax);
-                        float alpha = float.IsNegativeInfinity(mPrev) ? 0f : (float)Math.Exp(mPrev - mNew);
-                        int oRowBase = ii * Dv;
-                        float lNew = alpha * lRow[ii];
-                        for (int jj = 0; jj < kLen; jj++)
-                        {
-                            float p = (float)Math.Exp(sBlock[sRowBase + jj] - mNew);
-                            lNew += p;
-                            int vRow = vBase + (kStart + jj) * Dv;
-                            if (jj == 0 && alpha != 1f)
-                            {
-                                for (int d = 0; d < Dv; d++)
-                                    oBlock[oRowBase + d] = alpha * oBlock[oRowBase + d] + p * v[vRow + d];
-                            }
-                            else
-                            {
-                                for (int d = 0; d < Dv; d++)
-                                    oBlock[oRowBase + d] += p * v[vRow + d];
-                            }
-                        }
-                        mRow[ii] = mNew;
-                        lRow[ii] = lNew;
+                        float invL = lRow[ii] == 0f ? 0f : 1f / lRow[ii];
+                        float* oRowPtr = pO + oBase + (qStart + ii) * Dv;
+                        float* oBlockRowPtr = pOBlock + ii * Dv;
+                        // Copy oBlock → output then normalize.
+                        for (int d = 0; d < Dv; d++) oRowPtr[d] = oBlockRowPtr[d];
+                        FlashAttentionFloatSimd.NormalizeRow(oRowPtr, invL, Dv);
+                        pLse[lseBase + qStart + ii] = mRow[ii] + MathF.Log(lRow[ii] == 0f ? 1e-30f : lRow[ii]);
                     }
-                }
-
-                for (int ii = 0; ii < qLen; ii++)
-                {
-                    float invL = lRow[ii] == 0f ? 0f : 1f / lRow[ii];
-                    int oRow = oBase + (qStart + ii) * Dv;
-                    for (int d = 0; d < Dv; d++) o[oRow + d] = oBlock[ii * Dv + d] * invL;
-                    lse[lseBase + qStart + ii] = mRow[ii] + (float)Math.Log(lRow[ii] == 0f ? 1e-30f : lRow[ii]);
                 }
             }
         }
     }
 
-    private static void BackwardFloat(
+    private static unsafe void BackwardFloat(
         float[] dO, float[] q, float[] k, float[] v, float[] o, float[] lse,
         float[]? bias,
         float[] dQ, float[] dK, float[] dV,
@@ -495,18 +509,23 @@ public static class FlashAttention<T> where T : unmanaged
         int blockSizeQ, int blockSizeKV, float scale, bool isCausal, int queryOffset,
         int[] prefixShape, int[] biasPrefixStrides)
     {
-        // D_i = row-wise sum(dO * O) across Dv — used in dS.
+        // D_i = row-wise sum(dO * O) across Dv — used in dS. Inner sum
+        // is a SIMD dot product (same primitive as the forward Q·K^T).
         var D = new float[batchProduct * Sq];
-        for (int b = 0; b < batchProduct; b++)
+        fixed (float* pdO_pre = dO)
+        fixed (float* pO_pre = o)
+        fixed (float* pD_pre = D)
         {
-            int oBase = b * Sq * Dv;
-            int dBase = b * Sq;
-            for (int i = 0; i < Sq; i++)
+            for (int b = 0; b < batchProduct; b++)
             {
-                int oRow = oBase + i * Dv;
-                float acc = 0f;
-                for (int d = 0; d < Dv; d++) acc += dO[oRow + d] * o[oRow + d];
-                D[dBase + i] = acc;
+                int oBase = b * Sq * Dv;
+                int dBase = b * Sq;
+                for (int i = 0; i < Sq; i++)
+                {
+                    int oRow = oBase + i * Dv;
+                    pD_pre[dBase + i] = FlashAttentionFloatSimd.DotProduct(
+                        pdO_pre + oRow, pO_pre + oRow, Dv);
+                }
             }
         }
 
@@ -515,82 +534,122 @@ public static class FlashAttention<T> where T : unmanaged
         var sBlock = new float[Br * Bc];
         var pBlock = new float[Br * Bc];
 
-        for (int b = 0; b < batchProduct; b++)
+        fixed (float* pQ = q)
+        fixed (float* pK = k)
+        fixed (float* pV = v)
+        fixed (float* pO = o)
+        fixed (float* pdO = dO)
+        fixed (float* pLse = lse)
+        fixed (float* pBias = bias)
+        fixed (float* pdQ = dQ)
+        fixed (float* pdK = dK)
+        fixed (float* pdV = dV)
+        fixed (float* pD = D)
+        fixed (float* pSBlock = sBlock)
+        fixed (float* pPBlock = pBlock)
         {
-            int qBase = b * Sq * headDim;
-            int kBase = b * Sk * headDim;
-            int vBase = b * Sk * Dv;
-            int oBase = b * Sq * Dv;
-            int lseBase = b * Sq;
-            int biasBase = bias is not null ? BiasPrefixOffsetFor(b, prefixShape, biasPrefixStrides) : 0;
-
-            for (int qStart = 0; qStart < Sq; qStart += Br)
+            for (int b = 0; b < batchProduct; b++)
             {
-                int qEnd = Math.Min(qStart + Br, Sq);
-                int qLen = qEnd - qStart;
-                for (int kStart = 0; kStart < Sk; kStart += Bc)
+                int qBase = b * Sq * headDim;
+                int kBase = b * Sk * headDim;
+                int vBase = b * Sk * Dv;
+                int oBase = b * Sq * Dv;
+                int lseBase = b * Sq;
+                int biasBase = bias is not null ? BiasPrefixOffsetFor(b, prefixShape, biasPrefixStrides) : 0;
+
+                for (int qStart = 0; qStart < Sq; qStart += Br)
                 {
-                    int kEnd = Math.Min(kStart + Bc, Sk);
-                    int kLen = kEnd - kStart;
-                    if (isCausal && kStart > queryOffset + qEnd - 1) break;
-
-                    // Recompute S.
-                    for (int ii = 0; ii < qLen; ii++)
+                    int qEnd = Math.Min(qStart + Br, Sq);
+                    int qLen = qEnd - qStart;
+                    for (int kStart = 0; kStart < Sk; kStart += Bc)
                     {
-                        int qRow = qBase + (qStart + ii) * headDim;
-                        for (int jj = 0; jj < kLen; jj++)
+                        int kEnd = Math.Min(kStart + Bc, Sk);
+                        int kLen = kEnd - kStart;
+                        if (isCausal && kStart > queryOffset + qEnd - 1) break;
+
+                        // ── Recompute S = Q @ K^T * scale + bias  (SIMD dot)
+                        for (int ii = 0; ii < qLen; ii++)
                         {
-                            int kRow = kBase + (kStart + jj) * headDim;
-                            float acc = 0f;
-                            for (int d = 0; d < headDim; d++) acc += q[qRow + d] * k[kRow + d];
-                            float score = acc * scale;
-                            if (bias is not null)
-                                score += bias[biasBase + (qStart + ii) * Sk + (kStart + jj)];
-                            if (isCausal && (kStart + jj) > queryOffset + qStart + ii)
-                                score = float.NegativeInfinity;
-                            sBlock[ii * Bc + jj] = score;
-                        }
-                    }
-
-                    // P = softmax(S) reconstructed from saved LSE.
-                    for (int ii = 0; ii < qLen; ii++)
-                    {
-                        float lseV = lse[lseBase + qStart + ii];
-                        for (int jj = 0; jj < kLen; jj++)
-                            pBlock[ii * Bc + jj] = (float)Math.Exp(sBlock[ii * Bc + jj] - lseV);
-                    }
-
-                    // dV += P^T @ dO
-                    for (int jj = 0; jj < kLen; jj++)
-                    {
-                        int vRow = vBase + (kStart + jj) * Dv;
-                        for (int d = 0; d < Dv; d++)
-                        {
-                            float acc = 0f;
-                            for (int ii = 0; ii < qLen; ii++)
-                                acc += pBlock[ii * Bc + jj] * dO[oBase + (qStart + ii) * Dv + d];
-                            dV[vRow + d] += acc;
-                        }
-                    }
-
-                    // dQ, dK from dP/dS chain.
-                    for (int ii = 0; ii < qLen; ii++)
-                    {
-                        int dORow = oBase + (qStart + ii) * Dv;
-                        float dI = D[lseBase + qStart + ii];
-                        for (int jj = 0; jj < kLen; jj++)
-                        {
-                            int vRow = vBase + (kStart + jj) * Dv;
-                            float dP = 0f;
-                            for (int d = 0; d < Dv; d++) dP += dO[dORow + d] * v[vRow + d];
-                            float p = pBlock[ii * Bc + jj];
-                            float dS = p * (dP - dI) * scale;
-                            int qRow = qBase + (qStart + ii) * headDim;
-                            int kRow = kBase + (kStart + jj) * headDim;
-                            for (int d = 0; d < headDim; d++)
+                            float* qRowPtr = pQ + qBase + (qStart + ii) * headDim;
+                            float* sRowPtr = pSBlock + ii * Bc;
+                            for (int jj = 0; jj < kLen; jj++)
                             {
-                                dQ[qRow + d] += dS * k[kRow + d];
-                                dK[kRow + d] += dS * q[qRow + d];
+                                float* kRowPtr = pK + kBase + (kStart + jj) * headDim;
+                                float dot = FlashAttentionFloatSimd.DotProduct(qRowPtr, kRowPtr, headDim);
+                                float score = dot * scale;
+                                if (bias is not null)
+                                    score += pBias[biasBase + (qStart + ii) * Sk + (kStart + jj)];
+                                if (isCausal && (kStart + jj) > queryOffset + qStart + ii)
+                                    score = float.NegativeInfinity;
+                                sRowPtr[jj] = score;
+                            }
+                        }
+
+                        // ── P = exp(S - lse) using SIMD vector exp.
+                        // Same FastExp256 pattern as forward; pBlock is
+                        // freshly written so we don't need an alpha rescale.
+                        for (int ii = 0; ii < qLen; ii++)
+                        {
+                            float lseV = pLse[lseBase + qStart + ii];
+                            float* sRowPtr = pSBlock + ii * Bc;
+                            float* pRowPtr = pPBlock + ii * Bc;
+                            int jj = 0;
+#if NET5_0_OR_GREATER
+                            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && kLen >= 8)
+                            {
+                                var vLse = System.Runtime.Intrinsics.Vector256.Create(lseV);
+                                int bulkEnd = kLen - (kLen & 7);
+                                for (; jj < bulkEnd; jj += 8)
+                                {
+                                    var s = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sRowPtr + jj);
+                                    var p = AiDotNet.Tensors.Engines.Simd.SimdKernels.FastExp256(
+                                        System.Runtime.Intrinsics.X86.Avx.Subtract(s, vLse));
+                                    System.Runtime.Intrinsics.X86.Avx.Store(pRowPtr + jj, p);
+                                }
+                            }
+#endif
+                            for (; jj < kLen; jj++)
+                                pRowPtr[jj] = MathF.Exp(sRowPtr[jj] - lseV);
+                        }
+
+                        // ── dV += P^T @ dO  — for each (jj, d), accumulate
+                        // sum_ii P[ii,jj] · dO[ii,d]. Equivalent to: for
+                        // each ii, AXPY add P[ii,jj] · dO[ii,:] into
+                        // dV[jj, :]. AXPY is a textbook SIMD primitive.
+                        for (int jj = 0; jj < kLen; jj++)
+                        {
+                            float* dvRowPtr = pdV + vBase + (kStart + jj) * Dv;
+                            for (int ii = 0; ii < qLen; ii++)
+                            {
+                                float pij = pPBlock[ii * Bc + jj];
+                                if (pij == 0f) continue;
+                                float* dORowPtr = pdO + oBase + (qStart + ii) * Dv;
+                                FlashAttentionFloatSimd.AxpyAccumulate(dvRowPtr, dORowPtr, pij, Dv);
+                            }
+                        }
+
+                        // ── dQ, dK chain.
+                        // dP[ii,jj] = dO[ii,:] · V[jj,:]   (SIMD dot)
+                        // dS[ii,jj] = P[ii,jj] · (dP - D[ii]) · scale
+                        // dQ[ii,:] += sum_jj dS[ii,jj] · K[jj,:]   (AXPY)
+                        // dK[jj,:] += sum_ii dS[ii,jj] · Q[ii,:]   (AXPY)
+                        for (int ii = 0; ii < qLen; ii++)
+                        {
+                            float* dORowPtr = pdO + oBase + (qStart + ii) * Dv;
+                            float dI = pD[lseBase + qStart + ii];
+                            float* dqRowPtr = pdQ + qBase + (qStart + ii) * headDim;
+                            float* qRowPtr = pQ + qBase + (qStart + ii) * headDim;
+                            for (int jj = 0; jj < kLen; jj++)
+                            {
+                                float* vRowPtr = pV + vBase + (kStart + jj) * Dv;
+                                float dP = FlashAttentionFloatSimd.DotProduct(dORowPtr, vRowPtr, Dv);
+                                float p = pPBlock[ii * Bc + jj];
+                                float dS = p * (dP - dI) * scale;
+                                if (dS == 0f) continue;
+                                float* kRowPtr = pK + kBase + (kStart + jj) * headDim;
+                                float* dkRowPtr = pdK + kBase + (kStart + jj) * headDim;
+                                FlashAttentionFloatSimd.AxpyAccumulate(dqRowPtr, kRowPtr, dS, headDim);
+                                FlashAttentionFloatSimd.AxpyAccumulate(dkRowPtr, qRowPtr, dS, headDim);
                             }
                         }
                     }
