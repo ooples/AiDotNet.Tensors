@@ -42,6 +42,42 @@ public static class Losses
         var inSpan = input.AsSpan();
         var tgtSpan = target.AsSpan();
         var outSpan = output.AsWritableSpan();
+
+        // #294 NumericFastPath: bypass per-element INumericOperations<T>
+        // dispatch for the float / double primitive cases. Audit
+        // measured 4× speedup on this exact loop shape (per-element
+        // ToDouble + scalar arithmetic + FromDouble). T is unconstrained
+        // here so we pattern-match on the concrete data array.
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var outArr = output.GetDataArray();
+        if (inArr is double[] iD && tgtArr is double[] tD && outArr is double[] oD)
+        {
+            double half = 0.5;
+            double halfBeta = half * beta;
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                double diff = iD[i] - tD[i];
+                double absDiff = Math.Abs(diff);
+                oD[i] = absDiff < beta ? half * diff * diff / beta : absDiff - halfBeta;
+            }
+            return Reduce(output, reduction);
+        }
+        if (inArr is float[] iF && tgtArr is float[] tF && outArr is float[] oF)
+        {
+            float betaF = (float)beta;
+            float halfBetaF = 0.5f * betaF;
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                float diff = iF[i] - tF[i];
+                float absDiff = MathF.Abs(diff);
+                oF[i] = absDiff < betaF ? 0.5f * diff * diff / betaF : absDiff - halfBetaF;
+            }
+            return Reduce(output, reduction);
+        }
+
         for (int i = 0; i < inSpan.Length; i++)
         {
             double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
@@ -97,6 +133,43 @@ public static class Losses
         var varSpan = variance.AsSpan();
         var outSpan = output.AsWritableSpan();
         double constTerm = full ? 0.5 * Math.Log(2.0 * Math.PI) : 0.0;
+
+        // #294 NumericFastPath: float / double primitive fast paths
+        // bypass INumericOperations<T>'s per-element virtual dispatch
+        // via concrete-array pattern match.
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var varArr = variance.GetDataArray();
+        var outArr = output.GetDataArray();
+        if (inArr is double[] iD && tgtArr is double[] tD && varArr is double[] vD && outArr is double[] oD)
+        {
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                double xi = iD[i];
+                double ti = tD[i];
+                double vi = vD[i] > eps ? vD[i] : eps;
+                double diff = ti - xi;
+                oD[i] = 0.5 * (Math.Log(vi) + diff * diff / vi) + constTerm;
+            }
+            return Reduce(output, reduction);
+        }
+        if (inArr is float[] iF && tgtArr is float[] tF && varArr is float[] vF && outArr is float[] oF)
+        {
+            float epsF = (float)eps;
+            float constTermF = (float)constTerm;
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                float xi = iF[i];
+                float ti = tF[i];
+                float vi = vF[i] > epsF ? vF[i] : epsF;
+                float diff = ti - xi;
+                oF[i] = 0.5f * (MathF.Log(vi) + diff * diff / vi) + constTermF;
+            }
+            return Reduce(output, reduction);
+        }
+
         for (int i = 0; i < inSpan.Length; i++)
         {
             double xi = ops.ToDouble(inSpan[i]);

@@ -299,24 +299,37 @@ internal static class MatrixMultiplyHelper
             return Clamp(BlockSizeOverride.Value, 16, 128);
         }
 
+        // #294 Phase 4 wiring: delegate to CacheOptimizer's L1-aware
+        // tile picker for the float / double cases — single source of
+        // truth for tile sizing across the codebase. The picker uses
+        // Unsafe.SizeOf<T> internally so it stays in step with what
+        // the caller's actual element size is. Other T (BFloat16 /
+        // Half / custom numerics) fall through to the local heuristic
+        // because CacheOptimizer.ComputeOptimalTiling has an unmanaged
+        // constraint that this method intentionally does not — matmul
+        // is generic over a wider T set than the optimization helper.
+        if (typeof(T) == typeof(float))
+        {
+            var (m, _, _) = AiDotNet.Tensors.Engines.Optimization.CacheOptimizer
+                .ComputeOptimalTiling<float>(128, 128, 128);
+            return Clamp(m, 16, 128);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var (m, _, _) = AiDotNet.Tensors.Engines.Optimization.CacheOptimizer
+                .ComputeOptimalTiling<double>(128, 128, 128);
+            return Clamp(m, 16, 128);
+        }
+
+        // Fallback for non-primitive T using the same L1-aware formula
+        // CacheOptimizer uses (3-block working set: A_tile + B_tile +
+        // C_tile). Element size estimated by typeof check since T may
+        // not be unmanaged here.
         int elementSize = typeof(T) == typeof(double) ? 8 : 4;
         int l1 = PlatformDetector.Capabilities?.L1CacheSize ?? 0;
-        if (l1 <= 0)
-        {
-            l1 = 32 * 1024;
-        }
-
+        if (l1 <= 0) l1 = 32 * 1024;
         int block = (int)Math.Sqrt(l1 / (2.0 * elementSize));
-        if (block < 16)
-        {
-            block = 16;
-        }
-        else if (block > 128)
-        {
-            block = 128;
-        }
-
-        return block;
+        return Clamp(block, 16, 128);
     }
 
     private static long GetBlasWorkThreshold()

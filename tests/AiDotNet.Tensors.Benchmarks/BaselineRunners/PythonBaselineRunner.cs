@@ -59,7 +59,11 @@ public sealed class PythonBaselineRunner : IDisposable
         /// <summary>opt_einsum path optimizer.</summary>
         OptEinsum,
         /// <summary>jax.numpy under jit.</summary>
-        JaxJit
+        JaxJit,
+        /// <summary>Issue #294 PyTorch CPU baseline — matmul, conv2d,
+        /// FlashAttention (scaled_dot_product_attention), LayerNorm,
+        /// BCE forward+backward.</summary>
+        Torch294,
     }
 
     /// <summary>Creates a runner; auto-detects Python location via PATH.</summary>
@@ -122,6 +126,7 @@ public sealed class PythonBaselineRunner : IDisposable
             Baseline.TorchCompile => "run_torch_compile.py",
             Baseline.OptEinsum => "run_opt_einsum.py",
             Baseline.JaxJit => "run_jax_jit.py",
+            Baseline.Torch294 => "run_torch_294.py",
             _ => throw new ArgumentOutOfRangeException(nameof(baseline))
         };
         string scriptPath = Path.Combine(_scriptDir, scriptName);

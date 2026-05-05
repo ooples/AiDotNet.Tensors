@@ -16876,43 +16876,88 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic T path — uses numOps.Sum (SIMD via SimdKernels.Sum for
-        // float/double) for the mean/variance reductions instead of a scalar
-        // accumulation loop, and uses span slicing for the output write pass.
-        // The float fast path above returns early, so this branch is only
-        // double / BFloat16 / custom numeric types today — no else wrapper
-        // required.
+        // float/double) for the mean reduction. The float fast path
+        // above returns early so this branch is double / BFloat16 /
+        // custom numeric types.
+        //
+        // #294 NumericFastPath: when T == double, route the per-batch
+        // variance reduction through NumericFastPath.SumOfSquaresDouble
+        // (Vector<double>-vectorized) and the affine normalize through
+        // AffineNormalizeDouble. Saves the per-element virtual dispatch
+        // that the scalar diff*diff loop pays.
         var meanData = new T[batchSize];
         var varData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
         T featureSizeT = numOps.FromDouble(featureSize);
-        Parallel.For(0, batchSize, b =>
+
+        if (typeof(T) == typeof(double))
         {
-            int offset = b * featureSize;
-            var inSlice = inputData.AsSpan(offset, featureSize);
-
-            T sum = numOps.Sum(inSlice);
-            T m = numOps.Divide(sum, featureSizeT);
-            meanData[b] = m;
-
-            // Variance: still scalar-per-element because we need (x-m)² and there's
-            // no fused primitive. Still uses local `m` to avoid re-computation.
-            T sumSq = numOps.Zero;
-            for (int f = 0; f < featureSize; f++)
+            var inputD = (double[])(object)inputData;
+            var gammaD = (double[])(object)gammaData;
+            var betaD = (double[])(object)betaData;
+            var meanD = (double[])(object)meanData;
+            var varD = (double[])(object)varData;
+            var outD = (double[])(object)outputData;
+            double epsD = epsilon;
+            int fs = featureSize;
+            // Pre-allocate once; the centered scratch is per-thread to
+            // avoid allocation churn under Parallel.For.
+            Parallel.For(0, batchSize, () => new double[fs], (b, _, scratch) =>
             {
-                T diff = numOps.Subtract(inSlice[f], m);
-                sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
-            }
-            T v = numOps.Divide(sumSq, featureSizeT);
-            varData[b] = v;
-
-            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(v, eps)));
-            var outSlice = outputData.AsSpan(offset, featureSize);
-            for (int f = 0; f < featureSize; f++)
+                int offset = b * fs;
+                var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
+                double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
+                double m = sum / fs;
+                meanD[b] = m;
+                // Compute centered = (x - m), then SumOfSquares for variance.
+                // Two passes but each is SIMD; cheaper than one scalar pass.
+                AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                    inSlice, scratch.AsSpan(0, fs), m, 1.0);
+                double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
+                    new ReadOnlySpan<double>(scratch, 0, fs)) / fs;
+                varD[b] = v;
+                double invStd = 1.0 / Math.Sqrt(v + epsD);
+                // Normalize-and-scale: (x - m) * invStd * gamma + beta.
+                // AffineNormalize delivers (x - m) * invStd into outD;
+                // then a scalar gamma/beta apply (could SIMD-fuse later).
+                AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                    inSlice, new Span<double>(outD, offset, fs), m, invStd);
+                for (int f = 0; f < fs; f++)
+                    outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
+                return scratch;
+            }, scratch => { /* per-thread scratch goes out of scope */ });
+        }
+        else
+        {
+            Parallel.For(0, batchSize, b =>
             {
-                T normalized = numOps.Multiply(numOps.Subtract(inSlice[f], m), invStd);
-                outSlice[f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
-            }
-        });
+                int offset = b * featureSize;
+                var inSlice = inputData.AsSpan(offset, featureSize);
+
+                T sum = numOps.Sum(inSlice);
+                T m = numOps.Divide(sum, featureSizeT);
+                meanData[b] = m;
+
+                // Variance: scalar per-element because we need (x-m)² and there's
+                // no fused primitive. Uses local `m` to avoid re-computation.
+                T sumSq = numOps.Zero;
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T diff = numOps.Subtract(inSlice[f], m);
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
+                }
+                T v = numOps.Divide(sumSq, featureSizeT);
+                varData[b] = v;
+
+                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(v, eps)));
+                var outSlice = outputData.AsSpan(offset, featureSize);
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T normalized = numOps.Multiply(numOps.Subtract(inSlice[f], m), invStd);
+                    outSlice[f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
+                }
+            });
+        }
 
         // Create mean and variance tensors with batch shape
         mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
@@ -26287,6 +26332,50 @@ public partial class CpuEngine : ITensorLevelEngine
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
+
+        // #294 NumericFastPath wiring: bypass per-element
+        // INumericOperations<T> dispatch for the float / double
+        // primitive cases. Audit measured 4× speedup on the matching
+        // backward path — the same shape applies symmetrically here.
+        // Pattern-match the underlying T[] arrays (T isn't constrained
+        // to struct on this method, so MemoryMarshal.Cast<T,double>
+        // doesn't compile).
+        var predArr = predictions.GetDataArray();
+        var targetArr = targets.GetDataArray();
+        var resultArr = result.GetDataArray();
+        if (predArr is double[] pD && targetArr is double[] tD && resultArr is double[] dD)
+        {
+            double eps = (double)(object)epsilon!;
+            double upper = 1.0 - eps;
+            int n = predSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                double pi = pD[i];
+                double pc = pi < upper ? pi : upper;
+                if (pc < eps) pc = eps;
+                dD[i] = -(tD[i] * Math.Log(pc) + (1.0 - tD[i]) * Math.Log(1.0 - pc));
+            }
+            DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictionsOrig, targetsOrig, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
+            { var cp = predictions; var ct = targets; var ce = epsilon; AutoTracer.RecordOp("TensorBinaryCrossEntropy", result, eng => eng.TensorBinaryCrossEntropy(cp, ct, ce)); }
+            return result;
+        }
+        if (predArr is float[] pF && targetArr is float[] tF && resultArr is float[] dF)
+        {
+            float eps = (float)(object)epsilon!;
+            float upper = 1f - eps;
+            int n = predSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                float pi = pF[i];
+                float pc = pi < upper ? pi : upper;
+                if (pc < eps) pc = eps;
+                dF[i] = -(tF[i] * MathF.Log(pc) + (1f - tF[i]) * MathF.Log(1f - pc));
+            }
+            DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictionsOrig, targetsOrig, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
+            { var cp = predictions; var ct = targets; var ce = epsilon; AutoTracer.RecordOp("TensorBinaryCrossEntropy", result, eng => eng.TensorBinaryCrossEntropy(cp, ct, ce)); }
+            return result;
+        }
+
         T upperBound = numOps.Subtract(numOps.One, epsilon);
         double upperVal = numOps.ToDouble(upperBound);
         double epsVal = numOps.ToDouble(epsilon);
@@ -26332,25 +26421,65 @@ public partial class CpuEngine : ITensorLevelEngine
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
+
+        // #294 NumericFastPath wiring: the audit measured this exact
+        // method at 4× speedup when the inner loop runs raw double
+        // arithmetic instead of routing every op through INumericOperations<T>.
+        // Fast-path the float / double primitives via array
+        // pattern-match (T isn't constrained struct on this method).
+        var predArr = predictions.GetDataArray();
+        var targetArr = targets.GetDataArray();
+        var resultArr = result.GetDataArray();
+        if (predArr is double[] pD && targetArr is double[] tD && resultArr is double[] dD)
+        {
+            double eps = (double)(object)epsilon!;
+            double upper = 1.0 - eps;
+            int n = predSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                double pi = pD[i];
+                double pc = pi < upper ? pi : upper;
+                if (pc < eps) pc = eps;
+                // -t/p + (1-t)/(1-p)
+                dD[i] = (1.0 - tD[i]) / (1.0 - pc) - tD[i] / pc;
+            }
+            return result;
+        }
+        if (predArr is float[] pF && targetArr is float[] tF && resultArr is float[] dF)
+        {
+            float eps = (float)(object)epsilon!;
+            float upper = 1f - eps;
+            int n = predSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                float pi = pF[i];
+                float pc = pi < upper ? pi : upper;
+                if (pc < eps) pc = eps;
+                dF[i] = (1f - tF[i]) / (1f - pc) - tF[i] / pc;
+            }
+            return result;
+        }
+
+        // Generic T path — kept as-is for non-primitive types.
         T upperBound = numOps.Subtract(numOps.One, epsilon);
-        double upperVal = numOps.ToDouble(upperBound);
-        double epsVal = numOps.ToDouble(epsilon);
+        double upperValG = numOps.ToDouble(upperBound);
+        double epsValG = numOps.ToDouble(epsilon);
 
         for (int i = 0; i < predSpan.Length; i++)
         {
-            T p = predSpan[i];
-            T t = targetSpan[i];
+            T pT = predSpan[i];
+            T tT = targetSpan[i];
 
             // Clip for numerical stability
-            double pVal = numOps.ToDouble(p);
-            T clippedUpper = pVal < upperVal ? p : upperBound;
+            double pVal = numOps.ToDouble(pT);
+            T clippedUpper = pVal < upperValG ? pT : upperBound;
             double clippedUpperVal = numOps.ToDouble(clippedUpper);
-            T pClipped = clippedUpperVal > epsVal ? clippedUpper : epsilon;
+            T pClipped = clippedUpperVal > epsValG ? clippedUpper : epsilon;
 
             // Gradient: -t/p + (1-t)/(1-p)
-            T termA = numOps.Divide(t, pClipped);
+            T termA = numOps.Divide(tT, pClipped);
             T oneMinusP = numOps.Subtract(numOps.One, pClipped);
-            T oneMinusT = numOps.Subtract(numOps.One, t);
+            T oneMinusT = numOps.Subtract(numOps.One, tT);
             T termB = numOps.Divide(oneMinusT, oneMinusP);
 
             dest[i] = numOps.Subtract(termB, termA);
@@ -30083,10 +30212,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
+        // #294 NumericFastPath: float fast path was already inline; add
+        // the matching double fast path so both primitive cases skip
+        // the per-element virtual dispatch.
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
             float slopeF = (float)negativeSlope;
             for (int i = 0; i < length; i++) rF[i] = iF[i] > 0f ? gF[i] : gF[i] * slopeF;
+        }
+        else if (gradData is double[] gD && inputData is double[] iD && result is double[] rD)
+        {
+            for (int i = 0; i < length; i++) rD[i] = iD[i] > 0.0 ? gD[i] : gD[i] * negativeSlope;
         }
         else
         {
@@ -30114,12 +30250,39 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
         var iData = input.GetDataArray();
-        for (int i = 0; i < result.Length; i++)
+
+        // #294 NumericFastPath: bypass per-element ToDouble/FromDouble
+        // for the float / double primitives. Same audit-driven pattern
+        // as BCE backward (4× win measured there).
+        if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            double x = numOps.ToDouble(iData[i]);
-            double sig = 1.0 / (1.0 + Math.Exp(-x));
-            double deriv = sig + x * sig * (1.0 - sig);
-            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+            for (int i = 0; i < rF.Length; i++)
+            {
+                float x = iF[i];
+                float sig = 1f / (1f + MathF.Exp(-x));
+                float deriv = sig + x * sig * (1f - sig);
+                rF[i] = gF[i] * deriv;
+            }
+        }
+        else if (gData is double[] gD && iData is double[] iD && result is double[] rD)
+        {
+            for (int i = 0; i < rD.Length; i++)
+            {
+                double x = iD[i];
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                double deriv = sig + x * sig * (1.0 - sig);
+                rD[i] = gD[i] * deriv;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < result.Length; i++)
+            {
+                double x = numOps.ToDouble(iData[i]);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                double deriv = sig + x * sig * (1.0 - sig);
+                result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+            }
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
     }
@@ -30131,14 +30294,43 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
         var iData = input.GetDataArray();
-        for (int i = 0; i < result.Length; i++)
+
+        // #294 NumericFastPath: float / double primitive fast paths.
+        if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            double x = numOps.ToDouble(iData[i]);
-            double sp = Math.Log(1.0 + Math.Exp(x));
-            double tsp = Math.Tanh(sp);
-            double sig = 1.0 / (1.0 + Math.Exp(-x));
-            double deriv = tsp + x * sig * (1.0 - tsp * tsp);
-            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+            for (int i = 0; i < rF.Length; i++)
+            {
+                float x = iF[i];
+                float sp = MathF.Log(1f + MathF.Exp(x));
+                float tsp = MathF.Tanh(sp);
+                float sig = 1f / (1f + MathF.Exp(-x));
+                float deriv = tsp + x * sig * (1f - tsp * tsp);
+                rF[i] = gF[i] * deriv;
+            }
+        }
+        else if (gData is double[] gD && iData is double[] iD && result is double[] rD)
+        {
+            for (int i = 0; i < rD.Length; i++)
+            {
+                double x = iD[i];
+                double sp = Math.Log(1.0 + Math.Exp(x));
+                double tsp = Math.Tanh(sp);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                double deriv = tsp + x * sig * (1.0 - tsp * tsp);
+                rD[i] = gD[i] * deriv;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < result.Length; i++)
+            {
+                double x = numOps.ToDouble(iData[i]);
+                double sp = Math.Log(1.0 + Math.Exp(x));
+                double tsp = Math.Tanh(sp);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                double deriv = tsp + x * sig * (1.0 - tsp * tsp);
+                result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+            }
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
     }
