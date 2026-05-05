@@ -109,6 +109,16 @@ public sealed class CuRand : IDeviceRng
     private bool TryDeviceUniform(Tensor<float> output, bool normal, float mean, float stddev)
     {
         if (!CuRandNative.IsAvailable) return false;
+        // Subsequence-bypass: cuRAND's Philox API has no subsequence
+        // parameter — `curandSetPseudoRandomGeneratorSeed` accepts only
+        // the seed, and offset is a per-stream counter advancement, not
+        // the subsequence dimension that managed Philox 4x32-10 supports.
+        // When the caller asks for a non-zero subsequence, the device
+        // path's bits would silently diverge from CpuPhiloxGenerator's
+        // — breaking the cross-backend determinism contract that
+        // CuRand class-doc promises. Fall back to CPU so the contract
+        // holds.
+        if (_cpuFallback.Subsequence != 0) return false;
         IntPtr dPtr = IntPtr.Zero;
         IntPtr generator = IntPtr.Zero;
         try
@@ -153,6 +163,11 @@ public sealed class CuRand : IDeviceRng
     private bool TryDeviceUniformDouble(Tensor<double> output, bool normal, double mean, double stddev)
     {
         if (!CuRandNative.IsAvailable) return false;
+        // Same subsequence-bypass as TryDeviceUniform — cuRAND's Philox
+        // doesn't accept a subsequence parameter, so a non-zero
+        // subsequence on this side must fall back to CPU to preserve
+        // bit-equivalence.
+        if (_cpuFallback.Subsequence != 0) return false;
         IntPtr dPtr = IntPtr.Zero;
         IntPtr generator = IntPtr.Zero;
         try

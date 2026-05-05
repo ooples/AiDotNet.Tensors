@@ -116,6 +116,8 @@ public static class MathHelper
             return new UInt64Operations();
         if (typeof(T) == typeof(Bit))
             return new BitOperations();
+        if (typeof(T) == typeof(bool))
+            return new NumericOperations.BoolOperations();
         if (typeof(T) == typeof(NumericOperations.Float8E4M3))
             return new NumericOperations.Float8E4M3Operations();
         if (typeof(T) == typeof(NumericOperations.Float8E5M2))
