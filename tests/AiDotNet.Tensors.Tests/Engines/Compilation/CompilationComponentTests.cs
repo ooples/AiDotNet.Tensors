@@ -656,6 +656,90 @@ public class CompilationComponentTests
     }
 
     [Fact]
+    public void Issue304_TensorInputOverload_BindsExplicitQueryWhenWeightsAreReceiver()
+    {
+        AiDotNetEngine.Current = new CpuEngine();
+        using var cache = new CompiledModelCache<float>();
+
+        var weights = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            new[] { 3, 2 });
+
+        var query1 = new Tensor<float>(
+            new[] { 1f, 10f },
+            new[] { 2, 1 });
+
+        var plan = cache.GetOrCompileInference(query1, () => weights.MatrixMultiply(query1));
+        var first = plan.Execute().AsSpan().ToArray();
+
+        var query2 = new Tensor<float>(
+            new[] { 2f, 20f },
+            new[] { 2, 1 });
+
+        var plan2 = cache.GetOrCompileInference(query2, () => weights.MatrixMultiply(query2));
+        var second = plan2.Execute().AsSpan().ToArray();
+
+        Assert.Same(plan, plan2);
+        Assert.Equal(new[] { 21f, 43f, 65f }, first);
+        Assert.Equal(new[] { 42f, 86f, 130f }, second);
+    }
+
+    [Fact]
+    public void Issue304_TensorInputOverload_SeesMutatedSameQueryReference()
+    {
+        AiDotNetEngine.Current = new CpuEngine();
+        using var cache = new CompiledModelCache<float>();
+
+        var weights = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            new[] { 3, 2 });
+
+        var query = new Tensor<float>(
+            new[] { 1f, 10f },
+            new[] { 2, 1 });
+
+        var plan = cache.GetOrCompileInference(query, () => weights.MatrixMultiply(query));
+        var first = plan.Execute().AsSpan().ToArray();
+
+        var queryData = query.AsWritableSpan();
+        queryData[0] = 2f;
+        queryData[1] = 20f;
+
+        var plan2 = cache.GetOrCompileInference(query, () => weights.MatrixMultiply(query));
+        var second = plan2.Execute().AsSpan().ToArray();
+
+        Assert.Same(plan, plan2);
+        Assert.Equal(new[] { 21f, 43f, 65f }, first);
+        Assert.Equal(new[] { 42f, 86f, 130f }, second);
+    }
+
+    [Fact]
+    public void Issue304_ShapeOverload_SetInputsTargetsQueryNotFrozenWeights()
+    {
+        AiDotNetEngine.Current = new CpuEngine();
+        using var cache = new CompiledModelCache<float>();
+
+        var weights = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            new[] { 3, 2 });
+
+        var query = new Tensor<float>(
+            new[] { 1f, 10f },
+            new[] { 2, 1 });
+
+        var plan = cache.GetOrCompileInference(query._shape, () => weights.MatrixMultiply(query));
+
+        var query2 = new Tensor<float>(
+            new[] { 2f, 20f },
+            new[] { 2, 1 });
+
+        plan.SetInputs(new[] { query2 });
+        var output = plan.Execute().AsSpan().ToArray();
+
+        Assert.Equal(new[] { 42f, 86f, 130f }, output);
+    }
+
+    [Fact]
     public void CompiledModelCache_SymbolicOverloadStoresUnderSymbolicKey()
     {
         // Verify that the symbolic overload stores the plan under the symbolic key

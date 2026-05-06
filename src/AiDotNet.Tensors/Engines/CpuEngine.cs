@@ -9888,6 +9888,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Rank == 2 && b.Rank == 2)
         {
             int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+            if (n == 1)
+            {
+                TensorMatMulGemvFloat(a.Data, b.Data, output.Data, m, k);
+                return;
+            }
+
             Simd.SimdGemm.SgemmWithCachedB(
                 new System.ReadOnlySpan<float>(aArr, 0, m * k),
                 bArr,
@@ -10010,6 +10016,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
 
+        if (p == 1 && TryTensorMatMulGemv(a, b, result, m, n))
+        {
+            return result;
+        }
+
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
         {
@@ -10032,6 +10043,91 @@ public partial class CpuEngine : ITensorLevelEngine
         MatrixMultiplyHelper.MultiplyBlocked(numOps, a.Data, b.Data, result.Data, m, n, p, n, p, p);
 
         return result;
+    }
+
+    private static bool TryTensorMatMulGemv<T>(Tensor<T> a, Tensor<T> b, Tensor<T> result, int m, int k)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            TensorMatMulGemvFloat(aMem, bMem, rMem, m, k);
+            return true;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = (Memory<double>)(object)a.Data;
+            var bMem = (Memory<double>)(object)b.Data;
+            var rMem = (Memory<double>)(object)result.Data;
+            TensorMatMulGemvDouble(aMem, bMem, rMem, m, k);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void TensorMatMulGemvFloat(ReadOnlyMemory<float> matrix, ReadOnlyMemory<float> vector, Memory<float> output, int rows, int cols)
+    {
+        if ((long)rows * cols >= ParallelThreshold)
+        {
+            ParallelForChunks(rows, 256, (start, count) =>
+            {
+                var matrixSpan = matrix.Span;
+                var vectorSpan = vector.Span;
+                var outputSpan = output.Span;
+                int end = start + count;
+                for (int row = start; row < end; row++)
+                {
+                    outputSpan[row] = TensorPrimitivesCore.Dot(
+                        matrixSpan.Slice(row * cols, cols),
+                        vectorSpan.Slice(0, cols));
+                }
+            });
+            return;
+        }
+
+        var matrixSpan = matrix.Span;
+        var vectorSpan = vector.Span;
+        var outputSpan = output.Span;
+        for (int row = 0; row < rows; row++)
+        {
+            outputSpan[row] = TensorPrimitivesCore.Dot(
+                matrixSpan.Slice(row * cols, cols),
+                vectorSpan.Slice(0, cols));
+        }
+    }
+
+    private static void TensorMatMulGemvDouble(ReadOnlyMemory<double> matrix, ReadOnlyMemory<double> vector, Memory<double> output, int rows, int cols)
+    {
+        if ((long)rows * cols >= ParallelThreshold)
+        {
+            ParallelForChunks(rows, 256, (start, count) =>
+            {
+                var matrixSpan = matrix.Span;
+                var vectorSpan = vector.Span;
+                var outputSpan = output.Span;
+                int end = start + count;
+                for (int row = start; row < end; row++)
+                {
+                    outputSpan[row] = TensorPrimitivesCore.Dot(
+                        matrixSpan.Slice(row * cols, cols),
+                        vectorSpan.Slice(0, cols));
+                }
+            });
+            return;
+        }
+
+        var matrixSpan = matrix.Span;
+        var vectorSpan = vector.Span;
+        var outputSpan = output.Span;
+        for (int row = 0; row < rows; row++)
+        {
+            outputSpan[row] = TensorPrimitivesCore.Dot(
+                matrixSpan.Slice(row * cols, cols),
+                vectorSpan.Slice(0, cols));
+        }
     }
 
     /// <summary>

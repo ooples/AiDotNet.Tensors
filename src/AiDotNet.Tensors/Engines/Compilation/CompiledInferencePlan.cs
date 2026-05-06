@@ -117,7 +117,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         int[] inputShape,
         Tensor<T>? compiledInputTensor,
         List<GCHandle>? handles = null,
-        CompiledInferencePlan<T>[]? sourcePlans = null)
+        CompiledInferencePlan<T>[]? sourcePlans = null,
+        Tensor<T>[]? compiledInputTensors = null)
     {
         _steps = steps;
         _finalOutput = finalOutput;
@@ -126,7 +127,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // Compile() / CreateFromDeserialized currently capture one input,
         // so the array has length 0 or 1 in practice. Storing it as an array
         // lets SetInputs generalize cleanly when multi-input Compile lands.
-        _compiledInputTensors = compiledInputTensor is null
+        _compiledInputTensors = compiledInputTensors is not null
+            ? compiledInputTensors
+            : compiledInputTensor is null
             ? Array.Empty<Tensor<T>>()
             : new[] { compiledInputTensor };
         _sourcePlans = sourcePlans ?? Array.Empty<CompiledInferencePlan<T>>();
@@ -923,6 +926,22 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// </param>
     internal static CompiledInferencePlan<T> Compile(
         LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput)
+        => Compile(scope, engine, explicitOutput, explicitInput: null, requestedInputShape: null);
+
+    internal static CompiledInferencePlan<T> Compile(
+        LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput, Tensor<T> explicitInput)
+        => Compile(scope, engine, explicitOutput, explicitInput, explicitInput._shape);
+
+    internal static CompiledInferencePlan<T> Compile(
+        LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput, int[] requestedInputShape)
+        => Compile(scope, engine, explicitOutput, explicitInput: null, requestedInputShape);
+
+    private static CompiledInferencePlan<T> Compile(
+        LazyTensorScope scope,
+        IEngine engine,
+        Tensor<T>? explicitOutput,
+        Tensor<T>? explicitInput,
+        int[]? requestedInputShape)
     {
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
@@ -945,14 +964,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
-        // Determine input shape from the first step's inputs (for IsValid check)
-        // and capture the tensor reference itself for Then() stitching + serialization.
-        var inputTensor = steps.Count > 0 && steps[0].Inputs.Length > 0
-            ? steps[0].Inputs[0]
-            : null;
-        var inputShape = inputTensor is not null
-            ? (int[])inputTensor._shape.Clone()
-            : Array.Empty<int>();
+        // Determine the mutable plan input from the caller's existing API
+        // contract. If the Tensor<T> cache overload supplied an explicit
+        // tensor, that exact tensor is the input slot. If the shape overload
+        // supplied only a shape, use the first traced leaf tensor with that
+        // shape and treat all other leaves as frozen constants. This fixes
+        // #304's weights.MatrixMultiply(query) case where the first op input
+        // is a frozen weight matrix, not the variable query.
+        var inputTensor = SelectCompiledInputTensor(steps, explicitInput, requestedInputShape);
+        var inputShape = requestedInputShape is not null
+            ? (int[])requestedInputShape.Clone()
+            : inputTensor is not null
+                ? (int[])inputTensor._shape.Clone()
+                : Array.Empty<int>();
 
         // Run step-mutating optimization passes BEFORE specialization.
         // Specialization pins raw pointers into each input/output buffer
@@ -1022,7 +1046,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 continue;
             }
 
-            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles);
+            bool allowCachedB = !IsMutableSecondMatMulInput(step, inputTensor);
+            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (specialized != null)
             {
                 // Wrap the specialized action as a CompiledStep with the optimized execute
@@ -1083,6 +1108,65 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 : new Tensor<T>(new int[] { 0 });
         }
         return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles);
+    }
+
+    private static Tensor<T>? SelectCompiledInputTensor(
+        List<CompiledStep<T>> steps,
+        Tensor<T>? explicitInput,
+        int[]? requestedInputShape)
+    {
+        if (explicitInput is not null)
+            return explicitInput;
+
+        if (steps.Count == 0)
+            return null;
+
+        if (requestedInputShape is not null)
+        {
+            foreach (var leaf in EnumerateLeafInputs(steps))
+            {
+                if (ShapesEqual(leaf._shape, requestedInputShape))
+                    return leaf;
+            }
+        }
+
+        return steps[0].Inputs.Length > 0 ? steps[0].Inputs[0] : null;
+    }
+
+    private static IEnumerable<Tensor<T>> EnumerateLeafInputs(List<CompiledStep<T>> steps)
+    {
+        var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < steps.Count; i++)
+            produced.Add(steps[i].OutputBuffer);
+
+        var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var inputs = steps[i].Inputs;
+            for (int j = 0; j < inputs.Length; j++)
+            {
+                var input = inputs[j];
+                if (produced.Contains(input))
+                    continue;
+                if (seen.Add(input))
+                    yield return input;
+            }
+        }
+    }
+
+    private sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
+    {
+        public static readonly ReferenceEqualityComparer<TItem> Instance = new();
+        public bool Equals(TItem? x, TItem? y) => ReferenceEquals(x, y);
+        public int GetHashCode(TItem obj) => RuntimeHelpers.GetHashCode(obj);
+    }
+
+    private static bool IsMutableSecondMatMulInput(CompiledStep<T> step, Tensor<T>? mutableInput)
+    {
+        return mutableInput is not null
+            && step.OpType == OpType.TensorMatMul
+            && step.Inputs.Length >= 2
+            && ReferenceEquals(step.Inputs[1], mutableInput);
     }
 
     /// <summary>
