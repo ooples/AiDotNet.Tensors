@@ -44,6 +44,8 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class CpuEngine : ITensorLevelEngine
 {
+    private static int _randomNormalSeedCounter = Environment.TickCount;
+
     /// <inheritdoc/>
     public string Name => "CPU Engine";
 
@@ -25375,6 +25377,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var random = RandomHelper.ThreadSafeRandom;
         double meanD = numOps.ToDouble(mean);
         double stdD = numOps.ToDouble(stddev);
+        int totalElements = destination.Length;
+
+        var liveBacking = destination.GetLiveBackingArrayOrNull();
+        if (liveBacking is not null && totalElements > ParallelThreshold)
+        {
+            FillRandomNormalArray(liveBacking, totalElements, numOps, meanD, stdD);
+            return;
+        }
 
         if (destination.IsContiguous)
         {
@@ -25383,11 +25393,11 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var destinationStorage = destination.RawWritableStorageSpan;
-        for (int i = 0; i < destination.Length;)
+        for (int i = 0; i < totalElements;)
         {
             NextNormalPair(random, out double z0, out double z1);
             destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z0 * stdD + meanD);
-            if (i < destination.Length)
+            if (i < totalElements)
                 destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z1 * stdD + meanD);
         }
     }
@@ -25476,6 +25486,197 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    private static void FillRandomNormalArray<T>(
+        T[] destination,
+        int length,
+        INumericOperations<T> numOps,
+        double meanD,
+        double stdD)
+    {
+        int workerCount = Math.Min(MaxDegreeOfParallelism, Math.Max(1, (length + MinChunkSize - 1) / MinChunkSize));
+        if (workerCount <= 1)
+        {
+            FillRandomNormal(destination.AsSpan(0, length), numOps, RandomHelper.ThreadSafeRandom, meanD, stdD);
+            return;
+        }
+
+        int baseSeed = System.Threading.Interlocked.Add(ref _randomNormalSeedCounter, unchecked((int)0x9E3779B9));
+        int chunkSize = (length + workerCount - 1) / workerCount;
+
+        if (typeof(T) == typeof(float))
+        {
+            var typedDestination = (float[])(object)destination;
+            LightweightParallel(workerCount, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                    FillRandomNormalFloatChunk(typedDestination, start, count, (float)meanD, (float)stdD, baseSeed + chunk);
+            });
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var typedDestination = (double[])(object)destination;
+            LightweightParallel(workerCount, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                    FillRandomNormalDoubleChunk(typedDestination, start, count, meanD, stdD, baseSeed + chunk);
+            });
+            return;
+        }
+
+        LightweightParallel(workerCount, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                FillRandomNormalGenericChunk(destination, start, count, numOps, meanD, stdD, baseSeed + chunk);
+        });
+    }
+
+    private static void FillRandomNormalFloatChunk(
+        float[] destination,
+        int start,
+        int count,
+        float mean,
+        float stdDev,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
+                {
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = (float)(z0 * stdDev + mean);
+                    destination[destinationIndex++] = (float)(z1 * stdDev + mean);
+                }
+
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = (float)(z0 * stdDev + mean);
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
+    private static void FillRandomNormalDoubleChunk(
+        double[] destination,
+        int start,
+        int count,
+        double mean,
+        double stdDev,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
+                {
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = z0 * stdDev + mean;
+                    destination[destinationIndex++] = z1 * stdDev + mean;
+                }
+
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = z0 * stdDev + mean;
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
+    private static void FillRandomNormalGenericChunk<T>(
+        T[] destination,
+        int start,
+        int count,
+        INumericOperations<T> numOps,
+        double meanD,
+        double stdD,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
+                {
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = numOps.FromDouble(z0 * stdD + meanD);
+                    destination[destinationIndex++] = numOps.FromDouble(z1 * stdD + meanD);
+                }
+
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = numOps.FromDouble(z0 * stdD + meanD);
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
     private static void FillUniformRange<T>(
         Span<T> destination,
         INumericOperations<T> numOps,
@@ -25493,6 +25694,15 @@ public partial class CpuEngine : ITensorLevelEngine
         double u2 = random.NextDouble();
 
         // Guard against log(0) which produces -Infinity and then NaN.
+        u1 = Math.Max(u1, double.Epsilon);
+
+        double mag = Math.Sqrt(-2.0 * Math.Log(u1));
+        z0 = mag * Math.Cos(2.0 * Math.PI * u2);
+        z1 = mag * Math.Sin(2.0 * Math.PI * u2);
+    }
+
+    private static void NextNormalPair(double u1, double u2, out double z0, out double z1)
+    {
         u1 = Math.Max(u1, double.Epsilon);
 
         double mag = Math.Sqrt(-2.0 * Math.Log(u1));

@@ -33,6 +33,19 @@ public class Issue305DestinationAwareInitTests
     }
 
     [Fact]
+    public void TensorRandomNormalInto_FillsLargeDestinationWithoutTempTensor()
+    {
+        var destination = new Tensor<float>(Enumerable.Repeat(float.NaN, 65_536).ToArray(), [65_536]);
+
+        _engine.TensorRandomNormalInto(destination, 0f, 1f);
+
+        var values = destination.ToArray();
+        Assert.All(values, value => Assert.True(!float.IsNaN(value) && !float.IsInfinity(value)));
+        Assert.Contains(values, value => value < 0f);
+        Assert.Contains(values, value => value > 0f);
+    }
+
+    [Fact]
     public void TensorRandomUniformRangeInto_UsesStrideAwareDestination()
     {
         var backing = new Tensor<float>(Enumerable.Repeat(-7f, 12).ToArray(), [3, 4]);
