@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
+using AiDotNet.Tensors.Engines.Execution;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -240,6 +241,163 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// the stitched plan's <see cref="Execute"/>.
     /// </para>
     /// </remarks>
+    /// <inheritdoc/>
+    public ICompiledPlan<T> Stitch(ICompiledPlan<T> next)
+    {
+#pragma warning disable CS0618 // Stitch IS the new name; the obsolete forwarding is intentional.
+        return ThenAsync(next);
+#pragma warning restore CS0618
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask<Tensor<T>> ExecuteAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+
+        // Same source-disposed guard as Execute() — see the long comment
+        // there. Run BEFORE acquiring the stream so a stale stitched plan
+        // raises ObjectDisposedException instead of half-running and
+        // leaving the stream stuck.
+        for (int i = 0; i < _sourcePlans.Length; i++)
+        {
+            if (_sourcePlans[i]._disposed)
+                throw new ObjectDisposedException(
+                    nameof(CompiledInferencePlan<T>),
+                    $"Stitched plan's source at index {i} has been disposed.");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Acquire a fresh stream sized for this single execution. CPU
+        // streams are cheap to construct (a Channel + LongRunning task);
+        // GPU streams wrap the engine's existing cudaStream_t with
+        // ownsStream=false so we don't tear down the backend's primary
+        // stream on dispose.
+        var stream = ExecutionStreamFactory.CreateForEngine<T>(_engine);
+        try
+        {
+            var steps = _steps;
+            for (int i = 0; i < steps.Length; i++)
+            {
+                stream.Submit(steps[i], _engine);
+            }
+            await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+        return _finalOutput;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        CancellationToken cancellationToken = default)
+        => ChainAsync(next, nextInputSlot: 0, cancellationToken);
+
+    /// <inheritdoc/>
+    public async ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        int nextInputSlot,
+        CancellationToken cancellationToken = default)
+    {
+        if (next is null) throw new ArgumentNullException(nameof(next));
+        if (next is not CompiledInferencePlan<T> nextPlan)
+            throw new NotSupportedException(
+                $"{nameof(ChainAsync)} requires the next plan to be a built-in " +
+                $"CompiledInferencePlan<T>. Got {next.GetType().FullName}.");
+
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot chain from a disposed plan.");
+        if (nextPlan._disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot chain into a disposed plan.");
+
+        if (_steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot chain from an empty plan (no steps to feed into next).", nameof(next));
+        if (nextPlan._steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot chain into an empty plan (no steps to consume the upstream output).", nameof(next));
+
+        // Slot validation. The single-input case (overload above) passes
+        // slot=0; the multi-input case (text-encoder → cross-attention)
+        // passes the explicit slot the caller wants to feed.
+        if (nextPlan._compiledInputTensors.Length == 0)
+            throw new ArgumentException(
+                "Next plan has no captured input tensors — it cannot be chained onto.", nameof(next));
+        if ((uint)nextInputSlot >= (uint)nextPlan._compiledInputTensors.Length)
+            throw new ArgumentOutOfRangeException(
+                nameof(nextInputSlot), nextInputSlot,
+                $"Slot must be in [0, {nextPlan._compiledInputTensors.Length}); next plan has " +
+                $"{nextPlan._compiledInputTensors.Length} captured input(s).");
+
+        var nextPlanInput = nextPlan._compiledInputTensors[nextInputSlot];
+
+        // Same shape-equality check Stitch performs — fail at chain time,
+        // not partway through the stream.
+        var thisOut = _finalOutput._shape;
+        var nextIn = nextPlanInput._shape;
+        if (thisOut.Length != nextIn.Length || !ShapesEqual(thisOut, nextIn))
+            throw new ArgumentException(
+                $"Cannot chain: this plan's output shape [{string.Join(", ", thisOut)}] " +
+                $"does not match next plan's input slot {nextInputSlot} shape [{string.Join(", ", nextIn)}]. " +
+                "Chaining requires shape-equal boundary tensors.",
+                nameof(next));
+
+        // Boundary rebind — zero-byte handoff of the intermediate buffer
+        // (criterion #6 of issue #296). The rebind is persistent (same
+        // semantics as Stitch) so subsequent ChainAsync / Execute calls
+        // on `next` keep reading from this plan's output. Idempotent
+        // re-chain to the same upstream is allowed; pointing at a
+        // different upstream is rejected to prevent silent rewiring.
+        if (nextPlan._lastStitchUpstream is not null &&
+            !ReferenceEquals(nextPlan._lastStitchUpstream, _finalOutput))
+        {
+            throw new InvalidOperationException(
+                "This plan has already been chained/stitched onto a different upstream. " +
+                "Reusing it with a new upstream would rebind its input storage and " +
+                "silently invalidate the earlier pipeline.");
+        }
+        nextPlanInput.RebindStorageFrom(_finalOutput);
+        nextPlan._lastStitchUpstream = _finalOutput;
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Stream the combined step sequence. A single stream preserves
+        // FIFO ordering — next's first step starts only after this
+        // plan's last step completes — and on GPU it gives the driver
+        // full latitude to overlap the queued kernels however the
+        // hardware allows.
+        var stream = ExecutionStreamFactory.CreateForEngine<T>(_engine);
+        try
+        {
+            var thisSteps = _steps;
+            for (int i = 0; i < thisSteps.Length; i++)
+                stream.Submit(thisSteps[i], _engine);
+
+            // Cross-engine chain: route each of next's steps through its
+            // original engine (matches the existing Stitch behaviour for
+            // mixed-engine pipelines). When the engines match, just
+            // submit through `_engine` directly with no wrapping.
+            bool crossEngine = !ReferenceEquals(_engine, nextPlan._engine);
+            var nextSteps = nextPlan._steps;
+            var nextEngine = nextPlan._engine;
+            for (int i = 0; i < nextSteps.Length; i++)
+            {
+                stream.Submit(nextSteps[i], crossEngine ? nextEngine : _engine);
+            }
+
+            await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+
+        return nextPlan._finalOutput;
+    }
+
     public ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next)
     {
         if (next is null) throw new ArgumentNullException(nameof(next));

@@ -111,6 +111,108 @@ public interface ICompiledPlan<T> : IDisposable
     int StepCount { get; }
 
     /// <summary>
+    /// <b>Synchronous</b> two-plan composition: produces a long-lived
+    /// stitched plan whose <see cref="Execute"/> runs <i>this</i>'s
+    /// steps followed by <i>next</i>'s steps as one flat delegate array.
+    /// The intermediate tensor (this plan's final output) shares backing
+    /// storage with next's captured input after the call, so data flows
+    /// through without any new <see cref="Tensor{T}"/> materialization or
+    /// per-execute copy. Production pipelines like
+    /// <c>tokenizer → encoder → transformer → classifier</c> become one
+    /// compiled plan with no inter-plan materialization overhead.
+    /// </summary>
+    /// <remarks>
+    /// <para>Same semantics as the obsolete <see cref="ThenAsync"/>; the
+    /// rename drops the misleading "Async" suffix per issue #296. Use
+    /// <see cref="ChainAsync(ICompiledPlan{T}, System.Threading.CancellationToken)"/>
+    /// when you want one-shot async pipelining instead of a long-lived
+    /// stitched plan.</para>
+    /// </remarks>
+    /// <inheritdoc cref="ThenAsync(ICompiledPlan{T})"/>
+    ICompiledPlan<T> Stitch(ICompiledPlan<T> next);
+
+    /// <summary>
+    /// Asynchronously executes this plan on a backend-appropriate
+    /// execution stream and returns the final output tensor when the
+    /// pipeline finishes.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation. Observed before
+    /// the await resumes; in-flight kernels run to completion regardless.</param>
+    /// <returns>A <see cref="ValueTask{T}"/> resolving to the plan's
+    /// final output tensor. Same buffer that
+    /// <see cref="Execute"/> would return — caller must read before the
+    /// next async call mutates it.</returns>
+    /// <remarks>
+    /// <para>
+    /// CPU backends drain through a long-lived worker thread reading from
+    /// a <c>Channel&lt;&gt;</c>; GPU backends submit kernels to a native
+    /// <c>cudaStream_t</c> and poll
+    /// <c>cuStreamQuery</c> + <see cref="System.Threading.Tasks.Task.Yield"/>
+    /// until the stream drains. Acceptance criterion #9 of issue #296
+    /// forbids <see cref="System.Threading.Tasks.Task.Run"/> on the per-step
+    /// hot path; the implementation enforces this with a struct work-item
+    /// queue and zero per-step <see cref="System.Threading.Tasks.Task"/>
+    /// allocations.
+    /// </para>
+    /// </remarks>
+    ValueTask<Tensor<T>> ExecuteAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// One-shot async pipeline: queues this plan's steps and
+    /// <paramref name="next"/>'s steps onto the same execution stream,
+    /// rebinds the boundary tensor (this plan's output → next's
+    /// captured input) so no inter-stage copy is paid, and resolves to
+    /// <paramref name="next"/>'s final output once the whole pipeline
+    /// completes. Replaces the obsolete <see cref="ThenAsync"/> for
+    /// callers who want true async chaining rather than a long-lived
+    /// stitched plan.
+    /// </summary>
+    /// <param name="next">The downstream plan. Must be the built-in
+    /// <c>CompiledInferencePlan&lt;T&gt;</c> — third-party
+    /// implementers cannot be chained because the rebind needs concrete
+    /// access to the input-tensor storage.</param>
+    /// <param name="cancellationToken">Cancellation token; observed
+    /// between the host queue-up and the final stream sync.</param>
+    /// <returns>A <see cref="ValueTask{T}"/> resolving to
+    /// <paramref name="next"/>'s final output tensor when the full
+    /// pipeline drains.</returns>
+    /// <remarks>
+    /// <para>For chains where <paramref name="next"/> has multiple
+    /// captured inputs, use the slot overload
+    /// <see cref="ChainAsync(ICompiledPlan{T}, int, System.Threading.CancellationToken)"/>
+    /// to identify which input to feed.</para>
+    /// </remarks>
+    ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Multi-input variant of <see cref="ChainAsync(ICompiledPlan{T}, System.Threading.CancellationToken)"/>:
+    /// the boundary rebind targets the captured input of
+    /// <paramref name="next"/> at index <paramref name="nextInputSlot"/>.
+    /// The other slots keep whatever data <see cref="SetInputs"/>
+    /// loaded into them prior to the call (the canonical pattern for
+    /// text-encoder → cross-attention noise-predictor: <c>SetInputs</c>
+    /// the time-step / noise tensors first, then
+    /// <c>ChainAsync(next, slotForCondition)</c> to feed the conditioner
+    /// output in).
+    /// </summary>
+    /// <param name="next">The downstream plan.</param>
+    /// <param name="nextInputSlot">Zero-based index into
+    /// <paramref name="next"/>'s captured-input array identifying which
+    /// input to rebind to this plan's output.</param>
+    /// <param name="cancellationToken">Cancellation.</param>
+    /// <returns>The same <see cref="ValueTask{T}"/> contract as the
+    /// single-input overload.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="nextInputSlot"/> is not a valid index into
+    /// <paramref name="next"/>'s captured inputs.</exception>
+    ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        int nextInputSlot,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Composes this plan with <paramref name="next"/> into a single stitched
     /// plan whose <see cref="Execute"/> runs <i>this</i>'s steps followed by
     /// <i>next</i>'s steps as one flat delegate array. The intermediate
@@ -189,6 +291,16 @@ public interface ICompiledPlan<T> : IDisposable
     /// support default interface members.
     /// </para>
     /// </remarks>
+    /// <para>
+    /// <b>Obsolete (issue #296):</b> the "Async" suffix is misleading —
+    /// this method is synchronous. Prefer <see cref="Stitch"/> for the
+    /// long-lived stitched-plan use case, or
+    /// <see cref="ChainAsync(ICompiledPlan{T}, System.Threading.CancellationToken)"/>
+    /// for one-shot async pipelining over an execution stream. This
+    /// member ships <c>[Obsolete]</c> for one minor version, then is
+    /// removed.
+    /// </para>
+    [Obsolete("Use Stitch for sync plan composition or ChainAsync for true async pipelining. Closes #296.", error: false)]
     ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next);
 
     /// <summary>
