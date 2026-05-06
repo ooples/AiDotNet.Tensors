@@ -1273,13 +1273,17 @@ public class WeightRegistryStreamingTests : IDisposable
         // full GC after each layer to collect dropped byte[]s, then
         // measures the actual live working set against the pool budget.
         //
-        // Methodology: force a full GC at the end of each layer (when
-        // the previous iteration's tensor has been registered and its
-        // GC byte[] has been dropped via DropStorageForStreaming). After
-        // the collection, GetTotalMemory reports only LIVE references
-        // — not uncollected garbage. The peak live-set is then a clean
-        // proxy for "how big can the heap get under sustained
-        // allocation".
+        // Methodology: force a COMPACTING Gen-2 collection at the end of
+        // each layer (when the previous iteration's tensor has been
+        // registered and its GC byte[] has been dropped via
+        // DropStorageForStreaming). The compacting flag matters under
+        // Server GC (CI default on Linux): without it, GetTotalMemory
+        // reports heap-segment size INCLUDING fragmented free space
+        // inside segments — for our 64KB byte[] / float[] churn pattern
+        // that fragmentation can run to several MB even though the
+        // actual live byte count is well under budget. After a
+        // compacting Gen-2 collection the heap is consolidated and the
+        // reading reflects true live references only.
         WeightRegistry.Reset();
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -1287,11 +1291,11 @@ public class WeightRegistryStreamingTests : IDisposable
             StreamingBackingStorePath = _backingDir,
         });
 
-        // Baseline: drain pre-existing test allocator state.
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        long heapBaseline = GC.GetTotalMemory(forceFullCollection: true);
+        // Baseline: drain pre-existing test allocator state with a
+        // compacting Gen-2 cycle so the baseline reading is itself free
+        // of cross-test fragmentation noise.
+        ForceCompactingGen2();
+        long heapBaseline = MeasureLiveBytes();
 
         long peakLiveSetDelta = 0;
         for (int layer = 0; layer < 16; layer++)
@@ -1303,18 +1307,16 @@ public class WeightRegistryStreamingTests : IDisposable
                 for (int i = 0; i < span.Length; i++) span[i] = (float)((layer * 4 + matrix + i) % 7);
                 WeightRegistry.RegisterWeight(t);
             }
-            // After each layer (4 weights), force a full collection so
-            // dropped byte[]s from the just-finished iteration are
-            // collected. Then measure: the heap size now reflects only
+            // After each layer (4 weights), force a compacting Gen-2
+            // collection so dropped byte[]s from the just-finished
+            // iteration are collected AND any fragmentation is
+            // consolidated. Then measure: heap size now reflects only
             // LIVE state (pool's resident byte[]s + LRU bookkeeping +
-            // backing files' file handles) — a regression that left
-            // uncollected weights on the heap would still grow this
-            // measurement linearly because their references would still
-            // exist somewhere.
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            long heapLive = GC.GetTotalMemory(forceFullCollection: true);
+            // backing-file handles) — a regression that left uncollected
+            // weights on the heap would still grow this measurement
+            // linearly because their references would still exist.
+            ForceCompactingGen2();
+            long heapLive = MeasureLiveBytes();
             long delta = heapLive - heapBaseline;
             if (delta > peakLiveSetDelta) peakLiveSetDelta = delta;
         }
@@ -1329,9 +1331,48 @@ public class WeightRegistryStreamingTests : IDisposable
             + $"(256 KB) since AllocateStreaming pages out competing weights "
             + $"before each new GC byte[] lands, but peak live-set was "
             + $"{peakLiveSetDelta} bytes ({peakLiveSetDelta / 1024.0:F1} KB). "
-            + "If this exceeds 1 MB after a forced full GC, "
+            + "If this exceeds 1 MB after a forced compacting Gen-2 GC, "
             + "AllocateStreaming isn't pacing the managed heap against the "
             + "pool budget — the OOM mode #1222 was meant to prevent.");
+    }
+
+    /// <summary>
+    /// Forces a compacting Gen-2 collection so the heap is consolidated
+    /// and <see cref="MeasureLiveBytes"/> reads reflect true live bytes,
+    /// not fragmented free space inside Server-GC heap segments. The
+    /// 4-arg <see cref="GC.Collect(int, GCCollectionMode, bool, bool)"/>
+    /// overload (compacting flag) is available on both net471 and
+    /// net10.0; <see cref="GCCollectionMode.Aggressive"/> would tighten
+    /// this further on net7+ but the compacting Default-mode pass is
+    /// already deterministic enough for this measurement.
+    /// </summary>
+    private static void ForceCompactingGen2()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect(generation: 2, mode: GCCollectionMode.Default,
+            blocking: true, compacting: true);
+    }
+
+    /// <summary>
+    /// Returns the post-compaction live-byte count. On net5+ we subtract
+    /// <see cref="System.GCMemoryInfo.FragmentedBytes"/> from
+    /// <see cref="System.GCMemoryInfo.HeapSizeBytes"/> to get a true
+    /// live-set reading regardless of whether the prior compaction left
+    /// any residual fragmentation; on net471 we fall back to the
+    /// post-compaction <see cref="GC.GetTotalMemory(bool)"/> (the
+    /// compacting Gen-2 above already consolidated the heap, so the
+    /// reading is comparable).
+    /// </summary>
+    private static long MeasureLiveBytes()
+    {
+#if NET5_0_OR_GREATER
+        var info = GC.GetGCMemoryInfo();
+        long live = info.HeapSizeBytes - info.FragmentedBytes;
+        return live > 0 ? live : GC.GetTotalMemory(forceFullCollection: false);
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
     }
 
     [Fact]
