@@ -45,6 +45,11 @@ public class CompiledPlanChainingBenchmarks
     private Tensor<float> _aiW2 = null!;
     private Tensor<float> _aiB1 = null!;
     private Tensor<float> _aiB2 = null!;
+    // Cached input array reused across iterations so the benchmark
+    // measures the API's per-call alloc, not the harness's
+    // `new[] { _aiInput }` boxing per call.
+    private Tensor<float>[] _aiInputArray = null!;
+    private Tensor<float>[] _aiHiddenArray = null!;
 
     // Pre-compiled plans for the new chained-async path. Plan A: Linear+ReLU
     // (input → hidden). Plan B: Linear (hidden → output). ChainAsync
@@ -70,6 +75,8 @@ public class CompiledPlanChainingBenchmarks
 
         _aiInput = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
         _aiHiddenSeed = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
+        _aiInputArray = new[] { _aiInput };
+        _aiHiddenArray = new[] { _aiHiddenSeed };
         _aiW1 = Tensor<float>.CreateRandom(new[] { 256, 256 });
         _aiW2 = Tensor<float>.CreateRandom(new[] { 256, 10 });
         _aiB1 = Tensor<float>.CreateRandom(new[] { 256 });
@@ -148,9 +155,10 @@ public class CompiledPlanChainingBenchmarks
         // Current sync two-stage path: run plan A, copy its output into plan
         // B's captured input via SetInputs, run plan B. This is the
         // pre-#296 baseline that the new ChainAsync replaces.
-        _planA.SetInputs(new[] { _aiInput });
+        _planA.SetInputs(_aiInputArray);
         var hidden = _planA.Execute();
-        _planB.SetInputs(new[] { hidden });
+        _aiHiddenArray[0] = hidden;
+        _planB.SetInputs(_aiHiddenArray);
         return _planB.Execute();
     }
 
@@ -161,7 +169,7 @@ public class CompiledPlanChainingBenchmarks
         // onto a single execution stream and rebinds the boundary tensor
         // zero-copy (criterion #6). On CPU the stream is a Channel<>-backed
         // worker; on GPU it would wrap the engine's cudaStream_t.
-        _planA.SetInputs(new[] { _aiInput });
+        _planA.SetInputs(_aiInputArray);
         return await _planA.ChainAsync(_planB).ConfigureAwait(false);
     }
 }

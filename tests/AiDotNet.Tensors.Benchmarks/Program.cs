@@ -250,6 +250,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--296-diffusion")
+        {
+            BenchmarkRunner.Run<DiffusionPipelineBenchmark>(BenchConfig);
+            return;
+        }
+
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
