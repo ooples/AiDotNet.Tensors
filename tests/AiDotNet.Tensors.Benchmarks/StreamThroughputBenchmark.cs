@@ -50,6 +50,16 @@ public class StreamThroughputBenchmark
     private ICompiledPlan<float> _planA = null!;
     private ICompiledPlan<float> _planB = null!;
 
+    // Pool of independent plan pairs for the pipelined-async benchmark.
+    // Each pair (a, b) executes one batch's worth of chain — running 4
+    // pairs concurrently on different threads gives us 4-way pipelined
+    // execution, which is the throughput equivalent of CUDA-streams
+    // overlap on the CPU side.
+    private (ICompiledPlan<float> a, ICompiledPlan<float> b)[] _planPool = null!;
+    private CompiledModelCache<float>[] _poolCachesA = null!;
+    private CompiledModelCache<float>[] _poolCachesB = null!;
+    private const int _poolSize = 4;
+
     private TorchTensor[] _torchInputs = null!;
     private TorchSharp.Modules.Sequential _torchMlpModule = null!;
 
@@ -83,6 +93,42 @@ public class StreamThroughputBenchmark
             return _engine.TensorBroadcastAdd(o, _aiB2);
         });
 
+        // Plan pool for the pipelined benchmark. Each pair gets its
+        // own input tensors so concurrent execution doesn't trip the
+        // SetInputs copy.
+        _poolCachesA = new CompiledModelCache<float>[_poolSize];
+        _poolCachesB = new CompiledModelCache<float>[_poolSize];
+        _planPool = new (ICompiledPlan<float>, ICompiledPlan<float>)[_poolSize];
+        for (int s = 0; s < _poolSize; s++)
+        {
+            var inSeed = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
+            var hidSeed = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
+            _poolCachesA[s] = new CompiledModelCache<float>();
+            var a = _poolCachesA[s].GetOrCompileInference(inSeed, () =>
+            {
+                var h = _engine.TensorMatMul(inSeed, _aiW1);
+                h = _engine.TensorBroadcastAdd(h, _aiB1);
+                return _engine.ReLU(h);
+            });
+            _poolCachesB[s] = new CompiledModelCache<float>();
+            var b = _poolCachesB[s].GetOrCompileInference(hidSeed, () =>
+            {
+                var o = _engine.TensorMatMul(hidSeed, _aiW2);
+                return _engine.TensorBroadcastAdd(o, _aiB2);
+            });
+            _planPool[s] = (a, b);
+
+            // Pre-warm: a single sequential ChainAsync seeds the
+            // SimdGemm packed-weight cache for this pair's W1 / W2
+            // tensors. The cache uses a ConditionalWeakTable that's
+            // not safe under concurrent insert; pre-warming on this
+            // (single-threaded) Setup path means the steady-state
+            // parallel benchmark only ever hits the cache lookup,
+            // never the cache miss path.
+            a.SetInputs(new[] { _aiInputs[0] });
+            a.ChainAsync(b).AsTask().GetAwaiter().GetResult();
+        }
+
         _torchInputs = new TorchTensor[NumBatches];
         for (int i = 0; i < NumBatches; i++)
             _torchInputs[i] = torch.randn(BatchSize, 256);
@@ -107,6 +153,14 @@ public class StreamThroughputBenchmark
     {
         _cacheA?.Dispose();
         _cacheB?.Dispose();
+        if (_poolCachesA != null)
+        {
+            for (int s = 0; s < _poolSize; s++)
+            {
+                _poolCachesA[s]?.Dispose();
+                _poolCachesB[s]?.Dispose();
+            }
+        }
         _torchMlpModule?.Dispose();
     }
 
@@ -134,19 +188,31 @@ public class StreamThroughputBenchmark
     [Benchmark]
     public async Task Tensors_BatchSweep_PipelinedAsync()
     {
-        // Sequential ChainAsync over the same plans for every batch — the
-        // intermediate plan B's captured input is rebound to plan A's
-        // output the FIRST time ChainAsync runs and stays bound for
-        // subsequent calls (idempotent per #296 contract). Each
-        // ChainAsync acquires a fresh execution stream, so the host
-        // thread yields between batches; on CPU this lets the kernel-
-        // level thread pool (BLAS / AVX) saturate cores naturally
-        // without per-step Task.Run overhead.
+        // Real pipelining: dispatch each batch's chain on its own
+        // background task so multiple batches can occupy different
+        // cores at the same time. Each await launch needs its own
+        // plan pair so the boundary rebind doesn't cross between
+        // concurrent batches; we round-robin across a pool of
+        // pre-allocated plan pairs (lazily compiled in Setup).
+        // This is the Tensors-side analogue of CUDA-streams overlap
+        // — on CPU, "stream" just means "an independent worker
+        // pipeline" and concurrent invocation lets the library-level
+        // BLAS / AVX work share the available cores.
+        var pairs = _planPool;
+        var poolSize = pairs.Length;
+        var tasks = new Task[NumBatches];
         for (int i = 0; i < NumBatches; i++)
         {
-            _planA.SetInputs(new[] { _aiInputs[i] });
-            await _planA.ChainAsync(_planB).ConfigureAwait(false);
+            int batchIdx = i;
+            int slot = i % poolSize;
+            tasks[i] = Task.Run(async () =>
+            {
+                var (a, b) = pairs[slot];
+                a.SetInputs(new[] { _aiInputs[batchIdx] });
+                await a.ChainAsync(b).ConfigureAwait(false);
+            });
         }
+        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 }
 #endif
