@@ -553,7 +553,18 @@ public static class CpuFusedOperations
         {
             bool simdRelu = activation == FusedActivationType.ReLU;
             bool simdGelu = activation == FusedActivationType.GELU;
-            int parallelThreshold = 16 * 1024;  // 16K elems → parallelise
+            // 64K elems → parallelise. Below this the Parallel.For dispatch
+            // cost (~5–10 µs + ~3 KB allocation per call for closure +
+            // partitioner state) outweighs the SIMD pass it's amortising.
+            // For a 32K-element bias+activation pass (256×128 — the
+            // ChainAsync BS=128 case in issue #296) the SIMD-only loop
+            // measures ~5 µs vs ~10 µs with Parallel.For dispatch. The
+            // 64K threshold matches the (unrelated but related)
+            // ApplyBiasActivationNCHWInPlace floor in this same file.
+            // Closes the per-call allocation gap to PyTorch flagged by
+            // issue #296 acceptance criterion #5 at BS=128 (3.7 KB →
+            // ≈400 B once Parallel.For is bypassed).
+            int parallelThreshold = 64 * 1024;
 
             if (simdGelu && hasBias)
             {

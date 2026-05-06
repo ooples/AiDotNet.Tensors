@@ -410,7 +410,16 @@ public class PlanStitchingTests
         public void SetInputs(Tensor<float>[] inputs) => throw new NotSupportedException("Stub.");
         public bool IsValid(int[] inputShape) => true;
         public int StepCount => 0;
+        public ICompiledPlan<float> Stitch(ICompiledPlan<float> next) => this;
+        public ValueTask<Tensor<float>> ExecuteAsync(CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Stub.");
+        public ValueTask<Tensor<float>> ChainAsync(ICompiledPlan<float> next, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Stub.");
+        public ValueTask<Tensor<float>> ChainAsync(ICompiledPlan<float> next, int nextInputSlot, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Stub.");
+#pragma warning disable CS0618
         public ICompiledPlan<float> ThenAsync(ICompiledPlan<float> next) => this;
+#pragma warning restore CS0618
         public Task SaveAsync(Stream stream, CancellationToken cancellationToken = default)
             => throw new NotSupportedException("Stub does not support serialization.");
         public bool IsCompatibleWith(PlanCompatibilityInfo info) => false;

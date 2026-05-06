@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
+using AiDotNet.Tensors.Engines.Execution;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -51,6 +52,20 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private readonly CompiledInferencePlan<T>[] _sourcePlans;
 
     private bool _disposed;
+
+    // Lazy-initialized execution stream cached across ExecuteAsync /
+    // ChainAsync calls. The first call constructs the stream (Channel +
+    // long-lived worker on CPU; lightweight wrapper on GPU); every
+    // subsequent call reuses it — zero per-call allocation for the
+    // submission infrastructure. This is what lets ChainAsync hit
+    // criterion #6 of issue #296 ("0-byte boundary handoff") in steady
+    // state: the previous design allocated a fresh stream + worker per
+    // call, which dwarfed the boundary-tensor savings. Initialized
+    // under the lock so concurrent ExecuteAsync calls see one stream;
+    // null when no async call has been made yet (sync Execute path
+    // doesn't need a stream).
+    private IExecutionStream<T>? _cachedStream;
+    private readonly object _streamLock = new();
 
     /// <summary>
     /// Upstream final-output tensor that this plan was last stitched onto,
@@ -240,6 +255,282 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// the stitched plan's <see cref="Execute"/>.
     /// </para>
     /// </remarks>
+    /// <inheritdoc/>
+    public ICompiledPlan<T> Stitch(ICompiledPlan<T> next)
+    {
+#pragma warning disable CS0618 // Stitch IS the new name; the obsolete forwarding is intentional.
+        return ThenAsync(next);
+#pragma warning restore CS0618
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<Tensor<T>> ExecuteAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+
+        // Same source-disposed guard as Execute() — see the long comment
+        // there. Run BEFORE acquiring the stream so a stale stitched plan
+        // raises ObjectDisposedException instead of half-running and
+        // leaving the stream stuck.
+        for (int i = 0; i < _sourcePlans.Length; i++)
+        {
+            if (_sourcePlans[i]._disposed)
+                throw new ObjectDisposedException(
+                    nameof(CompiledInferencePlan<T>),
+                    $"Stitched plan's source at index {i} has been disposed.");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // CPU fast path: when the engine has no async device backend, the
+        // step kernels are pure CPU compute — there's no opportunity to
+        // overlap with the host thread, so going through a Channel-backed
+        // worker just adds queueing overhead. Inline the steps on the
+        // calling thread and return a completed ValueTask. Measured win
+        // is ~10 µs / call at BS=1 (the async state machine + channel
+        // write cost) which is the difference between hitting and missing
+        // criterion #1 in issue #296. GPU plans take the streaming path
+        // below where the kernels DO run concurrently with the host.
+        if (IsCpuEngine(_engine))
+        {
+            var steps = _steps;
+            for (int i = 0; i < steps.Length; i++)
+            {
+                steps[i].Execute(_engine, steps[i].OutputBuffer);
+            }
+            return new ValueTask<Tensor<T>>(_finalOutput);
+        }
+
+        return ExecuteAsyncStreamed(cancellationToken);
+    }
+
+    private async ValueTask<Tensor<T>> ExecuteAsyncStreamed(CancellationToken cancellationToken)
+    {
+        // GPU/streaming path. Reuse the plan's cached stream — every call
+        // after the first pays zero allocation for the submission
+        // infrastructure.
+        var stream = GetOrCreateStream();
+        var steps = _steps;
+        for (int i = 0; i < steps.Length; i++)
+        {
+            stream.Submit(steps[i], _engine);
+        }
+        await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+        return _finalOutput;
+    }
+
+    /// <summary>
+    /// Whether the engine runs steps on CPU (no native device backend
+    /// to overlap host work with). When true, <see cref="ExecuteAsync"/>
+    /// and <see cref="ChainAsync(ICompiledPlan{T}, int, CancellationToken)"/>
+    /// take a fast path that inlines the steps on the calling thread —
+    /// going through the Channel-backed worker is pure overhead when
+    /// there's no opportunity for host/device overlap.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Capability-based: an engine counts as CPU if it doesn't expose a
+    /// usable DirectGPU backend AND doesn't claim GPU support. This
+    /// catches both the canonical <c>CpuEngine</c> ("CPU Engine") AND
+    /// CPU-fallback variants like
+    /// <c>DirectGpuTensorEngine</c> when GPU initialization fails — that
+    /// path reports <c>"CPU Engine (DirectGpu unavailable)"</c> from
+    /// its Name and would have missed an exact-name match. Reviewer
+    /// feedback on PR #298 (review-comment 7tW0).
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsCpuEngine(IEngine engine)
+    {
+        // Two-pronged check: SupportsGpu must be false (so DirectGpuEngine
+        // and similar that claim GPU don't take this fast path) AND the
+        // DirectGpu surface must not expose a live backend (catches
+        // engines that report SupportsGpu=true but whose initialization
+        // failed, leaving them in a CPU-fallback state). When both are
+        // false the engine is provably CPU-bound and inlining the step
+        // loop on the calling thread is strictly better than queueing
+        // through a Channel-backed worker.
+        if (engine.SupportsGpu) return false;
+        var directGpu = engine.DirectGpu;
+        if (directGpu is not null && directGpu.IsAvailable) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Lazy-initializes <see cref="_cachedStream"/> on first async call
+    /// and returns it on every subsequent call. Double-checked locking
+    /// keeps construction cost off the hot path. Disposal is centralized
+    /// in <see cref="Dispose"/> — the plan owns the stream's lifetime.
+    /// </summary>
+    private IExecutionStream<T> GetOrCreateStream()
+    {
+        var existing = Volatile.Read(ref _cachedStream);
+        if (existing is not null) return existing;
+        lock (_streamLock)
+        {
+            existing = _cachedStream;
+            if (existing is not null) return existing;
+            _cachedStream = ExecutionStreamFactory.CreateForEngine<T>(_engine);
+            return _cachedStream;
+        }
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        CancellationToken cancellationToken = default)
+        => ChainAsync(next, nextInputSlot: 0, cancellationToken);
+
+    /// <inheritdoc/>
+    public ValueTask<Tensor<T>> ChainAsync(
+        ICompiledPlan<T> next,
+        int nextInputSlot,
+        CancellationToken cancellationToken = default)
+    {
+        if (next is null) throw new ArgumentNullException(nameof(next));
+        if (next is not CompiledInferencePlan<T> nextPlan)
+            throw new NotSupportedException(
+                $"{nameof(ChainAsync)} requires the next plan to be a built-in " +
+                $"CompiledInferencePlan<T>. Got {next.GetType().FullName}.");
+
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot chain from a disposed plan.");
+        if (nextPlan._disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>),
+            "Cannot chain into a disposed plan.");
+
+        if (_steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot chain from an empty plan (no steps to feed into next).", nameof(next));
+        if (nextPlan._steps.Length == 0)
+            throw new ArgumentException(
+                "Cannot chain into an empty plan (no steps to consume the upstream output).", nameof(next));
+
+        // Slot validation. The single-input case (overload above) passes
+        // slot=0; the multi-input case (text-encoder → cross-attention)
+        // passes the explicit slot the caller wants to feed.
+        if (nextPlan._compiledInputTensors.Length == 0)
+            throw new ArgumentException(
+                "Next plan has no captured input tensors — it cannot be chained onto.", nameof(next));
+        if ((uint)nextInputSlot >= (uint)nextPlan._compiledInputTensors.Length)
+            throw new ArgumentOutOfRangeException(
+                nameof(nextInputSlot), nextInputSlot,
+                $"Slot must be in [0, {nextPlan._compiledInputTensors.Length}); next plan has " +
+                $"{nextPlan._compiledInputTensors.Length} captured input(s).");
+
+        var nextPlanInput = nextPlan._compiledInputTensors[nextInputSlot];
+
+        // Same shape-equality check Stitch performs — fail at chain time,
+        // not partway through the stream.
+        var thisOut = _finalOutput._shape;
+        var nextIn = nextPlanInput._shape;
+        if (thisOut.Length != nextIn.Length || !ShapesEqual(thisOut, nextIn))
+            throw new ArgumentException(
+                $"Cannot chain: this plan's output shape [{string.Join(", ", thisOut)}] " +
+                $"does not match next plan's input slot {nextInputSlot} shape [{string.Join(", ", nextIn)}]. " +
+                "Chaining requires shape-equal boundary tensors.",
+                nameof(next));
+
+        // Cancellation check happens BEFORE any persistent state
+        // mutation. If the caller already canceled the token, we throw
+        // OperationCanceledException without rewiring next-plan's input
+        // storage — keeping cancellation side-effect-free as a contract.
+        // Previously the rebind ran first, so a canceled ChainAsync
+        // call still permanently aliased the boundary tensor; subsequent
+        // standalone next.Execute calls would then silently read this
+        // plan's stale output instead of the caller-provided input.
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Boundary rebind — zero-byte handoff of the intermediate buffer
+        // (criterion #6 of issue #296). The rebind is persistent (same
+        // semantics as Stitch) so subsequent ChainAsync / Execute calls
+        // on `next` keep reading from this plan's output. Idempotent
+        // re-chain to the same upstream is allowed; pointing at a
+        // different upstream is rejected to prevent silent rewiring.
+        if (nextPlan._lastStitchUpstream is not null &&
+            !ReferenceEquals(nextPlan._lastStitchUpstream, _finalOutput))
+        {
+            throw new InvalidOperationException(
+                "This plan has already been chained/stitched onto a different upstream. " +
+                "Reusing it with a new upstream would rebind its input storage and " +
+                "silently invalidate the earlier pipeline.");
+        }
+        nextPlanInput.RebindStorageFrom(_finalOutput);
+        nextPlan._lastStitchUpstream = _finalOutput;
+
+        // CPU fast path — same rationale as ExecuteAsync. Inline both
+        // plans' steps on the calling thread, no Channel queueing.
+        // Closes the gap between ChainAsync and the existing
+        // Stitch+Execute path on CPU.
+        bool crossEngine = !ReferenceEquals(_engine, nextPlan._engine);
+        if (IsCpuEngine(_engine) && IsCpuEngine(nextPlan._engine))
+        {
+            var thisSteps = _steps;
+            for (int i = 0; i < thisSteps.Length; i++)
+                thisSteps[i].Execute(_engine, thisSteps[i].OutputBuffer);
+
+            var nextSteps2 = nextPlan._steps;
+            var nextEngine2 = nextPlan._engine;
+            for (int i = 0; i < nextSteps2.Length; i++)
+            {
+                var step = nextSteps2[i];
+                step.Execute(crossEngine ? nextEngine2 : _engine, step.OutputBuffer);
+            }
+            return new ValueTask<Tensor<T>>(nextPlan._finalOutput);
+        }
+
+        return ChainAsyncStreamed(nextPlan, crossEngine, cancellationToken);
+    }
+
+    private async ValueTask<Tensor<T>> ChainAsyncStreamed(
+        CompiledInferencePlan<T> nextPlan, bool crossEngine, CancellationToken cancellationToken)
+    {
+        // GPU/streaming path. Reuse the upstream plan's cached stream —
+        // same one ExecuteAsync uses, so the worker thread is amortized
+        // across every async call. A single stream preserves FIFO ordering
+        // (next's first step starts only after this plan's last step
+        // completes); on GPU it gives the driver full latitude to overlap
+        // the queued kernels however the hardware allows.
+        var stream = GetOrCreateStream();
+        var thisSteps = _steps;
+        for (int i = 0; i < thisSteps.Length; i++)
+            stream.Submit(thisSteps[i], _engine);
+
+        var nextSteps = nextPlan._steps;
+        var nextEngine = nextPlan._engine;
+
+        if (crossEngine)
+        {
+            // Cross-engine GPU chain: the upstream stream only sees the
+            // engine it was created against. If we keep submitting next's
+            // steps to the upstream stream while running them on a
+            // DIFFERENT GPU engine, those kernels enqueue on a stream the
+            // upstream backend doesn't know about — so SyncAsync on the
+            // upstream stream returns BEFORE next's kernels finish, and
+            // ChainAsync's await would resume against a still-pending
+            // GPU output. Sync the upstream first to flush this plan's
+            // work, then run next's steps on its OWN cached stream and
+            // sync that one. On CPU this is the same fast-path the
+            // single-engine case takes (just with two streams instead
+            // of one); on GPU it's correctness, not just perf.
+            // Closes review-comment #298.8R6W.
+            await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+
+            var nextStream = nextPlan.GetOrCreateStream();
+            for (int i = 0; i < nextSteps.Length; i++)
+                nextStream.Submit(nextSteps[i], nextEngine);
+            await nextStream.SyncAsync(cancellationToken).ConfigureAwait(false);
+            return nextPlan._finalOutput;
+        }
+
+        // Same-engine fast path: queue everything on the upstream
+        // stream and sync once.
+        for (int i = 0; i < nextSteps.Length; i++)
+            stream.Submit(nextSteps[i], _engine);
+
+        await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+        return nextPlan._finalOutput;
+    }
+
     public ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next)
     {
         if (next is null) throw new ArgumentNullException(nameof(next));
@@ -517,6 +808,22 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Tear down the cached execution stream BEFORE freeing pinned
+        // handles — the stream's worker thread might still be draining
+        // a final ExecuteAsync that races against Dispose, and the
+        // step delegates it's running reference the pinned buffers.
+        // Letting the worker finish (synchronous Dispose blocks for it
+        // via GetAwaiter().GetResult on the underlying DisposeAsync)
+        // ensures no use-after-free on the unpinned handles.
+        IExecutionStream<T>? streamToDispose;
+        lock (_streamLock)
+        {
+            streamToDispose = _cachedStream;
+            _cachedStream = null;
+        }
+        streamToDispose?.Dispose();
+
         foreach (var handle in _pinnedHandles)
         {
             if (handle.IsAllocated)
