@@ -74,6 +74,24 @@ public class FusedKernelsIssue301Tests
             CpuFusedOperations.FusedLoRAForward(input, baseOut, loraA, loraB, 1f, output));
     }
 
+    [Fact]
+    public void FusedLoRAForward_AllowsOutputToAliasBaseOutput()
+    {
+        const int batch = 3, inFeat = 8, rank = 2, outFeat = 5;
+        var input = RandomTensor(new[] { batch, inFeat }, seed: 21);
+        var baseOut = RandomTensor(new[] { batch, outFeat }, seed: 22);
+        var loraA = RandomTensor(new[] { inFeat, rank }, seed: 23, scale: 0.1);
+        var loraB = RandomTensor(new[] { rank, outFeat }, seed: 24, scale: 0.1);
+        var originalBase = new Tensor<float>(baseOut.AsSpan().ToArray(), new[] { batch, outFeat });
+        var expected = new Tensor<float>(new[] { batch, outFeat });
+
+        CpuFusedOperations.FusedLoRAForward(input, originalBase, loraA, loraB, 0.75f, expected);
+        CpuFusedOperations.FusedLoRAForward(input, baseOut, loraA, loraB, 0.75f, baseOut);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected.GetFlat(i), baseOut.GetFlat(i), precision: 5);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // FusedDDIMStep
     // ─────────────────────────────────────────────────────────────────
@@ -183,5 +201,23 @@ public class FusedKernelsIssue301Tests
                 Assert.True(diff <= tol,
                     $"SparseLinear mismatch at [{b}, {j}]: got={got[b * outFeat + j]}, expected={sum}.");
             }
+    }
+
+    [Fact]
+    public void FusedSparseLinear_RejectsNonMonotonicCsrRowOffsets()
+    {
+        var input = RandomTensor(new[] { 2, 4 }, seed: 31);
+        var values = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 3 });
+        var output = new Tensor<float>(new[] { 2, 2 });
+
+        Assert.Throws<ArgumentException>(() =>
+            CpuFusedOperations.FusedSparseLinear(
+                input,
+                new[] { 0, 3, 2 },
+                new[] { 0, 1, 2 },
+                values,
+                bias: null,
+                FusedActivationType.None,
+                output));
     }
 }

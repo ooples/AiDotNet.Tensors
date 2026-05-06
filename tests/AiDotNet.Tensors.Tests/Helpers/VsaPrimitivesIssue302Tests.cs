@@ -101,6 +101,17 @@ public class VsaPrimitivesIssue302Tests
             CpuVsaOperations.HopfieldRetrieve(store, query, float.NaN, alphas));
     }
 
+    [Fact]
+    public void HopfieldRetrieve_RejectsZeroWidthStore()
+    {
+        var store = new Tensor<float>(Array.Empty<float>(), new[] { 4, 0 });
+        var query = new Tensor<float>(Array.Empty<float>(), new[] { 0 });
+        var alphas = new Tensor<float>(new[] { 4 });
+
+        Assert.Throws<ArgumentException>(() =>
+            CpuVsaOperations.HopfieldRetrieve(store, query, beta: 1f, alphas));
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // HrrBindBatch / HrrUnbindBatch
     // ─────────────────────────────────────────────────────────────────

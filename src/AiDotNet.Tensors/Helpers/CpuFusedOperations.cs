@@ -1751,9 +1751,19 @@ public static class CpuFusedOperations
             throw new ArgumentException(
                 $"sparseRowOffsets length {sparseRowOffsets.Length} must equal out+1 ({outFeat + 1}).",
                 nameof(sparseRowOffsets));
-        int nnz = sparseRowOffsets[outFeat];
         if (sparseRowOffsets[0] != 0)
             throw new ArgumentException("sparseRowOffsets[0] must be 0.", nameof(sparseRowOffsets));
+        for (int i = 1; i < sparseRowOffsets.Length; i++)
+        {
+            if (sparseRowOffsets[i] < sparseRowOffsets[i - 1])
+                throw new ArgumentException(
+                    $"sparseRowOffsets must be monotonically non-decreasing; index {i - 1}={sparseRowOffsets[i - 1]}, index {i}={sparseRowOffsets[i]}.",
+                    nameof(sparseRowOffsets));
+        }
+
+        int nnz = sparseRowOffsets[outFeat];
+        if (nnz < 0)
+            throw new ArgumentException($"CSR nnz must be non-negative; got {nnz}.", nameof(sparseRowOffsets));
         if (sparseColIndices.Length < nnz)
             throw new ArgumentException(
                 $"sparseColIndices length {sparseColIndices.Length} < nnz {nnz}.", nameof(sparseColIndices));

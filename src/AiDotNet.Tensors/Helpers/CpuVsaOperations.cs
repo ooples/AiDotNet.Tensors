@@ -71,6 +71,8 @@ public static class CpuVsaOperations
 
         int n = store.Shape[0];
         int d = store.Shape[1];
+        if (d == 0)
+            throw new ArgumentException("store inner dim D must be positive.", nameof(store));
         if (query.Shape[0] != d)
             throw new ArgumentException(
                 $"query length {query.Shape[0]} must equal store inner dim {d}.", nameof(query));
@@ -299,8 +301,8 @@ public static class CpuVsaOperations
             // FFTs of the staged complex rows. Allocate fresh tensors
             // wrapping the buffers (Fft.Fft1 requires Tensor<T>); only
             // the Tensor wrapper is allocated, not the data array.
-            var aComplex = new Tensor<float>(aBuf.AsSpan(0, 2 * N).ToArray(), new[] { 2 * N });
-            var bComplex = new Tensor<float>(bBuf.AsSpan(0, 2 * N).ToArray(), new[] { 2 * N });
+            var aComplex = Tensor<float>.FromMemory(aBuf.AsMemory(0, 2 * N), new[] { 2 * N });
+            var bComplex = Tensor<float>.FromMemory(bBuf.AsMemory(0, 2 * N), new[] { 2 * N });
             var Aspec = Fft.Fft1(aComplex);
             var Bspec = Fft.Fft1(bComplex);
 

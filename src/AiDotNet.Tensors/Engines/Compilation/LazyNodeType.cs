@@ -67,8 +67,8 @@ internal enum LazyNodeType : byte
     FusedLinearSigmoid,
     FusedConvBNReLU,
 
-    // Issue #301 fused kernels — registered for future graph-mode auto
-    // detection by the corresponding IFusionPattern implementations.
+    // Issue #301 fused kernels — emitted by graph-mode IFusionPattern
+    // chain walkers for LoRA, DDIM, and sparse linear paths.
     FusedLoRA,
     FusedDDIMStep,
     FusedSparseLinear,

@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IIssue301FusedBackend
     {
         /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
@@ -553,6 +553,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _programs.Add(fusedLinearProgram);
                 foreach (var name in Kernels.FusedLinearKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedLinearProgram, name);
+
+                try
+                {
+                    var issue301Program = CompileOrLoadCached(Kernels.Issue301FusedKernels.GetSource(), optimizationFlags, "Issue #301 fused kernels");
+                    _programs.Add(issue301Program);
+                    foreach (var name in Kernels.Issue301FusedKernels.GetKernelNames())
+                        _kernelCache[name] = new DirectOpenClKernel(_context, issue301Program, name);
+                }
+                catch { }
 
                 // Compile IoU loss kernels
                 var iouProgram = CompileOrLoadCached(Kernels.IoUKernels.GetSource(), optimizationFlags, "IoU loss kernels");
