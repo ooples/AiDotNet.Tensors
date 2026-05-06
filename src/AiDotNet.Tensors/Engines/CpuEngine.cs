@@ -3661,13 +3661,34 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
-        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}.");
+        if (destination.Length < a.Length)
+            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+        if (destination.IsSparse || a.IsSparse || b.IsSparse)
+            throw new InvalidOperationException("TensorSubtractInto does not support SparseTensor operands.");
 
         int length = a.Length;
+        if (!destination.IsContiguous || !a.IsContiguous || !b.IsContiguous)
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aStorage = a.RawStorageSpan;
+            var bStorage = b.RawStorageSpan;
+            var destinationStorage = destination.RawWritableStorageSpan;
+
+            for (int i = 0; i < length; i++)
+            {
+                destinationStorage[destination.LogicalToStorageIndex(i)] =
+                    numOps.Subtract(
+                        aStorage[a.LogicalToStorageIndex(i)],
+                        bStorage[b.LogicalToStorageIndex(i)]);
+            }
+            return;
+        }
+
         if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
@@ -4424,13 +4445,24 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
-        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
         if (destination.Length < a.Length)
             throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+        if (destination.IsSparse || a.IsSparse)
+            throw new InvalidOperationException("TensorMultiplyScalarInto does not support SparseTensor operands.");
 
         int length = a.Length;
+        if (!destination.IsContiguous || !a.IsContiguous)
+        {
+            var strideOps = MathHelper.GetNumericOperations<T>();
+            var sourceStorage = a.RawStorageSpan;
+            var destinationStorage = destination.RawWritableStorageSpan;
+            for (int i = 0; i < length; i++)
+            {
+                destinationStorage[destination.LogicalToStorageIndex(i)] =
+                    strideOps.Multiply(sourceStorage[a.LogicalToStorageIndex(i)], scalar);
+            }
+            return;
+        }
 
         // Float fast path: SIMD MultiplyScalar with parallel chunking
         if (typeof(T) == typeof(float))
@@ -25327,34 +25359,37 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
 
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
+        TensorRandomNormalInto(result, mean, stddev);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public void TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (destination.IsSparse)
+            throw new InvalidOperationException("Random initialization into SparseTensor is not supported.");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = RandomHelper.ThreadSafeRandom;
-        var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
-
-        var resultData = result.GetDataArray();
         double meanD = numOps.ToDouble(mean);
         double stdD = numOps.ToDouble(stddev);
 
-        // Box-Muller transform for normal distribution
-        for (int i = 0; i < totalElements; i += 2)
+        if (destination.IsContiguous)
         {
-            double u1 = random.NextDouble();
-            double u2 = random.NextDouble();
-
-            // Guard against log(0) which produces -Infinity and then NaN
-            u1 = Math.Max(u1, double.Epsilon);
-
-            double mag = Math.Sqrt(-2.0 * Math.Log(u1));
-            double z0 = mag * Math.Cos(2.0 * Math.PI * u2);
-            double z1 = mag * Math.Sin(2.0 * Math.PI * u2);
-
-            resultData[i] = numOps.FromDouble(z0 * stdD + meanD);
-            if (i + 1 < totalElements)
-                resultData[i + 1] = numOps.FromDouble(z1 * stdD + meanD);
+            FillRandomNormal(destination.AsWritableSpan(), numOps, random, meanD, stdD);
+            return;
         }
 
-        return result;
+        var destinationStorage = destination.RawWritableStorageSpan;
+        for (int i = 0; i < destination.Length;)
+        {
+            NextNormalPair(random, out double z0, out double z1);
+            destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z0 * stdD + meanD);
+            if (i < destination.Length)
+                destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z1 * stdD + meanD);
+        }
     }
 
     /// <inheritdoc/>
@@ -25362,18 +25397,28 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
 
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
+        TensorRandomUniformRangeInto(result, min, max, seed);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public void TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed = null)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (destination.IsSparse)
+            throw new InvalidOperationException("Random initialization into SparseTensor is not supported.");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double minD = numOps.ToDouble(min);
         double maxD = numOps.ToDouble(max);
         double range = maxD - minD;
+        int totalElements = destination.Length;
 
-        var resultData = result.GetDataArray();
-
-        if (totalElements > 10000)
+        var liveBacking = destination.GetLiveBackingArrayOrNull();
+        if (liveBacking is not null && totalElements > 10000)
         {
             // For seeded random with parallelism, we need thread-local randoms
             if (seed.HasValue)
@@ -25386,7 +25431,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
                     (i, state, localRandom) =>
                     {
-                        resultData[i] = numOps.FromDouble(localRandom.NextDouble() * range + minD);
+                        liveBacking[i] = numOps.FromDouble(localRandom.NextDouble() * range + minD);
                         return localRandom;
                     },
                     _ => { });
@@ -25395,19 +25440,64 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 Parallel.For(0, totalElements, i =>
                 {
-                    resultData[i] = numOps.FromDouble(RandomHelper.ThreadSafeRandom.NextDouble() * range + minD);
+                    liveBacking[i] = numOps.FromDouble(RandomHelper.ThreadSafeRandom.NextDouble() * range + minD);
                 });
             }
-        }
-        else
-        {
-            for (int i = 0; i < totalElements; i++)
-            {
-                resultData[i] = numOps.FromDouble(random.NextDouble() * range + minD);
-            }
+            return;
         }
 
-        return result;
+        if (destination.IsContiguous)
+        {
+            FillUniformRange(destination.AsWritableSpan(), numOps, random, minD, range);
+            return;
+        }
+
+        var destinationStorage = destination.RawWritableStorageSpan;
+        for (int i = 0; i < totalElements; i++)
+        {
+            destinationStorage[destination.LogicalToStorageIndex(i)] =
+                numOps.FromDouble(random.NextDouble() * range + minD);
+        }
+    }
+
+    private static void FillRandomNormal<T>(
+        Span<T> destination,
+        INumericOperations<T> numOps,
+        Random random,
+        double meanD,
+        double stdD)
+    {
+        for (int i = 0; i < destination.Length;)
+        {
+            NextNormalPair(random, out double z0, out double z1);
+            destination[i++] = numOps.FromDouble(z0 * stdD + meanD);
+            if (i < destination.Length)
+                destination[i++] = numOps.FromDouble(z1 * stdD + meanD);
+        }
+    }
+
+    private static void FillUniformRange<T>(
+        Span<T> destination,
+        INumericOperations<T> numOps,
+        Random random,
+        double minD,
+        double range)
+    {
+        for (int i = 0; i < destination.Length; i++)
+            destination[i] = numOps.FromDouble(random.NextDouble() * range + minD);
+    }
+
+    private static void NextNormalPair(Random random, out double z0, out double z1)
+    {
+        double u1 = random.NextDouble();
+        double u2 = random.NextDouble();
+
+        // Guard against log(0) which produces -Infinity and then NaN.
+        u1 = Math.Max(u1, double.Epsilon);
+
+        double mag = Math.Sqrt(-2.0 * Math.Log(u1));
+        z0 = mag * Math.Cos(2.0 * Math.PI * u2);
+        z1 = mag * Math.Sin(2.0 * Math.PI * u2);
     }
 
     /// <inheritdoc/>
@@ -28782,8 +28872,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU
     }
 
@@ -28793,8 +28882,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU
     }
 

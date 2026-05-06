@@ -269,6 +269,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--305-init")
+        {
+            BenchmarkRunner.Run<Issue305FirstForwardInitBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
@@ -478,6 +484,7 @@ class Program
         Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");
         Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
         Console.WriteLine("  --296-diffusion     : 50-step denoising loop vs PyTorch nn.Sequential");
+        Console.WriteLine("  --305-init          : First-forward weight-init peak benchmark vs old temp+copy and TorchSharp");
 #endif
     }
 }
