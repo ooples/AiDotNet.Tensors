@@ -237,6 +237,19 @@ class Program
             return;
         }
 
+        // Issue #296 acceptance harness: real-async ChainAsync vs PyTorch
+        if (args[0] == "--296-chain")
+        {
+            BenchmarkRunner.Run<CompiledPlanChainingBenchmarks>(BenchConfig);
+            return;
+        }
+
+        if (args[0] == "--296-throughput")
+        {
+            BenchmarkRunner.Run<StreamThroughputBenchmark>(BenchConfig);
+            return;
+        }
+
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
