@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.Execution;
 /// step submission. CPU streams are backed by a long-lived worker thread
 /// reading from a <see cref="System.Threading.Channels.Channel{T}"/>;
 /// GPU streams wrap a native <c>cudaStream_t</c> (or HIP stream / OpenCL
-/// command queue) so kernels submitted via <see cref="SubmitAsync"/>
+/// command queue) so kernels submitted via <see cref="Submit"/>
 /// execute concurrently with the host. Both backends preserve FIFO
 /// ordering within a single stream — step N's writes are guaranteed to
 /// be visible to step N+1's reads.
@@ -44,7 +44,7 @@ namespace AiDotNet.Tensors.Engines.Execution;
 /// </para>
 /// <para>
 /// <b>CUDA Graph capture compatibility:</b> when <see cref="Submit"/>
-/// is called inside a <see cref="Gpu.CudaGraphScope"/>, the kernel
+/// is called inside a <see cref="AiDotNet.Tensors.Engines.Gpu.CudaGraphScope"/>, the kernel
 /// dispatch is captured into the graph rather than executed eagerly.
 /// <see cref="SyncAsync"/> outside the capture replays the captured
 /// graph deterministically — the same path PyTorch's

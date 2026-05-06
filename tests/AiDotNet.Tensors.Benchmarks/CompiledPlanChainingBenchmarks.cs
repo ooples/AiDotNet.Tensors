@@ -126,17 +126,34 @@ public class CompiledPlanChainingBenchmarks
     [GlobalCleanup]
     public void Cleanup()
     {
+        // TorchSharp tensors hold native libtorch memory; the GC won't
+        // free them — explicit Dispose() is required to release the
+        // underlying ATen storage. Without this every benchmark run
+        // accumulates ~7-10 KB of native libtorch heap. Closes review-
+        // comments #298.1Sre / #298.7tYW / #298.75AA.
+        _torchInput?.Dispose();
+        _torchW1T?.Dispose();
+        _torchW2T?.Dispose();
+        _torchB1?.Dispose();
+        _torchB2?.Dispose();
+        _torchMlpModule?.Dispose();
+
         _cacheA?.Dispose();
         _cacheB?.Dispose();
-        _torchMlpModule?.Dispose();
     }
 
     [Benchmark(Baseline = true)]
     public TorchTensor PyTorch_TwoStageSequential()
     {
-        // Two explicit stages, eager — closest analog to "two compiled plans".
-        var hidden = torch.nn.functional.linear(_torchInput, _torchW1T, _torchB1);
-        var activated = torch.nn.functional.relu(hidden);
+        // Two explicit stages, eager — closest analog to "two compiled
+        // plans". Intermediate `hidden` and `activated` are TorchSharp
+        // tensors holding native ATen storage; `using` ensures they're
+        // released when this scope exits so BenchmarkDotNet's per-call
+        // memory measurement isn't polluted by leaked native bytes
+        // (closes #298.7tYk / #298.75AL). The returned tensor is the
+        // caller's to dispose; BenchmarkDotNet's harness handles that.
+        using var hidden = torch.nn.functional.linear(_torchInput, _torchW1T, _torchB1);
+        using var activated = torch.nn.functional.relu(hidden);
         return torch.nn.functional.linear(activated, _torchW2T, _torchB2);
     }
 

@@ -325,20 +325,35 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// and <see cref="ChainAsync(ICompiledPlan{T}, int, CancellationToken)"/>
     /// take a fast path that inlines the steps on the calling thread —
     /// going through the Channel-backed worker is pure overhead when
-    /// there's no opportunity for host/device overlap. The decision uses
-    /// engine name rather than a type check so the codebase doesn't take
-    /// a hard dependency on the concrete <c>CpuEngine</c> class from this
-    /// generic plan implementation.
+    /// there's no opportunity for host/device overlap.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Capability-based: an engine counts as CPU if it doesn't expose a
+    /// usable DirectGPU backend AND doesn't claim GPU support. This
+    /// catches both the canonical <c>CpuEngine</c> ("CPU Engine") AND
+    /// CPU-fallback variants like
+    /// <c>DirectGpuTensorEngine</c> when GPU initialization fails — that
+    /// path reports <c>"CPU Engine (DirectGpu unavailable)"</c> from
+    /// its Name and would have missed an exact-name match. Reviewer
+    /// feedback on PR #298 (review-comment 7tW0).
+    /// </para>
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool IsCpuEngine(IEngine engine)
     {
-        // CpuEngine is the only engine that returns this name; every
-        // GPU backend (DirectGpuEngine, etc.) reports its accelerator
-        // identity here. String comparison is hot-path-safe — the JIT
-        // optimizes constant-folded ordinal compares to a few register
-        // ops and the engine's Name property is a static readonly string.
-        return string.Equals(engine.Name, "CPU Engine", StringComparison.Ordinal);
+        // Two-pronged check: SupportsGpu must be false (so DirectGpuEngine
+        // and similar that claim GPU don't take this fast path) AND the
+        // DirectGpu surface must not expose a live backend (catches
+        // engines that report SupportsGpu=true but whose initialization
+        // failed, leaving them in a CPU-fallback state). When both are
+        // false the engine is provably CPU-bound and inlining the step
+        // loop on the calling thread is strictly better than queueing
+        // through a Channel-backed worker.
+        if (engine.SupportsGpu) return false;
+        var directGpu = engine.DirectGpu;
+        if (directGpu is not null && directGpu.IsAvailable) return false;
+        return true;
     }
 
     /// <summary>
@@ -415,6 +430,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 "Chaining requires shape-equal boundary tensors.",
                 nameof(next));
 
+        // Cancellation check happens BEFORE any persistent state
+        // mutation. If the caller already canceled the token, we throw
+        // OperationCanceledException without rewiring next-plan's input
+        // storage — keeping cancellation side-effect-free as a contract.
+        // Previously the rebind ran first, so a canceled ChainAsync
+        // call still permanently aliased the boundary tensor; subsequent
+        // standalone next.Execute calls would then silently read this
+        // plan's stale output instead of the caller-provided input.
+        cancellationToken.ThrowIfCancellationRequested();
+
         // Boundary rebind — zero-byte handoff of the intermediate buffer
         // (criterion #6 of issue #296). The rebind is persistent (same
         // semantics as Stitch) so subsequent ChainAsync / Execute calls
@@ -431,8 +456,6 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
         nextPlanInput.RebindStorageFrom(_finalOutput);
         nextPlan._lastStitchUpstream = _finalOutput;
-
-        cancellationToken.ThrowIfCancellationRequested();
 
         // CPU fast path — same rationale as ExecuteAsync. Inline both
         // plans' steps on the calling thread, no Channel queueing.

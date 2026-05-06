@@ -460,6 +460,11 @@ class Program
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
+        Console.WriteLine();
+        Console.WriteLine("Issue #296 acceptance benchmarks (real async ICompiledPlan):");
+        Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");
+        Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
+        Console.WriteLine("  --296-diffusion     : 50-step denoising loop vs PyTorch nn.Sequential");
 #endif
     }
 }

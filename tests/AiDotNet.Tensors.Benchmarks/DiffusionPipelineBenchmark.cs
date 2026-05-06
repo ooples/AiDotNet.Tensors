@@ -49,6 +49,14 @@ public class DiffusionPipelineBenchmark
     private TorchTensor _torchInput = null!;
     private TorchSharp.Modules.Sequential _torchUnet = null!;
 
+    // Cached single-element input array reused across the 50-step
+    // denoising loop. Without it, each iteration's `new[] { _aiInput }`
+    // would allocate a fresh Tensor<float>[1] (24 B × 50 = 1.2 KB per
+    // benchmark call) and skew BenchmarkDotNet's MemoryDiagnoser
+    // measurement away from the API's actual per-call alloc.
+    // Closes review-comment #298.75Ac.
+    private Tensor<float>[] _aiInputArray = null!;
+
     [GlobalSetup]
     public void Setup()
     {
@@ -56,6 +64,7 @@ public class DiffusionPipelineBenchmark
 
         _aiInput = Tensor<float>.CreateRandom(new[] { BatchSize, Hidden });
         _aiHiddenSeed = Tensor<float>.CreateRandom(new[] { BatchSize, Hidden });
+        _aiInputArray = new[] { _aiInput };
         _aiW1 = Tensor<float>.CreateRandom(new[] { Hidden, Hidden });
         _aiW2 = Tensor<float>.CreateRandom(new[] { Hidden, Hidden });
         _aiB1 = Tensor<float>.CreateRandom(new[] { Hidden });
@@ -94,9 +103,14 @@ public class DiffusionPipelineBenchmark
     [GlobalCleanup]
     public void Cleanup()
     {
+        // Dispose TorchSharp tensors / module — they hold native
+        // libtorch memory the GC won't reclaim. Closes review-comment
+        // #298.75AR.
+        _torchInput?.Dispose();
+        _torchUnet?.Dispose();
+
         _cacheA?.Dispose();
         _cacheB?.Dispose();
-        _torchUnet?.Dispose();
     }
 
     [Benchmark(Baseline = true)]
@@ -123,7 +137,7 @@ public class DiffusionPipelineBenchmark
         // Task.Run.
         for (int step = 0; step < DenoisingSteps; step++)
         {
-            _planA.SetInputs(new[] { _aiInput });
+            _planA.SetInputs(_aiInputArray);
             await _planA.ChainAsync(_planB).ConfigureAwait(false);
         }
     }

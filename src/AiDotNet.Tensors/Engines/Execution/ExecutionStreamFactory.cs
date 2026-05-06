@@ -81,41 +81,47 @@ internal static class ExecutionStreamFactory
     }
 
     /// <summary>
-    /// Reflective lookup for the CUDA stream a <see cref="DirectGpuEngine"/>
-    /// has active. Reflective rather than direct because <see cref="CudaBackend"/>
-    /// holds <c>_stream</c> as a private field — exposing it as a public
-    /// property would touch a separately-versioned API and the issue's
-    /// "minimal blast radius" goal. If the lookup fails for any reason
-    /// (no active backend, non-CUDA backend, internal field renamed), we
-    /// fall through to the CPU stream — never throw.
+    /// Direct lookup of the active GPU stream on a
+    /// <see cref="DirectGpuEngine"/>. Routes through the public
+    /// <see cref="DirectGpuEngine.Backend"/> property and the public
+    /// <c>DefaultStream</c> on whichever <c>IDirectGpuBackend</c>
+    /// implementation is wired in (CUDA / OpenCL / Vulkan / Metal —
+    /// all expose <c>IGpuStream DefaultStream</c> via their public
+    /// API). No reflection: a future backend rename surfaces as a
+    /// compile-time error rather than a silent CPU fallback. Returns
+    /// null when there's no active backend, in which case the factory
+    /// falls through to the CPU stream.
     /// </summary>
     private static IGpuStream? TryGetCudaStream(DirectGpuEngine directGpu)
     {
-        try
-        {
-            // DirectGpuEngine exposes its underlying backend; the CUDA
-            // backend in turn exposes its primary stream. We probe via
-            // public surface so the binding stays stable across CUDA-
-            // backend internal refactors.
-            var backendProp = directGpu.GetType().GetProperty("Backend");
-            var backend = backendProp?.GetValue(directGpu);
-            if (backend is null) return null;
+        var backend = directGpu.Backend;
+        if (backend is null) return null;
 
-            // Public Stream property if it exists; otherwise the private
-            // _stream field (matches the existing CudaBackend layout).
-            var streamProp = backend.GetType().GetProperty("Stream");
-            if (streamProp?.GetValue(backend) is IGpuStream stream)
-                return stream;
-
-            var streamField = backend.GetType().GetField(
-                "_stream",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            return streamField?.GetValue(backend) as IGpuStream;
-        }
-        catch
+        // CudaBackend exposes DefaultStream as a public IGpuStream
+        // property. The IDirectGpuBackend interface itself doesn't
+        // declare DefaultStream (other backends — OpenCL, Vulkan, Metal
+        // — manage streams differently), so the lookup is concrete-type
+        // routed: typed cast on CudaBackend, fall through for everything
+        // else. Switching to a direct cast (no reflection) means a
+        // future CudaBackend rename surfaces as a compile-time error
+        // rather than a silent CPU fallback.
+        if (backend is CudaBackend cudaBackend)
         {
-            // Any reflection failure → fall through to CPU stream.
-            return null;
+            try
+            {
+                return cudaBackend.DefaultStream;
+            }
+            catch (InvalidOperationException)
+            {
+                // DefaultStream throws if the backend isn't fully
+                // initialized yet (lazy-load races). Fall through to
+                // CPU so the plan still runs.
+                return null;
+            }
         }
+
+        // Non-CUDA direct-GPU backends: no execution-stream wrapper
+        // surface yet. Future work for HIP / Vulkan / Metal goes here.
+        return null;
     }
 }

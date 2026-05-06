@@ -69,6 +69,17 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
     private TaskCompletionSource<bool>? _drainTcs;
     private int _disposed; // 0 = alive, 1 = disposed
 
+    // First exception thrown by a step kernel in the worker loop.
+    // Captured + surfaced from Sync / SyncAsync so callers actually
+    // observe step failures instead of hanging forever waiting for a
+    // drain that will never come (the worker task faults and stops
+    // pulling from the channel; submitted keeps climbing while
+    // completed sits still). Volatile so the read in Sync / SyncAsync
+    // sees the worker thread's write without a fence. Once set, the
+    // stream is in a faulted terminal state — Submit also surfaces
+    // the fault to fail fast on the producer side.
+    private Exception? _faultedException;
+
     public CpuExecutionStream()
     {
         _channel = Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions
@@ -97,6 +108,11 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
         if (engine is null) throw new ArgumentNullException(nameof(engine));
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(CpuExecutionStream<T>));
+        // Surface any prior step failure on the producer side too —
+        // submitting more work after a fault is wasted, and the caller
+        // expects to see the failure rather than queuing dead work
+        // that the (faulted, drained) worker won't run.
+        ThrowIfFaulted();
 
         // Increment BEFORE write so a SyncAsync on a fully-drained stream
         // never observes (_completed > _submitted). Atomic so multi-producer
@@ -133,6 +149,11 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
         while (Volatile.Read(ref _completed) < target)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            // Surface any worker-thread step failure as the await
+            // resumption — without this the caller would hang here
+            // forever, since after a fault the worker stops draining
+            // and `_completed` will never catch up to `target`.
+            ThrowIfFaulted();
             TaskCompletionSource<bool> tcs;
             lock (_syncLock)
             {
@@ -147,6 +168,10 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
             // via the linked CTS pattern in the polyfill below.
             await WaitWithCancellationAsync(tcs.Task, cancellationToken).ConfigureAwait(false);
         }
+        // Final fault check after the wait resumes — covers the case
+        // where the worker faulted between our last check and the TCS
+        // signal that woke us up.
+        ThrowIfFaulted();
     }
 
     /// <inheritdoc/>
@@ -161,6 +186,9 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
         long target = Volatile.Read(ref _submitted);
         while (Volatile.Read(ref _completed) < target)
         {
+            // Surface any worker-thread step failure as the call's
+            // exception — same rationale as the SyncAsync variant.
+            ThrowIfFaulted();
             TaskCompletionSource<bool> tcs;
             lock (_syncLock)
             {
@@ -170,6 +198,7 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
             }
             tcs.Task.Wait();
         }
+        ThrowIfFaulted();
     }
 
     private async Task WorkerLoopAsync()
@@ -189,16 +218,40 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
                     {
                         item.Step.Execute(item.Engine, item.Step.OutputBuffer);
                     }
+                    catch (Exception ex)
+                    {
+                        // Capture the FIRST step exception — subsequent
+                        // failures don't overwrite it, since the original
+                        // is the most useful diagnostic. Without this
+                        // catch the exception would fault _workerTask
+                        // and the worker loop would stop consuming the
+                        // channel; submitted would keep climbing while
+                        // completed sat still, hanging every future
+                        // Sync / SyncAsync call. Now Sync / SyncAsync
+                        // observe _faultedException and rethrow it
+                        // wrapped so callers actually see the failure.
+                        Interlocked.CompareExchange(ref _faultedException, ex, null);
+
+                        // Drain whatever's queued so subsequent Sync
+                        // calls return the fault rather than hanging.
+                        // Best-effort: any further work this consumer
+                        // queues should also see the fault on the next
+                        // Submit.
+                        _channel.Writer.TryComplete(ex);
+                    }
                     finally
                     {
                         long completed = Interlocked.Increment(ref _completed);
                         long submitted = Volatile.Read(ref _submitted);
-                        if (completed >= submitted)
+                        if (completed >= submitted || Volatile.Read(ref _faultedException) is not null)
                         {
                             // Fire any parked SyncAsync. Replace the TCS
                             // with null so the next SyncAsync allocates a
                             // fresh one — re-arming a fired TCS isn't
-                            // supported.
+                            // supported. We unblock both the drain
+                            // condition AND the fault condition so a
+                            // post-fault Sync surfaces the exception
+                            // instead of hanging.
                             TaskCompletionSource<bool>? tcs;
                             lock (_syncLock)
                             {
@@ -223,6 +276,23 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
             }
             tcs?.TrySetResult(true);
         }
+    }
+
+    /// <summary>
+    /// Surfaces any worker-thread step exception captured since the last
+    /// fault check. Called from <see cref="Submit"/>, <see cref="Sync"/>,
+    /// and <see cref="SyncAsync"/> so callers always observe failures
+    /// instead of hanging on a dead worker. Wraps the original exception
+    /// so the call-site stack trace is preserved alongside the worker's.
+    /// </summary>
+    private void ThrowIfFaulted()
+    {
+        var ex = Volatile.Read(ref _faultedException);
+        if (ex is null) return;
+        // ExceptionDispatchInfo.Throw preserves the original stack trace
+        // while adding the call site as a "rethrow at" frame — exactly
+        // what a user awaiting Sync wants to see.
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
     }
 
     private static Task WaitWithCancellationAsync(Task task, CancellationToken cancellationToken)

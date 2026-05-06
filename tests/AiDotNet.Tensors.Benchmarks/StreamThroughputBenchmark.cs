@@ -151,6 +151,16 @@ public class StreamThroughputBenchmark
     [GlobalCleanup]
     public void Cleanup()
     {
+        // Dispose all TorchSharp tensors — they hold native libtorch
+        // memory the GC can't reclaim. Closes review-comment #298.1Srq /
+        // #298.7tYW.
+        if (_torchInputs is not null)
+        {
+            foreach (var t in _torchInputs)
+                t?.Dispose();
+        }
+        _torchMlpModule?.Dispose();
+
         _cacheA?.Dispose();
         _cacheB?.Dispose();
         if (_poolCachesA != null)
@@ -161,7 +171,6 @@ public class StreamThroughputBenchmark
                 _poolCachesB[s]?.Dispose();
             }
         }
-        _torchMlpModule?.Dispose();
     }
 
     [Benchmark(Baseline = true)]
@@ -188,31 +197,38 @@ public class StreamThroughputBenchmark
     [Benchmark]
     public async Task Tensors_BatchSweep_PipelinedAsync()
     {
-        // Real pipelining: dispatch each batch's chain on its own
-        // background task so multiple batches can occupy different
-        // cores at the same time. Each await launch needs its own
-        // plan pair so the boundary rebind doesn't cross between
-        // concurrent batches; we round-robin across a pool of
-        // pre-allocated plan pairs (lazily compiled in Setup).
-        // This is the Tensors-side analogue of CUDA-streams overlap
-        // — on CPU, "stream" just means "an independent worker
-        // pipeline" and concurrent invocation lets the library-level
-        // BLAS / AVX work share the available cores.
+        // Real pipelining: process batches in waves of `poolSize` at a
+        // time, where each wave has every batch on its OWN plan pair —
+        // no two concurrent tasks ever touch the same plan instance.
+        // Previously this used `i % poolSize` round-robin, which let
+        // batches 0, 4, 8, ... call SetInputs/ChainAsync on the same
+        // plan pair simultaneously, racing the captured-input copy and
+        // making throughput non-deterministic. Closes review-comment
+        // #298.7q48 / #298.7tY7.
+        //
+        // The wave structure caps in-flight concurrency at `poolSize`
+        // (4) which is also where the CPU-side parallelism ceiling sits
+        // for this kernel size (each fused-linear stage already runs
+        // multi-threaded BLAS/AVX inside one plan).
         var pairs = _planPool;
         var poolSize = pairs.Length;
-        var tasks = new Task[NumBatches];
-        for (int i = 0; i < NumBatches; i++)
+        for (int waveStart = 0; waveStart < NumBatches; waveStart += poolSize)
         {
-            int batchIdx = i;
-            int slot = i % poolSize;
-            tasks[i] = Task.Run(async () =>
+            int waveEnd = Math.Min(waveStart + poolSize, NumBatches);
+            var tasks = new Task[waveEnd - waveStart];
+            for (int i = waveStart; i < waveEnd; i++)
             {
-                var (a, b) = pairs[slot];
-                a.SetInputs(new[] { _aiInputs[batchIdx] });
-                await a.ChainAsync(b).ConfigureAwait(false);
-            });
+                int slot = i - waveStart; // ∈ [0, poolSize) — UNIQUE per task in this wave
+                int batchIdx = i;
+                tasks[i - waveStart] = Task.Run(async () =>
+                {
+                    var (a, b) = pairs[slot];
+                    a.SetInputs(new[] { _aiInputs[batchIdx] });
+                    await a.ChainAsync(b).ConfigureAwait(false);
+                });
+            }
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
-        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 }
 #endif

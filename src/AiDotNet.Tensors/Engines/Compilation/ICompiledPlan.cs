@@ -290,7 +290,6 @@ public interface ICompiledPlan<T> : IDisposable
     /// Framework 4.7.1 (one of this library's target frameworks) does not
     /// support default interface members.
     /// </para>
-    /// </remarks>
     /// <para>
     /// <b>Obsolete (issue #296):</b> the "Async" suffix is misleading —
     /// this method is synchronous. Prefer <see cref="Stitch"/> for the
@@ -300,6 +299,7 @@ public interface ICompiledPlan<T> : IDisposable
     /// member ships <c>[Obsolete]</c> for one minor version, then is
     /// removed.
     /// </para>
+    /// </remarks>
     [Obsolete("Use Stitch for sync plan composition or ChainAsync for true async pipelining. Closes #296.", error: false)]
     ICompiledPlan<T> ThenAsync(ICompiledPlan<T> next);
 
