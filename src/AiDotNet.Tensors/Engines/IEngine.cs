@@ -2121,6 +2121,16 @@ public interface IEngine
     void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar);
 
     /// <summary>
+    /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination: dest[i] = source[i] * scalar. Zero allocation.
+    /// </summary>
+    /// <remarks>
+    /// This destination-last overload matches layer initialization call sites. TensorSubtractInto already
+    /// has a destination-aware overload, but cannot expose a destination-last overload without an ambiguous
+    /// three-Tensor signature in C#.
+    /// </remarks>
+    void TensorMultiplyScalarInto<T>(Tensor<T> source, T scalar, Tensor<T> destination);
+
+    /// <summary>
     /// Adds tensor b to tensor a in-place with broadcasting: a += broadcast(b). Zero allocation.
     /// Essential for bias addition in Conv/Dense layers without allocating a new output tensor.
     /// </summary>
@@ -5841,6 +5851,19 @@ public interface IEngine
     Tensor<T> TensorRandomNormal<T>(int[] shape, T mean, T stddev);
 
     /// <summary>
+    /// Fills an existing tensor with random values from a normal distribution.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">The tensor storage to fill in place.</param>
+    /// <param name="mean">The mean of the distribution.</param>
+    /// <param name="stddev">The standard deviation of the distribution.</param>
+    /// <remarks>
+    /// This preserves the destination tensor identity, avoiding temporary full-shape allocations during
+    /// streaming weight initialization.
+    /// </remarks>
+    void TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev);
+
+    /// <summary>
     /// Generates a tensor filled with random values from a uniform distribution within a specified range.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -5858,6 +5881,20 @@ public interface IEngine
     /// </para>
     /// </remarks>
     Tensor<T> TensorRandomUniformRange<T>(int[] shape, T min, T max, int? seed = null);
+
+    /// <summary>
+    /// Fills an existing tensor with random values from a uniform distribution within a specified range.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">The tensor storage to fill in place.</param>
+    /// <param name="min">The minimum value (inclusive).</param>
+    /// <param name="max">The maximum value (exclusive).</param>
+    /// <param name="seed">Optional random seed for reproducibility.</param>
+    /// <remarks>
+    /// This preserves the destination tensor identity, avoiding temporary full-shape allocations during
+    /// streaming weight initialization.
+    /// </remarks>
+    void TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed = null);
 
     /// <summary>
     /// Generates a dropout mask tensor where each element is either zero or a scale value.
