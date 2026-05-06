@@ -1,22 +1,24 @@
-using AiDotNet.Tensors.Engines.Autodiff;
-using AiDotNet.Tensors.LinearAlgebra;
+// Copyright (c) AiDotNet. All rights reserved.
+
+using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
-/// CPU fusion pass that pattern-matches sequences of lazy nodes and replaces them
-/// with fused operations. Uses the same fusion patterns as KernelFusionManager
-/// but applied to the lazy computation graph.
+/// CPU fusion pass that pattern-matches sequences of lazy nodes and
+/// replaces them with fused operations.
 ///
-/// Current fusion patterns:
-/// - MatMul + BiasAdd → FusedLinear (single BLAS call)
-/// - MatMul + BiasAdd + ReLU → FusedLinearReLU
-/// - MatMul + BiasAdd + Sigmoid → FusedLinearSigmoid
-/// - MatMul + BiasAdd + GELU → FusedLinearGELU
-///
-/// Future patterns (Phase 3+):
-/// - Conv2D + BatchNorm + ReLU → FusedConvBNReLU
-/// - Elementwise chains (Add + Mul → FMA)
+/// <para>OCP-compliant: this class iterates a registry of
+/// <see cref="IFusionPattern"/> instances; adding a new fusion pattern
+/// is a new <see cref="IFusionPattern"/> implementation registered with
+/// <see cref="FusionPatternRegistry"/>, with no modification to this
+/// pass. The built-in patterns registered out of the box cover:</para>
+/// <list type="bullet">
+///   <item>MatMul + BiasAdd (+ optional activation) → FusedLinear[ReLU/GELU/Sigmoid]</item>
+///   <item>MatMul + MatMul + MultiplyScalar + Add → FusedLoRA  (issue #301)</item>
+///   <item>SparseLinear pattern via dense-mask sentinel → FusedSparseLinear (issue #301)</item>
+///   <item>DDIM sampler-update chain → FusedDDIMStep  (issue #301)</item>
+/// </list>
 /// </summary>
 internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
 {
@@ -24,7 +26,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
 
     public List<ILazyNode> Run(List<ILazyNode> nodes)
     {
-        // Build consumer-count map: how many downstream nodes use each node's output
+        // Build consumer-count map: how many downstream nodes use each node's output.
         var consumerCounts = new Dictionary<ILazyNode, int>();
         foreach (var node in nodes)
         {
@@ -39,222 +41,30 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
 
         var result = new List<ILazyNode>(nodes.Count);
         var removed = new HashSet<ILazyNode>();
+        var patterns = FusionPatternRegistry.Patterns;
 
         for (int i = 0; i < nodes.Count; i++)
         {
             if (removed.Contains(nodes[i]))
                 continue;
 
-            // Try to fuse MatMul + Add + Activation → FusedLinear
-            if (TryFuseLinear(nodes, i, consumerCounts, removed, out var fused))
+            // Try each pattern in registration order. First match wins —
+            // patterns register in priority order (most specific first).
+            bool didFuse = false;
+            for (int p = 0; p < patterns.Count; p++)
             {
-                if (fused != null)
-                    result.Add(fused);
-                continue;
+                if (patterns[p].TryFuse(nodes, i, consumerCounts, removed, out var fused))
+                {
+                    if (fused != null)
+                        result.Add(fused);
+                    didFuse = true;
+                    break;
+                }
             }
-
-            result.Add(nodes[i]);
+            if (!didFuse)
+                result.Add(nodes[i]);
         }
 
         return result;
-    }
-
-    /// <summary>
-    /// Tries to fuse a MatMul node with a subsequent BiasAdd and optional activation
-    /// into a single FusedLinear node. Returns true if the current node was consumed.
-    /// </summary>
-    private static bool TryFuseLinear(
-        List<ILazyNode> nodes, int index,
-        Dictionary<ILazyNode, int> consumerCounts,
-        HashSet<ILazyNode> removed,
-        out ILazyNode? fused)
-    {
-        fused = null;
-        var matmul = nodes[index];
-        if (matmul.OpType != LazyNodeType.MatMul)
-            return false;
-
-        // MatMul output must have exactly one consumer (the Add)
-        if (consumerCounts.ContainsKey(matmul) && consumerCounts[matmul] > 1)
-            return false;
-
-        // Look ahead for Add (bias) consuming this MatMul's output
-        ILazyNode? addNode = null;
-        int addIndex = -1;
-        for (int j = index + 1; j < nodes.Count && j <= index + 3; j++)
-        {
-            if (removed.Contains(nodes[j]))
-                continue;
-            if ((nodes[j].OpType == LazyNodeType.Add || nodes[j].OpType == LazyNodeType.BroadcastAdd)
-                && IsConsumerOf(nodes[j], matmul))
-            {
-                addNode = nodes[j];
-                addIndex = j;
-                break;
-            }
-        }
-
-        if (addNode == null)
-            return false;
-
-        // Check if Add output has exactly one consumer (potential activation)
-        FusedActivationType activation = FusedActivationType.None;
-        ILazyNode? activationNode = null;
-        int activationIndex = -1;
-
-        if (!consumerCounts.ContainsKey(addNode) || consumerCounts[addNode] <= 1)
-        {
-            for (int j = addIndex + 1; j < nodes.Count && j <= addIndex + 2; j++)
-            {
-                if (removed.Contains(nodes[j]))
-                    continue;
-                if (IsConsumerOf(nodes[j], addNode))
-                {
-                    // OCP-compliant: lookup via ActivationRegistry instead of switch
-                    ActivationRegistry.TryGetActivationType(nodes[j].OpType, out activation);
-
-                    if (activation != FusedActivationType.None)
-                    {
-                        // Reject the activation if it has downstream consumers we
-                        // would strand. Fusion rewrites MatMul+Add+Activation into
-                        // a single FusedLinear node, but doesn't redirect
-                        // external consumers of the activation's output — so any
-                        // downstream node that read from the activation would be
-                        // left pointing at a node we removed. Safer to leave the
-                        // activation standalone when it's shared.
-                        if (consumerCounts.ContainsKey(nodes[j]) && consumerCounts[nodes[j]] > 1)
-                            break;
-
-                        activationNode = nodes[j];
-                        activationIndex = j;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Build fused node using the typed FusedLinearNodeBuilder
-        fused = FusedLinearNodeBuilder.TryBuild(matmul, addNode, activationNode, activation);
-        if (fused == null)
-            return false;
-
-        // Rewire the final-output tensor's LazySource to point at the new
-        // fused node. Downstream consumers read their inputs' LazySource via
-        // GetInputNodes() — if it still points at the now-removed activation
-        // / add node, DCE rebuilds its consumer map and drops the fused node
-        // because nothing in the current list claims to consume it. That was
-        // the ONNX-import multi-op-chain breakage: a Gemm+Relu+Add graph
-        // fused to FusedLinearReLU + Add, DCE rebuilt counts, FusedLinearReLU
-        // had 0 consumers in the rebuilt map, and got dropped — leaving Add
-        // reading a pre-trace tensor that only held the input placeholder.
-        SetLazySource(fused);
-
-        // Mark consumed nodes for removal
-        removed.Add(matmul);
-        removed.Add(addNode);
-        if (activationNode != null)
-            removed.Add(activationNode);
-
-        return true;
-    }
-
-    private static void SetLazySource(ILazyNode node)
-    {
-        // Rewire the output tensor's LazySource to the fused node so downstream
-        // GetInputNodes() sees it as the producer. Works for both float and
-        // double; no-op if the output type doesn't match either.
-        switch (node)
-        {
-            case LazyNode<float> f: f.Output.LazySource = f; break;
-            case LazyNode<double> d: d.Output.LazySource = d; break;
-        }
-    }
-
-    private static bool IsConsumerOf(ILazyNode consumer, ILazyNode producer)
-    {
-        foreach (var input in consumer.GetInputNodes())
-        {
-            if (ReferenceEquals(input, producer))
-                return true;
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Builds typed FusedLinear LazyNodes. Separate class to handle the generic type parameter.
-    /// </summary>
-    private static class FusedLinearNodeBuilder
-    {
-        internal static ILazyNode? TryBuild(
-            ILazyNode matmul, ILazyNode addNode,
-            ILazyNode? activationNode, FusedActivationType activation)
-        {
-            // Try float
-            if (matmul is LazyNode<float> matmulF && addNode is LazyNode<float> addF)
-                return BuildTyped(matmulF, addF, activationNode as LazyNode<float>, activation);
-            // Try double
-            if (matmul is LazyNode<double> matmulD && addNode is LazyNode<double> addD)
-                return BuildTyped(matmulD, addD, activationNode as LazyNode<double>, activation);
-            return null;
-        }
-
-        private static LazyNode<T>? BuildTyped<T>(
-            LazyNode<T> matmul, LazyNode<T> add,
-            LazyNode<T>? activationNode, FusedActivationType activation)
-        {
-            // Determine the final output: activation output if present, else add output
-            var finalOutput = activationNode != null ? activationNode.Output : add.Output;
-
-            // Inputs: input tensor, weight tensor, bias tensor
-            var input = matmul.Input0;
-            var weights = matmul.Input1 ?? matmul.Input0;
-
-            // The bias is the "other" input of the add node (the one that isn't the matmul output)
-            Tensor<T> bias;
-            if (ReferenceEquals(add.Input0, matmul.Output))
-                bias = add.Input1 ?? add.Input0;
-            else
-                bias = add.Input0;
-
-            // Only fuse if bias is 1D (broadcast bias add pattern).
-            // An elementwise add with same-shaped tensors is NOT a bias add.
-            if (bias._shape.Length != 1)
-                return null;
-
-            // Verify bias dim matches matmul output columns
-            var matmulOutputCols = matmul.OutputShape[matmul.OutputShape.Length - 1];
-            if (bias._shape[0] != matmulOutputCols)
-                return null;
-
-            // Clear LazySource on intermediate outputs so auto-materialize doesn't
-            // try to realize the now-removed nodes. The fused node will write the
-            // final result into finalOutput.
-            matmul.Output.LazySource = null;
-            add.Output.LazySource = null;
-
-            var nodeType = ActivationRegistry.GetFusedLinearNodeType(activation);
-
-            var capturedInput = input;
-            var capturedWeights = weights;
-            var capturedBias = bias;
-            var capturedActivation = activation;
-
-            object[]? savedState = activation != FusedActivationType.None
-                ? new object[] { activation }
-                : null;
-
-            return new LazyNode<T>(
-                nodeType,
-                "FusedLinear",
-                new[] { capturedInput, capturedWeights, capturedBias },
-                finalOutput,
-                (eng, output) =>
-                {
-                    var eager = eng.FusedLinear(capturedInput, capturedWeights, capturedBias, capturedActivation);
-                    eager.AsSpan().CopyTo(output.AsWritableSpan());
-                },
-                BackwardFunctions<T>.FusedLinearWithActivationBackward,
-                savedState);
-        }
     }
 }

@@ -67,6 +67,18 @@ internal enum LazyNodeType : byte
     FusedLinearSigmoid,
     FusedConvBNReLU,
 
+    // Issue #301 fused kernels — registered for future graph-mode auto
+    // detection by the corresponding IFusionPattern implementations.
+    FusedLoRA,
+    FusedDDIMStep,
+    FusedSparseLinear,
+
+    // Issue #302 VSA primitives — content-addressable retrieval and
+    // HRR algebra. Standalone ops, not fusion targets.
+    HopfieldRetrieve,
+    HrrBind,
+    HrrUnbind,
+
     // Loss functions
     MSELoss,
     CrossEntropyLoss,
