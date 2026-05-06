@@ -145,13 +145,18 @@ public class CompiledPlanChainingBenchmarks
     [Benchmark(Baseline = true)]
     public TorchTensor PyTorch_TwoStageSequential()
     {
-        // Two explicit stages, eager — closest analog to "two compiled
-        // plans". Intermediate `hidden` and `activated` are TorchSharp
-        // tensors holding native ATen storage; `using` ensures they're
-        // released when this scope exits so BenchmarkDotNet's per-call
-        // memory measurement isn't polluted by leaked native bytes
-        // (closes #298.7tYk / #298.75AL). The returned tensor is the
-        // caller's to dispose; BenchmarkDotNet's harness handles that.
+        // torch.no_grad() disables autograd for the inference path so
+        // the measurement reflects pure forward kernel time (matching
+        // the AiDotNet ChainAsync benchmark which doesn't run
+        // gradients either). Without it the baseline pays autograd
+        // bookkeeping overhead the AiDotNet path doesn't, giving an
+        // unfair head start to Tensors. Closes review-comment
+        // #298.1Sbh.
+        using var _noGrad = torch.no_grad();
+        // Intermediate `hidden` and `activated` are TorchSharp tensors
+        // holding native ATen storage; `using` ensures they're released
+        // when this scope exits so BenchmarkDotNet's per-call memory
+        // measurement isn't polluted by leaked native bytes.
         using var hidden = torch.nn.functional.linear(_torchInput, _torchW1T, _torchB1);
         using var activated = torch.nn.functional.relu(hidden);
         return torch.nn.functional.linear(activated, _torchW2T, _torchB2);
@@ -160,9 +165,10 @@ public class CompiledPlanChainingBenchmarks
     [Benchmark]
     public TorchTensor PyTorch_Sequential()
     {
-        // Highest-level TorchSharp API: nn.Sequential treats lin1+relu+lin2
-        // as a single forward call. This is the upper-bound baseline the
-        // issue's acceptance criteria target (≤1.05×).
+        // Same no_grad pattern as PyTorch_TwoStageSequential — pure
+        // inference, matching what the AiDotNet ChainAsync path
+        // measures.
+        using var _noGrad = torch.no_grad();
         return _torchMlpModule.forward(_torchInput);
     }
 

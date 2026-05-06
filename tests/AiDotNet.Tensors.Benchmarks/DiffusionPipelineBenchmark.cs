@@ -119,7 +119,10 @@ public class DiffusionPipelineBenchmark
         // 50 sequential forward passes through the noise predictor —
         // closest available analog to a real diffusion sampling loop
         // (without time-step conditioning, which would only add a
-        // constant per-step cost the same on both sides).
+        // constant per-step cost the same on both sides). Wrapped in
+        // torch.no_grad() so the measurement is pure inference,
+        // matching the AiDotNet ChainAsync path. Closes #298.1Sbh.
+        using var _noGrad = torch.no_grad();
         for (int step = 0; step < DenoisingSteps; step++)
         {
             using var output = _torchUnet.forward(_torchInput);

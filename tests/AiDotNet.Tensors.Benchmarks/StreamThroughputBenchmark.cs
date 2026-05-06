@@ -176,6 +176,12 @@ public class StreamThroughputBenchmark
     [Benchmark(Baseline = true)]
     public void PyTorch_BatchSweep_Sequential()
     {
+        // torch.no_grad() — pure inference, no autograd. Same rationale
+        // as in CompiledPlanChainingBenchmarks: the AiDotNet ChainAsync
+        // path doesn't run gradients either, so an autograd-tracked
+        // PyTorch baseline isn't a fair comparison. Closes review-
+        // comment #298.1Sbh.
+        using var _noGrad = torch.no_grad();
         for (int i = 0; i < NumBatches; i++)
         {
             using var output = _torchMlpModule.forward(_torchInputs[i]);
