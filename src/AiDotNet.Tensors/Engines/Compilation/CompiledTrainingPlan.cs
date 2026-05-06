@@ -1706,7 +1706,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)
     {
-        const int parallelThreshold = 50_000;
+        const int parallelThreshold = 128 * 1024;
         const int chunkSize = 256;
         if ((long)rows * cols < parallelThreshold)
         {

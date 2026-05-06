@@ -45,6 +45,7 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine : ITensorLevelEngine
 {
     private static int _randomNormalSeedCounter = Environment.TickCount;
+    private const int TensorMatMulGemvParallelThreshold = 128 * 1024;
 
     /// <inheritdoc/>
     public string Name => "CPU Engine";
@@ -10070,7 +10071,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void TensorMatMulGemvFloat(ReadOnlyMemory<float> matrix, ReadOnlyMemory<float> vector, Memory<float> output, int rows, int cols)
     {
-        if ((long)rows * cols >= ParallelThreshold)
+        if ((long)rows * cols >= TensorMatMulGemvParallelThreshold)
         {
             ParallelForChunks(rows, 256, (start, count) =>
             {
@@ -10101,7 +10102,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void TensorMatMulGemvDouble(ReadOnlyMemory<double> matrix, ReadOnlyMemory<double> vector, Memory<double> output, int rows, int cols)
     {
-        if ((long)rows * cols >= ParallelThreshold)
+        if ((long)rows * cols >= TensorMatMulGemvParallelThreshold)
         {
             ParallelForChunks(rows, 256, (start, count) =>
             {

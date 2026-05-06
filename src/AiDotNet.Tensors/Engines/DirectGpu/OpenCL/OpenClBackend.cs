@@ -1556,8 +1556,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             bool traceEnabled = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
             bool forceDirect = Environment.GetEnvironmentVariable("AIDOTNET_FORCE_DIRECT") == "1";
 
-            // Use indirect path for matrices at or above the MinIndirectSize threshold (CLBlast behavior)
-            bool useIndirectPath = _clblastMinIndirectSize > 0 && (M >= _clblastMinIndirectSize || N >= _clblastMinIndirectSize);
+            // Keep GEMV/vector-like calls on XgemmDirect. The packed indirect
+            // row-major swap path is tuned for matrix-shaped GEMM and corrupts
+            // N=1 results once M crosses the CLBlast MinIndirectSize threshold.
+            bool isVectorLikeGemm = M == 1 || N == 1;
+            bool useIndirectPath = !isVectorLikeGemm &&
+                _clblastMinIndirectSize > 0 &&
+                (M >= _clblastMinIndirectSize || N >= _clblastMinIndirectSize);
 
             // Try direct path only for small matrices (below MinIndirectSize threshold)
             if (!useIndirectPath || forceDirect)
