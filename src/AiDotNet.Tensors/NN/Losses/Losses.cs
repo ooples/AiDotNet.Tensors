@@ -52,6 +52,14 @@ public static class Losses
         var tgtSpan = target.AsSpan();
         var outSpan = output.AsWritableSpan();
 
+        // beta == 0 is a degenerate case where the quadratic branch
+        // would divide by zero. PyTorch documents this as equivalent
+        // to plain L1; we special-case it explicitly so neither the
+        // primitive fast paths nor the generic path ever evaluate
+        // 0.5·diff²/0. Keeping the branch outside the inner loop also
+        // lets the JIT hoist the constant comparison.
+        bool isPlainL1 = beta == 0.0;
+
         // #294 NumericFastPath: bypass per-element INumericOperations<T>
         // dispatch for the float / double primitive cases. Audit
         // measured 4× speedup on this exact loop shape (per-element
@@ -62,39 +70,63 @@ public static class Losses
         var outArr = output.GetDataArray();
         if (inArr is double[] iD && tgtArr is double[] tD && outArr is double[] oD)
         {
-            double half = 0.5;
-            double halfBeta = half * beta;
             int n = inSpan.Length;
-            for (int i = 0; i < n; i++)
+            if (isPlainL1)
             {
-                double diff = iD[i] - tD[i];
-                double absDiff = Math.Abs(diff);
-                oD[i] = absDiff < beta ? half * diff * diff / beta : absDiff - halfBeta;
+                for (int i = 0; i < n; i++) oD[i] = Math.Abs(iD[i] - tD[i]);
+            }
+            else
+            {
+                double halfBeta = 0.5 * beta;
+                for (int i = 0; i < n; i++)
+                {
+                    double diff = iD[i] - tD[i];
+                    double absDiff = Math.Abs(diff);
+                    oD[i] = absDiff < beta ? 0.5 * diff * diff / beta : absDiff - halfBeta;
+                }
             }
             return Reduce(output, reduction);
         }
         if (inArr is float[] iF && tgtArr is float[] tF && outArr is float[] oF)
         {
-            float betaF = (float)beta;
-            float halfBetaF = 0.5f * betaF;
             int n = inSpan.Length;
-            for (int i = 0; i < n; i++)
+            if (isPlainL1)
             {
-                float diff = iF[i] - tF[i];
-                float absDiff = MathF.Abs(diff);
-                oF[i] = absDiff < betaF ? 0.5f * diff * diff / betaF : absDiff - halfBetaF;
+                for (int i = 0; i < n; i++) oF[i] = MathF.Abs(iF[i] - tF[i]);
+            }
+            else
+            {
+                float betaF = (float)beta;
+                float halfBetaF = 0.5f * betaF;
+                for (int i = 0; i < n; i++)
+                {
+                    float diff = iF[i] - tF[i];
+                    float absDiff = MathF.Abs(diff);
+                    oF[i] = absDiff < betaF ? 0.5f * diff * diff / betaF : absDiff - halfBetaF;
+                }
             }
             return Reduce(output, reduction);
         }
 
-        for (int i = 0; i < inSpan.Length; i++)
+        if (isPlainL1)
         {
-            double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
-            double absDiff = Math.Abs(diff);
-            double loss = absDiff < beta
-                ? 0.5 * diff * diff / beta
-                : absDiff - 0.5 * beta;
-            outSpan[i] = ops.FromDouble(loss);
+            for (int i = 0; i < inSpan.Length; i++)
+            {
+                double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
+                outSpan[i] = ops.FromDouble(Math.Abs(diff));
+            }
+        }
+        else
+        {
+            for (int i = 0; i < inSpan.Length; i++)
+            {
+                double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
+                double absDiff = Math.Abs(diff);
+                double loss = absDiff < beta
+                    ? 0.5 * diff * diff / beta
+                    : absDiff - 0.5 * beta;
+                outSpan[i] = ops.FromDouble(loss);
+            }
         }
         return Reduce(output, reduction);
     }

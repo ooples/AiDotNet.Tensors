@@ -90,6 +90,8 @@ namespace AiDotNet.Tensors.Engines.Optimization
         public static void Tile2D<TAction>(int rows, int cols, int tileSize, TAction action)
             where TAction : struct, ITile2DAction
         {
+            if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+            if (cols < 0) throw new ArgumentOutOfRangeException(nameof(cols));
             if (tileSize <= 0) throw new ArgumentOutOfRangeException(nameof(tileSize));
             for (int i = 0; i < rows; i += tileSize)
             {
@@ -113,6 +115,9 @@ namespace AiDotNet.Tensors.Engines.Optimization
             TAction action)
             where TAction : struct, ITile3DAction
         {
+            if (dim1 < 0) throw new ArgumentOutOfRangeException(nameof(dim1));
+            if (dim2 < 0) throw new ArgumentOutOfRangeException(nameof(dim2));
+            if (dim3 < 0) throw new ArgumentOutOfRangeException(nameof(dim3));
             if (tileSize1 <= 0) throw new ArgumentOutOfRangeException(nameof(tileSize1));
             if (tileSize2 <= 0) throw new ArgumentOutOfRangeException(nameof(tileSize2));
             if (tileSize3 <= 0) throw new ArgumentOutOfRangeException(nameof(tileSize3));
@@ -144,6 +149,7 @@ namespace AiDotNet.Tensors.Engines.Optimization
         public static void UnrollBy4<TAction>(int length, TAction action)
             where TAction : struct, ILoopAction
         {
+            if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
             int unrolled = length & ~3;
             for (int i = 0; i < unrolled; i += 4)
             {
@@ -166,6 +172,7 @@ namespace AiDotNet.Tensors.Engines.Optimization
         public static void UnrollBy8<TAction>(int length, TAction action)
             where TAction : struct, ILoopAction
         {
+            if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
             int unrolled = length & ~7;
             for (int i = 0; i < unrolled; i += 8)
             {
@@ -194,6 +201,7 @@ namespace AiDotNet.Tensors.Engines.Optimization
         public static void StripMine<TAction>(int totalSize, int stripSize, TAction action)
             where TAction : struct, IStripAction
         {
+            if (totalSize < 0) throw new ArgumentOutOfRangeException(nameof(totalSize));
             if (stripSize <= 0) throw new ArgumentOutOfRangeException(nameof(stripSize));
             for (int start = 0; start < totalSize; start += stripSize)
             {
@@ -216,6 +224,8 @@ namespace AiDotNet.Tensors.Engines.Optimization
             int rows, int cols, bool rowMajorAccess, TAction action)
             where TAction : struct, IInterchangeAction
         {
+            if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+            if (cols < 0) throw new ArgumentOutOfRangeException(nameof(cols));
             if (rowMajorAccess)
             {
                 for (int i = 0; i < rows; i++)
@@ -257,6 +267,8 @@ namespace AiDotNet.Tensors.Engines.Optimization
             int rows, int cols, int tileSize, TAction action)
             where TAction : struct, ITile2DAction
         {
+            if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+            if (cols < 0) throw new ArgumentOutOfRangeException(nameof(cols));
             if (tileSize <= 0) throw new ArgumentOutOfRangeException(nameof(tileSize));
             int numTilesI = (rows + tileSize - 1) / tileSize;
             int numTilesJ = (cols + tileSize - 1) / tileSize;

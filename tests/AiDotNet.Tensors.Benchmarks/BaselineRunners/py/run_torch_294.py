@@ -97,8 +97,17 @@ def _time_layernorm(args, warmup, iters):
 
 def _time_bce_deriv(args, warmup, iters):
     n = int(args)
-    pred = torch.rand(n, dtype=torch.float32, requires_grad=True)
-    target = torch.rand(n, dtype=torch.float32)
+    # Match the C# side (Issue294PyTorchParityBenchmark.TimeBceForwardBackward)
+    # exactly: pred ∈ [0.02, 0.98] uniform, target binary 0/1. Using
+    # torch.rand for the target (continuous uniform) was the previous
+    # baseline shape — but that's a fundamentally different workload
+    # from binary classification: the gradient magnitudes differ, the
+    # log() inputs differ, and the runtimes are not comparable. Seeded
+    # generators so re-runs of this script are reproducible.
+    gen = torch.Generator().manual_seed(4)
+    pred = (torch.rand(n, dtype=torch.float32, generator=gen) * 0.96 + 0.02)
+    pred.requires_grad_(True)
+    target = (torch.rand(n, dtype=torch.float32, generator=gen) < 0.5).to(torch.float32)
 
     def step():
         if pred.grad is not None:

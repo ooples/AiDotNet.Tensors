@@ -172,6 +172,19 @@ public static class FlashAttention<T> where T : unmanaged
             out int batchProduct, out int Sq, out int Sk, out int headDim, out int Dv,
             out int[] prefixShape, out int[] biasPrefixShape, out int[] biasPrefixStrides);
 
+        // Validate gradOutput / output / logsumexp shapes match what
+        // the forward produced for this (query, key, value) triple.
+        // Without this, a tensor with the right total element count
+        // but wrong rank or dim ordering silently writes through
+        // GetDataArray + raw offset arithmetic, producing wrong
+        // gradients instead of failing fast on the shape error.
+        // Expected:
+        //   gradOutput, output: [...prefix..., Sq, Dv]
+        //   logsumexp:          [...prefix..., Sq]
+        EnsureBackwardShape(gradOutput, prefixShape, Sq, Dv, nameof(gradOutput));
+        EnsureBackwardShape(output, prefixShape, Sq, Dv, nameof(output));
+        EnsureLseShape(logsumexp, prefixShape, Sq);
+
         // Cap by sequence dim, not headDim — see Forward.
         if (blockSizeQ == 0) blockSizeQ = ResolveDefaultBlockSize(Sq);
         if (blockSizeKV == 0) blockSizeKV = ResolveDefaultBlockSize(Sk);
@@ -231,6 +244,29 @@ public static class FlashAttention<T> where T : unmanaged
     }
 
     /// <summary>
+    /// Rejects integer types in the generic ForwardGeneric /
+    /// BackwardGeneric paths. Softmax outputs are in (0, 1); writing
+    /// them back through <see cref="INumericOperations{T}.FromDouble"/>
+    /// for an integer T would truncate every probability to 0, so
+    /// the API would silently return meaningless results. Fail fast
+    /// with a clear NotSupportedException — callers should pick
+    /// float / double / Half / BFloat16 instead.
+    /// </summary>
+    private static void ThrowIfIntegralT()
+    {
+        if (typeof(T) == typeof(int) || typeof(T) == typeof(long)
+            || typeof(T) == typeof(short) || typeof(T) == typeof(byte)
+            || typeof(T) == typeof(uint) || typeof(T) == typeof(ulong)
+            || typeof(T) == typeof(ushort) || typeof(T) == typeof(sbyte))
+        {
+            throw new NotSupportedException(
+                $"FlashAttention<{typeof(T).Name}> is not supported: softmax outputs in (0, 1) " +
+                "would truncate to 0 when written back through an integer type. " +
+                "Use float, double, Half, or BFloat16.");
+        }
+    }
+
+    /// <summary>
     /// L1-aware default block size for FlashAttention's Q/KV tiles
     /// along the SEQUENCE axis. <paramref name="seqDim"/> is the
     /// sequence dim being tiled (Sq for Q-tiles, Sk for KV-tiles);
@@ -258,6 +294,62 @@ public static class FlashAttention<T> where T : unmanaged
             return Math.Max(16, Math.Min(m, 128));
         }
         return Math.Max(16, Math.Min(64, seqDim));
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="t"/> has shape
+    /// <c>[...prefix..., Sq, Dv]</c>. Used by <see cref="Backward"/>
+    /// to fail fast when <c>gradOutput</c> or <c>output</c> doesn't
+    /// match the forward's contract.
+    /// </summary>
+    private static void EnsureBackwardShape(Tensor<T> t, int[] prefixShape, int Sq, int Dv, string paramName)
+    {
+        int expectedRank = prefixShape.Length + 2;
+        if (t.Rank != expectedRank)
+            throw new ArgumentException(
+                $"{paramName} must have rank {expectedRank} ([...prefix..., Sq, Dv]); got rank {t.Rank}.",
+                paramName);
+        for (int i = 0; i < prefixShape.Length; i++)
+        {
+            if (t._shape[i] != prefixShape[i])
+                throw new ArgumentException(
+                    $"{paramName} prefix dim {i} = {t._shape[i]} but query/key/value have {prefixShape[i]}.",
+                    paramName);
+        }
+        if (t._shape[expectedRank - 2] != Sq)
+            throw new ArgumentException(
+                $"{paramName} second-to-last dim must equal Sq={Sq}; got {t._shape[expectedRank - 2]}.",
+                paramName);
+        if (t._shape[expectedRank - 1] != Dv)
+            throw new ArgumentException(
+                $"{paramName} last dim must equal Dv={Dv}; got {t._shape[expectedRank - 1]}.",
+                paramName);
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="lse"/> has shape
+    /// <c>[...prefix..., Sq]</c>. Used by <see cref="Backward"/> to
+    /// fail fast when <c>logsumexp</c> doesn't match the forward's
+    /// contract.
+    /// </summary>
+    private static void EnsureLseShape(Tensor<T> lse, int[] prefixShape, int Sq)
+    {
+        int expectedRank = prefixShape.Length + 1;
+        if (lse.Rank != expectedRank)
+            throw new ArgumentException(
+                $"logsumexp must have rank {expectedRank} ([...prefix..., Sq]); got rank {lse.Rank}.",
+                nameof(lse));
+        for (int i = 0; i < prefixShape.Length; i++)
+        {
+            if (lse._shape[i] != prefixShape[i])
+                throw new ArgumentException(
+                    $"logsumexp prefix dim {i} = {lse._shape[i]} but query/key/value have {prefixShape[i]}.",
+                    nameof(lse));
+        }
+        if (lse._shape[expectedRank - 1] != Sq)
+            throw new ArgumentException(
+                $"logsumexp last dim must equal Sq={Sq}; got {lse._shape[expectedRank - 1]}.",
+                nameof(lse));
     }
 
     /// <summary>
@@ -329,6 +421,22 @@ public static class FlashAttention<T> where T : unmanaged
                 throw new ArgumentException($"attentionBias last-two[-1] must be Sk={Sk}; got {attentionBias._shape[bRank - 1]}.", nameof(attentionBias));
 
             int biasPrefixRank = bRank - 2;
+            // NumPy-broadcast contract: bias's prefix rank may be
+            // EQUAL TO or LESS THAN the output prefix rank (left-pad
+            // with implicit size-1 broadcasts). It cannot exceed —
+            // a bias that's "wider" than the query/key prefix can't
+            // broadcast meaningfully against query's leading dims.
+            // Without this guard, leftPad goes negative and the
+            // broadcast-stride computation indexes prefixShape with
+            // a negative offset, throwing IndexOutOfRangeException
+            // instead of a clear shape error.
+            if (biasPrefixRank > prefixShape.Length)
+                throw new ArgumentException(
+                    $"attentionBias has {biasPrefixRank} prefix dim(s) (rank {bRank} minus the trailing [Sq, Sk]), " +
+                    $"but query/key/value share only {prefixShape.Length} prefix dim(s). " +
+                    $"Bias prefix rank must be <= query prefix rank for NumPy-style broadcasting.",
+                    nameof(attentionBias));
+
             biasPrefixShape = new int[biasPrefixRank];
             for (int i = 0; i < biasPrefixRank; i++) biasPrefixShape[i] = attentionBias._shape[i];
 
@@ -997,8 +1105,14 @@ public static class FlashAttention<T> where T : unmanaged
         int[] prefixShape, int[] biasPrefixStrides)
     {
         // Generic path: convert each tile through ToDouble, run the
-        // double kernel inline, ToDouble for output. Slower than the
-        // typed path but covers BFloat16 / Half / custom numerics.
+        // double kernel inline, FromDouble for output. Slower than
+        // the typed path but covers BFloat16 / Half / custom numerics.
+        // Reject integral T (int / long) up front: softmax produces
+        // probabilities in (0, 1), and FromDouble would truncate them
+        // all to 0, returning meaningless gradients/outputs. Fail
+        // fast with a clear NotSupportedException instead of silently
+        // producing wrong values.
+        ThrowIfIntegralT();
         var ops = MathHelper.GetNumericOperations<T>();
 
         int Br = Math.Min(blockSizeQ, Sq);
@@ -1098,6 +1212,8 @@ public static class FlashAttention<T> where T : unmanaged
         int blockSizeQ, int blockSizeKV, double scale, bool isCausal, int queryOffset,
         int[] prefixShape, int[] biasPrefixStrides)
     {
+        // Same integral-T guard as ForwardGeneric — see that comment.
+        ThrowIfIntegralT();
         var ops = MathHelper.GetNumericOperations<T>();
 
         var D = new double[batchProduct * Sq];

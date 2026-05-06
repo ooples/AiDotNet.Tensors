@@ -95,6 +95,15 @@ namespace AiDotNet.Tensors.Engines.Optimization
         /// a logical <c>[rows, cols]</c> matrix in row-major layout,
         /// and <paramref name="dst"/> receives a <c>[cols, rows]</c>
         /// matrix in row-major layout (i.e., the transpose).</para>
+        ///
+        /// <para><b>Overlap behaviour</b>: this routine is NOT in-place
+        /// safe. Block-major writes touch <c>dst[jj*rows + ii]</c> while
+        /// reads still need <c>src[(jj')*cols + ii']</c> from across the
+        /// diagonal — overlapping spans would clobber unread source data
+        /// for any non-trivial shape (and even for square shapes the
+        /// access pattern is not a swap). When overlap is detected we
+        /// throw <see cref="ArgumentException"/> rather than silently
+        /// producing garbage.</para>
         /// </summary>
         public static void TransposeBlocked<T>(ReadOnlySpan<T> src, Span<T> dst, int rows, int cols)
             where T : unmanaged
@@ -106,6 +115,13 @@ namespace AiDotNet.Tensors.Engines.Optimization
                 throw new ArgumentException($"src length {src.Length} too short for [{rows}, {cols}].", nameof(src));
             if (dst.Length < total)
                 throw new ArgumentException($"dst length {dst.Length} too short for [{cols}, {rows}].", nameof(dst));
+#if NETCOREAPP3_0_OR_GREATER || NET5_0_OR_GREATER
+            if (total > 0 && SpansOverlap(src, dst))
+                throw new ArgumentException(
+                    "TransposeBlocked does not support overlapping src and dst spans — block-major writes "
+                    + "would clobber source data across the diagonal. Allocate a separate destination buffer.",
+                    nameof(dst));
+#endif
 
             // 32-element block fits in two cache lines for T=float (256B
             // line, 32×4=128B), one line for T=double, etc. Larger

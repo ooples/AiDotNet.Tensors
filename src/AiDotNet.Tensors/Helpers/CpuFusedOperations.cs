@@ -1106,13 +1106,15 @@ public static class CpuFusedOperations
         const int FusedTileSize = 64;
         if (totalElements >= PARALLEL_THRESHOLD)
         {
-            // For large tensors we still want batch-level parallelism;
-            // each worker tiles its slice via the helper.
-            Parallel.For(0, batchSize, b =>
-            {
-                int offset = b * featureSize;
-                FusedBiasDropoutRow(input, bias, output, dropoutMask, offset, featureSize, dropoutScale);
-            });
+            // Large tensors: tile in 2D and dispatch the tiles through
+            // LoopOptimizer.ParallelTile2D, which routes onto the repo's
+            // CpuParallelSettings.LightweightParallel persistent worker
+            // pool. Replaces the previous raw Parallel.For so we honour
+            // the configured MaxDegreeOfParallelism cap and share the
+            // pool with SimdConvHelper / Im2ColHelper instead of
+            // spinning up a fresh ThreadPool slice per call.
+            LoopOptimizer.ParallelTile2D(batchSize, featureSize, FusedTileSize,
+                new FusedBiasDropoutTile(input, bias, output, dropoutMask, featureSize, dropoutScale));
         }
         else
         {

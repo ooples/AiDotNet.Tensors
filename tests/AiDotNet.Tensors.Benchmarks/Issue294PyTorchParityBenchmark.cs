@@ -7,6 +7,7 @@ using AiDotNet.Tensors.Benchmarks.BaselineRunners;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Globalization;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -59,7 +60,7 @@ internal static class Issue294PyTorchParityBenchmark
             var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
                 "matmul", $"{m}x{k}x{n}", warmup: 5, iters: 30);
             string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
-            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            string speedup = FormatSpeedup(aiMs, torch?.MedianMs);
             Console.WriteLine($"{m}x{k}x{n,-12} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
         }
         Console.WriteLine();
@@ -85,7 +86,7 @@ internal static class Issue294PyTorchParityBenchmark
             var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
                 "conv2d", args, warmup: 3, iters: 10);
             string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
-            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            string speedup = FormatSpeedup(aiMs, torch?.MedianMs);
             Console.WriteLine($"{s.label,-30} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
         }
         Console.WriteLine();
@@ -99,7 +100,7 @@ internal static class Issue294PyTorchParityBenchmark
             var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
                 "attn", $"2x4x{sq}x32;false", warmup: 5, iters: 20);
             string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
-            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            string speedup = FormatSpeedup(aiMs, torch?.MedianMs);
             Console.WriteLine($"{sq,-8} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
         }
         Console.WriteLine();
@@ -113,7 +114,7 @@ internal static class Issue294PyTorchParityBenchmark
             var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
                 "layernorm", $"{b}x{f}", warmup: 10, iters: 50);
             string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
-            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            string speedup = FormatSpeedup(aiMs, torch?.MedianMs);
             Console.WriteLine($"{b}x{f,-12} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
         }
         Console.WriteLine();
@@ -127,11 +128,48 @@ internal static class Issue294PyTorchParityBenchmark
             var torch = runner.TryRun(PythonBaselineRunner.Baseline.Torch294,
                 "bcederiv", n.ToString(), warmup: 10, iters: 50);
             string torchMs = torch?.MedianMs.ToString("F3") ?? "skip";
-            string speedup = torch is null ? "-" : (torch.MedianMs / aiMs).ToString("F2") + "×";
+            string speedup = FormatSpeedup(aiMs, torch?.MedianMs);
             Console.WriteLine($"{n,-12} {aiMs,-15:F3} {torchMs,-15} {speedup,-10}");
         }
         Console.WriteLine();
-        Console.WriteLine("Done. Speedup > 1× means AiDotNet beats PyTorch CPU on this shape.");
+        Console.WriteLine("Done. Both columns are per-iteration medians (not means);");
+        Console.WriteLine("speedup = PyTorch median / AiDotNet median. > 1× means AiDotNet wins.");
+    }
+
+    /// <summary>
+    /// Median speedup formatter that matches the "median vs median"
+    /// timing protocol — both <paramref name="aiMedianMs"/> and
+    /// <paramref name="torchMedianMs"/> must come from a per-iter median
+    /// reduction. Returns <c>"-"</c> when PyTorch was skipped, and
+    /// <c>"n/a"</c> when AiDotNet's median is so close to zero that the
+    /// ratio would either overflow or be dominated by stopwatch
+    /// resolution noise. Threshold is 1µs (1e-3 ms) — anything below
+    /// that is below <see cref="Stopwatch"/>'s realistic on-Windows
+    /// resolution and the ratio is uninformative.
+    /// </summary>
+    private static string FormatSpeedup(double aiMedianMs, double? torchMedianMs)
+    {
+        if (torchMedianMs is null) return "-";
+        if (!(aiMedianMs > 1e-3)) return "n/a";
+        double ratio = torchMedianMs.Value / aiMedianMs;
+        return ratio.ToString("F2", CultureInfo.InvariantCulture) + "×";
+    }
+
+    /// <summary>
+    /// Returns the median of an unsorted span of per-iteration sample
+    /// times in ms. We use median (not mean) so a single GC pause
+    /// doesn't blow up the headline number — same protocol the
+    /// Python baseline (<c>run_torch_294.py</c>) reports.
+    /// </summary>
+    private static double Median(double[] samples)
+    {
+        var sorted = (double[])samples.Clone();
+        Array.Sort(sorted);
+        int n = sorted.Length;
+        if (n == 0) return 0.0;
+        return (n & 1) == 1
+            ? sorted[n / 2]
+            : 0.5 * (sorted[(n / 2) - 1] + sorted[n / 2]);
     }
 
     private static double TimeMatMul(CpuEngine engine, int m, int k, int n, int warmup, int iters)
@@ -144,10 +182,19 @@ internal static class Issue294PyTorchParityBenchmark
         var a = new Tensor<float>(aData, new[] { m, k });
         var b = new Tensor<float>(bData, new[] { k, n });
         for (int i = 0; i < warmup; i++) engine.TensorMatMul(a, b);
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) engine.TensorMatMul(a, b);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds / iters;
+        // Per-iter median (not mean): a single stop-the-world GC pause
+        // would distort the mean by an order of magnitude on small
+        // shapes, but the median is robust and matches the protocol
+        // run_torch_294.py uses for the PyTorch side.
+        var samples = new double[iters];
+        for (int i = 0; i < iters; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            engine.TensorMatMul(a, b);
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        return Median(samples);
     }
 
     private static double TimeConv2D(CpuEngine engine,
@@ -162,10 +209,15 @@ internal static class Issue294PyTorchParityBenchmark
         var x = new Tensor<float>(xData, new[] { n, c, h, w });
         var kT = new Tensor<float>(kData, new[] { oc, c, kh, kw });
         for (int i = 0; i < warmup; i++) engine.Conv2D(x, kT, stride: stride, padding: pad);
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) engine.Conv2D(x, kT, stride: stride, padding: pad);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds / iters;
+        var samples = new double[iters];
+        for (int i = 0; i < iters; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            engine.Conv2D(x, kT, stride: stride, padding: pad);
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        return Median(samples);
     }
 
     private static double TimeFlashAttention(int b, int h, int sq, int d, int warmup, int iters)
@@ -181,10 +233,15 @@ internal static class Issue294PyTorchParityBenchmark
         var kT = new Tensor<float>(kData, new[] { b, h, sq, d });
         var v = new Tensor<float>(vData, new[] { b, h, sq, d });
         for (int i = 0; i < warmup; i++) FlashAttention<float>.Forward(q, kT, v);
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) FlashAttention<float>.Forward(q, kT, v);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds / iters;
+        var samples = new double[iters];
+        for (int i = 0; i < iters; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            FlashAttention<float>.Forward(q, kT, v);
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        return Median(samples);
     }
 
     private static double TimeLayerNorm(CpuEngine engine, int b, int f, int warmup, int iters)
@@ -199,10 +256,15 @@ internal static class Issue294PyTorchParityBenchmark
         var gamma = new Tensor<float>(gData, new[] { f });
         var beta = new Tensor<float>(bData, new[] { f });
         for (int i = 0; i < warmup; i++) engine.TensorLayerNorm(x, gamma, beta);
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) engine.TensorLayerNorm(x, gamma, beta);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds / iters;
+        var samples = new double[iters];
+        for (int i = 0; i < iters; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            engine.TensorLayerNorm(x, gamma, beta);
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        return Median(samples);
     }
 
     private static double TimeBceForwardBackward(CpuEngine engine, int n, int warmup, int iters)
@@ -223,14 +285,16 @@ internal static class Issue294PyTorchParityBenchmark
             engine.TensorBinaryCrossEntropy(pred, target, eps);
             engine.TensorBinaryCrossEntropyBackward(pred, target, eps);
         }
-        var sw = Stopwatch.StartNew();
+        var samples = new double[iters];
         for (int i = 0; i < iters; i++)
         {
+            var sw = Stopwatch.StartNew();
             engine.TensorBinaryCrossEntropy(pred, target, eps);
             engine.TensorBinaryCrossEntropyBackward(pred, target, eps);
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
         }
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds / iters;
+        return Median(samples);
     }
 }
 #endif
