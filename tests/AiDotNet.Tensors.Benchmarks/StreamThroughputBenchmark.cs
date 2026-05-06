@@ -120,11 +120,16 @@ public class StreamThroughputBenchmark
 
             // Pre-warm: a single sequential ChainAsync seeds the
             // SimdGemm packed-weight cache for this pair's W1 / W2
-            // tensors. The cache uses a ConditionalWeakTable that's
-            // not safe under concurrent insert; pre-warming on this
-            // (single-threaded) Setup path means the steady-state
-            // parallel benchmark only ever hits the cache lookup,
-            // never the cache miss path.
+            // tensors. ConditionalWeakTable is itself thread-safe, but
+            // SimdGemm.SgemmWithCachedB populates it via a non-atomic
+            // TryGetValue → Remove → Add pattern (not GetOrAdd /
+            // GetValue(factory)), so concurrent first-touch from
+            // different threads can race the population step and one
+            // thread's Add throws "An item with the same key has
+            // already been added". Pre-warming on this (single-
+            // threaded) Setup path means the steady-state parallel
+            // benchmark only hits the cache lookup, never the
+            // populate-on-miss path. Closes review-comment #298.8R7M.
             a.SetInputs(new[] { _aiInputs[0] });
             a.ChainAsync(b).AsTask().GetAwaiter().GetResult();
         }

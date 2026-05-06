@@ -144,15 +144,22 @@ public interface ICompiledPlan<T> : IDisposable
     /// next async call mutates it.</returns>
     /// <remarks>
     /// <para>
-    /// CPU backends drain through a long-lived worker thread reading from
-    /// a <c>Channel&lt;&gt;</c>; GPU backends submit kernels to a native
-    /// <c>cudaStream_t</c> and poll
+    /// CPU backends take a fast path that inlines the step loop on the
+    /// calling thread and returns a completed <see cref="ValueTask{TResult}"/>
+    /// — there's no native device-stream concept on CPU, so going
+    /// through a worker / channel would just add queueing overhead with
+    /// no host/device overlap to amortize it against. GPU backends
+    /// submit kernels to a native <c>cudaStream_t</c> and poll
     /// <c>cuStreamQuery</c> + <see cref="System.Threading.Tasks.Task.Yield"/>
-    /// until the stream drains. Acceptance criterion #9 of issue #296
-    /// forbids <see cref="System.Threading.Tasks.Task.Run"/> on the per-step
-    /// hot path; the implementation enforces this with a struct work-item
-    /// queue and zero per-step <see cref="System.Threading.Tasks.Task"/>
-    /// allocations.
+    /// until the stream drains, so the host thread yields rather than
+    /// blocking while the GPU works. Acceptance criterion #9 of issue
+    /// #296 forbids <see cref="System.Threading.Tasks.Task.Run"/> on the
+    /// per-step hot path: the CPU fast path is fully synchronous (no
+    /// Tasks created); the GPU path uses one long-lived worker pool
+    /// behind <c>CpuExecutionStream</c> for plans that DO benefit from
+    /// host/device overlap. Closes review-comment #298.8R6v (the prior
+    /// docs said CPU drains through a worker, which only describes the
+    /// pre-fast-path pre-#298 design).
     /// </para>
     /// </remarks>
     ValueTask<Tensor<T>> ExecuteAsync(CancellationToken cancellationToken = default);

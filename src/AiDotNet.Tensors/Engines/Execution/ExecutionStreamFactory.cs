@@ -37,9 +37,13 @@ internal static class ExecutionStreamFactory
 {
     /// <summary>
     /// Creates a fresh execution stream appropriate for the given
-    /// engine. CPU engines get a worker-pool-backed stream; CUDA-capable
-    /// engines get a stream backed by a freshly-created
-    /// <c>cudaStream_t</c> (priority 0, non-blocking).
+    /// engine. CPU engines get a worker-pool-backed stream;
+    /// CUDA-capable engines get a wrapper around the engine's existing
+    /// <see cref="CudaBackend.DefaultStream"/> (NOT a new
+    /// <c>cudaStream_t</c> — kernels dispatched through the engine
+    /// route via the backend's internally-managed stream context, so
+    /// using a different stream would let the kernels enqueue against
+    /// the wrong target). Closes review-comment #298.8R5W.
     /// </summary>
     /// <typeparam name="T">The tensor element type.</typeparam>
     /// <param name="engine">The engine the stream will dispatch through.</param>

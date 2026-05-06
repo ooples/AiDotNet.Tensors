@@ -497,10 +497,35 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         var nextSteps = nextPlan._steps;
         var nextEngine = nextPlan._engine;
-        for (int i = 0; i < nextSteps.Length; i++)
+
+        if (crossEngine)
         {
-            stream.Submit(nextSteps[i], crossEngine ? nextEngine : _engine);
+            // Cross-engine GPU chain: the upstream stream only sees the
+            // engine it was created against. If we keep submitting next's
+            // steps to the upstream stream while running them on a
+            // DIFFERENT GPU engine, those kernels enqueue on a stream the
+            // upstream backend doesn't know about — so SyncAsync on the
+            // upstream stream returns BEFORE next's kernels finish, and
+            // ChainAsync's await would resume against a still-pending
+            // GPU output. Sync the upstream first to flush this plan's
+            // work, then run next's steps on its OWN cached stream and
+            // sync that one. On CPU this is the same fast-path the
+            // single-engine case takes (just with two streams instead
+            // of one); on GPU it's correctness, not just perf.
+            // Closes review-comment #298.8R6W.
+            await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
+
+            var nextStream = nextPlan.GetOrCreateStream();
+            for (int i = 0; i < nextSteps.Length; i++)
+                nextStream.Submit(nextSteps[i], nextEngine);
+            await nextStream.SyncAsync(cancellationToken).ConfigureAwait(false);
+            return nextPlan._finalOutput;
         }
+
+        // Same-engine fast path: queue everything on the upstream
+        // stream and sync once.
+        for (int i = 0; i < nextSteps.Length; i++)
+            stream.Submit(nextSteps[i], _engine);
 
         await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
         return nextPlan._finalOutput;

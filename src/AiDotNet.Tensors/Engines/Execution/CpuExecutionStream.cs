@@ -180,9 +180,12 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
         // Block-wait variant for the synchronous Execute() path. We cannot
         // simply .GetAwaiter().GetResult() on SyncAsync because that allocates
         // an awaiter and risks deadlock when called on a sync-context-bound
-        // thread. Instead use the same target-snapshot loop with a
-        // ManualResetEventSlim wakeup — same correctness, sync semantics,
-        // zero per-step allocation.
+        // thread. Instead use the same target-snapshot loop and block on
+        // the shared TaskCompletionSource the worker signals on drain —
+        // tcs.Task.Wait() blocks the calling thread without allocating
+        // any per-call task / continuation, since _drainTcs is reused
+        // across waiters until it fires. Closes review-comment #298.8R6A
+        // (the prior comment incorrectly said ManualResetEventSlim).
         long target = Volatile.Read(ref _submitted);
         while (Volatile.Read(ref _completed) < target)
         {
@@ -214,6 +217,34 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
             {
                 while (reader.TryRead(out var item))
                 {
+                    // Fault-fast: once a prior step has thrown, skip
+                    // every remaining queued item without executing it.
+                    // The synchronous Execute() path aborts on first
+                    // failure, so the async stream should match — running
+                    // post-fault steps could mutate buffers that the
+                    // failed step left in a partial state, producing
+                    // garbage downstream output that masks the original
+                    // diagnostic. We still increment _completed so the
+                    // drain counter eventually catches up to _submitted
+                    // and any parked SyncAsync wakes up to surface the
+                    // fault. Closes review-comment #298.8R52.
+                    if (Volatile.Read(ref _faultedException) is not null)
+                    {
+                        long completedSkip = Interlocked.Increment(ref _completed);
+                        long submittedSkip = Volatile.Read(ref _submitted);
+                        if (completedSkip >= submittedSkip)
+                        {
+                            TaskCompletionSource<bool>? skipTcs;
+                            lock (_syncLock)
+                            {
+                                skipTcs = _drainTcs;
+                                _drainTcs = null;
+                            }
+                            skipTcs?.TrySetResult(true);
+                        }
+                        continue;
+                    }
+
                     try
                     {
                         item.Step.Execute(item.Engine, item.Step.OutputBuffer);
