@@ -2138,38 +2138,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TensorSubtractInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
     {
         if (!dest.IsContiguous) { base.TensorSubtractInto(dest, a, b); return; }
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || !ShapesMatch(a.Shape._dims, dest.Shape._dims))
-        {
-            base.TensorSubtractInto(dest, a, b);
-            return;
-        }
-        if (TryGetBackend(out var backend))
-        {
-            try
-            {
-                var destinationData = dest.GetLiveBackingArrayOrNull();
-                if (destinationData is null)
-                    throw new InvalidOperationException("Destination tensor must expose a live backing array for GPU Into dispatch.");
-                using var bufferA = GetOrAllocateBuffer(backend, a);
-                using var bufferB = GetOrAllocateBuffer(backend, b);
-                var bufferOut = AllocateOutputBuffer(backend, dest.Length);
-                try
-                {
-                    backend.Subtract(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, dest.Length);
-                    DownloadGpuBufferInto(backend, bufferOut, destinationData, dest.Length);
-                    dest._gpuBuffer = bufferOut.Buffer;
-                    dest._gpuBackend = backend;
-                    return;
-                }
-                catch
-                {
-                    bufferOut.Dispose();
-                    throw;
-                }
-            }
-            catch { }
-        }
-        base.TensorSubtractInto(dest, a, b);
+        // Compute on GPU then copy directly into dest's backing storage
+        var result = ((IEngine)this).TensorSubtract(a, b);
+        result.Data.Span.CopyTo(dest.Data.Span);
     }
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
@@ -2185,43 +2156,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> dest, Tensor<T> a, T scalar)
     {
         if (!dest.IsContiguous) { base.TensorMultiplyScalarInto(dest, a, scalar); return; }
-        if (!ShapesMatch(a.Shape._dims, dest.Shape._dims))
+        // Compute on GPU, copy result directly into dest's contiguous span
+        var scalarF = ToFloatScalar(scalar);
+        var result = TryRunScalar(a.GetDataArray(), scalar,
+            static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
+        if (result != null)
         {
-            base.TensorMultiplyScalarInto(dest, a, scalar);
+            result.AsSpan(0, Math.Min(result.Length, dest.Length)).CopyTo(dest.Data.Span);
             return;
         }
-        if (TryGetBackend(out var backend))
-        {
-            try
-            {
-                var destinationData = dest.GetLiveBackingArrayOrNull();
-                if (destinationData is null)
-                    throw new InvalidOperationException("Destination tensor must expose a live backing array for GPU Into dispatch.");
-                float scalarF = ToFloatScalar(scalar);
-                using var bufferA = GetOrAllocateBuffer(backend, a);
-                var bufferOut = AllocateOutputBuffer(backend, dest.Length);
-                try
-                {
-                    backend.Scale(bufferA.Buffer, bufferOut.Buffer, scalarF, dest.Length);
-                    DownloadGpuBufferInto(backend, bufferOut, destinationData, dest.Length);
-                    dest._gpuBuffer = bufferOut.Buffer;
-                    dest._gpuBackend = backend;
-                    return;
-                }
-                catch
-                {
-                    bufferOut.Dispose();
-                    throw;
-                }
-            }
-            catch { }
-        }
         base.TensorMultiplyScalarInto(dest, a, scalar);
-    }
-
-    void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> source, T scalar, Tensor<T> destination)
-    {
-        ((IEngine)this).TensorMultiplyScalarInto(destination, source, scalar);
     }
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
@@ -6456,9 +6400,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         base.RegisterPersistentTensor(tensor, role);
 
-        if (tensor.IsSparse)
-            return;
-
         if (!TryGetBackend(out var backend))
             return;
 
@@ -6493,16 +6434,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         base.UnregisterPersistentTensor(tensor);
 
-        if (tensor.IsSparse)
-        {
-            var sparseKey = tensor.DataVector.GetBackingArrayUnsafe();
-            if (sparseKey is not null && _persistentBufferCache.TryRemove(sparseKey, out var sparseEntry))
-                sparseEntry.Dispose();
-            if (sparseKey is not null)
-                _tensorVersions.TryRemove(sparseKey, out _);
-            return;
-        }
-
         object key = tensor.GetDataArray();
 
         if (_persistentBufferCache.TryRemove(key, out var entry))
@@ -6519,9 +6450,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public new void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
         base.InvalidatePersistentTensor(tensor);
-
-        if (tensor.IsSparse)
-            return;
 
         if (!TryGetBackend(out var backend))
             return;
@@ -14753,27 +14681,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRandomUniform<T>(shape);
     }
 
-    Tensor<T> IEngine.TensorRandomUniformRange<T>(int[] shape, T min, T max, int? seed)
-    {
-        if (shape == null) throw new ArgumentNullException(nameof(shape));
-        if (TryGetBackend(out var b))
-        {
-            try
-            {
-                int total = 1;
-                foreach (var d in shape) total *= d;
-                var go = b.AllocateBuffer(total);
-                ulong rngSeed = seed.HasValue
-                    ? unchecked((ulong)seed.Value)
-                    : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
-                b.GenerateRandomUniform(go, total, Convert.ToSingle(min), Convert.ToSingle(max), rngSeed);
-                return DeferTensorResult<T>(b, go, total, shape);
-            }
-            catch { }
-        }
-        return base.TensorRandomUniformRange(shape, min, max, seed);
-    }
-
     Tensor<T> IEngine.TensorRandomNormal<T>(int[] shape, T mean, T stddev)
     {
         if (TryGetBackend(out var b))
@@ -14789,80 +14696,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch { }
         }
         return base.TensorRandomNormal(shape, mean, stddev);
-    }
-
-    void IEngine.TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed)
-    {
-        if (destination == null) throw new ArgumentNullException(nameof(destination));
-        if (!destination.IsContiguous || destination.IsSparse)
-        {
-            base.TensorRandomUniformRangeInto(destination, min, max, seed);
-            return;
-        }
-        if (TryGetBackend(out var b))
-        {
-            try
-            {
-                var destinationData = destination.GetLiveBackingArrayOrNull();
-                if (destinationData is null)
-                    throw new InvalidOperationException("Destination tensor must expose a live backing array for GPU Into dispatch.");
-                var go = AllocateOutputBuffer(b, destination.Length);
-                try
-                {
-                    ulong rngSeed = seed.HasValue
-                        ? unchecked((ulong)seed.Value)
-                        : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
-                    b.GenerateRandomUniform(go.Buffer, destination.Length, Convert.ToSingle(min), Convert.ToSingle(max), rngSeed);
-                    DownloadGpuBufferInto(b, go, destinationData, destination.Length);
-                    destination._gpuBuffer = go.Buffer;
-                    destination._gpuBackend = b;
-                    return;
-                }
-                catch
-                {
-                    go.Dispose();
-                    throw;
-                }
-            }
-            catch { }
-        }
-        base.TensorRandomUniformRangeInto(destination, min, max, seed);
-    }
-
-    void IEngine.TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev)
-    {
-        if (destination == null) throw new ArgumentNullException(nameof(destination));
-        if (!destination.IsContiguous || destination.IsSparse)
-        {
-            base.TensorRandomNormalInto(destination, mean, stddev);
-            return;
-        }
-        if (TryGetBackend(out var b))
-        {
-            try
-            {
-                var destinationData = destination.GetLiveBackingArrayOrNull();
-                if (destinationData is null)
-                    throw new InvalidOperationException("Destination tensor must expose a live backing array for GPU Into dispatch.");
-                var go = AllocateOutputBuffer(b, destination.Length);
-                try
-                {
-                    b.GenerateRandomNormal(go.Buffer, destination.Length, Convert.ToSingle(mean), Convert.ToSingle(stddev),
-                        (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
-                    DownloadGpuBufferInto(b, go, destinationData, destination.Length);
-                    destination._gpuBuffer = go.Buffer;
-                    destination._gpuBackend = b;
-                    return;
-                }
-                catch
-                {
-                    go.Dispose();
-                    throw;
-                }
-            }
-            catch { }
-        }
-        base.TensorRandomNormalInto(destination, mean, stddev);
     }
 
     Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)
