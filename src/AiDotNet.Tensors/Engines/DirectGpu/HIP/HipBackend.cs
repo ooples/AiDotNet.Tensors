@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend
+public sealed partial class HipBackend : IAsyncGpuBackend, IIssue301FusedBackend
 {
     private IntPtr _stream;
     private HipStream? _defaultStream;
@@ -80,6 +80,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _lossModule;
     private IntPtr _softmaxVarModule;
     private IntPtr _fusedLinearModule;
+    private IntPtr _issue301FusedModule;
     private IntPtr _iouModule;
     private IntPtr _complexModule;
     private IntPtr _parity210Module;
@@ -517,6 +518,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             // Compile Fused Linear + Activation kernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,
                 Kernels.HipFusedLinearKernels.GetKernelNames());
+
+            try
+            {
+                CompileKernelModule(Kernels.HipIssue301FusedKernels.GetSource(), "issue301_fused", ref _issue301FusedModule,
+                    Kernels.HipIssue301FusedKernels.GetKernelNames());
+            }
+            catch { }
 
             // Compile IoU loss kernels
             CompileKernelModule(Kernels.HipIoUKernels.GetSource(), "iou", ref _iouModule,
@@ -10298,12 +10306,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule, _complexModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _issue301FusedModule, _iouModule, _complexModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = _complexModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _issue301FusedModule = _iouModule = _complexModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

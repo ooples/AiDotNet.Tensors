@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IIssue301FusedBackend
 {
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);

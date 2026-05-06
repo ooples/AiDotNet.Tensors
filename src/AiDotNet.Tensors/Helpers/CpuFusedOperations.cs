@@ -1343,4 +1343,504 @@ public static class CpuFusedOperations
     }
 
     #endregion
+
+    #region Fused LoRA Forward (Issue #301 — Workstream 1)
+
+    /// <summary>
+    /// Fused LoRA-adapter forward pass.
+    /// Computes <c>output = baseOutput + scaling · (input · A · B)</c> in a
+    /// single pass with no <c>[batch, rank]</c> intermediate materialised.
+    ///
+    /// <para>Replaces the 5-call decomposed sequence:</para>
+    /// <code>
+    /// intermed = MatMul(input, A)            // [batch, rank]
+    /// delta    = MatMul(intermed, B)         // [batch, out]
+    /// scaled   = MultiplyScalar(delta, α)
+    /// output   = Add(baseOutput, scaled)
+    /// </code>
+    /// </summary>
+    /// <param name="input">Input tensor, shape <c>[batch, in]</c>.</param>
+    /// <param name="baseOutput">Pre-computed <c>base.Forward(input)</c>,
+    /// shape <c>[batch, out]</c>. Read-only.</param>
+    /// <param name="loraA">LoRA-A factor, shape <c>[in, rank]</c>, row-major.</param>
+    /// <param name="loraB">LoRA-B factor, shape <c>[rank, out]</c>, row-major.</param>
+    /// <param name="scaling">LoRA scale (α / rank).</param>
+    /// <param name="output">Output tensor, shape <c>[batch, out]</c>; written in place.</param>
+    /// <remarks>
+    /// Per-row strategy: hold a <c>rank</c>-element accumulator on the stack,
+    /// build it via SIMD AXPY against rows of A, then SIMD-AXPY each
+    /// rank-weighted column of B into the output row that started as a copy
+    /// of baseOutput. Memory traffic vs the decomposed path:
+    /// <list type="bullet">
+    ///   <item>No <c>[batch, rank]</c> intermed allocation</item>
+    ///   <item>No <c>[batch, out]</c> delta allocation</item>
+    ///   <item>baseOutput streamed once (not read twice)</item>
+    /// </list>
+    /// Aliasing: <paramref name="output"/> may alias <paramref name="baseOutput"/>
+    /// (in-place over the base), but must not alias <paramref name="input"/>,
+    /// <paramref name="loraA"/>, or <paramref name="loraB"/>.
+    /// </remarks>
+    public static void FusedLoRAForward(
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> input,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> baseOutput,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> loraA,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> loraB,
+        float scaling,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> output)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (baseOutput is null) throw new ArgumentNullException(nameof(baseOutput));
+        if (loraA is null) throw new ArgumentNullException(nameof(loraA));
+        if (loraB is null) throw new ArgumentNullException(nameof(loraB));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+
+        // Shape contracts: [batch, in] · [in, rank] · [rank, out] → [batch, out]
+        if (input.Rank != 2) throw new ArgumentException("input must be rank-2 [batch, in].", nameof(input));
+        if (loraA.Rank != 2) throw new ArgumentException("loraA must be rank-2 [in, rank].", nameof(loraA));
+        if (loraB.Rank != 2) throw new ArgumentException("loraB must be rank-2 [rank, out].", nameof(loraB));
+        if (baseOutput.Rank != 2) throw new ArgumentException("baseOutput must be rank-2 [batch, out].", nameof(baseOutput));
+        if (output.Rank != 2) throw new ArgumentException("output must be rank-2 [batch, out].", nameof(output));
+
+        int batch = input.Shape[0];
+        int inFeat = input.Shape[1];
+        int rank = loraA.Shape[1];
+        int outFeat = loraB.Shape[1];
+
+        if (loraA.Shape[0] != inFeat)
+            throw new ArgumentException(
+                $"loraA inner dim {loraA.Shape[0]} must equal input.Shape[1] {inFeat}.", nameof(loraA));
+        if (loraB.Shape[0] != rank)
+            throw new ArgumentException(
+                $"loraB inner dim {loraB.Shape[0]} must equal loraA.Shape[1] {rank}.", nameof(loraB));
+        if (baseOutput.Shape[0] != batch || baseOutput.Shape[1] != outFeat)
+            throw new ArgumentException(
+                $"baseOutput shape [{baseOutput.Shape[0]}, {baseOutput.Shape[1]}] must equal [batch, out] = [{batch}, {outFeat}].",
+                nameof(baseOutput));
+        if (output.Shape[0] != batch || output.Shape[1] != outFeat)
+            throw new ArgumentException(
+                $"output shape [{output.Shape[0]}, {output.Shape[1]}] must equal [batch, out] = [{batch}, {outFeat}].",
+                nameof(output));
+
+        // Stack-allocation budget: per-batch-row accumulator is `rank`
+        // floats. Cap at 256 (1 KB) for stackalloc safety; above that, fall
+        // back to a heap rented array per row. Typical LoRA rank is 4–32
+        // so the stackalloc path covers the entire common case.
+        const int StackallocRankCap = 256;
+
+        var inArr = input.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("input data array missing — non-blittable storage.");
+        var baseArr = baseOutput.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("baseOutput data array missing.");
+        var aArr = loraA.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("loraA data array missing.");
+        var bArr = loraB.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("loraB data array missing.");
+        var outArr = output.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("output data array missing.");
+
+        bool stackallocOk = rank <= StackallocRankCap;
+        // Parallel threshold: per-row work is roughly (in*rank + rank*out)
+        // FMAs. Below this we run sequentially to avoid Parallel.For
+        // dispatch overhead on tiny LoRA shapes (rank=4, in=out=128).
+        long rowWork = (long)inFeat * rank + (long)rank * outFeat;
+        bool parallel = batch >= 4 && rowWork * batch >= PARALLEL_THRESHOLD;
+
+        if (parallel)
+        {
+            Parallel.For(0, batch, b =>
+                FusedLoRAProcessRow(inArr, baseArr, aArr, bArr, outArr,
+                    b, inFeat, rank, outFeat, scaling, stackallocOk));
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++)
+                FusedLoRAProcessRow(inArr, baseArr, aArr, bArr, outArr,
+                    b, inFeat, rank, outFeat, scaling, stackallocOk);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedLoRAProcessRow(
+        float[] input, float[] baseOutput, float[] A, float[] B, float[] output,
+        int row, int inFeat, int rank, int outFeat, float scaling, bool stackallocOk)
+    {
+        int inputBase = row * inFeat;
+        int rowBase = row * outFeat;
+
+        // Stage 1 — build acc[rank] = input_row · A.
+        // Outer-product accumulation: for each i, broadcast input[i] and
+        // SIMD-AXPY A_row[i, :] into acc. This walks A in row-major order
+        // (cache-friendly) and lets the SIMD width run along the rank
+        // dimension (which is small but contiguous).
+        if (stackallocOk)
+        {
+            Span<float> acc = stackalloc float[rank];
+            acc.Clear();
+            FusedLoRABuildAcc(input.AsSpan(inputBase, inFeat),
+                A.AsSpan(0, inFeat * rank), rank, acc);
+            FusedLoRAEmitRow(baseOutput.AsSpan(rowBase, outFeat),
+                B.AsSpan(0, rank * outFeat),
+                output.AsSpan(rowBase, outFeat),
+                rank, outFeat, scaling, acc);
+        }
+        else
+        {
+            // rank > 256 is unusual for LoRA; rent a heap buffer.
+            var rented = System.Buffers.ArrayPool<float>.Shared.Rent(rank);
+            try
+            {
+                Array.Clear(rented, 0, rank);
+                FusedLoRABuildAcc(input.AsSpan(inputBase, inFeat),
+                    A.AsSpan(0, inFeat * rank), rank, rented.AsSpan(0, rank));
+                FusedLoRAEmitRow(baseOutput.AsSpan(rowBase, outFeat),
+                    B.AsSpan(0, rank * outFeat),
+                    output.AsSpan(rowBase, outFeat),
+                    rank, outFeat, scaling, rented.AsSpan(0, rank));
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedLoRABuildAcc(
+        ReadOnlySpan<float> inputRow, ReadOnlySpan<float> A,
+        int rank, Span<float> acc)
+    {
+        int inFeat = inputRow.Length;
+        for (int i = 0; i < inFeat; i++)
+        {
+            float xi = inputRow[i];
+            // acc += xi * A_row[i, :]
+            FusedLoRAAxpy(xi, A.Slice(i * rank, rank), acc);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedLoRAEmitRow(
+        ReadOnlySpan<float> baseRow, ReadOnlySpan<float> B,
+        Span<float> outputRow, int rank, int outFeat, float scaling,
+        ReadOnlySpan<float> acc)
+    {
+        // output_row = baseRow (start point), then add scaling · (acc · B).
+        // baseRow.CopyTo(outputRow) handles both the disjoint case and the
+        // alias-as-baseOutput case — Span.CopyTo routes to Buffer.Memmove
+        // which is overlap-safe.
+        baseRow.CopyTo(outputRow);
+        // For each rank k, AXPY (scaling · acc[k]) · B_row[k, :] into output.
+        for (int k = 0; k < rank; k++)
+        {
+            float scale = scaling * acc[k];
+            if (scale == 0f) continue; // skip zero-weighted rows entirely
+            FusedLoRAAxpy(scale, B.Slice(k * outFeat, outFeat), outputRow);
+        }
+    }
+
+    /// <summary>
+    /// SIMD AXPY: <c>y += a · x</c>. Vector256 hot path on AVX2,
+    /// Vector128 fallback on SSE/NEON, scalar tail.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedLoRAAxpy(float a, ReadOnlySpan<float> x, Span<float> y)
+    {
+        int len = x.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && len >= Vector256<float>.Count)
+        {
+            var vA = Vector256.Create(a);
+            int vCount = len - (len % Vector256<float>.Count);
+            for (; i < vCount; i += Vector256<float>.Count)
+            {
+                var vx = Vector256.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(x), (nuint)i);
+                var vy = Vector256.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(y), (nuint)i);
+                var r = Vector256.Add(vy, Vector256.Multiply(vA, vx));
+                r.StoreUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(y), (nuint)i);
+            }
+        }
+        else if (Vector128.IsHardwareAccelerated && len >= Vector128<float>.Count)
+        {
+            var vA = Vector128.Create(a);
+            int vCount = len - (len % Vector128<float>.Count);
+            for (; i < vCount; i += Vector128<float>.Count)
+            {
+                var vx = Vector128.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(x), (nuint)i);
+                var vy = Vector128.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(y), (nuint)i);
+                var r = Vector128.Add(vy, Vector128.Multiply(vA, vx));
+                r.StoreUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(y), (nuint)i);
+            }
+        }
+#endif
+        for (; i < len; i++) y[i] += a * x[i];
+    }
+
+    #endregion
+
+    #region Fused DDIM Step (Issue #301 — Workstream 2)
+
+    /// <summary>
+    /// Fused DDIM denoising step.
+    /// Computes <c>x_{t-1} = sqrt(ᾱ_{t-1}) · x_0_pred + sqrt(1 - ᾱ_{t-1}) · ε_θ</c>
+    /// where <c>x_0_pred = (x_t − sqrt(1 - ᾱ_t) · ε_θ) / sqrt(ᾱ_t)</c>.
+    ///
+    /// <para>Substituting and collapsing into a single coefficient form:
+    /// <c>x_{t-1} = c_xt · x_t + c_eps · ε_θ</c> where
+    /// <c>c_xt = sqrt(ᾱ_{t-1}) / sqrt(ᾱ_t)</c> and
+    /// <c>c_eps = sqrt(1 - ᾱ_{t-1}) - sqrt(1 - ᾱ_t) · sqrt(ᾱ_{t-1}) / sqrt(ᾱ_t)</c>.
+    /// One SIMD elementwise pass — replaces the 5–10 op sampler-update path.</para>
+    /// </summary>
+    /// <param name="xT">Current latent <c>x_t</c>, any rank, contiguous.</param>
+    /// <param name="epsilonTheta">Noise predictor output, same shape as <paramref name="xT"/>.</param>
+    /// <param name="alphaBarT">Schedule constant <c>ᾱ_t</c>, must be in (0, 1].</param>
+    /// <param name="alphaBarTMinus1">Schedule constant <c>ᾱ_{t-1}</c>, must be in [0, 1].
+    /// At <c>t = 1</c> the previous step is the clean image: pass 1.0.</param>
+    /// <param name="xTMinus1">Output <c>x_{t-1}</c>, same shape as <paramref name="xT"/>; written in place.</param>
+    public static void FusedDDIMStep(
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> xT,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> epsilonTheta,
+        float alphaBarT,
+        float alphaBarTMinus1,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> xTMinus1)
+    {
+        if (xT is null) throw new ArgumentNullException(nameof(xT));
+        if (epsilonTheta is null) throw new ArgumentNullException(nameof(epsilonTheta));
+        if (xTMinus1 is null) throw new ArgumentNullException(nameof(xTMinus1));
+
+        int len = xT.Length;
+        if (epsilonTheta.Length != len)
+            throw new ArgumentException(
+                $"epsilonTheta length {epsilonTheta.Length} must equal xT length {len}.", nameof(epsilonTheta));
+        if (xTMinus1.Length != len)
+            throw new ArgumentException(
+                $"xTMinus1 length {xTMinus1.Length} must equal xT length {len}.", nameof(xTMinus1));
+
+        // ᾱ_t ∈ (0, 1] — closed at 1 (initial pure-noise step), open at
+        // 0 because we divide by sqrt(ᾱ_t). ᾱ_{t-1} ∈ [0, 1] because the
+        // previous step can in principle be the clean image with ᾱ=1
+        // (the DDIM final step) or the limit ᾱ=0; both endpoints are
+        // numerically fine — only ᾱ_t == 0 is unsafe.
+        if (!(alphaBarT > 0f && alphaBarT <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarT),
+                $"alphaBarT must be in (0, 1]; got {alphaBarT}.");
+        if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarTMinus1),
+                $"alphaBarTMinus1 must be in [0, 1]; got {alphaBarTMinus1}.");
+
+        // Pre-collapse the two-stage formula into per-element coefficients.
+        // Doing this in double avoids catastrophic cancellation at the
+        // very small-noise tail (alphaBarT very close to 1) where
+        // sqrt(1 - alphaBarT) is a small number subtracted from another
+        // small number.
+        double sqrtAt = Math.Sqrt(alphaBarT);
+        double sqrtAtMinus1 = Math.Sqrt(alphaBarTMinus1);
+        double sqrtOneMinusAt = Math.Sqrt(1.0 - alphaBarT);
+        double sqrtOneMinusAtMinus1 = Math.Sqrt(1.0 - alphaBarTMinus1);
+        float cXt = (float)(sqrtAtMinus1 / sqrtAt);
+        float cEps = (float)(sqrtOneMinusAtMinus1 - sqrtOneMinusAt * sqrtAtMinus1 / sqrtAt);
+
+        var xtArr = xT.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("xT data array missing.");
+        var epsArr = epsilonTheta.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("epsilonTheta data array missing.");
+        var outArr = xTMinus1.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("xTMinus1 data array missing.");
+
+        FusedDDIMStepInner(xtArr.AsSpan(0, len), epsArr.AsSpan(0, len),
+            outArr.AsSpan(0, len), cXt, cEps);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedDDIMStepInner(
+        ReadOnlySpan<float> xT, ReadOnlySpan<float> epsilon,
+        Span<float> output, float cXt, float cEps)
+    {
+        int len = xT.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && len >= Vector256<float>.Count)
+        {
+            var vCxt = Vector256.Create(cXt);
+            var vCeps = Vector256.Create(cEps);
+            int vCount = len - (len % Vector256<float>.Count);
+            for (; i < vCount; i += Vector256<float>.Count)
+            {
+                var vx = Vector256.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(xT), (nuint)i);
+                var ve = Vector256.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(epsilon), (nuint)i);
+                var r = Vector256.Add(Vector256.Multiply(vCxt, vx), Vector256.Multiply(vCeps, ve));
+                r.StoreUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output), (nuint)i);
+            }
+        }
+        else if (Vector128.IsHardwareAccelerated && len >= Vector128<float>.Count)
+        {
+            var vCxt = Vector128.Create(cXt);
+            var vCeps = Vector128.Create(cEps);
+            int vCount = len - (len % Vector128<float>.Count);
+            for (; i < vCount; i += Vector128<float>.Count)
+            {
+                var vx = Vector128.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(xT), (nuint)i);
+                var ve = Vector128.LoadUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(epsilon), (nuint)i);
+                var r = Vector128.Add(Vector128.Multiply(vCxt, vx), Vector128.Multiply(vCeps, ve));
+                r.StoreUnsafe(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(output), (nuint)i);
+            }
+        }
+#endif
+        for (; i < len; i++) output[i] = cXt * xT[i] + cEps * epsilon[i];
+    }
+
+    #endregion
+
+    #region Fused Sparse Linear (Issue #301 — Workstream 3)
+
+    /// <summary>
+    /// Fused sparse-linear forward.
+    /// Computes <c>output[b, j] = activation(sum_{k where mask[j,k]=1} input[b, k] · W[j, k] + bias[j])</c>
+    /// over CSR-format sparse weights, achieving FLOPs proportional to <c>nnz</c>
+    /// rather than <c>in · out</c>.
+    /// </summary>
+    /// <param name="input">Dense input, shape <c>[batch, in]</c>.</param>
+    /// <param name="sparseRowOffsets">CSR row pointers, length <c>out + 1</c>.
+    /// <c>sparseRowOffsets[j]</c> is the starting index in
+    /// <paramref name="sparseColIndices"/> / <paramref name="sparseValues"/>
+    /// for output row <c>j</c>; <c>sparseRowOffsets[out]</c> equals total nnz.</param>
+    /// <param name="sparseColIndices">Column indices into the input feature
+    /// axis, length nnz. Each <c>sparseColIndices[p] ∈ [0, in)</c>.</param>
+    /// <param name="sparseValues">Non-zero weight values, length nnz.</param>
+    /// <param name="bias">Optional bias of length out. <c>null</c> = no bias.</param>
+    /// <param name="activation">Fused activation applied after the bias add.</param>
+    /// <param name="output">Dense output, shape <c>[batch, out]</c>; written in place.</param>
+    public static void FusedSparseLinear(
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> input,
+        int[] sparseRowOffsets,
+        int[] sparseColIndices,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> sparseValues,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float>? bias,
+        FusedActivationType activation,
+        AiDotNet.Tensors.LinearAlgebra.Tensor<float> output)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (sparseRowOffsets is null) throw new ArgumentNullException(nameof(sparseRowOffsets));
+        if (sparseColIndices is null) throw new ArgumentNullException(nameof(sparseColIndices));
+        if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+
+        if (input.Rank != 2) throw new ArgumentException("input must be rank-2 [batch, in].", nameof(input));
+        if (output.Rank != 2) throw new ArgumentException("output must be rank-2 [batch, out].", nameof(output));
+
+        int batch = input.Shape[0];
+        int inFeat = input.Shape[1];
+        int outFeat = output.Shape[1];
+        if (output.Shape[0] != batch)
+            throw new ArgumentException(
+                $"output.Shape[0] ({output.Shape[0]}) must equal input.Shape[0] ({batch}).", nameof(output));
+
+        if (sparseRowOffsets.Length != outFeat + 1)
+            throw new ArgumentException(
+                $"sparseRowOffsets length {sparseRowOffsets.Length} must equal out+1 ({outFeat + 1}).",
+                nameof(sparseRowOffsets));
+        if (sparseRowOffsets[0] != 0)
+            throw new ArgumentException("sparseRowOffsets[0] must be 0.", nameof(sparseRowOffsets));
+        for (int i = 1; i < sparseRowOffsets.Length; i++)
+        {
+            if (sparseRowOffsets[i] < sparseRowOffsets[i - 1])
+                throw new ArgumentException(
+                    $"sparseRowOffsets must be monotonically non-decreasing; index {i - 1}={sparseRowOffsets[i - 1]}, index {i}={sparseRowOffsets[i]}.",
+                    nameof(sparseRowOffsets));
+        }
+
+        int nnz = sparseRowOffsets[outFeat];
+        if (nnz < 0)
+            throw new ArgumentException($"CSR nnz must be non-negative; got {nnz}.", nameof(sparseRowOffsets));
+        if (sparseColIndices.Length < nnz)
+            throw new ArgumentException(
+                $"sparseColIndices length {sparseColIndices.Length} < nnz {nnz}.", nameof(sparseColIndices));
+        if (sparseValues.Length < nnz)
+            throw new ArgumentException(
+                $"sparseValues length {sparseValues.Length} < nnz {nnz}.", nameof(sparseValues));
+        if (bias is not null && bias.Length != outFeat)
+            throw new ArgumentException(
+                $"bias length {bias.Length} must equal out ({outFeat}).", nameof(bias));
+
+        var inArr = input.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("input data array missing.");
+        var valArr = sparseValues.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("sparseValues data array missing.");
+        var biasArr = bias?.GetDataArray() as float[];
+        var outArr = output.GetDataArray() as float[]
+            ?? throw new InvalidOperationException("output data array missing.");
+
+        // Validate column indices once up front. Per-element validation in
+        // the inner loop would defeat the SIMD/parallelism we want.
+        for (int p = 0; p < nnz; p++)
+        {
+            int col = sparseColIndices[p];
+            if ((uint)col >= (uint)inFeat)
+                throw new ArgumentException(
+                    $"sparseColIndices[{p}] = {col} out of range [0, {inFeat}).",
+                    nameof(sparseColIndices));
+        }
+
+        // OCP: resolve the activation delegate ONCE via the existing
+        // _floatActivations registry (line ~1198) so adding a new
+        // activation type doesn't require touching this kernel — the
+        // registry is the single source of truth for the open extension
+        // axis. Per-element invocation pays one virtual dispatch on the
+        // delegate; the registry path is what FusedGemmBiasActivation,
+        // FusedLayerNormActivation, etc. all use.
+        var activationFn = GetFloatActivation(activation);
+
+        // Per-(batch, output-row) work is `nnz_per_row` FMAs. We
+        // parallelise over batch when batch*outFeat is large enough to
+        // amortise dispatch; otherwise sequential.
+        bool parallel = batch * outFeat >= PARALLEL_THRESHOLD;
+        if (parallel)
+        {
+            Parallel.For(0, batch, b =>
+                FusedSparseLinearProcessRow(inArr, sparseRowOffsets, sparseColIndices,
+                    valArr, biasArr, outArr, b, inFeat, outFeat, activationFn));
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++)
+                FusedSparseLinearProcessRow(inArr, sparseRowOffsets, sparseColIndices,
+                    valArr, biasArr, outArr, b, inFeat, outFeat, activationFn);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedSparseLinearProcessRow(
+        float[] input, int[] rowOffsets, int[] colIndices, float[] values,
+        float[]? bias, float[] output,
+        int batchIdx, int inFeat, int outFeat, Func<float, float> activationFn)
+    {
+        int inputBase = batchIdx * inFeat;
+        int outputBase = batchIdx * outFeat;
+        for (int j = 0; j < outFeat; j++)
+        {
+            int start = rowOffsets[j];
+            int end = rowOffsets[j + 1];
+            float sum = bias is null ? 0f : bias[j];
+            for (int p = start; p < end; p++)
+            {
+                int col = colIndices[p];
+                sum += input[inputBase + col] * values[p];
+            }
+            output[outputBase + j] = activationFn(sum);
+        }
+    }
+
+    #endregion
 }

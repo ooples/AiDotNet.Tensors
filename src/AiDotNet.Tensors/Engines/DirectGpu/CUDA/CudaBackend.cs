@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend, IIssue301FusedBackend
 {
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
@@ -654,6 +654,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend
         try
         {
             CompileKernelModule(device, Kernels.CudaFusedLinearKernels.GetSource(), "fused_linear_kernels", Kernels.CudaFusedLinearKernels.GetKernelNames());
+        }
+        catch { }
+
+        try
+        {
+            CompileKernelModule(device, Kernels.CudaIssue301FusedKernels.GetSource(), "issue301_fused_kernels", Kernels.CudaIssue301FusedKernels.GetKernelNames());
         }
         catch { }
 
