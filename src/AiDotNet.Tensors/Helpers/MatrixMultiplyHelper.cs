@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Interfaces;
 
@@ -299,24 +300,45 @@ internal static class MatrixMultiplyHelper
             return Clamp(BlockSizeOverride.Value, 16, 128);
         }
 
-        int elementSize = typeof(T) == typeof(double) ? 8 : 4;
+        // #294 Phase 4 wiring: delegate to CacheOptimizer's L1-aware
+        // tile picker — single source of truth for tile sizing across
+        // the codebase. CacheOptimizer.ComputeOptimalTiling<T> uses
+        // Unsafe.SizeOf<T> internally so it returns the right tile
+        // for any element size: float (4B), double (8B), Half (2B),
+        // BFloat16 (2B), int (4B), long (8B). Routing each typeof(T)
+        // case explicitly ensures the per-T fast path is the SAME
+        // formula the rest of the codebase uses; without this the
+        // Half/BFloat16 path would fall back to the old 4-byte
+        // heuristic and pick tiles half as large as L1 actually
+        // permits, undermining the single-source-of-truth refactor.
+        if (typeof(T) == typeof(float))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<float>(128, 128, 128).tileM, 16, 128);
+        if (typeof(T) == typeof(double))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<double>(128, 128, 128).tileM, 16, 128);
+        if (typeof(T) == typeof(Half))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<Half>(128, 128, 128).tileM, 16, 128);
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<AiDotNet.Tensors.NumericOperations.BFloat16>(128, 128, 128).tileM, 16, 128);
+        if (typeof(T) == typeof(int))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<int>(128, 128, 128).tileM, 16, 128);
+        if (typeof(T) == typeof(long))
+            return Clamp(CacheOptimizer.ComputeOptimalTiling<long>(128, 128, 128).tileM, 16, 128);
+
+        // Last-resort fallback for non-primitive T (Complex,
+        // Multivector, custom numerics) where Unsafe.SizeOf would
+        // need the unmanaged constraint that this method's signature
+        // doesn't provide. Use Marshal.SizeOf as a runtime-resolvable
+        // size — at least gives the right tile for blittable structs;
+        // for non-blittable types the runtime throws and we'd need
+        // an explicit case above. Same L1-aware formula as
+        // CacheOptimizer (3-block working set sqrt).
+        int elementSize;
+        try { elementSize = System.Runtime.InteropServices.Marshal.SizeOf<T>(); }
+        catch { elementSize = 4; } // non-blittable: safe default for matmul tile heuristic
         int l1 = PlatformDetector.Capabilities?.L1CacheSize ?? 0;
-        if (l1 <= 0)
-        {
-            l1 = 32 * 1024;
-        }
-
-        int block = (int)Math.Sqrt(l1 / (2.0 * elementSize));
-        if (block < 16)
-        {
-            block = 16;
-        }
-        else if (block > 128)
-        {
-            block = 128;
-        }
-
-        return block;
+        if (l1 <= 0) l1 = 32 * 1024;
+        int block = (int)Math.Sqrt(l1 / (3.0 * Math.Max(1, elementSize)));
+        return Clamp(block, 16, 128);
     }
 
     private static long GetBlasWorkThreshold()

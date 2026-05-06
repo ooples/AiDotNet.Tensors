@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
@@ -1104,27 +1105,83 @@ public static class CpuFusedOperations
     {
         int totalElements = batchSize * featureSize;
 
+        // #294 Phase 4 wiring: this kernel is a textbook
+        // LoopOptimizer.Tile2D consumer — a 2D iteration over
+        // (batch, feature) with a fused per-element body. Using the
+        // helper makes the iteration shape uniform with the rest of
+        // the codebase's tiled patterns; the inner per-tile loop is a
+        // tight scalar fused-op stream that the JIT can vectorize.
+        // Tile size of 64 covers the cache-line stride for floats
+        // (16 floats per 64B cache line × 4 lines) and matches the
+        // typical bias-row reuse pattern.
+        const int FusedTileSize = 64;
         if (totalElements >= PARALLEL_THRESHOLD)
         {
-            Parallel.For(0, batchSize, b =>
-            {
-                int offset = b * featureSize;
-                for (int i = 0; i < featureSize; i++)
-                {
-                    int idx = offset + i;
-                    output[idx] = (input[idx] + bias[i]) * dropoutMask[idx] * dropoutScale;
-                }
-            });
+            // Large tensors: tile in 2D and dispatch the tiles through
+            // LoopOptimizer.ParallelTile2D, which routes onto the repo's
+            // CpuParallelSettings.LightweightParallel persistent worker
+            // pool. Replaces the previous raw Parallel.For so we honour
+            // the configured MaxDegreeOfParallelism cap and share the
+            // pool with SimdConvHelper / Im2ColHelper instead of
+            // spinning up a fresh ThreadPool slice per call.
+            LoopOptimizer.ParallelTile2D(batchSize, featureSize, FusedTileSize,
+                new FusedBiasDropoutTile(input, bias, output, dropoutMask, featureSize, dropoutScale));
         }
         else
         {
-            for (int b = 0; b < batchSize; b++)
+            // Sequential path uses Tile2D with one row per tile so
+            // the fused body sees a contiguous feature span.
+            LoopOptimizer.Tile2D(batchSize, featureSize, FusedTileSize,
+                new FusedBiasDropoutTile(input, bias, output, dropoutMask, featureSize, dropoutScale));
+        }
+    }
+
+    /// <summary>
+    /// Inner per-row body for the fused bias+dropout fused op.
+    /// Hoisted into a helper so both the parallel and the tiled
+    /// sequential paths can share the same scalar/vectorizable body
+    /// without delegate allocation.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void FusedBiasDropoutRow(
+        float[] input, float[] bias, float[] output, float[] dropoutMask,
+        int rowOffset, int featureSize, float dropoutScale)
+    {
+        for (int i = 0; i < featureSize; i++)
+        {
+            int idx = rowOffset + i;
+            output[idx] = (input[idx] + bias[i]) * dropoutMask[idx] * dropoutScale;
+        }
+    }
+
+    /// <summary>
+    /// Struct callback for <see cref="LoopOptimizer.Tile2D{TAction}"/>
+    /// that runs <see cref="FusedBiasDropoutRow"/> over each tile's
+    /// row range. Struct (not delegate) so RyuJIT specializes the
+    /// helper per concrete callee, devirtualizes Invoke, and inlines
+    /// the body into the Tile2D loop — same shape as
+    /// <see cref="System.Numerics.Vector{T}"/>'s callbacks.
+    /// </summary>
+    private readonly struct FusedBiasDropoutTile : LoopOptimizer.ITile2DAction
+    {
+        private readonly float[] _input, _bias, _output, _dropoutMask;
+        private readonly int _featureSize;
+        private readonly float _dropoutScale;
+        public FusedBiasDropoutTile(float[] input, float[] bias, float[] output, float[] dropoutMask,
+            int featureSize, float dropoutScale)
+        {
+            _input = input; _bias = bias; _output = output; _dropoutMask = dropoutMask;
+            _featureSize = featureSize; _dropoutScale = dropoutScale;
+        }
+        public void Invoke(int i0, int i1, int j0, int j1)
+        {
+            for (int b = i0; b < i1; b++)
             {
-                int offset = b * featureSize;
-                for (int i = 0; i < featureSize; i++)
+                int rowOffset = b * _featureSize;
+                for (int j = j0; j < j1; j++)
                 {
-                    int idx = offset + i;
-                    output[idx] = (input[idx] + bias[i]) * dropoutMask[idx] * dropoutScale;
+                    int idx = rowOffset + j;
+                    _output[idx] = (_input[idx] + _bias[j]) * _dropoutMask[idx] * _dropoutScale;
                 }
             }
         }

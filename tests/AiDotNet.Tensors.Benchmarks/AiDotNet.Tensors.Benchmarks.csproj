@@ -34,6 +34,14 @@
     <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
   </ItemGroup>
 
+  <!-- #294: Python baseline scripts must be on the build output side
+       so PythonBaselineRunner can locate them via AppContext.BaseDirectory.
+       Without this, IsAvailable returns false and the parity benchmark
+       reports "Python not available" even when python+torch are installed. -->
+  <ItemGroup>
+    <None Include="BaselineRunners\py\*.py" CopyToOutputDirectory="PreserveNewest" Pack="false" />
+  </ItemGroup>
+
   <!-- Copy CLBlast native DLL for GPU-accelerated BLAS benchmarks -->
   <Target Name="CopyClBlastToBenchmarkOutput" AfterTargets="Build">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\src\AiDotNet.Native.CLBlast\runtimes\win-x64\native\clblast.dll"

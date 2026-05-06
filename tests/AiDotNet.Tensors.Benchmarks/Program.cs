@@ -67,6 +67,19 @@ class Program
             return;
         }
 
+#if NET8_0_OR_GREATER
+        // Issue #294 acceptance criterion #6: PyTorch CPU parity
+        // benchmark — matmul, FlashAttention, LayerNorm, BCE
+        // forward+backward. Drives Python subprocess via
+        // PythonBaselineRunner; if torch isn't installed, prints
+        // AiDotNet timings only as a regression baseline.
+        if (args[0] == "--pytorch-parity")
+        {
+            Issue294PyTorchParityBenchmark.Run();
+            return;
+        }
+#endif
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {

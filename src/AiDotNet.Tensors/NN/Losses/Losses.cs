@@ -36,20 +36,97 @@ public static class Losses
     public static Tensor<T> SmoothL1Loss<T>(Tensor<T> input, Tensor<T> target, double beta = 1.0,
         LossReduction reduction = LossReduction.Mean)
     {
+        // beta is the Huber transition point — must be non-negative.
+        // beta=0 collapses to plain L1; negative beta would silently
+        // add a constant offset to every element on both fast paths
+        // and the generic path, returning a value that doesn't
+        // correspond to any well-defined loss. Reject up front so
+        // both branches see only valid inputs.
+        if (beta < 0)
+            throw new ArgumentOutOfRangeException(nameof(beta), $"beta must be non-negative; got {beta}.");
+
         EnsureSameShape(input, target);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
         var inSpan = input.AsSpan();
         var tgtSpan = target.AsSpan();
         var outSpan = output.AsWritableSpan();
-        for (int i = 0; i < inSpan.Length; i++)
+
+        // beta == 0 is a degenerate case where the quadratic branch
+        // would divide by zero. PyTorch documents this as equivalent
+        // to plain L1; we special-case it explicitly so neither the
+        // primitive fast paths nor the generic path ever evaluate
+        // 0.5·diff²/0. Keeping the branch outside the inner loop also
+        // lets the JIT hoist the constant comparison.
+        bool isPlainL1 = beta == 0.0;
+
+        // #294 NumericFastPath: bypass per-element INumericOperations<T>
+        // dispatch for the float / double primitive cases. Audit
+        // measured 4× speedup on this exact loop shape (per-element
+        // ToDouble + scalar arithmetic + FromDouble). T is unconstrained
+        // here so we pattern-match on the concrete data array.
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var outArr = output.GetDataArray();
+        if (inArr is double[] iD && tgtArr is double[] tD && outArr is double[] oD)
         {
-            double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
-            double absDiff = Math.Abs(diff);
-            double loss = absDiff < beta
-                ? 0.5 * diff * diff / beta
-                : absDiff - 0.5 * beta;
-            outSpan[i] = ops.FromDouble(loss);
+            int n = inSpan.Length;
+            if (isPlainL1)
+            {
+                for (int i = 0; i < n; i++) oD[i] = Math.Abs(iD[i] - tD[i]);
+            }
+            else
+            {
+                double halfBeta = 0.5 * beta;
+                for (int i = 0; i < n; i++)
+                {
+                    double diff = iD[i] - tD[i];
+                    double absDiff = Math.Abs(diff);
+                    oD[i] = absDiff < beta ? 0.5 * diff * diff / beta : absDiff - halfBeta;
+                }
+            }
+            return Reduce(output, reduction);
+        }
+        if (inArr is float[] iF && tgtArr is float[] tF && outArr is float[] oF)
+        {
+            int n = inSpan.Length;
+            if (isPlainL1)
+            {
+                for (int i = 0; i < n; i++) oF[i] = MathF.Abs(iF[i] - tF[i]);
+            }
+            else
+            {
+                float betaF = (float)beta;
+                float halfBetaF = 0.5f * betaF;
+                for (int i = 0; i < n; i++)
+                {
+                    float diff = iF[i] - tF[i];
+                    float absDiff = MathF.Abs(diff);
+                    oF[i] = absDiff < betaF ? 0.5f * diff * diff / betaF : absDiff - halfBetaF;
+                }
+            }
+            return Reduce(output, reduction);
+        }
+
+        if (isPlainL1)
+        {
+            for (int i = 0; i < inSpan.Length; i++)
+            {
+                double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
+                outSpan[i] = ops.FromDouble(Math.Abs(diff));
+            }
+        }
+        else
+        {
+            for (int i = 0; i < inSpan.Length; i++)
+            {
+                double diff = ops.ToDouble(ops.Subtract(inSpan[i], tgtSpan[i]));
+                double absDiff = Math.Abs(diff);
+                double loss = absDiff < beta
+                    ? 0.5 * diff * diff / beta
+                    : absDiff - 0.5 * beta;
+                outSpan[i] = ops.FromDouble(loss);
+            }
         }
         return Reduce(output, reduction);
     }
@@ -88,6 +165,14 @@ public static class Losses
         bool full = false, double eps = 1e-6,
         LossReduction reduction = LossReduction.Mean)
     {
+        // eps is the variance floor before the log() — must be
+        // strictly positive. eps<=0 would feed a non-positive value
+        // into Math.Log on the primitive fast paths, producing -inf
+        // or NaN instead of a meaningful loss. Reject at entry so all
+        // branches share consistent input validation.
+        if (eps <= 0)
+            throw new ArgumentOutOfRangeException(nameof(eps), $"eps must be > 0; got {eps}.");
+
         EnsureSameShape(input, target);
         EnsureSameShape(input, variance);
         var ops = MathHelper.GetNumericOperations<T>();
@@ -97,6 +182,43 @@ public static class Losses
         var varSpan = variance.AsSpan();
         var outSpan = output.AsWritableSpan();
         double constTerm = full ? 0.5 * Math.Log(2.0 * Math.PI) : 0.0;
+
+        // #294 NumericFastPath: float / double primitive fast paths
+        // bypass INumericOperations<T>'s per-element virtual dispatch
+        // via concrete-array pattern match.
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var varArr = variance.GetDataArray();
+        var outArr = output.GetDataArray();
+        if (inArr is double[] iD && tgtArr is double[] tD && varArr is double[] vD && outArr is double[] oD)
+        {
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                double xi = iD[i];
+                double ti = tD[i];
+                double vi = vD[i] > eps ? vD[i] : eps;
+                double diff = ti - xi;
+                oD[i] = 0.5 * (Math.Log(vi) + diff * diff / vi) + constTerm;
+            }
+            return Reduce(output, reduction);
+        }
+        if (inArr is float[] iF && tgtArr is float[] tF && varArr is float[] vF && outArr is float[] oF)
+        {
+            float epsF = (float)eps;
+            float constTermF = (float)constTerm;
+            int n = inSpan.Length;
+            for (int i = 0; i < n; i++)
+            {
+                float xi = iF[i];
+                float ti = tF[i];
+                float vi = vF[i] > epsF ? vF[i] : epsF;
+                float diff = ti - xi;
+                oF[i] = 0.5f * (MathF.Log(vi) + diff * diff / vi) + constTermF;
+            }
+            return Reduce(output, reduction);
+        }
+
         for (int i = 0; i < inSpan.Length; i++)
         {
             double xi = ops.ToDouble(inSpan[i]);

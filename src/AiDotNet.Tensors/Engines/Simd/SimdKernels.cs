@@ -6099,7 +6099,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         [MethodImpl(HotInline)]
-        private static float HorizontalMax(Vector256<float> v)
+        internal static float HorizontalMax(Vector256<float> v)
         {
             var lo = v.GetLower();
             var hi = Avx.ExtractVector128(v, 1);
