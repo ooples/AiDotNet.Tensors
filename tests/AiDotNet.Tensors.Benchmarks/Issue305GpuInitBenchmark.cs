@@ -86,9 +86,17 @@ public static class Issue305GpuInitBenchmark
         foreach (double timing in timings)
             sum += timing;
 
+        // Even-N median is the average of the two middle samples; previously
+        // we used timings[length/2] (upper-middle only) which biases the
+        // median upward for even sample counts.
+        int n = timings.Length;
+        double median = (n % 2 == 1)
+            ? timings[n / 2]
+            : 0.5 * (timings[(n / 2) - 1] + timings[n / 2]);
+
         return new Stats(
-            MeanMs: sum / timings.Length,
-            MedianMs: timings[timings.Length / 2],
+            MeanMs: sum / n,
+            MedianMs: median,
             MinMs: timings[0],
             MaxMs: timings[^1]);
     }

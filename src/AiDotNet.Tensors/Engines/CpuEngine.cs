@@ -3668,8 +3668,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}.");
-        if (destination.Length < a.Length)
-            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+        // Exact-length match: destination MUST be the same size as the sources.
+        // A larger destination would leave trailing stale data and silently
+        // misalign downstream consumers that key on tensor.Length.
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal source length ({a.Length}).");
         if (destination.IsSparse || a.IsSparse || b.IsSparse)
             throw new InvalidOperationException("TensorSubtractInto does not support SparseTensor operands.");
 
@@ -4447,8 +4451,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
-        if (destination.Length < a.Length)
-            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal source length ({a.Length}).");
         if (destination.IsSparse || a.IsSparse)
             throw new InvalidOperationException("TensorMultiplyScalarInto does not support SparseTensor operands.");
 
@@ -25430,29 +25435,32 @@ public partial class CpuEngine : ITensorLevelEngine
         var liveBacking = destination.GetLiveBackingArrayOrNull();
         if (liveBacking is not null && totalElements > 10000)
         {
-            // For seeded random with parallelism, we need thread-local randoms
-            if (seed.HasValue)
-            {
-                var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
-                for (int i = 0; i < seeds.Length; i++)
-                    seeds[i] = baseRandom.Next();
+            // Chunk-based parallel fill. Each chunk gets a deterministic
+            // chunk-id-derived seed (from baseSeed when provided, otherwise
+            // from a process-wide monotonic counter). Avoids the
+            // ManagedThreadId-modulo collision where two workers can pick
+            // the same seed and produce identical subsequences.
+            int workerCount = Math.Min(
+                CpuParallelSettings.MaxDegreeOfParallelism,
+                Math.Max(1, (totalElements + MinChunkSize - 1) / MinChunkSize));
+            int chunkSize = (totalElements + workerCount - 1) / workerCount;
+            int baseSeed = seed.HasValue
+                ? seed.Value
+                : System.Threading.Interlocked.Add(ref _randomUniformSeedCounter, unchecked((int)0x9E3779B9));
 
-                Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
-                    (i, state, localRandom) =>
-                    {
-                        liveBacking[i] = numOps.FromDouble(localRandom.NextDouble() * range + minD);
-                        return localRandom;
-                    },
-                    _ => { });
-            }
-            else
+            LightweightParallel(workerCount, chunkIdx =>
             {
-                Parallel.For(0, totalElements, i =>
-                {
-                    liveBacking[i] = numOps.FromDouble(RandomHelper.ThreadSafeRandom.NextDouble() * range + minD);
-                });
-            }
+                int start = chunkIdx * chunkSize;
+                int count = Math.Min(chunkSize, totalElements - start);
+                if (count <= 0) return;
+                // Mix base + chunkIdx through the same golden-ratio constant
+                // FillRandomNormalArray uses, so identical (baseSeed, workerCount)
+                // produces identical output across runs.
+                int chunkSeed = unchecked(baseSeed + (int)((uint)chunkIdx * 0x9E3779B9u));
+                var rand = RandomHelper.CreateSeededRandom(chunkSeed);
+                for (int i = start; i < start + count; i++)
+                    liveBacking[i] = numOps.FromDouble(rand.NextDouble() * range + minD);
+            });
             return;
         }
 
@@ -25469,6 +25477,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 numOps.FromDouble(random.NextDouble() * range + minD);
         }
     }
+
+    private static int _randomUniformSeedCounter;
 
     private static void FillRandomNormal<T>(
         Span<T> destination,

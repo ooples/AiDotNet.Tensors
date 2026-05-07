@@ -1403,19 +1403,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferB = AllocateOutputBuffer(backend, input.Length);
         try
         {
-            // AutocastScope: convert to fp16 for compute, back to fp32 for output
-            var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
-            if (fp16Input is not null)
+            // AutocastScope: convert to fp16 for compute, back to fp32 for output.
+            // try/finally guarantees fp16Input is released even if op() or
+            // ConvertToFp32 throws.
+            IGpuBuffer? fp16Input = null;
+            try
             {
-                using var fp16Output = AllocateOutputBuffer(backend, input.Length);
-                op(backend, fp16Input, fp16Output.Buffer, input.Length);
-                // Convert output back to fp32
-                backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
-                fp16Input.Dispose();
+                fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
+                if (fp16Input is not null)
+                {
+                    using var fp16Output = AllocateOutputBuffer(backend, input.Length);
+                    op(backend, fp16Input, fp16Output.Buffer, input.Length);
+                    backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                }
             }
-            else
+            finally
             {
-                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                fp16Input?.Dispose();
             }
             return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
@@ -1498,17 +1506,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // to fp32 for the downloaded result. Without this the chunked
                 // fallback would silently change numeric / perf behaviour vs
                 // the normal GPU path.
-                var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
-                if (fp16Input is not null)
+                IGpuBuffer? fp16Input = null;
+                try
                 {
-                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                    op(backend, fp16Input, fp16Out.Buffer, len);
-                    backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
-                    fp16Input.Dispose();
+                    fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
+                    if (fp16Input is not null)
+                    {
+                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                        op(backend, fp16Input, fp16Out.Buffer, len);
+                        backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
+                    }
+                    else
+                    {
+                        op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+                    }
                 }
-                else
+                finally
                 {
-                    op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+                    fp16Input?.Dispose();
                 }
                 var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
@@ -1571,21 +1586,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferC = AllocateOutputBuffer(backend, left.Length);
         try
         {
-            var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
-            var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
-            if (fp16A is not null && fp16B is not null)
+            // fp16A / fp16B are raw IGpuBuffer? (no IDisposable wrapper) so we
+            // must guarantee Dispose() runs even if op() or ConvertToFp32 throws.
+            // Previously these leaked on any exception inside the if-branch.
+            IGpuBuffer? fp16A = null;
+            IGpuBuffer? fp16B = null;
+            try
             {
-                using var fp16Out = AllocateOutputBuffer(backend, left.Length);
-                op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
-                backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
-                fp16A.Dispose();
-                fp16B.Dispose();
+                fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
+                fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
+                if (fp16A is not null && fp16B is not null)
+                {
+                    using var fp16Out = AllocateOutputBuffer(backend, left.Length);
+                    op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
+                    backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                }
             }
-            else
+            finally
             {
                 fp16A?.Dispose();
                 fp16B?.Dispose();
-                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
             }
             return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
@@ -1651,21 +1675,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
                 // chunked fallback doesn't silently change numeric/perf behaviour
                 // when autocast is enabled.
-                var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
-                var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
-                if (fp16A is not null && fp16B is not null)
+                IGpuBuffer? fp16A = null;
+                IGpuBuffer? fp16B = null;
+                try
                 {
-                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                    op(backend, fp16A, fp16B, fp16Out.Buffer, len);
-                    backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
-                    fp16A.Dispose();
-                    fp16B.Dispose();
+                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
+                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
+                    if (fp16A is not null && fp16B is not null)
+                    {
+                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                        op(backend, fp16A, fp16B, fp16Out.Buffer, len);
+                        backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
+                    }
+                    else
+                    {
+                        op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
+                    }
                 }
-                else
+                finally
                 {
                     fp16A?.Dispose();
                     fp16B?.Dispose();
-                    op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
                 }
                 var chunkResult = backend.DownloadBuffer(bC.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
@@ -1885,21 +1915,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var output = AllocateOutputBuffer(backend, left.Length);
             try
             {
-                var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
-                var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
-                if (fp16A is not null && fp16B is not null)
+                IGpuBuffer? fp16A = null;
+                IGpuBuffer? fp16B = null;
+                try
                 {
-                    using var fp16Out = AllocateOutputBuffer(backend, left.Length);
-                    op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
-                    backend.ConvertToFp32(fp16Out.Buffer, output.Buffer, left.Length);
-                    fp16A.Dispose();
-                    fp16B.Dispose();
+                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
+                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
+                    if (fp16A is not null && fp16B is not null)
+                    {
+                        using var fp16Out = AllocateOutputBuffer(backend, left.Length);
+                        op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
+                        backend.ConvertToFp32(fp16Out.Buffer, output.Buffer, left.Length);
+                    }
+                    else
+                    {
+                        op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
+                    }
                 }
-                else
+                finally
                 {
                     fp16A?.Dispose();
                     fp16B?.Dispose();
-                    op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
                 }
 
                 DownloadGpuBufferInto(backend, output, destinationArray, left.Length);

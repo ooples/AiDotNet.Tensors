@@ -30,7 +30,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max", type=float, default=0.05)
     parser.add_argument("--stddev", type=float, default=0.02)
     parser.add_argument("--device", choices=["auto", "cuda", "directml"], default="auto")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.runs <= 0:
+        parser.error("--runs must be > 0 (need at least one timed sample for median)")
+    if args.warmup < 0:
+        parser.error("--warmup must be >= 0")
+    if args.stddev < 0:
+        parser.error("--stddev must be >= 0")
+    if args.max < args.min:
+        parser.error(f"--max ({args.max}) must be >= --min ({args.min})")
+    for e in args.elements:
+        if e <= 0:
+            parser.error(f"--elements values must be > 0 (got {e})")
+
+    return args
 
 
 def select_device(requested: str):
