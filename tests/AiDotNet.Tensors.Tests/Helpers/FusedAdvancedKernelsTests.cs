@@ -9,7 +9,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
-public class FusedKernelsIssue301Tests
+public class FusedAdvancedKernelsTests
 {
     private static Tensor<float> RandomTensor(int[] shape, int seed, double scale = 1.0)
     {

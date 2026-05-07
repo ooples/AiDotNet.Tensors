@@ -21,7 +21,7 @@ public sealed partial class WebGpuBackend
         if (rank > 256)
             throw new System.NotSupportedException(
                 $"WebGPU LoRA fused kernel currently caps rank at 256 (got {rank}). " +
-                "Increase MAX_RANK in WebGpuIssue301FusedKernels.LoRAForward and the " +
+                "Increase MAX_RANK in WebGpuFusedAdvancedKernels.LoRAForward and the " +
                 "workgroup-private array size if higher ranks are required.");
 
         // The two-stage WGSL kernel uses one workgroup per batch row with a
@@ -30,11 +30,11 @@ public sealed partial class WebGpuBackend
         // exactly batchSize workgroups.
         int workSize = batchSize * 256;
         Dispatch5BufferAsync(
-            "Issue301FusedLoRA",
-            WebGpuIssue301FusedKernels.LoRAForward,
+            "FusedLoRA",
+            WebGpuFusedAdvancedKernels.LoRAForward,
             "main",
             input, baseOutput, loraA, loraB, output,
-            Issue301UniformLoRA(batchSize, inputFeatures, rank, outputFeatures, scaling),
+            FusedLoRAUniform(batchSize, inputFeatures, rank, outputFeatures, scaling),
             workSize).GetAwaiter().GetResult();
     }
 
@@ -48,8 +48,8 @@ public sealed partial class WebGpuBackend
     {
         if (size <= 0) return;
         Dispatch3BufferAsync(
-            "Issue301FusedDDIM",
-            WebGpuIssue301FusedKernels.DDIMStep,
+            "FusedDDIM",
+            WebGpuFusedAdvancedKernels.DDIMStep,
             "main",
             xT, epsilonTheta, output,
             new[] { System.BitConverter.Int32BitsToSingle(size), alphaBarT, alphaBarTMinus1, 0f },
@@ -72,15 +72,15 @@ public sealed partial class WebGpuBackend
         int total = batchSize * outputFeatures;
         if (total <= 0) return;
         Dispatch5BufferAsync(
-            "Issue301FusedSparseLinear",
-            WebGpuIssue301FusedKernels.SparseLinear,
+            "FusedSparseLinear",
+            WebGpuFusedAdvancedKernels.SparseLinear,
             "main",
             input, packedCsr, sparseValues, bias, output,
-            Issue301UniformInts(batchSize, inputFeatures, outputFeatures, nnz, hasBias, activation),
+            FusedKernelUniformInts(batchSize, inputFeatures, outputFeatures, nnz, hasBias, activation),
             total).GetAwaiter().GetResult();
     }
 
-    private static float[] Issue301UniformLoRA(int batchSize, int inputFeatures, int rank, int outputFeatures, float scaling) =>
+    private static float[] FusedLoRAUniform(int batchSize, int inputFeatures, int rank, int outputFeatures, float scaling) =>
         new[]
         {
             System.BitConverter.Int32BitsToSingle(batchSize),
@@ -93,7 +93,7 @@ public sealed partial class WebGpuBackend
             0f
         };
 
-    private static float[] Issue301UniformInts(params int[] values)
+    private static float[] FusedKernelUniformInts(params int[] values)
     {
         int padded = ((values.Length + 3) / 4) * 4;
         var uniforms = new float[padded];

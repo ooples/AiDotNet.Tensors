@@ -26,7 +26,7 @@ public sealed unsafe partial class VulkanBackend
         if ((uint)rank > 256u)
             throw new NotSupportedException(
                 $"Vulkan LoRA fused kernel currently caps rank at 256 (got {rank}). " +
-                "Increase MAX_RANK in VulkanIssue301FusedKernels.LoRAForward and " +
+                "Increase MAX_RANK in VulkanFusedAdvancedKernels.LoRAForward and " +
                 "redeploy the SPIR-V if higher ranks are required.");
 
         var pushConstants = new[]
@@ -39,7 +39,7 @@ public sealed unsafe partial class VulkanBackend
         };
 
         GlslQuintOp(
-            VulkanIssue301FusedKernels.LoRAForward,
+            VulkanFusedAdvancedKernels.LoRAForward,
             input, baseOutput, loraA, loraB, output,
             batchSize * VulkanKernels.WorkgroupSize,
             pushConstants,
@@ -72,7 +72,7 @@ public sealed unsafe partial class VulkanBackend
         };
 
         GlslBinaryOp(
-            VulkanIssue301FusedKernels.DDIMStep,
+            VulkanFusedAdvancedKernels.DDIMStep,
             xT, epsilonTheta, output,
             size,
             pushConstants,
@@ -115,7 +115,7 @@ public sealed unsafe partial class VulkanBackend
         };
 
         GlslQuintOp(
-            VulkanIssue301FusedKernels.SparseLinear,
+            VulkanFusedAdvancedKernels.SparseLinear,
             input, packedCsr, sparseValues, bias, output,
             (int)totalLong,
             pushConstants,

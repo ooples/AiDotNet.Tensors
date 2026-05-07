@@ -2,17 +2,17 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
-internal static class Issue301FusedKernels
+internal static class OpenClFusedAdvancedKernels
 {
     public static string[] GetKernelNames() => new[]
     {
-        "issue301_fused_lora_forward",
-        "issue301_fused_ddim_step",
-        "issue301_fused_sparse_linear"
+        "fused_lora_forward",
+        "fused_ddim_step",
+        "fused_sparse_linear"
     };
 
     public static string GetSource() => @"
-inline float issue301_activate(float x, int activation)
+inline float fused_activate(float x, int activation)
 {
     switch (activation)
     {
@@ -26,7 +26,7 @@ inline float issue301_activate(float x, int activation)
     }
 }
 
-// See CudaIssue301FusedKernels.cs for the full design rationale.
+// See CudaFusedAdvancedKernels.cs for the full design rationale.
 // Two-stage shared-memory variant — O(batch · rank · (in + out)) instead of
 // the broken O(batch · in · rank · out) inner-recompute variant.
 //
@@ -36,7 +36,7 @@ inline float issue301_activate(float x, int activation)
 //   __local proj[rank] passed via clSetKernelArg(... NULL ...) for dynamic
 //   shared mem (in OpenCL: __local float* proj as a kernel arg, then
 //   clSetKernelArg(kernel, idx, rank * sizeof(float), NULL)).
-__kernel void issue301_fused_lora_forward(
+__kernel void fused_lora_forward(
     __global const float* input,
     __global const float* base_output,
     __global const float* lora_a,
@@ -79,7 +79,7 @@ __kernel void issue301_fused_lora_forward(
     }
 }
 
-__kernel void issue301_fused_ddim_step(
+__kernel void fused_ddim_step(
     __global const float* x_t,
     __global const float* epsilon_theta,
     __global float* output,
@@ -97,7 +97,7 @@ __kernel void issue301_fused_ddim_step(
     output[idx] = c_xt * x_t[idx] + c_eps * epsilon_theta[idx];
 }
 
-__kernel void issue301_fused_sparse_linear(
+__kernel void fused_sparse_linear(
     __global const float* input,
     __global const int* packed_csr,
     __global const float* sparse_values,
@@ -133,7 +133,7 @@ __kernel void issue301_fused_sparse_linear(
         if ((uint)col < (uint)input_features)
             sum += input[b * input_features + col] * sparse_values[p];
     }
-    output[idx] = issue301_activate(sum, activation);
+    output[idx] = fused_activate(sum, activation);
 }
 ";
 }

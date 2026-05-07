@@ -2,19 +2,19 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
-internal static class CudaIssue301FusedKernels
+internal static class CudaFusedAdvancedKernels
 {
     public static string[] GetKernelNames() => new[]
     {
-        "issue301_fused_lora_forward",
-        "issue301_fused_ddim_step",
-        "issue301_fused_sparse_linear"
+        "fused_lora_forward",
+        "fused_ddim_step",
+        "fused_sparse_linear"
     };
 
     public static string GetSource() => @"
 #include <math.h>
 
-__device__ __forceinline__ float issue301_activate(float x, int activation)
+__device__ __forceinline__ float fused_activate(float x, int activation)
 {
     switch (activation)
     {
@@ -45,7 +45,7 @@ __device__ __forceinline__ float issue301_activate(float x, int activation)
 // Launch contract:
 //   grid.x = batch_size,  block.x = min(output_features, max_threads_per_block)
 //   shared mem = rank * sizeof(float) bytes (dynamic)
-extern ""C"" __global__ void issue301_fused_lora_forward(
+extern ""C"" __global__ void fused_lora_forward(
     const float* __restrict__ input,
     const float* __restrict__ base_output,
     const float* __restrict__ lora_a,
@@ -91,7 +91,7 @@ extern ""C"" __global__ void issue301_fused_lora_forward(
     }
 }
 
-extern ""C"" __global__ void issue301_fused_ddim_step(
+extern ""C"" __global__ void fused_ddim_step(
     const float* __restrict__ x_t,
     const float* __restrict__ epsilon_theta,
     float* __restrict__ output,
@@ -109,7 +109,7 @@ extern ""C"" __global__ void issue301_fused_ddim_step(
     output[idx] = c_xt * x_t[idx] + c_eps * epsilon_theta[idx];
 }
 
-extern ""C"" __global__ void issue301_fused_sparse_linear(
+extern ""C"" __global__ void fused_sparse_linear(
     const float* __restrict__ input,
     const int* __restrict__ packed_csr,
     const float* __restrict__ sparse_values,
@@ -145,7 +145,7 @@ extern ""C"" __global__ void issue301_fused_sparse_linear(
         if ((unsigned int)col < (unsigned int)input_features)
             sum += input[b * input_features + col] * sparse_values[p];
     }
-    output[idx] = issue301_activate(sum, activation);
+    output[idx] = fused_activate(sum, activation);
 }
 ";
 }

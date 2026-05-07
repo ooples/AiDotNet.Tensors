@@ -41,7 +41,7 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException(
                 $"output shape must be [{batch}, {outFeat}].", nameof(output));
 
-        if (TryGetBackend(out var backend) && backend is IIssue301FusedBackend fusedBackend)
+        if (TryGetBackend(out var backend) && backend is IFusedAdvancedKernels fusedBackend)
         {
             try
             {
@@ -104,7 +104,7 @@ public partial class DirectGpuTensorEngine
                     nameof(output));
         }
 
-        if (TryGetBackend(out var backend) && backend is IIssue301FusedBackend fusedBackend)
+        if (TryGetBackend(out var backend) && backend is IFusedAdvancedKernels fusedBackend)
         {
             try
             {
@@ -159,7 +159,7 @@ public partial class DirectGpuTensorEngine
 
         if (IsGpuSparseActivationSupported(activation)
             && TryGetBackend(out var backend)
-            && backend is IIssue301FusedBackend fusedBackend)
+            && backend is IFusedAdvancedKernels fusedBackend)
         {
             try
             {

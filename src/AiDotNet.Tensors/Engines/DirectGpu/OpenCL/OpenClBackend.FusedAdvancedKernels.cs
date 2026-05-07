@@ -4,20 +4,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public sealed partial class OpenClBackend
 {
-    private void EnsureIssue301KernelsAvailable(string opName)
+    private void EnsureFusedAdvancedKernelsAvailable(string opName)
     {
         if (_context == null) throw new InvalidOperationException("OpenCL context not available");
-        if (!_issue301KernelsAvailable)
+        if (!_fusedAdvancedKernelsAvailable)
             throw new NotSupportedException(
-                $"OpenCL Issue #301 fused kernels are not available on this device — " +
+                $"OpenCL fused-advanced kernels are not available on this device — " +
                 $"compile failed during backend initialization. {opName} cannot be dispatched. " +
                 $"Fall back to the eager decomposed path.");
     }
 
     private DirectOpenClContext RequireContext(string opName)
     {
-        EnsureIssue301KernelsAvailable(opName);
-        // EnsureIssue301KernelsAvailable already validated _context is non-null;
+        EnsureFusedAdvancedKernelsAvailable(opName);
+        // EnsureFusedAdvancedKernelsAvailable already validated _context is non-null;
         // this restates it locally so net471's nullable analysis is satisfied
         // without depending on [MemberNotNull] (which net471 cannot honour).
         return _context ?? throw new InvalidOperationException("OpenCL context not available");
@@ -36,11 +36,11 @@ public sealed partial class OpenClBackend
         float scaling)
     {
         var ctx = RequireContext(nameof(FusedLoRAForward));
-        var k = _kernelCache["issue301_fused_lora_forward"];
+        var k = _kernelCache["fused_lora_forward"];
         if (batchSize <= 0 || outputFeatures <= 0 || rank <= 0) return;
 
         // Two-stage launch: one work-group per batch row. Local memory holds
-        // proj[rank]. See CudaIssue301FusedKernels.cs for the design rationale.
+        // proj[rank]. See CudaFusedAdvancedKernels.cs for the design rationale.
         int localSize = System.Math.Min(outputFeatures, CalculateOptimalWorkGroupSize1D(outputFeatures));
         int globalSize = batchSize * localSize;
         int sharedBytes = checked(rank * sizeof(float));
@@ -71,7 +71,7 @@ public sealed partial class OpenClBackend
         float alphaBarTMinus1)
     {
         var ctx = RequireContext(nameof(FusedDDIMStep));
-        var k = _kernelCache["issue301_fused_ddim_step"];
+        var k = _kernelCache["fused_ddim_step"];
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)xT).Buffer.Handle);
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)epsilonTheta).Buffer.Handle);
@@ -98,7 +98,7 @@ public sealed partial class OpenClBackend
         int activation)
     {
         var ctx = RequireContext(nameof(FusedSparseLinear));
-        var k = _kernelCache["issue301_fused_sparse_linear"];
+        var k = _kernelCache["fused_sparse_linear"];
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)packedCsr).Buffer.Handle);

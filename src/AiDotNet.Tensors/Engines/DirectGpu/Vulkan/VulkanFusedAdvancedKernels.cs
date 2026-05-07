@@ -2,9 +2,9 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-internal static class VulkanIssue301FusedKernels
+internal static class VulkanFusedAdvancedKernels
 {
-    // Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+    // Two-stage fused LoRA forward. See CudaFusedAdvancedKernels.cs for the
     // design rationale. Total work: O(batch · rank · (in + out)) instead of
     // the broken O(batch · in · rank · out).
     //
@@ -130,7 +130,7 @@ layout(push_constant) uniform Params
     uint activation;
 } p;
 
-float issue301_apply_activation(float x)
+float fused_apply_activation(float x)
 {
     if (p.activation == 1u) return max(x, 0.0);
     if (p.activation == 2u)
@@ -174,7 +174,7 @@ void main()
     // sparseValuesData (UB on Vulkan, dispatch crash).
     if (rowStart < 0 || rowEnd < rowStart || uint(rowEnd) > p.nnz)
     {
-        outputData[gid] = issue301_apply_activation(sum);
+        outputData[gid] = fused_apply_activation(sum);
         return;
     }
 
@@ -186,7 +186,7 @@ void main()
         sum += inputData[b * p.inputFeatures + uint(col)] * sparseValuesData[uint(idx)];
     }
 
-    outputData[gid] = issue301_apply_activation(sum);
+    outputData[gid] = fused_apply_activation(sum);
 }
 ";
 }

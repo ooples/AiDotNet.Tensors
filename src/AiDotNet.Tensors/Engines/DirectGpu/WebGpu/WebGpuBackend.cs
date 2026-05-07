@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IIssue301FusedBackend
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels
 {
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;

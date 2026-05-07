@@ -3,10 +3,10 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-internal static class WebGpuIssue301FusedKernels
+internal static class WebGpuFusedAdvancedKernels
 {
     private const string ActivationHelper = @"
-fn issue301_apply_activation(xIn : f32, activation : i32) -> f32 {
+fn fused_apply_activation(xIn : f32, activation : i32) -> f32 {
     var x = xIn;
     if (activation == 1) { return max(x, 0.0); }
     if (activation == 2) {
@@ -24,7 +24,7 @@ fn issue301_apply_activation(xIn : f32, activation : i32) -> f32 {
 }
 ";
 
-    // Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+    // Two-stage fused LoRA forward. See CudaFusedAdvancedKernels.cs for the
     // design rationale. Total work: O(batch · rank · (in + out)) instead of
     // O(batch · in · rank · out).
     //
@@ -135,7 +135,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
         sum = sum + input_[b * p.inputFeatures + col] * sparseValues[idx];
     }
 
-    output[gid] = issue301_apply_activation(sum, p.activation);
+    output[gid] = fused_apply_activation(sum, p.activation);
 }
 ";
 }

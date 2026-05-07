@@ -2,13 +2,13 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 {
-    internal static class MetalIssue301FusedKernels
+    internal static class MetalFusedAdvancedKernels
     {
         public static string[] GetKernelNames() => new[]
         {
-            "issue301_fused_lora_forward",
-            "issue301_fused_ddim_step",
-            "issue301_fused_sparse_linear",
+            "fused_lora_forward",
+            "fused_ddim_step",
+            "fused_sparse_linear",
         };
 
         public const string Source = @"
@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 #include <metal_math>
 using namespace metal;
 
-static inline float issue301_apply_activation(float x, uint activation)
+static inline float fused_apply_activation(float x, uint activation)
 {
     if (activation == 1u) return max(x, 0.0f);
     if (activation == 2u)
@@ -35,7 +35,7 @@ static inline float issue301_apply_activation(float x, uint activation)
     return x;
 }
 
-// Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+// Two-stage fused LoRA forward. See CudaFusedAdvancedKernels.cs for the
 // full design rationale. Total work: O(batch · rank · (in + out)) instead
 // of the broken O(batch · in · rank · out).
 //
@@ -45,7 +45,7 @@ static inline float issue301_apply_activation(float x, uint activation)
 //                    threadgroup memory budget
 //   threadgroup memory = rank * sizeof(float) (passed dynamically via
 //                        setThreadgroupMemoryLength in dispatch)
-kernel void issue301_fused_lora_forward(
+kernel void fused_lora_forward(
     device const float* input [[buffer(0)]],
     device const float* baseOutput [[buffer(1)]],
     device const float* loraA [[buffer(2)]],
@@ -87,7 +87,7 @@ kernel void issue301_fused_lora_forward(
     }
 }
 
-kernel void issue301_fused_ddim_step(
+kernel void fused_ddim_step(
     device const float* xT [[buffer(0)]],
     device const float* epsilonTheta [[buffer(1)]],
     device float* output [[buffer(2)]],
@@ -103,7 +103,7 @@ kernel void issue301_fused_ddim_step(
     output[gid] = sqrt(alphaBarTMinus1) * x0Pred + sqrt(max(0.0f, 1.0f - alphaBarTMinus1)) * eps;
 }
 
-kernel void issue301_fused_sparse_linear(
+kernel void fused_sparse_linear(
     device const float* input [[buffer(0)]],
     device const float* packedCsr [[buffer(1)]],
     device const float* sparseValues [[buffer(2)]],
@@ -133,7 +133,7 @@ kernel void issue301_fused_sparse_linear(
     // produces UB / a dispatch crash. Matches the CUDA variant.
     if (rowStart < 0 || rowEnd < rowStart || uint(rowEnd) > nnz)
     {
-        output[gid] = issue301_apply_activation(sum, activation);
+        output[gid] = fused_apply_activation(sum, activation);
         return;
     }
 
@@ -148,7 +148,7 @@ kernel void issue301_fused_sparse_linear(
         sum += input[b * inputFeatures + uint(col)] * sparseValues[uint(idx)];
     }
 
-    output[gid] = issue301_apply_activation(sum, activation);
+    output[gid] = fused_apply_activation(sum, activation);
 }
 ";
     }

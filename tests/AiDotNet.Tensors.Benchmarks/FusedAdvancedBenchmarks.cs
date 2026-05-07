@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 [SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 10)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
-public class FusedIssue301Benchmarks
+public class FusedAdvancedBenchmarks
 {
     private const int Batch = 32;
     private const int InputFeatures = 256;

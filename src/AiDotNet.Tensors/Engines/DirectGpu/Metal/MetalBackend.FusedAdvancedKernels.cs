@@ -19,7 +19,7 @@ public sealed partial class MetalBackend
         int outputFeatures,
         float scaling)
     {
-        DispatchIssue301LoRA(input, baseOutput, loraA, loraB, output,
+        DispatchFusedLoRA(input, baseOutput, loraA, loraB, output,
             batchSize, inputFeatures, rank, outputFeatures, scaling);
     }
 
@@ -40,7 +40,7 @@ public sealed partial class MetalBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        var pipeline = GetPipeline("Issue301Fused", _issue301FusedLibrary, "issue301_fused_ddim_step");
+        var pipeline = GetPipeline("FusedAdvancedKernels", _fusedAdvancedLibrary, "fused_ddim_step");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -78,7 +78,7 @@ public sealed partial class MetalBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        var pipeline = GetPipeline("Issue301Fused", _issue301FusedLibrary, "issue301_fused_sparse_linear");
+        var pipeline = GetPipeline("FusedAdvancedKernels", _fusedAdvancedLibrary, "fused_sparse_linear");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -96,7 +96,7 @@ public sealed partial class MetalBackend
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
-    private void DispatchIssue301LoRA(
+    private void DispatchFusedLoRA(
         IGpuBuffer input,
         IGpuBuffer baseOutput,
         IGpuBuffer loraA,
@@ -119,7 +119,7 @@ public sealed partial class MetalBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        var pipeline = GetPipeline("Issue301Fused", _issue301FusedLibrary, "issue301_fused_lora_forward");
+        var pipeline = GetPipeline("FusedAdvancedKernels", _fusedAdvancedLibrary, "fused_lora_forward");
 
         // Two-stage layout: one threadgroup per batch row. Each group runs
         // up to 256 threads, capped by outputFeatures, and uses
