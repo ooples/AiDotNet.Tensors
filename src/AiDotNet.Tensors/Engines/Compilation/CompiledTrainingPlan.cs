@@ -144,6 +144,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         src.AsSpan().CopyTo(_compiledInputTensor!.AsWritableSpan());
     }
 
+    internal void SetInput(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+
+        int expected = _compiledInputTensor is null ? 0 : 1;
+        if (expected != 1)
+            throw new InvalidOperationException(
+                $"This plan was compiled with {expected} captured input(s); " +
+                $"{nameof(SetInput)} requires exactly one.");
+
+        ValidateShapesMatch(_compiledInputTensor!, input, nameof(input));
+        input.AsSpan().CopyTo(_compiledInputTensor!.AsWritableSpan());
+    }
+
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
     {
         if (expected._shape.Length != actual._shape.Length)
@@ -1018,8 +1033,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                // Direct BLAS into output + fused bias + activation
-                CpuFusedOperations.FusedGemmBiasActivation(
+                // Shapes were validated when the graph was compiled; replay skips
+                // public API argument checks and goes straight to the hot kernel.
+                CpuFusedOperations.FusedGemmBiasActivationUnchecked(
                     inArr, wArr, bArr, oArr, M, N, K, activation);
             };
         }

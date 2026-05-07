@@ -133,6 +133,17 @@ public static class CpuFusedOperations
         if (bias != null && bias.Length < N)
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
+        FusedGemmBiasActivationUnchecked(A, B, bias, output, M, N, K, activation);
+    }
+
+    internal static void FusedGemmBiasActivationUnchecked(
+        float[] A,
+        float[] B,
+        float[]? bias,
+        float[] output,
+        int M, int N, int K,
+        FusedActivationType activation)
+    {
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {

@@ -71,6 +71,42 @@ public class AsyncChainTests
     }
 
     [Fact]
+    public void CpuEngine_DoesNotExposeGlobalDirectGpu()
+    {
+        var engine = new CpuEngine();
+
+        Assert.False(engine.SupportsGpu);
+        Assert.Null(engine.DirectGpu);
+        Assert.Null(((IEngine)engine).DirectGpu);
+    }
+
+    [Fact]
+    public void SetInput_MatchesSetInputs_ForSingleInputPlan()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom(new[] { 4, 8 });
+        var w = Tensor<float>.CreateRandom(new[] { 8, 8 });
+        var b = Tensor<float>.CreateRandom(new[] { 8 });
+
+        var (cache, plan) = BuildLinearReluPlan(engine, input, w, b);
+        try
+        {
+            plan.SetInputs(new[] { input });
+            var fromArray = plan.Execute();
+            var expected = new float[fromArray.Length];
+            fromArray.AsSpan().CopyTo(expected);
+
+            plan.SetInput(input);
+            var fromSingle = plan.Execute();
+
+            Assert.Equal(fromArray.Shape.ToArray(), fromSingle.Shape.ToArray());
+            for (int i = 0; i < fromSingle.Length; i++)
+                Assert.Equal(expected[i], fromSingle[i]);
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
     public async Task ChainAsync_ProducesShapeMatchingAndNonDegenerateOutput()
     {
         // Structural correctness: ChainAsync's await resolves to a tensor
