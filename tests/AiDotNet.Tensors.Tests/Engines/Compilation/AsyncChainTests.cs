@@ -84,24 +84,41 @@ public class AsyncChainTests
     public void SetInput_MatchesSetInputs_ForSingleInputPlan()
     {
         var engine = new CpuEngine();
-        var input = Tensor<float>.CreateRandom(new[] { 4, 8 });
+        // Two distinct inputs: if SetInput is a no-op (or aliases to the
+        // first capture), execA and execB would be identical and this test
+        // would silently pass on a broken implementation.
+        var inputForCompile = Tensor<float>.CreateRandom(new[] { 4, 8 });
+        var inputA = Tensor<float>.CreateRandom(new[] { 4, 8 });
+        var inputB = Tensor<float>.CreateRandom(new[] { 4, 8 });
         var w = Tensor<float>.CreateRandom(new[] { 8, 8 });
         var b = Tensor<float>.CreateRandom(new[] { 8 });
 
-        var (cache, plan) = BuildLinearReluPlan(engine, input, w, b);
+        var (cache, plan) = BuildLinearReluPlan(engine, inputForCompile, w, b);
         try
         {
-            plan.SetInputs(new[] { input });
+            // Reference: drive with inputA via the array path.
+            plan.SetInputs(new[] { inputA });
             var fromArray = plan.Execute();
-            var expected = new float[fromArray.Length];
-            fromArray.AsSpan().CopyTo(expected);
+            var expectedA = new float[fromArray.Length];
+            fromArray.AsSpan().CopyTo(expectedA);
 
-            plan.SetInput(input);
-            var fromSingle = plan.Execute();
+            // Drive with inputB via SetInput. Output MUST differ from expectedA
+            // (otherwise SetInput silently dropped the new tensor).
+            plan.SetInput(inputB);
+            var fromSingleB = plan.Execute();
+            Assert.Equal(fromArray.Shape.ToArray(), fromSingleB.Shape.ToArray());
+            bool differs = false;
+            for (int i = 0; i < fromSingleB.Length; i++)
+            {
+                if (fromSingleB[i] != expectedA[i]) { differs = true; break; }
+            }
+            Assert.True(differs, "SetInput(inputB) produced identical output to SetInputs(inputA) — input was not actually rebound.");
 
-            Assert.Equal(fromArray.Shape.ToArray(), fromSingle.Shape.ToArray());
-            for (int i = 0; i < fromSingle.Length; i++)
-                Assert.Equal(expected[i], fromSingle[i]);
+            // Drive back with inputA via SetInput. Must match the SetInputs reference.
+            plan.SetInput(inputA);
+            var fromSingleA = plan.Execute();
+            for (int i = 0; i < fromSingleA.Length; i++)
+                Assert.Equal(expectedA[i], fromSingleA[i]);
         }
         finally { cache.Dispose(); }
     }

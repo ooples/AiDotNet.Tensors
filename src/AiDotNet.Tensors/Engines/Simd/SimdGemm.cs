@@ -132,12 +132,14 @@ internal static partial class SimdGemm
     private static float[]? _threadPackedABuffer;
     [ThreadStatic]
     private static WeakReference<float[]>? _threadPrePackedBKey0;
+    // Held weakly so the per-thread MRU does not strand the (potentially large)
+    // packed buffers after the source weight array becomes eligible for GC.
     [ThreadStatic]
-    private static PrePackedB? _threadPrePackedBValue0;
+    private static WeakReference<PrePackedB>? _threadPrePackedBValue0;
     [ThreadStatic]
     private static WeakReference<float[]>? _threadPrePackedBKey1;
     [ThreadStatic]
-    private static PrePackedB? _threadPrePackedBValue1;
+    private static WeakReference<PrePackedB>? _threadPrePackedBValue1;
 
     /// <summary>
     /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
@@ -241,6 +243,9 @@ internal static partial class SimdGemm
             && k <= SmallMatmulKThreshold
             && (narrowDirect || mediumParallelDirect))
         {
+            // SgemmAddInternal accumulates into c. We need overwrite semantics
+            // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
+            c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: true, clearedOutput: true);
             return;
@@ -255,7 +260,7 @@ internal static partial class SimdGemm
 
     private static PrePackedB GetOrBuildPrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
-        if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached))
+        if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
             return threadCached;
 
         if (_prePackedBCache.TryGetValue(b, out var existing)
@@ -288,7 +293,7 @@ internal static partial class SimdGemm
     }
 
     private static bool TryGetThreadPrePackedB(
-        float[] b, int k, int n, int expectedMc, out PrePackedB cached)
+        float[] b, int k, int n, int expectedMc, out PrePackedB? cached)
     {
         if (TryGetThreadPrePackedBSlot(_threadPrePackedBKey0, _threadPrePackedBValue0,
                 b, k, n, expectedMc, out cached))
@@ -302,17 +307,18 @@ internal static partial class SimdGemm
             return true;
         }
 
-        cached = null!;
+        cached = null;
         return false;
     }
 
     private static bool TryGetThreadPrePackedBSlot(
         WeakReference<float[]>? keyRef,
-        PrePackedB? value,
+        WeakReference<PrePackedB>? valueRef,
         float[] b, int k, int n, int expectedMc,
-        out PrePackedB cached)
+        out PrePackedB? cached)
     {
-        if (value is not null
+        if (valueRef is not null
+            && valueRef.TryGetTarget(out var value)
             && value.K == k && value.N == n && value.Mc == expectedMc
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
@@ -322,25 +328,24 @@ internal static partial class SimdGemm
             return true;
         }
 
-        cached = null!;
+        cached = null;
         return false;
     }
 
     private static void RememberThreadPrePackedB(float[] b, PrePackedB cached)
     {
-        if (_threadPrePackedBValue0 is not null
-            && _threadPrePackedBKey0 is not null
+        if (_threadPrePackedBKey0 is not null
             && _threadPrePackedBKey0.TryGetTarget(out var key0)
             && ReferenceEquals(key0, b))
         {
-            _threadPrePackedBValue0 = cached;
+            _threadPrePackedBValue0 = new WeakReference<PrePackedB>(cached);
             return;
         }
 
         _threadPrePackedBKey1 = _threadPrePackedBKey0;
         _threadPrePackedBValue1 = _threadPrePackedBValue0;
         _threadPrePackedBKey0 = new WeakReference<float[]>(b);
-        _threadPrePackedBValue0 = cached;
+        _threadPrePackedBValue0 = new WeakReference<PrePackedB>(cached);
     }
 
     private static float[] GetThreadPackedABuffer(int length)

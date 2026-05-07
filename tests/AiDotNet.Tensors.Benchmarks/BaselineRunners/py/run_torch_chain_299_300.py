@@ -133,6 +133,17 @@ def main():
     parser.add_argument("--compile", action="store_true", help="also time torch.compile when available")
     args = parser.parse_args()
 
+    if args.iters <= 0:
+        sys.stderr.write("--iters must be > 0 to compute median/p90\n")
+        sys.exit(2)
+    if args.warmup < 0:
+        sys.stderr.write("--warmup must be >= 0\n")
+        sys.exit(2)
+    for b in args.batches:
+        if b <= 0:
+            sys.stderr.write(f"--batches values must be > 0 (got {b})\n")
+            sys.exit(2)
+
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
