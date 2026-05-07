@@ -37,6 +37,14 @@ public sealed partial class OpenClBackend
     {
         var ctx = RequireContext(nameof(FusedLoRAForward));
         var k = _kernelCache["issue301_fused_lora_forward"];
+        if (batchSize <= 0 || outputFeatures <= 0 || rank <= 0) return;
+
+        // Two-stage launch: one work-group per batch row. Local memory holds
+        // proj[rank]. See CudaIssue301FusedKernels.cs for the design rationale.
+        int localSize = System.Math.Min(outputFeatures, CalculateOptimalWorkGroupSize1D(outputFeatures));
+        int globalSize = batchSize * localSize;
+        int sharedBytes = checked(rank * sizeof(float));
+
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)baseOutput).Buffer.Handle);
@@ -48,9 +56,9 @@ public sealed partial class OpenClBackend
         k.SetArg(arg++, rank);
         k.SetArg(arg++, outputFeatures);
         k.SetArg(arg++, scaling);
-        int total = batchSize * outputFeatures;
-        if (total <= 0) return;
-        k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
+        k.SetLocalArg(arg++, sharedBytes);
+
+        k.Execute1D(globalSize, localSize);
         ctx.Finish();
     }
 

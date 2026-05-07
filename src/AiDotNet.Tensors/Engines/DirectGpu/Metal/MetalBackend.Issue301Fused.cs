@@ -1,5 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System;
+using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
@@ -106,8 +109,7 @@ public sealed partial class MetalBackend
         float scaling)
     {
         ThrowIfDisposed();
-        int total = batchSize * outputFeatures;
-        if (total <= 0) return;
+        if (batchSize <= 0 || rank <= 0 || outputFeatures <= 0) return;
         if (input is not MetalGpuBuffer iBuffer ||
             baseOutput is not MetalGpuBuffer baseBuffer ||
             loraA is not MetalGpuBuffer aBuffer ||
@@ -118,7 +120,16 @@ public sealed partial class MetalBackend
         }
 
         var pipeline = GetPipeline("Issue301Fused", _issue301FusedLibrary, "issue301_fused_lora_forward");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+
+        // Two-stage layout: one threadgroup per batch row. Each group runs
+        // up to 256 threads, capped by outputFeatures, and uses
+        // rank * sizeof(float) bytes of dynamically-sized threadgroup memory
+        // for the proj[] cache.
+        const uint TargetThreadsPerGroup = 256u;
+        uint threadsPerGroupX = (uint)Math.Min(outputFeatures, (int)TargetThreadsPerGroup);
+        if (threadsPerGroupX < 1u) threadsPerGroupX = 1u;
+        uint sharedBytes = checked((uint)rank * sizeof(float));
+
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(iBuffer, 0);
@@ -131,6 +142,9 @@ public sealed partial class MetalBackend
         encoder.SetBytes((uint)rank, 7);
         encoder.SetBytes((uint)outputFeatures, 8);
         encoder.SetBytes(scaling, 9);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        encoder.SetThreadgroupMemoryLength(sharedBytes, 0);
+        encoder.DispatchThreadgroups(
+            new MTLSize((ulong)batchSize, 1, 1),
+            new MTLSize(threadsPerGroupX, 1, 1));
     }
 }

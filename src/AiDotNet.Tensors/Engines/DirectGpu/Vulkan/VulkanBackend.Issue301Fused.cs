@@ -16,6 +16,17 @@ public sealed unsafe partial class VulkanBackend
         int outputFeatures,
         float scaling)
     {
+        // The two-stage LoRA kernel uses one workgroup per batch row. The
+        // GlslQuintOp wrapper computes workgroup count via
+        // ceil(dispatchSize / 256). Pass batchSize * 256 to land on exactly
+        // batchSize workgroups.
+        if (batchSize <= 0 || rank <= 0) return;
+        if ((uint)rank > 256u)
+            throw new NotSupportedException(
+                $"Vulkan LoRA fused kernel currently caps rank at 256 (got {rank}). " +
+                "Increase MAX_RANK in VulkanIssue301FusedKernels.LoRAForward and " +
+                "redeploy the SPIR-V if higher ranks are required.");
+
         var pushConstants = new[]
         {
             (uint)batchSize,
@@ -28,7 +39,7 @@ public sealed unsafe partial class VulkanBackend
         GlslQuintOp(
             VulkanIssue301FusedKernels.LoRAForward,
             input, baseOutput, loraA, loraB, output,
-            batchSize * outputFeatures,
+            batchSize * VulkanKernels.WorkgroupSize,
             pushConstants,
             5 * sizeof(uint));
     }

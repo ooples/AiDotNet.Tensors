@@ -24,6 +24,16 @@ fn issue301_apply_activation(xIn : f32, activation : i32) -> f32 {
 }
 ";
 
+    // Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+    // design rationale. Total work: O(batch · rank · (in + out)) instead of
+    // O(batch · in · rank · out).
+    //
+    // Launch contract (set by the WebGPU dispatch wrapper):
+    //   workgroups.x   = batchSize
+    //   workgroup_size = (256, 1, 1)
+    //   workgroup memory = static MAX_RANK = 256 floats — covers practical
+    //                      LoRA rank values; rank > 256 is rejected by the
+    //                      dispatch path before the kernel is reached.
     public const string LoRAForward = @"
 @group(0) @binding(0) var<storage, read> input_ : array<f32>;
 @group(0) @binding(1) var<storage, read> baseOutput : array<f32>;
@@ -33,25 +43,47 @@ fn issue301_apply_activation(xIn : f32, activation : i32) -> f32 {
 struct P { batchSize : i32, inputFeatures : i32, rank : i32, outputFeatures : i32, scaling : f32, pad0 : f32, pad1 : f32, pad2 : f32 };
 @group(0) @binding(5) var<uniform> p : P;
 
+const MAX_RANK : u32 = 256u;
+var<workgroup> proj : array<f32, 256>;
+
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) id : vec3<u32>) {
-    let gid = i32(id.x);
-    let total = p.batchSize * p.outputFeatures;
-    if (gid >= total) { return; }
+fn main(
+    @builtin(workgroup_id) wg : vec3<u32>,
+    @builtin(local_invocation_id) tid : vec3<u32>
+) {
+    let b = i32(wg.x);
+    if (b >= p.batchSize) { return; }
 
-    let b = gid / p.outputFeatures;
-    let o = gid - b * p.outputFeatures;
-    var delta : f32 = 0.0;
+    let blockSize : u32 = 256u;
+    let inBase = b * p.inputFeatures;
 
-    for (var r : i32 = 0; r < p.rank; r = r + 1) {
-        var hidden : f32 = 0.0;
+    // Stage 1: cooperatively compute proj[r] = sum_i input[b,i] * loraA[i,r]
+    let effRank = min(u32(p.rank), MAX_RANK);
+    var r : u32 = tid.x;
+    loop {
+        if (r >= effRank) { break; }
+        var acc : f32 = 0.0;
         for (var i : i32 = 0; i < p.inputFeatures; i = i + 1) {
-            hidden = hidden + input_[b * p.inputFeatures + i] * loraA[i * p.rank + r];
+            acc = acc + input_[inBase + i] * loraA[i * p.rank + i32(r)];
         }
-        delta = delta + hidden * loraB[r * p.outputFeatures + o];
+        proj[r] = acc;
+        r = r + blockSize;
     }
 
-    output[gid] = baseOutput[gid] + p.scaling * delta;
+    workgroupBarrier();
+
+    // Stage 2: each thread emits one or more output columns, reusing proj.
+    let outBase = b * p.outputFeatures;
+    var o : u32 = tid.x;
+    loop {
+        if (i32(o) >= p.outputFeatures) { break; }
+        var delta : f32 = 0.0;
+        for (var rr : u32 = 0u; rr < effRank; rr = rr + 1u) {
+            delta = delta + proj[rr] * loraB[i32(rr) * p.outputFeatures + i32(o)];
+        }
+        output[outBase + i32(o)] = baseOutput[outBase + i32(o)] + p.scaling * delta;
+        o = o + blockSize;
+    }
 }
 ";
 

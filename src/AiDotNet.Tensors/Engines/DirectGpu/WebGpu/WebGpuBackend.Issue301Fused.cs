@@ -17,15 +17,25 @@ public sealed partial class WebGpuBackend
         int outputFeatures,
         float scaling)
     {
-        int total = batchSize * outputFeatures;
-        if (total <= 0) return;
+        if (batchSize <= 0 || rank <= 0 || outputFeatures <= 0) return;
+        if (rank > 256)
+            throw new System.NotSupportedException(
+                $"WebGPU LoRA fused kernel currently caps rank at 256 (got {rank}). " +
+                "Increase MAX_RANK in WebGpuIssue301FusedKernels.LoRAForward and the " +
+                "workgroup-private array size if higher ranks are required.");
+
+        // The two-stage WGSL kernel uses one workgroup per batch row with a
+        // workgroup_size of 256. Dispatch5BufferAsync's CalculateWorkgroups1D
+        // computes ceil(workSize / 256), so passing batchSize * 256 yields
+        // exactly batchSize workgroups.
+        int workSize = batchSize * 256;
         Dispatch5BufferAsync(
             "Issue301FusedLoRA",
             WebGpuIssue301FusedKernels.LoRAForward,
             "main",
             input, baseOutput, loraA, loraB, output,
             Issue301UniformLoRA(batchSize, inputFeatures, rank, outputFeatures, scaling),
-            total).GetAwaiter().GetResult();
+            workSize).GetAwaiter().GetResult();
     }
 
     public void FusedDDIMStep(

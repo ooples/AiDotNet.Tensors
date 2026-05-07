@@ -26,6 +26,16 @@ inline float issue301_activate(float x, int activation)
     }
 }
 
+// See CudaIssue301FusedKernels.cs for the full design rationale.
+// Two-stage shared-memory variant — O(batch · rank · (in + out)) instead of
+// the broken O(batch · in · rank · out) inner-recompute variant.
+//
+// Launch contract:
+//   global_size = batch_size * local_size
+//   local_size  = min(output_features, max work-group size)
+//   __local proj[rank] passed via clSetKernelArg(... NULL ...) for dynamic
+//   shared mem (in OpenCL: __local float* proj as a kernel arg, then
+//   clSetKernelArg(kernel, idx, rank * sizeof(float), NULL)).
 __kernel void issue301_fused_lora_forward(
     __global const float* input,
     __global const float* base_output,
@@ -36,23 +46,37 @@ __kernel void issue301_fused_lora_forward(
     int input_features,
     int rank,
     int output_features,
-    float scaling)
+    float scaling,
+    __local float* proj)
 {
-    int idx = get_global_id(0);
-    int total = batch_size * output_features;
-    if (idx >= total) return;
+    int b = get_group_id(0);
+    if (b >= batch_size) return;
 
-    int b = idx / output_features;
-    int j = idx - b * output_features;
-    float delta = 0.0f;
-    for (int r = 0; r < rank; r++)
+    int tid = get_local_id(0);
+    int block_size = get_local_size(0);
+
+    __global const float* in_row = input + b * input_features;
+
+    // Stage 1: cooperatively compute proj[r] = sum_i in_row[i] * lora_a[i, r].
+    for (int r = tid; r < rank; r += block_size)
     {
         float acc = 0.0f;
         for (int i = 0; i < input_features; i++)
-            acc += input[b * input_features + i] * lora_a[i * rank + r];
-        delta += acc * lora_b[r * output_features + j];
+            acc += in_row[i] * lora_a[i * rank + r];
+        proj[r] = acc;
     }
-    output[idx] = base_output[idx] + scaling * delta;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Stage 2: each thread emits one or more output columns, reusing proj.
+    int row_base = b * output_features;
+    for (int j = tid; j < output_features; j += block_size)
+    {
+        float delta = 0.0f;
+        for (int r = 0; r < rank; r++)
+            delta += proj[r] * lora_b[r * output_features + j];
+        output[row_base + j] = base_output[row_base + j] + scaling * delta;
+    }
 }
 
 __kernel void issue301_fused_ddim_step(

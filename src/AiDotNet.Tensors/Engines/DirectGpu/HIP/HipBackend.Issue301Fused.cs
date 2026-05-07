@@ -18,11 +18,18 @@ public sealed partial class HipBackend
     {
         if (!_kernelCache.TryGetValue("issue301_fused_lora_forward", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: issue301_fused_lora_forward");
+
+        // Two-stage kernel: one block per batch row, dynamic shared memory
+        // holds proj[rank]. See CudaIssue301FusedKernels.cs for the design.
+        uint blockX = (uint)System.Math.Min(System.Math.Max(outputFeatures, 1), (int)DefaultBlockSize);
+        uint grid = (uint)System.Math.Max(batchSize, 1);
+        uint sharedMemBytes = checked((uint)rank * sizeof(float));
+
         IntPtr pInput = input.Handle, pBase = baseOutput.Handle, pA = loraA.Handle, pB = loraB.Handle, pOut = output.Handle;
         void** args = stackalloc void*[10];
         args[0] = &pInput; args[1] = &pBase; args[2] = &pA; args[3] = &pB; args[4] = &pOut;
         args[5] = &batchSize; args[6] = &inputFeatures; args[7] = &rank; args[8] = &outputFeatures; args[9] = &scaling;
-        LaunchKernel(kernel, (uint)((batchSize * outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        LaunchKernelWithSharedMem(kernel, grid, blockX, sharedMemBytes, args);
         Synchronize();
     }
 

@@ -28,6 +28,23 @@ __device__ __forceinline__ float issue301_activate(float x, int activation)
     }
 }
 
+// Issue #301 fused LoRA forward: output = base_output + scaling · (input · A · B)
+//
+// Two-stage decomposition (the only way to hit the issue's ≥5× target vs the
+// decomposed path):
+//   Stage 1 (per row of input): proj[r] = Σ_i input[b,i] · A[i,r]   — O(in × rank)
+//   Stage 2 (per (row, col) of output): delta = Σ_r proj[r] · B[r,j]
+//                                      output[b,j] = base[b,j] + scaling · delta — O(rank)
+// Total per batch row: O(rank · (in + out))
+// Total work: O(batch · rank · (in + out))
+//
+// The decomposed-into-fused-loop variant (compute proj inside the (b,j) loop)
+// pays O(batch · in · rank · out) — out× more — and is strictly slower than
+// the unfused path it claims to replace.
+//
+// Launch contract:
+//   grid.x = batch_size,  block.x = min(output_features, max_threads_per_block)
+//   shared mem = rank * sizeof(float) bytes (dynamic)
 extern ""C"" __global__ void issue301_fused_lora_forward(
     const float* __restrict__ input,
     const float* __restrict__ base_output,
@@ -40,21 +57,38 @@ extern ""C"" __global__ void issue301_fused_lora_forward(
     int output_features,
     float scaling)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * output_features;
-    if (idx >= total) return;
+    extern __shared__ float proj[];   // [rank]
 
-    int b = idx / output_features;
-    int j = idx - b * output_features;
-    float delta = 0.0f;
-    for (int r = 0; r < rank; r++)
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    const float* in_row = input + b * input_features;
+
+    // Stage 1: cooperatively compute proj[r] for r in [0, rank).
+    // Strided over threads in the block. Each thread runs a full input_features
+    // dot product with column r of A.
+    for (int r = tid; r < rank; r += block_size)
     {
         float acc = 0.0f;
         for (int i = 0; i < input_features; i++)
-            acc += input[b * input_features + i] * lora_a[i * rank + r];
-        delta += acc * lora_b[r * output_features + j];
+            acc += in_row[i] * lora_a[i * rank + r];
+        proj[r] = acc;
     }
-    output[idx] = base_output[idx] + scaling * delta;
+
+    __syncthreads();
+
+    // Stage 2: each thread emits one or more output columns, reusing proj[].
+    int row_base = b * output_features;
+    for (int j = tid; j < output_features; j += block_size)
+    {
+        float delta = 0.0f;
+        for (int r = 0; r < rank; r++)
+            delta += proj[r] * lora_b[r * output_features + j];
+        output[row_base + j] = base_output[row_base + j] + scaling * delta;
+    }
 }
 
 extern ""C"" __global__ void issue301_fused_ddim_step(

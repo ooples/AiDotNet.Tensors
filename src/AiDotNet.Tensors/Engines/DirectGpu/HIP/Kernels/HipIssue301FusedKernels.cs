@@ -29,6 +29,14 @@ __device__ __forceinline__ float issue301_activate(float x, int activation)
     }
 }
 
+// See CudaIssue301FusedKernels.cs for the full design rationale. Two-stage
+// shared-memory variant: O(batch · rank · (in + out)) instead of the
+// O(batch · in · rank · out) decomposed-into-fused-loop variant the issue
+// criteria explicitly forbid.
+//
+// Launch contract:
+//   grid.x = batch_size,  block.x = min(output_features, max_threads_per_block)
+//   shared mem = rank * sizeof(float) bytes (dynamic)
 extern ""C"" __global__ void issue301_fused_lora_forward(
     const float* __restrict__ input,
     const float* __restrict__ base_output,
@@ -41,21 +49,34 @@ extern ""C"" __global__ void issue301_fused_lora_forward(
     int output_features,
     float scaling)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * output_features;
-    if (idx >= total) return;
+    extern __shared__ float proj[];
 
-    int b = idx / output_features;
-    int j = idx - b * output_features;
-    float delta = 0.0f;
-    for (int r = 0; r < rank; r++)
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    const float* in_row = input + b * input_features;
+
+    for (int r = tid; r < rank; r += block_size)
     {
         float acc = 0.0f;
         for (int i = 0; i < input_features; i++)
-            acc += input[b * input_features + i] * lora_a[i * rank + r];
-        delta += acc * lora_b[r * output_features + j];
+            acc += in_row[i] * lora_a[i * rank + r];
+        proj[r] = acc;
     }
-    output[idx] = base_output[idx] + scaling * delta;
+
+    __syncthreads();
+
+    int row_base = b * output_features;
+    for (int j = tid; j < output_features; j += block_size)
+    {
+        float delta = 0.0f;
+        for (int r = 0; r < rank; r++)
+            delta += proj[r] * lora_b[r * output_features + j];
+        output[row_base + j] = base_output[row_base + j] + scaling * delta;
+    }
 }
 
 extern ""C"" __global__ void issue301_fused_ddim_step(

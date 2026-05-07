@@ -35,6 +35,16 @@ static inline float issue301_apply_activation(float x, uint activation)
     return x;
 }
 
+// Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+// full design rationale. Total work: O(batch · rank · (in + out)) instead
+// of the broken O(batch · in · rank · out).
+//
+// Launch contract:
+//   threadgroups   = batchSize
+//   threads/group  = min(outputFeatures, MAX_RANK = 256) — capped to fit
+//                    threadgroup memory budget
+//   threadgroup memory = rank * sizeof(float) (passed dynamically via
+//                        setThreadgroupMemoryLength in dispatch)
 kernel void issue301_fused_lora_forward(
     device const float* input [[buffer(0)]],
     device const float* baseOutput [[buffer(1)]],
@@ -46,26 +56,35 @@ kernel void issue301_fused_lora_forward(
     constant uint& rank [[buffer(7)]],
     constant uint& outputFeatures [[buffer(8)]],
     constant float& scaling [[buffer(9)]],
-    uint gid [[thread_position_in_grid]])
+    threadgroup float* proj [[threadgroup(0)]],
+    uint b [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint blockSize [[threads_per_threadgroup]])
 {
-    uint total = batchSize * outputFeatures;
-    if (gid >= total) return;
+    if (b >= batchSize) return;
 
-    uint b = gid / outputFeatures;
-    uint o = gid - b * outputFeatures;
-    float delta = 0.0f;
+    device const float* in_row = input + b * inputFeatures;
 
-    for (uint r = 0; r < rank; ++r)
+    // Stage 1: cooperatively compute proj[r] for r in [0, rank).
+    for (uint r = tid; r < rank; r += blockSize)
     {
-        float hidden = 0.0f;
+        float acc = 0.0f;
         for (uint i = 0; i < inputFeatures; ++i)
-        {
-            hidden += input[b * inputFeatures + i] * loraA[i * rank + r];
-        }
-        delta += hidden * loraB[r * outputFeatures + o];
+            acc += in_row[i] * loraA[i * rank + r];
+        proj[r] = acc;
     }
 
-    output[gid] = baseOutput[gid] + scaling * delta;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: each thread emits one or more output columns, reusing proj.
+    uint row_base = b * outputFeatures;
+    for (uint o = tid; o < outputFeatures; o += blockSize)
+    {
+        float delta = 0.0f;
+        for (uint r = 0; r < rank; ++r)
+            delta += proj[r] * loraB[r * outputFeatures + o];
+        output[row_base + o] = baseOutput[row_base + o] + scaling * delta;
+    }
 }
 
 kernel void issue301_fused_ddim_step(

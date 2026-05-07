@@ -4,6 +4,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 internal static class VulkanIssue301FusedKernels
 {
+    // Two-stage fused LoRA forward. See CudaIssue301FusedKernels.cs for the
+    // design rationale. Total work: O(batch · rank · (in + out)) instead of
+    // the broken O(batch · in · rank · out).
+    //
+    // Launch contract:
+    //   gl_NumWorkGroups.x = batchSize
+    //   local_size_x       = 256 (covers the typical output_features range)
+    //   shared array size  = MAX_RANK = 256 (constant — covers practical LoRA
+    //                        rank values; reads guard against overrun at runtime).
     public const string LoRAForward = @"
 #version 450
 layout(local_size_x = 256) in;
@@ -23,27 +32,43 @@ layout(push_constant) uniform Params
     uint scalingBits;
 } p;
 
+const uint MAX_RANK = 256u;
+shared float proj[MAX_RANK];
+
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    uint total = p.batchSize * p.outputFeatures;
-    if (gid >= total) return;
+    uint b = gl_WorkGroupID.x;
+    if (b >= p.batchSize) return;
 
-    uint b = gid / p.outputFeatures;
-    uint o = gid - b * p.outputFeatures;
-    float delta = 0.0;
+    uint tid = gl_LocalInvocationID.x;
+    uint blockSize = gl_WorkGroupSize.x;
 
-    for (uint r = 0; r < p.rank; ++r)
+    uint inBase = b * p.inputFeatures;
+
+    // Stage 1: cooperatively compute proj[r] = sum_i input[b,i] * loraA[i,r]
+    // Each thread handles a strided subset of r values. Capped at MAX_RANK.
+    uint effRank = min(p.rank, MAX_RANK);
+    for (uint r = tid; r < effRank; r += blockSize)
     {
-        float hidden = 0.0;
-        for (uint i = 0; i < p.inputFeatures; ++i)
-        {
-            hidden += inputData[b * p.inputFeatures + i] * loraAData[i * p.rank + r];
-        }
-        delta += hidden * loraBData[r * p.outputFeatures + o];
+        float acc = 0.0;
+        for (uint i = 0u; i < p.inputFeatures; ++i)
+            acc += inputData[inBase + i] * loraAData[i * p.rank + r];
+        proj[r] = acc;
     }
 
-    outputData[gid] = baseOutputData[gid] + uintBitsToFloat(p.scalingBits) * delta;
+    barrier();
+    memoryBarrierShared();
+
+    // Stage 2: each thread emits one or more output elements, reusing proj.
+    uint outBase = b * p.outputFeatures;
+    float scaling = uintBitsToFloat(p.scalingBits);
+    for (uint o = tid; o < p.outputFeatures; o += blockSize)
+    {
+        float delta = 0.0;
+        for (uint r = 0u; r < effRank; ++r)
+            delta += proj[r] * loraBData[r * p.outputFeatures + o];
+        outputData[outBase + o] = baseOutputData[outBase + o] + scaling * delta;
+    }
 }
 ";
 
