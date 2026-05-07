@@ -190,12 +190,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // accumulation-order differences (6th decimal place on MatMul).
         // Graph-level optimization passes are NOT re-run — the saved plan
         // was already optimized before serialization.
+        //
+        // Carry the same mutable-B guard the freshly-compiled path uses
+        // (Compile() at line 1049). Without this, a saved/reloaded plan
+        // whose mutable input is `step.Inputs[1]` (i.e. the second matmul
+        // operand) silently regresses to stale-packed-B after SetInputs(),
+        // undoing the correctness fix this PR ships.
         var pinnedHandles = new List<GCHandle>();
         var specialized = new CompiledStep<T>[steps.Length];
         for (int i = 0; i < steps.Length; i++)
         {
             var step = steps[i];
-            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles);
+            bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensor);
+            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (spec != null)
             {
                 var output = step.OutputBuffer;
@@ -1123,11 +1130,39 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         if (requestedInputShape is not null)
         {
+            // When the caller pinned a specific input shape, it must
+            // resolve to EXACTLY ONE traced leaf. Silent fallbacks were:
+            //   - 0 matches → return steps[0].Inputs[0] (compiles a
+            //     constant as the input slot — silent wrong-result bug)
+            //   - 2+ matches → return the first match (graphs with
+            //     repeated shapes silently bind the wrong leaf)
+            // Fail closed in both cases so SetInputs(...) at run time can
+            // never flow into a compiled-as-constant slot.
+            Tensor<T>? matched = null;
+            int matchCount = 0;
             foreach (var leaf in EnumerateLeafInputs(steps))
             {
                 if (ShapesEqual(leaf._shape, requestedInputShape))
-                    return leaf;
+                {
+                    matched = leaf;
+                    matchCount++;
+                    if (matchCount > 1) break; // already enough to fail
+                }
             }
+            if (matchCount == 0)
+                throw new InvalidOperationException(
+                    $"Compile(explicitInputShape=[{string.Join(",", requestedInputShape)}]) " +
+                    "could not resolve any traced leaf with that shape. The forward " +
+                    "trace did not consume an input matching that shape — verify the " +
+                    "shape and that the input is actually read by the captured graph.");
+            if (matchCount > 1)
+                throw new InvalidOperationException(
+                    $"Compile(explicitInputShape=[{string.Join(",", requestedInputShape)}]) " +
+                    "is ambiguous — the forward trace contains multiple distinct leaves " +
+                    "with that shape. Pass the input tensor explicitly via " +
+                    "Compile(explicitInput, ...) so the compiler knows which leaf is " +
+                    "the mutable input slot.");
+            return matched;
         }
 
         return steps[0].Inputs.Length > 0 ? steps[0].Inputs[0] : null;
