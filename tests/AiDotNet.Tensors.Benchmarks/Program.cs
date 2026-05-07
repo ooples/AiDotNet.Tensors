@@ -269,6 +269,13 @@ class Program
             return;
         }
 
+        // Issue #308 acceptance harness: cross-position HRR sequence primitives.
+        if (args[0] == "--308-vsa")
+        {
+            BenchmarkRunner.Run<VsaIssue308Benchmarks>(BenchConfig);
+            return;
+        }
+
 #if NET8_0_OR_GREATER
         if (args[0] == "--305-init")
         {
@@ -499,6 +506,7 @@ class Program
         Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
         Console.WriteLine("  --296-diffusion     : 50-step denoising loop vs PyTorch nn.Sequential");
         Console.WriteLine("  --304-gemv          : Issue #304 [N,D]x[D,1] GEMV compiled-cache benchmark vs TorchSharp CPU");
+        Console.WriteLine("  --308-vsa           : Cross-position HRR ShiftSlots/HrrBindShifted benchmark");
 #if NET8_0_OR_GREATER
         Console.WriteLine("  --305-init          : First-forward weight-init peak benchmark vs old temp+copy and TorchSharp");
         Console.WriteLine("  --305-init-gpu      : GPU random initialization benchmark for Issue #305");

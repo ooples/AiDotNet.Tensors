@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// The MPS library provides hand-tuned implementations of common operations.
 /// </para>
 /// </remarks>
-public sealed partial class MetalBackend : IDirectGpuBackend
+public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels
 {
     private readonly MetalDevice _device;
     private readonly MetalCommandQueue _commandQueue;
@@ -63,6 +63,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
+    private IntPtr _fusedAdvancedLibrary;
 
     #region Properties
 
@@ -228,6 +229,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"Metal FusedLinear pre-compilation warning: {ex.Message}");
+        }
+
+        try
+        {
+            _fusedAdvancedLibrary = _shaderLibrary.CompileLibrary("FusedAdvancedKernels", MetalFusedAdvancedKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal fused-advanced pre-compilation warning: {ex.Message}");
+            _fusedAdvancedLibrary = IntPtr.Zero;
         }
 
         try
