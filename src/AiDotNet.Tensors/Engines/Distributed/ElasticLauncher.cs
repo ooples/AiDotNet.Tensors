@@ -437,7 +437,11 @@ public sealed class ElasticLauncher
             {
                 client = new TcpClient();
                 var connectTask = client.ConnectAsync(host, port);
-                if (!connectTask.Wait((int)Math.Min(2000, (deadline - DateTime.UtcNow).TotalMilliseconds)))
+                // Floor at 1ms so a deadline that elapses between the while-
+                // check and here doesn't pass a negative timeout to Wait()
+                // (which throws ArgumentOutOfRangeException for values < -1).
+                int connectWaitMs = (int)Math.Max(1, Math.Min(2000, (deadline - DateTime.UtcNow).TotalMilliseconds));
+                if (!connectTask.Wait(connectWaitMs))
                 {
                     // Connect timed out from our perspective. If the OS-level
                     // handshake races to completion right after we give up,
