@@ -50,6 +50,8 @@ internal sealed class CsrCacheKey : IEquatable<CsrCacheKey>
     public bool Equals(CsrCacheKey? other) =>
         other is not null && ReferenceEquals(_sparse, other._sparse) && ReferenceEquals(_backend, other._backend);
 
+    public bool MatchesSparse(object sparse) => ReferenceEquals(_sparse, sparse);
+
     public override bool Equals(object? obj) => Equals(obj as CsrCacheKey);
 
     public override int GetHashCode()
@@ -884,6 +886,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    private void RemoveActivationCacheEntry(object cacheKey)
+    {
+        ActivationCacheEntry? removed = null;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryRemove(cacheKey, out var entry))
+            {
+                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
+                    -(entry.Buffer.Size * sizeof(float)));
+                removed = entry;
+            }
+        }
+
+        removed?.Dispose();
+    }
+
+    private bool TryReplacePersistentBuffer<T>(T[] data, IGpuBuffer buffer)
+    {
+        lock (_persistentBufferLock)
+        {
+            if (!_persistentBufferCache.TryGetValue(data, out var existing))
+                return false;
+
+            var nextVersion = existing.Version + 1;
+            var replacement = new GpuBufferCacheEntry(buffer, existing.Role)
+            {
+                Version = nextVersion
+            };
+
+            if (_persistentBufferCache.TryRemove(data, out var removed))
+                removed.Dispose();
+
+            _persistentBufferCache[data] = replacement;
+            _tensorVersions[data] = nextVersion;
+            return true;
+        }
+    }
+
     /// <summary>
     /// Evicts the oldest half of the activation cache entries.
     /// Must be called while holding _activationCacheLock.
@@ -1127,6 +1167,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="elementCount">Number of elements that will be written.</param>
     private void DownloadGpuBufferInto<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, T[] destination, int elementCount)
     {
+        Helpers.DeferredArrayMaterializer.Remove(destination);
+        RemoveActivationCacheEntry(destination);
+
         var capturedBuffer = outputBuffer.Buffer;
         var capturedBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(destination, arr =>
@@ -1147,7 +1190,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
             Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
         });
-        CacheActivation(destination, outputBuffer.Buffer, new[] { elementCount }, backend);
+
+        if (!TryReplacePersistentBuffer(destination, outputBuffer.Buffer))
+            CacheActivation(destination, outputBuffer.Buffer, new[] { elementCount }, backend);
     }
 
     /// <summary>
@@ -1358,19 +1403,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferB = AllocateOutputBuffer(backend, input.Length);
         try
         {
-            // AutocastScope: convert to fp16 for compute, back to fp32 for output
-            var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
-            if (fp16Input is not null)
+            // AutocastScope: convert to fp16 for compute, back to fp32 for output.
+            // try/finally guarantees fp16Input is released even if op() or
+            // ConvertToFp32 throws.
+            IGpuBuffer? fp16Input = null;
+            try
             {
-                using var fp16Output = AllocateOutputBuffer(backend, input.Length);
-                op(backend, fp16Input, fp16Output.Buffer, input.Length);
-                // Convert output back to fp32
-                backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
-                fp16Input.Dispose();
+                fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
+                if (fp16Input is not null)
+                {
+                    using var fp16Output = AllocateOutputBuffer(backend, input.Length);
+                    op(backend, fp16Input, fp16Output.Buffer, input.Length);
+                    backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                }
             }
-            else
+            finally
             {
-                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                fp16Input?.Dispose();
             }
             return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
@@ -1453,17 +1506,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // to fp32 for the downloaded result. Without this the chunked
                 // fallback would silently change numeric / perf behaviour vs
                 // the normal GPU path.
-                var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
-                if (fp16Input is not null)
+                IGpuBuffer? fp16Input = null;
+                try
                 {
-                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                    op(backend, fp16Input, fp16Out.Buffer, len);
-                    backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
-                    fp16Input.Dispose();
+                    fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
+                    if (fp16Input is not null)
+                    {
+                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                        op(backend, fp16Input, fp16Out.Buffer, len);
+                        backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
+                    }
+                    else
+                    {
+                        op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+                    }
                 }
-                else
+                finally
                 {
-                    op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
+                    fp16Input?.Dispose();
                 }
                 var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
@@ -1526,21 +1586,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferC = AllocateOutputBuffer(backend, left.Length);
         try
         {
-            var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
-            var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
-            if (fp16A is not null && fp16B is not null)
+            // fp16A / fp16B are raw IGpuBuffer? (no IDisposable wrapper) so we
+            // must guarantee Dispose() runs even if op() or ConvertToFp32 throws.
+            // Previously these leaked on any exception inside the if-branch.
+            IGpuBuffer? fp16A = null;
+            IGpuBuffer? fp16B = null;
+            try
             {
-                using var fp16Out = AllocateOutputBuffer(backend, left.Length);
-                op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
-                backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
-                fp16A.Dispose();
-                fp16B.Dispose();
+                fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
+                fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
+                if (fp16A is not null && fp16B is not null)
+                {
+                    using var fp16Out = AllocateOutputBuffer(backend, left.Length);
+                    op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
+                    backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                }
             }
-            else
+            finally
             {
                 fp16A?.Dispose();
                 fp16B?.Dispose();
-                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
             }
             return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
@@ -1606,21 +1675,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
                 // chunked fallback doesn't silently change numeric/perf behaviour
                 // when autocast is enabled.
-                var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
-                var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
-                if (fp16A is not null && fp16B is not null)
+                IGpuBuffer? fp16A = null;
+                IGpuBuffer? fp16B = null;
+                try
                 {
-                    using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                    op(backend, fp16A, fp16B, fp16Out.Buffer, len);
-                    backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
-                    fp16A.Dispose();
-                    fp16B.Dispose();
+                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
+                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
+                    if (fp16A is not null && fp16B is not null)
+                    {
+                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
+                        op(backend, fp16A, fp16B, fp16Out.Buffer, len);
+                        backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
+                    }
+                    else
+                    {
+                        op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
+                    }
                 }
-                else
+                finally
                 {
                     fp16A?.Dispose();
                     fp16B?.Dispose();
-                    op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
                 }
                 var chunkResult = backend.DownloadBuffer(bC.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
@@ -1793,6 +1868,132 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
             return HandleBufferTooLarge<T>(ex, callerName);
+        }
+    }
+
+    private static bool TryGetSimpleCpuDestinationArray<T>(Tensor<T> destination, int elementCount, out T[] destinationArray)
+    {
+        destinationArray = null!;
+        if (destination.IsSparse || !destination.IsContiguous || destination.Length < elementCount)
+            return false;
+
+        destinationArray = destination.GetLiveBackingArrayOrNull()!;
+        return destinationArray is not null;
+    }
+
+    private OwnedBuffer GetOrAllocateContiguousInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
+    {
+        if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
+            return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+
+        if (!tensor.IsContiguous || tensor.IsSparse)
+            throw new InvalidOperationException("GPU destination-aware tensor ops require contiguous dense inputs.");
+        if (tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length)
+            throw new InvalidOperationException("GPU destination-aware tensor ops require simple CPU-backed inputs.");
+
+        return GetOrAllocateBuffer(backend, tensor);
+    }
+
+    private bool TryRunBinaryInto<T>(
+        Tensor<T> destination,
+        Tensor<T> left,
+        Tensor<T> right,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
+    {
+        if (left.Length != right.Length)
+            return false;
+        if (!TryGetSimpleCpuDestinationArray(destination, left.Length, out var destinationArray))
+            return false;
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        try
+        {
+            using var bufferA = GetOrAllocateContiguousInputBuffer(backend, left);
+            using var bufferB = GetOrAllocateContiguousInputBuffer(backend, right);
+            var output = AllocateOutputBuffer(backend, left.Length);
+            try
+            {
+                IGpuBuffer? fp16A = null;
+                IGpuBuffer? fp16B = null;
+                try
+                {
+                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
+                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
+                    if (fp16A is not null && fp16B is not null)
+                    {
+                        using var fp16Out = AllocateOutputBuffer(backend, left.Length);
+                        op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
+                        backend.ConvertToFp32(fp16Out.Buffer, output.Buffer, left.Length);
+                    }
+                    else
+                    {
+                        op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
+                    }
+                }
+                finally
+                {
+                    fp16A?.Dispose();
+                    fp16B?.Dispose();
+                }
+
+                DownloadGpuBufferInto(backend, output, destinationArray, left.Length);
+                return true;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+        {
+            HandleBufferTooLarge<T>(ex, callerName);
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryRunScalarInto<T>(
+        Tensor<T> destination,
+        Tensor<T> input,
+        T scalar,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
+    {
+        if (!TryGetSimpleCpuDestinationArray(destination, input.Length, out var destinationArray))
+            return false;
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        try
+        {
+            using var bufferA = GetOrAllocateContiguousInputBuffer(backend, input);
+            var output = AllocateOutputBuffer(backend, input.Length);
+            try
+            {
+                op(backend, bufferA.Buffer, output.Buffer, ToFloatScalar(scalar), input.Length);
+                DownloadGpuBufferInto(backend, output, destinationArray, input.Length);
+                return true;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+        {
+            HandleBufferTooLarge<T>(ex, callerName);
+            return false;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -2107,9 +2308,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
     {
-        // Use allocating GPU path and copy result
-        var result = ((IEngine)this).TensorAdd(a, b);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInto(dest, a, b,
+            static (backend, left, right, output, size) => backend.Add(left, right, output, size)))
+            return;
+        base.TensorAddInto(dest, a, b);
     }
 
     void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
@@ -2122,8 +2324,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
     {
-        var result = ((IEngine)this).TensorMultiply(a, b);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInto(dest, a, b,
+            static (backend, left, right, output, size) => backend.Multiply(left, right, output, size)))
+            return;
+        base.TensorMultiplyInto(dest, a, b);
     }
 
     void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
@@ -2137,10 +2341,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
     {
-        if (!dest.IsContiguous) { base.TensorSubtractInto(dest, a, b); return; }
-        // Compute on GPU then copy directly into dest's backing storage
-        var result = ((IEngine)this).TensorSubtract(a, b);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInto(dest, a, b,
+            static (backend, left, right, output, size) => backend.Subtract(left, right, output, size)))
+            return;
+        base.TensorSubtractInto(dest, a, b);
     }
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
@@ -2155,16 +2359,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> dest, Tensor<T> a, T scalar)
     {
-        if (!dest.IsContiguous) { base.TensorMultiplyScalarInto(dest, a, scalar); return; }
-        // Compute on GPU, copy result directly into dest's contiguous span
-        var scalarF = ToFloatScalar(scalar);
-        var result = TryRunScalar(a.GetDataArray(), scalar,
-            static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
-        if (result != null)
-        {
-            result.AsSpan(0, Math.Min(result.Length, dest.Length)).CopyTo(dest.Data.Span);
+        if (TryRunScalarInto(dest, a, scalar,
+            static (backend, input, output, value, size) => backend.Scale(input, output, value, size)))
             return;
-        }
         base.TensorMultiplyScalarInto(dest, a, scalar);
     }
 
@@ -6398,6 +6595,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new void RegisterPersistentTensor<T>(Tensor<T> tensor, PersistentTensorRole role)
     {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.IsSparse)
+            return;
+
         base.RegisterPersistentTensor(tensor, role);
 
         if (!TryGetBackend(out var backend))
@@ -6432,15 +6633,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.IsSparse)
+        {
+            RemoveCsrBufferCacheForSparse(tensor);
+            return;
+        }
+
         base.UnregisterPersistentTensor(tensor);
 
         object key = tensor.GetDataArray();
 
-        if (_persistentBufferCache.TryRemove(key, out var entry))
+        lock (_persistentBufferLock)
         {
-            entry.Dispose();
+            if (_persistentBufferCache.TryRemove(key, out var entry))
+            {
+                entry.Dispose();
+            }
+            _tensorVersions.TryRemove(key, out _);
         }
-        _tensorVersions.TryRemove(key, out _);
     }
 
     /// <summary>
@@ -6449,6 +6660,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public new void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (tensor.IsSparse)
+        {
+            RemoveCsrBufferCacheForSparse(tensor);
+            return;
+        }
+
         base.InvalidatePersistentTensor(tensor);
 
         if (!TryGetBackend(out var backend))
@@ -6495,6 +6713,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return entry.Buffer;
         }
         return null;
+    }
+
+    private void RemoveCsrBufferCacheForSparse(object sparse)
+    {
+        foreach (var pair in _csrBufferCache.ToArray())
+        {
+            if (!pair.Key.MatchesSparse(sparse))
+                continue;
+
+            if (_csrBufferCache.TryRemove(pair.Key, out var entry))
+                entry.Dispose();
+        }
     }
 
     /// <summary>
@@ -14681,8 +14911,64 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRandomUniform<T>(shape);
     }
 
+    Tensor<T> IEngine.TensorRandomUniformRange<T>(int[] shape, T min, T max, int? seed)
+    {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        if (TryGetBackend(out var b))
+        {
+            try
+            {
+                int total = 1;
+                foreach (var d in shape) total *= d;
+                var go = b.AllocateBuffer(total);
+                ulong gpuSeed = seed.HasValue
+                    ? (ulong)(uint)seed.Value
+                    : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
+                b.GenerateRandomUniform(go, total, ToFloatScalar(min), ToFloatScalar(max), gpuSeed);
+                return DeferTensorResult<T>(b, go, total, shape);
+            }
+            catch { }
+        }
+        return base.TensorRandomUniformRange(shape, min, max, seed);
+    }
+
+    void IEngine.TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (TryGetBackend(out var b) &&
+            TryGetSimpleCpuDestinationArray(destination, destination.Length, out var destinationArray))
+        {
+            try
+            {
+                var go = AllocateOutputBuffer(b, destination.Length);
+                try
+                {
+                    ulong gpuSeed = seed.HasValue
+                        ? (ulong)(uint)seed.Value
+                        : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
+                    b.GenerateRandomUniform(go.Buffer, destination.Length, ToFloatScalar(min), ToFloatScalar(max), gpuSeed);
+                    DownloadGpuBufferInto(b, go, destinationArray, destination.Length);
+                    return;
+                }
+                catch
+                {
+                    go.Dispose();
+                    throw;
+                }
+            }
+            catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+            {
+                HandleBufferTooLarge<T>(ex, nameof(IEngine.TensorRandomUniformRangeInto));
+            }
+            catch { }
+        }
+
+        base.TensorRandomUniformRangeInto(destination, min, max, seed);
+    }
+
     Tensor<T> IEngine.TensorRandomNormal<T>(int[] shape, T mean, T stddev)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         if (TryGetBackend(out var b))
         {
             try
@@ -14696,6 +14982,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch { }
         }
         return base.TensorRandomNormal(shape, mean, stddev);
+    }
+
+    void IEngine.TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (TryGetBackend(out var b) &&
+            TryGetSimpleCpuDestinationArray(destination, destination.Length, out var destinationArray))
+        {
+            try
+            {
+                var go = AllocateOutputBuffer(b, destination.Length);
+                try
+                {
+                    b.GenerateRandomNormal(
+                        go.Buffer,
+                        destination.Length,
+                        ToFloatScalar(mean),
+                        ToFloatScalar(stddev),
+                        (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
+                    DownloadGpuBufferInto(b, go, destinationArray, destination.Length);
+                    return;
+                }
+                catch
+                {
+                    go.Dispose();
+                    throw;
+                }
+            }
+            catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
+            {
+                HandleBufferTooLarge<T>(ex, nameof(IEngine.TensorRandomNormalInto));
+            }
+            catch { }
+        }
+
+        base.TensorRandomNormalInto(destination, mean, stddev);
     }
 
     Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)

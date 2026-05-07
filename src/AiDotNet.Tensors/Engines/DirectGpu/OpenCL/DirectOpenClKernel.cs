@@ -77,6 +77,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        public void SetArg(uint index, ulong value)
+        {
+            IntPtr ptr = Marshal.AllocHGlobal(sizeof(ulong));
+            try
+            {
+                Marshal.WriteInt64(ptr, unchecked((long)value));
+                int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)sizeof(ulong), ptr);
+                if (err != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"Failed to set kernel arg {index}: {err}");
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ptr);
+            }
+        }
+
         /// <summary>
         /// Sets a local memory argument (for shared memory allocation).
         /// </summary>
