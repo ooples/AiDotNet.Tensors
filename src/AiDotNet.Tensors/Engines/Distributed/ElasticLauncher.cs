@@ -347,15 +347,46 @@ public sealed class ElasticLauncher
                     $"Saw {nonces.Count} of {_options.WorldSize} workers.");
             // Wait up to 250ms for the next connection so we can re-check the deadline.
             if (!WaitForConnection(listener, TimeSpan.FromMilliseconds(250))) continue;
-            var client = listener.AcceptTcpClient();
-            client.NoDelay = true;
-            var stream = client.GetStream();
-            string nonce = ReadLine(stream);
-            nonces.Add(nonce);
-            // Hold this client open until we've collected all nonces, then
-            // reply. The stream + client are explicitly disposed in the
-            // reply loop below — DO NOT use a `using` here.
-            clientReplies.Add(new TcpReply(client, stream, nonce));
+
+            // A connection arriving on the listener is NOT necessarily a real
+            // worker. Causes of stray connections we must tolerate:
+            //   - A client whose ConnectAsync.Wait deemed itself timed-out and
+            //     disposed the socket, while the OS-level handshake had
+            //     already completed — the coordinator sees connect+RST.
+            //   - Slow CI runners where a client retries after a transient
+            //     SocketException, leaving an orphan half-opened socket.
+            //   - Port scanners / health checks on shared CI loopback.
+            // A bad connection MUST NOT crash the whole rendezvous — it kills
+            // every other worker that was waiting at the barrier. Catch the
+            // I/O failure, dispose the bad client, and keep waiting. We give
+            // each accept a bounded read window via stream.ReadTimeout so a
+            // peer that connects then never writes can't stall the coordinator
+            // past the rendezvous deadline.
+            TcpClient? client = null;
+            NetworkStream? stream = null;
+            try
+            {
+                client = listener.AcceptTcpClient();
+                client.NoDelay = true;
+                stream = client.GetStream();
+                int remainingMs = (int)Math.Max(1000, (deadline - DateTime.UtcNow).TotalMilliseconds);
+                stream.ReadTimeout = remainingMs;
+                string nonce = ReadLine(stream);
+                nonces.Add(nonce);
+                // Hold this client open until we've collected all nonces, then
+                // reply. The stream + client are explicitly disposed in the
+                // reply loop below — DO NOT use a `using` here.
+                clientReplies.Add(new TcpReply(client, stream, nonce));
+                client = null; stream = null; // ownership transferred
+            }
+            catch (Exception ex) when (ex is IOException || ex is System.Net.Sockets.SocketException)
+            {
+                // Stray / aborted connection — log and resume the accept loop.
+                System.Diagnostics.Debug.WriteLine(
+                    $"[TcpCoordinator] dropping stray connection: {ex.GetType().Name}: {ex.Message}");
+                stream?.Dispose();
+                client?.Dispose();
+            }
         }
 
         // Sort + assign ranks.
@@ -392,17 +423,34 @@ public sealed class ElasticLauncher
         Exception? lastError = null;
         while (DateTime.UtcNow < deadline)
         {
+            // Don't use `using` here: when ConnectAsync.Wait deems itself
+            // timed-out, the OS-level handshake may have actually completed
+            // during the wait. A `using` Dispose on a half-connected client
+            // sends a stray FIN/RST to the coordinator that gets accepted as
+            // an orphan connection. Track ownership manually and force the
+            // socket closed *before* we drop the reference, so the
+            // coordinator's accept loop sees a hard close instead of a
+            // half-open handshake it has to read from.
+            TcpClient? client = null;
+            NetworkStream? stream = null;
             try
             {
-                using var client = new TcpClient();
+                client = new TcpClient();
                 var connectTask = client.ConnectAsync(host, port);
                 if (!connectTask.Wait((int)Math.Min(2000, (deadline - DateTime.UtcNow).TotalMilliseconds)))
                 {
+                    // Connect timed out from our perspective. If the OS-level
+                    // handshake races to completion right after we give up,
+                    // forcibly close instead of letting a half-connected
+                    // socket reach the coordinator's accept queue.
+                    try { client.Client?.Close(0); } catch { /* best-effort */ }
+                    client.Dispose();
+                    client = null;
                     Thread.Sleep(50);
                     continue;
                 }
                 client.NoDelay = true;
-                using var stream = client.GetStream();
+                stream = client.GetStream();
                 stream.ReadTimeout = (int)Math.Max(1000, (deadline - DateTime.UtcNow).TotalMilliseconds);
                 WriteLine(stream, workerNonce);
                 string reply = ReadLine(stream);
@@ -424,6 +472,16 @@ public sealed class ElasticLauncher
             }
             catch (SocketException ex) { lastError = ex; Thread.Sleep(50); }
             catch (IOException ex) { lastError = ex; Thread.Sleep(50); }
+            finally
+            {
+                // Always release the per-iteration socket — runs on the
+                // success-return path too (finally runs before the return
+                // value reaches the caller). The continue-on-timeout branch
+                // sets client to null after manual close, so this is a no-op
+                // there.
+                stream?.Dispose();
+                client?.Dispose();
+            }
         }
         throw new TimeoutException(
             $"TCP rendezvous client could not reach coordinator at {host}:{port} within " +
