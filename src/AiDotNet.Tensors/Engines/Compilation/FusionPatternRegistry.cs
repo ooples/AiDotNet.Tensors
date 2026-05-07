@@ -76,16 +76,20 @@ internal static class FusionPatternRegistry
     /// <summary>Removes a pattern by name. Returns false if no such pattern was registered.</summary>
     public static bool Unregister(string name)
     {
-        if (!_patterns.TryRemove(name, out _)) return false;
+        // Take the lock BEFORE the dictionary remove so we can't race with
+        // a concurrent Register(name) — that race would otherwise leave
+        // _patterns containing a new instance while _ordered drops it,
+        // silently disabling the pattern in the fusion pass.
         lock (_orderLock)
         {
+            if (!_patterns.TryRemove(name, out _)) return false;
             var prev = _ordered;
             var next = new List<IFusionPattern>(prev.Count);
             foreach (var p in prev)
                 if (p.Name != name) next.Add(p);
             _ordered = next;
+            return true;
         }
-        return true;
     }
 
     /// <summary>Snapshot of the currently registered patterns, in priority order.</summary>

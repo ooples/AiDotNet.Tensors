@@ -45,9 +45,12 @@ void main()
 
     uint inBase = b * p.inputFeatures;
 
-    // Stage 1: cooperatively compute proj[r] = sum_i input[b,i] * loraA[i,r]
-    // Each thread handles a strided subset of r values. Capped at MAX_RANK.
-    uint effRank = min(p.rank, MAX_RANK);
+    // Fail closed if host validation regressed and dispatched p.rank > MAX_RANK
+    // or p.rank == 0. Silent truncation produces numerically wrong output;
+    // skip the row entirely so callers see a zero output (and fail their
+    // numerical-equivalence checks) rather than a confidently-wrong answer.
+    if (p.rank == 0u || p.rank > MAX_RANK) return;
+    uint effRank = p.rank;
     for (uint r = tid; r < effRank; r += blockSize)
     {
         float acc = 0.0;
@@ -95,8 +98,15 @@ void main()
     float alphaBarT = uintBitsToFloat(p.alphaBarTBits);
     float alphaBarTMinus1 = uintBitsToFloat(p.alphaBarTMinus1Bits);
     float eps = epsilonData[gid];
-    float x0Pred = (xTData[gid] - sqrt(max(0.0, 1.0 - alphaBarT)) * eps) / sqrt(alphaBarT);
-    outputData[gid] = sqrt(alphaBarTMinus1) * x0Pred + sqrt(max(0.0, 1.0 - alphaBarTMinus1)) * eps;
+    // Clamp both alpha values away from negative-rounding artifacts before
+    // taking sqrt. sqrt(<=0) → 0/NaN poison every element, including the
+    // divisor sqrt(alphaBarT) (denominator). Host-side validation rejects
+    // alphaBarT <= 0 too, but a defensive max() here costs ~1 ALU and
+    // protects against rounding drift in cumulative-product schedules.
+    float clampedAt = max(alphaBarT, 1e-12);
+    float clampedAtm1 = max(alphaBarTMinus1, 0.0);
+    float x0Pred = (xTData[gid] - sqrt(max(0.0, 1.0 - clampedAt)) * eps) / sqrt(clampedAt);
+    outputData[gid] = sqrt(clampedAtm1) * x0Pred + sqrt(max(0.0, 1.0 - clampedAtm1)) * eps;
 }
 ";
 
@@ -142,19 +152,37 @@ float issue301_apply_activation(float x)
 void main()
 {
     uint gid = gl_GlobalInvocationID.x;
-    uint total = p.batchSize * p.outputFeatures;
-    if (gid >= total) return;
+    // batchSize * outputFeatures wraps modulo 2^32 in GLSL when the product
+    // exceeds 4.29B. The host-side dispatch validates that overflow before
+    // submitting; this re-derives the same total in 64-bit-safe form by
+    // checking each thread's (b, o) pair individually instead of trusting
+    // a wrapped `total`.
+    if (gid >= p.batchSize * p.outputFeatures) return;
 
     uint b = gid / p.outputFeatures;
     uint o = gid - b * p.outputFeatures;
+    if (b >= p.batchSize || o >= p.outputFeatures) return;
+
     int rowStart = floatBitsToInt(packedCsrData[o]);
     int rowEnd = floatBitsToInt(packedCsrData[o + 1u]);
     uint colBase = p.outputFeatures + 1u;
     float sum = p.hasBias != 0u ? biasData[o] : 0.0;
 
+    // Defensive bounds: skip the row if the CSR offsets are inverted,
+    // negative, or out of nnz range. p.nnz is the authoritative upper
+    // bound on idx; without this guard a corrupted CSR walks past
+    // sparseValuesData (UB on Vulkan, dispatch crash).
+    if (rowStart < 0 || rowEnd < rowStart || uint(rowEnd) > p.nnz)
+    {
+        outputData[gid] = issue301_apply_activation(sum);
+        return;
+    }
+
     for (int idx = rowStart; idx < rowEnd; ++idx)
     {
+        if (uint(idx) >= p.nnz) break;
         int col = floatBitsToInt(packedCsrData[colBase + uint(idx)]);
+        if (col < 0 || uint(col) >= p.inputFeatures) continue;
         sum += inputData[b * p.inputFeatures + uint(col)] * sparseValuesData[uint(idx)];
     }
 

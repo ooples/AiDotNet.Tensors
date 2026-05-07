@@ -113,10 +113,15 @@ public class FusedIssue301Benchmarks
     [Benchmark(Description = "TorchSharp/PyTorch: LoRA forward")]
     public TorchTensor PyTorch_LoRA()
     {
+        // TorchSharp tensors hold native C++ refs; without an explicit
+        // dispose scope each call leaks hidden / delta / scaled and
+        // distorts MemoryDiagnoser + throughput measurements.
+        using var scope = torch.NewDisposeScope();
         var hidden = torch.matmul(_torchInput, _torchLoraA);
         var delta = torch.matmul(hidden, _torchLoraB);
         var scaled = delta * LoRAScaling;
-        return _torchBaseOutput + scaled;
+        var result = _torchBaseOutput + scaled;
+        return result.MoveToOuterDisposeScope();
     }
 
     [Benchmark(Description = "AiDotNet Decomposed: DDIM step")]
@@ -144,8 +149,10 @@ public class FusedIssue301Benchmarks
     {
         const float alphaBarT = 0.64f;
         const float alphaBarTMinus1 = 0.81f;
+        using var scope = torch.NewDisposeScope();
         var x0Pred = (_torchXT - MathF.Sqrt(1f - alphaBarT) * _torchEpsilon) / MathF.Sqrt(alphaBarT);
-        return MathF.Sqrt(alphaBarTMinus1) * x0Pred + MathF.Sqrt(1f - alphaBarTMinus1) * _torchEpsilon;
+        var result = MathF.Sqrt(alphaBarTMinus1) * x0Pred + MathF.Sqrt(1f - alphaBarTMinus1) * _torchEpsilon;
+        return result.MoveToOuterDisposeScope();
     }
 
     [Benchmark(Description = "AiDotNet Decomposed: sparse linear as dense matmul+bias+ReLU")]
@@ -173,8 +180,10 @@ public class FusedIssue301Benchmarks
     [Benchmark(Description = "TorchSharp/PyTorch: dense sparse-linear equivalent")]
     public TorchTensor PyTorch_SparseLinear_Dense()
     {
+        using var scope = torch.NewDisposeScope();
         var linear = torch.matmul(_torchSparseInput, _torchSparseDenseWeight);
-        return torch.nn.functional.relu(linear + _torchSparseBias);
+        var result = torch.nn.functional.relu(linear + _torchSparseBias);
+        return result.MoveToOuterDisposeScope();
     }
 
     private void BuildSparseLinearInputs()

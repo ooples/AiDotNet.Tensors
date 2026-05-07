@@ -391,6 +391,17 @@ public static class CpuVsaOperations
             throw new ArgumentException(
                 $"alphasOut length {alphasOut.Shape[0]} must equal store rows {n}.", nameof(alphasOut));
 
+        // Score-sweep + tiled softmax indexes the backing arrays as flat
+        // [i * d + k] — that's only correct for contiguous, zero-offset
+        // storage. A sliced or transposed input would silently read wrong
+        // elements. Force the caller to materialise contiguous tensors.
+        if (!store.IsContiguous)
+            throw new ArgumentException("store must be contiguous (call .Contiguous() first).", nameof(store));
+        if (!query.IsContiguous)
+            throw new ArgumentException("query must be contiguous (call .Contiguous() first).", nameof(query));
+        if (!alphasOut.IsContiguous)
+            throw new ArgumentException("alphasOut must be contiguous (Hopfield writes flat).", nameof(alphasOut));
+
         if (n == 0) return;
 
         var storeArr = store.GetDataArray() as float[]
@@ -559,6 +570,17 @@ public static class CpuVsaOperations
         if (outR.Shape[0] != B || outR.Shape[1] != N)
             throw new ArgumentException(
                 $"output shape [{outR.Shape[0]}, {outR.Shape[1]}] must equal [{B}, {N}].", nameof(outR));
+
+        // Per-row FFT indexing assumes contiguous, zero-offset storage —
+        // a slice or transposed view would feed the wrong layout into the
+        // FFT and produce numerically wrong output.
+        if (!x.IsContiguous)
+            throw new ArgumentException("first operand must be contiguous.", nameof(x));
+        if (!y.IsContiguous)
+            throw new ArgumentException("second operand must be contiguous.", nameof(y));
+        if (!outR.IsContiguous)
+            throw new ArgumentException("output must be contiguous.", nameof(outR));
+
         if (N == 0 || B == 0) return;
 
         var xArr = x.GetDataArray() as float[]

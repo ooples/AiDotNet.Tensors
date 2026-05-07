@@ -577,6 +577,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             staged.Add(new KeyValuePair<string, DirectOpenClKernel>(
                                 name, new DirectOpenClKernel(_context, issue301Program, name)));
                         }
+                        catch (OutOfMemoryException)
+                        {
+                            // Fatal — never silently downgrade to "capability unavailable".
+                            throw;
+                        }
                         catch (Exception kex)
                         {
                             WriteDiag($"[OpenClBackend] Issue #301 kernel '{name}' failed to materialise: {kex.Message}");
@@ -595,6 +600,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         foreach (var kv in staged) kv.Value.Dispose();
                         issue301Program.Dispose();
                     }
+                }
+                catch (OutOfMemoryException)
+                {
+                    // OOM during program compile is fatal; suppressing it would
+                    // mask a process-level resource problem as a benign capability gap.
+                    throw;
                 }
                 catch (Exception ex)
                 {

@@ -127,11 +127,11 @@ kernel void issue301_fused_sparse_linear(
     uint colBase = outputFeatures + 1u;
     float sum = hasBias != 0u ? bias[o] : 0.0f;
 
-    // Defensive bounds: skip the row if the CSR offsets are inverted or
-    // negative. Without this a corrupted (or untrusted) CSR walks past
-    // packedCsr / sparseValues / input and produces UB / a dispatch crash.
-    // The CUDA variant has the same guard.
-    if (rowStart < 0 || rowEnd < rowStart)
+    // Defensive bounds: skip the row if the CSR offsets are inverted,
+    // negative, or out of nnz range. Without this a corrupted (or
+    // untrusted) CSR walks past packedCsr / sparseValues / input and
+    // produces UB / a dispatch crash. Matches the CUDA variant.
+    if (rowStart < 0 || rowEnd < rowStart || uint(rowEnd) > nnz)
     {
         output[gid] = issue301_apply_activation(sum, activation);
         return;
@@ -139,9 +139,10 @@ kernel void issue301_fused_sparse_linear(
 
     for (int idx = rowStart; idx < rowEnd; ++idx)
     {
-        // Per-element bounds: each col MUST land inside the input feature
-        // axis; each idx MUST land inside sparseValues. Skip malformed
-        // entries instead of reading past the buffer.
+        // Per-element bounds: each idx MUST land inside sparseValues
+        // [0, nnz) and each col MUST land inside the input feature axis.
+        // Skip malformed entries instead of reading past the buffer.
+        if (uint(idx) >= nnz) break;
         int col = as_type<int>(packedCsr[colBase + uint(idx)]);
         if (col < 0 || uint(col) >= inputFeatures) continue;
         sum += input[b * inputFeatures + uint(col)] * sparseValues[uint(idx)];

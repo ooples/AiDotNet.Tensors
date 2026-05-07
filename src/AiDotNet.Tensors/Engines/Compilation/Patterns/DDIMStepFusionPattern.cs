@@ -78,6 +78,14 @@ internal sealed class DDIMStepFusionPattern : IFusionPattern
         if (add is null || !PatternHelpers.SameShape(add.Output, xT))
             return false;
 
+        // Squaring erases sign — a malformed graph with negative scalars on
+        // the divide/scale path would still satisfy IsValidSchedule below,
+        // and the fused kernel would silently execute the positive-root
+        // DDIM step instead of the original negated one. Reject up front.
+        if (sqrtAt < 0f || sqrtAtMinus1 < 0f
+            || sqrtOneMinusAt < 0f || sqrtOneMinusAtMinus1 < 0f)
+            return false;
+
         float alphaBarT = sqrtAt * sqrtAt;
         float alphaBarTMinus1 = sqrtAtMinus1 * sqrtAtMinus1;
         if (!IsValidSchedule(alphaBarT, alphaBarTMinus1, sqrtOneMinusAt, sqrtOneMinusAtMinus1))

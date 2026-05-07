@@ -57,8 +57,11 @@ fn main(
     let blockSize : u32 = 256u;
     let inBase = b * p.inputFeatures;
 
-    // Stage 1: cooperatively compute proj[r] = sum_i input[b,i] * loraA[i,r]
-    let effRank = min(u32(p.rank), MAX_RANK);
+    // Fail closed if host validation regressed: rank must be in (0, MAX_RANK].
+    // The signed-stride term `i * p.rank` below makes a non-positive rank
+    // produce wrong indices, so refuse to run rather than silently corrupting.
+    if (p.rank <= 0 || u32(p.rank) > MAX_RANK) { return; }
+    let effRank = u32(p.rank);
     var r : u32 = tid.x;
     loop {
         if (r >= effRank) { break; }

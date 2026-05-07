@@ -49,6 +49,16 @@ public sealed partial class CudaBackend
     {
         if (!_kernelCache.TryGetValue("issue301_fused_ddim_step", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: issue301_fused_ddim_step.");
+        // Reject zero-size dispatches (CUDA rejects 0-block grid) and the
+        // alpha schedule values that would NaN-poison the output via
+        // 1/sqrt(0) in the kernel.
+        if (size <= 0) return;
+        if (!(alphaBarT > 0f && alphaBarT <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarT),
+                $"alphaBarT must be in (0, 1]; got {alphaBarT}.");
+        if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarTMinus1),
+                $"alphaBarTMinus1 must be in [0, 1]; got {alphaBarTMinus1}.");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pX = xT.Handle, pE = epsilonTheta.Handle, pOut = output.Handle;
@@ -74,8 +84,19 @@ public sealed partial class CudaBackend
     {
         if (!_kernelCache.TryGetValue("issue301_fused_sparse_linear", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: issue301_fused_sparse_linear.");
+
+        // batchSize * outputFeatures wraps silently to a corrupt grid count
+        // when the int product exceeds int.MaxValue. Promote to long, validate.
+        if (batchSize <= 0 || outputFeatures <= 0) return;
+        long totalLong = (long)batchSize * outputFeatures;
+        if (totalLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batchSize),
+                $"batchSize ({batchSize}) * outputFeatures ({outputFeatures}) = {totalLong} " +
+                "exceeds int.MaxValue; split the dispatch into chunks.");
+        int total = (int)totalLong;
+
         using var _ = PushContext();
-        uint grid = (uint)((batchSize * outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pInput = input.Handle, pCsr = packedCsr.Handle, pValues = sparseValues.Handle, pBias = bias.Handle, pOut = output.Handle;
         void** args = stackalloc void*[11];
         args[0] = &pInput; args[1] = &pCsr; args[2] = &pValues; args[3] = &pBias; args[4] = &pOut;

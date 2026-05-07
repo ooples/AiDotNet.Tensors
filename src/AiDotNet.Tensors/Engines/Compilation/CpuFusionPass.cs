@@ -12,13 +12,20 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// <see cref="IFusionPattern"/> instances; adding a new fusion pattern
 /// is a new <see cref="IFusionPattern"/> implementation registered with
 /// <see cref="FusionPatternRegistry"/>, with no modification to this
-/// pass. The built-in patterns registered out of the box cover:</para>
+/// pass.</para>
+///
+/// <para>Patterns registered out of the box (see
+/// <see cref="FusionPatternRegistry"/> static constructor):</para>
 /// <list type="bullet">
-///   <item>MatMul + BiasAdd (+ optional activation) → FusedLinear[ReLU/GELU/Sigmoid]</item>
-///   <item>MatMul + MatMul + MultiplyScalar + Add → FusedLoRA  (issue #301)</item>
-///   <item>SparseLinear pattern via dense-mask sentinel → FusedSparseLinear (issue #301)</item>
-///   <item>DDIM sampler-update chain → FusedDDIMStep  (issue #301)</item>
+///   <item><c>LinearFusionPattern</c> — MatMul + BiasAdd (+ optional activation) → FusedLinear[ReLU/GELU/Sigmoid]</item>
+///   <item><c>LoRAFusionPattern</c> (issue #301) — MatMul + MatMul + MultiplyScalar + Add → FusedLoRA. Activates only when the chain matches LoRA's exact 4-node shape with single-consumer fan-out at each intermediate.</item>
+///   <item><c>SparseLinearFusionPattern</c> (issue #301) — registered for the dense-mask CSR pattern; activates when the upstream graph emits the sentinel sparse layout.</item>
+///   <item><c>DDIMStepFusionPattern</c> (issue #301) — registered for the DDIM sampler-update chain; activates when the (noiseScale, subtract, divide, x0Scale, …) sequence is detected.</item>
 /// </list>
+///
+/// <para>A registered pattern's <c>TryFuse</c> may legitimately return <c>false</c>
+/// for any input that does not match its specific shape; emission depends on
+/// the runtime graph structure, not on whether the pattern is registered.</para>
 /// </summary>
 internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
 {

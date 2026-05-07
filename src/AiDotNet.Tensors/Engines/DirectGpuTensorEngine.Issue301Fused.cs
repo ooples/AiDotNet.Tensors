@@ -89,9 +89,20 @@ public partial class DirectGpuTensorEngine
     {
         if (output is null) throw new ArgumentNullException(nameof(output));
         ValidateDDIM(xT, epsilonTheta, alphaBarT, alphaBarTMinus1);
-        if (output.Length != xT.Length)
+        // Shape-preserving op: output's shape must exactly match xT, not just
+        // its element count. Length-only equality lets callers feed in a
+        // wrong-rank/wrong-shape destination whose metadata becomes invalid.
+        if (output.Rank != xT.Rank)
             throw new ArgumentException(
-                $"output length ({output.Length}) must equal xT length ({xT.Length}).", nameof(output));
+                $"output rank {output.Rank} must equal xT rank {xT.Rank}.", nameof(output));
+        for (int i = 0; i < xT.Rank; i++)
+        {
+            if (output.Shape[i] != xT.Shape[i])
+                throw new ArgumentException(
+                    $"output shape [{string.Join(",", output.Shape)}] " +
+                    $"must equal xT shape [{string.Join(",", xT.Shape)}].",
+                    nameof(output));
+        }
 
         if (TryGetBackend(out var backend) && backend is IIssue301FusedBackend fusedBackend)
         {
@@ -227,8 +238,22 @@ public partial class DirectGpuTensorEngine
     {
         if (xT is null) throw new ArgumentNullException(nameof(xT));
         if (epsilonTheta is null) throw new ArgumentNullException(nameof(epsilonTheta));
-        if (epsilonTheta.Length != xT.Length)
-            throw new ArgumentException("epsilonTheta length must equal xT length.", nameof(epsilonTheta));
+        // DDIM is shape-preserving — accept only exact shape match, not just
+        // matching element counts. A length-equal but rank/shape-different
+        // epsilon would let callers produce a result tensor with invalid
+        // metadata even though the numeric buffer happened to fit.
+        if (xT.Rank != epsilonTheta.Rank)
+            throw new ArgumentException(
+                $"epsilonTheta rank {epsilonTheta.Rank} must equal xT rank {xT.Rank}.",
+                nameof(epsilonTheta));
+        for (int i = 0; i < xT.Rank; i++)
+        {
+            if (xT.Shape[i] != epsilonTheta.Shape[i])
+                throw new ArgumentException(
+                    $"epsilonTheta shape [{string.Join(",", epsilonTheta.Shape)}] " +
+                    $"must equal xT shape [{string.Join(",", xT.Shape)}].",
+                    nameof(epsilonTheta));
+        }
         if (!(alphaBarT > 0f && alphaBarT <= 1f))
             throw new ArgumentOutOfRangeException(nameof(alphaBarT), "alphaBarT must be in (0, 1].");
         if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))

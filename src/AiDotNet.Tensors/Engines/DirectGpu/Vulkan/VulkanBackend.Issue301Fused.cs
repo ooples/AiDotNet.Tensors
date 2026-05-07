@@ -1,5 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
@@ -52,6 +54,16 @@ public sealed unsafe partial class VulkanBackend
         float alphaBarT,
         float alphaBarTMinus1)
     {
+        if (size <= 0) return;
+        // The Vulkan kernel divides by sqrt(alphaBarT). Reject ᾱ <= 0 here
+        // (defence-in-depth on top of the kernel's max() clamp).
+        if (!(alphaBarT > 0f && alphaBarT <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarT),
+                $"alphaBarT must be in (0, 1]; got {alphaBarT}.");
+        if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarTMinus1),
+                $"alphaBarTMinus1 must be in [0, 1]; got {alphaBarTMinus1}.");
+
         var pushConstants = new[]
         {
             (uint)size,
@@ -80,6 +92,18 @@ public sealed unsafe partial class VulkanBackend
         int hasBias,
         int activation)
     {
+        if (batchSize <= 0 || outputFeatures <= 0) return;
+        // GLSL `uint total = p.batchSize * p.outputFeatures` wraps modulo 2^32
+        // when the product exceeds ~4.29B. Validate on the C# side before
+        // submitting so the kernel's bounds guard isn't silently bypassed.
+        long totalLong = (long)batchSize * outputFeatures;
+        if (totalLong > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batchSize),
+                $"batchSize ({batchSize}) * outputFeatures ({outputFeatures}) = {totalLong} " +
+                "overflows uint32 in the GLSL kernel; split the dispatch.");
+        if (nnz < 0)
+            throw new ArgumentOutOfRangeException(nameof(nnz), $"nnz must be >= 0; got {nnz}.");
+
         var pushConstants = new[]
         {
             (uint)batchSize,
@@ -93,7 +117,7 @@ public sealed unsafe partial class VulkanBackend
         GlslQuintOp(
             VulkanIssue301FusedKernels.SparseLinear,
             input, packedCsr, sparseValues, bias, output,
-            batchSize * outputFeatures,
+            (int)totalLong,
             pushConstants,
             6 * sizeof(uint));
     }
