@@ -102,10 +102,16 @@ extern ""C"" __global__ void fused_ddim_step(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
 
-    float sqrt_at = sqrtf(alpha_bar_t);
-    float sqrt_atm1 = sqrtf(alpha_bar_t_minus_1);
+    // Defence in depth: host-side validation already rejects alpha_bar_t <= 0,
+    // but if a regression let it through, sqrtf(0) makes c_xt and c_eps Inf
+    // and poisons every output element. Clamp to a tiny positive value so the
+    // worst case is a near-final-step result instead of NaN-poisoned output.
+    float clamped_at = fmaxf(alpha_bar_t, 1e-12f);
+    float clamped_atm1 = fmaxf(alpha_bar_t_minus_1, 0.0f);
+    float sqrt_at = sqrtf(clamped_at);
+    float sqrt_atm1 = sqrtf(clamped_atm1);
     float c_xt = sqrt_atm1 / sqrt_at;
-    float c_eps = sqrtf(1.0f - alpha_bar_t_minus_1) - sqrtf(1.0f - alpha_bar_t) * sqrt_atm1 / sqrt_at;
+    float c_eps = sqrtf(fmaxf(0.0f, 1.0f - clamped_atm1)) - sqrtf(fmaxf(0.0f, 1.0f - clamped_at)) * sqrt_atm1 / sqrt_at;
     output[idx] = c_xt * x_t[idx] + c_eps * epsilon_theta[idx];
 }
 

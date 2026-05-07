@@ -81,6 +81,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _softmaxVarModule;
     private IntPtr _fusedLinearModule;
     private IntPtr _fusedAdvancedModule;
+    // True iff the fused-advanced kernel module compiled and registered
+    // successfully on this device. Public surface methods gate on this so a
+    // partial / failed compile surfaces a clear NotSupportedException at the
+    // call site instead of an opaque "kernel not found" deep in dispatch.
+    private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _iouModule;
     private IntPtr _complexModule;
     private IntPtr _parity210Module;
@@ -519,12 +524,30 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,
                 Kernels.HipFusedLinearKernels.GetKernelNames());
 
+            // Fused-advanced kernels (LoRA, DDIM, sparse-linear) are an
+            // OPTIONAL capability — older HIP runtimes / ROCm builds may
+            // reject the dynamic-shared-mem patterns the kernels use. If
+            // compilation fails we still want the rest of the backend to
+            // come up; we just refuse FusedLoRAForward / FusedDDIMStep /
+            // FusedSparseLinear at dispatch time via the availability flag.
             try
             {
                 CompileKernelModule(Kernels.HipFusedAdvancedKernels.GetSource(), "fused_advanced", ref _fusedAdvancedModule,
                     Kernels.HipFusedAdvancedKernels.GetKernelNames());
+                _fusedAdvancedKernelsAvailable = _fusedAdvancedModule != IntPtr.Zero;
             }
-            catch { }
+            catch (OutOfMemoryException)
+            {
+                // Process-level resource problem; do NOT silently downgrade.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[HipBackend] Fused-advanced kernel compile failed: {ex.GetType().Name}: {ex.Message}. " +
+                    "Backend will reject FusedLoRAForward/FusedDDIMStep/FusedSparseLinear.");
+                _fusedAdvancedKernelsAvailable = false;
+            }
 
             // Compile IoU loss kernels
             CompileKernelModule(Kernels.HipIoUKernels.GetSource(), "iou", ref _iouModule,

@@ -103,8 +103,14 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     if (gid >= p.size) { return; }
 
     let eps = epsilonTheta[gid];
-    let x0Pred = (xT[gid] - sqrt(max(0.0, 1.0 - p.alphaBarT)) * eps) / sqrt(p.alphaBarT);
-    output[gid] = sqrt(p.alphaBarTMinus1) * x0Pred + sqrt(max(0.0, 1.0 - p.alphaBarTMinus1)) * eps;
+    // Defence in depth: host-side already validates alphaBarT > 0, but if a
+    // regression let it through, sqrt(0) makes the divisor zero and the
+    // output Inf/NaN. Clamp away from zero so the worst case is a near-final-
+    // step result instead of poisoned output. Mirrors the Vulkan kernel.
+    let clampedAt = max(p.alphaBarT, 1e-12);
+    let clampedAtm1 = max(p.alphaBarTMinus1, 0.0);
+    let x0Pred = (xT[gid] - sqrt(max(0.0, 1.0 - clampedAt)) * eps) / sqrt(clampedAt);
+    output[gid] = sqrt(clampedAtm1) * x0Pred + sqrt(max(0.0, 1.0 - clampedAtm1)) * eps;
 }
 ";
 
@@ -130,8 +136,21 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let colBase = p.outputFeatures + 1;
     var sum : f32 = select(0.0, bias[o], p.hasBias != 0);
 
+    // Defensive bounds matching CUDA / HIP / Metal / Vulkan: skip the row if
+    // the CSR offsets are inverted, negative, or out of nnz range. A
+    // malformed CSR otherwise walks past sparseValues / input_ with UB.
+    if (rowStart < 0 || rowEnd < rowStart || rowEnd > p.nnz) {
+        output[gid] = fused_apply_activation(sum, p.activation);
+        return;
+    }
+
     for (var idx : i32 = rowStart; idx < rowEnd; idx = idx + 1) {
+        // Per-element bounds: idx must land inside sparseValues [0, nnz),
+        // and col must land inside the input feature axis. Skip malformed
+        // entries instead of reading past the buffer.
+        if (idx >= p.nnz) { break; }
         let col = bitcast<i32>(packedCsr[colBase + idx]);
+        if (col < 0 || col >= p.inputFeatures) { continue; }
         sum = sum + input_[b * p.inputFeatures + col] * sparseValues[idx];
     }
 

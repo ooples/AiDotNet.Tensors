@@ -6,6 +6,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend
 {
+    private void EnsureFusedAdvancedKernelsAvailable(string opName)
+    {
+        if (!_fusedAdvancedKernelsAvailable)
+            throw new NotSupportedException(
+                $"HIP fused-advanced kernels are not available on this device — " +
+                $"compilation failed during backend initialization. {opName} cannot be dispatched. " +
+                $"Fall back to the eager decomposed path.");
+    }
+
     public unsafe void FusedLoRAForward(
         IGpuBuffer input,
         IGpuBuffer baseOutput,
@@ -18,6 +27,7 @@ public sealed partial class HipBackend
         int outputFeatures,
         float scaling)
     {
+        EnsureFusedAdvancedKernelsAvailable(nameof(FusedLoRAForward));
         if (!_kernelCache.TryGetValue("fused_lora_forward", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: fused_lora_forward");
 
@@ -43,6 +53,7 @@ public sealed partial class HipBackend
         float alphaBarT,
         float alphaBarTMinus1)
     {
+        EnsureFusedAdvancedKernelsAvailable(nameof(FusedDDIMStep));
         if (!_kernelCache.TryGetValue("fused_ddim_step", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: fused_ddim_step");
         // size==0 → 0-block grid, which HIP rejects with hipErrorInvalidConfiguration.
@@ -76,6 +87,7 @@ public sealed partial class HipBackend
         int hasBias,
         int activation)
     {
+        EnsureFusedAdvancedKernelsAvailable(nameof(FusedSparseLinear));
         if (!_kernelCache.TryGetValue("fused_sparse_linear", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: fused_sparse_linear");
 

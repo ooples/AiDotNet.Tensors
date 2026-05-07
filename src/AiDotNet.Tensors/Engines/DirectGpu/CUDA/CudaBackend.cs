@@ -36,6 +36,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // and ending up with two threads working against different contexts.
     private readonly object _cudnnInitLock = new();
     private CudaStream? _defaultStream;
+    // True iff the fused-advanced kernel module compiled and registered all
+    // its kernels successfully. Public surface methods gate on this so a
+    // partial / failed compile surfaces a clear NotSupportedException at the
+    // call site instead of an opaque "kernel not found" deep in dispatch.
+    private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
@@ -657,11 +662,36 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
         catch { }
 
+        // Fused-advanced kernels (LoRA, DDIM, sparse-linear) are an OPTIONAL
+        // capability — older CUDA toolkits / drivers may reject the dynamic-
+        // shared-mem patterns the kernels use. If compilation fails we still
+        // want the rest of the backend to come up; we just refuse the fused
+        // dispatch methods at runtime via the availability flag.
         try
         {
             CompileKernelModule(device, Kernels.CudaFusedAdvancedKernels.GetSource(), "fused_advanced_kernels", Kernels.CudaFusedAdvancedKernels.GetKernelNames());
+            // Verify all expected kernel names actually landed in the cache.
+            // CompileKernelModule may partially populate on a per-kernel
+            // failure; we want all-or-nothing for the capability flag.
+            bool allLoaded = true;
+            foreach (var name in Kernels.CudaFusedAdvancedKernels.GetKernelNames())
+            {
+                if (!_kernelCache.ContainsKey(name)) { allLoaded = false; break; }
+            }
+            _fusedAdvancedKernelsAvailable = allLoaded;
         }
-        catch { }
+        catch (OutOfMemoryException)
+        {
+            // Process-level resource problem; do NOT silently downgrade.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[CudaBackend] Fused-advanced kernel compile failed: {ex.GetType().Name}: {ex.Message}. " +
+                "Backend will reject FusedLoRAForward/FusedDDIMStep/FusedSparseLinear.");
+            _fusedAdvancedKernelsAvailable = false;
+        }
 
         // Compile IoU loss kernels (IoU, GIoU, DIoU, CIoU forward + backward)
         // Optional — CPU composition fallback provides identical results.

@@ -7,6 +7,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    private void EnsureFusedAdvancedLibraryLoaded(string opName)
+    {
+        // Pattern matches MetalBackend's other optional libraries (Roi,
+        // Linalg, Geometry): the constructor catches compilation failures
+        // and leaves the library handle as IntPtr.Zero. Calling GetPipeline
+        // with a null library handle would deref into native code; refuse
+        // dispatch with a clear NotSupportedException at the call site.
+        if (_fusedAdvancedLibrary == IntPtr.Zero)
+            throw new NotSupportedException(
+                $"Metal fused-advanced kernels are not available — the kernel " +
+                $"library failed to compile during backend initialization. " +
+                $"{opName} cannot be dispatched. Fall back to the eager decomposed path.");
+    }
+
     public void FusedLoRAForward(
         IGpuBuffer input,
         IGpuBuffer baseOutput,
@@ -33,6 +47,16 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (size <= 0) return;
+        // Match the alpha-schedule validation in CUDA / HIP / Vulkan dispatch.
+        // Without this guard, the kernel computes 1/sqrt(alphaBarT) on the
+        // raw input, producing NaN / Inf output for ᾱ <= 0.
+        if (!(alphaBarT > 0f && alphaBarT <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarT),
+                $"alphaBarT must be in (0, 1]; got {alphaBarT}.");
+        if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(alphaBarTMinus1),
+                $"alphaBarTMinus1 must be in [0, 1]; got {alphaBarTMinus1}.");
+        EnsureFusedAdvancedLibraryLoaded(nameof(FusedDDIMStep));
         if (xT is not MetalGpuBuffer xBuffer ||
             epsilonTheta is not MetalGpuBuffer eBuffer ||
             output is not MetalGpuBuffer oBuffer)
@@ -67,8 +91,19 @@ public sealed partial class MetalBackend
         int activation)
     {
         ThrowIfDisposed();
-        int total = batchSize * outputFeatures;
-        if (total <= 0) return;
+        // batchSize * outputFeatures wraps silently to a corrupt grid count
+        // when the int product exceeds int.MaxValue (~2.1B). At 50000 × 50000
+        // = 2.5B the previous code computed `total = -1.79e9`, the `<= 0`
+        // guard returned early, and the dispatch was silently dropped.
+        // Promote to long, validate, then cast — matches CUDA / HIP.
+        if (batchSize <= 0 || outputFeatures <= 0) return;
+        long totalLong = (long)batchSize * outputFeatures;
+        if (totalLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batchSize),
+                $"batchSize ({batchSize}) * outputFeatures ({outputFeatures}) = {totalLong} " +
+                "exceeds int.MaxValue; split the dispatch into chunks.");
+        int total = (int)totalLong;
+        EnsureFusedAdvancedLibraryLoaded(nameof(FusedSparseLinear));
         if (input is not MetalGpuBuffer iBuffer ||
             packedCsr is not MetalGpuBuffer csrBuffer ||
             sparseValues is not MetalGpuBuffer vBuffer ||
@@ -110,6 +145,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (batchSize <= 0 || rank <= 0 || outputFeatures <= 0) return;
+        EnsureFusedAdvancedLibraryLoaded(nameof(FusedLoRAForward));
         if (input is not MetalGpuBuffer iBuffer ||
             baseOutput is not MetalGpuBuffer baseBuffer ||
             loraA is not MetalGpuBuffer aBuffer ||

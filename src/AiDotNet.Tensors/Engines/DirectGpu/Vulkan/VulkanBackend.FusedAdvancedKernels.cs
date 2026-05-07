@@ -93,14 +93,20 @@ public sealed unsafe partial class VulkanBackend
         int activation)
     {
         if (batchSize <= 0 || outputFeatures <= 0) return;
-        // GLSL `uint total = p.batchSize * p.outputFeatures` wraps modulo 2^32
-        // when the product exceeds ~4.29B. Validate on the C# side before
-        // submitting so the kernel's bounds guard isn't silently bypassed.
+        // Two compounding overflow risks to validate against:
+        //   1) GLSL `uint total = p.batchSize * p.outputFeatures` wraps modulo
+        //      2^32 if the product exceeds ~4.29B (defeats the in-shader
+        //      bounds guard).
+        //   2) The GlslQuintOp wrapper takes `int dispatchSize`, so the C#
+        //      side itself overflows on cast for products > int.MaxValue
+        //      (~2.15B), even though they'd still fit in uint32.
+        // The tighter bound (int.MaxValue) is the operative one — anything
+        // smaller is also < uint.MaxValue, so we only need one check.
         long totalLong = (long)batchSize * outputFeatures;
-        if (totalLong > uint.MaxValue)
+        if (totalLong > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(batchSize),
                 $"batchSize ({batchSize}) * outputFeatures ({outputFeatures}) = {totalLong} " +
-                "overflows uint32 in the GLSL kernel; split the dispatch.");
+                "exceeds int.MaxValue (Vulkan dispatch wrapper is int-bounded); split the dispatch.");
         if (nnz < 0)
             throw new ArgumentOutOfRangeException(nameof(nnz), $"nnz must be >= 0; got {nnz}.");
 
