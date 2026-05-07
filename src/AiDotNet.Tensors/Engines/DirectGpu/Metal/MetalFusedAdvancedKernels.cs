@@ -1,0 +1,155 @@
+// Copyright (c) AiDotNet. All rights reserved.
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
+{
+    internal static class MetalFusedAdvancedKernels
+    {
+        public static string[] GetKernelNames() => new[]
+        {
+            "fused_lora_forward",
+            "fused_ddim_step",
+            "fused_sparse_linear",
+        };
+
+        public const string Source = @"
+#include <metal_stdlib>
+#include <metal_math>
+using namespace metal;
+
+static inline float fused_apply_activation(float x, uint activation)
+{
+    if (activation == 1u) return max(x, 0.0f);
+    if (activation == 2u)
+    {
+        float k = sqrt(2.0f / 3.14159265358979323846f);
+        return 0.5f * x * (1.0f + tanh(k * (x + 0.044715f * x * x * x)));
+    }
+    if (activation == 3u) return 1.0f / (1.0f + exp(-x));
+    if (activation == 4u) return tanh(x);
+    if (activation == 5u) return x > 0.0f ? x : 0.01f * x;
+    if (activation == 6u)
+    {
+        float sigmoid = 1.0f / (1.0f + exp(-x));
+        return x * sigmoid;
+    }
+    return x;
+}
+
+// Two-stage fused LoRA forward. See CudaFusedAdvancedKernels.cs for the
+// full design rationale. Total work: O(batch · rank · (in + out)) instead
+// of the broken O(batch · in · rank · out).
+//
+// Launch contract:
+//   threadgroups   = batchSize
+//   threads/group  = min(outputFeatures, MAX_RANK = 256) — capped to fit
+//                    threadgroup memory budget
+//   threadgroup memory = rank * sizeof(float) (passed dynamically via
+//                        setThreadgroupMemoryLength in dispatch)
+kernel void fused_lora_forward(
+    device const float* input [[buffer(0)]],
+    device const float* baseOutput [[buffer(1)]],
+    device const float* loraA [[buffer(2)]],
+    device const float* loraB [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& batchSize [[buffer(5)]],
+    constant uint& inputFeatures [[buffer(6)]],
+    constant uint& rank [[buffer(7)]],
+    constant uint& outputFeatures [[buffer(8)]],
+    constant float& scaling [[buffer(9)]],
+    threadgroup float* proj [[threadgroup(0)]],
+    uint b [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint blockSize [[threads_per_threadgroup]])
+{
+    if (b >= batchSize) return;
+
+    device const float* in_row = input + b * inputFeatures;
+
+    // Stage 1: cooperatively compute proj[r] for r in [0, rank).
+    for (uint r = tid; r < rank; r += blockSize)
+    {
+        float acc = 0.0f;
+        for (uint i = 0; i < inputFeatures; ++i)
+            acc += in_row[i] * loraA[i * rank + r];
+        proj[r] = acc;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: each thread emits one or more output columns, reusing proj.
+    uint row_base = b * outputFeatures;
+    for (uint o = tid; o < outputFeatures; o += blockSize)
+    {
+        float delta = 0.0f;
+        for (uint r = 0; r < rank; ++r)
+            delta += proj[r] * loraB[r * outputFeatures + o];
+        output[row_base + o] = baseOutput[row_base + o] + scaling * delta;
+    }
+}
+
+kernel void fused_ddim_step(
+    device const float* xT [[buffer(0)]],
+    device const float* epsilonTheta [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    constant float& alphaBarT [[buffer(4)]],
+    constant float& alphaBarTMinus1 [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= size) return;
+
+    float eps = epsilonTheta[gid];
+    float x0Pred = (xT[gid] - sqrt(max(0.0f, 1.0f - alphaBarT)) * eps) / sqrt(alphaBarT);
+    output[gid] = sqrt(alphaBarTMinus1) * x0Pred + sqrt(max(0.0f, 1.0f - alphaBarTMinus1)) * eps;
+}
+
+kernel void fused_sparse_linear(
+    device const float* input [[buffer(0)]],
+    device const float* packedCsr [[buffer(1)]],
+    device const float* sparseValues [[buffer(2)]],
+    device const float* bias [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& batchSize [[buffer(5)]],
+    constant uint& inputFeatures [[buffer(6)]],
+    constant uint& outputFeatures [[buffer(7)]],
+    constant uint& nnz [[buffer(8)]],
+    constant uint& hasBias [[buffer(9)]],
+    constant uint& activation [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * outputFeatures;
+    if (gid >= total) return;
+
+    uint b = gid / outputFeatures;
+    uint o = gid - b * outputFeatures;
+    int rowStart = as_type<int>(packedCsr[o]);
+    int rowEnd = as_type<int>(packedCsr[o + 1u]);
+    uint colBase = outputFeatures + 1u;
+    float sum = hasBias != 0u ? bias[o] : 0.0f;
+
+    // Defensive bounds: skip the row if the CSR offsets are inverted,
+    // negative, or out of nnz range. Without this a corrupted (or
+    // untrusted) CSR walks past packedCsr / sparseValues / input and
+    // produces UB / a dispatch crash. Matches the CUDA variant.
+    if (rowStart < 0 || rowEnd < rowStart || uint(rowEnd) > nnz)
+    {
+        output[gid] = fused_apply_activation(sum, activation);
+        return;
+    }
+
+    for (int idx = rowStart; idx < rowEnd; ++idx)
+    {
+        // Per-element bounds: each idx MUST land inside sparseValues
+        // [0, nnz) and each col MUST land inside the input feature axis.
+        // Skip malformed entries instead of reading past the buffer.
+        if (uint(idx) >= nnz) break;
+        int col = as_type<int>(packedCsr[colBase + uint(idx)]);
+        if (col < 0 || uint(col) >= inputFeatures) continue;
+        sum += input[b * inputFeatures + uint(col)] * sparseValues[uint(idx)];
+    }
+
+    output[gid] = fused_apply_activation(sum, activation);
+}
+";
+    }
+}

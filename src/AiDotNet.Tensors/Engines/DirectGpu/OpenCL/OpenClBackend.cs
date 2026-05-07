@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
@@ -64,6 +64,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
+        // True iff fused-advanced kernels (LoRA, DDIM, sparse-linear) compiled
+        // and registered successfully on this backend. Public surface methods
+        // gate on this so a partial-cache compile failure surfaces a clear
+        // error instead of crashing inside Execute1D.
+        private bool _fusedAdvancedKernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
         private const int MaxPooledBufferElements = 1_048_576;
         private const int MaxPooledBuffersPerSize = 4;
@@ -553,6 +558,59 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 _programs.Add(fusedLinearProgram);
                 foreach (var name in Kernels.FusedLinearKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedLinearProgram, name);
+
+                // fused-advanced kernels are an optional capability — older
+                // OpenCL drivers may reject the half/sub-group features used.
+                // Build the cache atomically: if ANY individual kernel fails
+                // to materialise, roll back the partial inserts so dispatch
+                // never reads a half-populated cache and silently crashes.
+                try
+                {
+                    var fusedAdvancedProgram = CompileOrLoadCached(Kernels.OpenClFusedAdvancedKernels.GetSource(), optimizationFlags, "fused-advanced kernels");
+                    var fusedAdvancedKernelNames = Kernels.OpenClFusedAdvancedKernels.GetKernelNames();
+                    var staged = new List<KeyValuePair<string, DirectOpenClKernel>>(fusedAdvancedKernelNames.Length);
+                    bool kernelOk = true;
+                    foreach (var name in fusedAdvancedKernelNames)
+                    {
+                        try
+                        {
+                            staged.Add(new KeyValuePair<string, DirectOpenClKernel>(
+                                name, new DirectOpenClKernel(_context, fusedAdvancedProgram, name)));
+                        }
+                        catch (OutOfMemoryException)
+                        {
+                            // Fatal — never silently downgrade to "capability unavailable".
+                            throw;
+                        }
+                        catch (Exception kex)
+                        {
+                            WriteDiag($"[OpenClBackend] fused-advanced kernel '{name}' failed to materialise: {kex.Message}");
+                            kernelOk = false;
+                            break;
+                        }
+                    }
+                    if (kernelOk)
+                    {
+                        _programs.Add(fusedAdvancedProgram);
+                        foreach (var kv in staged) _kernelCache[kv.Key] = kv.Value;
+                        _fusedAdvancedKernelsAvailable = true;
+                    }
+                    else
+                    {
+                        foreach (var kv in staged) kv.Value.Dispose();
+                        fusedAdvancedProgram.Dispose();
+                    }
+                }
+                catch (OutOfMemoryException)
+                {
+                    // OOM during program compile is fatal; suppressing it would
+                    // mask a process-level resource problem as a benign capability gap.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    WriteDiag($"[OpenClBackend] fused-advanced-kernels program compile failed: {ex.Message}. Backend will reject FusedLoRAForward/FusedDDIMStep/FusedSparseLinear.");
+                }
 
                 // Compile IoU loss kernels
                 var iouProgram = CompileOrLoadCached(Kernels.IoUKernels.GetSource(), optimizationFlags, "IoU loss kernels");

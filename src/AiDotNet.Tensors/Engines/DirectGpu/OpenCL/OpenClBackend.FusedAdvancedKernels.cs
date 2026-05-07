@@ -1,0 +1,119 @@
+// Copyright (c) AiDotNet. All rights reserved.
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+
+public sealed partial class OpenClBackend
+{
+    private void EnsureFusedAdvancedKernelsAvailable(string opName)
+    {
+        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        if (!_fusedAdvancedKernelsAvailable)
+            throw new NotSupportedException(
+                $"OpenCL fused-advanced kernels are not available on this device — " +
+                $"compile failed during backend initialization. {opName} cannot be dispatched. " +
+                $"Fall back to the eager decomposed path.");
+    }
+
+    private DirectOpenClContext RequireContext(string opName)
+    {
+        EnsureFusedAdvancedKernelsAvailable(opName);
+        // EnsureFusedAdvancedKernelsAvailable already validated _context is non-null;
+        // this restates it locally so net471's nullable analysis is satisfied
+        // without depending on [MemberNotNull] (which net471 cannot honour).
+        return _context ?? throw new InvalidOperationException("OpenCL context not available");
+    }
+
+    public void FusedLoRAForward(
+        IGpuBuffer input,
+        IGpuBuffer baseOutput,
+        IGpuBuffer loraA,
+        IGpuBuffer loraB,
+        IGpuBuffer output,
+        int batchSize,
+        int inputFeatures,
+        int rank,
+        int outputFeatures,
+        float scaling)
+    {
+        var ctx = RequireContext(nameof(FusedLoRAForward));
+        var k = _kernelCache["fused_lora_forward"];
+        if (batchSize <= 0 || outputFeatures <= 0 || rank <= 0) return;
+
+        // Two-stage launch: one work-group per batch row. Local memory holds
+        // proj[rank]. See CudaFusedAdvancedKernels.cs for the design rationale.
+        int localSize = System.Math.Min(outputFeatures, CalculateOptimalWorkGroupSize1D(outputFeatures));
+        int globalSize = batchSize * localSize;
+        int sharedBytes = checked(rank * sizeof(float));
+
+        uint arg = 0;
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)baseOutput).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)loraA).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)loraB).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        k.SetArg(arg++, batchSize);
+        k.SetArg(arg++, inputFeatures);
+        k.SetArg(arg++, rank);
+        k.SetArg(arg++, outputFeatures);
+        k.SetArg(arg++, scaling);
+        k.SetLocalArg(arg++, sharedBytes);
+
+        k.Execute1D(globalSize, localSize);
+        ctx.Finish();
+    }
+
+    public void FusedDDIMStep(
+        IGpuBuffer xT,
+        IGpuBuffer epsilonTheta,
+        IGpuBuffer output,
+        int size,
+        float alphaBarT,
+        float alphaBarTMinus1)
+    {
+        var ctx = RequireContext(nameof(FusedDDIMStep));
+        var k = _kernelCache["fused_ddim_step"];
+        uint arg = 0;
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)xT).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)epsilonTheta).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        k.SetArg(arg++, size);
+        k.SetArg(arg++, alphaBarT);
+        k.SetArg(arg++, alphaBarTMinus1);
+        if (size <= 0) return;
+        k.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        ctx.Finish();
+    }
+
+    public void FusedSparseLinear(
+        IGpuBuffer input,
+        IGpuBuffer packedCsr,
+        IGpuBuffer sparseValues,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int batchSize,
+        int inputFeatures,
+        int outputFeatures,
+        int nnz,
+        int hasBias,
+        int activation)
+    {
+        var ctx = RequireContext(nameof(FusedSparseLinear));
+        var k = _kernelCache["fused_sparse_linear"];
+        uint arg = 0;
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)packedCsr).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)sparseValues).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+        k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        k.SetArg(arg++, batchSize);
+        k.SetArg(arg++, inputFeatures);
+        k.SetArg(arg++, outputFeatures);
+        k.SetArg(arg++, nnz);
+        k.SetArg(arg++, hasBias);
+        k.SetArg(arg++, activation);
+        int total = batchSize * outputFeatures;
+        if (total <= 0) return;
+        k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
+        ctx.Finish();
+    }
+}
