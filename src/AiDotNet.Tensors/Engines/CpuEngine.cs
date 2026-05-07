@@ -44,6 +44,8 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class CpuEngine : ITensorLevelEngine
 {
+    private static int _randomNormalSeedCounter = Environment.TickCount;
+
     /// <inheritdoc/>
     public string Name => "CPU Engine";
 
@@ -3661,13 +3663,38 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
-        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}.");
+        // Exact-length match: destination MUST be the same size as the sources.
+        // A larger destination would leave trailing stale data and silently
+        // misalign downstream consumers that key on tensor.Length.
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal source length ({a.Length}).");
+        if (destination.IsSparse || a.IsSparse || b.IsSparse)
+            throw new InvalidOperationException("TensorSubtractInto does not support SparseTensor operands.");
 
         int length = a.Length;
+        if (!destination.IsContiguous || !a.IsContiguous || !b.IsContiguous)
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aStorage = a.RawStorageSpan;
+            var bStorage = b.RawStorageSpan;
+            var destinationStorage = destination.RawWritableStorageSpan;
+
+            for (int i = 0; i < length; i++)
+            {
+                destinationStorage[destination.LogicalToStorageIndex(i)] =
+                    numOps.Subtract(
+                        aStorage[a.LogicalToStorageIndex(i)],
+                        bStorage[b.LogicalToStorageIndex(i)]);
+            }
+            return;
+        }
+
         if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
@@ -4424,13 +4451,25 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
-        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (destination.Length < a.Length)
-            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal source length ({a.Length}).");
+        if (destination.IsSparse || a.IsSparse)
+            throw new InvalidOperationException("TensorMultiplyScalarInto does not support SparseTensor operands.");
 
         int length = a.Length;
+        if (!destination.IsContiguous || !a.IsContiguous)
+        {
+            var strideOps = MathHelper.GetNumericOperations<T>();
+            var sourceStorage = a.RawStorageSpan;
+            var destinationStorage = destination.RawWritableStorageSpan;
+            for (int i = 0; i < length; i++)
+            {
+                destinationStorage[destination.LogicalToStorageIndex(i)] =
+                    strideOps.Multiply(sourceStorage[a.LogicalToStorageIndex(i)], scalar);
+            }
+            return;
+        }
 
         // Float fast path: SIMD MultiplyScalar with parallel chunking
         if (typeof(T) == typeof(float))
@@ -25327,34 +25366,45 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
 
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
+        TensorRandomNormalInto(result, mean, stddev);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public void TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (destination.IsSparse)
+            throw new InvalidOperationException("Random initialization into SparseTensor is not supported.");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = RandomHelper.ThreadSafeRandom;
-        var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
-
-        var resultData = result.GetDataArray();
         double meanD = numOps.ToDouble(mean);
         double stdD = numOps.ToDouble(stddev);
+        int totalElements = destination.Length;
 
-        // Box-Muller transform for normal distribution
-        for (int i = 0; i < totalElements; i += 2)
+        var liveBacking = destination.GetLiveBackingArrayOrNull();
+        if (liveBacking is not null && totalElements > ParallelThreshold)
         {
-            double u1 = random.NextDouble();
-            double u2 = random.NextDouble();
-
-            // Guard against log(0) which produces -Infinity and then NaN
-            u1 = Math.Max(u1, double.Epsilon);
-
-            double mag = Math.Sqrt(-2.0 * Math.Log(u1));
-            double z0 = mag * Math.Cos(2.0 * Math.PI * u2);
-            double z1 = mag * Math.Sin(2.0 * Math.PI * u2);
-
-            resultData[i] = numOps.FromDouble(z0 * stdD + meanD);
-            if (i + 1 < totalElements)
-                resultData[i + 1] = numOps.FromDouble(z1 * stdD + meanD);
+            FillRandomNormalArray(liveBacking, totalElements, numOps, meanD, stdD);
+            return;
         }
 
-        return result;
+        if (destination.IsContiguous)
+        {
+            FillRandomNormal(destination.AsWritableSpan(), numOps, random, meanD, stdD);
+            return;
+        }
+
+        var destinationStorage = destination.RawWritableStorageSpan;
+        for (int i = 0; i < totalElements;)
+        {
+            NextNormalPair(random, out double z0, out double z1);
+            destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z0 * stdD + meanD);
+            if (i < totalElements)
+                destinationStorage[destination.LogicalToStorageIndex(i++)] = numOps.FromDouble(z1 * stdD + meanD);
+        }
     }
 
     /// <inheritdoc/>
@@ -25362,52 +25412,312 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
 
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
+        TensorRandomUniformRangeInto(result, min, max, seed);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public void TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed = null)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (destination.IsSparse)
+            throw new InvalidOperationException("Random initialization into SparseTensor is not supported.");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double minD = numOps.ToDouble(min);
         double maxD = numOps.ToDouble(max);
         double range = maxD - minD;
+        int totalElements = destination.Length;
 
-        var resultData = result.GetDataArray();
-
-        if (totalElements > 10000)
+        var liveBacking = destination.GetLiveBackingArrayOrNull();
+        if (liveBacking is not null && totalElements > 10000)
         {
-            // For seeded random with parallelism, we need thread-local randoms
-            if (seed.HasValue)
-            {
-                var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
-                for (int i = 0; i < seeds.Length; i++)
-                    seeds[i] = baseRandom.Next();
+            // Chunk-based parallel fill. Each chunk gets a deterministic
+            // chunk-id-derived seed (from baseSeed when provided, otherwise
+            // from a process-wide monotonic counter). Avoids the
+            // ManagedThreadId-modulo collision where two workers can pick
+            // the same seed and produce identical subsequences.
+            int workerCount = Math.Min(
+                CpuParallelSettings.MaxDegreeOfParallelism,
+                Math.Max(1, (totalElements + MinChunkSize - 1) / MinChunkSize));
+            int chunkSize = (totalElements + workerCount - 1) / workerCount;
+            int baseSeed = seed.HasValue
+                ? seed.Value
+                : System.Threading.Interlocked.Add(ref _randomUniformSeedCounter, unchecked((int)0x9E3779B9));
 
-                Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
-                    (i, state, localRandom) =>
-                    {
-                        resultData[i] = numOps.FromDouble(localRandom.NextDouble() * range + minD);
-                        return localRandom;
-                    },
-                    _ => { });
-            }
-            else
+            LightweightParallel(workerCount, chunkIdx =>
             {
-                Parallel.For(0, totalElements, i =>
+                int start = chunkIdx * chunkSize;
+                int count = Math.Min(chunkSize, totalElements - start);
+                if (count <= 0) return;
+                // Mix base + chunkIdx through the same golden-ratio constant
+                // FillRandomNormalArray uses, so identical (baseSeed, workerCount)
+                // produces identical output across runs.
+                int chunkSeed = unchecked(baseSeed + (int)((uint)chunkIdx * 0x9E3779B9u));
+                var rand = RandomHelper.CreateSeededRandom(chunkSeed);
+                for (int i = start; i < start + count; i++)
+                    liveBacking[i] = numOps.FromDouble(rand.NextDouble() * range + minD);
+            });
+            return;
+        }
+
+        if (destination.IsContiguous)
+        {
+            FillUniformRange(destination.AsWritableSpan(), numOps, random, minD, range);
+            return;
+        }
+
+        var destinationStorage = destination.RawWritableStorageSpan;
+        for (int i = 0; i < totalElements; i++)
+        {
+            destinationStorage[destination.LogicalToStorageIndex(i)] =
+                numOps.FromDouble(random.NextDouble() * range + minD);
+        }
+    }
+
+    private static int _randomUniformSeedCounter;
+
+    private static void FillRandomNormal<T>(
+        Span<T> destination,
+        INumericOperations<T> numOps,
+        Random random,
+        double meanD,
+        double stdD)
+    {
+        for (int i = 0; i < destination.Length;)
+        {
+            NextNormalPair(random, out double z0, out double z1);
+            destination[i++] = numOps.FromDouble(z0 * stdD + meanD);
+            if (i < destination.Length)
+                destination[i++] = numOps.FromDouble(z1 * stdD + meanD);
+        }
+    }
+
+    private static void FillRandomNormalArray<T>(
+        T[] destination,
+        int length,
+        INumericOperations<T> numOps,
+        double meanD,
+        double stdD)
+    {
+        int workerCount = Math.Min(MaxDegreeOfParallelism, Math.Max(1, (length + MinChunkSize - 1) / MinChunkSize));
+        if (workerCount <= 1)
+        {
+            FillRandomNormal(destination.AsSpan(0, length), numOps, RandomHelper.ThreadSafeRandom, meanD, stdD);
+            return;
+        }
+
+        int baseSeed = System.Threading.Interlocked.Add(ref _randomNormalSeedCounter, unchecked((int)0x9E3779B9));
+        int chunkSize = (length + workerCount - 1) / workerCount;
+
+        if (typeof(T) == typeof(float))
+        {
+            var typedDestination = (float[])(object)destination;
+            LightweightParallel(workerCount, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                    FillRandomNormalFloatChunk(typedDestination, start, count, (float)meanD, (float)stdD, baseSeed + chunk);
+            });
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var typedDestination = (double[])(object)destination;
+            LightweightParallel(workerCount, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                    FillRandomNormalDoubleChunk(typedDestination, start, count, meanD, stdD, baseSeed + chunk);
+            });
+            return;
+        }
+
+        LightweightParallel(workerCount, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                FillRandomNormalGenericChunk(destination, start, count, numOps, meanD, stdD, baseSeed + chunk);
+        });
+    }
+
+    private static void FillRandomNormalFloatChunk(
+        float[] destination,
+        int start,
+        int count,
+        float mean,
+        float stdDev,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
                 {
-                    resultData[i] = numOps.FromDouble(RandomHelper.ThreadSafeRandom.NextDouble() * range + minD);
-                });
-            }
-        }
-        else
-        {
-            for (int i = 0; i < totalElements; i++)
-            {
-                resultData[i] = numOps.FromDouble(random.NextDouble() * range + minD);
-            }
-        }
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = (float)(z0 * stdDev + mean);
+                    destination[destinationIndex++] = (float)(z1 * stdDev + mean);
+                }
 
-        return result;
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = (float)(z0 * stdDev + mean);
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
+    private static void FillRandomNormalDoubleChunk(
+        double[] destination,
+        int start,
+        int count,
+        double mean,
+        double stdDev,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
+                {
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = z0 * stdDev + mean;
+                    destination[destinationIndex++] = z1 * stdDev + mean;
+                }
+
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = z0 * stdDev + mean;
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
+    private static void FillRandomNormalGenericChunk<T>(
+        T[] destination,
+        int start,
+        int count,
+        INumericOperations<T> numOps,
+        double meanD,
+        double stdD,
+        int seed)
+    {
+        var random = new Helpers.SimdRandom(seed);
+        const int uniformChunk = 1024;
+        var uniforms = System.Buffers.ArrayPool<double>.Shared.Rent(uniformChunk);
+        try
+        {
+            int written = 0;
+            while (written < count)
+            {
+                int outputCount = Math.Min(count - written, uniformChunk);
+                int uniformCount = outputCount + (outputCount & 1);
+                random.NextDoubles(uniforms.AsSpan(0, uniformCount));
+
+                int pairs = outputCount / 2;
+                int destinationIndex = start + written;
+                for (int pair = 0; pair < pairs; pair++)
+                {
+                    int uniformIndex = pair * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out double z1);
+                    destination[destinationIndex++] = numOps.FromDouble(z0 * stdD + meanD);
+                    destination[destinationIndex++] = numOps.FromDouble(z1 * stdD + meanD);
+                }
+
+                if ((outputCount & 1) != 0)
+                {
+                    int uniformIndex = pairs * 2;
+                    NextNormalPair(uniforms[uniformIndex], uniforms[uniformIndex + 1], out double z0, out _);
+                    destination[destinationIndex] = numOps.FromDouble(z0 * stdD + meanD);
+                }
+
+                written += outputCount;
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(uniforms);
+        }
+    }
+
+    private static void FillUniformRange<T>(
+        Span<T> destination,
+        INumericOperations<T> numOps,
+        Random random,
+        double minD,
+        double range)
+    {
+        for (int i = 0; i < destination.Length; i++)
+            destination[i] = numOps.FromDouble(random.NextDouble() * range + minD);
+    }
+
+    private static void NextNormalPair(Random random, out double z0, out double z1)
+    {
+        double u1 = random.NextDouble();
+        double u2 = random.NextDouble();
+
+        // Guard against log(0) which produces -Infinity and then NaN.
+        u1 = Math.Max(u1, double.Epsilon);
+
+        double mag = Math.Sqrt(-2.0 * Math.Log(u1));
+        z0 = mag * Math.Cos(2.0 * Math.PI * u2);
+        z1 = mag * Math.Sin(2.0 * Math.PI * u2);
+    }
+
+    private static void NextNormalPair(double u1, double u2, out double z0, out double z1)
+    {
+        u1 = Math.Max(u1, double.Epsilon);
+
+        double mag = Math.Sqrt(-2.0 * Math.Log(u1));
+        z0 = mag * Math.Cos(2.0 * Math.PI * u2);
+        z1 = mag * Math.Sin(2.0 * Math.PI * u2);
     }
 
     /// <inheritdoc/>
@@ -28782,8 +29092,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU
     }
 
@@ -28793,8 +29102,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU
     }
 
