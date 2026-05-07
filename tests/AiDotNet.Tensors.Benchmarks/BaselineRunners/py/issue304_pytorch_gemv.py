@@ -36,7 +36,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=80)
     parser.add_argument("--warmup", type=int, default=12)
     parser.add_argument("--device", choices=["cpu", "gpu", "all"], default="all")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.runs <= 0:
+        parser.error("--runs must be > 0")
+    if args.warmup < 0:
+        parser.error("--warmup must be >= 0")
+
+    return args
 
 
 def parse_shapes(value: str) -> list[Shape]:
@@ -45,8 +52,16 @@ def parse_shapes(value: str) -> list[Shape]:
         token = token.strip().lower()
         if not token:
             continue
-        rows, cols = token.split("x")
-        shapes.append(Shape(int(rows), int(cols)))
+        if "x" not in token:
+            raise ValueError(f"Invalid shape token '{token}': expected ROWSxCOLS")
+        rows_str, cols_str = token.split("x", 1)
+        rows = int(rows_str)
+        cols = int(cols_str)
+        if rows <= 0 or cols <= 0:
+            raise ValueError(f"Invalid shape '{token}': rows and cols must be > 0")
+        shapes.append(Shape(rows, cols))
+    if not shapes:
+        raise ValueError("--sizes parsed to empty list")
     return shapes
 
 
@@ -214,7 +229,10 @@ def run_cpu(torch, shapes: list[Shape], runs: int, warmup: int) -> None:
                 runs=runs,
                 warmup=warmup,
                 inner=inner,
-                action=lambda run: torch.matmul(weights, queries[run % len(queries)]),
+                # Bind weights/queries via default args so future refactors
+                # that hand these lambdas to a deferred executor don't see
+                # the next iteration's reassignment.
+                action=lambda run, w=weights, q=queries: torch.matmul(w, q[run % len(q)]),
                 sync_result=False,
             )
         print_result(shape, "PyTorch CPU matmul", times)
@@ -246,7 +264,10 @@ def run_gpu(torch, shapes: list[Shape], runs: int, warmup: int) -> None:
                     runs=runs,
                     warmup=warmup,
                     inner=inner,
-                    action=lambda run: torch.matmul(weights, queries[run % len(queries)]),
+                    # Bind weights/queries via default args so future refactors
+                # that hand these lambdas to a deferred executor don't see
+                # the next iteration's reassignment.
+                action=lambda run, w=weights, q=queries: torch.matmul(w, q[run % len(q)]),
                 )
             else:
                 device_times = measure_wall(
@@ -255,7 +276,10 @@ def run_gpu(torch, shapes: list[Shape], runs: int, warmup: int) -> None:
                     runs=runs,
                     warmup=warmup,
                     inner=inner,
-                    action=lambda run: torch.matmul(weights, queries[run % len(queries)]),
+                    # Bind weights/queries via default args so future refactors
+                # that hand these lambdas to a deferred executor don't see
+                # the next iteration's reassignment.
+                action=lambda run, w=weights, q=queries: torch.matmul(w, q[run % len(q)]),
                     sync_result=True,
                 )
 
@@ -265,7 +289,7 @@ def run_gpu(torch, shapes: list[Shape], runs: int, warmup: int) -> None:
                 runs=runs,
                 warmup=warmup,
                 inner=gpu_readback_inner_iterations(shape),
-                action=lambda run: torch.matmul(weights, queries[run % len(queries)]).detach().cpu(),
+                action=lambda run, w=weights, q=queries: torch.matmul(w, q[run % len(q)]).detach().cpu(),
                 sync_result=False,
             )
 
