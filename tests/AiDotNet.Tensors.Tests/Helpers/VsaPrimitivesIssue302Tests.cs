@@ -2,6 +2,7 @@
 // Issue #302 — numerical-equivalence tests for VSA primitives.
 
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -226,5 +227,146 @@ public class VsaPrimitivesIssue302Tests
         // FFT-implementation rounding choice.
         Assert.True(relErr < 1e-4,
             $"HRR bind-then-unbind relative error {relErr:E4} exceeds 1e-4 with unitary b — algebra broken.");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Issue #308: ShiftSlots / HrrBindShifted
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ShiftSlots_PositiveAndNegativeShift_UsesIdentityFill()
+    {
+        var input = new Tensor<double>(
+            Enumerable.Range(1, 15).Select(i => (double)i).ToArray(),
+            new[] { 5, 3 });
+        var identity = new Tensor<double>(new[] { -1.0, -2.0, -3.0 }, new[] { 3 });
+
+        var shiftedRight = new Tensor<double>(new[] { 5, 3 });
+        CpuVsaOperations.ShiftSlots(input, slotShift: 2, identity, shiftedRight);
+        Assert.Equal(
+            new[] { -1.0, -2.0, -3.0, -1.0, -2.0, -3.0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+            shiftedRight.AsSpan().ToArray());
+
+        var shiftedLeft = new Tensor<double>(new[] { 5, 3 });
+        CpuVsaOperations.ShiftSlots(input, slotShift: -1, identity, shiftedLeft);
+        Assert.Equal(
+            new[] { 4.0, 5.0, 6.0, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -2, -3 },
+            shiftedLeft.AsSpan().ToArray());
+    }
+
+    [Fact]
+    public void ShiftSlots_OutOfRangeShift_FillsEverySlotWithIdentity()
+    {
+        var input = new Tensor<float>(
+            Enumerable.Range(1, 8).Select(i => (float)i).ToArray(),
+            new[] { 4, 2 });
+        var identity = new Tensor<float>(new[] { 10f, 20f }, new[] { 2 });
+        var output = new Tensor<float>(new[] { 4, 2 });
+
+        CpuVsaOperations.ShiftSlots(input, slotShift: 99, identity, output);
+
+        Assert.Equal(
+            new[] { 10f, 20f, 10f, 20f, 10f, 20f, 10f, 20f },
+            output.AsSpan().ToArray());
+    }
+
+    [Fact]
+    public void HrrBindShifted_Double_MatchesNaiveSplitComplexReference()
+    {
+        const int T = 5;
+        const int D = 4;
+        var seqA = RandomSplitComplexDouble(T, D, seed: 3081);
+        var seqB = RandomSplitComplexDouble(T, D, seed: 3082);
+        var got = new Tensor<double>(new[] { T, 2 * D });
+
+        CpuVsaOperations.HrrBindShifted(seqA, seqB, slotOffset: 2, got);
+
+        AssertSplitComplexShiftedBind(seqA.AsSpan(), seqB.AsSpan(), got.AsSpan(), T, D, slotOffset: 2);
+    }
+
+    [Fact]
+    public void HrrBindShifted_Float_MatchesNaiveSplitComplexReference()
+    {
+        const int T = 4;
+        const int D = 3;
+        var seqA = RandomSplitComplexFloat(T, D, seed: 3083);
+        var seqB = RandomSplitComplexFloat(T, D, seed: 3084);
+        var got = new Tensor<float>(new[] { T, 2 * D });
+
+        CpuVsaOperations.HrrBindShifted(seqA, seqB, slotOffset: -1, got);
+
+        var a = seqA.AsSpan();
+        var b = seqB.AsSpan();
+        var g = got.AsSpan();
+        int stateDim = 2 * D;
+        for (int t = 0; t < T; t++)
+        {
+            int bSlot = t + 1;
+            int off = t * stateDim;
+            if ((uint)bSlot >= (uint)T)
+            {
+                for (int i = 0; i < stateDim; i++)
+                    Assert.Equal(a[off + i], g[off + i], precision: 6);
+                continue;
+            }
+
+            int bOff = bSlot * stateDim;
+            for (int d = 0; d < D; d++)
+            {
+                float ar = a[off + d], ai = a[off + D + d];
+                float br = b[bOff + d], bi = b[bOff + D + d];
+                Assert.Equal(ar * br - ai * bi, g[off + d], precision: 5);
+                Assert.Equal(ar * bi + ai * br, g[off + D + d], precision: 5);
+            }
+        }
+    }
+
+    private static Tensor<double> RandomSplitComplexDouble(int slots, int codeDim, int seed)
+    {
+        var rng = new Random(seed);
+        var data = new double[slots * 2 * codeDim];
+        for (int i = 0; i < data.Length; i++)
+            data[i] = rng.NextDouble() * 2.0 - 1.0;
+        return new Tensor<double>(data, new[] { slots, 2 * codeDim });
+    }
+
+    private static Tensor<float> RandomSplitComplexFloat(int slots, int codeDim, int seed)
+    {
+        var rng = new Random(seed);
+        var data = new float[slots * 2 * codeDim];
+        for (int i = 0; i < data.Length; i++)
+            data[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        return new Tensor<float>(data, new[] { slots, 2 * codeDim });
+    }
+
+    private static void AssertSplitComplexShiftedBind(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        ReadOnlySpan<double> got,
+        int slots,
+        int codeDim,
+        int slotOffset)
+    {
+        int stateDim = 2 * codeDim;
+        for (int t = 0; t < slots; t++)
+        {
+            int bSlot = t - slotOffset;
+            int off = t * stateDim;
+            if ((uint)bSlot >= (uint)slots)
+            {
+                for (int i = 0; i < stateDim; i++)
+                    Assert.Equal(a[off + i], got[off + i], precision: 12);
+                continue;
+            }
+
+            int bOff = bSlot * stateDim;
+            for (int d = 0; d < codeDim; d++)
+            {
+                double ar = a[off + d], ai = a[off + codeDim + d];
+                double br = b[bOff + d], bi = b[bOff + codeDim + d];
+                Assert.Equal(ar * br - ai * bi, got[off + d], precision: 12);
+                Assert.Equal(ar * bi + ai * br, got[off + codeDim + d], precision: 12);
+            }
+        }
     }
 }

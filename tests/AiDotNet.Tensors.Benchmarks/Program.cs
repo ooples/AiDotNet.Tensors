@@ -269,6 +269,13 @@ class Program
             return;
         }
 
+        // Issue #308 acceptance harness: cross-position HRR sequence primitives.
+        if (args[0] == "--308-vsa")
+        {
+            BenchmarkRunner.Run<VsaIssue308Benchmarks>(BenchConfig);
+            return;
+        }
+
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
@@ -478,6 +485,7 @@ class Program
         Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");
         Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
         Console.WriteLine("  --296-diffusion     : 50-step denoising loop vs PyTorch nn.Sequential");
+        Console.WriteLine("  --308-vsa           : Cross-position HRR ShiftSlots/HrrBindShifted benchmark");
 #endif
     }
 }

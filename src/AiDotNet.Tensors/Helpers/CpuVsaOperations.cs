@@ -18,6 +18,7 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.LinearAlgebra.Fft;
+using AiDotNet.Tensors.Operators;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 #endif
@@ -32,6 +33,316 @@ namespace AiDotNet.Tensors.Helpers;
 public static class CpuVsaOperations
 {
     private const int ParallelTileSize = 64;
+
+    // ─────────────────────────────────────────────────────────────────
+    // Issue #308: cross-position sequence primitives
+    // ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Shift a rank-2 sequence by slot, preserving each slot as one contiguous row.
+    /// For output slot <c>t</c>, copies <c>input[t - slotShift]</c> when that source
+    /// slot is in range; otherwise copies <paramref name="identityFill"/>.
+    /// </summary>
+    public static void ShiftSlots<T>(
+        Tensor<T> input,
+        int slotShift,
+        Tensor<T> identityFill,
+        Tensor<T> output)
+    {
+        ValidateShiftSlots(input, identityFill, output, out int slotCount, out int slotWidth);
+        if (slotCount == 0)
+            return;
+
+        var src = input.AsSpan();
+        var identity = identityFill.AsSpan();
+        var dst = output.AsWritableSpan();
+        if (ReferenceEquals(input.GetDataArray(), output.GetDataArray()))
+        {
+            var tmp = new T[dst.Length];
+            ShiftSlotsCore(src, slotShift, identity, tmp, slotCount, slotWidth);
+            tmp.CopyTo(dst);
+            return;
+        }
+
+        ShiftSlotsCore(src, slotShift, identity, dst, slotCount, slotWidth);
+    }
+
+    /// <summary>
+    /// Fused split-complex HRR shifted bind over rank-2 sequences laid out as
+    /// <c>[T, 2D]</c>, with each slot storing <c>Re[0..D), Im[0..D)</c>.
+    /// Computes <c>output[t] = seqA[t] * seqB[t - slotOffset]</c>; out-of-range
+    /// slots use the complex multiplicative identity, so <c>output[t] = seqA[t]</c>.
+    /// </summary>
+    public static void HrrBindShifted(
+        Tensor<double> seqA,
+        Tensor<double> seqB,
+        int slotOffset,
+        Tensor<double> output)
+    {
+        ValidateSplitComplexSequence(seqA, seqB, output, out int slotCount, out int codeDim);
+        if (slotCount == 0)
+            return;
+
+        var a = seqA.AsSpan();
+        var b = seqB.AsSpan();
+        var dst = output.AsWritableSpan();
+        if (ReferenceEquals(seqA.GetDataArray(), output.GetDataArray())
+            || ReferenceEquals(seqB.GetDataArray(), output.GetDataArray()))
+        {
+            var tmp = new double[dst.Length];
+            HrrBindShiftedCoreDouble(a, b, slotOffset, tmp, slotCount, codeDim);
+            tmp.CopyTo(dst);
+            return;
+        }
+
+        HrrBindShiftedCoreDouble(a, b, slotOffset, dst, slotCount, codeDim);
+    }
+
+    /// <inheritdoc cref="HrrBindShifted(Tensor{double}, Tensor{double}, int, Tensor{double})"/>
+    public static void HrrBindShifted(
+        Tensor<float> seqA,
+        Tensor<float> seqB,
+        int slotOffset,
+        Tensor<float> output)
+    {
+        ValidateSplitComplexSequence(seqA, seqB, output, out int slotCount, out int codeDim);
+        if (slotCount == 0)
+            return;
+
+        var a = seqA.AsSpan();
+        var b = seqB.AsSpan();
+        var dst = output.AsWritableSpan();
+        if (ReferenceEquals(seqA.GetDataArray(), output.GetDataArray())
+            || ReferenceEquals(seqB.GetDataArray(), output.GetDataArray()))
+        {
+            var tmp = new float[dst.Length];
+            HrrBindShiftedCoreFloat(a, b, slotOffset, tmp, slotCount, codeDim);
+            tmp.CopyTo(dst);
+            return;
+        }
+
+        HrrBindShiftedCoreFloat(a, b, slotOffset, dst, slotCount, codeDim);
+    }
+
+    private static void ValidateShiftSlots<T>(
+        Tensor<T> input,
+        Tensor<T> identityFill,
+        Tensor<T> output,
+        out int slotCount,
+        out int slotWidth)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (identityFill is null) throw new ArgumentNullException(nameof(identityFill));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input.Rank != 2)
+            throw new ArgumentException("input must be rank-2 [T, slotWidth].", nameof(input));
+        if (identityFill.Rank != 1)
+            throw new ArgumentException("identityFill must be rank-1 [slotWidth].", nameof(identityFill));
+        if (output.Rank != 2)
+            throw new ArgumentException("output must be rank-2 [T, slotWidth].", nameof(output));
+
+        slotCount = input.Shape[0];
+        slotWidth = input.Shape[1];
+        if (identityFill.Shape[0] != slotWidth)
+            throw new ArgumentException(
+                $"identityFill length {identityFill.Shape[0]} must equal slot width {slotWidth}.",
+                nameof(identityFill));
+        if (output.Shape[0] != slotCount || output.Shape[1] != slotWidth)
+            throw new ArgumentException(
+                $"output shape [{output.Shape[0]}, {output.Shape[1]}] must equal input [{slotCount}, {slotWidth}].",
+                nameof(output));
+    }
+
+    private static void ShiftSlotsCore<T>(
+        ReadOnlySpan<T> src,
+        int slotShift,
+        ReadOnlySpan<T> identity,
+        Span<T> dst,
+        int slotCount,
+        int slotWidth)
+    {
+        if (slotShift == 0)
+        {
+            src.CopyTo(dst);
+            return;
+        }
+
+        if (slotShift >= slotCount || slotShift <= -slotCount)
+        {
+            FillIdentitySlots(identity, dst, slotCount, slotWidth);
+            return;
+        }
+
+        if (slotShift > 0)
+        {
+            FillIdentitySlots(identity, dst.Slice(0, slotShift * slotWidth), slotShift, slotWidth);
+            src.Slice(0, (slotCount - slotShift) * slotWidth)
+                .CopyTo(dst.Slice(slotShift * slotWidth));
+            return;
+        }
+
+        int leftShift = -slotShift;
+        src.Slice(leftShift * slotWidth, (slotCount - leftShift) * slotWidth)
+            .CopyTo(dst);
+        FillIdentitySlots(
+            identity,
+            dst.Slice((slotCount - leftShift) * slotWidth),
+            leftShift,
+            slotWidth);
+    }
+
+    private static void FillIdentitySlots<T>(
+        ReadOnlySpan<T> identity,
+        Span<T> dst,
+        int slotCount,
+        int slotWidth)
+    {
+        for (int t = 0; t < slotCount; t++)
+            identity.CopyTo(dst.Slice(t * slotWidth, slotWidth));
+    }
+
+    private static void ValidateSplitComplexSequence<T>(
+        Tensor<T> seqA,
+        Tensor<T> seqB,
+        Tensor<T> output,
+        out int slotCount,
+        out int codeDim)
+    {
+        if (seqA is null) throw new ArgumentNullException(nameof(seqA));
+        if (seqB is null) throw new ArgumentNullException(nameof(seqB));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (seqA.Rank != 2)
+            throw new ArgumentException("seqA must be rank-2 [T, 2D].", nameof(seqA));
+        if (seqB.Rank != 2)
+            throw new ArgumentException("seqB must be rank-2 [T, 2D].", nameof(seqB));
+        if (output.Rank != 2)
+            throw new ArgumentException("output must be rank-2 [T, 2D].", nameof(output));
+
+        slotCount = seqA.Shape[0];
+        int stateDim = seqA.Shape[1];
+        if (stateDim <= 0 || (stateDim & 1) != 0)
+            throw new ArgumentException("seqA state width must be positive and even: [T, 2D].", nameof(seqA));
+        if (seqB.Shape[0] != slotCount || seqB.Shape[1] != stateDim)
+            throw new ArgumentException(
+                $"seqB shape [{seqB.Shape[0]}, {seqB.Shape[1]}] must equal seqA [{slotCount}, {stateDim}].",
+                nameof(seqB));
+        if (output.Shape[0] != slotCount || output.Shape[1] != stateDim)
+            throw new ArgumentException(
+                $"output shape [{output.Shape[0]}, {output.Shape[1]}] must equal seqA [{slotCount}, {stateDim}].",
+                nameof(output));
+
+        codeDim = stateDim / 2;
+    }
+
+    private static void HrrBindShiftedCoreDouble(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        int slotOffset,
+        Span<double> dst,
+        int slotCount,
+        int codeDim)
+    {
+        int stateDim = 2 * codeDim;
+        double[] tmpRR = ArrayPool<double>.Shared.Rent(codeDim);
+        double[] tmpII = ArrayPool<double>.Shared.Rent(codeDim);
+        double[] tmpRI = ArrayPool<double>.Shared.Rent(codeDim);
+        double[] tmpIR = ArrayPool<double>.Shared.Rent(codeDim);
+        try
+        {
+            var rr = tmpRR.AsSpan(0, codeDim);
+            var ii = tmpII.AsSpan(0, codeDim);
+            var ri = tmpRI.AsSpan(0, codeDim);
+            var ir = tmpIR.AsSpan(0, codeDim);
+            for (int t = 0; t < slotCount; t++)
+            {
+                int aOff = t * stateDim;
+                int bSlot = t - slotOffset;
+                var outSlot = dst.Slice(aOff, stateDim);
+                if ((uint)bSlot >= (uint)slotCount)
+                {
+                    a.Slice(aOff, stateDim).CopyTo(outSlot);
+                    continue;
+                }
+
+                int bOff = bSlot * stateDim;
+                var aR = a.Slice(aOff, codeDim);
+                var aI = a.Slice(aOff + codeDim, codeDim);
+                var bR = b.Slice(bOff, codeDim);
+                var bI = b.Slice(bOff + codeDim, codeDim);
+                var rR = outSlot.Slice(0, codeDim);
+                var rI = outSlot.Slice(codeDim, codeDim);
+
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(aR, bR, rr);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(aI, bI, ii);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(aR, bI, ri);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(aI, bR, ir);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<SubtractOperatorDouble>(rr, ii, rR);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<AddOperatorDouble>(ri, ir, rI);
+            }
+        }
+        finally
+        {
+            ArrayPool<double>.Shared.Return(tmpRR);
+            ArrayPool<double>.Shared.Return(tmpII);
+            ArrayPool<double>.Shared.Return(tmpRI);
+            ArrayPool<double>.Shared.Return(tmpIR);
+        }
+    }
+
+    private static void HrrBindShiftedCoreFloat(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        int slotOffset,
+        Span<float> dst,
+        int slotCount,
+        int codeDim)
+    {
+        int stateDim = 2 * codeDim;
+        float[] tmpRR = ArrayPool<float>.Shared.Rent(codeDim);
+        float[] tmpII = ArrayPool<float>.Shared.Rent(codeDim);
+        float[] tmpRI = ArrayPool<float>.Shared.Rent(codeDim);
+        float[] tmpIR = ArrayPool<float>.Shared.Rent(codeDim);
+        try
+        {
+            var rr = tmpRR.AsSpan(0, codeDim);
+            var ii = tmpII.AsSpan(0, codeDim);
+            var ri = tmpRI.AsSpan(0, codeDim);
+            var ir = tmpIR.AsSpan(0, codeDim);
+            for (int t = 0; t < slotCount; t++)
+            {
+                int aOff = t * stateDim;
+                int bSlot = t - slotOffset;
+                var outSlot = dst.Slice(aOff, stateDim);
+                if ((uint)bSlot >= (uint)slotCount)
+                {
+                    a.Slice(aOff, stateDim).CopyTo(outSlot);
+                    continue;
+                }
+
+                int bOff = bSlot * stateDim;
+                var aR = a.Slice(aOff, codeDim);
+                var aI = a.Slice(aOff + codeDim, codeDim);
+                var bR = b.Slice(bOff, codeDim);
+                var bI = b.Slice(bOff + codeDim, codeDim);
+                var rR = outSlot.Slice(0, codeDim);
+                var rI = outSlot.Slice(codeDim, codeDim);
+
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorFloat>(aR, bR, rr);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorFloat>(aI, bI, ii);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorFloat>(aR, bI, ri);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorFloat>(aI, bR, ir);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<SubtractOperatorFloat>(rr, ii, rR);
+                TensorPrimitivesCore.InvokeSpanSpanIntoSpan<AddOperatorFloat>(ri, ir, rI);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(tmpRR);
+            ArrayPool<float>.Shared.Return(tmpII);
+            ArrayPool<float>.Shared.Return(tmpRI);
+            ArrayPool<float>.Shared.Return(tmpIR);
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────
     // HopfieldRetrieve
