@@ -148,9 +148,8 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
             {
                 if (eng is DirectGpuTensorEngine gpu)
                 {
-                    var eager = gpu.FusedSparseLinear(
-                        capturedInput, rowOffsets, colIndices, values, capturedBias, capturedActivation);
-                    eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    gpu.FusedSparseLinearInto(
+                        output, capturedInput, rowOffsets, colIndices, values, capturedBias, capturedActivation);
                 }
                 else
                 {

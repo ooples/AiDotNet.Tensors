@@ -64,6 +64,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
+        // True iff Issue301Fused kernels (LoRA, DDIM, sparse-linear) compiled
+        // and registered successfully on this backend. Public surface methods
+        // gate on this so a partial-cache compile failure surfaces a clear
+        // error instead of crashing inside Execute1D.
+        private bool _issue301KernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
         private const int MaxPooledBufferElements = 1_048_576;
         private const int MaxPooledBuffersPerSize = 4;
@@ -554,14 +559,47 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in Kernels.FusedLinearKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedLinearProgram, name);
 
+                // Issue #301 fused kernels are an optional capability — older
+                // OpenCL drivers may reject the half/sub-group features used.
+                // Build the cache atomically: if ANY individual kernel fails
+                // to materialise, roll back the partial inserts so dispatch
+                // never reads a half-populated cache and silently crashes.
                 try
                 {
                     var issue301Program = CompileOrLoadCached(Kernels.Issue301FusedKernels.GetSource(), optimizationFlags, "Issue #301 fused kernels");
-                    _programs.Add(issue301Program);
-                    foreach (var name in Kernels.Issue301FusedKernels.GetKernelNames())
-                        _kernelCache[name] = new DirectOpenClKernel(_context, issue301Program, name);
+                    var issue301Names = Kernels.Issue301FusedKernels.GetKernelNames();
+                    var staged = new List<KeyValuePair<string, DirectOpenClKernel>>(issue301Names.Length);
+                    bool kernelOk = true;
+                    foreach (var name in issue301Names)
+                    {
+                        try
+                        {
+                            staged.Add(new KeyValuePair<string, DirectOpenClKernel>(
+                                name, new DirectOpenClKernel(_context, issue301Program, name)));
+                        }
+                        catch (Exception kex)
+                        {
+                            WriteDiag($"[OpenClBackend] Issue #301 kernel '{name}' failed to materialise: {kex.Message}");
+                            kernelOk = false;
+                            break;
+                        }
+                    }
+                    if (kernelOk)
+                    {
+                        _programs.Add(issue301Program);
+                        foreach (var kv in staged) _kernelCache[kv.Key] = kv.Value;
+                        _issue301KernelsAvailable = true;
+                    }
+                    else
+                    {
+                        foreach (var kv in staged) kv.Value.Dispose();
+                        issue301Program.Dispose();
+                    }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    WriteDiag($"[OpenClBackend] Issue #301 fused-kernel program compile failed: {ex.Message}. Backend will reject FusedLoRAForward/FusedDDIMStep/FusedSparseLinear.");
+                }
 
                 // Compile IoU loss kernels
                 var iouProgram = CompileOrLoadCached(Kernels.IoUKernels.GetSource(), optimizationFlags, "IoU loss kernels");

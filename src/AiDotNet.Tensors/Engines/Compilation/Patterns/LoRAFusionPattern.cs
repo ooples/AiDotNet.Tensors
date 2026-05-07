@@ -124,8 +124,10 @@ internal sealed class LoRAFusionPattern : IFusionPattern
             {
                 if (eng is DirectGpuTensorEngine gpu)
                 {
-                    var eager = gpu.FusedLoRAForward(capturedInput, capturedBase, capturedA, capturedB, capturedScaling);
-                    eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    // Destination-aware overload skips the alloc + CopyTo
+                    // round-trip the eager wrapper would otherwise force.
+                    gpu.FusedLoRAForwardInto(
+                        output, capturedInput, capturedBase, capturedA, capturedB, capturedScaling);
                 }
                 else
                 {

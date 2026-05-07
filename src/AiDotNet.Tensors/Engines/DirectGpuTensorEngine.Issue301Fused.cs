@@ -15,7 +15,31 @@ public partial class DirectGpuTensorEngine
         Tensor<float> loraB,
         float scaling)
     {
+        ValidateLoRA(input, baseOutput, loraA, loraB, out int batch, out _, out _, out int outFeat);
+        var output = new Tensor<float>(new[] { batch, outFeat });
+        FusedLoRAForwardInto(output, input, baseOutput, loraA, loraB, scaling);
+        return output;
+    }
+
+    /// <summary>
+    /// Destination-aware variant: writes into a pre-allocated <paramref name="output"/>
+    /// instead of allocating + copying. Compiled-graph fusion lowers to this so the
+    /// fused-LoRA node doesn't pay the same allocate-then-CopyTo round-trip the
+    /// allocate-and-return overload would.
+    /// </summary>
+    public void FusedLoRAForwardInto(
+        Tensor<float> output,
+        Tensor<float> input,
+        Tensor<float> baseOutput,
+        Tensor<float> loraA,
+        Tensor<float> loraB,
+        float scaling)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
         ValidateLoRA(input, baseOutput, loraA, loraB, out int batch, out int inFeat, out int rank, out int outFeat);
+        if (output.Rank != 2 || output.Shape[0] != batch || output.Shape[1] != outFeat)
+            throw new ArgumentException(
+                $"output shape must be [{batch}, {outFeat}].", nameof(output));
 
         if (TryGetBackend(out var backend) && backend is IIssue301FusedBackend fusedBackend)
         {
@@ -27,17 +51,20 @@ public partial class DirectGpuTensorEngine
                 var glb = UploadTensorRaw(backend, loraB);
                 var go = backend.AllocateBuffer(batch * outFeat);
                 fusedBackend.FusedLoRAForward(gi, gb, ga, glb, go, batch, inFeat, rank, outFeat, scaling);
-                return DeferTensorResult<float>(backend, go, batch * outFeat, new[] { batch, outFeat });
+                // Download directly into the caller's destination instead of
+                // allocating a new tensor and copying.
+                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
+                    (float[])(object)output.GetDataArray(), batch * outFeat);
+                return;
             }
-            catch
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                // Fall through to the CPU fused helper; correctness beats GPU availability.
+                // CPU fallback — preserves correctness when GPU dispatch fails.
+                LogGpuFallback(nameof(FusedLoRAForwardInto), ex);
             }
         }
 
-        var output = new Tensor<float>(new[] { batch, outFeat });
         CpuFusedOperations.FusedLoRAForward(input, baseOutput, loraA, loraB, scaling, output);
-        return output;
     }
 
     public Tensor<float> FusedDDIMStep(
@@ -47,6 +74,24 @@ public partial class DirectGpuTensorEngine
         float alphaBarTMinus1)
     {
         ValidateDDIM(xT, epsilonTheta, alphaBarT, alphaBarTMinus1);
+        var output = new Tensor<float>(xT.Shape.ToArray());
+        FusedDDIMStepInto(output, xT, epsilonTheta, alphaBarT, alphaBarTMinus1);
+        return output;
+    }
+
+    /// <summary>Destination-aware variant of <see cref="FusedDDIMStep"/>.</summary>
+    public void FusedDDIMStepInto(
+        Tensor<float> output,
+        Tensor<float> xT,
+        Tensor<float> epsilonTheta,
+        float alphaBarT,
+        float alphaBarTMinus1)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        ValidateDDIM(xT, epsilonTheta, alphaBarT, alphaBarTMinus1);
+        if (output.Length != xT.Length)
+            throw new ArgumentException(
+                $"output length ({output.Length}) must equal xT length ({xT.Length}).", nameof(output));
 
         if (TryGetBackend(out var backend) && backend is IIssue301FusedBackend fusedBackend)
         {
@@ -56,17 +101,17 @@ public partial class DirectGpuTensorEngine
                 var ge = UploadTensorRaw(backend, epsilonTheta);
                 var go = backend.AllocateBuffer(xT.Length);
                 fusedBackend.FusedDDIMStep(gx, ge, go, xT.Length, alphaBarT, alphaBarTMinus1);
-                return DeferTensorResult<float>(backend, go, xT.Length, xT.Shape.ToArray());
+                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
+                    (float[])(object)output.GetDataArray(), xT.Length);
+                return;
             }
-            catch
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                // Fall through to CPU fused helper.
+                LogGpuFallback(nameof(FusedDDIMStepInto), ex);
             }
         }
 
-        var output = new Tensor<float>(xT.Shape.ToArray());
         CpuFusedOperations.FusedDDIMStep(xT, epsilonTheta, alphaBarT, alphaBarTMinus1, output);
-        return output;
     }
 
     public Tensor<float> FusedSparseLinear(
@@ -78,7 +123,28 @@ public partial class DirectGpuTensorEngine
         FusedActivationType activation)
     {
         ValidateSparseLinear(input, sparseRowOffsets, sparseColIndices, sparseValues, bias,
+            out int batch, out _, out int outFeat, out _);
+        var output = new Tensor<float>(new[] { batch, outFeat });
+        FusedSparseLinearInto(output, input, sparseRowOffsets, sparseColIndices, sparseValues, bias, activation);
+        return output;
+    }
+
+    /// <summary>Destination-aware variant of <see cref="FusedSparseLinear"/>.</summary>
+    public void FusedSparseLinearInto(
+        Tensor<float> output,
+        Tensor<float> input,
+        int[] sparseRowOffsets,
+        int[] sparseColIndices,
+        Tensor<float> sparseValues,
+        Tensor<float>? bias,
+        FusedActivationType activation)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        ValidateSparseLinear(input, sparseRowOffsets, sparseColIndices, sparseValues, bias,
             out int batch, out int inFeat, out int outFeat, out int nnz);
+        if (output.Rank != 2 || output.Shape[0] != batch || output.Shape[1] != outFeat)
+            throw new ArgumentException(
+                $"output shape must be [{batch}, {outFeat}].", nameof(output));
 
         if (IsGpuSparseActivationSupported(activation)
             && TryGetBackend(out var backend)
@@ -99,18 +165,26 @@ public partial class DirectGpuTensorEngine
                     gi, csr.Buffer, gv, gb, go,
                     batch, inFeat, outFeat, nnz, bias is null ? 0 : 1, (int)activation);
 
-                return DeferTensorResult<float>(backend, go, batch * outFeat, new[] { batch, outFeat });
+                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
+                    (float[])(object)output.GetDataArray(), batch * outFeat);
+                return;
             }
-            catch
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                // Fall through to CPU fused helper.
+                LogGpuFallback(nameof(FusedSparseLinearInto), ex);
             }
         }
 
-        var output = new Tensor<float>(new[] { batch, outFeat });
         CpuFusedOperations.FusedSparseLinear(
             input, sparseRowOffsets, sparseColIndices, sparseValues, bias, activation, output);
-        return output;
+    }
+
+    private static void LogGpuFallback(string opName, Exception ex)
+    {
+        // Diagnostic-only — kept lightweight so the hot fallback path
+        // doesn't drag in a logger dependency.
+        System.Diagnostics.Debug.WriteLine(
+            $"[DirectGpuTensorEngine.{opName}] GPU dispatch failed, falling back to CPU: {ex.GetType().Name}: {ex.Message}");
     }
 
     private static void ValidateLoRA(

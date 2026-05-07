@@ -44,16 +44,27 @@ internal static class FusionPatternRegistry
     public static void Register(IFusionPattern pattern)
     {
         if (pattern is null) throw new ArgumentNullException(nameof(pattern));
-        bool isNew = _patterns.TryAdd(pattern.Name, pattern);
-        if (!isNew)
-        {
-            // Replace in place — preserves position in the ordered list.
-            _patterns[pattern.Name] = pattern;
-            // No need to rebuild order list; same name keeps the slot.
-            return;
-        }
+        // Always rebuild under the order lock so dictionary update and
+        // ordered-snapshot rebuild are atomic. Previously a re-registration
+        // updated _patterns but left _ordered pointing at the stale instance —
+        // CpuFusionPass kept calling the old pattern.
         lock (_orderLock)
         {
+            bool isNew = _patterns.TryAdd(pattern.Name, pattern);
+            if (!isNew)
+            {
+                _patterns[pattern.Name] = pattern;
+                // Rebuild the ordered snapshot in place, swapping the new
+                // instance into the slot the old one occupied so registration
+                // priority is preserved.
+                var prevR = _ordered;
+                var nextR = new List<IFusionPattern>(prevR.Count);
+                foreach (var p in prevR)
+                    nextR.Add(p.Name == pattern.Name ? pattern : p);
+                _ordered = nextR;
+                return;
+            }
+
             var prev = _ordered;
             var next = new List<IFusionPattern>(prev.Count + 1);
             next.AddRange(prev);

@@ -1633,6 +1633,15 @@ public static class CpuFusedOperations
         if (!(alphaBarTMinus1 >= 0f && alphaBarTMinus1 <= 1f))
             throw new ArgumentOutOfRangeException(nameof(alphaBarTMinus1),
                 $"alphaBarTMinus1 must be in [0, 1]; got {alphaBarTMinus1}.");
+        // DDIM is a denoising (backward-time) sampler: at step t-1 the latent
+        // is closer to the clean image so its signal level ᾱ_{t-1} must be
+        // >= ᾱ_t. Reversed inputs would silently produce a noise-adding step
+        // (the c_eps coefficient flips sign), corrupting the sample.
+        if (alphaBarTMinus1 < alphaBarT)
+            throw new ArgumentException(
+                $"alphaBarTMinus1 ({alphaBarTMinus1}) must be >= alphaBarT ({alphaBarT}); " +
+                "DDIM steps backward in time, so the previous step has more signal.",
+                nameof(alphaBarTMinus1));
 
         // Pre-collapse the two-stage formula into per-element coefficients.
         // Doing this in double avoids catastrophic cancellation at the
@@ -1802,15 +1811,24 @@ public static class CpuFusedOperations
         // FusedLayerNormActivation, etc. all use.
         var activationFn = GetFloatActivation(activation);
 
-        // Per-(batch, output-row) work is `nnz_per_row` FMAs. We
-        // parallelise over batch when batch*outFeat is large enough to
-        // amortise dispatch; otherwise sequential.
-        bool parallel = batch * outFeat >= PARALLEL_THRESHOLD;
+        // Per-(batch, output-row) work is `nnz_per_row` FMAs. We parallelise
+        // over the FLAT (batch, outRow) index — not just batch — so that
+        // batch=1 (the latency-sensitive sparse-inference regime) can still
+        // use multiple cores when outFeat is large. The dispatch threshold
+        // amortises across nnz/row · totalRows since per-row work scales
+        // with row sparsity.
+        long totalWork = (long)batch * outFeat;
+        bool parallel = totalWork >= PARALLEL_THRESHOLD;
         if (parallel)
         {
-            Parallel.For(0, batch, b =>
-                FusedSparseLinearProcessRow(inArr, sparseRowOffsets, sparseColIndices,
-                    valArr, biasArr, outArr, b, inFeat, outFeat, activationFn));
+            int totalRows = batch * outFeat;
+            Parallel.For(0, totalRows, idx =>
+            {
+                int b = idx / outFeat;
+                int j = idx - b * outFeat;
+                FusedSparseLinearOneRow(inArr, sparseRowOffsets, sparseColIndices,
+                    valArr, biasArr, outArr, b, j, inFeat, outFeat, activationFn);
+            });
         }
         else
         {
@@ -1840,6 +1858,25 @@ public static class CpuFusedOperations
             }
             output[outputBase + j] = activationFn(sum);
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FusedSparseLinearOneRow(
+        float[] input, int[] rowOffsets, int[] colIndices, float[] values,
+        float[]? bias, float[] output,
+        int batchIdx, int j, int inFeat, int outFeat, Func<float, float> activationFn)
+    {
+        int inputBase = batchIdx * inFeat;
+        int outputBase = batchIdx * outFeat;
+        int start = rowOffsets[j];
+        int end = rowOffsets[j + 1];
+        float sum = bias is null ? 0f : bias[j];
+        for (int p = start; p < end; p++)
+        {
+            int col = colIndices[p];
+            sum += input[inputBase + col] * values[p];
+        }
+        output[outputBase + j] = activationFn(sum);
     }
 
     #endregion

@@ -4,6 +4,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public sealed partial class OpenClBackend
 {
+    private void EnsureIssue301KernelsAvailable(string opName)
+    {
+        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        if (!_issue301KernelsAvailable)
+            throw new NotSupportedException(
+                $"OpenCL Issue #301 fused kernels are not available on this device — " +
+                $"compile failed during backend initialization. {opName} cannot be dispatched. " +
+                $"Fall back to the eager decomposed path.");
+    }
+
+    private DirectOpenClContext RequireContext(string opName)
+    {
+        EnsureIssue301KernelsAvailable(opName);
+        // EnsureIssue301KernelsAvailable already validated _context is non-null;
+        // this restates it locally so net471's nullable analysis is satisfied
+        // without depending on [MemberNotNull] (which net471 cannot honour).
+        return _context ?? throw new InvalidOperationException("OpenCL context not available");
+    }
+
     public void FusedLoRAForward(
         IGpuBuffer input,
         IGpuBuffer baseOutput,
@@ -16,7 +35,7 @@ public sealed partial class OpenClBackend
         int outputFeatures,
         float scaling)
     {
-        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        var ctx = RequireContext(nameof(FusedLoRAForward));
         var k = _kernelCache["issue301_fused_lora_forward"];
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -32,7 +51,7 @@ public sealed partial class OpenClBackend
         int total = batchSize * outputFeatures;
         if (total <= 0) return;
         k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
-        _context.Finish();
+        ctx.Finish();
     }
 
     public void FusedDDIMStep(
@@ -43,7 +62,7 @@ public sealed partial class OpenClBackend
         float alphaBarT,
         float alphaBarTMinus1)
     {
-        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        var ctx = RequireContext(nameof(FusedDDIMStep));
         var k = _kernelCache["issue301_fused_ddim_step"];
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)xT).Buffer.Handle);
@@ -54,7 +73,7 @@ public sealed partial class OpenClBackend
         k.SetArg(arg++, alphaBarTMinus1);
         if (size <= 0) return;
         k.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
-        _context.Finish();
+        ctx.Finish();
     }
 
     public void FusedSparseLinear(
@@ -70,7 +89,7 @@ public sealed partial class OpenClBackend
         int hasBias,
         int activation)
     {
-        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        var ctx = RequireContext(nameof(FusedSparseLinear));
         var k = _kernelCache["issue301_fused_sparse_linear"];
         uint arg = 0;
         k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -87,6 +106,6 @@ public sealed partial class OpenClBackend
         int total = batchSize * outputFeatures;
         if (total <= 0) return;
         k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
-        _context.Finish();
+        ctx.Finish();
     }
 }

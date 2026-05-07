@@ -103,13 +103,29 @@ internal sealed class LinearFusionPattern : IFusionPattern
             var finalOutput = activationNode != null ? activationNode.Output : add.Output;
 
             var input = matmul.Input0;
-            var weights = matmul.Input1 ?? matmul.Input0;
+            // Fail closed: a real matmul must have two distinct inputs. The
+            // earlier `?? matmul.Input0` fallback silently fused malformed
+            // graphs into self·self GEMMs.
+            if (matmul.Input1 is null) return null;
+            var weights = matmul.Input1;
 
+            // The add MUST consume the matmul output on one side; the *other*
+            // side is the bias. If the matmul output isn't on either side
+            // we're not actually fusing a bias-add — bail.
             Tensor<T> bias;
             if (ReferenceEquals(add.Input0, matmul.Output))
-                bias = add.Input1 ?? add.Input0;
-            else
+            {
+                if (add.Input1 is null) return null;
+                bias = add.Input1;
+            }
+            else if (ReferenceEquals(add.Input1, matmul.Output))
+            {
                 bias = add.Input0;
+            }
+            else
+            {
+                return null;
+            }
 
             // Only fuse if bias is 1D (broadcast bias add pattern).
             if (bias._shape.Length != 1) return null;
