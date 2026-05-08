@@ -142,7 +142,23 @@ internal sealed class PersistentParallelExecutor
             // Below grain size — run inline on the calling thread.
             // No worker wakeup, no completion-event wait, no
             // _executeLock contention. Workers stay parked.
-            for (int c = 0; c < numChunks; c++) action(c);
+            //
+            // Match the parallel path's exception semantics: capture
+            // the first thrown exception, finish the remaining chunks
+            // (the parallel path already runs main + workers to
+            // completion before the dispatcher re-throws), then
+            // re-throw at the end. Without this, a kernel that
+            // crosses the grain-size threshold mid-run (dynamic batch
+            // shrinking, varying inner shapes) would observe a
+            // behavior change between the two paths: chunks 1+
+            // skipped on the serial path, run on the parallel path.
+            Exception? firstException = null;
+            for (int c = 0; c < numChunks; c++)
+            {
+                try { action(c); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            if (firstException is not null) throw firstException;
             return;
         }
         Execute(numChunks, action);

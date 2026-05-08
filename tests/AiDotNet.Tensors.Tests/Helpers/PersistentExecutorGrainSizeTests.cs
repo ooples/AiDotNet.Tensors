@@ -136,6 +136,43 @@ public class PersistentExecutorGrainSizeTests
     }
 
     /// <summary>
+    /// Exception parity between serial-fallback and parallel modes.
+    /// The parallel <see cref="PersistentParallelExecutor.Execute(int, Action{int})"/>
+    /// path already runs every chunk before re-throwing the first
+    /// captured exception (see WorkerLoop's catch block + Execute's
+    /// re-throw at the end of the lock); the serial-fallback path
+    /// must do the same so callers don't observe a behavior change
+    /// when work happens to cross the grain-size threshold.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // small work → serial fallback
+    [InlineData(false)]  // large work → parallel dispatch
+    public void Execute_RethrowsFirstException_AfterAllChunksRan(bool small)
+    {
+        int numChunks = 8;
+        long totalWork = small
+            ? PersistentParallelExecutor.DefaultSerialGrainSize / 4
+            : (long)PersistentParallelExecutor.DefaultSerialGrainSize * 4;
+        int[] visits = new int[numChunks];
+
+        // Throw on chunk 2; every chunk index must still be visited.
+        var thrown = Assert.ThrowsAny<Exception>(() =>
+        {
+            PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, c =>
+            {
+                Interlocked.Increment(ref visits[c]);
+                if (c == 2) throw new InvalidOperationException("planted-exception-from-chunk-2");
+            });
+        });
+
+        Assert.Contains("planted-exception-from-chunk-2", thrown.Message);
+        for (int c = 0; c < numChunks; c++)
+            Assert.True(visits[c] == 1,
+                $"Chunk {c} visited {visits[c]} times after a sibling chunk threw — "
+                + "expected each chunk to run exactly once regardless of mode.");
+    }
+
+    /// <summary>
     /// Integration check on the actual BatchNorm hot path (issue #313's
     /// principal target). With a tiny [1, 32, 7, 7] shape — the kind of
     /// late-stage EfficientNet/MobileNet layer where channels=32 channels
