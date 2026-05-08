@@ -75,8 +75,20 @@ public static class TensorAllocator
             cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
-            Array.Clear(cached, 0,
-                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : totalSize);
+            // Issue #311: clear the ENTIRE pooled array, not just the
+            // logical portion. The pooled buffer may exceed totalSize
+            // (ArrayPool buckets pad to the next power of two; a 401,408-
+            // element rent returns a 524,288-element array), and the
+            // padding region carries the previous renter's bytes.
+            // Downstream kernels that read past the logical extent via
+            // SIMD overhang then observe non-zero garbage — making two
+            // forward passes through "logically identical" tensors
+            // diverge by 3-4% after a couple of layers (DBM clone-after-
+            // train). Clearing the whole array makes the zero-init
+            // contract layout-invariant: identical logical content +
+            // identical padding (= zero) → identical SIMD reduction
+            // order across pooled and freshly-allocated tensors.
+            Array.Clear(cached, 0, cached.Length);
             var memory = new Memory<T>(cached, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, cached);
         }
@@ -89,8 +101,10 @@ public static class TensorAllocator
             AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            Array.Clear(pooled, 0,
-                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
+            // Issue #311: clear the entire array, including the padding
+            // beyond totalSize. See the matching comment on the cached
+            // path above.
+            Array.Clear(pooled, 0, pooled.Length);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
@@ -135,9 +149,23 @@ public static class TensorAllocator
             cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
-            // Must clear reference types to avoid retaining stale objects
+            // Reference types: must clear EVERYTHING so we don't retain
+            // stale objects in the GC graph.
+            // Value types (issue #311): clear only the padding region
+            // (totalSize..cached.Length). The caller's contract is that
+            // it writes every element of the LOGICAL region, but
+            // downstream readers can still SIMD-overhang into padding
+            // and observe the prior renter's garbage — that produces
+            // ~3-4% drift between original (pooled-padded) and clone
+            // (freshly-allocated) Predict outputs after a few layers.
+            // Clearing only the padding preserves the "skip clear of
+            // logical region" optimization that is the whole point of
+            // RentUninitialized; the clear-padding-only cost is the
+            // ~25% bucket overhead, not the full buffer.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(cached, 0, cached.Length);
+            else if (cached.Length > totalSize)
+                Array.Clear(cached, totalSize, cached.Length - totalSize);
             var memory = new Memory<T>(cached, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, cached);
         }
@@ -145,9 +173,11 @@ public static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Must clear reference types to avoid retaining stale objects
+            // See matching #311 comment on the cached path above.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(pooled, 0, pooled.Length);
+            else if (pooled.Length > totalSize)
+                Array.Clear(pooled, totalSize, pooled.Length - totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
