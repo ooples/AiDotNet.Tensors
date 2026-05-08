@@ -290,6 +290,12 @@ class Program
         }
 #endif
 
+        if (args[0] == "--304-gemv")
+        {
+            Issue304GemvBenchmark.Run();
+            return;
+        }
+
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
@@ -499,6 +505,7 @@ class Program
         Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");
         Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
         Console.WriteLine("  --296-diffusion     : 50-step denoising loop vs PyTorch nn.Sequential");
+        Console.WriteLine("  --304-gemv          : Issue #304 [N,D]x[D,1] GEMV compiled-cache benchmark vs TorchSharp CPU");
         Console.WriteLine("  --308-vsa           : Cross-position HRR ShiftSlots/HrrBindShifted benchmark");
 #if NET8_0_OR_GREATER
         Console.WriteLine("  --305-init          : First-forward weight-init peak benchmark vs old temp+copy and TorchSharp");

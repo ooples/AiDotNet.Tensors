@@ -668,6 +668,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var cB = (float[])(object)inputB.GetDataArray();
             var cOut = (float[])(object)output.GetDataArray();
 
+            if (N == 1)
+            {
+                return eng => TensorMatMulGemvFloat(cA, cB, cOut, M, K);
+            }
+
             if (allowCachedB)
             {
                 return eng =>
@@ -1697,6 +1702,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // which is not yet supported by the compiled step infrastructure.
 
         return null;
+    }
+
+    private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)
+    {
+        const int parallelThreshold = 128 * 1024;
+        const int chunkSize = 256;
+        if ((long)rows * cols < parallelThreshold)
+        {
+            for (int row = 0; row < rows; row++)
+            {
+                output[row] = TensorPrimitivesCore.Dot(
+                    matrix.AsSpan(row * cols, cols),
+                    vector.AsSpan(0, cols));
+            }
+
+            return;
+        }
+
+        int chunks = (rows + chunkSize - 1) / chunkSize;
+        Parallel.For(0, chunks, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int end = Math.Min(start + chunkSize, rows);
+            for (int row = start; row < end; row++)
+            {
+                output[row] = TensorPrimitivesCore.Dot(
+                    matrix.AsSpan(row * cols, cols),
+                    vector.AsSpan(0, cols));
+            }
+        });
     }
 
     /// <summary>

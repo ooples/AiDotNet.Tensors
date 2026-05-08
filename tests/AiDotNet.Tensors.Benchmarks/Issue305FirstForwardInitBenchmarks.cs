@@ -23,6 +23,13 @@ public class Issue305FirstForwardInitBenchmarks
     private Tensor<float> _destination = null!;
     private TorchTensor _torchDestination = null!;
 
+    // Snapshot of process-global Torch settings captured in Setup() and
+    // restored in Cleanup() so this benchmark doesn't bleed state into
+    // sibling benchmarks that BDN runs in the same process (e.g. when
+    // dispatched via --full or --vs-torchsharp-cpu).
+    private bool _priorGradEnabled;
+    private int _priorNumThreads;
+
     [Params(1_000_000, 16_777_216)]
     public int Elements { get; set; }
 
@@ -32,6 +39,8 @@ public class Issue305FirstForwardInitBenchmarks
         _engine = new CpuEngine();
         _destination = new Tensor<float>([Elements]);
 
+        _priorGradEnabled = torch.is_grad_enabled();
+        _priorNumThreads = torch.get_num_threads();
         torch.set_grad_enabled(false);
         torch.set_num_threads(Environment.ProcessorCount);
         _torchDestination = torch.empty([Elements], device: torch.CPU);
@@ -41,6 +50,10 @@ public class Issue305FirstForwardInitBenchmarks
     public void Cleanup()
     {
         _torchDestination.Dispose();
+        // Restore Torch's process-global settings so cross-benchmark state
+        // doesn't carry into the next benchmark in the same BDN run.
+        torch.set_num_threads(_priorNumThreads);
+        torch.set_grad_enabled(_priorGradEnabled);
     }
 
     [Benchmark(Baseline = true)]

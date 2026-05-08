@@ -93,6 +93,17 @@ public class GpuCpuConsistencyTests
         return Math.Abs((expected - actual) / expected) <= relativeTolerance;
     }
 
+    private static float DeterministicValue(int value)
+    {
+        unchecked
+        {
+            uint x = (uint)value * 747_796_405u + 2_891_336_453u;
+            x = ((x >> (int)((x >> 28) + 4)) ^ x) * 277_803_737u;
+            x = (x >> 22) ^ x;
+            return (x & 0xFFFF) / 65_535f - 0.5f;
+        }
+    }
+
     #region Addition Consistency Tests
 
     [SkippableFact]
@@ -678,6 +689,43 @@ public class GpuCpuConsistencyTests
         for (int i = 0; i < 5; i++)
         {
             Assert.Equal(result1[i], result2[i]);
+        }
+    }
+
+    #endregion
+
+    #region TensorMatMul GPU vs CPU Consistency Tests
+
+    [SkippableFact]
+    public void TensorMatMul_GemvAboveClBlastIndirectThreshold_GpuMatchesCpu()
+    {
+        SkipIfNoDirectGpu();
+
+        const int rows = 512;
+        const int cols = 64;
+        var weights = Enumerable.Range(0, rows * cols)
+            .Select(i => DeterministicValue(i + 304))
+            .ToArray();
+        var query = Enumerable.Range(0, cols)
+            .Select(i => DeterministicValue(i + 10_000))
+            .ToArray();
+
+        var a = new Tensor<float>(weights, new[] { rows, cols });
+        var b = new Tensor<float>(query, new[] { cols, 1 });
+
+        var cpuEngine = new CpuEngine();
+        using var gpuEngine = new DirectGpuTensorEngine();
+        var cpuResult = cpuEngine.TensorMatMul(a, b);
+        var gpuResult = gpuEngine.TensorMatMul(a, b);
+
+        Assert.Equal(cpuResult.Shape, gpuResult.Shape);
+        for (int i = 0; i < cpuResult.Length; i++)
+        {
+            float expected = cpuResult.GetFlat(i);
+            float actual = gpuResult.GetFlat(i);
+            float tolerance = 1e-4f + MathF.Abs(expected) * 1e-4f;
+            Assert.True(MathF.Abs(expected - actual) <= tolerance,
+                $"TensorMatMul GEMV mismatch at {i}: CPU={expected}, GPU={actual}");
         }
     }
 
