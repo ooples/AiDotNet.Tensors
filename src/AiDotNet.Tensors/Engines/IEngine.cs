@@ -5841,6 +5841,19 @@ public interface IEngine
     Tensor<T> TensorRandomNormal<T>(int[] shape, T mean, T stddev);
 
     /// <summary>
+    /// Fills an existing tensor with random values from a normal distribution.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">The tensor to fill in-place.</param>
+    /// <param name="mean">The mean of the distribution.</param>
+    /// <param name="stddev">The standard deviation of the distribution.</param>
+    /// <remarks>
+    /// Use this for weight initialization when the tensor identity must be preserved,
+    /// for example persistent/streaming weights registered before first forward.
+    /// </remarks>
+    void TensorRandomNormalInto<T>(Tensor<T> destination, T mean, T stddev);
+
+    /// <summary>
     /// Generates a tensor filled with random values from a uniform distribution within a specified range.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -5858,6 +5871,20 @@ public interface IEngine
     /// </para>
     /// </remarks>
     Tensor<T> TensorRandomUniformRange<T>(int[] shape, T min, T max, int? seed = null);
+
+    /// <summary>
+    /// Fills an existing tensor with random values from a uniform distribution within a specified range.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">The tensor to fill in-place.</param>
+    /// <param name="min">The minimum value (inclusive).</param>
+    /// <param name="max">The maximum value (exclusive).</param>
+    /// <param name="seed">Optional random seed for reproducibility.</param>
+    /// <remarks>
+    /// Use this for weight initialization when the tensor identity must be preserved,
+    /// for example persistent/streaming weights registered before first forward.
+    /// </remarks>
+    void TensorRandomUniformRangeInto<T>(Tensor<T> destination, T min, T max, int? seed = null);
 
     /// <summary>
     /// Generates a dropout mask tensor where each element is either zero or a scale value.
