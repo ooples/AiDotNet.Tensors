@@ -61,23 +61,35 @@ public class PersistentExecutorGrainSizeTests
         long totalWork = (long)PersistentParallelExecutor.DefaultSerialGrainSize * 4;
         var observed = new int[numChunks];
 
+        // Synchronization-based probe — deterministically detects at
+        // least one worker-thread execution without depending on a spin
+        // loop being long enough for the scheduler. Caller-thread
+        // chunks Wait briefly for any worker to signal; worker-thread
+        // chunks Set the event. Because the dispatcher's main thread
+        // runs chunks 0, _numWorkers+1, … round-robin AFTER workers
+        // are signaled, the caller-thread Wait gives the woken workers
+        // an actual scheduling window. If no worker ever runs (the
+        // bug we're trying to detect), the Wait times out and the
+        // assertion fails with a clean diagnostic.
+        using var workerSeen = new ManualResetEventSlim(false);
         PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, c =>
         {
-            // Spin a little so chunks don't all serialize through chunk 0
-            // before the workers have a chance to wake.
-            int x = 0;
-            for (int i = 0; i < 5_000; i++) x ^= i;
-            observed[c] = Thread.CurrentThread.ManagedThreadId ^ (x & 0);
+            int tid = Thread.CurrentThread.ManagedThreadId;
+            observed[c] = tid;
+            if (tid != callerId)
+                workerSeen.Set();
+            else
+                workerSeen.Wait(TimeSpan.FromMilliseconds(200));
         });
 
         bool sawOtherThread = false;
         for (int c = 0; c < numChunks; c++)
             if (observed[c] != callerId) { sawOtherThread = true; break; }
-        Assert.True(sawOtherThread,
+        Assert.True(sawOtherThread && workerSeen.IsSet,
             $"All {numChunks} chunks ran on caller thread {callerId} despite "
             + $"totalWork ({totalWork}) >> DefaultSerialGrainSize "
             + $"({PersistentParallelExecutor.DefaultSerialGrainSize}). The worker pool "
-            + "should have been engaged.");
+            + $"should have been engaged. workerSeen.IsSet={workerSeen.IsSet}.");
     }
 
     /// <summary>
@@ -96,19 +108,26 @@ public class PersistentExecutorGrainSizeTests
         int numChunks = Math.Max(2, Environment.ProcessorCount);
         var observed = new int[numChunks];
 
+        // Same synchronization-based probe as the AboveGrainSize test
+        // — deterministic worker detection rather than a spin race.
+        using var workerSeen = new ManualResetEventSlim(false);
         PersistentParallelExecutor.Instance.Execute(numChunks, c =>
         {
-            int x = 0;
-            for (int i = 0; i < 5_000; i++) x ^= i;
-            observed[c] = Thread.CurrentThread.ManagedThreadId ^ (x & 0);
+            int tid = Thread.CurrentThread.ManagedThreadId;
+            observed[c] = tid;
+            if (tid != callerId)
+                workerSeen.Set();
+            else
+                workerSeen.Wait(TimeSpan.FromMilliseconds(200));
         });
 
         bool sawOtherThread = false;
         for (int c = 0; c < numChunks; c++)
             if (observed[c] != callerId) { sawOtherThread = true; break; }
-        Assert.True(sawOtherThread,
+        Assert.True(sawOtherThread && workerSeen.IsSet,
             "2-arg Execute should continue to dispatch to the worker pool — "
-            + "backward-compatibility for callers that haven't been migrated.");
+            + "backward-compatibility for callers that haven't been migrated. "
+            + $"workerSeen.IsSet={workerSeen.IsSet}.");
     }
 
     /// <summary>
