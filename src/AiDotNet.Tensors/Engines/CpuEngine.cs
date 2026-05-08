@@ -16250,10 +16250,22 @@ public partial class CpuEngine : ITensorLevelEngine
             float epsF = numOps.ToDouble(eps) is double d ? (float)d : 1e-5f;
             var meanF = new float[channels];
             var varF = new float[channels];
+            // Allocate the output buffer to the LOGICAL extent
+            // (batch * channels * H * W = input.Length), NOT to inF.Length.
+            // The underlying float[] returned by GetDataArray() is allowed
+            // to be SIMD-padded — e.g. for [1, 32, 112, 112] the logical
+            // extent is 401,408 but the padded buffer can be 524,288 (the
+            // next multiple of 32 spatial / 128 channel for AVX-friendly
+            // layouts). The inner BatchNorm4DFloat kernel iterates strictly
+            // in logical-index space (offset = n * channels * spatialSize
+            // + c * spatialSize), so the output only needs to hold the
+            // logical extent — and TensorAllocator.Rent(shape, data) below
+            // hard-asserts data.Length == product(shape). Issue #310.
+            int logicalLength = input.Length;
 #if NET5_0_OR_GREATER
-            var outF = GC.AllocateUninitializedArray<float>(inF.Length);
+            var outF = GC.AllocateUninitializedArray<float>(logicalLength);
 #else
-            var outF = new float[inF.Length];
+            var outF = new float[logicalLength];
 #endif
             BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outF);
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
