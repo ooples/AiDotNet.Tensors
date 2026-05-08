@@ -60,10 +60,16 @@ public class PaddedBufferDeterminismTests
     }
 
     /// <summary>
-    /// Full forward chain (matmul → sigmoid → matmul) with the input
-    /// allocated via ArrayPool with garbage padding vs via the fresh
-    /// CLR allocator. Same logical values; outputs must match bit-for-
-    /// bit.
+    /// Full forward chain (matmul → sigmoid → matmul) with all
+    /// operands allocated via ArrayPool with garbage padding vs via
+    /// the fresh CLR allocator. Same logical values; outputs after
+    /// the SECOND matmul must match bit-for-bit.
+    ///
+    /// <para>Two matmuls (not one) so we exercise the original DBM
+    /// drift path: a sigmoid output (post-pool-allocated) is then
+    /// fed back into another matmul, and any padding-leak in the
+    /// second-stage matmul accumulates the divergence introduced
+    /// by the first stage's sigmoid output.</para>
     /// </summary>
     [Theory]
     [InlineData(8, 64, 32)]
@@ -79,30 +85,42 @@ public class PaddedBufferDeterminismTests
         var weightsVals = new float[hidden * outFeat];
         for (int i = 0; i < weightsVals.Length; i++) weightsVals[i] = (float)(rng.NextDouble() * 0.1);
 
-        // PADDED path — input rented from pool, padding seeded with
-        // large garbage values so any overhang read is detectable.
+        // Second-stage weights map [outFeat] → [hidden] so the chain
+        // has shape [batch, hidden] → [batch, outFeat] → [batch, hidden].
+        var weights2Vals = new float[outFeat * hidden];
+        for (int i = 0; i < weights2Vals.Length; i++) weights2Vals[i] = (float)(rng.NextDouble() * 0.1);
+
+        // PADDED path — every operand rented from the pool with
+        // large-magnitude garbage written into its padding region so
+        // any overhang read is detectable.
         var inputPad = RentWithGarbagePadding(new[] { batch, hidden }, inputVals, padValue: 999_999f);
         var weightsPad = RentWithGarbagePadding(new[] { hidden, outFeat }, weightsVals, padValue: -999_999f);
+        var weights2Pad = RentWithGarbagePadding(new[] { outFeat, hidden }, weights2Vals, padValue: 777_777f);
 
-        // FRESH path — non-padded backing storage.
+        // FRESH path — non-padded backing storage on every operand.
         var inputFresh = FreshTensor(new[] { batch, hidden }, inputVals);
         var weightsFresh = FreshTensor(new[] { hidden, outFeat }, weightsVals);
+        var weights2Fresh = FreshTensor(new[] { outFeat, hidden }, weights2Vals);
 
         var engine = new CpuEngine();
+        // Stage 1: matmul + sigmoid.
         var z1Pad = engine.TensorMatMul(inputPad, weightsPad);
         var a1Pad = engine.Sigmoid(z1Pad);
-
         var z1Fresh = engine.TensorMatMul(inputFresh, weightsFresh);
         var a1Fresh = engine.Sigmoid(z1Fresh);
+        // Stage 2: feed the (pool-allocated) sigmoid output back into
+        // another matmul — the part that previously produced DBM drift.
+        var z2Pad = engine.TensorMatMul(a1Pad, weights2Pad);
+        var z2Fresh = engine.TensorMatMul(a1Fresh, weights2Fresh);
 
-        var padSpan = a1Pad.AsSpan();
-        var freshSpan = a1Fresh.AsSpan();
+        var padSpan = z2Pad.AsSpan();
+        var freshSpan = z2Fresh.AsSpan();
         Assert.Equal(freshSpan.Length, padSpan.Length);
         for (int i = 0; i < padSpan.Length; i++)
         {
             Assert.True(padSpan[i] == freshSpan[i],
                 $"Mismatch at idx {i}: pooled-padded={padSpan[i]} vs fresh={freshSpan[i]} — "
-                + "padding region is leaking into the matmul/sigmoid output.");
+                + "padding region is leaking into the matmul→sigmoid→matmul output.");
         }
     }
 
