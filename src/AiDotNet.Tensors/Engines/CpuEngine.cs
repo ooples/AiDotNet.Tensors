@@ -16318,7 +16318,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // dispatch vs Parallel.For's ~50 µs). At BatchNorm call rates inside
         // training loops this saves ~45 µs per call. #209 close-parity:
         // closes ~3% of the gap to libtorch's MKL-DNN routing.
-        Helpers.PersistentParallelExecutor.Instance.Execute(channels, c =>
+        // #313: pass total element work so small-tensor BatchNorm calls
+        // (e.g. ViT-Base [768, 768] LayerNorm-like per-token gamma/beta)
+        // skip the dispatch entirely and run inline on the calling thread.
+        long totalWork = (long)batch * channels * spatialSize;
+        Helpers.PersistentParallelExecutor.Instance.Execute(channels, totalWork, c =>
         {
             BatchNorm4DFloatChannel(input, gamma, beta, eps, batch, channels, spatialSize,
                 invCount, c, meanOut, varOut, output);
