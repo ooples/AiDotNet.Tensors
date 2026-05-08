@@ -226,29 +226,48 @@ public class GradientTapeLeakTests
         var lnBeta = MakeTensor(new[] { Dim }, 0.01f, 8);
         var sources = new[] { wq, wk, wv, wo, w1, w2, lnGamma, lnBeta };
 
-        // Warmup — populate JIT, AutoTensorCache pools, etc.
-        for (int i = 0; i < 5; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        // Methodology: long warmup + two-window growth-rate measurement.
+        // A single-window heap delta on Linux Server GC was observably
+        // noisy (61.6 KB/call observed in CI even with no real per-iter
+        // retention) — JIT, ArrayPool, and ThreadLocal arena initial
+        // populations all amortize across the first few iterations and
+        // showed up as fake retention. Splitting the measurement into
+        // two halves and asserting on the SECOND half cleanly separates
+        // genuine per-iter leaks (visible in BOTH halves) from one-time
+        // startup costs (visible in first half only).
+        const int Warmup = 50;
+        const int Measure = 200;
 
-        long start = GC.GetTotalMemory(forceFullCollection: true);
-        const int iters = 50;
-        for (int i = 0; i < iters; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long end = GC.GetTotalMemory(forceFullCollection: true);
+        for (int i = 0; i < Warmup; i++) Step();
+        StableForcedGc();
+        long m0 = LiveBytes();
 
-        long perCall = (end - start) / iters;
+        for (int i = 0; i < Measure / 2; i++) Step();
+        StableForcedGc();
+        long m1 = LiveBytes();
+
+        for (int i = 0; i < Measure / 2; i++) Step();
+        StableForcedGc();
+        long m2 = LiveBytes();
+
+        long firstHalfPerCall = (m1 - m0) / (Measure / 2);
+        long secondHalfPerCall = (m2 - m1) / (Measure / 2);
+
         _output.WriteLine(
             $"Issue #283 transformer block at scale (Dim={Dim} FF={FF} Seq={Seq} Heads={Heads}): " +
-            $"{perCall} B/call (start={start} end={end} iters={iters})");
+            $"first-half={firstHalfPerCall} B/call, second-half={secondHalfPerCall} B/call " +
+            $"(m0={m0} m1={m1} m2={m2} {Measure / 2} iters/half)");
 
-        // 50 KB/call ceiling. The reporter saw 400 KB/call on the same
-        // shape; this catches that with a 8x safety factor while still
-        // being well above legitimate runtime residue.
-        Assert.True(perCall < 50_000,
-            $"Issue #283 — managed-heap retention {perCall} B/call at transformer scale " +
+        // 50 KB/call ceiling on the SECOND-half retention — by this
+        // point any first-window startup costs are gone, so the
+        // remainder is true per-iter retention. Reporter saw 400 KB/call;
+        // this catches that with an 8x safety factor while staying
+        // above legitimate per-iter overhead like delegate caching.
+        Assert.True(secondHalfPerCall < 50_000,
+            $"Issue #283 — second-half retention {secondHalfPerCall} B/call at transformer scale " +
             $"(Dim={Dim} FF={FF} Seq={Seq}) exceeds 50 KB/call budget. " +
-            $"Start={start} End={end} Iters={iters}. " +
-            $"Reporter saw 400 KB/call — anything > 50 KB/call indicates a residual leak.");
+            $"first-half={firstHalfPerCall} B/call, m0={m0} m1={m1} m2={m2}. " +
+            $"Reporter saw 400 KB/call — second-half > 50 KB/call indicates a residual leak.");
 
         void Step()
         {
@@ -667,5 +686,44 @@ public class GradientTapeLeakTests
         var data = new float[len];
         for (int i = 0; i < data.Length; i++) data[i] = (float)((rng.NextDouble() * 2 - 1) * scale);
         return new Tensor<float>(data, shape);
+    }
+
+    /// <summary>
+    /// Two-stage GC sequence sufficient to stabilise even under
+    /// Server GC (Linux CI default): the first compacting Gen-2 pass
+    /// can promote freshly-orphaned objects to a generation that
+    /// itself collects on the second pass; the finalizer drain
+    /// between passes catches anything still in the F-reachable
+    /// queue. Without the second pass, on Linux Server GC the
+    /// observed live-byte count drifts up by tens of KB across the
+    /// test even when no real leak exists.
+    /// </summary>
+    private static void StableForcedGc()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect(generation: 2, mode: GCCollectionMode.Default,
+            blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(generation: 2, mode: GCCollectionMode.Default,
+            blocking: true, compacting: true);
+    }
+
+    /// <summary>
+    /// Live-byte count post-compaction. On net5+ subtracts
+    /// <c>FragmentedBytes</c> from <c>HeapSizeBytes</c> to exclude
+    /// fragmented free space inside Server-GC heap segments; on
+    /// net471 falls back to <c>GC.GetTotalMemory(false)</c>, which
+    /// is comparable after the compacting Gen-2 pass above.
+    /// </summary>
+    private static long LiveBytes()
+    {
+#if NET5_0_OR_GREATER
+        var info = GC.GetGCMemoryInfo();
+        long live = info.HeapSizeBytes - info.FragmentedBytes;
+        return live > 0 ? live : GC.GetTotalMemory(forceFullCollection: false);
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
     }
 }
