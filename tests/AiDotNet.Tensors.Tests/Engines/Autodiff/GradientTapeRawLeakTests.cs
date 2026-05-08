@@ -24,23 +24,25 @@ public class GradientTapeRawLeakTests
     /// <summary>
     /// Issue #312's exact reproducer: minimal multi-layer FFN with
     /// chained TensorMatMul / TensorMultiply / Tanh / LayerNorm / etc.
-    /// Asserts retention per call &lt; the issue's stretch goal of
-    /// 10 KB. Above that threshold, a sustained training loop will
-    /// accumulate enough heap to crash the test host before
-    /// completing a paper-grade benchmark sweep — exactly what
-    /// HarmonicEngine reported.
+    ///
+    /// <para>Methodology — growth-rate-vs-startup-amortization split:
+    /// runs the workload long enough to amortize JIT compilation,
+    /// ArrayPool bucket warm-up, and ThreadLocal arena growth, then
+    /// measures retention across TWO halves and asserts on the
+    /// SECOND half only. A real leak grows both halves equally; one-
+    /// time startup costs only show in the first half. The 50-iter
+    /// warmup + 200-iter measure window has been steady on both
+    /// Workstation GC (Windows local) and Server GC (Linux CI).</para>
     /// </summary>
     [Fact]
-    public void RawTapeAndEngineOps_RetainsBoundedHeapAcross500Iterations()
+    public void RawTapeAndEngineOps_SecondHalfRetentionIsBounded()
     {
         // Slightly smaller than the issue's [256, 128, 512, 256, 8]
         // shape so the test fits inside CI test-host memory while
-        // still exercising the same retention path. 50 iters chosen
-        // so the test runs in seconds; the per-call retention
-        // assertion is what matters, not absolute heap size.
+        // still exercising the same retention path.
         const int F = 64, H = 128, V = 64, B = 32, L = 4;
-        const int Warmup = 5;
-        const int Measure = 50;
+        const int Warmup = 50;
+        const int Measure = 200;
         const long PerCallBudgetBytes = 10 * 1024; // 10 KB/call — issue #312 stretch goal
 
         var engine = AiDotNetEngine.Current;
@@ -86,36 +88,67 @@ public class GradientTapeRawLeakTests
         trainable.Add(Wh);
         trainable.Add(bh);
 
-        // Warmup: lets thread-local arenas / caches settle so the
-        // baseline measurement doesn't double-count first-call
-        // allocations as retention.
+        // Long warmup so JIT, ArrayPool buckets, and the
+        // GradientTape's ThreadLocal arena are all in steady state
+        // before we start measuring. A short warmup blends startup
+        // costs into the first measurement window and inflates the
+        // observed per-call retention even though steady-state is
+        // bounded.
         for (int i = 0; i < Warmup; i++) RunOneStep(engine, x0, targets, W1s, b1s, W2s, b2s, gamma, beta, Wh, bh, L, trainable);
 
+        StableForcedGc();
+        long m0 = LiveBytes();
+
+        // First measurement window.
+        for (int i = 0; i < Measure / 2; i++) RunOneStep(engine, x0, targets, W1s, b1s, W2s, b2s, gamma, beta, Wh, bh, L, trainable);
+        StableForcedGc();
+        long m1 = LiveBytes();
+
+        // Second measurement window — same workload, just later in time.
+        for (int i = 0; i < Measure / 2; i++) RunOneStep(engine, x0, targets, W1s, b1s, W2s, b2s, gamma, beta, Wh, bh, L, trainable);
+        StableForcedGc();
+        long m2 = LiveBytes();
+
+        long firstHalfPerCall = (m1 - m0) / (Measure / 2);
+        long secondHalfPerCall = (m2 - m1) / (Measure / 2);
+
+        _output.WriteLine($"Retention windows: m0={m0:N0} B, m1={m1:N0} B, m2={m2:N0} B. "
+            + $"first-half={firstHalfPerCall:N0} B/call, second-half={secondHalfPerCall:N0} B/call "
+            + $"({Measure / 2} iters per half; budget {PerCallBudgetBytes:N0} B/call).");
+
+        // Assert on the SECOND half: by then any first-window startup
+        // amortisation (JIT, ArrayPool growth, internal cache warm-up
+        // that finishes once and doesn't repeat) is gone, and any
+        // remaining growth is per-iteration retention. A real leak
+        // shows in BOTH halves; first-half-only growth is benign.
+        Assert.True(secondHalfPerCall < PerCallBudgetBytes,
+            $"Issue #312 — second-half retention exceeded {PerCallBudgetBytes:N0} B/call: "
+            + $"observed {secondHalfPerCall:N0} B/call over {Measure / 2} iterations "
+            + $"(m1={m1:N0}, m2={m2:N0}). First-half was {firstHalfPerCall:N0} B/call "
+            + $"(m0={m0:N0}, m1={m1:N0}). A second-half retention above this threshold "
+            + "indicates a real per-iteration leak that accumulates to host-fatal "
+            + "memory pressure on long training runs.");
+    }
+
+    /// <summary>
+    /// Two-stage GC sequence sufficient to stabilise even under
+    /// Server GC (Linux CI default): the first compacting Gen-2 pass
+    /// can promote freshly-orphaned objects to a generation that
+    /// itself collects on the second pass; the finalizer drain
+    /// between passes catches anything still in the F-reachable
+    /// queue. Without the second pass, on Linux Server GC the
+    /// observed live-byte count can drift up by tens of MB across
+    /// the test even when no real leak exists.
+    /// </summary>
+    private static void StableForcedGc()
+    {
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect(generation: 2, mode: GCCollectionMode.Default,
             blocking: true, compacting: true);
-        long start = LiveBytes();
-
-        for (int i = 0; i < Measure; i++) RunOneStep(engine, x0, targets, W1s, b1s, W2s, b2s, gamma, beta, Wh, bh, L, trainable);
-
-        GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect(generation: 2, mode: GCCollectionMode.Default,
             blocking: true, compacting: true);
-        long end = LiveBytes();
-
-        long retentionPerCall = (end - start) / Measure;
-        _output.WriteLine($"Retention: start={start:N0} B, end={end:N0} B, "
-            + $"per-call={retentionPerCall:N0} B over {Measure} iters (budget {PerCallBudgetBytes:N0} B/call).");
-        Assert.True(retentionPerCall < PerCallBudgetBytes,
-            $"Issue #312 — raw-tape + engine-ops retention exceeded "
-            + $"{PerCallBudgetBytes:N0} B/call: observed {retentionPerCall:N0} B/call "
-            + $"over {Measure} iterations (start={start:N0}, end={end:N0}). "
-            + "A leak above this threshold accumulates to host-fatal "
-            + "memory pressure on long training runs. Repro pattern: "
-            + "raw GradientTape + chained engine.TensorMatMul / "
-            + "engine.TensorAdd / engine.Tanh / engine.LayerNorm.");
     }
 
     private static long LiveBytes()
