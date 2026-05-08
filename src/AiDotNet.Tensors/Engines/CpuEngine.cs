@@ -54,7 +54,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public bool SupportsGpu => false;
 
     /// <inheritdoc/>
-    public DirectGpu.DirectGpuEngine? DirectGpu => Engine.DirectGpu;
+    public DirectGpu.DirectGpuEngine? DirectGpu => null;
 
     /// <inheritdoc/>
     public AiDotNet.Tensors.Engines.DevicePrimitives.IDevicePrimitives DevicePrimitives

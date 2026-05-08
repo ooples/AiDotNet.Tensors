@@ -133,6 +133,18 @@ public static class CpuFusedOperations
         if (bias != null && bias.Length < N)
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
+        FusedGemmBiasActivationUnchecked(A, B, bias, output, M, N, K, activation);
+    }
+
+    internal static void FusedGemmBiasActivationUnchecked(
+        float[] A,
+        float[] B,
+        float[]? bias,
+        float[] output,
+        int M, int N, int K,
+        FusedActivationType activation,
+        bool allowCachedB = true)
+    {
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
@@ -144,8 +156,21 @@ public static class CpuFusedOperations
         // once and amortises over every forward call. Falls through to the
         // standard Sgemm inside SgemmWithCachedB for shapes where caching
         // isn't applicable (n > Nc=4096 or AVX-512 eligible).
-        SimdGemm.SgemmWithCachedB(
-            A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
+        //
+        // allowCachedB MUST be false when B can mutate between calls (e.g. the
+        // training-plan forward path: optimizer.Step() updates the weight in
+        // place, and the cached pre-packed copy would go stale). Inference
+        // plans bind frozen weights and can safely re-use the packed cache.
+        if (allowCachedB)
+        {
+            SimdGemm.SgemmWithCachedB(
+                A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
+        }
+        else
+        {
+            SimdGemm.Sgemm(
+                A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
+        }
         ApplyBiasActivationInPlace(output, bias, M, N, activation);
     }
 

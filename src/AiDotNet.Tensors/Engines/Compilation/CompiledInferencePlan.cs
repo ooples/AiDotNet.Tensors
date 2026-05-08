@@ -798,6 +798,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
     }
 
+    internal void SetInput(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        if (_compiledInputTensors.Length != 1)
+            throw new InvalidOperationException(
+                $"This plan was compiled with {_compiledInputTensors.Length} captured input(s); " +
+                $"{nameof(SetInput)} requires exactly one.");
+
+        ValidateShapesMatch(_compiledInputTensors[0], input, nameof(input));
+        input.AsSpan().CopyTo(_compiledInputTensors[0].AsWritableSpan());
+    }
+
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
     {
         if (expected._shape.Length != actual._shape.Length)

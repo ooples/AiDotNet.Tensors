@@ -10,23 +10,22 @@ using TorchTensor = TorchSharp.torch.Tensor;
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// Issue #296 acceptance harness: head-to-head latency comparison of
+/// Issues #299/#300 acceptance harness: head-to-head latency comparison of
 /// PyTorch (TorchSharp) vs AiDotNet.Tensors compiled-plan chaining
 /// across batch sizes {1, 32, 128}. Two-stage Linear→ReLU→Linear
-/// (256→256→10) — matches the issue's measured-baseline benchmark.
+/// (256→256→10) — matches the measured chain benchmark.
 ///
 /// Compares four implementations:
 ///   - PyTorch_TwoStageSequential : eager two-stage call (the 1.00× baseline)
 ///   - PyTorch_Sequential          : nn.Sequential single forward
 ///   - Tensors_TwoStageSequential : current sync 2-stage Execute (the gap to close)
-///   - Tensors_ChainAsync          : the new ICompiledPlan&lt;T&gt;.ChainAsync path
+///   - Tensors_ChainAsync          : ICompiledPlan&lt;T&gt;.ChainAsync path
 ///
-/// Acceptance criteria addressed by this benchmark (issue #296):
-///   #1 BS=1   latency: Tensors_ChainAsync ≤ 1.05× PyTorch_Sequential
-///   #2 BS=32  latency: Tensors_ChainAsync ≤ 1.05× PyTorch_Sequential
-///   #3 BS=128 latency: Tensors_ChainAsync ≤ 1.05× PyTorch_Sequential
-///   #5 alloc:  Tensors per-call ≤ 2× PyTorch's at every batch size
-///   #6 alloc:  ChainAsync inter-stage boundary alloc = 0 bytes (rebind, not memcpy)
+/// Acceptance criteria addressed by this benchmark:
+///   #299 BS=1   latency: Tensors_ChainAsync ≤ 0.70× PyTorch_Sequential
+///   #299 BS=32  latency: Tensors_ChainAsync ≤ 1.10× PyTorch_Sequential
+///   #299 BS=128 latency: Tensors_ChainAsync ≤ 1.05× PyTorch_Sequential
+///   #300 alloc: Tensors per-call ≤ 2× PyTorch's at every batch size
 /// </summary>
 [SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 10)]
 [MemoryDiagnoser]
@@ -38,18 +37,13 @@ public class CompiledPlanChainingBenchmarks
 
     private CpuEngine _engine = null!;
 
-    // AiDotNet — two-stage MLP, 256 → 256 → 10 (matches issue #296 baseline)
+    // AiDotNet - two-stage MLP, 256 -> 256 -> 10 (matches issues #299/#300)
     private Tensor<float> _aiInput = null!;
     private Tensor<float> _aiHiddenSeed = null!;
     private Tensor<float> _aiW1 = null!;
     private Tensor<float> _aiW2 = null!;
     private Tensor<float> _aiB1 = null!;
     private Tensor<float> _aiB2 = null!;
-    // Cached input array reused across iterations so the benchmark
-    // measures the API's per-call alloc, not the harness's
-    // `new[] { _aiInput }` boxing per call.
-    private Tensor<float>[] _aiInputArray = null!;
-    private Tensor<float>[] _aiHiddenArray = null!;
 
     // Pre-compiled plans for the new chained-async path. Plan A: Linear+ReLU
     // (input → hidden). Plan B: Linear (hidden → output). ChainAsync
@@ -75,8 +69,6 @@ public class CompiledPlanChainingBenchmarks
 
         _aiInput = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
         _aiHiddenSeed = Tensor<float>.CreateRandom(new[] { BatchSize, 256 });
-        _aiInputArray = new[] { _aiInput };
-        _aiHiddenArray = new[] { _aiHiddenSeed };
         _aiW1 = Tensor<float>.CreateRandom(new[] { 256, 256 });
         _aiW2 = Tensor<float>.CreateRandom(new[] { 256, 10 });
         _aiB1 = Tensor<float>.CreateRandom(new[] { 256 });
@@ -115,11 +107,11 @@ public class CompiledPlanChainingBenchmarks
 
         // nn.Sequential single-forward (the strongest TorchSharp baseline)
         var lin1 = torch.nn.Linear(256, 256);
-        lin1.weight = new TorchSharp.Modules.Parameter(_torchW1T);
-        lin1.bias = new TorchSharp.Modules.Parameter(_torchB1);
+        lin1.weight = new TorchSharp.Modules.Parameter(_torchW1T.clone());
+        lin1.bias = new TorchSharp.Modules.Parameter(_torchB1.clone());
         var lin2 = torch.nn.Linear(256, 10);
-        lin2.weight = new TorchSharp.Modules.Parameter(_torchW2T);
-        lin2.bias = new TorchSharp.Modules.Parameter(_torchB2);
+        lin2.weight = new TorchSharp.Modules.Parameter(_torchW2T.clone());
+        lin2.bias = new TorchSharp.Modules.Parameter(_torchB2.clone());
         _torchMlpModule = torch.nn.Sequential(("lin1", lin1), ("relu", torch.nn.ReLU()), ("lin2", lin2));
     }
 
@@ -177,23 +169,22 @@ public class CompiledPlanChainingBenchmarks
     {
         // Current sync two-stage path: run plan A, copy its output into plan
         // B's captured input via SetInputs, run plan B. This is the
-        // pre-#296 baseline that the new ChainAsync replaces.
-        _planA.SetInputs(_aiInputArray);
+        // SetInputs baseline used to expose the per-call allocation gap.
+        _planA.SetInput(_aiInput);
         var hidden = _planA.Execute();
-        _aiHiddenArray[0] = hidden;
-        _planB.SetInputs(_aiHiddenArray);
+        _planB.SetInput(hidden);
         return _planB.Execute();
     }
 
     [Benchmark]
-    public async ValueTask<Tensor<float>> Tensors_ChainAsync()
+    public ValueTask<Tensor<float>> Tensors_ChainAsync()
     {
         // The new path. SetInputs once, then ChainAsync queues both plans
         // onto a single execution stream and rebinds the boundary tensor
-        // zero-copy (criterion #6). On CPU the stream is a Channel<>-backed
+        // zero-copy. On CPU the stream is a Channel<>-backed
         // worker; on GPU it would wrap the engine's cudaStream_t.
-        _planA.SetInputs(_aiInputArray);
-        return await _planA.ChainAsync(_planB).ConfigureAwait(false);
+        _planA.SetInput(_aiInput);
+        return _planA.ChainAsync(_planB);
     }
 }
 #endif

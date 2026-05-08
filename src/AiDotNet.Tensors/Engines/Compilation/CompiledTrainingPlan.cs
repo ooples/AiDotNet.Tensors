@@ -140,8 +140,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         var src = inputs[0] ?? throw new ArgumentException(
             "inputs[0] is null.", nameof(inputs));
-        ValidateShapesMatch(_compiledInputTensor!, src, "inputs[0]");
-        src.AsSpan().CopyTo(_compiledInputTensor!.AsWritableSpan());
+        var dst = _compiledInputTensor;
+        if (dst is null)
+            throw new InvalidOperationException(
+                "Internal invariant violated: _compiledInputTensor is null but expected==1.");
+        ValidateShapesMatch(dst, src, "inputs[0]");
+        src.AsSpan().CopyTo(dst.AsWritableSpan());
+    }
+
+    internal void SetInput(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+
+        var dst = _compiledInputTensor;
+        if (dst is null)
+            throw new InvalidOperationException(
+                $"This plan was compiled with 0 captured input(s); " +
+                $"{nameof(SetInput)} requires exactly one.");
+
+        ValidateShapesMatch(dst, input, nameof(input));
+        input.AsSpan().CopyTo(dst.AsWritableSpan());
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1023,9 +1042,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                // Direct BLAS into output + fused bias + activation
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inArr, wArr, bArr, oArr, M, N, K, activation);
+                // Shapes were validated when the graph was compiled; replay skips
+                // public API argument checks and goes straight to the hot kernel.
+                //
+                // allowCachedB: false because optimizer.Step() mutates wArr in
+                // place between forward calls. The pre-packed B cache keys on
+                // the array's identity, so the cached panels would be stale on
+                // every step after the first.
+                CpuFusedOperations.FusedGemmBiasActivationUnchecked(
+                    inArr, wArr, bArr, oArr, M, N, K, activation, allowCachedB: false);
             };
         }
 

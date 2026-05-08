@@ -127,6 +127,19 @@ internal static partial class SimdGemm
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
+    private static readonly object _prePackedBCacheLock = new();
+    [ThreadStatic]
+    private static float[]? _threadPackedABuffer;
+    [ThreadStatic]
+    private static WeakReference<float[]>? _threadPrePackedBKey0;
+    // Held weakly so the per-thread MRU does not strand the (potentially large)
+    // packed buffers after the source weight array becomes eligible for GC.
+    [ThreadStatic]
+    private static WeakReference<PrePackedB>? _threadPrePackedBValue0;
+    [ThreadStatic]
+    private static WeakReference<float[]>? _threadPrePackedBKey1;
+    [ThreadStatic]
+    private static WeakReference<PrePackedB>? _threadPrePackedBValue1;
 
     /// <summary>
     /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
@@ -200,35 +213,150 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
-        c.Clear();
-
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip if AVX-512 path is
         // eligible (the specialised kernel's layout differs).
         if (n > Nc || Avx512Sgemm.CanUse)
         {
+            c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: true, clearedOutput: true);
             return;
         }
 
-        _prePackedBCache.TryGetValue(b, out var existing);
-        int expectedMc = ChooseAdaptiveMc(m, k, n);
-        PrePackedB cached;
-        if (existing is null
-            || existing.K != k || existing.N != n
-            || existing.Mc != expectedMc)
+        // Preserve the existing direct AVX2/FMA small/medium GEMM fast path.
+        // The cached-B packed path helps large inference GEMMs by avoiding
+        // PackB, but issue #299/#300's chain shape [128,256]x[256,256] sits
+        // squarely in SgemmDirectParallelM's tuned range. Forcing it through
+        // cached packing loses to both our direct kernel and PyTorch. The
+        // second chain GEMM is narrow (N=10), where packing overhead dominates
+        // compute, so route that through SgemmDirectNarrowN as well.
+        long directWork = (long)m * k * n;
+        bool narrowDirect = n > 0 && n < Nr;
+        bool mediumParallelDirect = n >= Nr
+            && directWork >= ParallelDirectWorkThreshold
+            && m >= ParallelDirectMinM
+            && (n % 8 == 0);
+        if (Avx2.IsSupported && Fma.IsSupported
+            && m >= Mr
+            && directWork <= SmallMatmulWorkThreshold
+            && k <= SmallMatmulKThreshold
+            && (narrowDirect || mediumParallelDirect))
         {
-            if (existing is not null) _prePackedBCache.Remove(b);
-            cached = BuildPrePackedB(b, k, n, m);
-            _prePackedBCache.Add(b, cached);
-        }
-        else
-        {
-            cached = existing;
+            // SgemmAddInternal accumulates into c. We need overwrite semantics
+            // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
+            c.Clear();
+            SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
+                allowParallel: true, clearedOutput: true);
+            return;
         }
 
+        c.Clear();
+        int expectedMc = ChooseAdaptiveMc(m, k, n);
+        var cached = GetOrBuildPrePackedB(b, k, n, m, expectedMc);
+
         SgemmTiledWithCached(a, cached, c, m, k, n);
+    }
+
+    private static PrePackedB GetOrBuildPrePackedB(float[] b, int k, int n, int m, int expectedMc)
+    {
+        if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
+            return threadCached;
+
+        if (_prePackedBCache.TryGetValue(b, out var existing)
+            && existing.K == k && existing.N == n
+            && existing.Mc == expectedMc)
+        {
+            RememberThreadPrePackedB(b, existing);
+            return existing;
+        }
+
+        lock (_prePackedBCacheLock)
+        {
+            if (_prePackedBCache.TryGetValue(b, out existing))
+            {
+                if (existing.K == k && existing.N == n
+                    && existing.Mc == expectedMc)
+                {
+                    RememberThreadPrePackedB(b, existing);
+                    return existing;
+                }
+
+                _prePackedBCache.Remove(b);
+            }
+
+            var cached = BuildPrePackedB(b, k, n, m);
+            _prePackedBCache.Add(b, cached);
+            RememberThreadPrePackedB(b, cached);
+            return cached;
+        }
+    }
+
+    private static bool TryGetThreadPrePackedB(
+        float[] b, int k, int n, int expectedMc, out PrePackedB? cached)
+    {
+        if (TryGetThreadPrePackedBSlot(_threadPrePackedBKey0, _threadPrePackedBValue0,
+                b, k, n, expectedMc, out cached))
+        {
+            return true;
+        }
+
+        if (TryGetThreadPrePackedBSlot(_threadPrePackedBKey1, _threadPrePackedBValue1,
+                b, k, n, expectedMc, out cached))
+        {
+            return true;
+        }
+
+        cached = null;
+        return false;
+    }
+
+    private static bool TryGetThreadPrePackedBSlot(
+        WeakReference<float[]>? keyRef,
+        WeakReference<PrePackedB>? valueRef,
+        float[] b, int k, int n, int expectedMc,
+        out PrePackedB? cached)
+    {
+        if (valueRef is not null
+            && valueRef.TryGetTarget(out var value)
+            && value.K == k && value.N == n && value.Mc == expectedMc
+            && keyRef is not null
+            && keyRef.TryGetTarget(out var key)
+            && ReferenceEquals(key, b))
+        {
+            cached = value;
+            return true;
+        }
+
+        cached = null;
+        return false;
+    }
+
+    private static void RememberThreadPrePackedB(float[] b, PrePackedB cached)
+    {
+        if (_threadPrePackedBKey0 is not null
+            && _threadPrePackedBKey0.TryGetTarget(out var key0)
+            && ReferenceEquals(key0, b))
+        {
+            _threadPrePackedBValue0 = new WeakReference<PrePackedB>(cached);
+            return;
+        }
+
+        _threadPrePackedBKey1 = _threadPrePackedBKey0;
+        _threadPrePackedBValue1 = _threadPrePackedBValue0;
+        _threadPrePackedBKey0 = new WeakReference<float[]>(b);
+        _threadPrePackedBValue0 = new WeakReference<PrePackedB>(cached);
+    }
+
+    private static float[] GetThreadPackedABuffer(int length)
+    {
+        var buffer = _threadPackedABuffer;
+        if (buffer is null || buffer.Length < length)
+        {
+            buffer = new float[length];
+            _threadPackedABuffer = buffer;
+        }
+        return buffer;
     }
 
     // ─── Path D: weight-only int8 SGEMM ────────────────────────────────────
@@ -262,6 +390,7 @@ internal static partial class SimdGemm
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], Int8PrePackedB> _int8PrePackedBCache = new();
+    private static readonly object _int8PrePackedBCacheLock = new();
 
     /// <summary>
     /// Build the int8 pre-packed cache for B: compute symmetric scale,
@@ -353,23 +482,38 @@ internal static partial class SimdGemm
             return;
         }
 
-        _int8PrePackedBCache.TryGetValue(b, out var existing);
         int expectedMc = ChooseAdaptiveMc(m, k, n);
-        Int8PrePackedB cached;
-        if (existing is null
-            || existing.K != k || existing.N != n
-            || existing.Mc != expectedMc)
-        {
-            if (existing is not null) _int8PrePackedBCache.Remove(b);
-            cached = BuildInt8PrePackedB(b, k, n, m);
-            _int8PrePackedBCache.Add(b, cached);
-        }
-        else
-        {
-            cached = existing;
-        }
+        var cached = GetOrBuildInt8PrePackedB(b, k, n, m, expectedMc);
 
         SgemmTiledWithInt8Cached(a, cached, c, m, k, n);
+    }
+
+    private static Int8PrePackedB GetOrBuildInt8PrePackedB(float[] b, int k, int n, int m, int expectedMc)
+    {
+        if (_int8PrePackedBCache.TryGetValue(b, out var existing)
+            && existing.K == k && existing.N == n
+            && existing.Mc == expectedMc)
+        {
+            return existing;
+        }
+
+        lock (_int8PrePackedBCacheLock)
+        {
+            if (_int8PrePackedBCache.TryGetValue(b, out existing))
+            {
+                if (existing.K == k && existing.N == n
+                    && existing.Mc == expectedMc)
+                {
+                    return existing;
+                }
+
+                _int8PrePackedBCache.Remove(b);
+            }
+
+            var cached = BuildInt8PrePackedB(b, k, n, m);
+            _int8PrePackedBCache.Add(b, cached);
+            return cached;
+        }
     }
 
     /// <summary>
@@ -558,12 +702,13 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
+        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
-        float[] packedABuf = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
-        if (canParallelize)
+        float[]? packedABuf = useParallel2D ? null : GetThreadPackedABuffer(packedASizePerRow);
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : null;
+        if (useParallel2D)
         {
             for (int r = 0; r < numRowBlocks; r++)
                 packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
@@ -581,7 +726,7 @@ internal static partial class SimdGemm
 
                 int subsBase = pcIter * cached.NumColSubBlocks;
 
-                if (canParallelize && cached.NumColSubBlocks >= 2)
+                if (useParallel2D)
                 {
                     // 2D parallel: row blocks × col subs
                     int localNumRowBlocks = numRowBlocks;
@@ -643,12 +788,13 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    PackA(a, packedABuf, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
+                    var packedA = packedABuf!;
+                    PackA(a, packedA, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
                         int mc = System.Math.Min(Mc, m - ic);
                         if (ic > 0)
-                            PackA(a, packedABuf, k, false, ic, mc, pc, kc);
+                            PackA(a, packedA, k, false, ic, mc, pc, kc);
 
                         for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                         {
@@ -656,7 +802,7 @@ internal static partial class SimdGemm
                             int subNc = (cs == cached.NumColSubBlocks - 1) ? (nc - jStart) : cached.ColSubSize;
                             if (subNc > 0)
                                 MacroKernel(
-                                    packedABuf, cached.PackedSubs[subsBase + cs],
+                                    packedA, cached.PackedSubs[subsBase + cs],
                                     c, mc, subNc, kc, n,
                                     ic, jc + jStart);
                         }
@@ -666,7 +812,6 @@ internal static partial class SimdGemm
         }
         finally
         {
-            System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
             if (packedABufs is not null)
             {
                 for (int r = 0; r < numRowBlocks; r++)
@@ -906,7 +1051,7 @@ internal static partial class SimdGemm
         bool clearedOutput = false)
     {
 #if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
+        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
             // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
             // with fully vectorized masked edge kernels (proper fix for iter
@@ -927,6 +1072,7 @@ internal static partial class SimdGemm
             //     and n=72 both have n % 8 == 0.
             long directWork = (long)m * k * n;
             if (!transA && !transB
+                && n >= Nr
                 && directWork <= SmallMatmulWorkThreshold
                 && k <= SmallMatmulKThreshold
                 && (n % 8 == 0))
@@ -947,6 +1093,15 @@ internal static partial class SimdGemm
                 return;
             }
 
+            if (!transA && !transB
+                && n < Nr
+                && directWork <= SmallMatmulWorkThreshold
+                && k <= SmallMatmulKThreshold)
+            {
+                SgemmDirectNarrowN(a, lda, b, ldb, c, m, k, n, clearedOutput);
+                return;
+            }
+
             // #209 close-parity: AttentionQKT (Q·K^T) and other transB=true
             // small-K shapes were forced through SgemmTiled's packed path.
             // For small K (≤ SmallMatmulKThreshold) the explicit transpose
@@ -955,6 +1110,7 @@ internal static partial class SimdGemm
             // SgemmDirect fast path. This eliminates the 5× gap to libtorch
             // on the 512×64 → 512×512 attention shape.
             if (!transA && transB
+                && n >= Nr
                 && directWork <= SmallMatmulWorkThresholdTransB
                 && k <= SmallMatmulKThreshold
                 && (n % 8 == 0))
@@ -1402,7 +1558,7 @@ internal static partial class SimdGemm
         int mFull = (m / Mr) * Mr;
         int numFullBlocks = mFull / Mr;     // count of complete Mr-row blocks
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
-        int numChunks = Math.Min(cores, numFullBlocks);
+        int numChunks = Math.Min(cores, (numFullBlocks + 1) / 2);
         if (numChunks <= 1)
         {
             // Not enough work to parallelize meaningfully.
@@ -1475,6 +1631,140 @@ internal static partial class SimdGemm
                 }
             }
         }
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmDirectNarrowN(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c,
+        int m, int k, int n,
+        bool clearedOutput)
+    {
+        int mFull = (m / Mr) * Mr;
+
+        fixed (float* pAroot = a, pBroot = b, pCroot = c)
+        {
+            for (int i = 0; i < mFull; i += Mr)
+            {
+                DirectKernelMxNarrow(
+                    pAroot + i * lda, lda,
+                    pBroot, ldb,
+                    pCroot + i * n, n,
+                    k, Mr, n, clearedOutput);
+            }
+
+            int mcTail = m - mFull;
+            if (mcTail > 0)
+            {
+                DirectKernelMxNarrow(
+                    pAroot + mFull * lda, lda,
+                    pBroot, ldb,
+                    pCroot + mFull * n, n,
+                    k, mcTail, n, clearedOutput);
+            }
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe void DirectKernelMxNarrow(
+        float* pA, int lda,
+        float* pB, int ldb,
+        float* pC, int ldc,
+        int k, int mcActual, int ncActual,
+        bool clearedOutput)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual > 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+        bool hasTail = lane1N > 0;
+
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = lane0N == 8 ? Avx.LoadVector256(pB) : Avx.MaskLoad(pB, mask0);
+            var b1 = hasTail ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero;
+
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00);
+            if (hasTail) c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            if (mcActual > 1)
+            {
+                var a1 = Vector256.Create(pA1[p]);
+                c10 = Fma.MultiplyAdd(a1, b0, c10);
+                if (hasTail) c11 = Fma.MultiplyAdd(a1, b1, c11);
+            }
+            if (mcActual > 2)
+            {
+                var a2 = Vector256.Create(pA2[p]);
+                c20 = Fma.MultiplyAdd(a2, b0, c20);
+                if (hasTail) c21 = Fma.MultiplyAdd(a2, b1, c21);
+            }
+            if (mcActual > 3)
+            {
+                var a3 = Vector256.Create(pA3[p]);
+                c30 = Fma.MultiplyAdd(a3, b0, c30);
+                if (hasTail) c31 = Fma.MultiplyAdd(a3, b1, c31);
+            }
+            if (mcActual > 4)
+            {
+                var a4 = Vector256.Create(pA4[p]);
+                c40 = Fma.MultiplyAdd(a4, b0, c40);
+                if (hasTail) c41 = Fma.MultiplyAdd(a4, b1, c41);
+            }
+            if (mcActual > 5)
+            {
+                var a5 = Vector256.Create(pA5[p]);
+                c50 = Fma.MultiplyAdd(a5, b0, c50);
+                if (hasTail) c51 = Fma.MultiplyAdd(a5, b1, c51);
+            }
+
+            pB += ldb;
+        }
+
+        if (mcActual > 0) StoreNarrowRow(pC,           mask0, mask1, c00, c01, hasTail, clearedOutput);
+        if (mcActual > 1) StoreNarrowRow(pC + ldc,     mask0, mask1, c10, c11, hasTail, clearedOutput);
+        if (mcActual > 2) StoreNarrowRow(pC + ldc * 2, mask0, mask1, c20, c21, hasTail, clearedOutput);
+        if (mcActual > 3) StoreNarrowRow(pC + ldc * 3, mask0, mask1, c30, c31, hasTail, clearedOutput);
+        if (mcActual > 4) StoreNarrowRow(pC + ldc * 4, mask0, mask1, c40, c41, hasTail, clearedOutput);
+        if (mcActual > 5) StoreNarrowRow(pC + ldc * 5, mask0, mask1, c50, c51, hasTail, clearedOutput);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreNarrowRow(
+        float* row,
+        Vector256<float> mask0,
+        Vector256<float> mask1,
+        Vector256<float> v0,
+        Vector256<float> v1,
+        bool hasTail,
+        bool clearedOutput)
+    {
+        if (clearedOutput)
+        {
+            Avx.MaskStore(row, mask0, v0);
+            if (hasTail) Avx.MaskStore(row + 8, mask1, v1);
+            return;
+        }
+
+        Avx.MaskStore(row, mask0, Avx.Add(Avx.MaskLoad(row, mask0), v0));
+        if (hasTail)
+            Avx.MaskStore(row + 8, mask1, Avx.Add(Avx.MaskLoad(row + 8, mask1), v1));
     }
 
     /// <summary>
