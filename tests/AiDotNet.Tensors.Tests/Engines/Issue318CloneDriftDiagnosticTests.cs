@@ -128,6 +128,64 @@ public class Issue318CloneDriftDiagnosticTests
     }
 
     /// <summary>
+    /// AUTOMATIC determinism contract: when
+    /// <see cref="TensorPool.ForceFreshAllocations"/> is enabled,
+    /// every engine-op-produced tensor's backing array is allocated
+    /// at exactly logical-Length size. The pool/cache asymmetry
+    /// disappears at the source — consumers don't need to remember
+    /// to call Canonicalize on every tensor.
+    ///
+    /// <para>This is the automatic / opt-in-globally version. The
+    /// per-tensor Canonicalize() API below is the per-call
+    /// alternative. Either path closes #318: ForceFreshAllocations
+    /// for global determinism (state_dict round-trip, Clone-after-
+    /// train semantics), Canonicalize for selective use on
+    /// individual tensors.</para>
+    /// </summary>
+    [Fact]
+    public void ForceFreshAllocations_EliminatesPathAsymmetryAutomatically()
+    {
+        const int Rows = 392, Cols = 1024;
+        const int Total = Rows * Cols;
+        var engine = new CpuEngine();
+        var rng = new Random(42);
+        var values = new float[Total];
+        for (int i = 0; i < Total; i++) values[i] = (float)((rng.NextDouble() - 0.5) * 0.1);
+
+        bool savedFlag = TensorPool.ForceFreshAllocations;
+        TensorPool.ForceFreshAllocations = true;
+        try
+        {
+            var zero = new Tensor<float>(new[] { Rows, Cols });
+            var neg = new Tensor<float>(new[] { Rows, Cols });
+            var nS = neg.AsWritableSpan();
+            for (int i = 0; i < Total; i++) nS[i] = -values[i];
+            var pathA = engine.TensorSubtract(zero, neg);
+
+            var pathB = new Tensor<float>(new[] { Rows, Cols });
+            var bS = pathB.AsWritableSpan();
+            for (int i = 0; i < Total; i++) bS[i] = values[i];
+
+            var aBacking = pathA.GetDataArray();
+            var bBacking = pathB.GetDataArray();
+            _output.WriteLine($"With ForceFreshAllocations=true: A backing={aBacking.Length}, B backing={bBacking.Length}");
+
+            Assert.True(aBacking.Length == Total,
+                $"Path A backing must be exactly {Total} when ForceFreshAllocations=true; got {aBacking.Length}.");
+            Assert.True(bBacking.Length == Total,
+                $"Path B backing must be exactly {Total}; got {bBacking.Length}.");
+
+            for (int i = 0; i < Total; i++)
+                Assert.True(aBacking[i] == bBacking[i],
+                    $"Backing arrays differ at idx {i}: A={aBacking[i]}, B={bBacking[i]}.");
+        }
+        finally
+        {
+            TensorPool.ForceFreshAllocations = savedFlag;
+        }
+    }
+
+    /// <summary>
     /// Issue #318 closing contract: <see cref="TensorBase{T}.Canonicalize"/>
     /// must produce backing arrays of EXACTLY <see cref="TensorBase{T}.Length"/>
     /// elements, regardless of how the source tensor was constructed.
