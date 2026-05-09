@@ -14946,7 +14946,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradWeights.Length; i++)
             gradWeights[i] = numOps.Zero;
 
-        Parallel.For(0, weightsShape.Aggregate(1, (acc, val) => acc * val), idx => // Iterate over all weight elements
+        CpuParallelSettings.ParallelForOrSerial(0, gradWeights.Length, gradWeights.Length, idx => // Iterate over all weight elements
         {
             // Deconstruct idx to weights indices (oh, ow, oc, ic, kh, kw)
             int flatIdx = idx;
@@ -15002,7 +15002,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradBias.Length; i++)
             gradBias[i] = numOps.Zero;
 
-        Parallel.For(0, outChannels, oc => // Iterate over output channels
+        CpuParallelSettings.ParallelForOrSerial(0, outChannels, gradOutputData.Length, oc => // Iterate over output channels
         {
             T sum = numOps.Zero;
             for (int b = 0; b < batch; b++)
@@ -15419,7 +15419,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (useParallel)
         {
-            Parallel.For(0, outerSize, row =>
+            CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, row =>
             {
                 SoftmaxBackwardFloatRow(gradOut, output, gradIn, row, axisSize);
             });
@@ -27061,7 +27061,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outerCount > 64)
         {
-            Parallel.For(0, outerCount, outer =>
+            CpuParallelSettings.ParallelForOrSerial(0, outerCount, resultData.Length, outer =>
             {
                 int srcOffset = outer * axisSize * stride + index * stride;
                 int dstOffset = outer * stride;
@@ -27213,7 +27213,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outerCount > 64)
         {
-            Parallel.For(0, outerCount, outer =>
+            CpuParallelSettings.ParallelForOrSerial(0, outerCount, (long)outerCount * axisSize, outer =>
             {
                 int dstOffset = outer * axisSize * stride + index * stride;
                 int srcOffset = outer * stride;
