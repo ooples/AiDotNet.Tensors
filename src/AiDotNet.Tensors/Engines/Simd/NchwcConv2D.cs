@@ -88,7 +88,8 @@ internal static class NchwcConv2D
         bool useSimd = false; // net471: no Runtime.Intrinsics — scalar only.
 #endif
 
-        Parallel.For(0, totalTasks, taskIdx =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
+            (long)totalTasks * _outStrideCg, taskIdx =>
         {
             int n = taskIdx / _cgOut;
             int ocg = taskIdx % _cgOut;

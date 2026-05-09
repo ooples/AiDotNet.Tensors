@@ -893,7 +893,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         unsafe
                         {
                             float* p = (float*)inH.AddrOfPinnedObject();
-                            Parallel.For(0, numChunks, chunk =>
+                            CpuParallelSettings.ParallelForOrSerial(0, numChunks, len, chunk =>
                             {
                                 int start = chunk * chunkSize;
                                 int count = Math.Min(chunkSize, len - start);
@@ -1879,7 +1879,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         int chunks = (rows + chunkSize - 1) / chunkSize;
-        Parallel.For(0, chunks, chunk =>
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
             int start = chunk * chunkSize;
             int end = Math.Min(start + chunkSize, rows);
