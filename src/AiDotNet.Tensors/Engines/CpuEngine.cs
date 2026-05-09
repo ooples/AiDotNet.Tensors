@@ -6831,7 +6831,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -6919,7 +6919,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
             int inputBaseOffset = (b * channels + c) * height * width;
@@ -7023,7 +7023,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
             int inputBaseOffset = (b * channels + c) * height * width;
@@ -7183,7 +7183,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -11215,7 +11215,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var outputData = result.GetDataArray();
 
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -11379,7 +11379,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = new T[batch * channels * outputHeight * outputWidth];
         T poolArea = numOps.FromDouble(poolH * poolW);
 
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -11635,7 +11635,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
 
-        Parallel.For(0, batch * outChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
+            (long)batch * outChannels * outputHeight * outputWidth, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -11892,7 +11893,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fKernel = (float[])(object)kernelData;
             var fOutput = (float[])(object)outputData;
 
-            Parallel.For(0, batch * outChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -11933,7 +11934,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dKernel = (double[])(object)kernelData;
             var dOutput = (double[])(object)outputData;
 
-            Parallel.For(0, batch * outChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -12295,7 +12296,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
-        Parallel.For(0, batch * outChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -12482,7 +12483,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var locks = new object[batch * inChannels * height * width];
         for (int i = 0; i < locks.Length; i++) locks[i] = new object();
 
-        Parallel.For(0, batch * outChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
+            (long)batch * outChannels * outputHeight * outputWidth, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -13385,7 +13387,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
-        Parallel.For(0, batch * outChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -13494,7 +13496,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fKernel = (float[])(object)kernelData;
             var fGradInput = (float[])(object)gradInputData;
             Array.Clear(fGradInput, 0, fGradInput.Length);
-            Parallel.For(0, batch * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, fGradInput.Length, idx =>
             {
                 int b = idx / inChannels;
                 int ic = idx % inChannels;
@@ -13538,7 +13540,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dKernel = (double[])(object)kernelData;
             var dGradInput = (double[])(object)gradInputData;
             Array.Clear(dGradInput, 0, dGradInput.Length);
-            Parallel.For(0, batch * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, dGradInput.Length, idx =>
             {
                 int b = idx / inChannels;
                 int ic = idx % inChannels;
@@ -13581,7 +13583,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradInputData.Length; i++)
                 gradInputData[i] = numOps.Zero;
 
-            Parallel.For(0, batch * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, gradInputData.Length, idx =>
             {
                 int b = idx / inChannels;
                 int ic = idx % inChannels;
@@ -13681,7 +13683,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradOut = (float[])(object)gradOutputData;
             var fInput = (float[])(object)inputData;
             var fGradKernel = (float[])(object)gradKernelData;
-            Parallel.For(0, outChannels * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, fGradKernel.Length, idx =>
             {
                 int oc = idx / inChannels;
                 int ic = idx % inChannels;
@@ -13725,7 +13727,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             var dInput = (double[])(object)inputData;
             var dGradKernel = (double[])(object)gradKernelData;
-            Parallel.For(0, outChannels * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, dGradKernel.Length, idx =>
             {
                 int oc = idx / inChannels;
                 int ic = idx % inChannels;
@@ -13769,7 +13771,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradKernelData.Length; i++)
                 gradKernelData[i] = numOps.Zero;
 
-            Parallel.For(0, outChannels * inChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, gradKernelData.Length, idx =>
             {
                 int oc = idx / inChannels;
                 int ic = idx % inChannels;
@@ -14868,7 +14870,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var weightsData = weights.GetFlattenedData();
 
-        Parallel.For(0, batch * inChannels * inputHeight * inputWidth, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels * inputHeight * inputWidth, finalGradInput.Length, idx =>
         {
             int b = idx / (inChannels * inputHeight * inputWidth);
             int ic = (idx / (inputHeight * inputWidth)) % inChannels;
