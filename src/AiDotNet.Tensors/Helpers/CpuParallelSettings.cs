@@ -168,7 +168,13 @@ public static class CpuParallelSettings
     public static void ParallelForOrSerial(int fromInclusive, int toExclusive, long totalWork, Action<int> body)
     {
         if (toExclusive <= fromInclusive) return;
-        if (totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        // Honor the class-level MaxDegreeOfParallelism contract: if the user has
+        // pinned to 1 thread, run serial regardless of work size. Same
+        // pattern as ParallelForChunks (line 84) and the legacy LightweightParallel
+        // code path. Snapshot the value once so a concurrent setter mid-call
+        // can't toggle us between paths.
+        int maxDegree = MaxDegreeOfParallelism;
+        if (maxDegree <= 1 || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Match Parallel.For's exception semantics: capture
             // first thrown exception, finish remaining iterations,
@@ -185,7 +191,11 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
-        System.Threading.Tasks.Parallel.For(fromInclusive, toExclusive, body);
+        System.Threading.Tasks.Parallel.For(
+            fromInclusive,
+            toExclusive,
+            new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
+            body);
     }
 
     /// <summary>
@@ -226,7 +236,11 @@ public static class CpuParallelSettings
         Action<TLocal> localFinally)
     {
         if (toExclusive <= fromInclusive) return;
-        if (totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        // Honor the class-level MaxDegreeOfParallelism contract: pinning to 1
+        // forces serial regardless of work size (same as the Action<int>
+        // overload above). Snapshot once for consistency.
+        int maxDegree = MaxDegreeOfParallelism;
+        if (maxDegree <= 1 || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Serial fast path: one local accumulator, no
             // ParallelLoopState (Stop/Break never fire serial-side).
@@ -251,6 +265,12 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
-        System.Threading.Tasks.Parallel.For(fromInclusive, toExclusive, localInit, body, localFinally);
+        System.Threading.Tasks.Parallel.For(
+            fromInclusive,
+            toExclusive,
+            new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
+            localInit,
+            body,
+            localFinally);
     }
 }

@@ -10,7 +10,7 @@
 //
 // What it measures:
 //   * Per-op µs/call for TensorMatMul, TensorBroadcastAdd, GELU,
-//     LayerNorm, Sigmoid at canonical ViT-Base patch shape
+//     LayerNorm at canonical ViT-Base patch shape
 //     [197, 768] — the shapes that dominate every layer's wall-clock
 //   * End-to-end ms/iter for a 12-layer block performing matmul
 //     + bias-add + GELU + LayerNorm chains
