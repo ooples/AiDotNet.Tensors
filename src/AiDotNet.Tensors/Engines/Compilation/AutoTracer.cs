@@ -26,6 +26,33 @@ internal static class AutoTracer
     /// <summary>Whether auto-tracing is enabled (default: true).</summary>
     internal static bool Enabled { get; set; } = true;
 
+    /// <summary>
+    /// Fast inlinable check that callers should use BEFORE constructing
+    /// the replay-delegate closure. The closure (e.g.
+    /// <c>eng =&gt; eng.TensorBroadcastAdd(ca, cb)</c>) is allocated
+    /// at the call site BEFORE <see cref="RecordOp{T}"/> can early-
+    /// return, so checking <see cref="Enabled"/> inside RecordOp does
+    /// nothing for closure-allocation cost. Issue #319 hot path:
+    /// every engine op was paying ~30 ns of closure allocation that
+    /// got immediately discarded when a tape was active (the common
+    /// case in training loops). At ~200 ops per ViT-Base train step
+    /// that's ~6 µs/step pure GC pressure.
+    ///
+    /// <para>Call sites pattern:</para>
+    /// <code>
+    /// if (AutoTracer.ShouldRecord)
+    ///     AutoTracer.RecordOp("OpName", result, eng =&gt; eng.OpName(captured));
+    /// </code>
+    /// </summary>
+    internal static bool ShouldRecord
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get => Enabled
+            && !GraphMode.IsActive
+            && TensorCodecOptions.Current.EnableCompilation
+            && !Autodiff.DifferentiableOps.ThreadTapeActive();
+    }
+
     [ThreadStatic]
     private static AutoTracerState? _state;
 

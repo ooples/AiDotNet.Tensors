@@ -2962,14 +2962,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
             DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
-            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb)); }
+            // #319: gate closure allocation on AutoTracer.ShouldRecord.
+            // The replay-delegate closure costs ~30 ns/op and was being
+            // allocated unconditionally even when a GradientTape was
+            // active (the common training case where AutoTracer
+            // suppresses recording entirely).
+            if (AutoTracer.ShouldRecord)
+            {
+                var ca = a; var cb = b;
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+            }
             return res;
         }
 
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
         var result = a.BroadcastAdd(b);
         DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorBroadcastAdd(ca, cb)); }
+        if (AutoTracer.ShouldRecord)
+        {
+            var ca = a; var cb = b;
+            AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorBroadcastAdd(ca, cb));
+        }
         return result;
     }
 
