@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -2380,7 +2381,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<Action<IEngine>> fusedBackward,
         HashSet<int> consumedIndices)
     {
-        if (typeof(T) != typeof(float)) return;
+        // PR #319: dual-precision pattern detection. Float fires the L1-resident
+        // FusedMultiLayerGemm fast path (Phase B); double fires a simpler
+        // BLAS-Dgemm × ReLU × BLAS-Dgemm chain that still beats the eager
+        // tape path because the two matmuls dispatch to OpenBLAS Dgemm
+        // directly (75 GFLOPS) instead of going through the eager
+        // engine.TensorMatMul → tape recording → AutoTracer pipeline. The
+        // L1-cache-residency benefit specifically requires the FusedMultiLayer
+        // kernel which is float-only; extending it to double is a separate
+        // 200+ line SIMD effort tracked as a follow-up.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
 
         for (int i = 0; i + 2 < steps.Count; i++)
         {
@@ -2435,6 +2445,121 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
+
+            // ── Double-precision branch — BLAS-Dgemm × scalar ReLU × BLAS-Dgemm.
+            // Skips the L1-resident fused kernel (float-only) but still avoids
+            // the eager tape recording/dispatch pipeline. The two matmuls
+            // dispatch through OpenBLAS Dgemm directly (~75 GFLOPS) instead of
+            // going through eager TensorMatMul → tape recording → AutoTracer.
+            // Gated on BlasProvider.HasNativeDgemm at compile-build time — if
+            // the user has explicitly opted out of BLAS (AIDOTNET_USE_BLAS=0),
+            // we don't fuse this triple; the eager path will run and remain
+            // correct (just slower for that user). Industry standard: if you
+            // disable the BLAS that matmul depends on, you've also disabled
+            // the kernels that depend on it.
+            if (typeof(T) == typeof(double))
+            {
+                if (!BlasProvider.HasNativeDgemm)
+                {
+                    TensorAllocator.Return(activatedBuffer);
+                    continue;
+                }
+
+                var capturedInputD = inputTensor;
+                var capturedW1D = w1Tensor;
+                var capturedW2D = w2Tensor;
+                var capturedOutputD = outputTensor;
+                var capturedActivatedD = activatedBuffer;
+                int cmD = m, ckD = k, chD = h, cnD = n;
+                var capturedGradMapD = gradMap;
+
+                fusedForward.Add(eng =>
+                {
+                    var inA = (double[])(object)capturedInputD.GetDataArray();
+                    var w1A = (double[])(object)capturedW1D.GetDataArray();
+                    var w2A = (double[])(object)capturedW2D.GetDataArray();
+                    var outA = (double[])(object)capturedOutputD.GetDataArray();
+                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
+
+                    BlasProvider.TryGemm(cmD, chD, ckD, inA, 0, ckD, w1A, 0, chD, actA, 0, chD);
+
+                    int activatedLen = cmD * chD;
+                    for (int idx = 0; idx < activatedLen; idx++)
+                        if (actA[idx] < 0.0) actA[idx] = 0.0;
+
+                    BlasProvider.TryGemm(cmD, cnD, chD, actA, 0, chD, w2A, 0, cnD, outA, 0, cnD);
+                });
+
+                fusedBackward.Add(eng =>
+                {
+                    if (!capturedGradMapD.TryGetValue(capturedOutputD, out var gradOut)) return;
+
+                    var gOutArr = (double[])(object)gradOut.GetDataArray();
+                    var inA = (double[])(object)capturedInputD.GetDataArray();
+                    var w1A = (double[])(object)capturedW1D.GetDataArray();
+                    var w2A = (double[])(object)capturedW2D.GetDataArray();
+                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
+
+                    capturedGradMapD.TryGetValue(capturedW1D, out var gW1Tensor);
+                    capturedGradMapD.TryGetValue(capturedW2D, out var gW2Tensor);
+                    capturedGradMapD.TryGetValue(capturedInputD, out var gInTensor);
+
+                    // dW2 = activated^T @ gradOut → [h, n]
+                    if (gW2Tensor is not null)
+                    {
+                        var gW2 = (double[])(object)gW2Tensor.GetDataArray();
+                        BlasProvider.TryGemmEx(chD, cnD, cmD,
+                            actA, 0, chD, transA: true,
+                            gOutArr, 0, cnD, transB: false,
+                            gW2, 0, cnD);
+                    }
+
+                    // gradH = gradOut @ w2^T → [m, h]
+                    var gradH = ArrayPool<double>.Shared.Rent(cmD * chD);
+                    Array.Clear(gradH, 0, cmD * chD);
+                    BlasProvider.TryGemmEx(cmD, chD, cnD,
+                        gOutArr, 0, cnD, transA: false,
+                        w2A, 0, cnD, transB: true,
+                        gradH, 0, chD);
+
+                    // ReLU backward: gradH *= (activated > 0 ? 1 : 0)
+                    int gradHLen = cmD * chD;
+                    for (int idx = 0; idx < gradHLen; idx++)
+                        if (actA[idx] <= 0.0) gradH[idx] = 0.0;
+
+                    // dW1 = input^T @ gradH → [k, h]
+                    if (gW1Tensor is not null)
+                    {
+                        var gW1 = (double[])(object)gW1Tensor.GetDataArray();
+                        BlasProvider.TryGemmEx(ckD, chD, cmD,
+                            inA, 0, ckD, transA: true,
+                            gradH, 0, chD, transB: false,
+                            gW1, 0, chD);
+                    }
+
+                    // dInput = gradH @ w1^T → [m, k]
+                    if (gInTensor is not null)
+                    {
+                        var gIn = (double[])(object)gInTensor.GetDataArray();
+                        BlasProvider.TryGemmEx(cmD, ckD, chD,
+                            gradH, 0, chD, transA: false,
+                            w1A, 0, chD, transB: true,
+                            gIn, 0, ckD);
+                    }
+
+                    ArrayPool<double>.Shared.Return(gradH);
+
+                    capturedW1D.Grad = gW1Tensor;
+                    capturedW2D.Grad = gW2Tensor;
+                    capturedInputD.Grad = gInTensor;
+                });
+
+                consumedIndices.Add(i);
+                consumedIndices.Add(i + 1);
+                consumedIndices.Add(i + 2);
+                i += 2;
+                continue;
+            }
 
             // Capture for closures
             var capturedInput = inputTensor;
