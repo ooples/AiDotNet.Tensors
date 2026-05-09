@@ -18704,7 +18704,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var queryData = query.GetFlattenedData();
         var keyData = key.GetFlattenedData();
 
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * d_k, bh =>
         {
             int qOffset = bh * seqQ * d_k;
             int kOffset = bh * seqK * d_k;
@@ -18728,7 +18728,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var weightsData = new T[batch * heads * seqQ * seqK];
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * d_k, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -18776,7 +18776,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = new T[batch * heads * seqQ * d_v];
         var valueData = value.GetDataArray();
 
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * d_k, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -19201,7 +19201,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradQData = new T[batch * heads * seqQ * d_k];
         var gradKData = new T[batch * heads * seqK * d_k];
 
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * d_k, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -19750,7 +19750,7 @@ public partial class CpuEngine : ITensorLevelEngine
         numOps.Fill(outputData.AsSpan(), numOps.Zero);
         numOps.Fill(statsData.AsSpan(), negInf);
 
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -20209,7 +20209,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            Parallel.For(0, batch * heads, bh =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
             {
                 int b = bh / heads;
                 int h = bh % heads;
@@ -20342,7 +20342,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch, int heads, int seqQ, int headDim, int seqK,
         int BLOCK_Q, int BLOCK_KV)
     {
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -20428,7 +20428,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch, int heads, int seqQ, int headDim, int seqK,
         int BLOCK_Q, int BLOCK_KV)
     {
-        Parallel.For(0, batch * heads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
         {
             int b = bh / heads;
             int h = bh % heads;
