@@ -16207,7 +16207,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = new T[input.Length];
 
         // Compute mean per channel (across height, width)
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * spatialSize, c =>
         {
             T sum = numOps.Zero;
             int channelOffset = c * spatialSize;
@@ -16219,7 +16219,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         // Compute variance per channel
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * spatialSize, c =>
         {
             T sumSq = numOps.Zero;
             T channelMean = meanData[c];
@@ -16233,7 +16233,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         // Normalize and scale
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * spatialSize, c =>
         {
             T channelMean = meanData[c];
             T channelStdInv = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[c], eps)));
@@ -16650,7 +16650,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Standard batch norm backward formula:
         // dx = (gamma / sqrt(var + eps) / N) * (N * dy - sum(dy) - (x - mean) / (var + eps) * sum(dy * (x - mean)))
         // All terms must be scaled by gamma for correctness
-        Parallel.For(0, features, f =>
+        CpuParallelSettings.ParallelForOrSerial(0, features, gradInputData.Length, f =>
         {
             T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[f], eps)));
             T gamma = gammaData[f];
@@ -16717,7 +16717,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var giF = new float[input.Length];
             float elemF = elementsPerChannel;
 
-            Parallel.For(0, channels, c =>
+            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
             {
                 float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
                 float mean_c = meF[c];
@@ -16766,7 +16766,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInputData = new T[input.Length];
 
         // Compute gradGamma and gradBeta per channel (generic fallback)
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
         {
             T gGamma = numOps.Zero;
             T gBeta = numOps.Zero;
@@ -16791,7 +16791,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         // Compute gradInput
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
         {
             T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[c], eps)));
             T gammaC = gammaData[c];
@@ -16867,7 +16867,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradBetaData = new T[channels];
         var gradInputData = new T[input.Length];
 
-        Parallel.For(0, channels, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, gradInputData.Length, c =>
         {
             T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[c], eps)));
             T mean_c = meanData[c];
@@ -17986,7 +17986,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = output.GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
-        Parallel.For(0, batch * numGroups, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, outputData.Length, idx =>
         {
             int b = idx / numGroups;
             int g = idx % numGroups;
@@ -18401,7 +18401,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        Parallel.For(0, batchSize, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
         {
             int offset = b * featureSize;
             T featureSizeT = numOps.FromDouble(featureSize);
@@ -18481,7 +18481,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, b =>
             {
                 int off = b * fs;
                 float invRms = 1f / fRms[b];
@@ -18523,7 +18523,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, b =>
             {
                 int off = b * fs;
                 double invRms = 1.0 / dRms[b];
@@ -18557,7 +18557,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * featureSize, b =>
             {
                 T invRms = numOps.Divide(numOps.One, rmsData[b]);
                 T sumCorrection = numOps.Zero;
