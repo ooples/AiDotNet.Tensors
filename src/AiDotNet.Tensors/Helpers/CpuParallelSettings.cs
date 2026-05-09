@@ -187,4 +187,70 @@ public static class CpuParallelSettings
         }
         System.Threading.Tasks.Parallel.For(fromInclusive, toExclusive, body);
     }
+
+    /// <summary>
+    /// Grain-size-aware drop-in for the localInit/localFinally overload of
+    /// <see cref="System.Threading.Tasks.Parallel.For{TLocal}(int, int, Func{TLocal}, Func{int, System.Threading.Tasks.ParallelLoopState, TLocal, TLocal}, Action{TLocal})"/>.
+    /// When <paramref name="totalWork"/> is below
+    /// <see cref="PersistentParallelExecutor.DefaultSerialGrainSize"/>,
+    /// runs the body inline on the calling thread with a single
+    /// thread-local accumulator that's seeded by <paramref name="localInit"/>
+    /// before the loop and finalised by <paramref name="localFinally"/> after.
+    /// Above the threshold, dispatches to <c>Parallel.For</c>'s per-task-local
+    /// overload unchanged.
+    ///
+    /// <para>Issue #319 follow-up: closes the gap for kernels that build
+    /// per-thread accumulators (cross-entropy loss, BatchNorm reductions,
+    /// random-fill primitives) — these stayed on raw <c>Parallel.For</c>
+    /// because the existing helper only had the <c>Action&lt;int&gt;</c>
+    /// signature. The serial-path <paramref name="localFinally"/> still runs
+    /// once, so callers that aggregate per-task results into a shared field
+    /// behave identically (a single thread accumulates everything inline).</para>
+    /// </summary>
+    /// <typeparam name="TLocal">Type of the per-task-local accumulator.</typeparam>
+    /// <param name="fromInclusive">First index, inclusive.</param>
+    /// <param name="toExclusive">One past last index, exclusive.</param>
+    /// <param name="totalWork">Total elementwise work the body will
+    /// perform across all iterations combined.</param>
+    /// <param name="localInit">Factory producing the initial per-task local.</param>
+    /// <param name="body">Iteration body — same shape as
+    /// <c>Parallel.For</c>'s <c>Func&lt;int, ParallelLoopState, TLocal, TLocal&gt;</c>.</param>
+    /// <param name="localFinally">Action invoked once per task with the final
+    /// per-task local — typically merges the local into a shared accumulator.</param>
+    public static void ParallelForOrSerial<TLocal>(
+        int fromInclusive,
+        int toExclusive,
+        long totalWork,
+        Func<TLocal> localInit,
+        Func<int, System.Threading.Tasks.ParallelLoopState, TLocal, TLocal> body,
+        Action<TLocal> localFinally)
+    {
+        if (toExclusive <= fromInclusive) return;
+        if (totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        {
+            // Serial fast path: one local accumulator, no
+            // ParallelLoopState (Stop/Break never fire serial-side).
+            // Match Parallel.For's exception semantics: capture
+            // first thrown exception, finish remaining iterations,
+            // re-throw at end via raw exception (consistent with
+            // PersistentParallelExecutor.Execute serial path).
+            //
+            // ParallelLoopState is sealed with no public constructor,
+            // so we pass null. The body must tolerate it — same
+            // contract that PersistentParallelExecutor's serial path
+            // already imposes on its non-localInit body shape.
+            TLocal local = localInit();
+            Exception? firstException = null;
+            for (int i = fromInclusive; i < toExclusive; i++)
+            {
+                try { local = body(i, null!, local); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            try { localFinally(local); }
+            catch (Exception ex) { firstException ??= ex; }
+            if (firstException is not null) throw firstException;
+            return;
+        }
+        System.Threading.Tasks.Parallel.For(fromInclusive, toExclusive, localInit, body, localFinally);
+    }
 }

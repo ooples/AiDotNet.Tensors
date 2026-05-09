@@ -5684,7 +5684,10 @@ public partial class CpuEngine : ITensorLevelEngine
             threadLocalGrads[t] = new double[depth * height * width * channels];
         }
 
-        Parallel.For(0, numPositions, () => Thread.CurrentThread.ManagedThreadId % numThreads, (n, _, threadIndex) =>
+        CpuParallelSettings.ParallelForOrSerial(0, numPositions,
+            (long)numPositions * 8, // 8 trilinear-corner accumulator updates per position
+            () => Thread.CurrentThread.ManagedThreadId % numThreads,
+            (n, _, threadIndex) =>
         {
             var localGrad = threadLocalGrads[threadIndex];
 
@@ -17119,7 +17122,10 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 // Parallel path: per-thread scratch via Parallel.For's
                 // localInit / localFinally so allocations don't churn.
-                Parallel.For(0, batchSize, () => new double[fs], (b, _, scratch) =>
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize,
+                    (long)batchSize * fs,
+                    () => new double[fs],
+                    (b, _, scratch) =>
                 {
                     int offset = b * fs;
                     var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
@@ -25924,7 +25930,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < seeds.Length; i++)
                     seeds[i] = baseRandom.Next();
 
-                Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
+                CpuParallelSettings.ParallelForOrSerial(0, totalElements,
+                    totalElements,
+                    () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
                     (i, state, localRandom) =>
                     {
                         resultData[i] = localRandom.NextDouble() < dropoutRateD ? zero : scale;
@@ -31410,11 +31418,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (batchSize > 32)
         {
             object lockObj = new object();
-            Parallel.For(0, batchSize, () => 0.0, (b, _, localLoss) =>
-            {
-                return localLoss + ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, sparseTargets);
-            },
-            localLoss => { lock (lockObj) { totalLoss += localLoss; } });
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize,
+                (long)batchSize * numClasses,
+                () => 0.0,
+                (b, _, localLoss) =>
+                {
+                    return localLoss + ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, sparseTargets);
+                },
+                localLoss => { lock (lockObj) { totalLoss += localLoss; } });
         }
         else
         {
