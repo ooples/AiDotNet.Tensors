@@ -2742,7 +2742,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     chunkSize = (chunkSize + 15) & ~15;
                     IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                     int totalLength = length;
-                    Parallel.For(0, subChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, totalLength - start);
@@ -2841,7 +2841,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -3997,7 +3997,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
                         chunkSize = (chunkSize + 31) & ~31;
-                        Parallel.For(0, subChunks, chunk =>
+                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
                         {
                             int start = chunk * chunkSize;
                             int count = Math.Min(chunkSize, length - start);
@@ -4031,7 +4031,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     chunkSize = (chunkSize + 15) & ~15;
                     IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                     int totalLength = length;
-                    Parallel.For(0, subChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, totalLength - start);
@@ -4125,7 +4125,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         int chunkSize = (length + mulChunks - 1) / mulChunks;
                         chunkSize = (chunkSize + 31) & ~31;
-                        Parallel.For(0, mulChunks, chunk =>
+                        CpuParallelSettings.ParallelForOrSerial(0, mulChunks, length, chunk =>
                         {
                             int start = chunk * chunkSize;
                             int count = Math.Min(chunkSize, length - start);
@@ -4158,7 +4158,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     chunkSize = (chunkSize + 15) & ~15;
                     IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                     int totalLength = length;
-                    Parallel.For(0, mulChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, mulChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, totalLength - start);
@@ -4252,7 +4252,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4367,7 +4367,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4418,7 +4418,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4446,7 +4446,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4513,7 +4513,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4544,7 +4544,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
                 chunkSize = (chunkSize + 31) & ~31;
-                Parallel.For(0, numChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4711,7 +4711,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
                         chunkSize = (chunkSize + 31) & ~31;
-                        Parallel.For(0, subChunks, chunk =>
+                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
                         {
                             int start = chunk * chunkSize;
                             int count = Math.Min(chunkSize, length - start);
@@ -4744,7 +4744,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     chunkSize = (chunkSize + 15) & ~15;
                     IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                     int totalLength = length;
-                    Parallel.For(0, subChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, totalLength - start);
@@ -5597,7 +5597,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(new[] { numPositions, channels });
 
-        Parallel.For(0, numPositions, n =>
+        CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * channels * 8, n =>
         {
             // Get position (z, y, x)
             T pz = positions[n, 0];
@@ -6376,7 +6376,7 @@ public partial class CpuEngine : ITensorLevelEngine
         IntPtr pData = (IntPtr)data;
         int totalLength = length;
 
-        Parallel.For(0, chunks, chunk =>
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, chunk =>
         {
             int start = chunk * chunkSize;
             int count = Math.Min(chunkSize, totalLength - start);
@@ -6480,7 +6480,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
             {
-                Parallel.For(0, bc, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
@@ -6551,7 +6551,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
             {
-                Parallel.For(0, bc, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
@@ -6709,7 +6709,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
             {
-                Parallel.For(0, bc, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
                     ProcessChannel((float*)ipIn + idx * hw, (float*)ipOut + idx * ohow);
                 });
@@ -7174,7 +7174,7 @@ public partial class CpuEngine : ITensorLevelEngine
             };
 
             if (h * w >= 1024)
-                Parallel.For(0, bc, poolKernel);
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, poolKernel);
             else
                 for (int idx = 0; idx < bc; idx++) poolKernel(idx);
             DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
@@ -8012,7 +8012,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (useParallel)
         {
-            System.Threading.Tasks.Parallel.For(0, batch * outChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
+                (long)batch * outChannels * outputHeight * outputWidth, idx =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -8269,7 +8270,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     int chunkSize = (length + sigChunks - 1) / sigChunks;
                     chunkSize = (chunkSize + 31) & ~31;
 
-                    Parallel.For(0, sigChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -8426,7 +8427,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     int chunkSize = (length + jitChunks - 1) / jitChunks;
                     chunkSize = (chunkSize + 31) & ~31;
 
-                    Parallel.For(0, jitChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, jitChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -8469,7 +8470,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int chunkSize = (length + sigChunks - 1) / sigChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
-                Parallel.For(0, sigChunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -8585,7 +8586,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     float* pDstP = pDstFix + dOff;
                     int chunkSize = (length + reluChunks - 1) / reluChunks;
                     chunkSize = (chunkSize + 31) & ~31;
-                    Parallel.For(0, reluChunks, chunk =>
+                    CpuParallelSettings.ParallelForOrSerial(0, reluChunks, length, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -9132,7 +9133,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 chunkSize = (chunkSize + 31) & ~31;
                 IntPtr pIn = (IntPtr)pSrc;
                 IntPtr pOut = (IntPtr)pDst;
-                Parallel.For(0, chunks, chunk =>
+                CpuParallelSettings.ParallelForOrSerial(0, chunks, len, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, len - start);
@@ -10709,7 +10710,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (im2colOps >= 1_000_000L)
                 {
-                    Parallel.For(0, inC, CopyChannel);
+                    CpuParallelSettings.ParallelForOrSerial(0, inC, im2colOps, CopyChannel);
                 }
                 else
                 {
@@ -10867,7 +10868,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             const int BLK = 32;
             int numColBlocks = (cols + BLK - 1) / BLK;
-            System.Threading.Tasks.Parallel.For(0, numColBlocks, colBlockIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, numColBlocks, (long)rows * cols, colBlockIdx =>
             {
                 int cb = colBlockIdx * BLK;
                 int cEnd = Math.Min(cb + BLK, cols);
@@ -10891,7 +10892,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (parallelBatch)
         {
-            Parallel.For(0, batch, ProcessImage);
+            CpuParallelSettings.ParallelForOrSerial(0, batch,
+                (long)batch * outC * oH * oW, ProcessImage);
         }
         else
         {
@@ -11980,7 +11982,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Use thread-local accumulation to avoid lock contention
             var lockObj = new object();
-            Parallel.For(0, batch * inChannels,
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels,
+                (long)batch * inChannels * height * width,
                 // Initialize thread-local storage
                 () => new T[batch * outChannels * outputHeight * outputWidth],
                 // Body
@@ -17773,7 +17776,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                Parallel.For(0, batchSize, ProcessBatch);
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, ProcessBatch);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -17836,7 +17839,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                Parallel.For(0, batchSize, ProcessBatch);
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, ProcessBatch);
             }
         }
         else
@@ -18188,7 +18191,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Batch typically small (1–16) for diffusion training, but each
             // batch's work is large (channels × spatialSize). Always parallel.
-            Parallel.For(0, batch, ProcessBatch);
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatch);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -18271,7 +18274,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            Parallel.For(0, batch, ProcessBatchD);
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatchD);
         }
         else
         {
@@ -31542,7 +31545,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (batchSize > 32)
         {
-            Parallel.For(0, batchSize, processBatch);
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * numClasses, processBatch);
         }
         else
         {
@@ -31629,7 +31632,7 @@ public partial class CpuEngine : ITensorLevelEngine
         };
 
         if (totalChannels > 32)
-            Parallel.For(0, totalChannels, processChannel);
+            CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, processChannel);
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
@@ -31665,7 +31668,7 @@ public partial class CpuEngine : ITensorLevelEngine
         };
 
         if (totalChannels > 32)
-            Parallel.For(0, totalChannels, processChannel);
+            CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, processChannel);
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
@@ -31896,7 +31899,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Align to 32-float boundary for SIMD
             chunkSize = (chunkSize + 31) & ~31;
 
-            Parallel.For(0, numChunks, chunk =>
+            CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
@@ -31925,7 +31928,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int chunkSize = (length + numChunks - 1) / numChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
-            Parallel.For(0, numChunks, chunk =>
+            CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
@@ -35358,7 +35361,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var ops = MathHelper.GetNumericOperations<T>();
 
         // B(f1, f2) = X(f1) * X(f2) * conj(X(f1+f2))
-        System.Threading.Tasks.Parallel.For(0, maxF1, f1 =>
+        CpuParallelSettings.ParallelForOrSerial(0, maxF1, (long)maxF1 * maxF2, f1 =>
         {
             for (int f2 = 0; f2 < maxF2; f2++)
             {
@@ -35396,7 +35399,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<Complex<T>>([maxF1, maxF2, maxF3]);
         var ops = MathHelper.GetNumericOperations<T>();
 
-        System.Threading.Tasks.Parallel.For(0, maxF1, f1 =>
+        CpuParallelSettings.ParallelForOrSerial(0, maxF1, (long)maxF1 * maxF2 * maxF3, f1 =>
         {
             for (int f2 = 0; f2 < maxF2; f2++)
             {
