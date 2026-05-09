@@ -17077,36 +17077,68 @@ public partial class CpuEngine : ITensorLevelEngine
             var outD = (double[])(object)outputData;
             double epsD = epsilon;
             int fs = featureSize;
-            // Pre-allocate once; the centered scratch is per-thread to
-            // avoid allocation churn under Parallel.For.
-            Parallel.For(0, batchSize, () => new double[fs], (b, _, scratch) =>
+            // #319: total work is batchSize * featureSize floats. For ViT-Base
+            // with batch=1, featureSize=768 (= 768 ops total), this is well
+            // below the 32K grain size — Parallel.For dispatch was paying
+            // semaphore-signal overhead with zero parallelism benefit.
+            // Migrate to ParallelForOrSerial so small-batch LayerNorm runs
+            // inline on the calling thread.
+            long lnTotalWork = (long)batchSize * featureSize;
+            if (lnTotalWork < AiDotNet.Tensors.Helpers.PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                int offset = b * fs;
-                var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
-                double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
-                double m = sum / fs;
-                meanD[b] = m;
-                // Compute centered = (x - m), then SumOfSquares for variance.
-                // Two passes but each is SIMD; cheaper than one scalar pass.
-                AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                    inSlice, scratch.AsSpan(0, fs), m, 1.0);
-                double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
-                    new ReadOnlySpan<double>(scratch, 0, fs)) / fs;
-                varD[b] = v;
-                double invStd = 1.0 / Math.Sqrt(v + epsD);
-                // Normalize-and-scale: (x - m) * invStd * gamma + beta.
-                // AffineNormalize delivers (x - m) * invStd into outD;
-                // then a scalar gamma/beta apply (could SIMD-fuse later).
-                AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                    inSlice, new Span<double>(outD, offset, fs), m, invStd);
-                for (int f = 0; f < fs; f++)
-                    outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
-                return scratch;
-            }, scratch => { /* per-thread scratch goes out of scope */ });
+                // Serial path: one scratch shared across iterations.
+                var scratchSerial = new double[fs];
+                for (int b = 0; b < batchSize; b++)
+                {
+                    int offset = b * fs;
+                    var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
+                    double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
+                    double m = sum / fs;
+                    meanD[b] = m;
+                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                        inSlice, scratchSerial.AsSpan(0, fs), m, 1.0);
+                    double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
+                        new ReadOnlySpan<double>(scratchSerial, 0, fs)) / fs;
+                    varD[b] = v;
+                    double invStd = 1.0 / Math.Sqrt(v + epsD);
+                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                        inSlice, new Span<double>(outD, offset, fs), m, invStd);
+                    for (int f = 0; f < fs; f++)
+                        outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
+                }
+            }
+            else
+            {
+                // Parallel path: per-thread scratch via Parallel.For's
+                // localInit / localFinally so allocations don't churn.
+                Parallel.For(0, batchSize, () => new double[fs], (b, _, scratch) =>
+                {
+                    int offset = b * fs;
+                    var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
+                    double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
+                    double m = sum / fs;
+                    meanD[b] = m;
+                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                        inSlice, scratch.AsSpan(0, fs), m, 1.0);
+                    double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
+                        new ReadOnlySpan<double>(scratch, 0, fs)) / fs;
+                    varD[b] = v;
+                    double invStd = 1.0 / Math.Sqrt(v + epsD);
+                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
+                        inSlice, new Span<double>(outD, offset, fs), m, invStd);
+                    for (int f = 0; f < fs; f++)
+                        outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
+                    return scratch;
+                }, scratch => { /* per-thread scratch goes out of scope */ });
+            }
         }
         else
         {
-            Parallel.For(0, batchSize, b =>
+            // #319: same total-work guard as the float64 fast path above —
+            // small-batch generic-T LayerNorm runs inline below the 32K
+            // grain size to skip Parallel.For dispatch overhead.
+            long lnGenericWork = (long)batchSize * featureSize;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, lnGenericWork, b =>
             {
                 int offset = b * featureSize;
                 var inSlice = inputData.AsSpan(offset, featureSize);
