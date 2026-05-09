@@ -56,6 +56,21 @@ public static class PR319GrainSizeHarness
 
             ReportBest("L2Normalize   ", outerRuns, warmup, measure,
                 () => engine.TensorNormalize(input, axis: 1, epsilon: 1e-10f));
+
+            // MatMul covers MatrixMultiplyHelper + Avx512Sgemm + SimdGemmDouble
+            // Reshape input → 2D matrix and multiply against random kernel
+            int M = B * C, K = H * W, N = C;
+            var matA = MakeTensor(new[] { M, K }, rng);
+            var matB = MakeTensor(new[] { K, N }, rng);
+            ReportBest("MatMul        ", outerRuns, warmup, measure,
+                () => engine.TensorMatMul(matA, matB));
+
+            // Conv2D covers NchwcConv2D / NchwcConv2D16 / FusedConvHelper
+            var convInput = MakeTensor(new[] { B, C, H, W }, rng);
+            var convKernel = MakeTensor(new[] { C, C, 3, 3 }, rng);
+            ReportBest("Conv2D 3×3    ", outerRuns, warmup, measure,
+                () => engine.Conv2D(convInput, convKernel,
+                    stride: new[] { 1, 1 }, padding: new[] { 1, 1 }, dilation: new[] { 1, 1 }));
         }
 
         Console.WriteLine();
