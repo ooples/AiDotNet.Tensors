@@ -31060,7 +31060,7 @@ public partial class CpuEngine : ITensorLevelEngine
             && meanData is float[] mF && varData is float[] vF && resultData is float[] rF)
         {
             float epsF = (float)epsilon;
-            Parallel.For(0, batch * channels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, rF.Length, idx =>
             {
                 int b2 = idx / channels;
                 int c2 = idx % channels;
@@ -31761,7 +31761,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback.
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int inputBaseOffset = idx * inHeight * inWidth;
             int outputBaseOffset = idx * outputHeight * outputWidth;
@@ -31825,7 +31825,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         var resultData = result.GetDataArray();
 
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, resultData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -33150,7 +33150,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inData = input.GetFlattenedData();
         var outData = output.GetDataArray();
         int totalBC = n * c;
-        Parallel.For(0, totalBC, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, totalBC, outData.Length, bc =>
         {
             int inBase = bc * h * w;
             int outBase = bc * outH * outW;
@@ -35433,7 +35433,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var ops = MathHelper.GetNumericOperations<T>();
 
         // Per batch: FFT once, then per cavity, per bounce: multiply in freq domain → IFFT → tanh → FFT again
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numCavities * n, b =>
         {
             var inSlice = new T[n];
             for (int i = 0; i < n; i++) inSlice[i] = input[b * n + i];
@@ -35505,7 +35505,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(outShape);
         var ops = MathHelper.GetNumericOperations<T>();
 
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numSegments * numMfcc, b =>
         {
             int melBins = Math.Max(numMfcc * 2, 16);
             var dctBasis = BuildDctBasis<T>(numMfcc, melBins);
@@ -35580,7 +35580,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(outShape);
         var ops = MathHelper.GetNumericOperations<T>();
 
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numSegments * numBins, b =>
         {
             var buf = new Complex<T>[fftSize];
             for (int s = 0; s < numSegments; s++)
@@ -35659,7 +35659,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(outShape);
         var ops = MathHelper.GetNumericOperations<T>();
 
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numBands, b =>
         {
             // Compute theta phase via analytic signal on theta band
             var wave = new T[fftSize];
