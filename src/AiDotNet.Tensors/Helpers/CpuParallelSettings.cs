@@ -120,4 +120,22 @@ public static class CpuParallelSettings
     {
         PersistentParallelExecutor.Instance.Execute(numChunks, action);
     }
+
+    /// <summary>
+    /// Grain-size-aware variant: forwards to
+    /// <see cref="PersistentParallelExecutor.Execute(int, long, Action{int})"/>
+    /// so callers that know their op's elementwise work can engage
+    /// PyTorch-style serial-fallback below
+    /// <see cref="PersistentParallelExecutor.DefaultSerialGrainSize"/>.
+    /// Issue #319 follow-up to PR #316: kernels that pass a real
+    /// totalWork value skip dispatch overhead on small ops.
+    /// </summary>
+    /// <param name="numChunks">Number of chunks to process in parallel.</param>
+    /// <param name="totalWork">Total elementwise work the action will
+    /// perform across all chunks combined.</param>
+    /// <param name="action">Action receiving chunk index (0..numChunks-1).</param>
+    public static void LightweightParallel(int numChunks, long totalWork, Action<int> action)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, action);
+    }
 }
