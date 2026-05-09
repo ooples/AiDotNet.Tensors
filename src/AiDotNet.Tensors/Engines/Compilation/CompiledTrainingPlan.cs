@@ -283,9 +283,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float eps = 1e-8f,
         float weightDecay = 0f)
     {
-        if (typeof(T) != typeof(float))
-            throw new NotSupportedException("Fused optimizer updates only support float parameters.");
+        if (typeof(T) == typeof(float))
+        {
+            ConfigureOptimizerFloat(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            ConfigureOptimizerDouble(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
 
+    private unsafe void ConfigureOptimizerFloat(
+        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+    {
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
         var paramArrays = new float[paramCount][];
@@ -351,6 +364,86 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         default:
                             throw new NotSupportedException(
                                 $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
+                                $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
+                    }
+                }
+            }
+        };
+    }
+
+    private unsafe void ConfigureOptimizerDouble(
+        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+    {
+        // Mirror of ConfigureOptimizerFloat for double parameters. PR #319
+        // follow-up: tape-trained Tensor<double> models (e.g. ViT-Base in
+        // the consumer integration test) can now hit the fused-compiled
+        // training path that was previously gated behind float-only
+        // (NeuralNetworkBase.TryTrainWithFusedOptimizer line 4855 +
+        // CompiledTapeTrainingStep.TryStepWithFusedOptimizer line 232).
+        int paramCount = _parameters.Length;
+        var paramArrays = new double[paramCount][];
+        var gradArrays = new double[paramCount][];
+        var lengths = new int[paramCount];
+        var m = new double[paramCount][];
+        var v = new double[paramCount][];
+
+        for (int p = 0; p < paramCount; p++)
+        {
+            paramArrays[p] = (double[])(object)_parameters[p].GetDataArray();
+            gradArrays[p] = _gradients[p] is not null
+                ? (double[])(object)_gradients[p].GetDataArray()
+                : Array.Empty<double>();
+            lengths[p] = _parameters[p].Length;
+
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
+            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
+        }
+
+        _optimizerStep = 0;
+        // Hyperparameters arrive as float (the kernel API was originally
+        // float-only); promote to double once at config time so the inner
+        // loop doesn't pay an implicit-conversion cost per element.
+        double lr = learningRate;
+        double b1 = beta1;
+        double b2 = beta2;
+        double epsVal = eps;
+        double wd = weightDecay;
+        var optType = optimizerType;
+
+        _optimizerUpdate = () =>
+        {
+            _optimizerStep++;
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                int len = lengths[p];
+
+                fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
+                       pM = m[p], pV = v[p])
+                {
+                    switch (optType)
+                    {
+                        case OptimizerType.SGD:
+                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
+                            break;
+                        case OptimizerType.Adam:
+                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
+                            break;
+                        case OptimizerType.AdamW:
+                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizer (double). " +
                                 $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
                     }
                 }
