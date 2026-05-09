@@ -9210,7 +9210,7 @@ public partial class CpuEngine : ITensorLevelEngine
             outerSize *= input._shape[i];
 
         // Apply GLU: output = a * sigmoid(b)
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9265,7 +9265,7 @@ public partial class CpuEngine : ITensorLevelEngine
             outerSize *= input._shape[i];
 
         // Gradient: d/da = sigmoid(b) * gradOut, d/db = a * sigmoid(b) * (1 - sigmoid(b)) * gradOut
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9330,7 +9330,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         double sqrtTwoOverPi = Math.Sqrt(2.0 / Math.PI);
 
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9389,7 +9389,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         double sqrtTwoOverPi = Math.Sqrt(2.0 / Math.PI);
 
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9461,7 +9461,7 @@ public partial class CpuEngine : ITensorLevelEngine
             outerSize *= input._shape[i];
 
         // SwiGLU: a * (b * sigmoid(b))
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9520,7 +9520,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // d/da = Swish(b) * gradOut
         // d/db = a * d_Swish(b) * gradOut where d_Swish(b) = sigmoid(b) + b * sigmoid(b) * (1 - sigmoid(b))
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9585,7 +9585,7 @@ public partial class CpuEngine : ITensorLevelEngine
             outerSize *= input._shape[i];
 
         // ReGLU: a * ReLU(b) = a * max(0, b)
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9643,7 +9643,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // d/da = ReLU(b) * gradOut
         // d/db = a * (b > 0 ? 1 : 0) * gradOut
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)input.Length, outer =>
         {
             for (int h = 0; h < halfSize; h++)
             {
@@ -9969,7 +9969,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                Parallel.For(0, batchSize, batch =>
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
                 {
                     Simd.SimdGemm.SgemmSequential(
                         new System.ReadOnlySpan<float>(aArr, batch * sliceA, sliceA),
@@ -10226,7 +10226,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Fallback: per-slice dispatch (preserves behavior for non-contiguous A or
         // when the big GEMM declines — e.g. non-float/double T, or work below the
         // BLAS threshold where per-slice dispatch can actually win).
-        Parallel.For(0, batchSize, batch =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
         {
             int aOffset = batch * matrixSizeA;
             int resultOffset = batch * matrixSizeResult;
@@ -10322,7 +10322,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var bF = (float[])(object)bData;
             var rF = (float[])(object)rData;
 
-            Parallel.For(0, batchSize, batch =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
             {
                 int aOffset = batch * matrixSizeA;
                 int bOffset = batch * matrixSizeB;
@@ -10338,7 +10338,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        Parallel.For(0, batchSize, batch =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
         {
             int aOffset = batch * matrixSizeA;
             int bOffset = batch * matrixSizeB;
@@ -24511,7 +24511,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
 
         // Perform the repeat operation
-        Parallel.For(0, outerSize, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)result.Length, outer =>
         {
             for (int a = 0; a < axisSize; a++)
             {
@@ -25334,7 +25334,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int d = normalizedAxis + 1; d < source._shape.Length; d++) innerSize *= source._shape[d];
 
             // For indices that are 1D or match the source shape at the gather dimension
-            Parallel.For(0, outerSize, outer =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)totalOutput, outer =>
             {
                 for (int idxPos = 0; idxPos < indices.Length; idxPos++)
                 {
