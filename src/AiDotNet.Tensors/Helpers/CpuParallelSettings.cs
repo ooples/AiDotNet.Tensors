@@ -138,4 +138,53 @@ public static class CpuParallelSettings
     {
         PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, action);
     }
+
+    /// <summary>
+    /// Grain-size-aware drop-in for <see cref="System.Threading.Tasks.Parallel.For(int, int, Action{int})"/>.
+    /// When <paramref name="totalWork"/> is below
+    /// <see cref="PersistentParallelExecutor.DefaultSerialGrainSize"/>,
+    /// runs the body inline on the calling thread — no ThreadPool
+    /// dispatch, no <c>LowLevelLifoSemaphore</c> wait. Above the
+    /// threshold, falls through to <c>Parallel.For</c>.
+    ///
+    /// <para>Issue #319 background: the original profile showed 42.59%
+    /// of ViT-Base CPU train wall-clock in
+    /// <c>LowLevelLifoSemaphore.WaitForSignal</c> — that's the .NET
+    /// ThreadPool primitive used by every <c>Parallel.For</c> call.
+    /// Hundreds of small-op call sites in <c>CpuEngine</c> dispatch
+    /// to <c>Parallel.For</c> unconditionally even when the work is
+    /// smaller than the dispatch overhead itself. This helper is the
+    /// migration vehicle: each call site swaps
+    /// <c>Parallel.For(0, n, body)</c> for
+    /// <c>ParallelForOrSerial(0, n, totalWork, body)</c> and the
+    /// JIT eliminates the dispatch on workloads below threshold.</para>
+    /// </summary>
+    /// <param name="fromInclusive">First index, inclusive.</param>
+    /// <param name="toExclusive">One past last index, exclusive.</param>
+    /// <param name="totalWork">Total elementwise work the body will
+    /// perform across all iterations combined.</param>
+    /// <param name="body">Iteration body — same shape as
+    /// <c>Parallel.For</c>'s <c>Action&lt;int&gt;</c>.</param>
+    public static void ParallelForOrSerial(int fromInclusive, int toExclusive, long totalWork, Action<int> body)
+    {
+        if (toExclusive <= fromInclusive) return;
+        if (totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        {
+            // Match Parallel.For's exception semantics: capture
+            // first thrown exception, finish remaining iterations,
+            // re-throw at end. Parallel.For uses
+            // AggregateException — for serial-mode we re-throw the
+            // raw first exception (consistent with the
+            // PersistentParallelExecutor.Execute serial path).
+            Exception? firstException = null;
+            for (int i = fromInclusive; i < toExclusive; i++)
+            {
+                try { body(i); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            if (firstException is not null) throw firstException;
+            return;
+        }
+        System.Threading.Tasks.Parallel.For(fromInclusive, toExclusive, body);
+    }
 }

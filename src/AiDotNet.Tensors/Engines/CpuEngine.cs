@@ -2494,7 +2494,11 @@ public partial class CpuEngine : ITensorLevelEngine
             int aStride0 = a._strides[0], aStride1 = a._strides[1];
             int bStride0 = b._strides[0], bStride1 = b._strides[1];
 
-            Parallel.For(0, m, i =>
+            // #319: pass total FMA work so small-shape generic-T
+            // matmul (e.g. per-token Q·K^T at 197×64×197 = ~12K FMAs
+            // per row, ~2.5M total) below grain size runs serial.
+            long mmGenericWork = (long)m * n * k;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, mmGenericWork, i =>
             {
                 for (int j = 0; j < n; j++)
                 {
@@ -2555,7 +2559,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                Parallel.For(0, batchSize, batch =>
+                // #319: total work across the batch is batch * m * n * k
+                // FMAs. For a 12-head ViT attention layer with
+                // batch=12, m=197, n=197, k=64 → 12 * 197² * 64 ≈ 30M
+                // FMAs total — well above grain size, parallelizes.
+                // For a small batch (batch=2 of [16, 64, 16] tiles)
+                // the work could be small enough to skip dispatch.
+                long batchTotalWork = (long)batchSize * m * n * k;
+                Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, batchTotalWork, batch =>
                 {
                     int aOffset = batch * matrixSizeA;
                     int bOffset = batch * matrixSizeB;
@@ -2570,7 +2581,8 @@ public partial class CpuEngine : ITensorLevelEngine
             goto batchDone;
         }
 
-        Parallel.For(0, batchSize, batch =>
+        long generalBatchWork = (long)batchSize * m * n * k;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, generalBatchWork, batch =>
         {
             int aOffset = batch * matrixSizeA;
             int bOffset = batch * matrixSizeB;
