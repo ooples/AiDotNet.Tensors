@@ -80,6 +80,13 @@ class Program
         }
 #endif
 
+        // PR #319 grain-size migration regression check (wall-clock harness).
+        if (args[0] == "--pr319-grain")
+        {
+            PR319GrainSizeHarness.Run();
+            return;
+        }
+
         // Run full BenchmarkDotNet suite if requested
         if (args[0] == "--full")
         {
