@@ -13910,7 +13910,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -13996,7 +13996,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var localMaxIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
 
         // Parallel over batch * channels
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -14084,7 +14084,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Parallel over batch * channels - each (b, c) pair writes to a unique slice of gradInputData
         // so no thread-local buffers are needed (avoiding racy thread-ID based indexing)
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -14209,7 +14209,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -14291,7 +14291,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Parallel over batch * channels - each (b, c) pair writes to a unique slice of gradInputData
         // so no thread-local buffers are needed (avoiding racy thread-ID based indexing)
-        Parallel.For(0, batch * channels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -14393,7 +14393,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
 
         // Use parallel processing over batch and channels
-        Parallel.For(0, batch * channels, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, bc =>
         {
             int b = bc / channels;
             int c = bc % channels;
@@ -14452,7 +14452,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Each (b, c) iteration writes to a disjoint slice of gradInputData,
         // so no synchronization is needed - direct writes are thread-safe
-        Parallel.For(0, batch * channels, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, bc =>
         {
             int b = bc / channels;
             int c = bc % channels;
@@ -15123,7 +15123,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result2 = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var outputDataGeneric = result2.GetDataArray();
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15377,7 +15377,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = output.GetFlattenedData();
         var gradInputData = new T[outputData.Length];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15553,7 +15553,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15643,7 +15643,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15732,7 +15732,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15809,7 +15809,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15882,7 +15882,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -15935,7 +15935,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -16005,7 +16005,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var normalizedData = new T[input.Length];
         var norms = new T[outerSize * innerSize];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -16039,7 +16039,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Chain rule through L2 normalization
         var gradInputData = new T[input.Length];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
@@ -27294,7 +27294,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = tensor.GetFlattenedData();
         var outputData = new T[tensor.Length];
 
-        Parallel.For(0, outerSize * innerSize, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
