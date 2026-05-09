@@ -102,6 +102,68 @@ internal sealed class PersistentParallelExecutor
     [ThreadStatic]
     private static bool _isExecuting;
 
+    /// <summary>
+    /// Default serial-fallback grain size — total elementwise work
+    /// below this threshold runs inline on the calling thread (no
+    /// worker dispatch). 32K elements matches PyTorch's
+    /// <c>at::internal::GRAIN_SIZE</c> default. Tuned for fp32 work;
+    /// fp64-heavy hot loops can override per-call via the
+    /// <see cref="Execute(int, long, Action{int})"/> overload.
+    ///
+    /// <para>Issue #313 background: profiling ViT-Base CPU training
+    /// found ~90% of wall time in <c>LowLevelLifoSemaphore.WaitForSignal</c>
+    /// and <c>ManualResetEventSlim.Wait</c> — workers being dispatched
+    /// to per-channel work that's smaller than the dispatch overhead
+    /// itself. Below the grain size, serial inline beats parallel
+    /// dispatch + signal + join by a wide margin.</para>
+    /// </summary>
+    public static int DefaultSerialGrainSize { get; set; } = 32 * 1024;
+
+    /// <summary>
+    /// Parallel execute with PyTorch-style serial-fallback below
+    /// <paramref name="totalWork"/> &lt; <see cref="DefaultSerialGrainSize"/>.
+    /// Use this overload from any kernel that knows its inner-loop
+    /// size — pass the rough element-FMA count and we'll skip the
+    /// worker pool entirely when the work is too small to justify
+    /// the dispatch.
+    /// </summary>
+    /// <param name="numChunks">Chunk count for the parallel path.</param>
+    /// <param name="totalWork">Total elementwise work the
+    /// <paramref name="action"/> body will perform across all chunks
+    /// combined. Compared against <see cref="DefaultSerialGrainSize"/>
+    /// to decide between serial inline and parallel dispatch.</param>
+    /// <param name="action">Per-chunk callback.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Execute(int numChunks, long totalWork, Action<int> action)
+    {
+        if (numChunks <= 0) return;
+        if (totalWork < DefaultSerialGrainSize)
+        {
+            // Below grain size — run inline on the calling thread.
+            // No worker wakeup, no completion-event wait, no
+            // _executeLock contention. Workers stay parked.
+            //
+            // Match the parallel path's exception semantics: capture
+            // the first thrown exception, finish the remaining chunks
+            // (the parallel path already runs main + workers to
+            // completion before the dispatcher re-throws), then
+            // re-throw at the end. Without this, a kernel that
+            // crosses the grain-size threshold mid-run (dynamic batch
+            // shrinking, varying inner shapes) would observe a
+            // behavior change between the two paths: chunks 1+
+            // skipped on the serial path, run on the parallel path.
+            Exception? firstException = null;
+            for (int c = 0; c < numChunks; c++)
+            {
+                try { action(c); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            if (firstException is not null) throw firstException;
+            return;
+        }
+        Execute(numChunks, action);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Execute(int numChunks, Action<int> action)
     {
