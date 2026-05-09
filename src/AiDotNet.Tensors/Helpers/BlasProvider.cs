@@ -387,6 +387,37 @@ internal static class BlasProvider
         catch { return false; }
     }
 
+    /// <summary>
+    /// Double-precision counterpart of <see cref="TryGemmEx(int, int, int, float[], int, int, bool, float[], int, int, bool, float[], int, int)"/>.
+    /// Used by the compiled-plan double MatMul backward path (PR #319) to dispatch
+    /// transposed Dgemm directly into pre-allocated output buffers without paying
+    /// the engine's TensorTranspose + TensorMatMul allocation+copy cost.
+    /// </summary>
+    internal static bool TryGemmEx(int m, int n, int k,
+        double[] a, int aOffset, int lda, bool transA,
+        double[] b, int bOffset, int ldb, bool transB,
+        double[] c, int cOffset, int ldc)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;  // 112 = CblasTrans
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (double* pa = &a[aOffset])
+                fixed (double* pb = &b[bOffset])
+                fixed (double* pc = &c[cOffset])
+                {
+                    cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Direct-dispatch hot paths. Historically these skipped the Try* gate
     // when the caller had already verified availability (via HasRawSgemm /

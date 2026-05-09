@@ -763,7 +763,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<GCHandle>? handleTracker = null,
         bool allowCachedB = true)
     {
-        if (typeof(T) != typeof(float)) return null;
+        // Per-branch type checks below — each `typeof(T) == typeof(float)` /
+        // `typeof(T) == typeof(double)` arm decides whether that op has a
+        // specialized path for the current numeric type. Branches without a
+        // double specialization simply fall through to the generic engine
+        // path at the bottom of the caller. PR #319: extend the MatMul
+        // branch to cover double via BlasProvider.TryGemm(double[], ...) +
+        // SimdGemm.Dgemm fallback so tape-trained Tensor<double> models
+        // (the consumer ViT-Base in PR #1224) hit the compiled-replay fast
+        // path on their hottest op.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // MatMul forward (double): direct BLAS into output buffer.
+        // Mirrors the float branch below but with double[] arrays and
+        // BlasProvider's double Dgemm overload (cblas_dgemm_ptr → OpenBLAS
+        // when AIDOTNET_USE_BLAS != 0). Falls through to SimdGemm.Dgemm
+        // when BLAS isn't loadable.
+        if (typeof(T) == typeof(double)
+            && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+
+            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
+            var cA = (double[])(object)inputA.GetDataArray();
+            var cB = (double[])(object)inputB.GetDataArray();
+            var cOut = (double[])(object)output.GetDataArray();
+
+            // Note: no Path-A pre-pack cache for double yet (SimdGemm has no
+            // DgemmWithCachedB), so the inference vs training distinction
+            // collapses to a single replay form: try BLAS, fall through to
+            // SimdGemm.Dgemm. Pre-pack-B for double is a future enhancement.
+            return eng =>
+            {
+                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                    SimdGemm.Dgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+            };
+        }
 
         // MatMul forward: direct BLAS into output buffer
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
@@ -1863,7 +1902,62 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         IEngine engine,
         List<GCHandle>? handleTracker = null)
     {
-        if (typeof(T) != typeof(float)) return null;
+        // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
+        // PR #319: extend the MatMul backward to cover double via
+        // BlasProvider.TryGemmEx(double[], ...) so tape-trained
+        // Tensor<double> models hit the compiled-replay fast path on the
+        // dominant backward op (matmul backward = ~30% of typical
+        // transformer train wall-clock).
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
+        // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
+        // engine fallback is the generic TensorMatMul which routes through SimdGemm.Dgemm.
+        if (typeof(T) == typeof(double)
+            && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && BlasProvider.IsAvailable)
+        {
+            var inputAd = step.Inputs[0];
+            var inputBd = step.Inputs[1];
+            var outputD = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(outputD) || !gradMap.ContainsKey(inputAd) || !gradMap.ContainsKey(inputBd))
+                return null;
+
+            var gradOutD = gradMap[outputD];
+            var gradAd = gradMap[inputAd];
+            var gradBd = gradMap[inputBd];
+
+            int Md = inputAd._shape[0], Kd = inputAd._shape[1], Nd = inputBd._shape[1];
+
+            double[]? cdDC = null, cdA = null, cdB = null, cdDestA = null, cdDestB = null;
+
+            return eng =>
+            {
+                cdDC ??= (double[])(object)gradOutD.GetDataArray();
+                cdA ??= (double[])(object)inputAd.GetDataArray();
+                cdB ??= (double[])(object)inputBd.GetDataArray();
+                cdDestA ??= (double[])(object)gradAd.GetDataArray();
+                cdDestB ??= (double[])(object)gradBd.GetDataArray();
+
+                // dA = dC @ B^T — double-precision BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd))
+                {
+                    var dA = eng.TensorMatMul(gradOutD, inputBd.Transpose());
+                    dA.AsSpan().CopyTo(gradAd.AsWritableSpan());
+                }
+                // dB = A^T @ dC — double-precision BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(Kd, Nd, Md, cdA, 0, Kd, true, cdDC, 0, Nd, false, cdDestB, 0, Nd))
+                {
+                    var dB = eng.TensorMatMul(inputAd.Transpose(), gradOutD);
+                    dB.AsSpan().CopyTo(gradBd.AsWritableSpan());
+                }
+
+                inputAd.Grad = gradAd;
+                inputBd.Grad = gradBd;
+            };
+        }
 
         // MatMul backward: dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
