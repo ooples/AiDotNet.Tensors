@@ -10569,7 +10569,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            Parallel.For(0, batch * outChannels, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
+                (long)batch * outChannels * outputHeight * outputWidth, idx =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -10994,7 +10995,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
 
-        Parallel.For(0, batch * inChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, gradInput.Length, idx =>
         {
             int b = idx / inChannels;
             int ic = idx % inChannels;
@@ -11145,7 +11146,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
 
-        Parallel.For(0, outChannels * inChannels, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, gradKernel.Length, idx =>
         {
             int oc = idx / inChannels;
             int ic = idx % inChannels;
@@ -12093,7 +12094,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradOut = (float[])(object)gradOutputData;
             var fInput = (float[])(object)inputData;
             var fGradKernel = (float[])(object)gradKernel;
-            Parallel.For(0, pairs, pair =>
+            CpuParallelSettings.ParallelForOrSerial(0, pairs, fGradKernel.Length, pair =>
             {
                 int ic = pair / outChannels;
                 int oc = pair % outChannels;
@@ -12129,7 +12130,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             var dInput = (double[])(object)inputData;
             var dGradKernel = (double[])(object)gradKernel;
-            Parallel.For(0, pairs, pair =>
+            CpuParallelSettings.ParallelForOrSerial(0, pairs, dGradKernel.Length, pair =>
             {
                 int ic = pair / outChannels;
                 int oc = pair % outChannels;
@@ -17850,7 +17851,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Compute gradInput
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, gradInputData.Length, b =>
             {
                 T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
                 T sumGrad = numOps.Zero;
@@ -23282,7 +23283,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradInputData = new T[batch * channels * height * width];
 
-        Parallel.For(0, batch, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
         {
             for (int oc = 0; oc < newChannels; oc++)
             {
@@ -24864,7 +24865,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        Parallel.For(0, batch, bIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * n * m, bIdx =>
         {
             for (int i = 0; i < n; i++)
             {
@@ -26072,7 +26073,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];
                 var result = AutoTensorCache.RentOrAllocate<T>([batch]);
-                Parallel.For(0, batch, b =>
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * n, b =>
                 {
                     T sum = numOps.Zero;
                     for (int i = 0; i < n; i++)
@@ -26992,7 +26993,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var XData = X.GetDataArray();
         var YData = Y.GetDataArray();
 
-        Parallel.For(0, height, row =>
+        CpuParallelSettings.ParallelForOrSerial(0, height, X.Length + Y.Length, row =>
         {
             T yVal = yData[row];
             int rowOffset = row * width;
@@ -27157,7 +27158,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var bData = b.GetDataArray();
         var resultData = result.GetDataArray();
 
-        Parallel.For(0, batch, batchIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, resultData.Length, batchIdx =>
         {
             int aBase = batchIdx * M * K;
             int rBase = batchIdx * M * N;
@@ -27397,7 +27398,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var resultValues = TensorAllocator.Rent<T>([batch, k]);
             var indicesResult = new Tensor<int>([batch, k]);
 
-            Parallel.For(0, batch, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * features, b =>
             {
                 // Extract row and sort with indices
                 var rowWithIndices = new (T value, int index)[features];
@@ -27446,7 +27447,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int batch = result._shape[0];
             int numIndices = indices._shape[1];
 
-            Parallel.For(0, batch, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numIndices, b =>
             {
                 for (int i = 0; i < numIndices; i++)
                 {
@@ -27499,7 +27500,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var indicesData = indices.GetFlattenedData();
             var tensorData = tensor.GetFlattenedData();
             var resultData = result.GetDataArray();
-            Parallel.For(0, numIndices, i =>
+            CpuParallelSettings.ParallelForOrSerial(0, numIndices, resultData.Length, i =>
             {
                 int idx = indicesData[i];
                 Array.Copy(tensorData, idx * cols, resultData, i * cols, cols);
@@ -27601,7 +27602,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // General path: copy each tensor with index mapping
-        Parallel.For(0, numTensors, t =>
+        CpuParallelSettings.ParallelForOrSerial(0, numTensors, result.Length, t =>
         {
             var tensor = tensors[t];
             var tensorData = tensor.IsContiguous ? tensor.GetDataArray() : tensor.GetFlattenedData();
