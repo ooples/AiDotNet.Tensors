@@ -1444,7 +1444,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 int totalElems = batchSize * normSize;
                 if (totalElems >= 50_000)
                 {
-                    System.Threading.Tasks.Parallel.For(0, batchSize, b =>
+                    CpuParallelSettings.ParallelForOrSerial(0, batchSize, totalElems, b =>
                     {
                         unsafe
                         {

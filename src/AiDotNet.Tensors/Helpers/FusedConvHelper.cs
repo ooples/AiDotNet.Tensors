@@ -107,7 +107,7 @@ internal static class FusedConvHelper
         if (useParallel)
         {
             int numMTiles = (M + Mc - 1) / Mc;
-            Parallel.For(0, numMTiles, mcTile =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numMTiles, (long)M * N * K, mcTile =>
             {
                 int mc = mcTile * Mc;
                 int mcEnd = Math.Min(mc + Mc, M);

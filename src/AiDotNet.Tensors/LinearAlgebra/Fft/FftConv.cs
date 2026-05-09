@@ -149,7 +149,7 @@ public static class FftConv
         }
 
         // Batch loop parallelized.
-        Parallel.For(0, N, n =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N, (long)N * Cin * Lh * 2 * freqW, n =>
         {
             // Transform input for this batch: pad each input channel to [Lh, Lw], 2D-RFft.
             var inputSpec = new double[Cin * Lh * 2 * freqW];
@@ -216,7 +216,7 @@ public static class FftConv
         var ops = MathHelper.GetNumericOperations<T>();
         var wD = weight.GetDataArray();
         var result = new double[Cout * Cin * Lh * 2 * freqW];
-        Parallel.For(0, Cout * Cin, idx =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, Cout * Cin, result.Length, idx =>
         {
             int cout = idx / Cin;
             int cin = idx % Cin;

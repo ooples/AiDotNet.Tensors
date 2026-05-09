@@ -14561,8 +14561,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var mergeLock = new object();
 
         // Use Parallel.For with true per-task local accumulators to avoid race conditions
-        Parallel.For(
+        CpuParallelSettings.ParallelForOrSerial(
             0, batch * inChannels,
+            outputData.Length,
             () => new T[outputData.Length], // localInit: create per-task buffer
             (bic, state, localOutput) =>
             {
@@ -14674,8 +14675,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Parallel.For with localInit/localFinally for thread-safe accumulation
         var mergeLock = new object();
 
-        Parallel.For(
+        CpuParallelSettings.ParallelForOrSerial(
             0, batch * inChannels,
+            gradKernelData.Length,
             () => new T[gradKernelData.Length], // localInit: create per-task buffer
             (bic, state, localGradKernel) =>
             {

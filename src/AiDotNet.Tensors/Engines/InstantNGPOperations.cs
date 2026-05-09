@@ -38,7 +38,7 @@ public static class InstantNGPOperations
 
         var features = new T[numPoints * totalFeatures];
 
-        Parallel.For(0, numPoints, n =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numPoints, (long)numPoints * numLevels * featuresPerLevel, n =>
         {
             double px = numOps.ToDouble(positions.GetFlat(n * 3));
             double py = numOps.ToDouble(positions.GetFlat(n * 3 + 1));
@@ -151,7 +151,7 @@ public static class InstantNGPOperations
             }
         }
 
-        Parallel.For(0, numPoints, n =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numPoints, (long)numPoints * numLevels * featuresPerLevel, n =>
         {
             double px = Clamp01(numOps.ToDouble(positions.GetFlat(n * 3)));
             double py = Clamp01(numOps.ToDouble(positions.GetFlat(n * 3 + 1)));
@@ -280,7 +280,7 @@ public static class InstantNGPOperations
             stripeLocks[i] = new object();
         }
 
-        Parallel.For(0, numSamples, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numSamples, numSamples, i =>
         {
             double px = numOps.ToDouble(positions.GetFlat(i * 3));
             double py = numOps.ToDouble(positions.GetFlat(i * 3 + 1));
@@ -356,7 +356,7 @@ public static class InstantNGPOperations
 
         int totalCells = gridSize * gridSize * gridSize;
 
-        Parallel.For(0, numRays, r =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRays, numRays, r =>
         {
             double ox = numOps.ToDouble(rayOrigins.GetFlat(r * 3));
             double oy = numOps.ToDouble(rayOrigins.GetFlat(r * 3 + 1));

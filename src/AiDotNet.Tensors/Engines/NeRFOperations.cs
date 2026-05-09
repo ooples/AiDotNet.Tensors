@@ -39,7 +39,7 @@ public static class NeRFOperations
         }
 
         // Vectorized parallel computation
-        Parallel.For(0, numPoints, n =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numPoints, numPoints, n =>
         {
             int posOffset = n * inputDim;
             int outOffset = n * outputDim;
@@ -89,7 +89,7 @@ public static class NeRFOperations
             frequencies[l] = Math.Pow(2.0, l) * Math.PI;
         }
 
-        Parallel.For(0, numPoints, n =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numPoints, numPoints, n =>
         {
             int posOffset = n * inputDim;
             int gradOffset = n * outputDim;
@@ -163,7 +163,7 @@ public static class NeRFOperations
 
         var colors = new T[numRays * 3];
 
-        Parallel.For(0, numRays, r =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRays, (long)numRays * numSamples, r =>
         {
             double transmittance = 1.0;
             double accumR = 0.0, accumG = 0.0, accumB = 0.0;
@@ -245,7 +245,7 @@ public static class NeRFOperations
         var rgbGrad = new T[numRays * numSamples * 3];
         var densityGrad = new T[numRays * numSamples];
 
-        Parallel.For(0, numRays, r =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRays, (long)numRays * numSamples, r =>
         {
             // Forward pass to cache transmittance and alpha values
             var transmittances = new double[numSamples];
@@ -367,7 +367,8 @@ public static class NeRFOperations
         var tVals = new T[numRays * numSamples];
 
         // Use thread-local random for stratified sampling
-        Parallel.For(0, numRays, () => RandomHelper.CreateSeededRandom(Environment.TickCount ^ Thread.CurrentThread.ManagedThreadId),
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRays, (long)numRays * numSamples,
+            () => RandomHelper.CreateSeededRandom(Environment.TickCount ^ Thread.CurrentThread.ManagedThreadId),
             (r, state, random) =>
             {
                 double ox = numOps.ToDouble(rayOrigins.GetFlat(r * 3));
@@ -433,7 +434,8 @@ public static class NeRFOperations
 
         var fineTValues = new T[numRays * numFineSamples];
 
-        Parallel.For(0, numRays, () => RandomHelper.CreateSeededRandom(Environment.TickCount ^ Thread.CurrentThread.ManagedThreadId),
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRays, (long)numRays * numFineSamples,
+            () => RandomHelper.CreateSeededRandom(Environment.TickCount ^ Thread.CurrentThread.ManagedThreadId),
             (r, state, random) =>
             {
                 int coarseOffset = r * numCoarseSamples;
@@ -542,7 +544,7 @@ public static class NeRFOperations
         double r21 = numOps.ToDouble(cameraRotation[2, 1]);
         double r22 = numOps.ToDouble(cameraRotation[2, 2]);
 
-        Parallel.For(0, imageHeight, y =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, imageHeight, (long)imageHeight * imageWidth, y =>
         {
             for (int x = 0; x < imageWidth; x++)
             {

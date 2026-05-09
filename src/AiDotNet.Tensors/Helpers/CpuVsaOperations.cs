@@ -420,7 +420,7 @@ public static class CpuVsaOperations
         if (n >= ParallelTileSize * 2)
         {
             int tileCount = (n + ParallelTileSize - 1) / ParallelTileSize;
-            Parallel.For(0, tileCount, t =>
+            CpuParallelSettings.ParallelForOrSerial(0, tileCount, (long)n * d, t =>
             {
                 int start = t * ParallelTileSize;
                 int end = Math.Min(start + ParallelTileSize, n);
@@ -601,7 +601,7 @@ public static class CpuVsaOperations
         // in place to save one allocation.
         if (B >= 4)
         {
-            Parallel.For(0, B, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, B, (long)B * N * (long)Math.Log(Math.Max(N, 2), 2), b =>
                 ProcessHrrRow(xArr, yArr, outArr, b, N, conjugate));
         }
         else

@@ -67,7 +67,7 @@ public static class MeshConvolutionOperations
         var biasData = biases.ToArray();
 
         // Process vertices in parallel
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             // Step 1: Gather features from spiral neighbors
             var gathered = new T[gatheredSize];
@@ -183,7 +183,7 @@ public static class MeshConvolutionOperations
         var weightsData = weights.GetDataArray();
 
         // Process vertices in parallel
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             // Compute gradient for gathered features first
             var gatheredGrad = new T[gatheredSize];
@@ -290,7 +290,7 @@ public static class MeshConvolutionOperations
         var indicesData = spiralIndices.ToArray();
 
         // Process vertices in parallel
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             // Gather features from spiral neighbors
             var gathered = new T[gatheredSize];
@@ -383,7 +383,7 @@ public static class MeshConvolutionOperations
 
         // Sum gradients across all vertices for each output channel
         // Using SIMD for the reduction
-        Parallel.For(0, outputChannels, oc =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outputChannels, outputChannels, oc =>
         {
             T sum = numOps.Zero;
 
@@ -495,7 +495,7 @@ public static class MeshConvolutionOperations
         ComputeSparseLaplacianProduct(sparseStructure, L3x, L4x, numVertices, inputChannels, numOps);
 
         // Combine: exp(-t*L)*x ≈ x - t*L*x + (t²/2)*L²*x - (t³/6)*L³*x + (t⁴/24)*L⁴*x
-        Parallel.For(0, numVertices * inputChannels, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices * inputChannels, (long)numVertices * inputChannels, i =>
         {
             double val = numOps.ToDouble(vertexData[i]);
             val -= t * numOps.ToDouble(Lx[i]);
@@ -508,7 +508,7 @@ public static class MeshConvolutionOperations
         // Step 2: Apply linear transformation
         var output = new T[numVertices * outputChannels];
 
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             for (int oc = 0; oc < outputChannels; oc++)
             {
@@ -538,7 +538,7 @@ public static class MeshConvolutionOperations
     {
         var neighbors = new List<(int index, double weight)>[numVertices];
 
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             var vertexNeighbors = new List<(int index, double weight)>();
             for (int j = 0; j < numVertices; j++)
@@ -565,7 +565,7 @@ public static class MeshConvolutionOperations
         int numVertices, int channels,
         INumericOperations<T> numOps)
     {
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             var vertexNeighbors = sparseStructure[v];
 
@@ -642,7 +642,7 @@ public static class MeshConvolutionOperations
         ComputeLaplacianProduct(lapData, L2x, L3x, numVertices, inputChannels, numOps);
         ComputeLaplacianProduct(lapData, L3x, L4x, numVertices, inputChannels, numOps);
 
-        Parallel.For(0, numVertices * inputChannels, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices * inputChannels, (long)numVertices * inputChannels, i =>
         {
             double val = numOps.ToDouble(vertexData[i]);
             val -= t * numOps.ToDouble(Lx[i]);
@@ -654,7 +654,7 @@ public static class MeshConvolutionOperations
 
         // Compute bias gradient
         var biasGrad = new T[outputChannels];
-        Parallel.For(0, outputChannels, oc =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outputChannels, outputChannels, oc =>
         {
             T sum = numOps.Zero;
             for (int v = 0; v < numVertices; v++)
@@ -666,7 +666,7 @@ public static class MeshConvolutionOperations
 
         // Compute weight gradient
         var weightGrad = new T[outputChannels * inputChannels];
-        Parallel.For(0, outputChannels, oc =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outputChannels, outputChannels, oc =>
         {
             for (int ic = 0; ic < inputChannels; ic++)
             {
@@ -683,7 +683,7 @@ public static class MeshConvolutionOperations
 
         // Compute input gradient: backprop through linear then through diffusion
         var linearGrad = new T[numVertices * inputChannels];
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             for (int ic = 0; ic < inputChannels; ic++)
             {
@@ -711,7 +711,7 @@ public static class MeshConvolutionOperations
         ComputeLaplacianProduct(lapData, L2Tg, L3Tg, numVertices, inputChannels, numOps);
         ComputeLaplacianProduct(lapData, L3Tg, L4Tg, numVertices, inputChannels, numOps);
 
-        Parallel.For(0, numVertices * inputChannels, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices * inputChannels, (long)numVertices * inputChannels, i =>
         {
             double val = numOps.ToDouble(linearGrad[i]);
             val -= t * numOps.ToDouble(LTg[i]);
@@ -758,7 +758,7 @@ public static class MeshConvolutionOperations
         bool useCotangent = laplacianType != LaplacianType.Uniform;
 
         // Process faces in parallel
-        Parallel.For(0, numFaces, f =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numFaces, numFaces, f =>
         {
             int v0 = faceData[f * 3 + 0];
             int v1 = faceData[f * 3 + 1];
@@ -797,7 +797,7 @@ public static class MeshConvolutionOperations
         });
 
         // Set diagonal to negative sum of row
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             double sum = 0.0;
             for (int j = 0; j < numVertices; j++)
@@ -821,7 +821,7 @@ public static class MeshConvolutionOperations
                 diagInvSqrt[v] = d > 1e-10 ? 1.0 / Math.Sqrt(d) : 0.0;
             }
 
-            Parallel.For(0, numVertices, i =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, i =>
             {
                 for (int j = 0; j < numVertices; j++)
                 {
@@ -943,7 +943,7 @@ public static class MeshConvolutionOperations
         var spiralIndices = new int[numVertices * spiralLength];
 
         // Generate spiral for each vertex
-        Parallel.For(0, numVertices, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
         {
             var spiral = GenerateVertexSpiral(v, adjacency, vertexData, spiralLength, numOps);
 

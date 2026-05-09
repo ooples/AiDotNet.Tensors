@@ -112,7 +112,8 @@ public static class Stft
 
         double frameScale = normalized ? 1.0 / Math.Sqrt(nFft) : 1.0;
 
-        Parallel.For(0, batch, b =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
+            (long)batch * sigLen * (long)Math.Log(Math.Max(nFft, 2), 2), b =>
         {
             // Build padded view of this batch's signal.
             var padded = new double[paddedLen];
@@ -247,7 +248,8 @@ public static class Stft
 
         double frameScale = normalized ? Math.Sqrt(nFft) : 1.0;
 
-        Parallel.For(0, batch, b =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
+            (long)batch * paddedLen * (long)Math.Log(Math.Max(nFft, 2), 2), b =>
         {
             var reconstructed = new double[paddedLen];
             var windowSum = new double[paddedLen];
