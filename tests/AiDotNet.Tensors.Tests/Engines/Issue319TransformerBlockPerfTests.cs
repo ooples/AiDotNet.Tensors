@@ -42,6 +42,61 @@ public class Issue319TransformerBlockPerfTests
     public Issue319TransformerBlockPerfTests(ITestOutputHelper output) { _output = output; }
 
     /// <summary>
+    /// Compares raw SIMD-kernel time vs engine-wrapper time per op.
+    /// This tells us whether wall-clock is dominated by inner-loop
+    /// SIMD compute or by wrapper overhead (allocation, recording,
+    /// contiguity checks). Without this split, optimisation work is
+    /// just guessing about where the time goes.
+    /// </summary>
+    [Fact]
+    public void RawSimdVsEngineWrapper_FindsWhereTimeGoes()
+    {
+        const int Hidden = 768;
+        const int Seq = 197;
+        const int Calls = 200;
+        var engine = new CpuEngine();
+        var rng = new Random(7);
+
+        var x = new Tensor<float>(new[] { Seq, Hidden });
+        var xs = x.AsWritableSpan();
+        for (int i = 0; i < xs.Length; i++) xs[i] = (float)((rng.NextDouble() - 0.5));
+
+        // Pre-allocate output once so we measure the kernel only.
+        var output = new Tensor<float>(new[] { Seq, Hidden });
+        var xArr = (x.GetDataArray() as float[])!;
+        var oArr = (output.GetDataArray() as float[])!;
+
+        // Warmup — JIT both paths.
+        for (int i = 0; i < 3; i++) engine.GELU(x);
+
+        // Engine-wrapped GELU.
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Calls; i++) engine.GELU(x);
+        sw.Stop();
+        double engineGeluUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Calls;
+
+        // Raw SIMD GELU — bypass everything.
+        sw.Restart();
+        unsafe
+        {
+            fixed (float* p = xArr)
+            fixed (float* o = oArr)
+            {
+                for (int i = 0; i < Calls; i++)
+                    AiDotNet.Tensors.Engines.Simd.SimdKernels.GELUUnsafe(p, o, x.Length);
+            }
+        }
+        sw.Stop();
+        double rawGeluUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Calls;
+
+        _output.WriteLine($"GELU on [{Seq}, {Hidden}] = {x.Length:N0} elements ({Calls} calls):");
+        _output.WriteLine($"  engine.GELU(x)        : {engineGeluUs,8:F1} µs/call");
+        _output.WriteLine($"  raw SimdKernels.GELU  : {rawGeluUs,8:F1} µs/call");
+        _output.WriteLine($"  wrapper overhead      : {engineGeluUs - rawGeluUs,8:F1} µs/call "
+            + $"({(engineGeluUs - rawGeluUs) / engineGeluUs * 100,6:F1}% of total)");
+    }
+
+    /// <summary>
     /// Per-op timing breakdown for the canonical ViT-Base patch
     /// shape <c>[197, 768]</c>. Reports µs/call for each op so a
     /// future migration round can be measured against current
