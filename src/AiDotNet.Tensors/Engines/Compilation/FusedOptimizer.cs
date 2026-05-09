@@ -126,6 +126,121 @@ internal static class FusedOptimizer
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Double-precision overloads — engaged for `Tensor<double>` models on
+    // the fused-compiled training path. PR #319 follow-up: the
+    // CompiledTrainingPlan / CompiledTapeTrainingStep fast paths used to
+    // gate `typeof(T) != typeof(float)` returning false, so models with
+    // `Tensor<double>` parameters fell back to the eager autograd tape —
+    // a 7-10× wall-clock penalty on ViT-Base scale (most of the
+    // 3024 ms/iter "tape framework overhead" the consumer harness
+    // measured). Adding double mirrors lets those models hit the same
+    // compile-once-replay-many path.
+    //
+    // Vector256<double> is 4-wide vs Vector256<float>'s 8-wide, so the
+    // unroll factor halves and the SIMD-bound length thresholds halve
+    // accordingly. Hardware support: same Avx + Fma + Sse intrinsics.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>AVX2 SGD (double): param -= lr * grad</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void SgdUpdateSimd(double* param, double* grad, int length, double lr)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 16)
+        {
+            var vLr = Vector256.Create(-lr);
+            int simdLen = length & ~15;
+            for (; i < simdLen; i += 16)
+            {
+                Avx.Store(param + i,      Fma.MultiplyAdd(vLr, Avx.LoadVector256(grad + i),      Avx.LoadVector256(param + i)));
+                Avx.Store(param + i + 4,  Fma.MultiplyAdd(vLr, Avx.LoadVector256(grad + i + 4),  Avx.LoadVector256(param + i + 4)));
+                Avx.Store(param + i + 8,  Fma.MultiplyAdd(vLr, Avx.LoadVector256(grad + i + 8),  Avx.LoadVector256(param + i + 8)));
+                Avx.Store(param + i + 12, Fma.MultiplyAdd(vLr, Avx.LoadVector256(grad + i + 12), Avx.LoadVector256(param + i + 12)));
+            }
+        }
+        else if (Fma.IsSupported && length >= 4)
+        {
+            var vLr = Vector256.Create(-lr);
+            int simdLen = length & ~3;
+            for (; i < simdLen; i += 4)
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.LoadVector256(grad + i), Avx.LoadVector256(param + i)));
+        }
+#endif
+        for (; i < length; i++)
+            param[i] -= lr * grad[i];
+    }
+
+    /// <summary>AVX2 Adam (double): m = β1·m + (1-β1)·g; v = β2·v + (1-β2)·g²; param -= lr·m̂/(√v̂ + ε)</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void AdamUpdateSimd(
+        double* param, double* grad, double* m, double* v, int length,
+        double lr, double beta1, double beta2, double eps, int step)
+    {
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double bc2 = 1.0 - System.Math.Pow(beta2, step);
+        double lrAdj = lr / bc1;
+
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 4)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1.0 - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1.0 - beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(eps);
+            var vBc2Inv = Vector256.Create(1.0 / bc2);
+            int simdLen = length & ~3;
+
+            for (; i < simdLen; i += 4)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var vHat = Avx.Multiply(vNew, vBc2Inv);
+                var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                var update = Avx.Divide(mNew, denom);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
+            double mHat = m[i] / bc1;
+            double vHat = v[i] / bc2;
+            param[i] -= lr * mHat / (System.Math.Sqrt(vHat) + eps);
+        }
+    }
+
+    /// <summary>AVX2 AdamW (double): Adam with decoupled weight decay</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void AdamWUpdateSimd(
+        double* param, double* grad, double* m, double* v, int length,
+        double lr, double beta1, double beta2, double eps, double weightDecay, int step)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 4)
+        {
+            var vWdLr = Vector256.Create(1.0 - weightDecay * lr);
+            int simdLen = length & ~3;
+            for (; i < simdLen; i += 4)
+                Avx.Store(param + i, Avx.Multiply(Avx.LoadVector256(param + i), vWdLr));
+        }
+#endif
+        for (; i < length; i++)
+            param[i] *= (1.0 - weightDecay * lr);
+
+        AdamUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, step);
+    }
+
     /// <summary>AVX2 AdamW: Adam with decoupled weight decay</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AdamWUpdateSimd(
