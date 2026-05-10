@@ -54,9 +54,12 @@ public static class TensorPool
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape)
     {
-        if (!Enabled || ForceFreshAllocations)
+        if (!Enabled)
             return new Tensor<T>(shape);
 
+        // ForceFreshAllocations is honoured inside TensorAllocator.Rent
+        // — this keeps allocator-side bookkeeping (MemoryProfiler hooks)
+        // consistent and gives one source of truth for the policy.
         return TensorAllocator.Rent<T>(shape);
     }
 
@@ -69,9 +72,12 @@ public static class TensorPool
     /// </summary>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
-        if (!Enabled || ForceFreshAllocations)
+        if (!Enabled)
             return new Tensor<T>(shape);
 
+        // ForceFreshAllocations is honoured inside
+        // TensorAllocator.RentUninitialized — same single source of
+        // truth as the Rent path above.
         return TensorAllocator.RentUninitialized<T>(shape);
     }
 
