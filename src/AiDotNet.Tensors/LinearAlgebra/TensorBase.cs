@@ -1179,14 +1179,11 @@ public abstract class TensorBase<T> : IDisposable
     public TensorBase<T> Canonicalize()
     {
         ThrowIfSparse();
-        // Always allocate fresh — never go through TensorAllocator's
-        // pool tiers — so the resulting backing array is exactly
-        // Length elements with no bucket padding. The copy reads via
-        // ToArray() (handles views, non-contiguous storage, padded
-        // pooled buffers) and writes into the fresh array's span.
-        var freshData = new T[Length];
-        var src = ToArray();
-        src.AsSpan().CopyTo(freshData.AsSpan());
+        // ToArray() already returns a freshly-allocated T[] of exactly
+        // Length elements with logical-order content (handles views,
+        // non-contiguous storage, padded pooled buffers correctly).
+        // No second allocation needed — wrap it directly.
+        var freshData = ToArray();
         var result = CreateInstance(freshData, _shape);
         result.Layout = Layout;
         return result;
