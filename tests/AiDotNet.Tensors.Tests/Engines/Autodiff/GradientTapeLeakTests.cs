@@ -451,6 +451,411 @@ public class GradientTapeLeakTests
         }
     }
 
+    /// <summary>
+    /// Reopened-#1227 repro: AiDotNet consumer-side measurement (see
+    /// ooples/AiDotNet PR #1285) shows ~1.5 MB/call retention at
+    /// L=4 / 1000-call scale, even though the single-encoder-block
+    /// canary above asserts 0 B/call. Either the leak is in an op
+    /// the canary doesn't exercise, or it only manifests at the
+    /// chained-layers scale.
+    ///
+    /// This probe mirrors a 4-encoder-layer transformer (the
+    /// reporter's exact config: Heads=4, Dim=128, FF=512, Seq=64,
+    /// 4 encoder layers, pre-norm style with residual connections,
+    /// bias add on every dense projection, output classification
+    /// head, softmax+cross-entropy-style loss). If retention scales
+    /// linearly with layer count, we have a Tensors-side repro that
+    /// matches the consumer's symptom.
+    /// </summary>
+    [Fact]
+    public void TrainStep_FourLayerTransformer_NoLinearLeakAcrossWindows()
+    {
+        var engine = AiDotNetEngine.Current;
+        const int Batch = 1, Seq = 64, Dim = 128, FF = 512, Vocab = 256;
+        const int NumLayers = 4;
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
+
+        // Per-layer weights (4 sets of QKV/output + FFN + LayerNorm gain/bias).
+        var perLayerW = new System.Collections.Generic.List<Tensor<float>[]>(NumLayers);
+        for (int L = 0; L < NumLayers; L++)
+        {
+            perLayerW.Add(new[]
+            {
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 1),  // wq
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 2),  // wk
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 3),  // wv
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 4),  // wo
+                MakeTensor(new[] { Dim, FF }, 0.05f, L * 10 + 5),   // w1
+                MakeTensor(new[] { FF, Dim }, 0.05f, L * 10 + 6),   // w2
+                MakeTensor(new[] { Dim }, 1.0f, L * 10 + 7),        // ln1_gamma
+                MakeTensor(new[] { Dim }, 0.0f, L * 10 + 8),        // ln1_beta
+                MakeTensor(new[] { Dim }, 1.0f, L * 10 + 9),        // ln2_gamma
+                MakeTensor(new[] { Dim }, 0.0f, L * 10 + 10),       // ln2_beta
+            });
+        }
+        var wOut = MakeTensor(new[] { Dim, Vocab }, 0.05f, 999);
+        var allSources = new System.Collections.Generic.List<Tensor<float>>();
+        foreach (var W in perLayerW) allSources.AddRange(W);
+        allSources.Add(wOut);
+        var sources = allSources.ToArray();
+
+        // Two consecutive 200-call windows with forced Gen2 GC between them.
+        // A linear leak shows equal growth in both windows; warm-up shows
+        // large window-1 and near-zero window-2.
+        const int Warmup = 25;
+        const int Measure = 200;
+        for (int i = 0; i < Warmup; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+
+        long w1PerCall = (m1 - m0) / Measure;
+        long w2PerCall = (m2 - m1) / Measure;
+        _output.WriteLine(
+            $"4-layer Transformer leak probe (Dim={Dim} FF={FF} Seq={Seq} L={NumLayers}): " +
+            $"win1={w1PerCall} B/call, win2={w2PerCall} B/call " +
+            $"(m0={m0} m1={m1} m2={m2}; {Measure} iters/window)");
+
+        // Tripwire: second-window per-call retention < 100 KB. The reporter's
+        // consumer-side observation was ~360 KB/call at L=1 → ~1.5 MB at L=4,
+        // so a 100 KB ceiling on a 4-layer probe catches both the issue's
+        // signature and any future regression at this scale.
+        Assert.True(w2PerCall < 100_000,
+            $"4-layer Transformer second-window retention {w2PerCall} B/call exceeds 100 KB/call. " +
+            $"Matches AiDotNet#1227 / Tensors#283 residual-leak signature. " +
+            $"win1={w1PerCall} B/call, m0={m0} m1={m1} m2={m2}.");
+
+        void Step()
+        {
+            // Token "embedding": synthesise an input directly at [B*Seq, Dim]
+            // since the Tensors layer doesn't have an embedding op surfaced
+            // to the test, and a leak rooted in the gather would surface
+            // separately. The hot per-layer ops are what we want.
+            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
+            using var tape = new GradientTape<float>();
+
+            Tensor<float> h = x;
+            for (int L = 0; L < NumLayers; L++)
+            {
+                var W = perLayerW[L];
+                Tensor<float> wq = W[0], wk = W[1], wv = W[2], wo = W[3], w1 = W[4], w2 = W[5];
+                Tensor<float> g1 = W[6], b1 = W[7], g2 = W[8], b2 = W[9];
+
+                // Pre-norm + attention
+                var xNorm = engine.TensorLayerNorm(h, g1, b1, epsilon: 1e-5);
+                var q = engine.TensorMatMul(xNorm, wq);
+                var k = engine.TensorMatMul(xNorm, wk);
+                var v = engine.TensorMatMul(xNorm, wv);
+                var scores = engine.TensorMatMulTransposed(q, k);
+                var attn = engine.Softmax(scores, axis: -1);
+                var ctx = engine.TensorMatMul(attn, v);
+                var proj = engine.TensorMatMul(ctx, wo);
+                h = engine.TensorAdd(h, proj);
+
+                // Pre-norm + FFN
+                var hNorm = engine.TensorLayerNorm(h, g2, b2, epsilon: 1e-5);
+                var ffn1 = engine.TensorMatMul(hNorm, w1);
+                var ffn1Act = engine.ReLU(ffn1);
+                var ffn2 = engine.TensorMatMul(ffn1Act, w2);
+                h = engine.TensorAdd(h, ffn2);
+            }
+
+            // Output projection: reduce per-token to vocab logits, then
+            // reduce to a scalar loss surrogate (sum-of-squared-logits is
+            // enough to exercise backward through every parameter).
+            var logits = engine.TensorMatMul(h, wOut);
+            var loss = engine.ReduceSum(logits, null);
+            var grads = tape.ComputeGradients(loss, sources: sources);
+
+            // Simulate optimizer reading .Grad on every source — that's the
+            // consumer-side pattern that exercises source-tensor pinning.
+            foreach (var s in sources)
+            {
+                Assert.True(grads.ContainsKey(s));
+                Assert.NotNull(s.Grad);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="TrainStep_FourLayerTransformer_NoLinearLeakAcrossWindows"/>
+    /// but with the ops AiDotNet's MultiHeadAttentionLayer actually uses
+    /// internally — Permute (for the head-split transpose) and FusedLinear
+    /// (for the output projection's matmul+bias). The simpler 4-layer probe
+    /// passes at 0 B/call, so if AiDotNet leaks at 1.5 MB/call the leak
+    /// must be in an op the simpler probe doesn't exercise. This probe
+    /// adds the candidates one by one.
+    /// </summary>
+    [Fact]
+    public void TrainStep_FourLayerTransformer_WithPermuteAndFusedLinear_NoLeak()
+    {
+        var engine = AiDotNetEngine.Current;
+        const int Batch = 1, Seq = 64, Dim = 128, FF = 512, Heads = 4, HeadDim = Dim / Heads;
+        const int NumLayers = 4;
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
+
+        // Per-layer weights + biases (FusedLinear takes bias).
+        var perLayerW = new System.Collections.Generic.List<Tensor<float>[]>(NumLayers);
+        for (int L = 0; L < NumLayers; L++)
+        {
+            perLayerW.Add(new[]
+            {
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 20 + 1),   // wq
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 20 + 2),   // wk
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 20 + 3),   // wv
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 20 + 4),   // wo
+                MakeTensor(new[] { Dim }, 0.0f, L * 20 + 5),         // bo (bias for output proj)
+                MakeTensor(new[] { Dim, FF }, 0.05f, L * 20 + 6),    // w1
+                MakeTensor(new[] { FF }, 0.0f, L * 20 + 7),          // b1
+                MakeTensor(new[] { FF, Dim }, 0.05f, L * 20 + 8),    // w2
+                MakeTensor(new[] { Dim }, 0.0f, L * 20 + 9),         // b2
+                MakeTensor(new[] { Dim }, 1.0f, L * 20 + 10),        // ln1_gamma
+                MakeTensor(new[] { Dim }, 0.0f, L * 20 + 11),        // ln1_beta
+                MakeTensor(new[] { Dim }, 1.0f, L * 20 + 12),        // ln2_gamma
+                MakeTensor(new[] { Dim }, 0.0f, L * 20 + 13),        // ln2_beta
+            });
+        }
+        var wOut = MakeTensor(new[] { Dim, 256 }, 0.05f, 999);
+        var allSources = new System.Collections.Generic.List<Tensor<float>>();
+        foreach (var W in perLayerW) allSources.AddRange(W);
+        allSources.Add(wOut);
+        var sources = allSources.ToArray();
+
+        const int Warmup = 25;
+        const int Measure = 200;
+        for (int i = 0; i < Warmup; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+
+        long w1PerCall = (m1 - m0) / Measure;
+        long w2PerCall = (m2 - m1) / Measure;
+        _output.WriteLine(
+            $"4L-Transformer + Permute + FusedLinear leak probe: " +
+            $"win1={w1PerCall} B/call, win2={w2PerCall} B/call " +
+            $"(m0={m0} m1={m1} m2={m2}; {Measure} iters/window)");
+
+        Assert.True(w2PerCall < 100_000,
+            $"4L-Transformer+Permute+FusedLinear second-window retention {w2PerCall} B/call > 100 KB. " +
+            $"win1={w1PerCall} B/call, m0={m0} m1={m1} m2={m2}.");
+
+        void Step()
+        {
+            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
+            using var tape = new GradientTape<float>();
+
+            Tensor<float> h = x;
+            for (int L = 0; L < NumLayers; L++)
+            {
+                var W = perLayerW[L];
+                Tensor<float> wq = W[0], wk = W[1], wv = W[2], wo = W[3], bo = W[4];
+                Tensor<float> w1 = W[5], b1 = W[6], w2 = W[7], b2 = W[8];
+                Tensor<float> g1 = W[9], beta1 = W[10], g2 = W[11], beta2 = W[12];
+
+                // Pre-norm
+                var xNorm = engine.TensorLayerNorm(h, g1, beta1, epsilon: 1e-5);
+
+                // QKV projections [B*S, Dim] -> [B*S, Dim]
+                var Q_flat = engine.TensorMatMul(xNorm, wq);
+                var K_flat = engine.TensorMatMul(xNorm, wk);
+                var V_flat = engine.TensorMatMul(xNorm, wv);
+
+                // Reshape + Permute to [B, Heads, S, HeadDim] (mirrors MHA layer)
+                var Q4 = engine.Reshape(Q_flat, new[] { Batch, Seq, Heads, HeadDim });
+                var K4 = engine.Reshape(K_flat, new[] { Batch, Seq, Heads, HeadDim });
+                var V4 = engine.Reshape(V_flat, new[] { Batch, Seq, Heads, HeadDim });
+                var queries = engine.TensorPermute(Q4, new[] { 0, 2, 1, 3 });
+                var keys = engine.TensorPermute(K4, new[] { 0, 2, 1, 3 });
+                var values = engine.TensorPermute(V4, new[] { 0, 2, 1, 3 });
+
+                // Scaled dot-product attention
+                var ctx4 = engine.ScaledDotProductAttention(queries, keys, values,
+                    mask: null,
+                    scale: 1.0 / Math.Sqrt(HeadDim),
+                    out var attnWeights);
+
+                // [B, H, S, D] -> [B, S, H, D] -> [B*S, Dim]
+                var ctxT = engine.TensorPermute(ctx4, new[] { 0, 2, 1, 3 });
+                var ctxFlat = engine.Reshape(ctxT, new[] { Batch * Seq, Dim });
+
+                // Fused output projection (matmul+bias, no activation)
+                var attnProj = engine.FusedLinear(ctxFlat, wo, bo, FusedActivationType.None);
+                h = engine.TensorAdd(h, attnProj);
+
+                // Pre-norm + FFN with FusedLinear (matches DenseLayer pattern)
+                var hNorm = engine.TensorLayerNorm(h, g2, beta2, epsilon: 1e-5);
+                var ffn1 = engine.FusedLinear(hNorm, w1, b1, FusedActivationType.ReLU);
+                var ffn2 = engine.FusedLinear(ffn1, w2, b2, FusedActivationType.None);
+                h = engine.TensorAdd(h, ffn2);
+            }
+
+            // Output classification logits
+            var logits = engine.TensorMatMul(h, wOut);
+            var loss = engine.ReduceSum(logits, null);
+            var grads = tape.ComputeGradients(loss, sources: sources);
+            foreach (var s in sources)
+            {
+                Assert.True(grads.ContainsKey(s));
+                Assert.NotNull(s.Grad);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reopened-#1227 regression. The original cleanup at the end of
+    /// <c>ComputeGradients</c> gated on <c>sources is not null</c>, which
+    /// meant any caller passing <c>null</c> (the standard consumer pattern
+    /// when reading gradients from the returned dictionary) skipped the
+    /// cleanup entirely — every forward intermediate kept its
+    /// <c>GradFn</c> back-pointer, and any external code that retained a
+    /// single intermediate (e.g. a layer's <c>_lastInput</c> cache)
+    /// pinned the whole graph across calls. ooples/AiDotNet#1227
+    /// measured ~1.5 MB/call retention on a 4-encoder-layer Transformer
+    /// going through this exact path.
+    ///
+    /// This probe matches AiDotNet's pattern: <c>sources: null</c>, no
+    /// retain-grad, single tape per Step. It also retains an intermediate
+    /// to mimic the layer-cache pinning that triggered the consumer-side
+    /// leak. Without the fix, second-window retention runs around 100 KB/call
+    /// on this 4-layer config; with the fix it stays at 0 B/call.
+    /// </summary>
+    [Fact]
+    public void TrainStep_FourLayerTransformer_NullSources_NoLeak()
+    {
+        var engine = AiDotNetEngine.Current;
+        const int Batch = 1, Seq = 64, Dim = 128, FF = 512;
+        const int NumLayers = 4;
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
+
+        var perLayerW = new System.Collections.Generic.List<Tensor<float>[]>(NumLayers);
+        for (int L = 0; L < NumLayers; L++)
+        {
+            perLayerW.Add(new[]
+            {
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 1),
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 2),
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 3),
+                MakeTensor(new[] { Dim, Dim }, 0.05f, L * 10 + 4),
+                MakeTensor(new[] { Dim, FF }, 0.05f, L * 10 + 5),
+                MakeTensor(new[] { FF, Dim }, 0.05f, L * 10 + 6),
+                MakeTensor(new[] { Dim }, 1.0f, L * 10 + 7),
+                MakeTensor(new[] { Dim }, 0.0f, L * 10 + 8),
+                MakeTensor(new[] { Dim }, 1.0f, L * 10 + 9),
+                MakeTensor(new[] { Dim }, 0.0f, L * 10 + 10),
+            });
+        }
+        // Mimic AiDotNet's layer-cache pattern: each MultiHeadAttentionLayer
+        // and DenseLayer stores 5-10 `_last*` fields pointing at forward
+        // intermediates. Simulate that with one slot per layer × multiple
+        // intermediates per layer.
+        Tensor<float>?[,] layerCaches = new Tensor<float>?[NumLayers, 8];
+
+        const int Warmup = 25;
+        const int Measure = 200;
+        for (int i = 0; i < Warmup; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+
+        for (int i = 0; i < Measure; i++) Step();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+
+        long w1PerCall = (m1 - m0) / Measure;
+        long w2PerCall = (m2 - m1) / Measure;
+        _output.WriteLine(
+            $"4L-Transformer null-sources leak probe " +
+            $"(reopened-AiDotNet#1227): " +
+            $"win1={w1PerCall} B/call, win2={w2PerCall} B/call " +
+            $"(m0={m0} m1={m1} m2={m2}; {Measure} iters/window)");
+
+        // Hold the references to defeat the JIT's dead-code elimination —
+        // without this, the JIT can drop layerCaches early and we
+        // get a false-clean reading even pre-fix.
+        Assert.NotNull(layerCaches);
+
+        // 50 KB/call ceiling. Pre-fix this test produced ~100 KB/call;
+        // with the cleanup-runs-for-null-sources fix it drops to 0 B/call
+        // on net10.0. The 50 KB band accommodates legitimate per-iter
+        // warm-up costs (delegate caching, pool growth) without
+        // tolerating the original graph-retention pattern.
+        Assert.True(w2PerCall < 50_000,
+            $"Reopened-AiDotNet#1227: null-sources ComputeGradients leaked " +
+            $"{w2PerCall} B/call > 50 KB on a 4-encoder-layer Transformer with " +
+            $"a single retained forward intermediate. " +
+            $"win1={w1PerCall} B/call, m0={m0} m1={m1} m2={m2}.");
+
+        void Step()
+        {
+            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
+            using var tape = new GradientTape<float>();
+
+            Tensor<float> h = x;
+            for (int L = 0; L < NumLayers; L++)
+            {
+                var W = perLayerW[L];
+                Tensor<float> wq = W[0], wk = W[1], wv = W[2], wo = W[3];
+                Tensor<float> w1 = W[4], w2 = W[5];
+                Tensor<float> g1 = W[6], beta1 = W[7], g2 = W[8], beta2 = W[9];
+
+                var xNorm = engine.TensorLayerNorm(h, g1, beta1, epsilon: 1e-5);
+                var q = engine.TensorMatMul(xNorm, wq);
+                var k = engine.TensorMatMul(xNorm, wk);
+                var v = engine.TensorMatMul(xNorm, wv);
+                var scores = engine.TensorMatMulTransposed(q, k);
+                var attn = engine.Softmax(scores, axis: -1);
+                var ctx = engine.TensorMatMul(attn, v);
+                var proj = engine.TensorMatMul(ctx, wo);
+                h = engine.TensorAdd(h, proj);
+
+                var hNorm = engine.TensorLayerNorm(h, g2, beta2, epsilon: 1e-5);
+                var ffn1 = engine.TensorMatMul(hNorm, w1);
+                var ffn1Act = engine.ReLU(ffn1);
+                var ffn2 = engine.TensorMatMul(ffn1Act, w2);
+                h = engine.TensorAdd(h, ffn2);
+
+                // Layer-cache simulation: retain forward intermediates the
+                // way AiDotNet's MultiHeadAttentionLayer does via
+                // _lastInput / _lastQueryInput / _lastKeyInput / _lastValueInput
+                // / _lastProjectedQueries / _lastAttentionScores / etc.
+                layerCaches[L, 0] = xNorm;
+                layerCaches[L, 1] = q;
+                layerCaches[L, 2] = k;
+                layerCaches[L, 3] = v;
+                layerCaches[L, 4] = attn;
+                layerCaches[L, 5] = ctx;
+                layerCaches[L, 6] = ffn1Act;
+                layerCaches[L, 7] = h;
+            }
+
+            var loss = engine.ReduceSum(h, null);
+            // Critical: pass sources=null to match AiDotNet's consumer pattern
+            // (NeuralNetworkBase.TrainWithTape reads gradients from the
+            // returned Dictionary, not from tensor.Grad).
+            var grads = tape.ComputeGradients(loss, sources: null);
+        }
+    }
+
     [Fact]
     public void TrainStep_LongRun_1000Iters_StaysUnder10KB_PerCall()
     {

@@ -527,20 +527,41 @@ public sealed class GradientTape<T> : IDisposable
 
         // Tape-walk parity for the .Grad / .GradFn cleanup that ComputeGradientsViaGraph does.
         // AccumulateGrad sets `tensor.Grad = stored` for every tensor that receives a
-        // gradient contribution — including forward intermediates — so on a
-        // non-persistent tape we null .Grad on non-source / non-RetainGrad tensors so
-        // the gradient lifetime doesn't get chained to whatever holds the intermediate.
-        // Tape-walk-specific cases (anomaly detection, hooks) all reach this cleanup
-        // the same way the graph path does.
+        // gradient contribution — including forward intermediates — and each tensor's
+        // GradFn pointer chains back through the entire forward graph via captured
+        // BackwardFunction closures. Without explicit cleanup, any external code that
+        // retains even ONE forward intermediate (e.g. a layer's `_lastInput` cache)
+        // keeps the whole graph alive across Train calls, surviving Gen2 GC.
+        //
+        // The previous guard `sources is not null` skipped cleanup whenever the caller
+        // didn't specify a source filter. In practice every long-running training loop
+        // calls ComputeGradients(loss, sources: null) — including AiDotNet's
+        // NeuralNetworkBase.TrainWithTape (passes null and consumes the returned Dictionary
+        // directly) — so the cleanup never ran and the heap grew linearly at the per-call
+        // saved-for-backward footprint. ooples/AiDotNet#1227 documented this at ~1.5 MB/call
+        // on a 4-encoder-layer Transformer; the same model on the equivalent raw-tape
+        // probe in this repo measured 0 B/call because the test always passed explicit
+        // sources.
+        //
+        // Fix: run the cleanup whether or not `sources` was provided. When sources is
+        // null we still clear .GradFn on every tape-recorded tensor (breaks the graph
+        // back-pointer chain) and clear .Grad on tensors that aren't pinned via
+        // RetainGrad. The returned `grads` Dictionary already holds the gradient
+        // references the caller needs — clearing the per-tensor .Grad field doesn't
+        // drop any data the caller can still access through the dictionary.
         //
         // SKIP cleanup when createGraph=true: the outer caller is computing higher-
         // order derivatives (Hvp / Hessian / double-backward), and forward
         // intermediates' .Grad / .GradFn fields are part of the higher-order graph
         // that the next backward pass needs to walk.
-        if (!_options.Persistent && !createGraph && sources is not null)
+        if (!_options.Persistent && !createGraph)
         {
-            HashSet<Tensor<T>> sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-            foreach (var s in sources) sourceSet.Add(s);
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (sources is not null)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) sourceSet.Add(s);
+            }
             for (int i = 0; i < _entries.Count; i++)
             {
                 ref var e = ref _entries[i];
@@ -600,11 +621,21 @@ public sealed class GradientTape<T> : IDisposable
         return grads;
     }
 
-    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>> sourceSet)
+    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet)
     {
+        // Always clear GradFn — this is the back-pointer that chains a tensor to its
+        // BackwardFunction closure, which in turn captures forward intermediates. The
+        // forward graph stays alive as long as ANY tape-tracked tensor keeps its
+        // GradFn, regardless of whether the consumer asked to filter by sources.
         t.GradFn = null;
-        if (sourceSet.Contains(t)) return;
+        // Preserve .Grad when the caller explicitly listed this tensor as a source
+        // (they're going to read `tensor.Grad` rather than the returned Dictionary).
+        if (sourceSet?.Contains(t) == true) return;
+        // Preserve .Grad on tensors the user explicitly marked with RetainGrad().
         if (_retainGrad is not null && _retainGrad.Contains(t)) return;
+        // For null-sources callers, the gradients still live in the returned
+        // Dictionary — clearing .Grad here only severs the per-tensor field, not
+        // the data itself.
         t.Grad = null;
     }
 
@@ -717,59 +748,132 @@ public sealed class GradientTape<T> : IDisposable
         if (!_options.Persistent)
         {
             // Build a set of source tensors for O(1) sourcehood check.
-            // sources == null means the caller wants the full grads dict,
-            //   so we can't safely null .Grad on anything.
-            // sources != null (even if empty) means the caller specified
-            //   the protected set explicitly — clear .Grad on everything
-            //   else, including the case where the explicit set is empty.
+            //   sources != null (even if empty): the caller specified the
+            //     protected set explicitly — clear .Grad on everything
+            //     else (including the case where the explicit set is empty).
+            //   sources == null: the caller is consuming gradients via the
+            //     returned dictionary (the standard pattern in
+            //     AiDotNet.NeuralNetworkBase.TrainWithTape, all auto-
+            //     differentiation-driven optimizers, etc.). We MUST still
+            //     clear .Grad on forward intermediates here — otherwise
+            //     each intermediate's gradient tensor (a fresh
+            //     ~outputSize-of-the-op backing array, NOT pooled past the
+            //     64-slot TensorPool cap) stays pinned for the lifetime of
+            //     the intermediate. When a consumer-side cache (a layer's
+            //     `_lastInput` field, a streaming-pool retention, etc.)
+            //     holds a single forward intermediate, all of that
+            //     intermediate's gradient memory bleeds across calls.
+            //     Reopened-#1227 measured this as ~1.5 MB/call retention
+            //     on a 4-encoder-layer Transformer.
+            //
+            // The dict returned to the caller keeps the gradient references
+            // by value — clearing the per-tensor .Grad field just severs
+            // the back-pointer from intermediates, not the dict's mapping.
             HashSet<Tensor<T>>? sourceSet = null;
             if (sources is not null)
             {
                 sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources) sourceSet.Add(s);
             }
-            // Local helper: should this tensor keep its .Grad?
-            // True when sources mode is off (sourceSet null), when the tensor
-            // is a source, or when the user retained grads on it explicitly.
+
+            // Should this tensor keep its .Grad after backward returns?
+            //   - Explicit source (caller asked for its grad by reference): yes
+            //   - RetainGrad-marked non-leaf: yes
+            //   - Otherwise: no — even when sources was null, because the
+            //     gradient is preserved in the returned dictionary
+            //     regardless of whether .Grad stays set on the tensor.
             bool ShouldKeepGrad(Tensor<T> t)
             {
-                if (sourceSet is null) return true;
-                if (sourceSet.Contains(t)) return true;
+                if (sourceSet?.Contains(t) == true) return true;
                 if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
                 return false;
             }
+
             foreach (var node in topoOrder)
             {
+                // node.Output is always an intermediate (it has GradFn until
+                // we null it on this line). Safe to clear .Grad: parameters
+                // never appear as outputs (they're graph leaves), so we can't
+                // accidentally drop a param's gradient here.
                 node.Output.GradFn = null;
                 if (!ShouldKeepGrad(node.Output))
                     node.Output.Grad = null;
 
-                // Input0 is non-nullable on GradNode<T>; the recorder
-                // always populates it.
+                // For Inputs: always null .GradFn (the graph traversal is
+                // over so the back-pointer is dead weight). For .Grad:
+                //
+                //   sourceSet != null:
+                //     The caller provided an explicit source list. Clear
+                //     .Grad on non-source inputs (matches the established
+                //     "sources specifies what to keep" contract).
+                //   sourceSet == null AND input is NOT a graph leaf:
+                //     We've cleared this input's GradFn — i.e. it WAS an
+                //     intermediate (output of an upstream op). Its .Grad
+                //     also gets cleared on the upstream op's iteration,
+                //     but the consumer-visible gradient is preserved
+                //     through the returned `grads` dictionary either way.
+                //     Clearing it here doesn't drop data.
+                //   sourceSet == null AND input IS a graph leaf:
+                //     The input has GradFn = null already (a parameter or
+                //     a user-supplied input). Preserving .Grad here keeps
+                //     `param.Grad` populated for callers that read it
+                //     directly (a small subset, but BC-relevant).
+                //
+                // We can distinguish "intermediate input" from "leaf input"
+                // by checking GradFn BEFORE this iteration nulls it. Cache
+                // the snapshot below.
+                bool input0WasIntermediate = node.Input0.GradFn is not null;
                 node.Input0.GradFn = null;
-                if (!ShouldKeepGrad(node.Input0))
+                if (sourceSet is not null)
+                {
+                    if (!ShouldKeepGrad(node.Input0)) node.Input0.Grad = null;
+                }
+                else if (input0WasIntermediate && !ShouldKeepGrad(node.Input0))
+                {
                     node.Input0.Grad = null;
+                }
 
                 if (node.Input1 is not null)
                 {
+                    bool wasIntermediate = node.Input1.GradFn is not null;
                     node.Input1.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input1))
+                    if (sourceSet is not null)
+                    {
+                        if (!ShouldKeepGrad(node.Input1)) node.Input1.Grad = null;
+                    }
+                    else if (wasIntermediate && !ShouldKeepGrad(node.Input1))
+                    {
                         node.Input1.Grad = null;
+                    }
                 }
                 if (node.Input2 is not null)
                 {
+                    bool wasIntermediate = node.Input2.GradFn is not null;
                     node.Input2.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input2))
+                    if (sourceSet is not null)
+                    {
+                        if (!ShouldKeepGrad(node.Input2)) node.Input2.Grad = null;
+                    }
+                    else if (wasIntermediate && !ShouldKeepGrad(node.Input2))
+                    {
                         node.Input2.Grad = null;
+                    }
                 }
                 if (node.InputsOverflow is not null)
                 {
                     foreach (var inp in node.InputsOverflow)
                     {
                         if (inp is null) continue;
+                        bool wasIntermediate = inp.GradFn is not null;
                         inp.GradFn = null;
-                        if (!ShouldKeepGrad(inp))
+                        if (sourceSet is not null)
+                        {
+                            if (!ShouldKeepGrad(inp)) inp.Grad = null;
+                        }
+                        else if (wasIntermediate && !ShouldKeepGrad(inp))
+                        {
                             inp.Grad = null;
+                        }
                     }
                 }
             }
