@@ -67,7 +67,8 @@ internal static class NchwcConv2D16
         bool useSimd = Avx512F.IsSupported;
 #endif
 
-        Parallel.For(0, N * cgOut, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cgOut,
+            (long)N * cgOut * _outStrideCg, task =>
         {
             int n = task / _cgOut;
             int ocg = task % _cgOut;

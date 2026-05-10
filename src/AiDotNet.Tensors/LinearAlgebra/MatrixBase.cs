@@ -1216,7 +1216,7 @@ public abstract class MatrixBase<T>
             int numRowBlocks = (rows + BlockSize - 1) / BlockSize;
 
             // Parallel processing of row blocks
-            System.Threading.Tasks.Parallel.For(0, numRowBlocks, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)rows * cols, iiBlock =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, rows);
@@ -1345,7 +1345,7 @@ public abstract class MatrixBase<T>
             int numBlocks = (n + BlockSize - 1) / BlockSize;
 
             // Process diagonal and upper-triangular blocks in parallel
-            System.Threading.Tasks.Parallel.For(0, numBlocks, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numBlocks, (long)n * n, iiBlock =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, n);

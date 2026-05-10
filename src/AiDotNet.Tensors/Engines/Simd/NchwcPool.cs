@@ -46,7 +46,7 @@ internal static class NchwcPool
         bool useSimd = Avx.IsSupported;
 #endif
 
-        Parallel.For(0, N * cg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
         {
             int n = task / cg;
             int ocg = task % cg;
@@ -135,7 +135,7 @@ internal static class NchwcPool
         bool useSimd = Avx.IsSupported;
 #endif
 
-        Parallel.For(0, N * cg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
         {
             int n = task / cg;
             int ocg = task % cg;
@@ -214,7 +214,7 @@ internal static class NchwcPool
         bool useSimd = Avx.IsSupported;
 #endif
 
-        Parallel.For(0, N * cg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * inStrideCg, task =>
         {
             int n = task / cg;
             int ocg = task % cg;

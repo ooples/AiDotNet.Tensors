@@ -386,7 +386,8 @@ public static class Fft
         int outStride = 2 * n;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        Parallel.For(0, batch, b =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
+            (long)batch * n * (long)Math.Log(Math.Max(n, 2), 2), b =>
         {
             var buf = new double[2 * n];
             int copy = Math.Min(nIn, n);
@@ -445,7 +446,8 @@ public static class Fft
         {
             // Forward real FFT: pack real into complex, run full FFT, output first K bins.
             // (Packing-trick optimization comes later — this version is correct and clear.)
-            Parallel.For(0, batch, b =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
+                (long)batch * n * (long)Math.Log(Math.Max(n, 2), 2), b =>
             {
                 var buf = new double[2 * n];
                 int copyR = Math.Min(last, n);
@@ -463,7 +465,8 @@ public static class Fft
             // Inverse real FFT: reconstruct full Hermitian-symmetric spectrum from
             // the positive-frequency half, run IFFT, take real part.
             int kIn = last / 2;
-            Parallel.For(0, batch, b =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
+                (long)batch * n * (long)Math.Log(Math.Max(n, 2), 2), b =>
             {
                 var buf = new double[2 * n];
                 int copyK = Math.Min(kIn, numFreqs);
@@ -575,7 +578,8 @@ public static class Fft
         int outMatStride = n * outRowStride;
         var ops = MathHelper.GetNumericOperations<T>();
 
-        Parallel.For(0, prefix * innerComplex, pi =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, prefix * innerComplex,
+            (long)prefix * innerComplex * n * (long)Math.Log(Math.Max(n, 2), 2), pi =>
         {
             int p = pi / innerComplex;
             int c = pi % innerComplex;

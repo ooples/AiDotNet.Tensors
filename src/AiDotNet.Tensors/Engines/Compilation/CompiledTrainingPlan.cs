@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -283,9 +284,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float eps = 1e-8f,
         float weightDecay = 0f)
     {
-        if (typeof(T) != typeof(float))
-            throw new NotSupportedException("Fused optimizer updates only support float parameters.");
+        if (typeof(T) == typeof(float))
+        {
+            ConfigureOptimizerFloat(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            ConfigureOptimizerDouble(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
 
+    private unsafe void ConfigureOptimizerFloat(
+        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+    {
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
         var paramArrays = new float[paramCount][];
@@ -351,6 +365,86 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         default:
                             throw new NotSupportedException(
                                 $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
+                                $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
+                    }
+                }
+            }
+        };
+    }
+
+    private unsafe void ConfigureOptimizerDouble(
+        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+    {
+        // Mirror of ConfigureOptimizerFloat for double parameters. PR #319
+        // follow-up: tape-trained Tensor<double> models (e.g. ViT-Base in
+        // the consumer integration test) can now hit the fused-compiled
+        // training path that was previously gated behind float-only
+        // (NeuralNetworkBase.TryTrainWithFusedOptimizer line 4855 +
+        // CompiledTapeTrainingStep.TryStepWithFusedOptimizer line 232).
+        int paramCount = _parameters.Length;
+        var paramArrays = new double[paramCount][];
+        var gradArrays = new double[paramCount][];
+        var lengths = new int[paramCount];
+        var m = new double[paramCount][];
+        var v = new double[paramCount][];
+
+        for (int p = 0; p < paramCount; p++)
+        {
+            paramArrays[p] = (double[])(object)_parameters[p].GetDataArray();
+            gradArrays[p] = _gradients[p] is not null
+                ? (double[])(object)_gradients[p].GetDataArray()
+                : Array.Empty<double>();
+            lengths[p] = _parameters[p].Length;
+
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
+            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
+        }
+
+        _optimizerStep = 0;
+        // Hyperparameters arrive as float (the kernel API was originally
+        // float-only); promote to double once at config time so the inner
+        // loop doesn't pay an implicit-conversion cost per element.
+        double lr = learningRate;
+        double b1 = beta1;
+        double b2 = beta2;
+        double epsVal = eps;
+        double wd = weightDecay;
+        var optType = optimizerType;
+
+        _optimizerUpdate = () =>
+        {
+            _optimizerStep++;
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                int len = lengths[p];
+
+                fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
+                       pM = m[p], pV = v[p])
+                {
+                    switch (optType)
+                    {
+                        case OptimizerType.SGD:
+                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
+                            break;
+                        case OptimizerType.Adam:
+                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
+                            break;
+                        case OptimizerType.AdamW:
+                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizer (double). " +
                                 $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
                     }
                 }
@@ -670,7 +764,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<GCHandle>? handleTracker = null,
         bool allowCachedB = true)
     {
-        if (typeof(T) != typeof(float)) return null;
+        // Per-branch type checks below — each `typeof(T) == typeof(float)` /
+        // `typeof(T) == typeof(double)` arm decides whether that op has a
+        // specialized path for the current numeric type. Branches without a
+        // double specialization simply fall through to the generic engine
+        // path at the bottom of the caller. PR #319: extend the MatMul
+        // branch to cover double via BlasProvider.TryGemm(double[], ...) +
+        // SimdGemm.Dgemm fallback so tape-trained Tensor<double> models
+        // (the consumer ViT-Base in PR #1224) hit the compiled-replay fast
+        // path on their hottest op.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // MatMul forward (double): direct BLAS into output buffer.
+        // Mirrors the float branch below but with double[] arrays and
+        // BlasProvider's double Dgemm overload (cblas_dgemm_ptr → OpenBLAS
+        // when AIDOTNET_USE_BLAS != 0). Falls through to SimdGemm.Dgemm
+        // when BLAS isn't loadable.
+        if (typeof(T) == typeof(double)
+            && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+
+            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
+            var cA = (double[])(object)inputA.GetDataArray();
+            var cB = (double[])(object)inputB.GetDataArray();
+            var cOut = (double[])(object)output.GetDataArray();
+
+            // Note: no Path-A pre-pack cache for double yet (SimdGemm has no
+            // DgemmWithCachedB), so the inference vs training distinction
+            // collapses to a single replay form: try BLAS, fall through to
+            // SimdGemm.Dgemm. Pre-pack-B for double is a future enhancement.
+            return eng =>
+            {
+                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                    SimdGemm.Dgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+            };
+        }
 
         // MatMul forward: direct BLAS into output buffer
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
@@ -760,7 +893,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         unsafe
                         {
                             float* p = (float*)inH.AddrOfPinnedObject();
-                            Parallel.For(0, numChunks, chunk =>
+                            CpuParallelSettings.ParallelForOrSerial(0, numChunks, len, chunk =>
                             {
                                 int start = chunk * chunkSize;
                                 int count = Math.Min(chunkSize, len - start);
@@ -1311,7 +1444,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 int totalElems = batchSize * normSize;
                 if (totalElems >= 50_000)
                 {
-                    System.Threading.Tasks.Parallel.For(0, batchSize, b =>
+                    CpuParallelSettings.ParallelForOrSerial(0, batchSize, totalElems, b =>
                     {
                         unsafe
                         {
@@ -1746,7 +1879,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         int chunks = (rows + chunkSize - 1) / chunkSize;
-        Parallel.For(0, chunks, chunk =>
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
             int start = chunk * chunkSize;
             int end = Math.Min(start + chunkSize, rows);
@@ -1770,7 +1903,62 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         IEngine engine,
         List<GCHandle>? handleTracker = null)
     {
-        if (typeof(T) != typeof(float)) return null;
+        // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
+        // PR #319: extend the MatMul backward to cover double via
+        // BlasProvider.TryGemmEx(double[], ...) so tape-trained
+        // Tensor<double> models hit the compiled-replay fast path on the
+        // dominant backward op (matmul backward = ~30% of typical
+        // transformer train wall-clock).
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
+        // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
+        // engine fallback is the generic TensorMatMul which routes through SimdGemm.Dgemm.
+        if (typeof(T) == typeof(double)
+            && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && BlasProvider.IsAvailable)
+        {
+            var inputAd = step.Inputs[0];
+            var inputBd = step.Inputs[1];
+            var outputD = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(outputD) || !gradMap.ContainsKey(inputAd) || !gradMap.ContainsKey(inputBd))
+                return null;
+
+            var gradOutD = gradMap[outputD];
+            var gradAd = gradMap[inputAd];
+            var gradBd = gradMap[inputBd];
+
+            int Md = inputAd._shape[0], Kd = inputAd._shape[1], Nd = inputBd._shape[1];
+
+            double[]? cdDC = null, cdA = null, cdB = null, cdDestA = null, cdDestB = null;
+
+            return eng =>
+            {
+                cdDC ??= (double[])(object)gradOutD.GetDataArray();
+                cdA ??= (double[])(object)inputAd.GetDataArray();
+                cdB ??= (double[])(object)inputBd.GetDataArray();
+                cdDestA ??= (double[])(object)gradAd.GetDataArray();
+                cdDestB ??= (double[])(object)gradBd.GetDataArray();
+
+                // dA = dC @ B^T — double-precision BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd))
+                {
+                    var dA = eng.TensorMatMul(gradOutD, inputBd.Transpose());
+                    dA.AsSpan().CopyTo(gradAd.AsWritableSpan());
+                }
+                // dB = A^T @ dC — double-precision BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(Kd, Nd, Md, cdA, 0, Kd, true, cdDC, 0, Nd, false, cdDestB, 0, Nd))
+                {
+                    var dB = eng.TensorMatMul(inputAd.Transpose(), gradOutD);
+                    dB.AsSpan().CopyTo(gradBd.AsWritableSpan());
+                }
+
+                inputAd.Grad = gradAd;
+                inputBd.Grad = gradBd;
+            };
+        }
 
         // MatMul backward: dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
@@ -2193,7 +2381,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<Action<IEngine>> fusedBackward,
         HashSet<int> consumedIndices)
     {
-        if (typeof(T) != typeof(float)) return;
+        // PR #319: dual-precision pattern detection. Float fires the L1-resident
+        // FusedMultiLayerGemm fast path (Phase B); double fires a simpler
+        // BLAS-Dgemm × ReLU × BLAS-Dgemm chain that still beats the eager
+        // tape path because the two matmuls dispatch to OpenBLAS Dgemm
+        // directly (75 GFLOPS) instead of going through the eager
+        // engine.TensorMatMul → tape recording → AutoTracer pipeline. The
+        // L1-cache-residency benefit specifically requires the FusedMultiLayer
+        // kernel which is float-only; extending it to double is a separate
+        // 200+ line SIMD effort tracked as a follow-up.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
 
         for (int i = 0; i + 2 < steps.Count; i++)
         {
@@ -2248,6 +2445,121 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
+
+            // ── Double-precision branch — BLAS-Dgemm × scalar ReLU × BLAS-Dgemm.
+            // Skips the L1-resident fused kernel (float-only) but still avoids
+            // the eager tape recording/dispatch pipeline. The two matmuls
+            // dispatch through OpenBLAS Dgemm directly (~75 GFLOPS) instead of
+            // going through eager TensorMatMul → tape recording → AutoTracer.
+            // Gated on BlasProvider.HasNativeDgemm at compile-build time — if
+            // the user has explicitly opted out of BLAS (AIDOTNET_USE_BLAS=0),
+            // we don't fuse this triple; the eager path will run and remain
+            // correct (just slower for that user). Industry standard: if you
+            // disable the BLAS that matmul depends on, you've also disabled
+            // the kernels that depend on it.
+            if (typeof(T) == typeof(double))
+            {
+                if (!BlasProvider.HasNativeDgemm)
+                {
+                    TensorAllocator.Return(activatedBuffer);
+                    continue;
+                }
+
+                var capturedInputD = inputTensor;
+                var capturedW1D = w1Tensor;
+                var capturedW2D = w2Tensor;
+                var capturedOutputD = outputTensor;
+                var capturedActivatedD = activatedBuffer;
+                int cmD = m, ckD = k, chD = h, cnD = n;
+                var capturedGradMapD = gradMap;
+
+                fusedForward.Add(eng =>
+                {
+                    var inA = (double[])(object)capturedInputD.GetDataArray();
+                    var w1A = (double[])(object)capturedW1D.GetDataArray();
+                    var w2A = (double[])(object)capturedW2D.GetDataArray();
+                    var outA = (double[])(object)capturedOutputD.GetDataArray();
+                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
+
+                    BlasProvider.TryGemm(cmD, chD, ckD, inA, 0, ckD, w1A, 0, chD, actA, 0, chD);
+
+                    int activatedLen = cmD * chD;
+                    for (int idx = 0; idx < activatedLen; idx++)
+                        if (actA[idx] < 0.0) actA[idx] = 0.0;
+
+                    BlasProvider.TryGemm(cmD, cnD, chD, actA, 0, chD, w2A, 0, cnD, outA, 0, cnD);
+                });
+
+                fusedBackward.Add(eng =>
+                {
+                    if (!capturedGradMapD.TryGetValue(capturedOutputD, out var gradOut)) return;
+
+                    var gOutArr = (double[])(object)gradOut.GetDataArray();
+                    var inA = (double[])(object)capturedInputD.GetDataArray();
+                    var w1A = (double[])(object)capturedW1D.GetDataArray();
+                    var w2A = (double[])(object)capturedW2D.GetDataArray();
+                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
+
+                    capturedGradMapD.TryGetValue(capturedW1D, out var gW1Tensor);
+                    capturedGradMapD.TryGetValue(capturedW2D, out var gW2Tensor);
+                    capturedGradMapD.TryGetValue(capturedInputD, out var gInTensor);
+
+                    // dW2 = activated^T @ gradOut → [h, n]
+                    if (gW2Tensor is not null)
+                    {
+                        var gW2 = (double[])(object)gW2Tensor.GetDataArray();
+                        BlasProvider.TryGemmEx(chD, cnD, cmD,
+                            actA, 0, chD, transA: true,
+                            gOutArr, 0, cnD, transB: false,
+                            gW2, 0, cnD);
+                    }
+
+                    // gradH = gradOut @ w2^T → [m, h]
+                    var gradH = ArrayPool<double>.Shared.Rent(cmD * chD);
+                    Array.Clear(gradH, 0, cmD * chD);
+                    BlasProvider.TryGemmEx(cmD, chD, cnD,
+                        gOutArr, 0, cnD, transA: false,
+                        w2A, 0, cnD, transB: true,
+                        gradH, 0, chD);
+
+                    // ReLU backward: gradH *= (activated > 0 ? 1 : 0)
+                    int gradHLen = cmD * chD;
+                    for (int idx = 0; idx < gradHLen; idx++)
+                        if (actA[idx] <= 0.0) gradH[idx] = 0.0;
+
+                    // dW1 = input^T @ gradH → [k, h]
+                    if (gW1Tensor is not null)
+                    {
+                        var gW1 = (double[])(object)gW1Tensor.GetDataArray();
+                        BlasProvider.TryGemmEx(ckD, chD, cmD,
+                            inA, 0, ckD, transA: true,
+                            gradH, 0, chD, transB: false,
+                            gW1, 0, chD);
+                    }
+
+                    // dInput = gradH @ w1^T → [m, k]
+                    if (gInTensor is not null)
+                    {
+                        var gIn = (double[])(object)gInTensor.GetDataArray();
+                        BlasProvider.TryGemmEx(cmD, ckD, chD,
+                            gradH, 0, chD, transA: false,
+                            w1A, 0, chD, transB: true,
+                            gIn, 0, ckD);
+                    }
+
+                    ArrayPool<double>.Shared.Return(gradH);
+
+                    capturedW1D.Grad = gW1Tensor;
+                    capturedW2D.Grad = gW2Tensor;
+                    capturedInputD.Grad = gInTensor;
+                });
+
+                consumedIndices.Add(i);
+                consumedIndices.Add(i + 1);
+                consumedIndices.Add(i + 2);
+                i += 2;
+                continue;
+            }
 
             // Capture for closures
             var capturedInput = inputTensor;
