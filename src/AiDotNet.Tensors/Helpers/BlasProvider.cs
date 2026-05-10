@@ -8,23 +8,28 @@ namespace AiDotNet.Tensors.Helpers;
 /// External BLAS provider — opt-in via env var.
 ///
 /// <para>
-/// By default this class is a <b>pass-through stub</b>: every <c>Try*</c> gate
-/// returns <c>false</c>, every <c>HasX</c> flag returns <c>false</c>, and the
-/// engine routes through <see cref="Engines.Simd.SimdGemm"/>'s AVX2 blocked
-/// kernel. Zero native dependencies, supply-chain-independent builds.
+/// Default behaviour (industry-standard, matches PyTorch / NumPy / TF):
+/// dynamically loads <c>libopenblas</c> from the
+/// <c>AiDotNet.Native.OpenBLAS</c> NuGet (transitive dependency of every
+/// AiDotNet install) and routes <c>cblas_sgemm</c> / <c>cblas_dgemm</c>
+/// through the native path. Closes the 6-25× matmul gap vs MKL-backed
+/// PyTorch on transformer-FFN shapes (issue #242) — and the
+/// 80%-of-ViT-Base-train-time bottleneck that the
+/// Issue319TransformerBlockPerfTests probe surfaces.
 /// </para>
 /// <para>
-/// When the environment variable <c>AIDOTNET_USE_BLAS=1</c> is set at process
-/// start, the provider dynamically loads <c>libopenblas</c> (ships via the
-/// <c>AiDotNet.Native.OpenBLAS</c> NuGet) and routes <c>cblas_sgemm</c> /
-/// <c>cblas_dgemm</c> through the native path. This closes the 10-25× matmul
-/// gap vs MKL-backed PyTorch on transformer-FFN shapes (issue #242) without
-/// changing the default build behaviour.
+/// Opt-OUT: set <c>AIDOTNET_USE_BLAS=0</c> (or <c>false</c> / <c>no</c> /
+/// <c>off</c>) at process start to disable the native path and route every
+/// dispatch through <see cref="Engines.Simd.SimdGemm"/>'s AVX2 blocked
+/// kernel. Use this for deterministic-bit-exact builds where BLAS's
+/// non-associative reduction order is unacceptable, or for environments
+/// where libopenblas refuses to load.
 /// </para>
 /// <para>
-/// Missing native library at runtime falls back to the SimdGemm path — the
-/// <c>HasX</c> flags read the actual dynamic-load success, so consumers that
-/// gate on them (e.g. <c>HasRawSgemm</c>) still transparently fall through.
+/// Missing native library at runtime falls back to the SimdGemm path
+/// transparently — the <c>HasX</c> flags read the actual dynamic-load
+/// success, so consumers that gate on them (e.g. <c>HasRawSgemm</c>) still
+/// see <c>false</c> and route correctly.
 /// </para>
 /// </summary>
 internal static class BlasProvider
@@ -79,11 +84,30 @@ internal static class BlasProvider
 
     private static bool ReadOptIn()
     {
+        // Industry-standard default: BLAS on when the native lib is available.
+        // PyTorch / NumPy / TensorFlow all default to BLAS-mandatory; AiDotNet
+        // ships AiDotNet.Native.OpenBLAS as a transitive NuGet dependency, so
+        // libopenblas is loadable on every consumer install. The previous
+        // opt-in default (`AIDOTNET_USE_BLAS=1` to enable) left double-precision
+        // matmul running on the in-house SimdGemm.Dgemm AVX2 path at ~12 GFLOPS
+        // when OpenBLAS Dgemm runs the same kernel at ~75 GFLOPS — a 6× perf
+        // gap on every TensorMatMul call (which is ~80 % of ViT-Base CPU
+        // train wall-clock per the Issue319TransformerBlockPerfTests probe).
+        //
+        // Opt-OUT is now `AIDOTNET_USE_BLAS=0|false|no` — for deterministic-
+        // bit-exact builds where BLAS's non-associative reduction order is
+        // unacceptable, or for environments where libopenblas refuses to load
+        // and we want the SimdGemm fallback to engage without paying for the
+        // ProbeNativeLibrary cost on every cold start.
         var raw = Environment.GetEnvironmentVariable("AIDOTNET_USE_BLAS");
-        if (string.IsNullOrWhiteSpace(raw)) return false;
-        return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(raw, "yes", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(raw)) return true;
+        // Explicit opt-out values disable BLAS; everything else (including
+        // empty string after trim, unrecognized strings, and the legacy
+        // 1/true/yes affirmations) leaves BLAS enabled.
+        return !(string.Equals(raw, "0", StringComparison.OrdinalIgnoreCase)
+              || string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase)
+              || string.Equals(raw, "no", StringComparison.OrdinalIgnoreCase)
+              || string.Equals(raw, "off", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool ProbeNativeLibrary()
@@ -356,6 +380,37 @@ internal static class BlasProvider
                 {
                     cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Double-precision counterpart of <see cref="TryGemmEx(int, int, int, float[], int, int, bool, float[], int, int, bool, float[], int, int)"/>.
+    /// Used by the compiled-plan double MatMul backward path (PR #319) to dispatch
+    /// transposed Dgemm directly into pre-allocated output buffers without paying
+    /// the engine's TensorTranspose + TensorMatMul allocation+copy cost.
+    /// </summary>
+    internal static bool TryGemmEx(int m, int n, int k,
+        double[] a, int aOffset, int lda, bool transA,
+        double[] b, int bOffset, int ldb, bool transB,
+        double[] c, int cOffset, int ldc)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;  // 112 = CblasTrans
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (double* pa = &a[aOffset])
+                fixed (double* pb = &b[bOffset])
+                fixed (double* pc = &c[cOffset])
+                {
+                    cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
             return true;

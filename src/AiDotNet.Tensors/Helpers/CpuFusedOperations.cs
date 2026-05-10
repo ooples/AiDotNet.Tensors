@@ -216,7 +216,7 @@ public static class CpuFusedOperations
             long totalElements = (long)totalPlanes * hw;
             if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
-                Parallel.For(0, totalPlanes, p =>
+                CpuParallelSettings.ParallelForOrSerial(0, totalPlanes, totalElements, p =>
                     ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
             }
             else
@@ -430,7 +430,7 @@ public static class CpuFusedOperations
             long totalElements = (long)totalPlanes * hw;
             if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
-                Parallel.For(0, totalPlanes, p =>
+                CpuParallelSettings.ParallelForOrSerial(0, totalPlanes, totalElements, p =>
                     ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
             }
             else
@@ -600,7 +600,7 @@ public static class CpuFusedOperations
                 // then load+gelu+store). For BERT FFN up this cuts
                 // ~200 µs per call; 12 calls per BERT = ~2.4 ms.
                 if (M * N >= parallelThreshold && M >= 4)
-                    Parallel.For(0, M, i => ApplyBiasGeluRowSimd(output, bias!, i, N));
+                    CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasGeluRowSimd(output, bias!, i, N));
                 else
                     for (int i = 0; i < M; i++)
                         ApplyBiasGeluRowSimd(output, bias!, i, N);
@@ -611,7 +611,7 @@ public static class CpuFusedOperations
             {
                 if (M * N >= parallelThreshold && M >= 4)
                 {
-                    Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, bias, i, N, simdRelu));
+                    CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, bias, i, N, simdRelu));
                 }
                 else
                 {
@@ -623,7 +623,7 @@ public static class CpuFusedOperations
             {
                 // Pure ReLU, no bias
                 if (M * N >= parallelThreshold && M >= 4)
-                    Parallel.For(0, M, i => ApplyBiasReluRowSimd(output, null, i, N, true));
+                    CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, null, i, N, true));
                 else
                     for (int i = 0; i < M; i++)
                         ApplyBiasReluRowSimd(output, null, i, N, true);
@@ -890,7 +890,7 @@ public static class CpuFusedOperations
 
         if (batchSize >= 4)
         {
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * featureSize, b =>
             {
                 FusedLayerNormSingleSample(input, gamma, beta, output, b, featureSize, epsilon, activation);
             });
@@ -979,7 +979,7 @@ public static class CpuFusedOperations
     {
         if (batchSize >= 4)
         {
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * featureSize, b =>
             {
                 FusedResidualLayerNormSingle(input, residual, gamma, beta, output, b, featureSize, epsilon);
             });
@@ -1056,7 +1056,7 @@ public static class CpuFusedOperations
     {
         if (batchSize >= 4)
         {
-            Parallel.For(0, batchSize, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * seqLen * seqLen, b =>
             {
                 FusedScaledSoftmaxRow(input, output, b, seqLen, scale);
             });
@@ -1472,7 +1472,7 @@ public static class CpuFusedOperations
 
         if (parallel)
         {
-            Parallel.For(0, batch, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, rowWork * batch, b =>
                 FusedLoRAProcessRow(inArr, baseArr, aArr, bArr, outArr,
                     b, inFeat, rank, outFeat, scaling, stackallocOk));
         }
@@ -1847,7 +1847,7 @@ public static class CpuFusedOperations
         if (parallel)
         {
             int totalRows = batch * outFeat;
-            Parallel.For(0, totalRows, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, totalRows, totalWork, idx =>
             {
                 int b = idx / outFeat;
                 int j = idx - b * outFeat;

@@ -304,7 +304,8 @@ internal static class FusedAttention
         int qStride = seqQ * headDim;
         int kStride = seqK * headDim;
 
-        System.Threading.Tasks.Parallel.For(0, batchHeads, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchHeads,
+            (long)batchHeads * seqQ * seqK * headDim, bh =>
         {
             int qOffset = bh * qStride;
             int kOffset = bh * kStride;

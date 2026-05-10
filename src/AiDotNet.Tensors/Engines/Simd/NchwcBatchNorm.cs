@@ -91,7 +91,7 @@ internal static class NchwcBatchNorm
                 long totalOps = (long)N * cg * spatial;
                 if (totalOps >= 64 * 1024)
                 {
-                    Parallel.For(0, N * cg, task =>
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, totalOps, task =>
                         ProcessChannelGroup(inArr, outArr, task, cg, spatial, hwC, packedScale, packedBias
 #if NET5_0_OR_GREATER
                             , useSimd
@@ -223,7 +223,7 @@ internal static class NchwcBatchNorm
                 long totalOps = (long)N * C * spatial;
                 if (totalOps >= 64 * 1024)
                 {
-                    Parallel.For(0, N * C, task =>
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * C, totalOps, task =>
                         ProcessChannel(inArr, outArr, task, C, spatial, packedScale, packedBias
 #if NET5_0_OR_GREATER
                             , useSimd

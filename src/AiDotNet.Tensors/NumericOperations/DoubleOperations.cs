@@ -959,7 +959,7 @@ public class DoubleOperations : INumericOperations<double>
                 fixed (double* xPtr = x)
                 {
                     var xp = xPtr;
-                    Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism }, i =>
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, i =>
                     {
                         int start = i * chunkSize;
                         int count = Math.Min(chunkSize, length - start);

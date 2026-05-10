@@ -136,7 +136,7 @@ public static class SimdHrrKernels
         int chunks = Math.Min(maxDop, Math.Max(1, n / ParallelThresholdElements));
         int chunkSize = (n + chunks - 1) / chunks;
 
-        Parallel.For(0, chunks, chunk =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, n, chunk =>
         {
             int start = chunk * chunkSize;
             int end = Math.Min(start + chunkSize, n);
@@ -420,7 +420,7 @@ public static class SimdHrrKernels
             return;
         }
 
-        Parallel.For(0, V, v =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, V, (long)V * D, v =>
         {
             int rowOff = v * D;
             scores[v] = PhaseCoherenceRow(

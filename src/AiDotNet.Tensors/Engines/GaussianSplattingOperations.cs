@@ -89,7 +89,7 @@ public static class GaussianSplattingOperations
         double cx = imageWidth * 0.5;
         double cy = imageHeight * 0.5;
 
-        Parallel.For(0, numGaussians, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numGaussians, numGaussians, i =>
         {
             // Get 3D mean
             double mx = numOps.ToDouble(means3D.GetFlat(i * 3));
@@ -283,7 +283,7 @@ public static class GaussianSplattingOperations
         int numTilesX = (imageWidth + tileSize - 1) / tileSize;
         int numTilesY = (imageHeight + tileSize - 1) / tileSize;
 
-        Parallel.For(0, numTilesX * numTilesY, tileIdx =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numTilesX * numTilesY, (long)numTilesX * numTilesY * tileSize * tileSize, tileIdx =>
         {
             int tileX = tileIdx % numTilesX;
             int tileY = tileIdx / numTilesX;
@@ -406,7 +406,7 @@ public static class GaussianSplattingOperations
         int numTilesX = (imageWidth + tileSize - 1) / tileSize;
         int numTilesY = (imageHeight + tileSize - 1) / tileSize;
 
-        Parallel.For(0, numTilesX * numTilesY, tileIdx =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numTilesX * numTilesY, (long)numTilesX * numTilesY * tileSize * tileSize, tileIdx =>
         {
             int tileX = tileIdx % numTilesX;
             int tileY = tileIdx / numTilesX;
@@ -575,7 +575,7 @@ public static class GaussianSplattingOperations
         bool broadcastDir = viewDirections._shape[0] == 1;
         var colors = new T[numGaussians * numChannels];
 
-        Parallel.For(0, numGaussians, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numGaussians, numGaussians, i =>
         {
             int dirIdx = broadcastDir ? 0 : i;
             double dx = numOps.ToDouble(viewDirections.GetFlat(dirIdx * 3));
@@ -632,7 +632,7 @@ public static class GaussianSplattingOperations
         bool broadcastDir = viewDirections._shape[0] == 1;
         var shGrad = new T[numGaussians * basisCount * numChannels];
 
-        Parallel.For(0, numGaussians, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numGaussians, numGaussians, i =>
         {
             int dirIdx = broadcastDir ? 0 : i;
             double dx = numOps.ToDouble(viewDirections.GetFlat(dirIdx * 3));
@@ -693,7 +693,7 @@ public static class GaussianSplattingOperations
         // Output: upper triangular covariance [N, 6] = c00, c01, c02, c11, c12, c22
         var covariances = new T[numGaussians * 6];
 
-        Parallel.For(0, numGaussians, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numGaussians, numGaussians, i =>
         {
             // Get quaternion (w, x, y, z)
             double qw = numOps.ToDouble(rotations.GetFlat(i * 4));
@@ -792,7 +792,7 @@ public static class GaussianSplattingOperations
         var rotGrad = new T[numGaussians * 4];
         var scaleGrad = new T[numGaussians * 3];
 
-        Parallel.For(0, numGaussians, i =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numGaussians, numGaussians, i =>
         {
             // Get quaternion (w, x, y, z) and normalize in a single expression
             double rawQw = numOps.ToDouble(rotations.GetFlat(i * 4));

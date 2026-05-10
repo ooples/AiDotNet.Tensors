@@ -169,7 +169,7 @@ internal static class Avx512Sgemm
             if (allowParallel && mTiles >= 2)
             {
                 float* aOuter = aPtr; float* bOuter = bPtr; float* cOuter = cPtr;
-                Parallel.For(0, mTiles, mt =>
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, mTiles, (long)m * n * k, mt =>
                 {
                     var packed = new float[16 * kLocal];
                     fixed (float* pPtr = packed)

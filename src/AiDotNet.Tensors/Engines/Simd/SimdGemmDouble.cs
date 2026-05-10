@@ -136,11 +136,12 @@ internal static partial class SimdGemm
                 int procs = Environment.ProcessorCount;
                 if (numRowBlocks * 2 < procs && numColBlocks > 1)
                 {
-                    Parallel.For(0, total, bi => Tile(bi / numColBlocks, bi % numColBlocks));
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, total, (long)m * n * k,
+                        bi => Tile(bi / numColBlocks, bi % numColBlocks));
                 }
                 else
                 {
-                    Parallel.For(0, numRowBlocks, ii =>
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)m * n * k, ii =>
                     {
                         for (int jj = 0; jj < numColBlocks; jj++) Tile(ii, jj);
                     });

@@ -212,7 +212,7 @@ internal static class MatrixMultiplyHelper
             // already saturated by M-axis; keep them on the simpler path.
             if (numRowBlocks * 2 < procs && numColBlocks > 1)
             {
-                Parallel.For(0, total, blockIdx =>
+                CpuParallelSettings.ParallelForOrSerial(0, total, (long)m * n * k, blockIdx =>
                 {
                     int ii = blockIdx / numColBlocks;
                     int jj = blockIdx % numColBlocks;
@@ -221,7 +221,7 @@ internal static class MatrixMultiplyHelper
             }
             else
             {
-                Parallel.For(0, numRowBlocks, iiBlock =>
+                CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)m * n * k, iiBlock =>
                 {
                     for (int jjBlock = 0; jjBlock < numColBlocks; jjBlock++)
                         multiplyTile(iiBlock, jjBlock);
