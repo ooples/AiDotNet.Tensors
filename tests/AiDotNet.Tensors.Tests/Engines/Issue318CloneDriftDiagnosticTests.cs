@@ -25,9 +25,28 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+/// <summary>
+/// Test collection that disables parallelization for tests touching
+/// process-wide state (TensorPool.ForceFreshAllocations). Without
+/// this gate, an unrelated test class running in parallel could
+/// observe the mutated flag and either fail spuriously or pass for
+/// the wrong reason.
+/// </summary>
+[CollectionDefinition("Issue318GlobalStateCollection", DisableParallelization = true)]
+public class Issue318GlobalStateCollection { }
+
+[Collection("Issue318GlobalStateCollection")]
 public class Issue318CloneDriftDiagnosticTests
 {
     private readonly ITestOutputHelper _output;
+
+    // Belt-and-suspenders gate — collection-level
+    // DisableParallelization keeps OTHER test classes from running
+    // concurrently, but tests within this class also share the
+    // process-wide TensorPool.ForceFreshAllocations flag. This lock
+    // serialises mutation across them.
+    private static readonly object _forceFreshGate = new();
+
     public Issue318CloneDriftDiagnosticTests(ITestOutputHelper output) { _output = output; }
 
     /// <summary>
@@ -152,36 +171,45 @@ public class Issue318CloneDriftDiagnosticTests
         var values = new float[Total];
         for (int i = 0; i < Total; i++) values[i] = (float)((rng.NextDouble() - 0.5) * 0.1);
 
-        bool savedFlag = TensorPool.ForceFreshAllocations;
-        TensorPool.ForceFreshAllocations = true;
-        try
+        // Wrap the mutation + assertions in the gate so a parallel
+        // test inside this same class can't observe the toggled flag
+        // while we're using it. The collection-level
+        // DisableParallelization handles cross-class concurrency; this
+        // lock handles within-class concurrency for tests that happen
+        // to also touch the flag.
+        lock (_forceFreshGate)
         {
-            var zero = new Tensor<float>(new[] { Rows, Cols });
-            var neg = new Tensor<float>(new[] { Rows, Cols });
-            var nS = neg.AsWritableSpan();
-            for (int i = 0; i < Total; i++) nS[i] = -values[i];
-            var pathA = engine.TensorSubtract(zero, neg);
+            bool savedFlag = TensorPool.ForceFreshAllocations;
+            TensorPool.ForceFreshAllocations = true;
+            try
+            {
+                var zero = new Tensor<float>(new[] { Rows, Cols });
+                var neg = new Tensor<float>(new[] { Rows, Cols });
+                var nS = neg.AsWritableSpan();
+                for (int i = 0; i < Total; i++) nS[i] = -values[i];
+                var pathA = engine.TensorSubtract(zero, neg);
 
-            var pathB = new Tensor<float>(new[] { Rows, Cols });
-            var bS = pathB.AsWritableSpan();
-            for (int i = 0; i < Total; i++) bS[i] = values[i];
+                var pathB = new Tensor<float>(new[] { Rows, Cols });
+                var bS = pathB.AsWritableSpan();
+                for (int i = 0; i < Total; i++) bS[i] = values[i];
 
-            var aBacking = pathA.GetDataArray();
-            var bBacking = pathB.GetDataArray();
-            _output.WriteLine($"With ForceFreshAllocations=true: A backing={aBacking.Length}, B backing={bBacking.Length}");
+                var aBacking = pathA.GetDataArray();
+                var bBacking = pathB.GetDataArray();
+                _output.WriteLine($"With ForceFreshAllocations=true: A backing={aBacking.Length}, B backing={bBacking.Length}");
 
-            Assert.True(aBacking.Length == Total,
-                $"Path A backing must be exactly {Total} when ForceFreshAllocations=true; got {aBacking.Length}.");
-            Assert.True(bBacking.Length == Total,
-                $"Path B backing must be exactly {Total}; got {bBacking.Length}.");
+                Assert.True(aBacking.Length == Total,
+                    $"Path A backing must be exactly {Total} when ForceFreshAllocations=true; got {aBacking.Length}.");
+                Assert.True(bBacking.Length == Total,
+                    $"Path B backing must be exactly {Total}; got {bBacking.Length}.");
 
-            for (int i = 0; i < Total; i++)
-                Assert.True(aBacking[i] == bBacking[i],
-                    $"Backing arrays differ at idx {i}: A={aBacking[i]}, B={bBacking[i]}.");
-        }
-        finally
-        {
-            TensorPool.ForceFreshAllocations = savedFlag;
+                for (int i = 0; i < Total; i++)
+                    Assert.True(aBacking[i] == bBacking[i],
+                        $"Backing arrays differ at idx {i}: A={aBacking[i]}, B={bBacking[i]}.");
+            }
+            finally
+            {
+                TensorPool.ForceFreshAllocations = savedFlag;
+            }
         }
     }
 
