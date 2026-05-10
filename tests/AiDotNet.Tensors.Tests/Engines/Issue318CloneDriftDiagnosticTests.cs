@@ -275,16 +275,28 @@ public class Issue318CloneDriftDiagnosticTests
 
     private void RunFloatChain()
     {
-        const int Dim0 = 256, Dim1 = 1024, Dim2 = 256;
+        // Non-power-of-two dimensions force pool-bucket asymmetry on
+        // the engine-op path (392*Dim1 = 401,408 → ArrayPool bucket
+        // pads to 524,288). Power-of-two dims hide the bug because
+        // the pooled buffer happens to be exactly logical-length.
+        const int Dim0 = 392, Dim1 = 1024, Dim2 = 392;
         var engine = new CpuEngine();
         var rng = new Random(7);
 
         var w0Trained = TrainedWeightF(engine, new[] { Dim0, Dim1 }, rng);
         var w1Trained = TrainedWeightF(engine, new[] { Dim1, Dim1 }, rng);
         var w2Trained = TrainedWeightF(engine, new[] { Dim1, Dim2 }, rng);
-        var w0Cloned = SetFlatTensorF(w0Trained);
-        var w1Cloned = SetFlatTensorF(w1Trained);
-        var w2Cloned = SetFlatTensorF(w2Trained);
+        // Canonicalize both sides so backing arrays are byte-equal —
+        // this is the contract the test claims to verify. Without
+        // these calls the test passes for the wrong reason (pool
+        // didn't pad these specific shapes); with these calls the
+        // test exercises the actual fix path.
+        w0Trained = (Tensor<float>)w0Trained.Canonicalize();
+        w1Trained = (Tensor<float>)w1Trained.Canonicalize();
+        w2Trained = (Tensor<float>)w2Trained.Canonicalize();
+        var w0Cloned = (Tensor<float>)SetFlatTensorF(w0Trained).Canonicalize();
+        var w1Cloned = (Tensor<float>)SetFlatTensorF(w1Trained).Canonicalize();
+        var w2Cloned = (Tensor<float>)SetFlatTensorF(w2Trained).Canonicalize();
         AssertLogicalEqualF(w0Trained, w0Cloned, "w0");
         AssertLogicalEqualF(w1Trained, w1Cloned, "w1");
         AssertLogicalEqualF(w2Trained, w2Cloned, "w2");
@@ -320,16 +332,22 @@ public class Issue318CloneDriftDiagnosticTests
 
     private void RunDoubleChain()
     {
-        const int Dim0 = 256, Dim1 = 1024, Dim2 = 256;
+        // Non-power-of-two dimensions to force pool-bucket asymmetry —
+        // see RunFloatChain comment for rationale.
+        const int Dim0 = 392, Dim1 = 1024, Dim2 = 392;
         var engine = new CpuEngine();
         var rng = new Random(7);
 
         var w0Trained = TrainedWeightD(engine, new[] { Dim0, Dim1 }, rng);
         var w1Trained = TrainedWeightD(engine, new[] { Dim1, Dim1 }, rng);
         var w2Trained = TrainedWeightD(engine, new[] { Dim1, Dim2 }, rng);
-        var w0Cloned = SetFlatTensorD(w0Trained);
-        var w1Cloned = SetFlatTensorD(w1Trained);
-        var w2Cloned = SetFlatTensorD(w2Trained);
+        // Canonicalize both sides so we exercise the actual fix path.
+        w0Trained = (Tensor<double>)w0Trained.Canonicalize();
+        w1Trained = (Tensor<double>)w1Trained.Canonicalize();
+        w2Trained = (Tensor<double>)w2Trained.Canonicalize();
+        var w0Cloned = (Tensor<double>)SetFlatTensorD(w0Trained).Canonicalize();
+        var w1Cloned = (Tensor<double>)SetFlatTensorD(w1Trained).Canonicalize();
+        var w2Cloned = (Tensor<double>)SetFlatTensorD(w2Trained).Canonicalize();
         AssertLogicalEqualD(w0Trained, w0Cloned, "w0");
         AssertLogicalEqualD(w1Trained, w1Cloned, "w1");
         AssertLogicalEqualD(w2Trained, w2Cloned, "w2");
