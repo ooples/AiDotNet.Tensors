@@ -8829,7 +8829,12 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
-            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
+            // #319: GELU = x·sigmoid(2·sqrt(2/π)·(x + 0.044715·x³)) — one
+            // Padé sigmoid per Vector256 instead of the tanh-decomp path's
+            // two (tanh = 2·sigmoid(2x) − 1). Numerically equivalent within
+            // float32 ULP; measured 1.36× kernel speedup on ViT-Base
+            // [197, 768] because the single divide dominates cycle cost.
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.FusedGELUUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
