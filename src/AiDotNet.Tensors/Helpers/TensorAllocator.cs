@@ -47,7 +47,14 @@ public static class TensorAllocator
             ? (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()
             : 0L;
 
-        if (!TensorPool.Enabled || totalSize == 0)
+        // #318: when consumers enable ForceFreshAllocations they're
+        // opting into byte-equal backing arrays across all
+        // construction paths (state_dict round-trip determinism,
+        // Clone-after-train semantics) at the cost of pool reuse.
+        // Same code path as the disabled-pool case — every Rent goes
+        // straight to `new Tensor<T>(shape)` which produces a backing
+        // array of EXACTLY logical Length.
+        if (!TensorPool.Enabled || TensorPool.ForceFreshAllocations || totalSize == 0)
         {
             if (bytesIfTracking > 0)
                 AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
@@ -133,6 +140,12 @@ public static class TensorAllocator
         int totalSize = 1;
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
+
+        // #318: when ForceFreshAllocations is enabled the caller wants
+        // backing arrays exactly logical-Length sized. Skip both the
+        // arena and pool tiers — go straight to new Tensor<T>(shape).
+        if (TensorPool.ForceFreshAllocations)
+            return new Tensor<T>(shape);
 
         // Arena path: reuse the entire Tensor<T> object + backing array — truly zero alloc
         var arena = TensorArena.Current;

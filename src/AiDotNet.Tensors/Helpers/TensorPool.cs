@@ -20,6 +20,34 @@ public static class TensorPool
     public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
 
     /// <summary>
+    /// When true, every <see cref="Rent{T}(int[])"/> /
+    /// <see cref="RentUninitialized{T}(int[])"/> call allocates a
+    /// fresh <c>T[]</c> of EXACTLY <c>product(shape)</c> elements —
+    /// no ArrayPool bucket padding, no thread-local cache reuse with
+    /// over-sized buffers. Two tensors with byte-equal logical
+    /// content always have backing arrays of identical length and
+    /// content, eliminating the cross-construction-path divergence
+    /// that issue #318 reports.
+    ///
+    /// <para>Default <c>false</c> — backwards-compatible perf
+    /// behaviour. Enable when training-time and inference-time
+    /// determinism contracts (state_dict round-trip, deterministic
+    /// Clone) outweigh the GC-pressure cost of skipping the pool.
+    /// Can also be enabled via the
+    /// <c>AIDOTNET_FORCE_FRESH_ALLOCATIONS=1</c> environment
+    /// variable so consumer test rigs can flip it without code
+    /// changes.</para>
+    ///
+    /// <para>Cost when enabled: every <c>Rent</c> goes through
+    /// <c>new T[totalSize]</c> instead of the ArrayPool / thread-
+    /// local cache path. For training loops with many small
+    /// allocations this turns into Gen-0 GC pressure — the same
+    /// regression the pool was designed to avoid. Don't enable
+    /// globally unless you have a measured determinism need.</para>
+    /// </summary>
+    public static bool ForceFreshAllocations { get; set; } = IsEnvTrue("AIDOTNET_FORCE_FRESH_ALLOCATIONS");
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
     /// use standard CLR allocation. All paths return zeroed memory.
@@ -29,6 +57,9 @@ public static class TensorPool
         if (!Enabled)
             return new Tensor<T>(shape);
 
+        // ForceFreshAllocations is honoured inside TensorAllocator.Rent
+        // — this keeps allocator-side bookkeeping (MemoryProfiler hooks)
+        // consistent and gives one source of truth for the policy.
         return TensorAllocator.Rent<T>(shape);
     }
 
@@ -44,6 +75,9 @@ public static class TensorPool
         if (!Enabled)
             return new Tensor<T>(shape);
 
+        // ForceFreshAllocations is honoured inside
+        // TensorAllocator.RentUninitialized — same single source of
+        // truth as the Rent path above.
         return TensorAllocator.RentUninitialized<T>(shape);
     }
 

@@ -1134,6 +1134,62 @@ public abstract class TensorBase<T> : IDisposable
     // ================================================================
 
     /// <summary>
+    /// Returns a tensor with byte-canonical backing storage —
+    /// a fresh, non-pooled <c>T[]</c> of exactly <see cref="Length"/>
+    /// elements (no padding tail), holding this tensor's logical
+    /// content. Two tensors with byte-equal logical content are
+    /// guaranteed to have byte-equal backing arrays after both have
+    /// been canonicalised, regardless of how each was originally
+    /// constructed.
+    ///
+    /// <para>Why this exists (issue #318): a tensor produced by an
+    /// engine op (e.g. <c>Engine.TensorSubtract</c> during a
+    /// training step's <c>UpdateParameters</c>) lives in a pooled
+    /// backing array whose length is the next ArrayPool bucket size
+    /// (a power of two), so a <c>[392, 1024]</c> tensor (logical
+    /// 401,408 elements) has a 524,288-element backing array with
+    /// 122,880 elements of padding. A tensor produced by
+    /// <c>new Tensor&lt;T&gt;(shape)</c> (the path
+    /// <c>RBMLayer.SetParameters</c> uses for deserialization) has
+    /// a backing array of EXACTLY 401,408 elements — no padding.
+    /// Even with byte-equal logical content, downstream kernels
+    /// that key on backing-array length / alignment can produce
+    /// different SIMD reduction sequences and float64 non-
+    /// associativity drives the divergence into the third or
+    /// fourth significant digit, accumulating to several percent
+    /// in a deep model's forward pass (the consumer's DBM Clone
+    /// signature).</para>
+    ///
+    /// <para><b>Round-trip contract</b>: call this on the result of
+    /// any engine-op-produced tensor before passing it back into
+    /// the engine if you need <c>state_dict</c>-style determinism
+    /// (Predict on a cloned model produces the exact same output
+    /// as Predict on the original). This matches PyTorch's
+    /// <c>.contiguous()</c> idiom.</para>
+    ///
+    /// <para><b>Cost</b>: one allocation of size <see cref="Length"/>
+    /// plus a Span.CopyTo (vectorised on .NET 5+). On the hot
+    /// training-loop path this is a real cost; the API is
+    /// opt-in for callers that need the determinism guarantee
+    /// rather than auto-applied.</para>
+    /// </summary>
+    /// <returns>A new tensor whose backing array is freshly
+    /// allocated, exactly <see cref="Length"/> elements long, and
+    /// holds the logical content of this tensor.</returns>
+    public TensorBase<T> Canonicalize()
+    {
+        ThrowIfSparse();
+        // ToArray() already returns a freshly-allocated T[] of exactly
+        // Length elements with logical-order content (handles views,
+        // non-contiguous storage, padded pooled buffers correctly).
+        // No second allocation needed — wrap it directly.
+        var freshData = ToArray();
+        var result = CreateInstance(freshData, _shape);
+        result.Layout = Layout;
+        return result;
+    }
+
+    /// <summary>
     /// Creates a deep copy of this tensor (always contiguous, never a view).
     /// </summary>
     public virtual TensorBase<T> Clone()
