@@ -21128,6 +21128,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return resultFCast;
         }
 
+        // Double fast path mirrors the float branch but uses inline double
+        // arithmetic + DgemmSequential (or BLAS dgemm when libopenblas is
+        // loaded) instead of SgemmSequential. Same materialized-softmax
+        // strategy: scores = Q · K^T (per head, with a pre-transposed K
+        // scratch buffer because SimdGemm.Dgemm has no transB flag), then
+        // fused scale + mask + bias + numerically stable softmax row-wise,
+        // then output = softmax · V.
+        if (typeof(T) == typeof(double))
+        {
+            double scaleValD = scale ?? 1.0 / Math.Sqrt(headDim);
+            var resultD = FlashAttentionDouble(
+                (Tensor<double>)(object)query,
+                (Tensor<double>)(object)key,
+                (Tensor<double>)(object)value,
+                attentionBias is null ? null : (Tensor<double>)(object)attentionBias,
+                scaleValD, isCausal,
+                batch, heads, seqQ, headDim, seqK,
+                out var statsD);
+            softmaxStats = (Tensor<T>)(object)statsD;
+            var resultDCast = (Tensor<T>)(object)resultD;
+            var savedD = attentionBias is null
+                ? new object[] { softmaxStats, scaleValD, isCausal }
+                : new object[] { softmaxStats, scaleValD, isCausal, attentionBias };
+            DifferentiableOps.RecordIfActive("FlashAttention", resultDCast,
+                new[] { query, key, value },
+                BackwardFunctions<T>.FlashAttentionBackward,
+                savedD);
+            return resultDCast;
+        }
+
         // Extract bias data for the scalar path (shape already validated above).
         T[]? biasData = null;
         bool hasBias = false;
@@ -21456,6 +21486,162 @@ public partial class CpuEngine : ITensorLevelEngine
         finally
         {
             System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// Double-precision counterpart of <see cref="FlashAttentionFloat"/>. Same
+    /// materialized-softmax structure (per-head pre-transpose of K, fused
+    /// scale + causal/bias mask + numerically stable softmax, output = P · V).
+    /// Routes scores=Q·K^T and out=P·V through cblas_dgemm via
+    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> when libopenblas is loaded;
+    /// falls back to the in-house <see cref="Simd.SimdGemm.DgemmSequential"/>
+    /// tiled Vector256&lt;double&gt; FMA kernel when BLAS is absent. The outer
+    /// <c>Parallel.For</c> across (batch * heads) demands the sequential GEMM
+    /// variant so workers don't nest.
+    /// </summary>
+    private Tensor<double> FlashAttentionDouble(
+        Tensor<double> query,
+        Tensor<double> key,
+        Tensor<double> value,
+        Tensor<double>? attentionBias,
+        double scaleValue,
+        bool isCausal,
+        int batch, int heads, int seqQ, int headDim, int seqK,
+        out Tensor<double> softmaxStats)
+    {
+        int bhCount = batch * heads;
+        int d_v = headDim;
+
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+
+        var qd = query.GetFlattenedData();
+        var kd = key.GetFlattenedData();
+        var vd = value.GetDataArray();
+        double[]? biasData = null;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            if (!attentionBias.IsContiguous) attentionBias = attentionBias.Contiguous();
+            biasData = attentionBias.GetDataArray();
+            biasBroadcastBatch = attentionBias.Rank == 3;
+        }
+
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
+        try
+        {
+            var weightsData = new double[scoresLen];
+            var outputData = new double[bhCount * seqQ * d_v];
+            var statsData = new double[bhCount * seqQ];
+
+            double scaleD = scaleValue;
+            double negInfD = double.NegativeInfinity;
+
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+
+                int qOff = bh * seqQ * headDim;
+                int kOff = bh * seqK * headDim;
+                int sOff = bh * seqQ * seqK;
+
+                // Step 1: scores = Q · K^T. Pre-transpose this head's K into a
+                // pooled scratch buffer so the GEMM doesn't need transB support.
+                var kt = System.Buffers.ArrayPool<double>.Shared.Rent(headDim * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < headDim; j++)
+                            kt[j * seqK + i] = kd[kOff + i * headDim + j];
+
+                    if (!Helpers.BlasProvider.TryGemmEx(seqQ, seqK, headDim,
+                        qd, qOff, headDim, false,
+                        kt, 0, seqK, false,
+                        scoresData, sOff, seqK))
+                    {
+                        Engines.Simd.SimdGemm.DgemmSequential(
+                            qd.AsSpan(qOff, seqQ * headDim),
+                            kt.AsSpan(0, headDim * seqK),
+                            scoresData.AsSpan(sOff, seqQ * seqK),
+                            seqQ, headDim, seqK);
+                    }
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(kt); }
+
+                // Step 2: fused scale + causal-mask + bias + stable softmax per row.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    double maxVal = negInfD;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double v = scoresData[rowOff + j] * scaleD;
+                        if (biasData is not null)
+                        {
+                            int biasIdx = biasBroadcastBatch
+                                ? (h * seqQ * seqK + i * seqK + j)
+                                : (b * heads * seqQ * seqK + h * seqQ * seqK + i * seqK + j);
+                            v += biasData[biasIdx];
+                        }
+                        if (isCausal && j > i) v = negInfD;
+                        if (v > maxVal) maxVal = v;
+                        scoresData[rowOff + j] = v;
+                    }
+
+                    // Fully-masked row guard — matches the float path.
+                    if (double.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++)
+                            weightsData[rowOff + j] = 0.0;
+                        statsData[bh * seqQ + i] = negInfD;
+                        continue;
+                    }
+
+                    double sumExp = 0.0;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double e = Math.Exp(scoresData[rowOff + j] - maxVal);
+                        weightsData[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    double inv = sumExp != 0.0 ? 1.0 / sumExp : 0.0;
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] *= inv;
+
+                    statsData[bh * seqQ + i] = maxVal + Math.Log(sumExp);
+                }
+
+                // Step 3: output = softmax · V. No transpose, V is row-major.
+                int wOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+                if (!Helpers.BlasProvider.TryGemmEx(seqQ, d_v, seqK,
+                    weightsData, wOff, seqK, false,
+                    vd, vOff, d_v, false,
+                    outputData, oOff, d_v))
+                {
+                    Engines.Simd.SimdGemm.DgemmSequential(
+                        weightsData.AsSpan(wOff, seqQ * seqK),
+                        vd.AsSpan(vOff, seqK * d_v),
+                        outputData.AsSpan(oOff, seqQ * d_v),
+                        seqQ, seqK, d_v);
+                }
+            });
+
+            softmaxStats = TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ },
+                new Vector<double>(statsData));
+            return TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, headDim },
+                new Vector<double>(outputData));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
         }
     }
 
