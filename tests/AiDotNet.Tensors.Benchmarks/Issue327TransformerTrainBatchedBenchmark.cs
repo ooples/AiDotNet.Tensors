@@ -73,7 +73,11 @@ public static class Issue327TransformerTrainBatchedBenchmark
 
         Console.WriteLine();
         Console.WriteLine("─── Phase C — Full Train step (L=4, fwd+bwd+opt) ───────────");
-        RunFullTrainStep(engine);
+        RunFullTrainStep(engine, persistent: false);
+
+        Console.WriteLine();
+        Console.WriteLine("─── Phase C2 — Same step, Persistent tape (compiled chain) ─");
+        RunFullTrainStep(engine, persistent: true);
 
         Console.WriteLine();
         Console.WriteLine("─── Phase D — Sustained CPU utilization probe (5s window) ──");
@@ -232,7 +236,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
     // Phase C — full L=4 Train step with autograd backward + Adam-ish opt
     // ────────────────────────────────────────────────────────────────────
 
-    private static void RunFullTrainStep(CpuEngine engine)
+    private static void RunFullTrainStep(CpuEngine engine, bool persistent)
     {
         var weights = MakeWeights(Layers);
         var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
@@ -244,10 +248,17 @@ public static class Issue327TransformerTrainBatchedBenchmark
         const int warmup = 3;
         const int iters = 20;
 
+        // For persistent mode, hold one tape across all iters so the
+        // compiled-chain cache engages on iter 2+. For non-persistent,
+        // each call creates a fresh tape inside DoTrainStep.
+        GradientTape<float>? sharedTape = persistent
+            ? new GradientTape<float>(new GradientTapeOptions { Persistent = true })
+            : null;
+
         // Warmup
         for (int i = 0; i < warmup; i++)
         {
-            DoTrainStep(engine, input, weights, optM, optV, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out _, out _, out _);
         }
 
         long gen0Before = GC.CollectionCount(0);
@@ -263,10 +274,12 @@ public static class Issue327TransformerTrainBatchedBenchmark
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
         {
-            DoTrainStep(engine, input, weights, optM, optV, out var fwdMs, out var bwdMs, out var optMs);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out var fwdMs, out var bwdMs, out var optMs);
             phaseTotals[i] = (fwdMs, bwdMs, optMs);
         }
         sw.Stop();
+
+        sharedTape?.Dispose();
 
         proc.Refresh();
         TimeSpan cpuAfter = proc.TotalProcessorTime;
@@ -285,7 +298,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         double activeCores = cpuSec / wallSec;
 
         Console.WriteLine();
-        Console.WriteLine($"  Train step (L={Layers}):");
+        Console.WriteLine($"  Train step (L={Layers}, persistent={persistent}):");
         Console.WriteLine($"    Per-iter wall    : {msPer,8:F3} ms");
         Console.WriteLine($"    Per-phase median : fwd {medianFwd:F3} ms / bwd {medianBwd:F3} ms / opt {medianOpt:F3} ms");
         Console.WriteLine($"    CPU/wall         : {cpuSec:F2}s / {wallSec:F2}s = {activeCores:F2} active cores ({100 * activeCores / Environment.ProcessorCount:F0}%)");
@@ -304,6 +317,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Tensor<float>[] weights,
         Tensor<float>[] optM,
         Tensor<float>[] optV,
+        GradientTape<float>? sharedTape,
         out double fwdMs,
         out double bwdMs,
         out double optMs)
@@ -311,8 +325,9 @@ public static class Issue327TransformerTrainBatchedBenchmark
         var swFwd = Stopwatch.StartNew();
         Dictionary<Tensor<float>, Tensor<float>> grads;
         Tensor<float> loss;
-
-        using (var tape = new GradientTape<float>())
+        GradientTape<float>? ownTape = sharedTape is null ? new GradientTape<float>() : null;
+        var tape = sharedTape ?? ownTape!;
+        try
         {
             var y = ForwardL(engine, input, weights, Layers);
             // ReduceSum returns a tape-connected Tensor<float> (scalar
@@ -328,6 +343,10 @@ public static class Issue327TransformerTrainBatchedBenchmark
             grads = tape.ComputeGradients(loss, weights);
             swBwd.Stop();
             bwdMs = swBwd.Elapsed.TotalMilliseconds;
+        }
+        finally
+        {
+            ownTape?.Dispose();
         }
 
         // In-place Adam-style optimizer update.
@@ -401,14 +420,14 @@ public static class Issue327TransformerTrainBatchedBenchmark
         }) { IsBackground = true };
 
         // Warmup so JIT is stable
-        DoTrainStep(engine, input, weights, optM, optV, out _, out _, out _);
+        DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _);
 
         sampler.Start();
         var sw = Stopwatch.StartNew();
         int steps = 0;
         while (sw.Elapsed.TotalSeconds < targetSec)
         {
-            DoTrainStep(engine, input, weights, optM, optV, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _);
             steps++;
         }
         sw.Stop();
