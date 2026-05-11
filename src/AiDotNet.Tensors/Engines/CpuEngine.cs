@@ -2898,6 +2898,38 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path mirroring the float branch — same parallel-chunk
+        // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
+            }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
@@ -4429,6 +4461,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
+            }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
@@ -4544,6 +4606,36 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
                     }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
+            }
+            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
                 });
             }
             else
