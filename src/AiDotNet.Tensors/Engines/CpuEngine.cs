@@ -34844,6 +34844,22 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int r = 0; r < srcRows; r++)
                 Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
         }
+        else if (typeof(T) == typeof(double) && rank == 2 && padding.Length >= 4 && tensor.IsContiguous)
+        {
+            double dVal = value is not null ? (double)(object)value : 0.0;
+            var srcArr = (double[])(object)tensor.GetDataArray();
+            var dstArr = (double[])(object)result.GetDataArray();
+            int srcRows = tensor._shape[0], srcCols = tensor._shape[1];
+            int padLeft = padding[0];
+            int padTop = padding[2];
+            int dstCols = newShape[1];
+            if (dVal == 0.0)
+                Array.Clear(dstArr, 0, dstArr.Length);
+            else
+                for (int i = 0; i < dstArr.Length; i++) dstArr[i] = dVal;
+            for (int r = 0; r < srcRows; r++)
+                Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
+        }
         else
         {
             result.Fill(value);
@@ -34928,6 +34944,41 @@ public partial class CpuEngine : ITensorLevelEngine
                                 + fh   * omfw * inArr[rowH1 + w0]
                                 + fh   * fw   * inArr[rowH1 + w1];
                         outArr[rowOut + ow] = v;
+                    }
+                }
+            };
+            if (total > 4) Parallel.For(0, total, kernel);
+            else for (int bc = 0; bc < total; bc++) kernel(bc);
+            return;
+        }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            int total = n * c;
+            int hh = h, ww = w, oH = outH, oW = outW;
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * hh * ww;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                    double fh = fhArr[oh];
+                    double omfh = 1.0 - fh;
+                    int rowH0 = inBase + h0 * ww;
+                    int rowH1 = inBase + h1 * ww;
+                    int rowOut = outBase + oh * oW;
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                        double fw = fwArr[ow];
+                        double omfw = 1.0 - fw;
+                        double v = omfh * omfw * inArrD[rowH0 + w0]
+                                 + omfh * fw   * inArrD[rowH0 + w1]
+                                 + fh   * omfw * inArrD[rowH1 + w0]
+                                 + fh   * fw   * inArrD[rowH1 + w1];
+                        outArrD[rowOut + ow] = v;
                     }
                 }
             };
