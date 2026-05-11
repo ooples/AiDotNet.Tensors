@@ -440,13 +440,23 @@ internal static class BackwardFunctions<T>
                     }
                     // BLAS refused — return buffers to the cache before falling through
                     // so the engine fallback's allocator hits a warm pool next call.
-                    Helpers.AutoTensorCache.Return(gradATensor);
-                    Helpers.AutoTensorCache.Return(gradBTensor);
+                    AutoTensorCache.Return(gradATensor);
+                    AutoTensorCache.Return(gradBTensor);
                 }
             }
         }
 
-        // Fallback: transpose last two dims (works for all ranks)
+        // Fallback: transpose last two dims (works for all ranks).
+        // bT and aT are LOCAL intermediates feeding TensorMatMul. For
+        // standard (createGraph=false) backward they're unreferenced
+        // after the matmul produces gradAFallback / gradBFallback, so
+        // returning them to AutoTensorCache lets the next backward's
+        // RentOrAllocate reuse the buffer.
+        // GATE: higher-order AD (createGraph=true, e.g. Hvp/Hessian)
+        // records the matmul that consumes bT/aT — those recorded ops
+        // reference the SAME tensor instances. Pooling them mid-flight
+        // would let the next op rent the same buffer and overwrite
+        // recorded-ops' inputs. Skip the pool-return in that mode.
         var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
@@ -526,8 +536,8 @@ internal static class BackwardFunctions<T>
                         return;
                     }
                     // BLAS refused — return buffers before falling through.
-                    Helpers.AutoTensorCache.Return(gradATensor);
-                    Helpers.AutoTensorCache.Return(gradBTensor);
+                    AutoTensorCache.Return(gradATensor);
+                    AutoTensorCache.Return(gradBTensor);
                 }
             }
         }
@@ -2286,9 +2296,9 @@ internal static class BackwardFunctions<T>
                     || !BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N))
                 {
                     // Return rented buffers before falling through.
-                    Helpers.AutoTensorCache.Return(maskedTensor);
-                    Helpers.AutoTensorCache.Return(gradInput);
-                    Helpers.AutoTensorCache.Return(gradWeight);
+                    AutoTensorCache.Return(maskedTensor);
+                    AutoTensorCache.Return(gradInput);
+                    AutoTensorCache.Return(gradWeight);
                     goto fusedReluFallback;
                 }
             }
@@ -2310,7 +2320,7 @@ internal static class BackwardFunctions<T>
             // cache so the next call's [M,N] mask rental hits a warm pool.
             // gradInput/gradWeight/gradBias will be handed off to the grads
             // dict by the AccumulateGrad calls below; do NOT return them.
-            Helpers.AutoTensorCache.Return(maskedTensor);
+            AutoTensorCache.Return(maskedTensor);
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
@@ -2388,8 +2398,8 @@ internal static class BackwardFunctions<T>
         if (!used)
         {
             // BLAS refused — return rented buffers before falling through.
-            Helpers.AutoTensorCache.Return(gradInput);
-            Helpers.AutoTensorCache.Return(gradWeight);
+            AutoTensorCache.Return(gradInput);
+            AutoTensorCache.Return(gradWeight);
             var maskedTensor = new Tensor<T>((T[])(object)maskedArr, new[] { M, N });
             FusedLinearActivationBackwardFallback(maskedTensor, inputs, grads, engine);
             return;
@@ -3844,8 +3854,8 @@ internal static class BackwardFunctions<T>
             if (!used)
             {
                 // Return rented buffers before falling through.
-                Helpers.AutoTensorCache.Return(inputGrad);
-                Helpers.AutoTensorCache.Return(weightGrad);
+                AutoTensorCache.Return(inputGrad);
+                AutoTensorCache.Return(weightGrad);
                 goto fusedFallback;
             }
 
