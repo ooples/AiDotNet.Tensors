@@ -10658,6 +10658,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            // Double-precision fast path via im2col + dgemm. Closes the
+            // VGG16-BN profiling gap (Conv2DIntoImpl owned 32% of total
+            // CPU-thread time on the nested-scalar-loop fallback below;
+            // dgemm via libopenblas cuts that to a tuned BLAS path that
+            // hits the same FMA throughput the float SGEMM gets).
+            Conv2DIm2colGemmDouble(
+                (double[])(object)inputData,
+                (double[])(object)kernelData,
+                (double[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                outputHeight, outputWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW);
+        }
         else
         {
             CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
@@ -10975,6 +10991,79 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+        }
+
+        if (parallelBatch)
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, batch,
+                (long)batch * outC * oH * oW, ProcessImage);
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++) ProcessImage(b);
+        }
+    }
+
+    /// <summary>
+    /// Double-precision parallel to <see cref="Conv2DIm2colGemm"/>: im2col +
+    /// dgemm using <see cref="Helpers.BlasProvider.TryGemm"/> (libopenblas
+    /// dgemm). Mirrors the float fast path's lowering but uses the
+    /// asymmetric-stride <see cref="Helpers.Im2ColHelper.Im2Col"/> overload
+    /// so it works for the int[]-stride / int[]-padding / int[]-dilation
+    /// surface that the model layer's Conv2DInto override expects. This
+    /// closes the 32% CPU-time gap that VGG16-BN on doubles spends in the
+    /// nested scalar loop fallback the int[] Conv2DIntoImpl previously
+    /// hit (profiled — Conv2DIntoImpl + b__0 owned 428 s out of the
+    /// 1,345 s aggregated CPU-thread time for a single Train iteration).
+    /// </summary>
+    private static void Conv2DIm2colGemmDouble(
+        double[] input, double[] kernel, double[] output,
+        int batch, int inC, int H, int W,
+        int outC, int kH, int kW,
+        int oH, int oW,
+        int sH, int sW, int padH, int padW, int dH, int dW)
+    {
+        int K = inC * kH * kW;
+        int N = oH * oW;
+        int inputSliceSize = inC * H * W;
+
+        // Per-image batch parallelism gate matches the float path: only
+        // worth it when per-image GEMM is small enough that dgemm-internal
+        // parallelism can't saturate cores. 50M FMAs threshold same as
+        // float — dgemm has the same parallel-vs-cache trade-off.
+        long perImageCost = (long)outC * K * N;
+        bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
+
+        void ProcessImage(int b)
+        {
+            var col = System.Buffers.ArrayPool<double>.Shared.Rent(K * N);
+            try
+            {
+                Helpers.Im2ColHelper.Im2Col(
+                    input.AsSpan(b * inputSliceSize, inputSliceSize),
+                    col.AsSpan(0, K * N),
+                    1, inC, H, W, kH, kW, sH, sW, padH, padW, dH, dW);
+
+                int outOff = b * outC * N;
+                bool usedBlas = Helpers.BlasProvider.TryGemm(
+                    outC, N, K,
+                    kernel.AsSpan(0, outC * K), K,
+                    col.AsSpan(0, K * N), N,
+                    output.AsSpan(outOff, outC * N), N);
+
+                if (!usedBlas)
+                {
+                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                        kernel.AsSpan(0, outC * K),
+                        col.AsSpan(0, K * N),
+                        output.AsSpan(outOff, outC * N),
+                        outC, K, N);
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<double>.Shared.Return(col);
+            }
         }
 
         if (parallelBatch)
