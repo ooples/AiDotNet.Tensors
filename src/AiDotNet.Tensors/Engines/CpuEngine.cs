@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 #if NET5_0_OR_GREATER
@@ -1795,39 +1796,43 @@ public partial class CpuEngine : ITensorLevelEngine
         var aArray = a.GetDataArray();
         var bArray = b.GetDataArray();
 
-        // Use SIMD-optimized TensorPrimitives for float type
+        // Use SIMD-optimized TensorPrimitives for float type. Single rented
+        // scratch buffer reused across rows — earlier passes allocated a
+        // fresh row[] per outer-loop iteration, which dominated runtime on
+        // large vectors and produced O(rows × cols) GC churn.
         if (typeof(T) == typeof(float) && bArray.Length >= 16)
         {
             var bFloat = (float[])(object)bArray;
             var aFloat = (float[])(object)aArray;
-
-            for (int i = 0; i < aFloat.Length; i++)
+            var rowData = ArrayPool<float>.Shared.Rent(bFloat.Length);
+            try
             {
-                var rowData = new float[bFloat.Length];
-                // SIMD vectorized: multiply vector b by scalar a[i]
-                Simd.SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowData.AsSpan());
-
-                // Copy result to matrix
-                for (int j = 0; j < bFloat.Length; j++)
+                var rowSpan = rowData.AsSpan(0, bFloat.Length);
+                for (int i = 0; i < aFloat.Length; i++)
                 {
-                    result[i, j] = (T)(object)rowData[j];
+                    SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowSpan);
+                    for (int j = 0; j < bFloat.Length; j++)
+                        result[i, j] = (T)(object)rowData[j];
                 }
             }
+            finally { ArrayPool<float>.Shared.Return(rowData, clearArray: false); }
         }
         else if (typeof(T) == typeof(double) && bArray.Length >= 8)
         {
             var bDouble = (double[])(object)bArray;
             var aDouble = (double[])(object)aArray;
-
-            for (int i = 0; i < aDouble.Length; i++)
+            var rowData = ArrayPool<double>.Shared.Rent(bDouble.Length);
+            try
             {
-                var rowData = new double[bDouble.Length];
-                Simd.SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowData.AsSpan());
-                for (int j = 0; j < bDouble.Length; j++)
+                var rowSpan = rowData.AsSpan(0, bDouble.Length);
+                for (int i = 0; i < aDouble.Length; i++)
                 {
-                    result[i, j] = (T)(object)rowData[j];
+                    SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowSpan);
+                    for (int j = 0; j < bDouble.Length; j++)
+                        result[i, j] = (T)(object)rowData[j];
                 }
             }
+            finally { ArrayPool<double>.Shared.Return(rowData, clearArray: false); }
         }
         else
         {
@@ -3891,7 +3896,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pOut = (double*)pinOut.Pointer;
                 int axisSz = axisSize;
                 int outerSz = outerSize;
-                bool useParallel = outerSz >= 4 && (long)outerSz * axisSz >= 32768;
                 Action<int> rowKernel = row =>
                 {
                     double* rIn = pIn + row * axisSz;
@@ -3909,14 +3913,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     double inv = 1.0 / sum;
                     for (int i = 0; i < axisSz; i++) rOut[i] *= inv;
                 };
-                if (useParallel)
-                {
-                    Parallel.For(0, outerSz, rowKernel);
-                }
-                else
-                {
-                    for (int row = 0; row < outerSz; row++) rowKernel(row);
-                }
+                // Route through CpuParallelSettings so the loop respects the
+                // configured MaxDegreeOfParallelism and falls back to serial
+                // for small inputs (skipping ThreadPool dispatch overhead).
+                // The totalWork estimate is outerSz*axisSz fmac operations.
+                CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
             }
             return;
         }
@@ -7715,8 +7716,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         outArrD[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0.0;
                     }
             };
-            if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
-            else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, poolKernel);
             return;
         }
 
@@ -25420,8 +25420,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                      oW * sizeof(float));
                 }
             };
-            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
-            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
             return;
         }
         if (typeof(T) == typeof(double)
@@ -25442,8 +25441,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                      oW * sizeof(double));
                 }
             };
-            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
-            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
             return;
         }
 
@@ -25598,8 +25596,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                      w * sizeof(float));
                 }
             };
-            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
-            else for (int b = 0; b < batchSize; b++) kernel(b);
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
             return;
         }
         if (typeof(T) == typeof(double)
@@ -25628,8 +25625,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                      w * sizeof(double));
                 }
             };
-            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
-            else for (int b = 0; b < batchSize; b++) kernel(b);
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
             return;
         }
 
@@ -29161,7 +29157,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pOut = (double*)pinOut.Pointer;
                 int axisSz = axisSize;
                 int outerSz = outerSize;
-                bool useParallel = outerSz >= 4 && (long)outerSz * axisSz >= 32768;
                 Action<int> rowKernel = row =>
                 {
                     double* rIn = pIn + row * axisSz;
@@ -29173,8 +29168,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     double logSumExp = Math.Log(sumExp);
                     for (int i = 0; i < axisSz; i++) rOut[i] = (rIn[i] - max) - logSumExp;
                 };
-                if (useParallel) Parallel.For(0, outerSz, rowKernel);
-                else for (int row = 0; row < outerSz; row++) rowKernel(row);
+                CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
             }
             DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
                 BackwardFunctions<T>.LogSoftmaxBackward);
