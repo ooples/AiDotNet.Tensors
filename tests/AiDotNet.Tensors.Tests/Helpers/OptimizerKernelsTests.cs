@@ -1,0 +1,581 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// Tests for OptimizerKernels (issue #319 — eliminate per-iter SGD
+// step allocation in eager-mode training loops).
+//
+// Three checks:
+//   1. Float numerical equivalence — SgdInPlace produces the same
+//      result as the naive TensorMultiplyScalar + TensorSubtractInPlace
+//      pattern, within float32 ULP tolerance.
+//   2. Double numerical equivalence — same check for the double path.
+//   3. Allocation regression guard — SgdInPlace must not allocate any
+//      tensor objects on the heap during the update.
+
+using System;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace AiDotNet.Tensors.Tests.Helpers;
+
+// Disable xUnit parallel execution for this class — the two
+// alloc-comparison tests sample GC.GetTotalAllocatedBytes, which is
+// a process-wide counter. If another test in another class is
+// allocating concurrently, those bytes get attributed to our naive
+// vs fused measurement and the relative-reduction assertion can
+// trip on the noise.
+[CollectionDefinition("OptimizerKernelsAllocSerial", DisableParallelization = true)]
+public class OptimizerKernelsAllocSerialCollection { }
+
+[Collection("OptimizerKernelsAllocSerial")]
+public class OptimizerKernelsTests
+{
+    private readonly ITestOutputHelper _output;
+    public OptimizerKernelsTests(ITestOutputHelper output) { _output = output; }
+
+    [Fact]
+    public void SgdInPlace_Float_MatchesNaiveMultiplyScalarThenSubtract()
+    {
+        const int N = 4096; // covers the AVX2 32-wide unroll, the 8-wide tail, and the scalar tail
+        var rng = new Random(123);
+        var paramA = MakeRandom<float>(N, rng);
+        var paramB = CloneFloat(paramA);
+        var grad = MakeRandom<float>(N, rng);
+        const float lr = 1e-3f;
+        var engine = new CpuEngine();
+
+        // Reference: naive pattern with intermediate tensor allocation.
+        var update = engine.TensorMultiplyScalar(grad, lr);
+        engine.TensorSubtractInPlace(paramA, update);
+
+        // Target: fused in-place kernel.
+        OptimizerKernels.SgdInPlace(paramB, grad, lr);
+
+        var spanA = paramA.AsSpan();
+        var spanB = paramB.AsSpan();
+        float maxDiff = 0;
+        for (int i = 0; i < N; i++)
+        {
+            float diff = MathF.Abs(spanA[i] - spanB[i]);
+            float tol = 1e-6f * MathF.Max(1f, MathF.Abs(spanA[i]));
+            Assert.True(diff <= tol,
+                $"SgdInPlace<float> diverges at idx {i}: naive={spanA[i]} fused={spanB[i]} diff={diff}");
+            if (diff > maxDiff) maxDiff = diff;
+        }
+        _output.WriteLine($"Float SGD equivalence: N={N} max abs diff = {maxDiff:E4}");
+    }
+
+    [Fact]
+    public void SgdInPlace_Double_MatchesNaiveMultiplyScalarThenSubtract()
+    {
+        const int N = 4096;
+        var rng = new Random(456);
+        var paramA = MakeRandom<double>(N, rng);
+        var paramB = CloneDouble(paramA);
+        var grad = MakeRandom<double>(N, rng);
+        const double lr = 1e-3;
+        var engine = new CpuEngine();
+
+        var update = engine.TensorMultiplyScalar(grad, lr);
+        engine.TensorSubtractInPlace(paramA, update);
+
+        OptimizerKernels.SgdInPlace(paramB, grad, lr);
+
+        var spanA = paramA.AsSpan();
+        var spanB = paramB.AsSpan();
+        double maxDiff = 0;
+        for (int i = 0; i < N; i++)
+        {
+            double diff = Math.Abs(spanA[i] - spanB[i]);
+            double tol = 1e-13 * Math.Max(1.0, Math.Abs(spanA[i]));
+            Assert.True(diff <= tol,
+                $"SgdInPlace<double> diverges at idx {i}: naive={spanA[i]} fused={spanB[i]} diff={diff}");
+            if (diff > maxDiff) maxDiff = diff;
+        }
+        _output.WriteLine($"Double SGD equivalence: N={N} max abs diff = {maxDiff:E4}");
+    }
+
+    [Fact]
+    public void SgdInPlace_RejectsNullArguments()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        Assert.Throws<ArgumentNullException>(() => OptimizerKernels.SgdInPlace<float>(null!, t, 0.1f));
+        Assert.Throws<ArgumentNullException>(() => OptimizerKernels.SgdInPlace<float>(t, null!, 0.1f));
+    }
+
+    [Fact]
+    public void SgdInPlace_RejectsLengthMismatch()
+    {
+        var p = new Tensor<float>(new[] { 4 });
+        var g = new Tensor<float>(new[] { 8 });
+        Assert.Throws<ArgumentException>(() => OptimizerKernels.SgdInPlace(p, g, 0.1f));
+    }
+
+    [Fact]
+    public void SgdInPlace_EmptyTensor_NoOp()
+    {
+        var p = new Tensor<float>(new[] { 0 });
+        var g = new Tensor<float>(new[] { 0 });
+        // Must not throw, must not write to anything.
+        OptimizerKernels.SgdInPlace(p, g, 0.1f);
+    }
+
+    [Fact]
+    public void AdamInPlace_Float_MatchesReferenceFormula()
+    {
+        const int N = 4096;
+        var rng = new Random(1001);
+        var paramKernel = MakeRandom<float>(N, rng);
+        var paramRef = CloneFloat(paramKernel);
+        var grad = MakeRandom<float>(N, rng);
+        var mKernel = new Tensor<float>(new[] { N });
+        var vKernel = new Tensor<float>(new[] { N });
+        var mRef = new Tensor<float>(new[] { N });
+        var vRef = new Tensor<float>(new[] { N });
+
+        const float lr = 1e-3f;
+        const float b1 = 0.9f;
+        const float b2 = 0.999f;
+        const float eps = 1e-8f;
+
+        // Run 5 steps of both and compare.
+        for (int step = 1; step <= 5; step++)
+        {
+            OptimizerKernels.AdamInPlace(paramKernel, grad, mKernel, vKernel, lr, b1, b2, eps, step);
+            AdamReference(paramRef, grad, mRef, vRef, lr, b1, b2, eps, step);
+
+            var spanK = paramKernel.AsSpan();
+            var spanR = paramRef.AsSpan();
+            float maxDiff = 0;
+            for (int i = 0; i < N; i++)
+            {
+                float diff = MathF.Abs(spanK[i] - spanR[i]);
+                float tol = 1e-5f * MathF.Max(1f, MathF.Abs(spanR[i]));
+                Assert.True(diff <= tol,
+                    $"Step {step}: AdamInPlace<float> diverges at idx {i}: kernel={spanK[i]} ref={spanR[i]} diff={diff}");
+                if (diff > maxDiff) maxDiff = diff;
+            }
+            _output.WriteLine($"Adam step {step}: max abs diff = {maxDiff:E4}");
+        }
+    }
+
+    [Fact]
+    public void AdamWInPlace_Float_AppliesDecoupledWeightDecay()
+    {
+        // Verify AdamW differs from Adam ONLY by the (1 - weightDecay*lr)
+        // pre-multiply on param. With weightDecay=0 the two paths must
+        // be byte-identical.
+        const int N = 1024;
+        var rng = new Random(2002);
+        var p1 = MakeRandom<float>(N, rng);
+        var p2 = CloneFloat(p1);
+        var grad = MakeRandom<float>(N, rng);
+        var m1 = new Tensor<float>(new[] { N });
+        var v1 = new Tensor<float>(new[] { N });
+        var m2 = new Tensor<float>(new[] { N });
+        var v2 = new Tensor<float>(new[] { N });
+
+        OptimizerKernels.AdamInPlace(p1, grad, m1, v1, 1e-3f, 0.9f, 0.999f, 1e-8f, 1);
+        OptimizerKernels.AdamWInPlace(p2, grad, m2, v2, 1e-3f, 0.9f, 0.999f, 1e-8f, weightDecay: 0f, step: 1);
+
+        var s1 = p1.AsSpan();
+        var s2 = p2.AsSpan();
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(s1[i], s2[i]);
+        }
+
+        // With weightDecay > 0, AdamW must produce strictly different output.
+        var p3 = MakeRandom<float>(N, rng);
+        var p4 = CloneFloat(p3);
+        var m3 = new Tensor<float>(new[] { N });
+        var v3 = new Tensor<float>(new[] { N });
+        var m4 = new Tensor<float>(new[] { N });
+        var v4 = new Tensor<float>(new[] { N });
+        OptimizerKernels.AdamInPlace(p3, grad, m3, v3, 1e-3f, 0.9f, 0.999f, 1e-8f, 1);
+        OptimizerKernels.AdamWInPlace(p4, grad, m4, v4, 1e-3f, 0.9f, 0.999f, 1e-8f, weightDecay: 0.1f, step: 1);
+
+        var s3 = p3.AsSpan();
+        var s4 = p4.AsSpan();
+        int differences = 0;
+        for (int i = 0; i < N; i++) if (s3[i] != s4[i]) differences++;
+        Assert.True(differences > N / 2,
+            $"AdamW with weightDecay=0.1 should differ from Adam on most elements; observed {differences}/{N}.");
+    }
+
+    [Fact]
+    public void AdamInPlace_Double_MatchesReferenceFormula()
+    {
+        // Double-precision SIMD branch coverage (PR #322 review #5).
+        // OptimizerKernels.AdamInPlace<double> dispatches through
+        // FusedOptimizer.AdamUpdateSimd's double overload (AVX2+FMA on x64,
+        // scalar fallback elsewhere). The float test above covers the float
+        // path; this test does the same numerical equivalence check for
+        // double so the double SIMD branch can't silently regress.
+        const int N = 4096;
+        var rng = new Random(1002);
+        var paramKernel = MakeRandom<double>(N, rng);
+        var paramRef = CloneDouble(paramKernel);
+        var grad = MakeRandom<double>(N, rng);
+        var mKernel = new Tensor<double>(new[] { N });
+        var vKernel = new Tensor<double>(new[] { N });
+        var mRef = new Tensor<double>(new[] { N });
+        var vRef = new Tensor<double>(new[] { N });
+
+        const double lr = 1e-3;
+        const double b1 = 0.9;
+        const double b2 = 0.999;
+        const double eps = 1e-8;
+
+        for (int step = 1; step <= 5; step++)
+        {
+            OptimizerKernels.AdamInPlace(paramKernel, grad, mKernel, vKernel, lr, b1, b2, eps, step);
+            AdamReferenceDouble(paramRef, grad, mRef, vRef, lr, b1, b2, eps, step);
+
+            var spanK = paramKernel.AsSpan();
+            var spanR = paramRef.AsSpan();
+            double maxDiff = 0;
+            for (int i = 0; i < N; i++)
+            {
+                double diff = Math.Abs(spanK[i] - spanR[i]);
+                // 1e-13 relative tolerance is ~3 ULPs at double precision —
+                // tight enough to catch a formula bug, loose enough to
+                // tolerate the SIMD path's FMA-reordering.
+                double tol = 1e-13 * Math.Max(1.0, Math.Abs(spanR[i]));
+                Assert.True(diff <= tol,
+                    $"Step {step}: AdamInPlace<double> diverges at idx {i}: kernel={spanK[i]} ref={spanR[i]} diff={diff}");
+                if (diff > maxDiff) maxDiff = diff;
+            }
+            _output.WriteLine($"Adam<double> step {step}: max abs diff = {maxDiff:E4}");
+        }
+    }
+
+    [Fact]
+    public void AdamWInPlace_Double_AppliesDecoupledWeightDecay()
+    {
+        // Same parity check as the float AdamW test but on the double SIMD
+        // branch (PR #322 review #5). weightDecay=0 must be byte-identical
+        // to Adam; weightDecay>0 must diverge on most elements via the
+        // (1 - weightDecay*lr) pre-multiply.
+        const int N = 1024;
+        var rng = new Random(2003);
+        var p1 = MakeRandom<double>(N, rng);
+        var p2 = CloneDouble(p1);
+        var grad = MakeRandom<double>(N, rng);
+        var m1 = new Tensor<double>(new[] { N });
+        var v1 = new Tensor<double>(new[] { N });
+        var m2 = new Tensor<double>(new[] { N });
+        var v2 = new Tensor<double>(new[] { N });
+
+        OptimizerKernels.AdamInPlace(p1, grad, m1, v1, 1e-3, 0.9, 0.999, 1e-8, 1);
+        OptimizerKernels.AdamWInPlace(p2, grad, m2, v2, 1e-3, 0.9, 0.999, 1e-8, weightDecay: 0.0, step: 1);
+
+        var s1 = p1.AsSpan();
+        var s2 = p2.AsSpan();
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(s1[i], s2[i]);
+        }
+
+        var p3 = MakeRandom<double>(N, rng);
+        var p4 = CloneDouble(p3);
+        var m3 = new Tensor<double>(new[] { N });
+        var v3 = new Tensor<double>(new[] { N });
+        var m4 = new Tensor<double>(new[] { N });
+        var v4 = new Tensor<double>(new[] { N });
+        OptimizerKernels.AdamInPlace(p3, grad, m3, v3, 1e-3, 0.9, 0.999, 1e-8, 1);
+        OptimizerKernels.AdamWInPlace(p4, grad, m4, v4, 1e-3, 0.9, 0.999, 1e-8, weightDecay: 0.1, step: 1);
+
+        var s3 = p3.AsSpan();
+        var s4 = p4.AsSpan();
+        int differences = 0;
+        for (int i = 0; i < N; i++) if (s3[i] != s4[i]) differences++;
+        Assert.True(differences > N / 2,
+            $"AdamW<double> with weightDecay=0.1 should differ from Adam on most elements; observed {differences}/{N}.");
+    }
+
+    [Fact]
+    public void AdamInPlace_RejectsBadArguments()
+    {
+        var p = new Tensor<float>(new[] { 4 });
+        var g = new Tensor<float>(new[] { 4 });
+        var m = new Tensor<float>(new[] { 4 });
+        var v = new Tensor<float>(new[] { 4 });
+
+        Assert.Throws<ArgumentNullException>(() =>
+            OptimizerKernels.AdamInPlace<float>(null!, g, m, v, 1e-3f, 0.9f, 0.999f, 1e-8f, 1));
+        Assert.Throws<ArgumentNullException>(() =>
+            OptimizerKernels.AdamInPlace<float>(p, null!, m, v, 1e-3f, 0.9f, 0.999f, 1e-8f, 1));
+        Assert.Throws<ArgumentNullException>(() =>
+            OptimizerKernels.AdamInPlace<float>(p, g, null!, v, 1e-3f, 0.9f, 0.999f, 1e-8f, 1));
+        Assert.Throws<ArgumentNullException>(() =>
+            OptimizerKernels.AdamInPlace<float>(p, g, m, null!, 1e-3f, 0.9f, 0.999f, 1e-8f, 1));
+
+        var wrongLen = new Tensor<float>(new[] { 8 });
+        Assert.Throws<ArgumentException>(() =>
+            OptimizerKernels.AdamInPlace(p, wrongLen, m, v, 1e-3f, 0.9f, 0.999f, 1e-8f, 1));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OptimizerKernels.AdamInPlace(p, g, m, v, 1e-3f, 0.9f, 0.999f, 1e-8f, step: 0));
+    }
+
+    [Fact]
+    public void AdamInPlace_AllocatesFarLessThanNaiveReferenceImpl()
+    {
+        // Same approach as SgdInPlace_AllocatesFarLessThanNaivePattern:
+        // measure fused vs naive on identical workload and assert a
+        // relative reduction. Robust to coverage instrumentation that
+        // inflates GC.GetTotalAllocatedBytes by per-call instrumentation
+        // probes (CI's coverlet sees ~340 KB/call where local sees 33
+        // bytes/call). The actual kernel is zero-allocation by static
+        // analysis (Memory.Pin is a stack struct, AVX2 writes through
+        // pinned pointers).
+        const int Hidden = 768;
+        const int Iters = 100;
+        var rng = new Random(7);
+        var pNaive = MakeRandom<float>(Hidden * Hidden, rng);
+        var pFused = MakeRandom<float>(Hidden * Hidden, new Random(7));
+        var g = MakeRandom<float>(Hidden * Hidden, rng);
+        var mNaive = new Tensor<float>(new[] { Hidden * Hidden });
+        var vNaive = new Tensor<float>(new[] { Hidden * Hidden });
+        var mFused = new Tensor<float>(new[] { Hidden * Hidden });
+        var vFused = new Tensor<float>(new[] { Hidden * Hidden });
+
+        // Naive Adam implementation builds new tensors each step.
+        void NaiveAdam(int step)
+        {
+            // m = beta1 * m + (1-beta1) * g  -> two MulScalar + one Add
+            var t1 = engine_local.TensorMultiplyScalar(mNaive, 0.9f);
+            var t2 = engine_local.TensorMultiplyScalar(g, 0.1f);
+            var newM = engine_local.TensorAdd(t1, t2);
+            newM.AsSpan().CopyTo(mNaive.AsWritableSpan());
+            // pNaive update simplification: param -= lr * newM (mirrors fused dominant cost)
+            var u = engine_local.TensorMultiplyScalar(newM, 1e-3f);
+            engine_local.TensorSubtractInPlace(pNaive, u);
+        }
+
+        for (int i = 0; i < 10; i++)
+        {
+            OptimizerKernels.AdamInPlace(pFused, g, mFused, vFused, 1e-3f, 0.9f, 0.999f, 1e-8f, i + 1);
+            NaiveAdam(i + 1);
+        }
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+#if NET5_0_OR_GREATER
+        long naiveStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int i = 0; i < Iters; i++) NaiveAdam(20 + i);
+#if NET5_0_OR_GREATER
+        long naiveEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+#if NET5_0_OR_GREATER
+        long fusedStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int i = 0; i < Iters; i++)
+            OptimizerKernels.AdamInPlace(pFused, g, mFused, vFused, 1e-3f, 0.9f, 0.999f, 1e-8f, 20 + i);
+#if NET5_0_OR_GREATER
+        long fusedEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        long naiveBytes = naiveEnd - naiveStart;
+        long fusedBytes = fusedEnd - fusedStart;
+        _output.WriteLine($"AdamInPlace allocation: naive={naiveBytes} bytes ({naiveBytes / Iters} bytes/call), fused={fusedBytes} bytes ({fusedBytes / Iters} bytes/call).");
+        _output.WriteLine($"Reduction  : {(naiveBytes > 0 ? (double)naiveBytes / Math.Max(fusedBytes, 1) : 0):F1}×");
+        // PR #322 review #9, #15: only assert on monotonic byte counter.
+        // net471 falls back to GC.GetTotalMemory (heap size, not
+        // allocations) — that can decrease across the two snapshots
+        // if a background GC runs between them, making the assertion
+        // fundamentally unreliable. Diagnostic line above stays so
+        // the value is visible during local runs on either framework.
+#if NET5_0_OR_GREATER
+        Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
+            $"AdamInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
+            + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+#endif
+    }
+
+    private static readonly CpuEngine engine_local = new();
+
+    // Reference Adam implementation — straight transcription of the
+    // canonical update for cross-checking the SIMD kernel. Never the
+    // hot path; only used by the equivalence test.
+    private static void AdamReference(
+        Tensor<float> param, Tensor<float> grad,
+        Tensor<float> m, Tensor<float> v,
+        float lr, float beta1, float beta2, float eps, int step)
+    {
+        var p = param.AsWritableSpan();
+        var g = grad.AsSpan();
+        var ms = m.AsWritableSpan();
+        var vs = v.AsWritableSpan();
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        for (int i = 0; i < p.Length; i++)
+        {
+            ms[i] = beta1 * ms[i] + (1f - beta1) * g[i];
+            vs[i] = beta2 * vs[i] + (1f - beta2) * g[i] * g[i];
+            float mHat = ms[i] / bc1;
+            float vHat = vs[i] / bc2;
+            p[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    private static void AdamReferenceDouble(
+        Tensor<double> param, Tensor<double> grad,
+        Tensor<double> m, Tensor<double> v,
+        double lr, double beta1, double beta2, double eps, int step)
+    {
+        var p = param.AsWritableSpan();
+        var g = grad.AsSpan();
+        var ms = m.AsWritableSpan();
+        var vs = v.AsWritableSpan();
+        double bc1 = 1.0 - Math.Pow(beta1, step);
+        double bc2 = 1.0 - Math.Pow(beta2, step);
+        for (int i = 0; i < p.Length; i++)
+        {
+            ms[i] = beta1 * ms[i] + (1.0 - beta1) * g[i];
+            vs[i] = beta2 * vs[i] + (1.0 - beta2) * g[i] * g[i];
+            double mHat = ms[i] / bc1;
+            double vHat = vs[i] / bc2;
+            p[i] -= lr * mHat / (Math.Sqrt(vHat) + eps);
+        }
+    }
+
+    [Fact]
+    public void SgdInPlace_AllocatesFarLessThanNaivePattern()
+    {
+        // The kernel itself is zero-allocation (verified by static
+        // analysis of OptimizerKernels.cs: only Memory<T>.Pin which is
+        // a stack-only struct on net5+, and the AVX2 SIMD kernel which
+        // writes through raw pointers). But on CI we can't measure
+        // "kernel-only" allocation directly: code-coverage probes,
+        // xUnit infrastructure, and JIT tier-up all show up under
+        // GC.GetTotalAllocatedBytes. An absolute budget like
+        // "≤ 1024 bytes/call" passes locally (33 bytes/call) but
+        // fails on the ubuntu-24.04 CI runner with coverage enabled
+        // (43000 bytes/call from coverlet probes).
+        //
+        // Honest assertion: SgdInPlace must allocate substantially
+        // LESS than the naive TensorMultiplyScalar + TensorSubtractInPlace
+        // pattern. Both paths see identical coverage overhead, so the
+        // relative reduction is preserved across environments. The
+        // naive path allocates a fresh Tensor<float>[Hidden*Hidden]
+        // every call (~2.4 MB at ViT-Base shape) on top of the
+        // coverage noise; the fused path doesn't. 10× ratio is the
+        // floor — actual ratio is far higher on real workloads.
+        const int Hidden = 768;
+        const int Iters = 100;
+        var pNaive = MakeRandom<float>(Hidden * Hidden, new Random(7));
+        var pFused = MakeRandom<float>(Hidden * Hidden, new Random(7));
+        var g = MakeRandom<float>(Hidden * Hidden, new Random(13));
+        var engine = new CpuEngine();
+        const float lr = 1e-4f;
+
+        // Generous warmup — let JIT tier up both paths fully so the
+        // measurement reflects steady-state behavior, not first-call
+        // tier-0 → tier-1 transition costs.
+        for (int i = 0; i < 10; i++)
+        {
+            OptimizerKernels.SgdInPlace(pFused, g, lr);
+            var u = engine.TensorMultiplyScalar(g, lr);
+            engine.TensorSubtractInPlace(pNaive, u);
+        }
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+#if NET5_0_OR_GREATER
+        long naiveStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int i = 0; i < Iters; i++)
+        {
+            var update = engine.TensorMultiplyScalar(g, lr);
+            engine.TensorSubtractInPlace(pNaive, update);
+        }
+#if NET5_0_OR_GREATER
+        long naiveEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+#if NET5_0_OR_GREATER
+        long fusedStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int i = 0; i < Iters; i++)
+        {
+            OptimizerKernels.SgdInPlace(pFused, g, lr);
+        }
+#if NET5_0_OR_GREATER
+        long fusedEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        long naiveBytes = naiveEnd - naiveStart;
+        long fusedBytes = fusedEnd - fusedStart;
+        long perCallNaive = naiveBytes / Iters;
+        long perCallFused = fusedBytes / Iters;
+        _output.WriteLine($"Naive path : {naiveBytes} bytes over {Iters} iters = {perCallNaive} bytes/call");
+        _output.WriteLine($"Fused path : {fusedBytes} bytes over {Iters} iters = {perCallFused} bytes/call");
+        _output.WriteLine($"Reduction  : {(naiveBytes > 0 ? (double)naiveBytes / Math.Max(fusedBytes, 1) : 0):F1}×");
+
+        // The fused path should allocate at most 1/10th of what the
+        // naive path does — relative assertion robust to coverage,
+        // tier-up, and other env-specific allocation noise.
+        // PR #322 review #9, #15: only assert on monotonic byte counter
+        // (net5+). net471 falls back to GC.GetTotalMemory which is
+        // not monotonic and produces unreliable subtraction results.
+#if NET5_0_OR_GREATER
+        Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
+            $"SgdInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
+            + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+#endif
+    }
+
+    private static Tensor<T> MakeRandom<T>(int length, Random rng) where T : struct
+    {
+        var t = new Tensor<T>(new[] { length });
+        var s = t.AsWritableSpan();
+        if (typeof(T) == typeof(float))
+        {
+            var sf = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(s);
+            for (int i = 0; i < length; i++) sf[i] = (float)((rng.NextDouble() - 0.5) * 2.0);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var sd = System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(s);
+            for (int i = 0; i < length; i++) sd[i] = (rng.NextDouble() - 0.5) * 2.0;
+        }
+        return t;
+    }
+
+    private static Tensor<float> CloneFloat(Tensor<float> src)
+    {
+        var dst = new Tensor<float>(src._shape);
+        src.AsSpan().CopyTo(dst.AsWritableSpan());
+        return dst;
+    }
+
+    private static Tensor<double> CloneDouble(Tensor<double> src)
+    {
+        var dst = new Tensor<double>(src._shape);
+        src.AsSpan().CopyTo(dst.AsWritableSpan());
+        return dst;
+    }
+}

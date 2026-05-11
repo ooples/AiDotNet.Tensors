@@ -256,6 +256,73 @@ public static class TensorAllocator
     // RentUninitialized is defined above (line ~95) with arena support
 
     /// <summary>
+    /// Adopts a caller-owned <c>T[]</c> as the backing storage for a new
+    /// tensor — zero-copy, no Vector wrapping, no pool churn. Use this on
+    /// backward-kernel hot paths where the kernel has already computed
+    /// into a fresh array: instead of
+    /// <c>Rent&lt;T&gt;(shape, new Vector&lt;T&gt;(arr))</c> (which goes
+    /// through <c>IEnumerable&lt;T&gt;.ToArray()</c>, a full copy), call
+    /// <see cref="Rent{T}(int[], T[])"/> to skip the duplicate alloc.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #319 Phase 4: this overload is the simplest replacement for
+    /// the <c>Rent&lt;T&gt;(shape, new Vector&lt;T&gt;(data))</c> pattern
+    /// that appears in ~136 sites in <c>CpuEngine.cs</c>. The Vector
+    /// constructor used to call <c>ToArray()</c> on its
+    /// <c>IEnumerable&lt;T&gt;</c> input, which means a freshly-computed
+    /// gradient array got copied once into the Vector and then again into
+    /// the rented tensor (or, on the existing zero-copy fast path, into
+    /// a new Vector backing array). This overload skips both steps.
+    /// </para>
+    /// <para>
+    /// <b>Ownership:</b> after this call returns, the caller MUST NOT
+    /// retain a reference to <paramref name="data"/>. The tensor wraps
+    /// it directly; mutations through the caller's variable become
+    /// visible through the tensor and vice versa.
+    /// </para>
+    /// <para>
+    /// <b>Interaction with <see cref="TensorPool.ForceFreshAllocations"/>:</b>
+    /// this overload is implicitly compatible — its
+    /// <c>data.Length == product(shape)</c> precondition matches the
+    /// "backing array length is exactly product(shape)" guarantee that
+    /// flag was designed to enforce (no ArrayPool overhang, no pooled
+    /// over-sized buffers). Issue #318 callers can use this overload
+    /// freely without violating byte-equality contracts.
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> Rent<T>(int[] shape, T[] data)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+        if (totalSize != data.Length)
+            throw new ArgumentException(
+                $"Data length ({data.Length}) must match shape total ({totalSize}).",
+                nameof(data));
+        return new Tensor<T>(data, shape);
+    }
+
+    /// <summary>
+    /// Clearer-named alias for <see cref="Rent{T}(int[], T[])"/>. New call
+    /// sites should prefer this name — the <c>Rent</c> verb on the other
+    /// overload implies pool/arena renting, which can mislead readers of
+    /// code that's actually adopting caller-owned storage. <c>Adopt</c>
+    /// names the semantic precisely: this overload doesn't rent from any
+    /// pool; it takes ownership of an existing <c>T[]</c> and wraps it as
+    /// the tensor's backing storage. The other <see cref="Rent{T}(int[], T[])"/>
+    /// remains for the ~136 existing call sites; both are zero-copy and
+    /// have identical runtime behavior.
+    /// </summary>
+    /// <param name="shape">The tensor shape; product must equal <c>data.Length</c>.</param>
+    /// <param name="data">A caller-owned array. After this call returns, the
+    /// caller MUST NOT retain a reference — the tensor wraps it directly.</param>
+    public static Tensor<T> Adopt<T>(int[] shape, T[] data)
+        => Rent(shape, data);
+
+    /// <summary>
     /// Creates a tensor with the given shape and data from a Vector.
     /// Zero-copy when the Vector's backing array is exactly the right size
     /// (common pattern: caller does new T[n], computes into it, wraps in Vector).
