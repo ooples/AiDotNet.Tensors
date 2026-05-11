@@ -28765,6 +28765,41 @@ public partial class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("LogSoftmax", result, eng => result);
             return result;
         }
+        // Double primitive fast path for last-axis log-softmax. Inline 3-pass
+        // max / log-sum-exp / shift per row, parallel across rows. No
+        // INumericOperations<T> virtual dispatch and no per-element boxing.
+        // Hit by every classifier head and NLLLoss flow on fp64 networks.
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            var resultD = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+            using var pinIn = tensor.Data.Pin();
+            using var pinOut = resultD.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                int axisSz = axisSize;
+                int outerSz = outerSize;
+                bool useParallel = outerSz >= 4 && (long)outerSz * axisSz >= 32768;
+                Action<int> rowKernel = row =>
+                {
+                    double* rIn = pIn + row * axisSz;
+                    double* rOut = pOut + row * axisSz;
+                    double max = rIn[0];
+                    for (int i = 1; i < axisSz; i++) if (rIn[i] > max) max = rIn[i];
+                    double sumExp = 0.0;
+                    for (int i = 0; i < axisSz; i++) sumExp += Math.Exp(rIn[i] - max);
+                    double logSumExp = Math.Log(sumExp);
+                    for (int i = 0; i < axisSz; i++) rOut[i] = (rIn[i] - max) - logSumExp;
+                };
+                if (useParallel) Parallel.For(0, outerSz, rowKernel);
+                else for (int row = 0; row < outerSz; row++) rowKernel(row);
+            }
+            DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
+                BackwardFunctions<T>.LogSoftmaxBackward);
+            AutoTracer.RecordOp("LogSoftmax", resultD, eng => resultD);
+            return resultD;
+        }
 
         // Generic scalar fallback
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -30005,6 +30040,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.CoshUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Cosh(dSrc[i]);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -30051,6 +30093,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SinhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Sinh(dSrc[i]);
         }
         else
         {
@@ -32735,6 +32784,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
+            double dScale = 1.0 / (1.0 - dropoutRate);
+            var inArr = (double[])(object)input.GetDataArray();
+            var outArr = (double[])(object)dropResult.GetDataArray();
+            var mArr = (double[])(object)mask.GetDataArray();
+            for (int i = 0; i < input.Length; i++)
+            {
+                if (rand.NextDouble() >= dropoutRate)
+                {
+                    mArr[i] = dScale;
+                    outArr[i] = inArr[i] * dScale;
+                }
+                else
+                {
+                    mArr[i] = 0.0;
+                    outArr[i] = 0.0;
+                }
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -33078,6 +33148,46 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
 
+        // Float primitive fast path (non-Nchwc8 layouts): inline sum + divide,
+        // no INumericOperations<T> virtual dispatch. Used by every CNN classifier
+        // head that doesn't hit the Nchwc8 SIMD branch.
+        if (typeof(T) == typeof(float))
+        {
+            var inArrF = (float[])(object)inputData;
+            var outArrF = (float[])(object)resultData;
+            float invSp = 1f / spatialSize;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                float sum = 0f;
+                for (int s = 0; s < spatialSize; s++) sum += inArrF[offset + s];
+                outArrF[bc] = sum * invSp;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var inArrD = (double[])(object)inputData;
+            var outArrD = (double[])(object)resultData;
+            double invSp = 1.0 / spatialSize;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                double sum = 0.0;
+                for (int s = 0; s < spatialSize; s++) sum += inArrD[offset + s];
+                outArrD[bc] = sum * invSp;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+
         // Parallelize across batch*channels (each channel is independent)
         Action<int> processChannel = bc =>
         {
@@ -33111,6 +33221,46 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
+
+        // Float / double primitive fast paths: inline max-finding loop,
+        // no INumericOperations<T> dispatch. CNN classifier heads hit this
+        // per-step.
+        if (typeof(T) == typeof(float))
+        {
+            var inArrF = (float[])(object)inputData;
+            var outArrF = (float[])(object)resultData;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                float maxVal = inArrF[offset];
+                for (int s = 1; s < spatialSize; s++)
+                    if (inArrF[offset + s] > maxVal) maxVal = inArrF[offset + s];
+                outArrF[bc] = maxVal;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var inArrD = (double[])(object)inputData;
+            var outArrD = (double[])(object)resultData;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                double maxVal = inArrD[offset];
+                for (int s = 1; s < spatialSize; s++)
+                    if (inArrD[offset + s] > maxVal) maxVal = inArrD[offset + s];
+                outArrD[bc] = maxVal;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
 
         Action<int> processChannel = bc =>
         {
