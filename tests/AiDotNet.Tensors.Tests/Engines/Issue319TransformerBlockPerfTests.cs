@@ -94,6 +94,7 @@ public class Issue319TransformerBlockPerfTests
     /// just guessing about where the time goes.
     /// </summary>
     [Fact]
+    [Trait("Category", "Performance")]
     public void RawSimdVsEngineWrapper_FindsWhereTimeGoes()
     {
         const int Hidden = 768;
@@ -166,6 +167,7 @@ public class Issue319TransformerBlockPerfTests
     /// regressions; the per-op output is the diagnostic.
     /// </summary>
     [Fact]
+    [Trait("Category", "Performance")]
     public void TransformerBlockHotPath_PerOpTimingsAndBudget()
     {
         const int Hidden = 768;

@@ -38,6 +38,32 @@ namespace AiDotNet.Tensors.Helpers;
 /// — i.e. after gradients have been computed, when the optimizer is
 /// updating leaf parameters. It does not record on the tape.
 /// </para>
+/// <para>
+/// <b>Contiguity contract (PR #322 review #3, #5, #10, #11, #14, #20, #22):</b>
+/// the mutated tensors — <c>param</c> for SGD; <c>param</c>, <c>m</c>,
+/// <c>v</c> for Adam/AdamW — MUST be contiguous. The SIMD kernels
+/// walk the buffers linearly; passing a non-contiguous view (e.g.
+/// the result of <c>Transpose</c>) would silently write through the
+/// wrong stride and corrupt the optimizer state. Each method
+/// validates <c>IsContiguous</c> up front and throws
+/// <see cref="ArgumentException"/> with an actionable message when
+/// the precondition is violated.
+/// </para>
+/// <para>
+/// <b>"Allocation-free" — clarification (PR #322 review #3, #4, #13, #20):</b>
+/// the kernel itself is genuinely allocation-free. The ONE exception
+/// is the <c>grad</c> tensor: a non-contiguous <c>grad</c> view is
+/// materialized via <c>grad.Contiguous()</c> before the kernel runs,
+/// because the SIMD path requires linear memory. Allocate-free
+/// behavior therefore requires that <c>grad</c> is contiguous; this
+/// is the common case (most backward kernels produce contiguous
+/// outputs). When <c>grad</c> is a non-contiguous view, one
+/// shape-sized temporary tensor is allocated for the duration of the
+/// call. Callers who need strict allocation-free behavior in all
+/// cases should call <c>grad.Contiguous()</c> themselves once before
+/// the optimizer loop, so the materialization (if any) happens
+/// outside the hot path.
+/// </para>
 /// </remarks>
 public static class OptimizerKernels
 {
@@ -69,12 +95,24 @@ public static class OptimizerKernels
             throw new ArgumentException(
                 $"SgdInPlace requires matching lengths; param.Length={param.Length}, grad.Length={grad.Length}.");
         }
+        // PR #322 review #22: explicit contiguity guard on `param`. The
+        // SIMD kernel pins param.Data and walks it as a flat buffer; a
+        // non-contiguous view (e.g. Transpose) would silently write
+        // through the wrong stride and corrupt the parameter. Fail fast
+        // with a clear message instead of letting Pin throw a generic
+        // InvalidOperationException several frames deep.
+        if (!param.IsContiguous)
+        {
+            throw new ArgumentException(
+                "SgdInPlace requires param to be contiguous. Got a non-contiguous view; call param.Contiguous() before passing it to the optimizer, or materialize the parameter via its source.",
+                nameof(param));
+        }
         if (param.Length == 0) return;
 
-        // Materialize non-contiguous gradient views — the SIMD kernel
-        // walks linearly through memory. Param must already be
-        // contiguous (it's a leaf parameter; non-contiguous leaves
-        // would already break TensorSubtractInPlace).
+        // Non-contiguous gradient views (e.g. permutations from
+        // backward) get materialized — the SIMD kernel walks linearly.
+        // Documented in the XML remarks as an exception to the
+        // allocation-free contract (PR #322 review #3, #4, #13, #20).
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
 
         if (typeof(T) == typeof(float))
@@ -83,7 +121,11 @@ public static class OptimizerKernels
             var gradMem = AsFloatMemory(gradContig.Data);
             using var pinParam = paramMem.Pin();
             using var pinGrad = gradMem.Pin();
-            float lrF = (float)(object)lr!;
+            // PR #322 review #12: Unsafe.As reinterprets the typed
+            // generic value without boxing. The (T)(object)lr pattern
+            // would box lr to System.Object (one heap alloc per call)
+            // then unbox to float — wasted work since typeof(T) == float.
+            float lrF = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref lr);
             FusedOptimizer.SgdUpdateSimd(
                 (float*)pinParam.Pointer, (float*)pinGrad.Pointer, param.Length, lrF);
             return;
@@ -95,7 +137,7 @@ public static class OptimizerKernels
             var gradMem = AsDoubleMemory(gradContig.Data);
             using var pinParam = paramMem.Pin();
             using var pinGrad = gradMem.Pin();
-            double lrD = (double)(object)lr!;
+            double lrD = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref lr);
             FusedOptimizer.SgdUpdateSimd(
                 (double*)pinParam.Pointer, (double*)pinGrad.Pointer, param.Length, lrD);
             return;
@@ -160,11 +202,15 @@ public static class OptimizerKernels
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
             using var pinV = vMem.Pin();
+            // PR #322 review #12: Unsafe.As — no boxing.
             FusedOptimizer.AdamUpdateSimd(
                 (float*)pinP.Pointer, (float*)pinG.Pointer,
                 (float*)pinM.Pointer, (float*)pinV.Pointer,
                 param.Length,
-                (float)(object)lr!, (float)(object)beta1!, (float)(object)beta2!, (float)(object)eps!,
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref lr),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref beta1),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref beta2),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
                 step);
             return;
         }
@@ -183,7 +229,10 @@ public static class OptimizerKernels
                 (double*)pinP.Pointer, (double*)pinG.Pointer,
                 (double*)pinM.Pointer, (double*)pinV.Pointer,
                 param.Length,
-                (double)(object)lr!, (double)(object)beta1!, (double)(object)beta2!, (double)(object)eps!,
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref lr),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref beta1),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref beta2),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref eps),
                 step);
             return;
         }
@@ -222,12 +271,17 @@ public static class OptimizerKernels
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
             using var pinV = vMem.Pin();
+            // PR #322 review #12: Unsafe.As — no boxing.
             FusedOptimizer.AdamWUpdateSimd(
                 (float*)pinP.Pointer, (float*)pinG.Pointer,
                 (float*)pinM.Pointer, (float*)pinV.Pointer,
                 param.Length,
-                (float)(object)lr!, (float)(object)beta1!, (float)(object)beta2!, (float)(object)eps!,
-                (float)(object)weightDecay!, step);
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref lr),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref beta1),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref beta2),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref weightDecay),
+                step);
             return;
         }
 
@@ -245,8 +299,12 @@ public static class OptimizerKernels
                 (double*)pinP.Pointer, (double*)pinG.Pointer,
                 (double*)pinM.Pointer, (double*)pinV.Pointer,
                 param.Length,
-                (double)(object)lr!, (double)(object)beta1!, (double)(object)beta2!, (double)(object)eps!,
-                (double)(object)weightDecay!, step);
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref lr),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref beta1),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref beta2),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref eps),
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref weightDecay),
+                step);
             return;
         }
 
@@ -270,6 +328,24 @@ public static class OptimizerKernels
             throw new ArgumentException(
                 $"Adam/AdamW require matching lengths; param={param.Length}, grad={grad.Length}, m={m.Length}, v={v.Length}.");
         }
+        // PR #322 review #11, #14, #23: explicit contiguity guards.
+        // The SIMD kernels (AdamUpdateSimd / AdamWUpdateSimd) pin
+        // param.Data, m.Data, v.Data and walk them linearly. A
+        // non-contiguous view of any of these would silently write
+        // through the wrong stride and corrupt the optimizer state.
+        // Fail fast with actionable messages.
+        if (!param.IsContiguous)
+            throw new ArgumentException(
+                "Adam/AdamW require param to be contiguous. Got a non-contiguous view.",
+                nameof(param));
+        if (!m.IsContiguous)
+            throw new ArgumentException(
+                "Adam/AdamW require the first-moment buffer m to be contiguous.",
+                nameof(m));
+        if (!v.IsContiguous)
+            throw new ArgumentException(
+                "Adam/AdamW require the second-moment buffer v to be contiguous.",
+                nameof(v));
     }
 
     private static void AdamFallback<T>(

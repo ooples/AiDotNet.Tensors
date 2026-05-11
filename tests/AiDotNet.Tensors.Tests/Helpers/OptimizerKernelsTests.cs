@@ -301,9 +301,17 @@ public class OptimizerKernelsTests
         long fusedBytes = fusedEnd - fusedStart;
         _output.WriteLine($"AdamInPlace allocation: naive={naiveBytes} bytes ({naiveBytes / Iters} bytes/call), fused={fusedBytes} bytes ({fusedBytes / Iters} bytes/call).");
         _output.WriteLine($"Reduction  : {(naiveBytes > 0 ? (double)naiveBytes / Math.Max(fusedBytes, 1) : 0):F1}×");
+        // PR #322 review #9, #15: only assert on monotonic byte counter.
+        // net471 falls back to GC.GetTotalMemory (heap size, not
+        // allocations) — that can decrease across the two snapshots
+        // if a background GC runs between them, making the assertion
+        // fundamentally unreliable. Diagnostic line above stays so
+        // the value is visible during local runs on either framework.
+#if NET5_0_OR_GREATER
         Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
             $"AdamInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
             + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+#endif
     }
 
     private static readonly CpuEngine engine_local = new();
@@ -418,9 +426,14 @@ public class OptimizerKernelsTests
         // The fused path should allocate at most 1/10th of what the
         // naive path does — relative assertion robust to coverage,
         // tier-up, and other env-specific allocation noise.
+        // PR #322 review #9, #15: only assert on monotonic byte counter
+        // (net5+). net471 falls back to GC.GetTotalMemory which is
+        // not monotonic and produces unreliable subtraction results.
+#if NET5_0_OR_GREATER
         Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
             $"SgdInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
             + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+#endif
     }
 
     private static Tensor<T> MakeRandom<T>(int length, Random rng) where T : struct

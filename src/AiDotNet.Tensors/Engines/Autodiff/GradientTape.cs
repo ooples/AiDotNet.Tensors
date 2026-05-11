@@ -687,7 +687,11 @@ public sealed class GradientTape<T> : IDisposable
                 topoOrder = new List<GradNode<T>>();
             }
 
-            // Topological sort via DFS from loss.GradFn — build the execution order
+            // Topological sort via DFS from loss.GradFn — build the execution order.
+            // The walk CAN cross tape boundaries — that's how higher-order AD
+            // (createGraph=true → Hvp) reaches recorded backward ops from a
+            // prior tape. Cross-tape cleanup is gated below by OwningTape
+            // identity instead of restricting the walk itself.
             TopologicalSort(loss.GradFn!, visited, topoOrder);
 
             // Build delegate chain from topological order (capture for replay).
@@ -786,6 +790,18 @@ public sealed class GradientTape<T> : IDisposable
                 bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
                 foreach (var node in topoOrder)
                 {
+                    // Cross-tape guard (PR #322 review #17): the topo
+                    // sort follows GradFn pointers across tape boundaries
+                    // when a shared tensor's GradFn points back to an
+                    // outer tape's node (GradientCheckpointing pattern).
+                    // We must NOT null GradFn/Grad on those outer-owned
+                    // tensors — the outer's cleanup still depends on
+                    // them. The graph walk itself is allowed to cross
+                    // tape boundaries (higher-order AD / Hvp needs that);
+                    // only the destructive cleanup is restricted.
+                    bool nodeOwnedByThisTape = ReferenceEquals(node.OwningTape, this);
+                    if (!nodeOwnedByThisTape) continue;
+
                     node.Output.GradFn = null;
                     if (!ShouldKeepGrad(node.Output))
                         node.Output.Grad = null;
@@ -819,12 +835,10 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
 
-                    // Issue #319 Phase 3: only Return nodes that THIS tape
-                    // recorded. Inner backward passes (e.g. GradientCheckpointing
-                    // recompute) follow GradFn pointers past their own ops into
-                    // outer-tape nodes via shared input tensors; pooling those
-                    // here would clear fields the outer cleanup still needs.
-                    if (canPoolNodes && ReferenceEquals(node.OwningTape, this))
+                    // Pool return is also gated on createGraph mode —
+                    // higher-order AD keeps the recorded ops alive past
+                    // this cleanup. Already-gated by OwningTape above.
+                    if (canPoolNodes)
                     {
                         GradNodePool<T>.Return(node);
                     }

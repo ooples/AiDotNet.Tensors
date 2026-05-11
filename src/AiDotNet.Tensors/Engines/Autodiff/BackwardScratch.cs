@@ -32,6 +32,11 @@ internal static class BackwardScratch<T>
     [ThreadStatic] private static HashSet<GradNode<T>>? _visited;
     [ThreadStatic] private static List<GradNode<T>>? _topoOrder;
     [ThreadStatic] private static BackwardStep<T>[]? _steps;
+    // Live range of _steps populated by the most recent RentSteps caller.
+    // Release() clears only [0, _stepsLive) instead of the full array,
+    // preserving the headroom-grow benefit when the next backward needs
+    // a similarly-sized buffer. PR #322 review #16 + #18.
+    [ThreadStatic] private static int _stepsLive;
     [ThreadStatic] private static HashSet<Tensor<T>>? _sourceSet;
     [ThreadStatic] private static Dictionary<Tensor<T>, Tensor<T>>? _grads;
     [ThreadStatic] private static bool _inUse;
@@ -75,15 +80,19 @@ internal static class BackwardScratch<T>
         _topoOrder?.Clear();
         _sourceSet?.Clear();
         _grads?.Clear();
-        if (_steps is not null)
+        // Cached reshape view holds a small Tensor wrapper — fine to
+        // retain across calls when the loss shape is stable (the
+        // typical training-loop pattern). RentSeedGradient invalidates
+        // this whenever a fresh ones-array is created or the requested
+        // shape no longer matches, so no stale-view risk.
+        if (_steps is not null && _stepsLive > 0)
         {
-            // Don't clear the entire array — only the live range was
-            // populated. ComputeGradientsViaGraphCore is responsible
-            // for telling us how many slots it wrote via ClearStepsRange
-            // before Release, but defensively we full-clear here in
-            // case a caller skipped that. Array.Clear is O(length)
-            // but the array is value-type so it's a single memset.
-            Array.Clear(_steps, 0, _steps.Length);
+            // Only clear the live range. Avoids the O(capacity) cost
+            // that would otherwise erase the headroom-grow win (PR #322
+            // review #16, #18). ClearStepsRange may already have
+            // cleared a subset; clearing again here is idempotent.
+            Array.Clear(_steps, 0, Math.Min(_stepsLive, _steps.Length));
+            _stepsLive = 0;
         }
         _inUse = false;
     }
@@ -114,6 +123,10 @@ internal static class BackwardScratch<T>
             int newCap = Math.Max(needed, _steps?.Length * 2 ?? 16);
             _steps = new BackwardStep<T>[newCap];
         }
+        // Track how many slots the caller will populate. Release()
+        // uses this to clear ONLY the live range, not the full
+        // capacity. PR #322 review #16, #18.
+        _stepsLive = needed;
         return _steps;
     }
 
@@ -152,10 +165,24 @@ internal static class BackwardScratch<T>
         int length = 1;
         for (int i = 0; i < lossShape.Length; i++) length *= lossShape[i];
 
-        // The cache holds a contiguous ones tensor of the right length;
-        // we may need to reshape it to match lossShape. A reshape
-        // creates a view, not a copy, so this remains zero-alloc on
-        // the hot path.
+        // PR #322 review #19, #21: the cache holds a 1-D ones tensor;
+        // matching it to lossShape requires a Reshape. Reshape returns
+        // a view (zero-copy on data) but does allocate a Tensor<T>
+        // wrapper object. We avoid that wrapper alloc on the steady-
+        // state path by also caching the last-reshaped view per shape.
+        //
+        // Reshape's GradFn-attaching behavior is safe here:
+        //   * Common backward (createGraph=false): ComputeGradientsViaGraph
+        //     suspends the current tape before calling chain.Execute, so
+        //     Tensor.Reshape sees Current==null and does not set GradFn.
+        //   * Higher-order AD (createGraph=true): the tape is NOT
+        //     suspended; the seed legitimately needs a recorded GradFn
+        //     so the outer Hvp/Hessian pass can walk back through it.
+        // The cached view is invalidated whenever lossShape changes,
+        // so a stale GradFn from a prior createGraph=true call cannot
+        // bleed into a subsequent createGraph=false call (the latter
+        // would re-Reshape and the suspended tape produces a clean
+        // GradFn-free view).
         if (_cachedSeed is null || _cachedSeedLength != length)
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -164,15 +191,46 @@ internal static class BackwardScratch<T>
             for (int i = 0; i < length; i++) data[i] = one;
             _cachedSeed = new Tensor<T>(data, new[] { length });
             _cachedSeedLength = length;
+            _cachedSeedReshapedView = null;
+            _cachedSeedReshapedShape = null;
         }
 
-        // If the requested shape is already 1-D matching the cached
-        // length, just return the cached tensor — no reshape needed.
+        // 1-D direct match: return the underlying cached tensor.
         if (lossShape.Length == 1 && lossShape[0] == length)
             return _cachedSeed;
 
-        // Otherwise reshape (view-only — no data copy).
-        return _cachedSeed.Reshape(lossShape);
+        // Higher-dim: try to reuse the prior reshape if the shape matches.
+        if (_cachedSeedReshapedView is not null && _cachedSeedReshapedShape is not null
+            && ShapeMatches(_cachedSeedReshapedShape, lossShape))
+        {
+            return _cachedSeedReshapedView;
+        }
+
+        // First call for this shape (or shape changed): reshape and
+        // cache. Use NoGradScope to suspend any active tape across the
+        // Reshape call so the cached view does NOT carry a GradFn —
+        // RentSeedGradient must produce a graph-free constant. The
+        // outer caller (ComputeGradientsViaGraph) already suspends the
+        // tape in the createGraph=false case; this is a defensive
+        // belt-and-braces for the createGraph=true path or any
+        // non-standard caller.
+        using (GradientTape<T>.NoGrad())
+        {
+            _cachedSeedReshapedView = _cachedSeed.Reshape(lossShape);
+        }
+        _cachedSeedReshapedShape = (int[])lossShape.Clone();
+        return _cachedSeedReshapedView;
+    }
+
+    [ThreadStatic] private static Tensor<T>? _cachedSeedReshapedView;
+    [ThreadStatic] private static int[]? _cachedSeedReshapedShape;
+
+    private static bool ShapeMatches(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     /// <summary>

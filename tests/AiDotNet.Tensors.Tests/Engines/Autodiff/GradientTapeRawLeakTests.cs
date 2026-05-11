@@ -16,6 +16,15 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
+// Force serial execution against the "GcCounterSerial" collection —
+// this test samples GC.GetTotalMemory (process-wide heap size) and
+// is therefore corrupted by ANY concurrent test that allocates. The
+// canary's actual leak detection is correct in isolation; the
+// flake on parallel runs is the measurement methodology, not the
+// canary's intent. Sharing the collection with OptimizerKernelsTests
+// (which also samples GC counters) prevents the two from interfering
+// with each other. PR #322 review #15 follow-on.
+[Collection("OptimizerKernelsAllocSerial")]
 public class GradientTapeRawLeakTests
 {
     private readonly ITestOutputHelper _output;

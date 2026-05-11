@@ -45,8 +45,17 @@ public class Issue319TrainingLoopPerfTests
     /// Uses 4 layers (not 12) to keep test wall-clock low while still
     /// exercising the same op chain. The per-op cost dominates
     /// regardless of layer count; multiply by 3 for ViT-Base estimate.
+    /// <para>PR #322 review #1, #6: marked Performance so the CI test
+    /// filter <c>Category!=Benchmark&amp;Category!=Performance</c>
+    /// excludes it. The diagnostic numbers are machine-dependent and
+    /// the test only asserts <c>avgTotal &gt; 0</c>; running it in
+    /// every CI build wastes minutes of runner time for zero
+    /// regression signal. Run locally via
+    /// <c>dotnet test --filter "FullyQualifiedName~Issue319TrainingLoopPerfTests"</c>
+    /// when investigating perf changes.</para>
     /// </remarks>
     [Fact]
+    [Trait("Category", "Performance")]
     public void TrainingStep_PhaseBreakdown_ShowsWhereTimeGoes()
     {
         const int Hidden = 768;
@@ -143,8 +152,13 @@ public class Issue319TrainingLoopPerfTests
     /// Both paths are numerically equivalent (covered by
     /// OptimizerKernelsTests). This test isolates the GC-pressure win
     /// of the fused kernel on the actual training-loop hot path.
+    /// PR #322 review #2, #7, #15: gated as Performance so CI skips
+    /// it. The relative-allocation alloc-only assertion is also
+    /// flaky on net471 (GC.GetTotalMemory is not monotonic) — see
+    /// OptimizerKernelsTests for the env-robust replacement.
     /// </remarks>
     [Fact]
+    [Trait("Category", "Performance")]
     public void TrainingStep_FusedSgdInPlace_ReducesAllocsVsNaiveOptimizer()
     {
         const int Hidden = 768;
@@ -227,8 +241,14 @@ public class Issue319TrainingLoopPerfTests
         // delta is the stable signal. The fused path should allocate
         // strictly less than the naive path — anything else means the
         // kernel got mis-routed.
+        // PR #322 review #15: only enforce the alloc inequality when
+        // GC.GetTotalAllocatedBytes (monotonic) is available. On
+        // net471, GC.GetTotalMemory measures live heap size and is
+        // not monotonic — assertions on it are inherently flaky.
+#if NET5_0_OR_GREATER
         Assert.True(fusedAllocKb <= naiveAllocKb,
             $"Fused SGD allocated more than naive: fused={fusedAllocKb} KB/iter, naive={naiveAllocKb} KB/iter.");
+#endif
     }
 
     private static (double totalMs, double fwdMs, double bwdMs, double optMs)
