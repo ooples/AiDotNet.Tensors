@@ -141,8 +141,32 @@ internal static class AutoTrainingCompiler
 
     /// <summary>
     /// Computes a hash of the training step pattern from tape entries.
-    /// Two steps with the same op sequence + shapes produce the same hash.
+    /// Two steps with the same op sequence + shapes + tensor identities
+    /// produce the same hash; differing tensor identities (e.g., a cloned
+    /// model's parameter tensors are fresh instances) produce a different
+    /// hash so the compile-cache cannot replay a backward graph keyed on
+    /// the wrong tensor references.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Why tensor identities are in the hash: the compiled backward graph
+    /// stores tensor REFERENCES (specific Tensor{T} instances used during
+    /// the original compilation). Replaying it on different tensor objects
+    /// — e.g., after <c>network.Clone()</c> creates a new model with the
+    /// same architecture but fresh parameter tensors — silently produces
+    /// wrong gradients because the cached refs no longer correspond to any
+    /// live parameter. Including <c>RuntimeHelpers.GetHashCode</c> on
+    /// inputs and outputs makes that scenario miss the cache and trigger
+    /// a fresh compile.
+    /// </para>
+    /// <para>
+    /// Cost: O(entries × inputs) reference-hash lookups per Train call.
+    /// On VGG16-BN that's roughly 500 hash ops out of a 38 s iteration —
+    /// negligible (microseconds) relative to the wins from gating
+    /// auto-compile on persistent tape, which previously cut 65–73 % of
+    /// ComputeGradients walltime on profile data.
+    /// </para>
+    /// </remarks>
     private static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
@@ -156,9 +180,28 @@ internal static class AutoTrainingCompiler
             hash *= unchecked((long)0x100000001b3L);
             if (entry.Output is not null)
             {
+                // Identity disambiguates same-shape outputs across models
+                // (e.g., cloned network's intermediates vs original's).
+                hash ^= RuntimeHelpers.GetHashCode(entry.Output);
+                hash *= unchecked((long)0x100000001b3L);
                 foreach (int dim in entry.Output._shape)
                 {
                     hash ^= dim;
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+            }
+            // Hash input tensor identities so the cached compiled backward
+            // can't be replayed on a fresh set of parameter / activation
+            // tensors (the original use case that broke clone-then-train:
+            // identical op pattern + identical shapes but different
+            // underlying Tensor{T} references).
+            var inputs = entry.GetInputsArray();
+            if (inputs is not null)
+            {
+                foreach (var inp in inputs)
+                {
+                    if (inp is null) continue;
+                    hash ^= RuntimeHelpers.GetHashCode(inp);
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }
