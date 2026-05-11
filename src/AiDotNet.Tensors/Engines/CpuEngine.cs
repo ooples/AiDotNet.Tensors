@@ -7255,6 +7255,45 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path: direct double arithmetic with batch×channel parallelism,
+        // bypassing the per-element numOps virtual dispatch. Mirrors the allocating
+        // MaxPool2D's double path that VGG / ResNet / DenseNet hit on every pool layer.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        {
+            int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
+            int psD = poolSize, stD = stride, pdD = padding;
+            int bcD = batch * channels;
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            {
+                int inBase = idx * hD * wD;
+                int outBase = idx * oHD * oWD;
+                for (int oh = 0; oh < oHD; oh++)
+                {
+                    for (int ow = 0; ow < oWD; ow++)
+                    {
+                        double maxVal = double.NegativeInfinity;
+                        int ihStart = oh * stD - pdD;
+                        int iwStart = ow * stD - pdD;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = psD < (hD - ihStart) ? psD : (hD - ihStart);
+                        int kwEnd = psD < (wD - iwStart) ? psD : (wD - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inBase + (ihStart + kh) * wD + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                double v = inArrD[rowOff + kw];
+                                if (v > maxVal) maxVal = v;
+                            }
+                        }
+                        outArrD[outBase + oh * oWD + ow] = maxVal;
+                    }
+                }
+            });
+            return;
+        }
+
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
@@ -7352,6 +7391,47 @@ public partial class CpuEngine : ITensorLevelEngine
                             }
                         }
                         outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
+                    }
+            };
+            if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
+            else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            return;
+        }
+
+        // Double fast path: direct double arithmetic with the same batch×channel
+        // parallel partition, but without the per-element numOps virtual dispatch.
+        // Used by ResNet's global-average-pool final step and by GAP blocks in
+        // various CV architectures running fp64.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        {
+            int bc = batch * channels;
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+            Action<int> poolKernel = idx =>
+            {
+                int inputBase = idx * h * w;
+                int outputBase = idx * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        double sum = 0;
+                        int count = 0;
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = Math.Min(ps, h - ihStart);
+                        int kwEnd = Math.Min(ps, w - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                sum += inArrD[rowOff + kw];
+                                count++;
+                            }
+                        }
+                        outArrD[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0.0;
                     }
             };
             if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
