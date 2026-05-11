@@ -159,9 +159,19 @@ public sealed class SecureSeededRandom : Random
         if (minValue > maxValue)
             throw new ArgumentOutOfRangeException(nameof(minValue),
                 "minValue must be <= maxValue.");
-        long range = (long)maxValue - minValue;
+        // Range can be up to UInt32 (e.g. Next(int.MinValue, int.MaxValue)
+        // = 2^32 - 1). The previous Math.Min(range, int.MaxValue) silently
+        // capped the upper half off, so Next(int.MinValue, int.MaxValue)
+        // could never return values in (0, int.MaxValue). Use unsigned
+        // rejection sampling over the full 32-bit range and add back to
+        // minValue (the cast wraps correctly because the result fits in
+        // [minValue, maxValue) by construction).
+        uint range = (uint)((long)maxValue - minValue);
         if (range == 0) return minValue;
-        return minValue + Next((int)Math.Min(range, int.MaxValue));
+        uint limit = uint.MaxValue - (uint.MaxValue % range);
+        uint v;
+        do { v = (uint)(NextUInt64() >> 32); } while (v >= limit);
+        return (int)((long)minValue + (long)(v % range));
     }
 
     /// <inheritdoc/>
@@ -179,7 +189,24 @@ public sealed class SecureSeededRandom : Random
     }
 
     /// <inheritdoc/>
-    public override long NextInt64() => (long)(NextUInt64() & 0x7FFF_FFFF_FFFF_FFFFul);
+    /// <remarks>
+    /// System.Random.NextInt64() returns a value in [0, long.MaxValue) (exclusive).
+    /// The previous implementation could return long.MaxValue itself: masking off
+    /// the sign bit of NextUInt64() yields all 63 lower bits, including the all-
+    /// ones pattern that maps to long.MaxValue. Reject long.MaxValue via a small
+    /// rejection-sampling loop so the distribution matches the contract.
+    /// </remarks>
+    public override long NextInt64()
+    {
+        // Probability of rejection is 1 / 2^63 — effectively never, but
+        // rejection-sampling guarantees the contract.
+        long v;
+        do
+        {
+            v = (long)(NextUInt64() & 0x7FFF_FFFF_FFFF_FFFFul);
+        } while (v == long.MaxValue);
+        return v;
+    }
 
     /// <inheritdoc/>
     public override long NextInt64(long maxValue)
@@ -199,9 +226,24 @@ public sealed class SecureSeededRandom : Random
     {
         if (minValue > maxValue)
             throw new ArgumentOutOfRangeException(nameof(minValue));
-        long range = maxValue - minValue;
+        // Use ulong arithmetic for the range to avoid signed overflow when
+        // (maxValue - minValue) exceeds long.MaxValue. The widest case is
+        // NextInt64(long.MinValue, long.MaxValue) where the true range is
+        // 2^64 - 1, which doesn't fit in a signed long. The cast-and-
+        // subtract-as-ulong wraps correctly for any minValue/maxValue
+        // pair (since we already validated minValue <= maxValue above):
+        //   * minValue=10, maxValue=20: range = 10
+        //   * minValue=-5, maxValue=5:  range = 10 (unchecked wrap)
+        //   * minValue=long.MinValue, maxValue=long.MaxValue:
+        //     range = unchecked((2^63-1) - 2^63) = 2^64-1
+        ulong range = unchecked((ulong)maxValue - (ulong)minValue);
         if (range == 0) return minValue;
-        return minValue + NextInt64(range);
+        ulong limit = ulong.MaxValue - (ulong.MaxValue % range);
+        ulong v;
+        do { v = NextUInt64(); } while (v >= limit);
+        // unchecked: minValue + (v % range) wraps correctly into the
+        // [minValue, maxValue) interval thanks to ulong arithmetic.
+        return unchecked((long)((ulong)minValue + (v % range)));
     }
 
     /// <inheritdoc/>
