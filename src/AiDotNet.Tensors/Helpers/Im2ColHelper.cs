@@ -397,6 +397,45 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// Double-precision variant of <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
+    /// Used by the BLAS fast-path in <c>Conv2DBackwardInput</c> when T=double.
+    /// </summary>
+    public static void Col2ImAccumulate(
+        ReadOnlySpan<double> colData,
+        Span<double> imageData,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int colIdx = 0;
+        for (int c = 0; c < channels; c++)
+        {
+            for (int kh = 0; kh < kernelH; kh++)
+            {
+                for (int kw = 0; kw < kernelW; kw++)
+                {
+                    for (int oh = 0; oh < outputH; oh++)
+                    {
+                        int ih = oh * strideH + kh * dilationH - padH;
+                        for (int ow = 0; ow < outputW; ow++)
+                        {
+                            int iw = ow * strideW + kw * dilationW - padW;
+                            if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                            {
+                                imageData[c * height * width + ih * width + iw] += colData[colIdx];
+                            }
+                            colIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Performs Conv2D using im2col + GEMM approach.
     /// This is significantly faster than naive nested loops for large convolutions.
     /// </summary>

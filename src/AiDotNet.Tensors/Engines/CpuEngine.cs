@@ -2182,6 +2182,45 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path — mirrors the float branch above. Direct double
+        // arithmetic + parallelized over channels. CNN-heavy diffusion models
+        // (StableDiffusion, ControlNet, DiT) and any CNN trained at double
+        // precision hits this op on every inference / training-eval pass; the
+        // generic numOps fallback below pays ~3 virtual calls per output
+        // element and was a measurable share of ResNet50 BatchNorm wall time.
+        if (typeof(T) == typeof(double))
+        {
+            int Cd = x._shape[1], Hd = x._shape[2], Wd = x._shape[3], Nd = x._shape[0];
+            int spatialD = Hd * Wd;
+            var inD = (double[])(object)x.GetDataArray();
+            var gammaD = (double[])(object)gamma.GetDataArray();
+            var betaD  = (double[])(object)beta.GetDataArray();
+            var meanD  = (double[])(object)mean.GetDataArray();
+            var varD   = (double[])(object)variance.GetDataArray();
+            var outD   = (double[])(object)output.GetDataArray();
+            output.Layout = x.Layout;
+
+            var scaleD = new double[Cd];
+            var biasD  = new double[Cd];
+            for (int c = 0; c < Cd; c++)
+            {
+                double s = gammaD[c] / System.Math.Sqrt(varD[c] + epsilon);
+                scaleD[c] = s;
+                biasD[c]  = betaD[c] - s * meanD[c];
+            }
+
+            CpuParallelSettings.ParallelForOrSerial(0, Nd * Cd, (long)Nd * Cd * spatialD, ncIdx =>
+            {
+                int n = ncIdx / Cd;
+                int c = ncIdx % Cd;
+                int baseIdx = (n * Cd + c) * spatialD;
+                double s = scaleD[c], b2 = biasD[c];
+                for (int sp = 0; sp < spatialD; sp++)
+                    outD[baseIdx + sp] = inD[baseIdx + sp] * s + b2;
+            });
+            return;
+        }
+
         // Generic scalar fallback. Pre-combine scale/bias per channel, then FMA.
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
@@ -6830,6 +6869,49 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Double fast path: direct double arithmetic with the same parallel-
+        // over-(batch, channels) partition the generic fallback uses, but
+        // without the per-element numOps virtual dispatch. ResNet50's
+        // 3x3 maxpool over 1×64×112×112 hits this op once per train iter
+        // backward + forward; the generic numOps path was paying ~9
+        // GreaterThan + 9 ToDouble / output cell.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && result.GetDataArray() is double[] outArrD)
+        {
+            int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
+            int psD = poolSize, stD = stride, pdD = padding;
+            int bcD = batch * channels;
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            {
+                int inBase = idx * hD * wD;
+                int outBase = idx * oHD * oWD;
+                for (int oh = 0; oh < oHD; oh++)
+                {
+                    for (int ow = 0; ow < oWD; ow++)
+                    {
+                        double maxVal = double.NegativeInfinity;
+                        int ihStart = oh * stD - pdD;
+                        int iwStart = ow * stD - pdD;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = psD < (hD - ihStart) ? psD : (hD - ihStart);
+                        int kwEnd = psD < (wD - iwStart) ? psD : (wD - iwStart);
+
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inBase + (ihStart + kh) * wD + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                double v = inArrD[rowOff + kw];
+                                if (v > maxVal) maxVal = v;
+                            }
+                        }
+                        outArrD[outBase + oh * oWD + ow] = maxVal;
+                    }
+                }
+            });
+            return result;
+        }
+
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
@@ -11000,7 +11082,67 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(inputShape, resultArr);
         }
 
-        // Generic fallback for non-float types
+        // im2col + GEMM fast path for double — mirrors the float branch above
+        // but routes through cblas_dgemm (BlasProvider) instead of cblas_sgemm,
+        // and falls back to MultiplyMatrixBlockedDouble (the existing blocked
+        // double matmul kernel) when BLAS isn't available. Without this branch
+        // ResNet50 / VGG / every CNN trained at double precision spent its
+        // entire backward time in the 5-nested-loop generic fallback below —
+        // dotnet-trace measured ~218 sec self-time in Conv2DBackwardInput on
+        // a 3-iter ResNet50 train run, which the 08a NN-Classic CI shard
+        // cannot fit in the per-test 120 s budget.
+        if (typeof(T) == typeof(double))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            var gradInputD = new double[batch * inChannels * height * width];
+            var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
+            var kernelD = (double[])(object)kernel.GetFlattenedData();
+
+            // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
+            var kernelTD = new double[colH * outChannels];
+            for (int r = 0; r < outChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelTD[c * outChannels + r] = kernelD[r * colH + c];
+
+            var poolD = System.Buffers.ArrayPool<double>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var colBuf = poolD.Rent(colW * colH);
+                try
+                {
+                    int gradOutOff = b * outChannels * colW;
+
+                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                        kernelTD, 0, outChannels,
+                        gradOutputD, gradOutOff, colW,
+                        colBuf, 0, colW))
+                    {
+                        // Blocked double matmul fallback when libopenblas
+                        // isn't loadable — same algorithm BLAS would run,
+                        // ~2-3× slower but never asymptotically blocking.
+                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            new ReadOnlySpan<double>(kernelTD),
+                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                            new Span<double>(colBuf, 0, colH * colW),
+                            colH, outChannels, colW);
+                    }
+
+                    int imgOff = b * inChannels * height * width;
+                    Helpers.Im2ColHelper.Col2ImAccumulate(
+                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                        new Span<double>(gradInputD, imgOff, inChannels * height * width),
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                }
+                finally { poolD.Return(colBuf); }
+            });
+
+            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+        }
+
+        // Generic fallback for non-float, non-double types
         var gradInput = new T[batch * inChannels * height * width];
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
@@ -11151,7 +11293,88 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(kernelShape, resultArr);
         }
 
-        // Generic fallback for non-float types
+        // im2col + GEMM-with-transpose fast path for double — paired with the
+        // float branch above and with Conv2DBackwardInput's double branch.
+        // For each batch: localGrad = gradOutput × im2col^T; accumulate across
+        // batches into the final kernel gradient. Without this branch
+        // Conv2DBackwardKernel for double fell through to the 7-nested-loop
+        // generic fallback below, which dominated ResNet50 / VGG backward
+        // wall time alongside Conv2DBackwardInput.
+        if (typeof(T) == typeof(double))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            var gradKernelD = new double[outChannels * colH];
+            var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
+            var inputD = (double[])(object)input.GetFlattenedData();
+            int inputSliceSize = inChannels * height * width;
+
+            var perBatchGradsD = new double[batch][];
+            var kPoolD = System.Buffers.ArrayPool<double>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var im2colBuf = kPoolD.Rent(colH * colW);
+                var localGrad = kPoolD.Rent(outChannels * colH);
+                try
+                {
+                    Array.Clear(localGrad, 0, outChannels * colH);
+
+                    Helpers.Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                        new Span<double>(im2colBuf),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+
+                    int gradOutOff = b * outChannels * colW;
+
+                    // BLAS GEMM with transpose: localGrad = gradOutput × im2col^T
+                    if (!Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, colW,
+                        gradOutputD, gradOutOff, colW, false,
+                        im2colBuf, 0, colW, true,
+                        localGrad, 0, colH))
+                    {
+                        // No SimdGemm.Dgemm available; manually transpose
+                        // im2col into a tiled buffer then call the blocked
+                        // double matmul. For correctness when BLAS is off,
+                        // we transpose into a fresh buffer then NxN matmul.
+                        var im2colT = kPoolD.Rent(colW * colH);
+                        try
+                        {
+                            for (int r = 0; r < colH; r++)
+                                for (int c = 0; c < colW; c++)
+                                    im2colT[c * colH + r] = im2colBuf[r * colW + c];
+                            Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                                new ReadOnlySpan<double>(im2colT, 0, colW * colH),
+                                new Span<double>(localGrad, 0, outChannels * colH),
+                                outChannels, colW, colH);
+                        }
+                        finally { kPoolD.Return(im2colT); }
+                    }
+
+                    var gradCopy = new double[outChannels * colH];
+                    Array.Copy(localGrad, gradCopy, outChannels * colH);
+                    perBatchGradsD[b] = gradCopy;
+                }
+                finally
+                {
+                    kPoolD.Return(im2colBuf);
+                    kPoolD.Return(localGrad);
+                }
+            });
+
+            for (int b = 0; b < batch; b++)
+            {
+                var lg = perBatchGradsD[b];
+                for (int i = 0; i < gradKernelD.Length; i++)
+                    gradKernelD[i] += lg[i];
+            }
+
+            return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+        }
+
+        // Generic fallback for non-float, non-double types
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -16319,6 +16542,69 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
         }
 
+        // Double fast path — mirrors the float kernel structure with direct
+        // double arithmetic and per-channel parallelization. Without this
+        // branch, BatchNorm4D forward for double walks the generic numOps
+        // fallback below: ~6 virtual-call interface dispatches per output
+        // element, dominating BatchNorm wall time on ResNet50 training when
+        // the activation tape is enabled (BatchNorm4D forward runs on EVERY
+        // train pass, both as a primary op and inside Conv2D-fused-with-BN
+        // forward graphs).
+        if (inputData is double[] inD && gammaData is double[] gamD && betaData is double[] betD)
+        {
+            double epsD = numOps.ToDouble(eps);
+            var meanDArr = new double[channels];
+            var varDArr  = new double[channels];
+            int logicalLength = input.Length;
+#if NET5_0_OR_GREATER
+            var outDArr = GC.AllocateUninitializedArray<double>(logicalLength);
+#else
+            var outDArr = new double[logicalLength];
+#endif
+            int spD = spatialSize;
+            int epcD = elementsPerChannel;
+            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * epcD, c =>
+            {
+                double sum = 0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                        sum += inD[offset + s];
+                }
+                double meanC = sum / epcD;
+                meanDArr[c] = meanC;
+
+                double sumSq = 0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                    {
+                        double diff = inD[offset + s] - meanC;
+                        sumSq += diff * diff;
+                    }
+                }
+                double varC = sumSq / epcD;
+                varDArr[c] = varC;
+
+                double invStd = 1.0 / System.Math.Sqrt(varC + epsD);
+                double g = gamD[c], b2 = betD[c];
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                    {
+                        int idx = offset + s;
+                        outDArr[idx] = g * (inD[idx] - meanC) * invStd + b2;
+                    }
+                }
+            });
+            mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(meanDArr));
+            variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(varDArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(outDArr));
+        }
+
         var meanData = new T[channels];
         var varData = new T[channels];
         var outputData = new T[input.Length];
@@ -16778,6 +17064,67 @@ public partial class CpuEngine : ITensorLevelEngine
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<float>(ggF));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<float>(gbF));
             return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<float>(giF));
+        }
+
+        // Double fast path — mirrors the float branch directly above. ResNet50 /
+        // VGG / every CNN trained at double precision spends a significant
+        // fraction of backward time in BatchNorm; the generic numOps path below
+        // does ~10 virtual-call-per-element interface dispatches and pays an
+        // allocation per .Add/.Multiply call. Direct double arithmetic is
+        // 4-8× faster, matching the float branch's measured win on the same
+        // BDN sweep.
+        if (typeof(T) == typeof(double)
+            && gradOutputData is double[] goD && inputData is double[] inD
+            && gammaData is double[] gaD && meanData is double[] meD && varData is double[] vaD)
+        {
+            double epsD = numOps.ToDouble(eps);
+            var ggD = new double[channels];
+            var gbD = new double[channels];
+            var giD = new double[input.Length];
+            double elemD = elementsPerChannel;
+
+            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
+            {
+                double invStd = 1.0 / System.Math.Sqrt(vaD[c] + epsD);
+                double mean_c = meD[c];
+                double gGamma = 0, gBeta = 0, sumGrad = 0, sumGradX = 0;
+
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx + s;
+                        double diff = inD[idx] - mean_c;
+                        gGamma += goD[idx] * diff * invStd;
+                        gBeta += goD[idx];
+                        sumGrad += goD[idx];
+                        sumGradX += goD[idx] * diff;
+                    }
+                }
+
+                ggD[c] = gGamma;
+                gbD[c] = gBeta;
+                double gamma_c = gaD[c];
+                double gammaSumGrad = gamma_c * sumGrad;
+                double gammaSumGradX = gamma_c * sumGradX;
+
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx2 = (n * channels + c) * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx2 + s;
+                        double normalized = (inD[idx] - mean_c) * invStd;
+                        double gradNorm = gamma_c * goD[idx];
+                        giD[idx] = invStd / elemD * (elemD * gradNorm - gammaSumGrad - normalized * invStd * gammaSumGradX);
+                    }
+                }
+            });
+
+            gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(ggD));
+            gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(gbD));
+            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(giD));
         }
 
         var gradGammaData = new T[channels];
