@@ -639,11 +639,18 @@ public sealed class GradientTape<T> : IDisposable
 
     private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
     {
-        // Always clear GradFn — this is the back-pointer that chains a tensor to its
-        // BackwardFunction closure, which in turn captures forward intermediates. The
-        // forward graph stays alive as long as ANY tape-tracked tensor keeps its
-        // GradFn, regardless of whether the consumer asked to filter by sources.
-        t.GradFn = null;
+        // Only null GradFn on tensors THIS tape owns. A tensor whose GradFn
+        // doesn't belong to this tape's graph (e.g. an output of an outer
+        // tape, fed in as input to this tape's ops) must keep its back-
+        // pointer intact — otherwise the outer tape's later backward
+        // would see a severed graph and either crash or silently drop
+        // gradients. The ownership signal is membership in `intermediates`,
+        // which holds every Output produced by this tape's entries.
+        bool ownedByThisTape = intermediates.Contains(t);
+        if (ownedByThisTape)
+        {
+            t.GradFn = null;
+        }
         // Preserve .Grad when the caller explicitly listed this tensor as a source
         // (they're going to read `tensor.Grad` rather than the returned Dictionary).
         if (sourceSet?.Contains(t) == true) return;
@@ -651,14 +658,21 @@ public sealed class GradientTape<T> : IDisposable
         if (_retainGrad is not null && _retainGrad.Contains(t)) return;
         // Distinguish intermediate vs leaf when sources is null:
         //   sourceSet != null + non-source: caller's explicit filter said
-        //     "only keep what I listed" — clear regardless of leaf-ness.
-        //   sourceSet == null + intermediate: clear (returned dict still
-        //     holds the gradient; .Grad is only the per-tensor mirror).
-        //   sourceSet == null + leaf (parameter / user-supplied root):
-        //     preserve param.Grad — that's the BC contract that
-        //     AiDotNet.NeuralNetworkBase.TrainWithTape and the graph-walk
-        //     path (ComputeGradientsViaGraphCore line 776+) both honor.
-        if (sourceSet is not null || intermediates.Contains(t))
+        //     "only keep what I listed" — clear regardless of ownership.
+        //     Foreign-leaf .Grad wasn't populated by this backward pass
+        //     anyway (this tape only accumulates to its own reachable
+        //     graph), so clearing it is effectively a no-op on the typical
+        //     nested-tape case.
+        //   sourceSet == null + this-tape intermediate: clear (returned
+        //     dict still holds the gradient; .Grad is only the per-tensor
+        //     mirror).
+        //   sourceSet == null + leaf or foreign tensor:
+        //     preserve .Grad — for true leaves (params), the BC contract
+        //     that AiDotNet.NeuralNetworkBase.TrainWithTape and the graph-
+        //     walk path (ComputeGradientsViaGraphCore line 776+) honor;
+        //     for foreign tensors, their .Grad belongs to the outer tape
+        //     and we must not touch it.
+        if (sourceSet is not null || ownedByThisTape)
         {
             t.Grad = null;
         }
@@ -844,72 +858,74 @@ public sealed class GradientTape<T> : IDisposable
                 return false;
             }
 
+            // Build the set of nodes THIS graph owns. A tensor produced by an
+            // op on a foreign tape (an outer/parent tape, fed in as input to
+            // this tape's ops) has a non-null GradFn that doesn't belong to
+            // any node in topoOrder. We must NOT null its GradFn or touch its
+            // .Grad — those belong to the outer tape and would be corrupted
+            // by indiscriminate cleanup. `GradFn != null` is NOT a safe proxy
+            // for "intermediate of this graph" because it conflates
+            // this-graph intermediates with foreign-tape outputs.
+            var ownedIntermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var n in topoOrder)
+                ownedIntermediates.Add(n.Output);
+
             foreach (var node in topoOrder)
             {
-                // node.Output is always an intermediate (it has GradFn until
-                // we null it on this line). Safe to clear .Grad: parameters
-                // never appear as outputs (they're graph leaves), so we can't
-                // accidentally drop a param's gradient here.
+                // node.Output is always owned by this graph (we just put it
+                // into ownedIntermediates). Safe to null its GradFn and clear
+                // its .Grad: parameters never appear as outputs.
                 node.Output.GradFn = null;
                 if (!ShouldKeepGrad(node.Output))
                     node.Output.Grad = null;
 
-                // For Inputs: always null .GradFn (the graph traversal is
-                // over so the back-pointer is dead weight). For .Grad:
+                // For Inputs: only touch GradFn / .Grad when the input is
+                // owned by THIS graph (i.e. is the Output of some node in
+                // topoOrder). The three cases:
                 //
-                //   sourceSet != null:
-                //     The caller provided an explicit source list. Clear
-                //     .Grad on non-source inputs (matches the established
-                //     "sources specifies what to keep" contract).
-                //   sourceSet == null AND input is NOT a graph leaf:
-                //     We've cleared this input's GradFn — i.e. it WAS an
-                //     intermediate (output of an upstream op). Its .Grad
-                //     also gets cleared on the upstream op's iteration,
-                //     but the consumer-visible gradient is preserved
-                //     through the returned `grads` dictionary either way.
-                //     Clearing it here doesn't drop data.
-                //   sourceSet == null AND input IS a graph leaf:
-                //     The input has GradFn = null already (a parameter or
-                //     a user-supplied input). Preserving .Grad here keeps
-                //     `param.Grad` populated for callers that read it
-                //     directly (a small subset, but BC-relevant).
-                //
-                // We can distinguish "intermediate input" from "leaf input"
-                // by checking GradFn BEFORE this iteration nulls it. Cache
-                // the snapshot below.
-                bool input0WasIntermediate = node.Input0.GradFn is not null;
-                node.Input0.GradFn = null;
+                //   sourceSet != null + non-source: clear .Grad (caller's
+                //     explicit "keep what I listed" contract). Foreign-leaf
+                //     .Grad wasn't populated by this backward anyway, so
+                //     clearing is effectively a no-op for nested-tape inputs.
+                //   sourceSet == null + owned intermediate: clear .Grad
+                //     (returned dict still holds the gradient).
+                //   sourceSet == null + leaf or foreign tensor: preserve
+                //     .Grad — for true leaves that's the BC contract
+                //     (param.Grad), for foreign tensors that's outer-tape
+                //     state we must not touch.
+                bool input0Owned = ownedIntermediates.Contains(node.Input0);
+                if (input0Owned) node.Input0.GradFn = null;
                 if (sourceSet is not null)
                 {
                     if (!ShouldKeepGrad(node.Input0)) node.Input0.Grad = null;
                 }
-                else if (input0WasIntermediate && !ShouldKeepGrad(node.Input0))
+                else if (input0Owned && !ShouldKeepGrad(node.Input0))
                 {
                     node.Input0.Grad = null;
                 }
 
                 if (node.Input1 is not null)
                 {
-                    bool wasIntermediate = node.Input1.GradFn is not null;
-                    node.Input1.GradFn = null;
+                    bool input1Owned = ownedIntermediates.Contains(node.Input1);
+                    if (input1Owned) node.Input1.GradFn = null;
                     if (sourceSet is not null)
                     {
                         if (!ShouldKeepGrad(node.Input1)) node.Input1.Grad = null;
                     }
-                    else if (wasIntermediate && !ShouldKeepGrad(node.Input1))
+                    else if (input1Owned && !ShouldKeepGrad(node.Input1))
                     {
                         node.Input1.Grad = null;
                     }
                 }
                 if (node.Input2 is not null)
                 {
-                    bool wasIntermediate = node.Input2.GradFn is not null;
-                    node.Input2.GradFn = null;
+                    bool input2Owned = ownedIntermediates.Contains(node.Input2);
+                    if (input2Owned) node.Input2.GradFn = null;
                     if (sourceSet is not null)
                     {
                         if (!ShouldKeepGrad(node.Input2)) node.Input2.Grad = null;
                     }
-                    else if (wasIntermediate && !ShouldKeepGrad(node.Input2))
+                    else if (input2Owned && !ShouldKeepGrad(node.Input2))
                     {
                         node.Input2.Grad = null;
                     }
@@ -919,13 +935,13 @@ public sealed class GradientTape<T> : IDisposable
                     foreach (var inp in node.InputsOverflow)
                     {
                         if (inp is null) continue;
-                        bool wasIntermediate = inp.GradFn is not null;
-                        inp.GradFn = null;
+                        bool inpOwned = ownedIntermediates.Contains(inp);
+                        if (inpOwned) inp.GradFn = null;
                         if (sourceSet is not null)
                         {
                             if (!ShouldKeepGrad(inp)) inp.Grad = null;
                         }
-                        else if (wasIntermediate && !ShouldKeepGrad(inp))
+                        else if (inpOwned && !ShouldKeepGrad(inp))
                         {
                             inp.Grad = null;
                         }
