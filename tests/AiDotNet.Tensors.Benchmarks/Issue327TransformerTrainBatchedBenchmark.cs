@@ -258,8 +258,11 @@ public static class Issue327TransformerTrainBatchedBenchmark
         // Warmup
         for (int i = 0; i < warmup; i++)
         {
-            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out _, out _, out _, out _, out _, out _);
         }
+
+        // Per-phase alloc tracking: measure forward / backward / opt separately
+        long fwdAllocTotal = 0, bwdAllocTotal = 0, optAllocTotal = 0;
 
         long gen0Before = GC.CollectionCount(0);
         long gen1Before = GC.CollectionCount(1);
@@ -274,8 +277,13 @@ public static class Issue327TransformerTrainBatchedBenchmark
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
         {
-            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out var fwdMs, out var bwdMs, out var optMs);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape,
+                out var fwdMs, out var bwdMs, out var optMs,
+                out var fwdAlloc, out var bwdAlloc, out var optAlloc);
             phaseTotals[i] = (fwdMs, bwdMs, optMs);
+            fwdAllocTotal += fwdAlloc;
+            bwdAllocTotal += bwdAlloc;
+            optAllocTotal += optAlloc;
         }
         sw.Stop();
 
@@ -303,6 +311,9 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Console.WriteLine($"    Per-phase median : fwd {medianFwd:F3} ms / bwd {medianBwd:F3} ms / opt {medianOpt:F3} ms");
         Console.WriteLine($"    CPU/wall         : {cpuSec:F2}s / {wallSec:F2}s = {activeCores:F2} active cores ({100 * activeCores / Environment.ProcessorCount:F0}%)");
         Console.WriteLine($"    Allocation       : {allocPer / 1024.0:F1} KB/iter (= {allocPer / 1024.0 / 1024.0:F1} MB/iter)");
+        Console.WriteLine($"      fwd alloc     : {(fwdAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
+        Console.WriteLine($"      bwd alloc     : {(bwdAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
+        Console.WriteLine($"      opt alloc     : {(optAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
         Console.WriteLine($"    GC during run    : Gen0 {gen0After - gen0Before,3}  Gen1 {gen1After - gen1Before,3}  Gen2 {gen2After - gen2Before,3} (over {iters} iters)");
         Console.WriteLine();
         Console.WriteLine($"  Issue close target : ≤ 100.000 ms/step, ≥ 20 active cores");
@@ -320,13 +331,17 @@ public static class Issue327TransformerTrainBatchedBenchmark
         GradientTape<float>? sharedTape,
         out double fwdMs,
         out double bwdMs,
-        out double optMs)
+        out double optMs,
+        out long fwdAlloc,
+        out long bwdAlloc,
+        out long optAlloc)
     {
         var swFwd = Stopwatch.StartNew();
         Dictionary<Tensor<float>, Tensor<float>> grads;
         Tensor<float> loss;
         GradientTape<float>? ownTape = sharedTape is null ? new GradientTape<float>() : null;
         var tape = sharedTape ?? ownTape!;
+        long allocFwdStart = GC.GetTotalAllocatedBytes(precise: true);
         try
         {
             var y = ForwardL(engine, input, weights, Layers);
@@ -338,16 +353,20 @@ public static class Issue327TransformerTrainBatchedBenchmark
 
             swFwd.Stop();
             fwdMs = swFwd.Elapsed.TotalMilliseconds;
+            long allocFwdEnd = GC.GetTotalAllocatedBytes(precise: true);
+            fwdAlloc = allocFwdEnd - allocFwdStart;
 
             var swBwd = Stopwatch.StartNew();
             grads = tape.ComputeGradients(loss, weights);
             swBwd.Stop();
             bwdMs = swBwd.Elapsed.TotalMilliseconds;
+            bwdAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocFwdEnd;
         }
         finally
         {
             ownTape?.Dispose();
         }
+        long allocOptStart = GC.GetTotalAllocatedBytes(precise: true);
 
         // In-place Adam-style optimizer update.
         var swOpt = Stopwatch.StartNew();
@@ -375,6 +394,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         }
         swOpt.Stop();
         optMs = swOpt.Elapsed.TotalMilliseconds;
+        optAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocOptStart;
 
         _sink += loss.GetFlatIndexValue(0);
     }
@@ -420,14 +440,14 @@ public static class Issue327TransformerTrainBatchedBenchmark
         }) { IsBackground = true };
 
         // Warmup so JIT is stable
-        DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _);
+        DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _);
 
         sampler.Start();
         var sw = Stopwatch.StartNew();
         int steps = 0;
         while (sw.Elapsed.TotalSeconds < targetSec)
         {
-            DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _);
             steps++;
         }
         sw.Stop();
