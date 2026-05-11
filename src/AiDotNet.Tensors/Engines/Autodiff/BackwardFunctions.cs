@@ -447,16 +447,14 @@ internal static class BackwardFunctions<T>
         }
 
         // Fallback: transpose last two dims (works for all ranks).
-        // bT and aT are LOCAL intermediates feeding TensorMatMul. For
-        // standard (createGraph=false) backward they're unreferenced
-        // after the matmul produces gradAFallback / gradBFallback, so
-        // returning them to AutoTensorCache lets the next backward's
-        // RentOrAllocate reuse the buffer.
-        // GATE: higher-order AD (createGraph=true, e.g. Hvp/Hessian)
-        // records the matmul that consumes bT/aT — those recorded ops
-        // reference the SAME tensor instances. Pooling them mid-flight
-        // would let the next op rent the same buffer and overwrite
-        // recorded-ops' inputs. Skip the pool-return in that mode.
+        // bT and aT are local intermediates feeding TensorMatMul; after
+        // gradAFallback/gradBFallback are produced they have no further
+        // use in this backward. The pool-return is safe by virtue of
+        // AutoTensorCache.Return's GradFn check: when createGraph=true
+        // records the consuming matmul on the tape, bT/aT's GradFn is
+        // set (they came from TransposeLastTwoDims which records), so
+        // Return refuses to pool them. When createGraph=false they
+        // have no recorded references and pool cleanly.
         var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
