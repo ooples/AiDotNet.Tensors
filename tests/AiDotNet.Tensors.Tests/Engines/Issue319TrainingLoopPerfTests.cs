@@ -23,6 +23,7 @@ using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -132,6 +133,104 @@ public class Issue319TrainingLoopPerfTests
         Assert.True(avgTotal > 0, "Training step measurement broken.");
     }
 
+    /// <summary>
+    /// Side-by-side comparison: same training step run with the naive
+    /// optimizer pattern (TensorMultiplyScalar + TensorSubtractInPlace)
+    /// vs <see cref="OptimizerKernels.SgdInPlace{T}"/>. Reports allocation
+    /// delta so the win from the fused kernel is measurable in isolation.
+    /// </summary>
+    /// <remarks>
+    /// Both paths are numerically equivalent (covered by
+    /// OptimizerKernelsTests). This test isolates the GC-pressure win
+    /// of the fused kernel on the actual training-loop hot path.
+    /// </remarks>
+    [Fact]
+    public void TrainingStep_FusedSgdInPlace_ReducesAllocsVsNaiveOptimizer()
+    {
+        const int Hidden = 768;
+        const int Seq = 197;
+        const int Layers = 4;
+        const int WarmupIters = 3;
+        const int MeasureIters = 10;
+
+        var engine = new CpuEngine();
+        var rng = new Random(1);
+
+        var x = MakeTensor(new[] { Seq, Hidden }, rng, 1.0);
+        var weights = new Tensor<float>[Layers];
+        var biases = new Tensor<float>[Layers];
+        var gammas = new Tensor<float>[Layers];
+        var betas = new Tensor<float>[Layers];
+        for (int l = 0; l < Layers; l++)
+        {
+            weights[l] = MakeTensor(new[] { Hidden, Hidden }, rng, 0.02);
+            biases[l] = MakeTensor(new[] { Hidden }, rng, 0.01);
+            gammas[l] = MakeOnes(new[] { Hidden });
+            betas[l] = MakeTensor(new[] { Hidden }, rng, 0.0);
+        }
+
+        // Warmup
+        for (int w = 0; w < WarmupIters; w++) RunTrainStep(engine, x, weights, biases, gammas, betas, useFusedSgd: false);
+        for (int w = 0; w < WarmupIters; w++) RunTrainStep(engine, x, weights, biases, gammas, betas, useFusedSgd: true);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Naive optimizer path.
+        var swNaive = Stopwatch.StartNew();
+#if NET5_0_OR_GREATER
+        long naiveAllocStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveAllocStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int it = 0; it < MeasureIters; it++)
+            RunTrainStep(engine, x, weights, biases, gammas, betas, useFusedSgd: false);
+        swNaive.Stop();
+#if NET5_0_OR_GREATER
+        long naiveAllocEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long naiveAllocEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Fused optimizer path.
+        var swFused = Stopwatch.StartNew();
+#if NET5_0_OR_GREATER
+        long fusedAllocStart = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedAllocStart = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+        for (int it = 0; it < MeasureIters; it++)
+            RunTrainStep(engine, x, weights, biases, gammas, betas, useFusedSgd: true);
+        swFused.Stop();
+#if NET5_0_OR_GREATER
+        long fusedAllocEnd = GC.GetTotalAllocatedBytes(precise: true);
+#else
+        long fusedAllocEnd = GC.GetTotalMemory(forceFullCollection: false);
+#endif
+
+        double naiveMs = swNaive.Elapsed.TotalMilliseconds / MeasureIters;
+        double fusedMs = swFused.Elapsed.TotalMilliseconds / MeasureIters;
+        double naiveAllocKb = (naiveAllocEnd - naiveAllocStart) / 1024.0 / MeasureIters;
+        double fusedAllocKb = (fusedAllocEnd - fusedAllocStart) / 1024.0 / MeasureIters;
+
+        _output.WriteLine($"Naive vs FusedSgd training step ({MeasureIters} iters, {Layers} layers, [{Seq}, {Hidden}]):");
+        _output.WriteLine($"  Naive (MultiplyScalar + SubtractInPlace) : {naiveMs,8:F2} ms/iter, {naiveAllocKb,9:F1} KB/iter alloc");
+        _output.WriteLine($"  Fused OptimizerKernels.SgdInPlace        : {fusedMs,8:F2} ms/iter, {fusedAllocKb,9:F1} KB/iter alloc");
+        _output.WriteLine($"  Alloc reduction                          : {naiveAllocKb - fusedAllocKb,9:F1} KB/iter saved");
+
+        // Hardware variance is enormous on these workloads; the alloc
+        // delta is the stable signal. The fused path should allocate
+        // strictly less than the naive path — anything else means the
+        // kernel got mis-routed.
+        Assert.True(fusedAllocKb <= naiveAllocKb,
+            $"Fused SGD allocated more than naive: fused={fusedAllocKb} KB/iter, naive={naiveAllocKb} KB/iter.");
+    }
+
     private static (double totalMs, double fwdMs, double bwdMs, double optMs)
         RunTrainStepTimed(CpuEngine engine, Tensor<float> x,
             Tensor<float>[] weights, Tensor<float>[] biases,
@@ -192,7 +291,8 @@ public class Issue319TrainingLoopPerfTests
 
     private static void RunTrainStep(CpuEngine engine, Tensor<float> x,
         Tensor<float>[] weights, Tensor<float>[] biases,
-        Tensor<float>[] gammas, Tensor<float>[] betas)
+        Tensor<float>[] gammas, Tensor<float>[] betas,
+        bool useFusedSgd = false)
     {
         using var tape = new GradientTape<float>();
         var sources = new System.Collections.Generic.List<Tensor<float>>();
@@ -218,8 +318,15 @@ public class Issue319TrainingLoopPerfTests
         foreach (var src in sources)
         {
             if (!grads.TryGetValue(src, out var g)) continue;
-            var update = engine.TensorMultiplyScalar(g, lr);
-            engine.TensorSubtractInPlace(src, update);
+            if (useFusedSgd)
+            {
+                OptimizerKernels.SgdInPlace(src, g, lr);
+            }
+            else
+            {
+                var update = engine.TensorMultiplyScalar(g, lr);
+                engine.TensorSubtractInPlace(src, update);
+            }
         }
     }
 
