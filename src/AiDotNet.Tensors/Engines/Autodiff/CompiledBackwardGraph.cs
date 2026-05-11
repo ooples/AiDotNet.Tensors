@@ -167,6 +167,26 @@ public sealed class CompiledBackwardGraph<T>
         finally
         {
             DifferentiableOps.ClearIndexedGrads();
+
+            // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
+            // cleanup: clear .Grad on forward intermediates so a consumer-side cache
+            // that retains an intermediate (e.g. a layer's `_lastInput`) doesn't pin
+            // one full backward's worth of gradient tensors across successive Execute
+            // calls. Same defense-in-depth pattern as GradientTape.cs PR for
+            // reopened-#283 / consumer-AiDotNet#1227.
+            //
+            // We DON'T clear .GradFn here — the compiled graph reuses the tape's
+            // forward graph for the next Execute, so the GradFn back-pointers must
+            // stay live. .Grad gets re-set by AccumulateGrad on the next Execute,
+            // so clearing it here only severs the per-tensor field; the data flows
+            // through the returned dictionary regardless.
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (_sources is not null)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in _sources) sourceSet.Add(s);
+            }
+
             foreach (int i in _reachableEntryIndices)
             {
                 ref var e = ref _entries[i];
@@ -176,6 +196,15 @@ public sealed class CompiledBackwardGraph<T>
                 if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+
+                // .Grad cleanup on this entry's output (every output is an
+                // intermediate — graph leaves never appear as outputs in the
+                // entries array). Inputs are NOT cleared because they may be
+                // graph leaves (parameters), and the consumer relies on
+                // `param.Grad` being populated after a sources=null Execute.
+                bool keepGrad =
+                    (sourceSet?.Contains(e.Output) == true);
+                if (!keepGrad) e.Output.Grad = null;
             }
         }
 

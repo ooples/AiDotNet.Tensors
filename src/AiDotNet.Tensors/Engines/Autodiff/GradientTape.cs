@@ -687,10 +687,40 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
-        // If we have a cached delegate chain from a previous backward, replay it directly
+        // If we have a cached delegate chain from a previous backward, replay it directly.
+        // Apply the same per-intermediate .Grad cleanup as the fresh-walk path so a
+        // persistent tape doesn't keep one full backward's worth of gradient tensors
+        // pinned on every intermediate between successive Execute calls. We CANNOT clear
+        // GradFn on persistent-cached chains because the chain itself reuses those
+        // tensors' Output.GradFn pointers for the next Execute's graph traversal —
+        // only .Grad is safe to clear (it gets re-set by AccumulateGrad on the next
+        // forward+backward pass).
         if (_cachedDelegateChain is not null)
         {
-            return _cachedDelegateChain.Execute(loss, sources, _engine);
+            var cachedResult = _cachedDelegateChain.Execute(loss, sources, _engine);
+
+            HashSet<Tensor<T>>? cachedSourceSet = null;
+            if (sources is not null)
+            {
+                cachedSourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) cachedSourceSet.Add(s);
+            }
+
+            // Walk the chain's steps to find every intermediate (step.Output)
+            // and clear its .Grad. Inputs to a step may be parameters
+            // (graph leaves) — leave their .Grad alone for the same reason
+            // the fresh-walk path does. Intermediate-as-input cases get
+            // cleared when they appear as Output in their own step.
+            var cachedSteps = _cachedDelegateChain.Steps;
+            for (int i = 0; i < cachedSteps.Length; i++)
+            {
+                ref var step = ref cachedSteps[i];
+                if (cachedSourceSet?.Contains(step.Output) == true) continue;
+                if (_retainGrad is not null && _retainGrad.Contains(step.Output)) continue;
+                step.Output.Grad = null;
+            }
+
+            return cachedResult;
         }
 
         var engine = _engine;

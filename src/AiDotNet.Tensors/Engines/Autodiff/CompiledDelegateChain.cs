@@ -19,6 +19,14 @@ internal sealed class CompiledDelegateChain<T>
     }
 
     /// <summary>
+    /// Exposes the underlying step array so callers (the persistent-tape cleanup
+    /// in <c>ComputeGradientsViaGraphCore</c>) can walk it to release per-step
+    /// gradient retentions without re-doing the topological traversal that
+    /// produced the chain.
+    /// </summary>
+    internal BackwardStep<T>[] Steps => _steps;
+
+    /// <summary>
     /// Executes the pre-compiled backward chain. Each step is a captured closure
     /// that calls the backward function with the right inputs and accumulates gradients.
     /// </summary>
