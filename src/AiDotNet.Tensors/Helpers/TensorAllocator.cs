@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Profiling.Memory;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -44,79 +45,47 @@ public static class TensorAllocator
             totalSize = checked(totalSize * shape[i]);
         if (totalSize == 0) return new Tensor<T>(shape);
 
+        // MemoryProfiler hook — pinned tier is always a fresh allocation
+        // (TensorArena's pinned list grows monotonically; the fallback is
+        // `new Tensor<T>`). Mirror Rent<T>'s pattern: record on every path
+        // that actually allocates so CurrentBytes tracks pinned weights /
+        // optimizer state alongside scratch tensors instead of silently
+        // undercounting.
+        long bytesIfTracking = (long)totalSize * Unsafe.SizeOf<T>();
+
         var arena = TensorArena.Current;
         if (arena != null)
         {
             T[]? pinnedArray = arena.TryAllocatePinned<T>(totalSize);
             if (pinnedArray != null)
             {
+                MemoryProfiler.RecordAllocation(
+                    "TensorAllocator.Pinned", bytesIfTracking, shape, typeof(T).Name);
                 var memory = new Memory<T>(pinnedArray, 0, totalSize);
                 return Tensor<T>.FromMemory(memory, shape);
             }
         }
 
-        // Streaming auto-engage for large pinned allocations. When a single
-        // tensor exceeds StreamingThresholdElements (100M elements ≈ 800 MB
-        // for double, 400 MB for float — matches the 125M-param threshold
-        // the model layer uses for ParameterBuffer skip), route through
-        // WeightRegistry.AllocateStreaming so the GPU-offload manager has
-        // a chance to evict cold weights to host RAM / disk and keep peak
-        // GC heap pressure bounded. The streaming pool itself decides
-        // whether to actually evict; this just makes the allocation visible
-        // to it. Element-type gate matches AllocateStreaming's contract
-        // (float, double, int, long, Half, BFloat16 only); other Ts skip
-        // streaming and fall through to plain `new Tensor<T>(shape)`.
-        if (totalSize >= StreamingThresholdElements && WeightRegistryAcceptsType<T>())
-        {
-            try
-            {
-                return WeightRegistry.AllocateStreaming<T>(shape);
-            }
-            catch (ObjectDisposedException)
-            {
-                // Streaming pool has been disposed — graceful fallback to plain
-                // allocation so the caller still gets a usable tensor.
-            }
-            // NOTE: deliberately do NOT catch ArgumentException /
-            // NotSupportedException / InvalidOperationException / OutOfMemoryException
-            // from AllocateStreaming. Those signal real problems (invalid shape, type
-            // not actually streamable, byteCount > int.MaxValue forcing chunking,
-            // pool budget exceeded) that the caller needs to see — silently falling
-            // back to `new Tensor<T>(shape)` would replace an actionable error with
-            // a less informative OOM on a tensor the runtime can't actually hold.
-        }
+        // NOTE: an earlier draft of this method tried to auto-engage
+        // WeightRegistry.AllocateStreaming for tensors above ~100M elements,
+        // but AllocateStreaming only RESERVES pool budget — it requires a
+        // follow-on RegisterWeight call to actually commit the bytes into
+        // the streaming pool and drop the in-memory storage. RentPinned
+        // callers (LayerBase.EnsureInitialized, Adam moments, BN running
+        // stats) hold the tensor as plain GC-managed memory and never
+        // perform that handshake, so the auto-engage stranded the
+        // reservation without buying any streaming benefit. Use the
+        // explicit WeightRegistry API instead when a caller really wants
+        // pool-backed streaming.
 
         // No active arena — graceful degradation to standard CLR allocation.
         // The caller's "this lives across iterations" contract still holds
         // because plain Tensor<T> backing arrays aren't touched by Reset
         // (they were never in any arena pool to begin with).
+        MemoryProfiler.RecordAllocation(
+            "TensorAllocator.Pinned", bytesIfTracking, shape, typeof(T).Name);
         return new Tensor<T>(shape);
     }
-
-    /// <summary>
-    /// Element-count threshold above which <see cref="RentPinned{T}"/> routes
-    /// through <see cref="WeightRegistry.AllocateStreaming{T}"/>
-    /// instead of plain CLR allocation. 100M elements is the same order as the
-    /// 125M-param ParameterBuffer-skip threshold the model layer uses — picks
-    /// up the FC layers in BERT-large / VGG16-BN / GPT-3 attention banks
-    /// without engaging streaming for small Conv kernels (~10K elements).
-    /// </summary>
-    private const int StreamingThresholdElements = 100_000_000;
-
-    /// <summary>
-    /// Delegates to <see cref="WeightRegistry.IsStreamableType{T}"/>
-    /// — the single source of truth for which element types
-    /// <see cref="WeightRegistry.AllocateStreaming{T}"/>
-    /// can serialize. Keeping the streamable-type table in one place means
-    /// adding a new supported T (e.g., when BF8 arrives) only requires
-    /// updating <c>WeightRegistry.StreamableTypeSize</c>; this gate picks
-    /// up the change automatically. Previously this lived as a hand-written
-    /// duplicate here and silently drifted out of sync (BFloat16 was
-    /// streamable in WeightRegistry but excluded here, causing fp16-like
-    /// large weights to skip streaming and OOM at <c>new Tensor&lt;T&gt;()</c>).
-    /// </summary>
-    private static bool WeightRegistryAcceptsType<T>() =>
-        WeightRegistry.IsStreamableType<T>();
 
     /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
@@ -150,7 +119,7 @@ public static class TensorAllocator
         if (!TensorPool.Enabled || TensorPool.ForceFreshAllocations || totalSize == 0)
         {
             if (bytesIfTracking > 0)
-                AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+                MemoryProfiler.RecordAllocation(
                     "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             return new Tensor<T>(shape);
         }
@@ -198,7 +167,7 @@ public static class TensorAllocator
         // unconditionally here (RentUninitialized records on the same path).
         if (totalSize >= ArrayPoolThreshold)
         {
-            AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+            MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             // Issue #311: clear the entire array, including the padding
@@ -210,13 +179,13 @@ public static class TensorAllocator
         }
 
         // Tier 4: Standard managed allocation for small tensors — always a fresh alloc.
-        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+        MemoryProfiler.RecordAllocation(
             "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         T[] arr = new T[totalSize];
         var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
-        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+        MemoryProfiler.RecordAllocation(
             "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         return new Tensor<T>(shape);
 #endif

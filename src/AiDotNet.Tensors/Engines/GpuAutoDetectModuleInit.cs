@@ -59,7 +59,22 @@ internal static class GpuAutoDetectModuleInit
             // construction in try/catch and falls back to CPU on failure,
             // so this call is safe at module init even without a GPU /
             // driver / CUDA runtime present.
-            AiDotNetEngine.AutoDetectAndConfigureGpu();
+            //
+            // Module-init verbosity is OFF by default — emitting [AiDotNet]
+            // status to stdout at assembly-load time can break test runners
+            // that parse stdout (xUnit reporters, MSBuild diagnostics),
+            // hosted services that route stdout to structured loggers, and
+            // any consumer that expects clean program output. Users who
+            // WANT init-time logging can opt in via the
+            // AIDOTNET_VERBOSE_INIT env var, set their own logger via
+            // AiDotNetEngine.Logger before any tensor work, or call
+            // AutoDetectAndConfigureGpu() explicitly later with the default
+            // verbose: true. AIDOTNET_QUIET overrides everything — sets verbose=false
+            // even when AIDOTNET_VERBOSE_INIT is set, for the "I want zero
+            // noise" override.
+            var verboseInit = !string.IsNullOrEmpty(
+                Environment.GetEnvironmentVariable("AIDOTNET_VERBOSE_INIT"));
+            AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: verboseInit);
         }
         catch
         {
