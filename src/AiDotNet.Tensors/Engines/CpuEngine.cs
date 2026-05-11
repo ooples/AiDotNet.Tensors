@@ -3776,6 +3776,52 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path for last-axis softmax (innerSize == 1). Used by
+        // every attention layer's QKᵀ softmax and every classifier head
+        // when running fp64. Inline 3-pass max / exp-sum / normalize per
+        // row avoids the generic Softmax() fallback's per-element numOps
+        // virtual dispatch + intermediate allocation + CopyTo. Parallel
+        // across rows for cache locality and core saturation.
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            using var pinIn = input.Data.Pin();
+            using var pinOut = destination.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                int axisSz = axisSize;
+                int outerSz = outerSize;
+                bool useParallel = outerSz >= 4 && (long)outerSz * axisSz >= 32768;
+                Action<int> rowKernel = row =>
+                {
+                    double* rIn = pIn + row * axisSz;
+                    double* rOut = pOut + row * axisSz;
+                    double max = rIn[0];
+                    for (int i = 1; i < axisSz; i++)
+                        if (rIn[i] > max) max = rIn[i];
+                    double sum = 0;
+                    for (int i = 0; i < axisSz; i++)
+                    {
+                        double e = Math.Exp(rIn[i] - max);
+                        rOut[i] = e;
+                        sum += e;
+                    }
+                    double inv = 1.0 / sum;
+                    for (int i = 0; i < axisSz; i++) rOut[i] *= inv;
+                };
+                if (useParallel)
+                {
+                    Parallel.For(0, outerSz, rowKernel);
+                }
+                else
+                {
+                    for (int row = 0; row < outerSz; row++) rowKernel(row);
+                }
+            }
+            return;
+        }
+
         // Fallback: compute and copy, return pooled tensor
         var result = Softmax(input, axis);
         try
