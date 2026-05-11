@@ -656,41 +656,75 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
-        // If we have a cached delegate chain from a previous backward, replay it directly
-        if (_cachedDelegateChain is not null)
+        // Issue #319 Phase 1: thread-local scratch buffers for the
+        // backward dispatch path. Acquire once at the top of the call;
+        // nested backwards (createGraph=true Hessian path) fall back to
+        // fresh allocation everywhere — the inner call would otherwise
+        // clobber the outer call's buffers.
+        bool acquiredScratch = BackwardScratch<T>.TryAcquire();
+        try
         {
-            return _cachedDelegateChain.Execute(loss, sources, _engine);
-        }
-
-        var engine = _engine;
-
-        // Topological sort via DFS from loss.GradFn — build the execution order
-        var visited = new HashSet<GradNode<T>>();
-        var topoOrder = new List<GradNode<T>>();
-        TopologicalSort(loss.GradFn!, visited, topoOrder);
-
-        // Build delegate chain from topological order (capture for replay)
-        var steps = new BackwardStep<T>[topoOrder.Count];
-        for (int i = 0; i < topoOrder.Count; i++)
-        {
-            var node = topoOrder[topoOrder.Count - 1 - i]; // reverse for backward order
-            steps[i] = new BackwardStep<T>
+            // If we have a cached delegate chain from a previous
+            // backward, replay it directly. The chain itself is
+            // immutable; only the grads dict + seed gradient are
+            // rented, both inside chain.Execute.
+            if (_cachedDelegateChain is not null)
             {
-                Output = node.Output,
-                Inputs = node.GetInputsArray(),
-                Backward = node.Backward,
-                SavedState = node.SavedState
-            };
-        }
+                return _cachedDelegateChain.Execute(loss, sources, _engine, useScratch: acquiredScratch);
+            }
 
-        var chain = new CompiledDelegateChain<T>(steps);
+            var engine = _engine;
+            HashSet<GradNode<T>> visited;
+            List<GradNode<T>> topoOrder;
+            if (acquiredScratch)
+            {
+                visited = BackwardScratch<T>.RentVisited();
+                topoOrder = BackwardScratch<T>.RentTopoOrder();
+            }
+            else
+            {
+                visited = new HashSet<GradNode<T>>();
+                topoOrder = new List<GradNode<T>>();
+            }
 
-        // Cache for persistent tapes (same network structure every step)
-        if (_options.Persistent)
-            _cachedDelegateChain = chain;
+            // Topological sort via DFS from loss.GradFn — build the execution order
+            TopologicalSort(loss.GradFn!, visited, topoOrder);
 
-        // Execute the chain
-        var result = chain.Execute(loss, sources, engine);
+            // Build delegate chain from topological order (capture for replay).
+            // Persistent tapes need a private array — the chain is cached on the
+            // tape and re-executed on later backwards, so we can't share the
+            // scratch buffer with the next call. Non-persistent tapes rent
+            // from the scratch pool and clear on release.
+            int stepCount = topoOrder.Count;
+            BackwardStep<T>[] steps;
+            if (_options.Persistent || !acquiredScratch)
+            {
+                steps = new BackwardStep<T>[stepCount];
+            }
+            else
+            {
+                steps = BackwardScratch<T>.RentSteps(stepCount);
+            }
+            for (int i = 0; i < stepCount; i++)
+            {
+                var node = topoOrder[stepCount - 1 - i]; // reverse for backward order
+                steps[i] = new BackwardStep<T>
+                {
+                    Output = node.Output,
+                    Inputs = node.GetInputsArray(),
+                    Backward = node.Backward,
+                    SavedState = node.SavedState
+                };
+            }
+
+            var chain = new CompiledDelegateChain<T>(steps, stepCount);
+
+            // Cache for persistent tapes (same network structure every step)
+            if (_options.Persistent)
+                _cachedDelegateChain = chain;
+
+            // Execute the chain
+            var result = chain.Execute(loss, sources, engine, useScratch: acquiredScratch);
 
         // Clear GradFn to release graph memory (non-persistent tapes
         // get new graphs each step). Walk inputs inline rather than
@@ -714,68 +748,88 @@ public sealed class GradientTape<T> : IDisposable
         // Source tensors keep .Grad — that's the optimizer's input.
         // Tensors registered via RetainGrad() also keep .Grad — that's the
         // user's explicit request to retain gradients on a non-leaf tensor.
-        if (!_options.Persistent)
-        {
-            // Build a set of source tensors for O(1) sourcehood check.
-            // sources == null means the caller wants the full grads dict,
-            //   so we can't safely null .Grad on anything.
-            // sources != null (even if empty) means the caller specified
-            //   the protected set explicitly — clear .Grad on everything
-            //   else, including the case where the explicit set is empty.
-            HashSet<Tensor<T>>? sourceSet = null;
-            if (sources is not null)
+            if (!_options.Persistent)
             {
-                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-                foreach (var s in sources) sourceSet.Add(s);
-            }
-            // Local helper: should this tensor keep its .Grad?
-            // True when sources mode is off (sourceSet null), when the tensor
-            // is a source, or when the user retained grads on it explicitly.
-            bool ShouldKeepGrad(Tensor<T> t)
-            {
-                if (sourceSet is null) return true;
-                if (sourceSet.Contains(t)) return true;
-                if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
-                return false;
-            }
-            foreach (var node in topoOrder)
-            {
-                node.Output.GradFn = null;
-                if (!ShouldKeepGrad(node.Output))
-                    node.Output.Grad = null;
-
-                // Input0 is non-nullable on GradNode<T>; the recorder
-                // always populates it.
-                node.Input0.GradFn = null;
-                if (!ShouldKeepGrad(node.Input0))
-                    node.Input0.Grad = null;
-
-                if (node.Input1 is not null)
+                // Build a set of source tensors for O(1) sourcehood check.
+                // sources == null means the caller wants the full grads dict,
+                //   so we can't safely null .Grad on anything.
+                // sources != null (even if empty) means the caller specified
+                //   the protected set explicitly — clear .Grad on everything
+                //   else, including the case where the explicit set is empty.
+                HashSet<Tensor<T>>? sourceSet = null;
+                if (sources is not null)
                 {
-                    node.Input1.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input1))
-                        node.Input1.Grad = null;
+                    // Reuse the thread-local source set when we own the scratch.
+                    sourceSet = acquiredScratch
+                        ? BackwardScratch<T>.RentSourceSet()
+                        : new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                    foreach (var s in sources) sourceSet.Add(s);
                 }
-                if (node.Input2 is not null)
+                // Local helper: should this tensor keep its .Grad?
+                // True when sources mode is off (sourceSet null), when the tensor
+                // is a source, or when the user retained grads on it explicitly.
+                bool ShouldKeepGrad(Tensor<T> t)
                 {
-                    node.Input2.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input2))
-                        node.Input2.Grad = null;
+                    if (sourceSet is null) return true;
+                    if (sourceSet.Contains(t)) return true;
+                    if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
+                    return false;
                 }
-                if (node.InputsOverflow is not null)
+                foreach (var node in topoOrder)
                 {
-                    foreach (var inp in node.InputsOverflow)
+                    node.Output.GradFn = null;
+                    if (!ShouldKeepGrad(node.Output))
+                        node.Output.Grad = null;
+
+                    // Input0 is non-nullable on GradNode<T>; the recorder
+                    // always populates it.
+                    node.Input0.GradFn = null;
+                    if (!ShouldKeepGrad(node.Input0))
+                        node.Input0.Grad = null;
+
+                    if (node.Input1 is not null)
                     {
-                        if (inp is null) continue;
-                        inp.GradFn = null;
-                        if (!ShouldKeepGrad(inp))
-                            inp.Grad = null;
+                        node.Input1.GradFn = null;
+                        if (!ShouldKeepGrad(node.Input1))
+                            node.Input1.Grad = null;
+                    }
+                    if (node.Input2 is not null)
+                    {
+                        node.Input2.GradFn = null;
+                        if (!ShouldKeepGrad(node.Input2))
+                            node.Input2.Grad = null;
+                    }
+                    if (node.InputsOverflow is not null)
+                    {
+                        foreach (var inp in node.InputsOverflow)
+                        {
+                            if (inp is null) continue;
+                            inp.GradFn = null;
+                            if (!ShouldKeepGrad(inp))
+                                inp.Grad = null;
+                        }
                     }
                 }
             }
-        }
 
-        return result;
+            // Drop captured refs in the steps array's live range so they
+            // don't extend tensor lifetimes through the scratch pool.
+            // Skip for persistent tapes — the chain caches `steps` for
+            // re-execution on the next backward call.
+            if (!_options.Persistent && acquiredScratch)
+            {
+                BackwardScratch<T>.ClearStepsRange(stepCount);
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (acquiredScratch)
+            {
+                BackwardScratch<T>.Release();
+            }
+        }
     }
 
 
