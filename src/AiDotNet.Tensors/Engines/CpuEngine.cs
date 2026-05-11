@@ -25043,6 +25043,28 @@ public partial class CpuEngine : ITensorLevelEngine
             else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
             return;
         }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            int totalBC = batch * channels;
+            int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
+            int t = top, l = left;
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * iH * iW + t * iW + l;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    Buffer.BlockCopy(inArrD, (inBase + oh * iW) * sizeof(double),
+                                     outArrD, (outBase + oh * oW) * sizeof(double),
+                                     oW * sizeof(double));
+                }
+            };
+            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
+            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            return;
+        }
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
@@ -25193,6 +25215,36 @@ public partial class CpuEngine : ITensorLevelEngine
                     Buffer.BlockCopy(inArr, (inBase + ih * w) * sizeof(float),
                                      outArr, (outBase + ih * nW) * sizeof(float),
                                      w * sizeof(float));
+                }
+            };
+            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
+            else for (int b = 0; b < batchSize; b++) kernel(b);
+            return;
+        }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            double padD = padValue is double dv ? dv : 0.0;
+            if (padD == 0.0)
+            {
+                Array.Clear(outArrD, 0, outArrD.Length);
+            }
+            else
+            {
+                outArrD.AsSpan().Fill(padD);
+            }
+            int h = height, w = width, nH = newHeight, nW = newWidth;
+            int pt = padTop, pl = padLeft;
+            Action<int> kernel = b =>
+            {
+                int inBase = b * h * w;
+                int outBase = b * nH * nW + pt * nW + pl;
+                for (int ih = 0; ih < h; ih++)
+                {
+                    Buffer.BlockCopy(inArrD, (inBase + ih * w) * sizeof(double),
+                                     outArrD, (outBase + ih * nW) * sizeof(double),
+                                     w * sizeof(double));
                 }
             };
             if (batchSize > 4) Parallel.For(0, batchSize, kernel);
@@ -25445,11 +25497,70 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             return Unsafe.As<float, T>(ref result);
         }
+
+        if (typeof(T) == typeof(double))
+        {
+            T[] arr = tensor.GetFlattenedData();
+            double[] dArr = Unsafe.As<T[], double[]>(ref arr);
+            int length = tensor.Length;
+            double result;
+            fixed (double* ptr = dArr)
+            {
+                result = SumOfSquaresUnsafeDouble(ptr, length);
+            }
+            return Unsafe.As<double, T>(ref result);
+        }
 #endif
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Dot(tensor.AsSpan(), tensor.AsSpan());
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD sum of squares (double): sum(x[i] * x[i]) with 4x unrolled FMA accumulation.
+    /// Hits L2-regularization terms on Adam/SGD weight decay for fp64 networks.
+    /// </summary>
+    private static unsafe double SumOfSquaresUnsafeDouble(double* data, int length)
+    {
+        int i = 0;
+        double result = 0.0;
+
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && length >= 16)
+        {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = length & ~15;
+            for (; i < simdLen; i += 16)
+            {
+                var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i);
+                var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 4);
+                var v2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 8);
+                var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 12);
+                vsum0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsum0);
+                vsum1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsum1);
+                vsum2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2, v2, vsum2);
+                vsum3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsum3);
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            // Horizontal sum across 4 doubles
+            var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
+            var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
+            var s128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
+            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01_00_11_10);
+            s128 = System.Runtime.Intrinsics.X86.Sse2.Add(s128, shuf);
+            double tmp;
+            System.Runtime.Intrinsics.X86.Sse2.StoreScalar(&tmp, s128);
+            result = tmp;
+        }
+
+        for (; i < length; i++)
+            result += data[i] * data[i];
+        return result;
+    }
+#endif
 
 #if NET5_0_OR_GREATER
     /// <summary>
@@ -33841,6 +33952,49 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.TensorBCEWithLogitsLoss(capturedLogits, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BCEWithLogitsLossBackward);
             }
+        }
+
+        // Float fast path: fused stable BCE.
+        if (typeof(T) == typeof(float) && logits.IsContiguous && targets.IsContiguous)
+        {
+            var lArr = (float[])(object)logits.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = logits.Length;
+            float sumF = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float x = lArr[i];
+                float ti = tArr[i];
+                float loss = MathF.Max(x, 0f) - x * ti + MathF.Log(1f + MathF.Exp(-MathF.Abs(x)));
+                sumF += loss;
+            }
+            float meanF = sumF / len;
+            var scalarResultF = new Tensor<T>(new[] { Unsafe.As<float, T>(ref meanF) }, [1]);
+            DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultF, logits, targets,
+                BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultF, eng => scalarResultF);
+            return scalarResultF;
+        }
+        // Double fast path: same numerically stable form, inline arithmetic.
+        if (typeof(T) == typeof(double) && logits.IsContiguous && targets.IsContiguous)
+        {
+            var lArr = (double[])(object)logits.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = logits.Length;
+            double sumD = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double x = lArr[i];
+                double ti = tArr[i];
+                double loss = Math.Max(x, 0.0) - x * ti + Math.Log(1.0 + Math.Exp(-Math.Abs(x)));
+                sumD += loss;
+            }
+            double meanD = sumD / len;
+            var scalarResultD = new Tensor<T>(new[] { Unsafe.As<double, T>(ref meanD) }, [1]);
+            DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultD, logits, targets,
+                BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultD, eng => scalarResultD);
+            return scalarResultD;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
