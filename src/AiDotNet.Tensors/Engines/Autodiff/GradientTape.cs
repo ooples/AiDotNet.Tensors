@@ -192,6 +192,35 @@ public sealed class GradientTape<T> : IDisposable
 #if !NETFRAMEWORK
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
 #endif
+    /// <summary>
+    /// Identical to <see cref="ComputeGradients"/> but returns the
+    /// gradient dictionary wrapped in a <see cref="GradientsScope{T}"/>
+    /// disposable. When the caller disposes the scope (typically at
+    /// the end of a training step), every gradient tensor is returned
+    /// to <see cref="AutoTensorCache"/> so the next iteration's
+    /// backward can reuse the buffers instead of allocating fresh.
+    /// Closes the per-step gradient-tensor allocation cost reported
+    /// in issue #327.
+    /// </summary>
+    /// <param name="loss">The scalar loss tensor to differentiate.</param>
+    /// <param name="sources">Optional source tensors whose gradients
+    /// the caller will read. Required for safe pooling — the scope's
+    /// dispose path pools every dictionary value, so unfiltered
+    /// callers would observe corrupted tensors on the next iter.</param>
+    /// <param name="createGraph">Same semantics as
+    /// <see cref="ComputeGradients"/>. createGraph=true is unusual
+    /// here; consumers using higher-order AD should hold the
+    /// gradient dict themselves rather than scope-pool it.</param>
+    public GradientsScope<T> ComputeGradientsScope(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        bool createGraph = false)
+    {
+        if (sources is null) throw new ArgumentNullException(nameof(sources));
+        var grads = ComputeGradients(loss, sources, createGraph);
+        return new GradientsScope<T>(grads);
+    }
+
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources = null,

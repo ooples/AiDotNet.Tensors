@@ -352,6 +352,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Tensor<float> loss;
         GradientTape<float>? ownTape = sharedTape is null ? new GradientTape<float>() : null;
         var tape = sharedTape ?? ownTape!;
+        GradientsScope<float>? gradScope = null;
         long allocFwdStart = GC.GetTotalAllocatedBytes(precise: true);
         try
         {
@@ -368,15 +369,12 @@ public static class Issue327TransformerTrainBatchedBenchmark
             fwdAlloc = allocFwdEnd - allocFwdStart;
 
             var swBwd = Stopwatch.StartNew();
-            grads = tape.ComputeGradients(loss, weights);
+            gradScope = tape.ComputeGradientsScope(loss, weights);
+            grads = gradScope.Grads;
             swBwd.Stop();
             bwdMs = swBwd.Elapsed.TotalMilliseconds;
             bwdAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocFwdEnd;
 
-            // Sanity probe: count how many sources got gradients in this call.
-            // Persistent-tape pattern silently breaks across iters (cached chain
-            // points at stale iter-1 entries; iter-N's loss key never matches),
-            // and the fast 0.1 ms wall is meaningless without correct grads.
             foreach (var w in weights) if (grads.ContainsKey(w)) sourcesPresent++;
         }
         finally
@@ -412,6 +410,11 @@ public static class Issue327TransformerTrainBatchedBenchmark
         swOpt.Stop();
         optMs = swOpt.Elapsed.TotalMilliseconds;
         optAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocOptStart;
+
+        // Optimizer has consumed gradients; dispose the scope so the
+        // per-iter gradient tensors get pooled back to AutoTensorCache
+        // for the next iter's backward to reuse.
+        gradScope?.Dispose();
 
         _sink += loss.GetFlatIndexValue(0);
     }
