@@ -1215,28 +1215,26 @@ internal static partial class SimdGemm
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
 
-    // Issue #327: tall-thin transformer GEMMs (M=2048, K=128, N=384-512) at
-    // 100M-134M FMAs fall just over SmallMatmulWorkThreshold, sending them
-    // through SgemmTiled. At K=128 the inner compute per tile is small
-    // (~12KB packed A panel, ~50K FMAs/tile), so SgemmTiled's two-phase
-    // dispatch (PackA||PackB, then compute) burns more wall in
-    // PersistentParallelExecutor wake/wait than in actual FMAs — the
-    // baseline harness measured only 5-12 active cores of 32 on these
-    // exact shapes. SgemmDirect skips packing entirely and dispatches
-    // 341 Mr=6 row blocks (one per 6 rows of M=2048), giving
-    // PersistentParallelExecutor a clean numChunks=32 to fill every core.
+    // Issue #327: tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
+    // 100M-2.1G FMAs were going through SgemmTiled, where at K=128 the inner
+    // compute per tile is small (~12KB packed A panel, ~50K FMAs/tile) so the
+    // two-phase dispatch (PackA||PackB, then compute) burned more wall in
+    // PersistentParallelExecutor wake/wait than in actual FMAs. SgemmDirect
+    // skips packing entirely and dispatches Mr=6 row blocks via a single
+    // PersistentParallelExecutor call: M=2048 yields 341 row blocks, clean
+    // numChunks=32 → 32-core saturation.
     //
-    // The tall-thin gate qualifies M ≥ 256 AND K ≤ 256 AND work ≤ 256M:
+    // The tall-thin gate qualifies M ≥ 256 AND K ≤ 256 AND work ≤ 4G:
     //   - M ≥ 256 ensures ≥ 43 Mr=6 row blocks (plenty of slicing).
     //   - K ≤ 256 keeps the 6-row A panel ≤ 6 KB (well within L1d).
-    //   - work ≤ 256M absorbs QKV (100M) + FFN up (134M) + FFN down (134M);
-    //     output proj (2.1G) is still routed through SgemmTiled where its
-    //     wider N=8192 amortizes the pack cost.
+    //   - work ≤ 4G absorbs QKV (100M), FFN up (134M), FFN down (134M),
+    //     AND the 2.1G output proj — measured Phase A: 12 cores → ~22 cores
+    //     after this raise on the [32,64,128]×[128,8192] shape.
     //
-    // Above this, the small-N edge of FFN at K=512 (still 134M but K=512 just
-    // over the panel-cache threshold) and the V=8192 output projection both
-    // keep the SgemmTiled cache-friendly packed path.
-    private const long TallThinMatmulWorkThreshold = 256L * 1024 * 1024;
+    // Above 4G, square shapes (4608² = 97G, etc.) still need SgemmTiled's
+    // packed cache-blocking; the direct path's A-panel-per-iter approach
+    // doesn't amortize at that scale.
+    private const long TallThinMatmulWorkThreshold = 4L * 1024 * 1024 * 1024;
     private const int TallThinMatmulKThreshold = 256;
     private const int TallThinMatmulMinM = 256;
 
