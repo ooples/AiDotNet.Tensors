@@ -2942,6 +2942,16 @@ public partial class CpuEngine : ITensorLevelEngine
             else
                 Simd.SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3423,6 +3433,14 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdKernels.VectorMultiplyUnsafe(pSrc, pDst, pDst, input.Length);
             return;
         }
+        if (typeof(T) == typeof(double))
+        {
+            // SIMD double Swish via Span overload.
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            Simd.SimdKernels.Swish(srcSpan, dstSpan);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
         numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
@@ -3454,6 +3472,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length);
         }
         else
         {
@@ -3489,6 +3515,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.TanhUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3518,6 +3552,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            // SIMD double-precision Mish via the Span overload (no unsafe ptr
+            // variant exists for double Mish yet — same elementwise cost
+            // class either way).
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            Simd.SimdKernels.Mish(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3551,6 +3595,13 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
             unsafe { Simd.SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, alphaF); }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
+            Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
         }
         else
         {
@@ -3770,6 +3821,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorSubtractUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorSubtractUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3796,6 +3857,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorDivideUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorDivideUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
         }
         else
         {
@@ -4346,6 +4417,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
         }
         else
         {
@@ -8569,6 +8650,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast-path — the SIMD kernel exists, the dispatch didn't.
+        if (typeof(T) == typeof(double))
+        {
+            var mem = AsDoubleMemory(tensor.Data);
+            using var pin = mem.Pin();
+            double* p = (double*)pin.Pointer;
+
+            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            if (sigChunks >= 2)
+            {
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.SigmoidUnsafe(p, p, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -8596,6 +8707,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.SigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.SigmoidUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
         }
         else
         {
@@ -8788,6 +8907,20 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Symmetric fast path for double — same SimdKernels covers both
+        // element types but the dispatching in CpuEngine wasn't routing
+        // doubles to it. Closes the float-fast / double-slow gap on the
+        // hottest activation (every Conv/Dense forward pass calls this).
+        if (typeof(T) == typeof(double))
+        {
+            var mem = AsDoubleMemory(tensor.Data);
+            using var pin = mem.Pin();
+            double* p = (double*)pin.Pointer;
+
+            SimdKernels.ReLUUnsafe(p, p, length);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -8820,6 +8953,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 JitUnaryDispatch(pSrc, pDst, length);
             else
                 Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+            Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
         }
         else
         {
@@ -9127,6 +9270,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
             }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels).
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(tensor.Data)).Span;
+            var dstSpan = AsDoubleMemory(result.Data).Span;
+            SimdKernels.ELU(srcSpan, alpha, dstSpan);
         }
         else
         {
