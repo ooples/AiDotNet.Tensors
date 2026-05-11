@@ -6572,6 +6572,50 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Fast path: single-axis sum on 2D contiguous double tensor — mirrors float branch.
+        // Heavily used by gradient accumulation paths (loss/bias sums, axis-wise reductions in
+        // attention) on double networks; eliminates INumericOperations<T> dispatch.
+        if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(double))
+        {
+            int axis = normalizedAxes[0];
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var srcArr = (double[])(object)tensor.GetDataArray();
+
+            if (axis == 0)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var rArr = (double[])(object)fastResult.GetDataArray();
+                Array.Clear(rArr, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rArr[c] += srcArr[offset + c];
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+            else if (axis == 1)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var rArr = (double[])(object)fastResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    double sum = 0;
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sum += srcArr[offset + c];
+                    rArr[r] = sum;
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+        }
+
         // Calculate output shape
         var outputShape = new List<int>();
         for (int i = 0; i < tensor.Rank; i++)
@@ -23113,6 +23157,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (isFullReduction && input.IsContiguous)
         {
+            if (typeof(T) == typeof(double))
+            {
+                var dSpan = AsDoubleMemory(input.Data).Span;
+                double dSum = SimdKernels.Sum(dSpan);
+                double dMean = dSum / input.Length;
+                var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                ((double[])(object)scalarResult.GetDataArray())[0] = dMean;
+                DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
+                    BackwardFunctions<T>.ReduceMeanBackward,
+                    savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
+                AutoTracer.RecordOp("ReduceMean", scalarResult, eng => scalarResult);
+                return scalarResult;
+            }
             if (typeof(T) == typeof(float))
             {
                 unsafe
@@ -23352,6 +23409,48 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int r = 0; r < rows; r++)
                     for (int c = 0; c < cols; c++) { float d = fData[r * cols + c] - means[c]; fOut[c] += d * d; }
                 for (int c = 0; c < cols; c++) fOut[c] /= rows;
+                return result;
+            }
+        }
+
+        // Double fast path for 2D single-axis variance — mirrors float branch above.
+        // Eliminates INumericOperations<T> dispatch per element for the LayerNorm /
+        // BatchNorm / Instructor mean-pool inference critical paths on double tensors.
+        if (typeof(T) == typeof(double) && input.IsContiguous && axes.Length == 1 && input.Rank == 2)
+        {
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var dData = (double[])(object)input.GetDataArray();
+            int rows = input._shape[0], cols = input._shape[1];
+
+            if (axis == 1) // variance along columns (per-row)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dOut = (double[])(object)result.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    double rowSum = 0.0;
+                    for (int c = 0; c < cols; c++) rowSum += dData[off + c];
+                    double rowMean = rowSum / cols;
+                    double varSum = 0.0;
+                    for (int c = 0; c < cols; c++) { double d = dData[off + c] - rowMean; varSum += d * d; }
+                    dOut[r] = varSum / cols;
+                }
+                return result;
+            }
+            else if (axis == 0) // variance along rows (per-column)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dOut = (double[])(object)result.GetDataArray();
+                var means = new double[cols];
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) means[c] += dData[r * cols + c];
+                for (int c = 0; c < cols; c++) means[c] /= rows;
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) { double d = dData[r * cols + c] - means[c]; dOut[c] += d * d; }
+                for (int c = 0; c < cols; c++) dOut[c] /= rows;
                 return result;
             }
         }
