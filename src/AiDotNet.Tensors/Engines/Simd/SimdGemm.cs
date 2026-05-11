@@ -1071,14 +1071,15 @@ internal static partial class SimdGemm
             //     fall through to the normal split. For DiT-XL shapes n=256
             //     and n=72 both have n % 8 == 0.
             long directWork = (long)m * k * n;
-            // Issue #327 tall-thin gate: M≥256, K≤256, work ≤ 256M.
-            // Targets transformer GEMMs that fall just above the standard
+            // Tall-thin gate: M≥256, K≤256, work ≤ 4G.
+            // Targets transformer GEMMs that fall above the standard
             // small-matmul threshold but where SgemmTiled's two-phase
             // dispatch starves PersistentParallelExecutor (measured: 5-12
             // active cores of 32 on M=2048,K=128,N=384). SgemmDirectParallelM
-            // skips packing and dispatches 341 Mr=6 row blocks → 32-core
-            // saturation. Same n%8==0 alignment requirement as the standard
-            // gate so the masked-tail kernel handles narrow-N cleanly.
+            // skips packing and dispatches Mr=6 row blocks → near-32-core
+            // saturation for M=2048. Same n%8==0 alignment requirement as
+            // the standard gate so the masked-tail kernel handles narrow-N
+            // cleanly.
             bool tallThin = !transA && !transB
                 && n >= Nr
                 && (n % 8 == 0)
@@ -1215,7 +1216,7 @@ internal static partial class SimdGemm
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
 
-    // Issue #327: tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
+    // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
     // 100M-2.1G FMAs were going through SgemmTiled, where at K=128 the inner
     // compute per tile is small (~12KB packed A panel, ~50K FMAs/tile) so the
     // two-phase dispatch (PackA||PackB, then compute) burned more wall in
