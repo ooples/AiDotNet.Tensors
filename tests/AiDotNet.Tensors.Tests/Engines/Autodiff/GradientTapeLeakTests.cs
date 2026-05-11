@@ -500,22 +500,26 @@ public class GradientTapeLeakTests
         allSources.Add(wOut);
         var sources = allSources.ToArray();
 
-        // Two consecutive 200-call windows with forced Gen2 GC between them.
-        // A linear leak shows equal growth in both windows; warm-up shows
-        // large window-1 and near-zero window-2.
+        // Two consecutive 200-call windows with StableForcedGc()/LiveBytes()
+        // sampling for cross-platform stability under Server GC. A linear leak
+        // shows window-2 retention ≈ window-1 retention; a one-time warmup
+        // shows window-1 high and window-2 near-zero. The "no linear leak"
+        // claim asserts BOTH that the absolute window-2 figure is bounded AND
+        // that window-2 is not significantly larger than window-1 (so leaks
+        // can't hide behind warmup noise).
         const int Warmup = 25;
         const int Measure = 200;
         for (int i = 0; i < Warmup; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m0 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m1 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m2 = LiveBytes();
 
         long w1PerCall = (m1 - m0) / Measure;
         long w2PerCall = (m2 - m1) / Measure;
@@ -532,6 +536,16 @@ public class GradientTapeLeakTests
             $"4-layer Transformer second-window retention {w2PerCall} B/call exceeds 100 KB/call. " +
             $"Matches AiDotNet#1227 / Tensors#283 residual-leak signature. " +
             $"win1={w1PerCall} B/call, m0={m0} m1={m1} m2={m2}.");
+
+        // Slope check: window-2 retention should not exceed window-1 by more
+        // than 50 KB/call. A true linear leak would show w2 ≈ w1; this guard
+        // catches a regression where retention grows across windows (the
+        // signature that distinguishes a leak from one-time warmup).
+        Assert.True(w2PerCall < w1PerCall + 50_000,
+            $"4-layer Transformer leak grows across windows: " +
+            $"win1={w1PerCall} B/call → win2={w2PerCall} B/call " +
+            $"(slope > 50 KB/call). A linear leak should hold w1 ≈ w2; " +
+            $"w2 > w1 + 50KB indicates accelerating retention.");
 
         void Step()
         {
@@ -630,19 +644,22 @@ public class GradientTapeLeakTests
         allSources.Add(wOut);
         var sources = allSources.ToArray();
 
+        // StableForcedGc()/LiveBytes() per the file's standard two-window
+        // half-window methodology — see TrainStep_FourLayerTransformer_
+        // NoLinearLeakAcrossWindows for the matching pattern.
         const int Warmup = 25;
         const int Measure = 200;
         for (int i = 0; i < Warmup; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m0 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m1 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m2 = LiveBytes();
 
         long w1PerCall = (m1 - m0) / Measure;
         long w2PerCall = (m2 - m1) / Measure;
@@ -767,19 +784,21 @@ public class GradientTapeLeakTests
         // intermediates per layer.
         Tensor<float>?[,] layerCaches = new Tensor<float>?[NumLayers, 8];
 
+        // StableForcedGc()/LiveBytes() per the file's standard two-window
+        // half-window methodology — same as the other multi-layer probes.
         const int Warmup = 25;
         const int Measure = 200;
         for (int i = 0; i < Warmup; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m0 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m0 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m1 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m1 = LiveBytes();
 
         for (int i = 0; i < Measure; i++) Step();
-        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long m2 = GC.GetTotalMemory(forceFullCollection: true);
+        StableForcedGc();
+        long m2 = LiveBytes();
 
         long w1PerCall = (m1 - m0) / Measure;
         long w2PerCall = (m2 - m1) / Measure;

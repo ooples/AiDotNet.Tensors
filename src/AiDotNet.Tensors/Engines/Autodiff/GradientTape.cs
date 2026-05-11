@@ -562,18 +562,34 @@ public sealed class GradientTape<T> : IDisposable
                 sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources) sourceSet.Add(s);
             }
+
+            // Pre-collect every output tensor in the arena: these are the
+            // intermediates produced by tape-recorded ops. Graph leaves
+            // (parameters / user-supplied roots) never appear as Output in
+            // an entry. We need this distinction so the BC contract
+            // "param.Grad stays populated after a sources=null backward"
+            // holds in the tape-walk path the same way it holds in
+            // ComputeGradientsViaGraphCore (line 776+). Without this,
+            // calling CleanupTapeEntryGrad on a leaf input would null
+            // param.Grad and silently break any consumer reading it.
+            var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                intermediates.Add(_entries[i].Output);
+            }
+
             for (int i = 0; i < _entries.Count; i++)
             {
                 ref var e = ref _entries[i];
-                CleanupTapeEntryGrad(e.Output, sourceSet);
-                if (e.Input0 != null) CleanupTapeEntryGrad(e.Input0, sourceSet);
-                if (e.InputCount >= 2 && e.Input1 != null) CleanupTapeEntryGrad(e.Input1, sourceSet);
-                if (e.InputCount >= 3 && e.Input2 != null) CleanupTapeEntryGrad(e.Input2, sourceSet);
+                CleanupTapeEntryGrad(e.Output, sourceSet, intermediates);
+                if (e.Input0 != null) CleanupTapeEntryGrad(e.Input0, sourceSet, intermediates);
+                if (e.InputCount >= 2 && e.Input1 != null) CleanupTapeEntryGrad(e.Input1, sourceSet, intermediates);
+                if (e.InputCount >= 3 && e.Input2 != null) CleanupTapeEntryGrad(e.Input2, sourceSet, intermediates);
                 if (e.InputsOverflow != null)
                 {
                     foreach (var inp in e.InputsOverflow)
                     {
-                        if (inp != null) CleanupTapeEntryGrad(inp, sourceSet);
+                        if (inp != null) CleanupTapeEntryGrad(inp, sourceSet, intermediates);
                     }
                 }
             }
@@ -621,7 +637,7 @@ public sealed class GradientTape<T> : IDisposable
         return grads;
     }
 
-    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet)
+    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
     {
         // Always clear GradFn — this is the back-pointer that chains a tensor to its
         // BackwardFunction closure, which in turn captures forward intermediates. The
@@ -633,10 +649,19 @@ public sealed class GradientTape<T> : IDisposable
         if (sourceSet?.Contains(t) == true) return;
         // Preserve .Grad on tensors the user explicitly marked with RetainGrad().
         if (_retainGrad is not null && _retainGrad.Contains(t)) return;
-        // For null-sources callers, the gradients still live in the returned
-        // Dictionary — clearing .Grad here only severs the per-tensor field, not
-        // the data itself.
-        t.Grad = null;
+        // Distinguish intermediate vs leaf when sources is null:
+        //   sourceSet != null + non-source: caller's explicit filter said
+        //     "only keep what I listed" — clear regardless of leaf-ness.
+        //   sourceSet == null + intermediate: clear (returned dict still
+        //     holds the gradient; .Grad is only the per-tensor mirror).
+        //   sourceSet == null + leaf (parameter / user-supplied root):
+        //     preserve param.Grad — that's the BC contract that
+        //     AiDotNet.NeuralNetworkBase.TrainWithTape and the graph-walk
+        //     path (ComputeGradientsViaGraphCore line 776+) both honor.
+        if (sourceSet is not null || intermediates.Contains(t))
+        {
+            t.Grad = null;
+        }
     }
 
     /// <summary>

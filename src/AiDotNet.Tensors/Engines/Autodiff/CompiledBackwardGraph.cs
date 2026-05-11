@@ -111,11 +111,14 @@ public sealed class CompiledBackwardGraph<T>
     {
         var loss = currentLoss ?? _loss;
 
-        // Phase C: try optimized backward with CSE + algebraic simplification
+        // Phase C: try optimized backward with CSE + algebraic simplification.
+        // OptimizedBackwardPlan applies the same RetainGrad-aware intermediate
+        // .Grad cleanup as the non-optimized path below, so taking this branch
+        // does not bypass the leak fix.
         if (Optimization.TensorCodecOptions.Current.EnableAlgebraicBackward)
         {
             var optimized = OptimizedBackwardPlan<T>.TryCreate(
-                _entries, _reachableEntryIndices, loss, _sources, _engine);
+                _entries, _reachableEntryIndices, loss, _sources, _engine, _retainGrad);
             if (optimized is not null)
                 return optimized.Execute();
         }
