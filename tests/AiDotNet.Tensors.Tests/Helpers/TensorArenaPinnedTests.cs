@@ -138,4 +138,45 @@ public class TensorArenaPinnedTests
         // Zero-size short-circuit must not pollute the pinned tier counter.
         Assert.Equal(countBefore, arena.PinnedArrayCount);
     }
+
+    /// <summary>
+    /// On a CPU-only host (no GPU offload allocator registered),
+    /// RentPinnedOnGpu must gracefully fall back to RentPinned semantics.
+    /// Consumer code that unconditionally calls RentPinnedOnGpu (e.g.,
+    /// AdamOptimizer._tapeM after the AiDotNet migration) needs to keep
+    /// working when run on hosts without a GPU.
+    /// </summary>
+    [Fact]
+    public void RentPinnedOnGpu_NoGpuAllocator_FallsBackToPinned()
+    {
+        using var arena = TensorArena.Create();
+        int countBefore = arena.PinnedArrayCount;
+
+        // No `WeightRegistry.Configure(..., offloadAllocator: …)` call
+        // happens by default in the test harness, so the OffloadAllocator
+        // is null — exactly the CPU-host scenario the fallback targets.
+        var tensor = TensorAllocator.RentPinnedOnGpu<float>(new[] { 8 });
+
+        Assert.NotNull(tensor);
+        Assert.Equal(8, tensor.Length);
+        Assert.Equal(WeightLifetime.Default, tensor.Lifetime);
+        // Fallback path is RentPinned, so the pinned tier should have grown
+        // by one — verifying we actually pinned the allocation rather than
+        // routing through plain `new Tensor<T>`.
+        Assert.Equal(countBefore + 1, arena.PinnedArrayCount);
+    }
+
+    /// <summary>
+    /// Zero-size shape on RentPinnedOnGpu must short-circuit to plain
+    /// allocation without consulting any allocator (which would throw on
+    /// byteCount == 0 on most GPU runtimes). Same contract as RentPinned.
+    /// </summary>
+    [Fact]
+    public void RentPinnedOnGpu_ZeroSize_ReturnsUsableTensor()
+    {
+        using var arena = TensorArena.Create();
+        var tensor = TensorAllocator.RentPinnedOnGpu<double>(new[] { 0 });
+        Assert.NotNull(tensor);
+        Assert.Equal(0, tensor.Length);
+    }
 }

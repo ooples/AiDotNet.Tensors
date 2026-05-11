@@ -88,6 +88,101 @@ public static class TensorAllocator
     }
 
     /// <summary>
+    /// Rents a tensor whose storage is registered with the active GPU
+    /// backend's offload allocator — pinned-host memory DMA-mapped to the
+    /// GPU (no per-op cudaMemcpy on read) or managed/unified memory (driver
+    /// handles migration). Use for weights, optimizer state (Adam m / v),
+    /// running BatchNorm statistics on the GPU training path: every kernel
+    /// reads/writes the pinned region directly via the DMA mapping, and
+    /// CPU code sees the updated values without an explicit download.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Fallback behavior:</b>
+    /// <list type="bullet">
+    /// <item>No GPU offload allocator registered (CPU-only host, or GPU
+    /// engine but no backend yet) → falls back to <see cref="RentPinned{T}"/>
+    /// (CPU pinned tier). The returned tensor still survives
+    /// <see cref="TensorArena.Reset"/>, so the model can keep its weights
+    /// stable across iterations even when no GPU is available.</item>
+    /// <item>GpuOffload allocator is registered but throws (out of GPU
+    /// memory, allocator disposed) → falls back to CPU <see cref="RentPinned{T}"/>
+    /// and the caller proceeds on CPU. No silent OOM — the underlying
+    /// exception is rethrown after the fallback succeeds.</item>
+    /// </list></para>
+    /// <para><b>Initial state:</b> the returned tensor's data is zero-initialized
+    /// (same contract as <see cref="Rent{T}(int[])"/>). Host writes to the
+    /// returned tensor's <see cref="Tensor{T}.Data"/> propagate to GPU reads via
+    /// the DMA mapping (pinned scheme) or driver-managed migration
+    /// (managed scheme). GPU kernel writes are visible to CPU code on the
+    /// next access (with a host-side fence for write-after-write ordering
+    /// on the kernel-launch stream).</para>
+    /// <para><b>Lifetime:</b> registered with <see cref="WeightRegistry"/> and
+    /// pool-pinned in <see cref="TensorArena"/>. Survives Reset. The GPU
+    /// memory is freed when the tensor is collected by GC (via the registry's
+    /// finalizer-tracked handle) or when <see cref="WeightRegistry.UnregisterWeight{T}"/>
+    /// is called explicitly.</para>
+    /// </remarks>
+    public static Tensor<T> RentPinnedOnGpu<T>(int[] shape)
+    {
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+        if (totalSize == 0) return new Tensor<T>(shape);
+
+        // No GPU offload allocator registered → CPU pinned fallback. Same
+        // semantics as RentPinned (survives Reset), so consumer code that
+        // unconditionally calls RentPinnedOnGpu still works on CPU-only hosts.
+        var allocator = WeightRegistry.OffloadAllocator;
+        if (allocator is null || !allocator.IsAvailable)
+            return RentPinned<T>(shape);
+
+        // Streamable-type gate matches the WeightRegistry contract — non-
+        // streamable element types (decimal, custom structs) can't be
+        // serialized to the pinned-host stage buffer that RegisterWeight uses.
+        if (!WeightRegistry.IsStreamableType<T>())
+            return RentPinned<T>(shape);
+
+        long bytesIfTracking = (long)totalSize * Unsafe.SizeOf<T>();
+
+        try
+        {
+            // Construct a zero-initialized tensor and register it under the
+            // GpuOffload lifetime. RegisterWeight handles allocator dispatch,
+            // copies the (zero-initialized) bytes into the pinned region,
+            // and persists the OffloadDevicePointer / OffloadHostPointer
+            // metadata on the tensor for later kernel launches.
+            var tensor = new Tensor<T>(shape)
+            {
+                Lifetime = WeightLifetime.GpuOffload,
+            };
+            WeightRegistry.RegisterWeight(tensor);
+
+            // After RegisterWeight, the tensor's data lives in pinned host
+            // memory DMA-mapped to the GPU. Lifetime stays GpuOffload (the
+            // registry does not flip back to Default on success — only on
+            // allocator-unavailable fallback inside the registry, which we
+            // already short-circuited above).
+            MemoryProfiler.RecordAllocation(
+                "TensorAllocator.PinnedOnGpu", bytesIfTracking, shape, typeof(T).Name);
+            return tensor;
+        }
+        catch (NotSupportedException)
+        {
+            // Per-tensor size > int.MaxValue (the offload stage byte[] limit),
+            // unsupported element type, or backend doesn't support the lifetime.
+            // Caller-side chunking is the documented remedy; the CPU pinned
+            // fallback at least lets the model run.
+            return RentPinned<T>(shape);
+        }
+        catch (InvalidOperationException)
+        {
+            // Backend in a bad state (e.g., already-disposed allocator). Falling
+            // back to CPU is non-fatal for the train step.
+            return RentPinned<T>(shape);
+        }
+    }
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
     /// use standard CLR allocation. All paths return zeroed memory.
