@@ -36532,6 +36532,42 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>Decompose Complex&lt;double&gt; tensor to split double arrays for SIMD.</summary>
+    private static (double[] real, double[] imag) DecomposeToDouble<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = tensor.Length;
+        var real = new double[n];
+        var imag = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = ops.ToDouble(tensor[i].Real);
+            imag[i] = ops.ToDouble(tensor[i].Imaginary);
+        }
+        return (real, imag);
+    }
+
+    /// <summary>Recompose double split arrays back to Complex tensor.</summary>
+    private static Tensor<Complex<T>> RecomposeFromDouble<T>(double[] real, double[] imag, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = real.Length;
+        var result = new Tensor<Complex<T>>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(ops.FromDouble(real[i]), ops.FromDouble(imag[i]));
+        return result;
+    }
+
+    /// <summary>Recompose double array to real Tensor.</summary>
+    private static Tensor<T> RecomposeRealFromDouble<T>(double[] data, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = data.Length;
+        var result = new Tensor<T>(shape);
+        for (int i = 0; i < n; i++) result[i] = ops.FromDouble(data[i]);
+        return result;
+    }
+
     /// <summary>
     /// Computes batch count and last-axis size for batched FFT.
     /// For 1D: batch=1, fftSize=length. For multi-D: batch=product of leading dims, fftSize=last dim.
@@ -38426,6 +38462,13 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdComplexKernels.ComplexConjugate(aR, aI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexConjugateDouble(aR, aI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
+        }
         else
         {
             for (int i = 0; i < n; i++)
@@ -38454,6 +38497,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var output = new float[n];
             Simd.SimdComplexKernels.ComplexMagnitude(aR, aI, output);
             result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var output = new double[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeDouble(aR, aI, output);
+            result = RecomposeRealFromDouble<T>(output, a._shape);
         }
         else
         {
@@ -38487,6 +38537,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var output = new float[n];
             Simd.SimdComplexKernels.ComplexMagnitudeSquared(aR, aI, output);
             result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var output = new double[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeSquaredDouble(aR, aI, output);
+            result = RecomposeRealFromDouble<T>(output, a._shape);
         }
         else
         {
@@ -38594,6 +38651,13 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdComplexKernels.ComplexScale(aR, aI, oR, oI, (float)ops.ToDouble(scalar));
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexScaleDouble(aR, aI, oR, oI, ops.ToDouble(scalar));
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
+        }
         else
         {
             for (int i = 0; i < n; i++)
@@ -38628,6 +38692,14 @@ public partial class CpuEngine : ITensorLevelEngine
             var oR = new float[n]; var oI = new float[n];
             Simd.SimdComplexKernels.ComplexCrossSpectral(xR, xI, yR, yI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, x._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (xR, xI) = DecomposeToDouble(x);
+            var (yR, yI) = DecomposeToDouble(y);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexCrossSpectralDouble(xR, xI, yR, yI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, x._shape);
         }
         else
         {
@@ -39114,6 +39186,14 @@ public partial class CpuEngine : ITensorLevelEngine
             var oR = new float[n]; var oI = new float[n];
             Simd.SimdComplexKernels.ComplexAdd(aR, aI, bR, bI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var (bR, bI) = DecomposeToDouble(b);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexAddDouble(aR, aI, bR, bI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
         }
         else
         {

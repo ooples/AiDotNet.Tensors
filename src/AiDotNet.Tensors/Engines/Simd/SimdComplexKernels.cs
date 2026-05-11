@@ -247,6 +247,159 @@ public static class SimdComplexKernels
         }
     }
 
+    /// <summary>SIMD complex conjugate (double): outR = inR, outI = -inI</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexConjugateDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI,
+        Span<double> outR, Span<double> outI)
+    {
+        int n = inR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            var negMask = Vector256.Create(-0.0);
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                SimdKernels.WriteVector256(outR, i, SimdKernels.ReadVector256(inR, i));
+                SimdKernels.WriteVector256(outI, i, Avx.Xor(SimdKernels.ReadVector256(inI, i), negMask));
+            }
+        }
+#endif
+        for (; i < n; i++)
+        {
+            outR[i] = inR[i];
+            outI[i] = -inI[i];
+        }
+    }
+
+    /// <summary>SIMD complex magnitude (double): out = sqrt(re² + im²)</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexMagnitudeDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI, Span<double> output)
+    {
+        int n = inR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                var re = SimdKernels.ReadVector256(inR, i);
+                var im = SimdKernels.ReadVector256(inI, i);
+                var magSq = Avx.Add(Avx.Multiply(re, re), Avx.Multiply(im, im));
+                SimdKernels.WriteVector256(output, i, Avx.Sqrt(magSq));
+            }
+        }
+#endif
+        for (; i < n; i++)
+            output[i] = Math.Sqrt(inR[i] * inR[i] + inI[i] * inI[i]);
+    }
+
+    /// <summary>SIMD complex magnitude squared (double): out = re² + im²</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexMagnitudeSquaredDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI, Span<double> output)
+    {
+        int n = inR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                var re = SimdKernels.ReadVector256(inR, i);
+                var im = SimdKernels.ReadVector256(inI, i);
+                SimdKernels.WriteVector256(output, i, Avx.Add(Avx.Multiply(re, re), Avx.Multiply(im, im)));
+            }
+        }
+#endif
+        for (; i < n; i++)
+            output[i] = inR[i] * inR[i] + inI[i] * inI[i];
+    }
+
+    /// <summary>SIMD complex add (double): outR = aR + bR, outI = aI + bI</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexAddDouble(ReadOnlySpan<double> aR, ReadOnlySpan<double> aI,
+        ReadOnlySpan<double> bR, ReadOnlySpan<double> bI,
+        Span<double> outR, Span<double> outI)
+    {
+        int n = aR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                SimdKernels.WriteVector256(outR, i, Avx.Add(SimdKernels.ReadVector256(aR, i), SimdKernels.ReadVector256(bR, i)));
+                SimdKernels.WriteVector256(outI, i, Avx.Add(SimdKernels.ReadVector256(aI, i), SimdKernels.ReadVector256(bI, i)));
+            }
+        }
+#endif
+        for (; i < n; i++)
+        {
+            outR[i] = aR[i] + bR[i];
+            outI[i] = aI[i] + bI[i];
+        }
+    }
+
+    /// <summary>SIMD complex scale (double): outR = inR * s, outI = inI * s</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexScaleDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI,
+        Span<double> outR, Span<double> outI, double scalar)
+    {
+        int n = inR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            var s = Vector256.Create(scalar);
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                SimdKernels.WriteVector256(outR, i, Avx.Multiply(SimdKernels.ReadVector256(inR, i), s));
+                SimdKernels.WriteVector256(outI, i, Avx.Multiply(SimdKernels.ReadVector256(inI, i), s));
+            }
+        }
+#endif
+        for (; i < n; i++)
+        {
+            outR[i] = inR[i] * scalar;
+            outI[i] = inI[i] * scalar;
+        }
+    }
+
+    /// <summary>SIMD cross-spectral density (double): X * conj(Y)</summary>
+    [MethodImpl(HotInline)]
+    public static void ComplexCrossSpectralDouble(ReadOnlySpan<double> xR, ReadOnlySpan<double> xI,
+        ReadOnlySpan<double> yR, ReadOnlySpan<double> yI,
+        Span<double> outR, Span<double> outI)
+    {
+        int n = xR.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && n >= 4)
+        {
+            int simdLen = n & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                var xr = SimdKernels.ReadVector256(xR, i);
+                var xi = SimdKernels.ReadVector256(xI, i);
+                var yr = SimdKernels.ReadVector256(yR, i);
+                var yi = SimdKernels.ReadVector256(yI, i);
+                SimdKernels.WriteVector256(outR, i, Avx.Add(Avx.Multiply(xr, yr), Avx.Multiply(xi, yi)));
+                SimdKernels.WriteVector256(outI, i, Avx.Subtract(Avx.Multiply(xi, yr), Avx.Multiply(xr, yi)));
+            }
+        }
+#endif
+        for (; i < n; i++)
+        {
+            outR[i] = xR[i] * yR[i] + xI[i] * yI[i];
+            outI[i] = xI[i] * yR[i] - xR[i] * yI[i];
+        }
+    }
+
     /// <summary>
     /// SIMD complex conjugate: outR = inR, outI = -inI
     /// </summary>
