@@ -35,6 +35,16 @@ public sealed class CompiledBackwardGraph<T>
     private readonly IEngine _engine;
 
     /// <summary>
+    /// Optional reference to the owning tape's RetainGrad set. When non-null,
+    /// the cleanup phase of <see cref="Execute"/> preserves <c>.Grad</c> on any
+    /// tensor the user has explicitly marked with
+    /// <see cref="GradientTape{T}.RetainGrad"/>, matching the behavior of
+    /// <see cref="GradientTape{T}.CleanupTapeEntryGrad"/> and
+    /// <see cref="GradientTape{T}.ComputeGradientsViaGraphCore"/>.
+    /// </summary>
+    private readonly HashSet<Tensor<T>>? _retainGrad;
+
+    /// <summary>
     /// Compiles a backward graph by analyzing which tape entries are reachable
     /// from the loss tensor. Dead entries are eliminated from the execution plan.
     /// </summary>
@@ -42,7 +52,8 @@ public sealed class CompiledBackwardGraph<T>
         TapeEntryArena<T> entries,
         Tensor<T> loss,
         Tensor<T>[]? sources,
-        IEngine engine)
+        IEngine engine,
+        HashSet<Tensor<T>>? retainGrad = null)
     {
         // Arena reference is shared with the owning tape. Safe because:
         // 1. CompiledBackwardGraph is created inside ComputeGradients which holds the tape
@@ -52,6 +63,7 @@ public sealed class CompiledBackwardGraph<T>
         _loss = loss;
         _sources = sources;
         _engine = engine;
+        _retainGrad = retainGrad;
 
         // Dead node elimination: find which entries are reachable from loss
         var reachable = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -202,8 +214,15 @@ public sealed class CompiledBackwardGraph<T>
                 // entries array). Inputs are NOT cleared because they may be
                 // graph leaves (parameters), and the consumer relies on
                 // `param.Grad` being populated after a sources=null Execute.
+                //
+                // Matches the parity rule used by
+                // GradientTape.CleanupTapeEntryGrad (line 635) and
+                // ComputeGradientsViaGraphCore (line 719): a tensor explicitly
+                // marked with RetainGrad() must keep its .Grad even though it
+                // is a graph intermediate.
                 bool keepGrad =
-                    (sourceSet?.Contains(e.Output) == true);
+                    (sourceSet?.Contains(e.Output) == true)
+                    || (_retainGrad is not null && _retainGrad.Contains(e.Output));
                 if (!keepGrad) e.Output.Grad = null;
             }
         }

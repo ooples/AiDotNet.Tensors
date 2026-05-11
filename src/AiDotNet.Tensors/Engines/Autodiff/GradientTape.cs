@@ -1086,7 +1086,7 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.Length != 1)
             throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
-        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine);
+        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
     }
 
     /// <summary>
