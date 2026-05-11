@@ -398,12 +398,7 @@ internal static class Im2ColHelper
 
     /// <summary>
     /// Double-precision variant of <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
-    /// Required for the BLAS fast-path in <c>Conv2DBackwardInput</c> when T=double
-    /// — ResNet50 / VGG and every CNN trained at double precision spend the bulk
-    /// of their backward time in this op; the previous code only had a 5-nested-
-    /// loop fallback for double (see CpuEngine.Conv2DBackwardInput generic
-    /// branch), turning a hot path into the limiting factor for the entire
-    /// 08a NN-Classic CI shard.
+    /// Used by the BLAS fast-path in <c>Conv2DBackwardInput</c> when T=double.
     /// </summary>
     public static void Col2ImAccumulate(
         ReadOnlySpan<double> colData,
