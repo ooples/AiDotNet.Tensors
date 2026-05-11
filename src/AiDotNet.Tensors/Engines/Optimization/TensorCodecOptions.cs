@@ -107,7 +107,39 @@ public sealed class TensorCodecOptions
     public bool EnableBlasBatch { get; set; } = true;
 
     /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
+    /// <remarks>Legacy boolean — kept for backward compat. New code should use
+    /// <see cref="MixedPrecisionPolicy"/> for finer-grained control over which dtype
+    /// is used (fp16 vs bf16) and whether autocast is engaged automatically.</remarks>
     public bool EnableMixedPrecision { get; set; }
+
+    /// <summary>
+    /// Mixed-precision routing policy for compute-bound ops (MatMul, Conv2D,
+    /// Attention) under issue #337. Hot-path GPU kernels read this to decide
+    /// whether to dispatch on the standard fp32 path or to cast inputs to the
+    /// lower-precision compute dtype while keeping fp32 master weights.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Defaults:</b> <see cref="Optimization.MixedPrecisionPolicy.None"/> —
+    /// kernels run in the model's declared dtype (typically fp32). No autocast,
+    /// no loss scaling, no behavior change vs. pre-#337 builds.</para>
+    /// <para><b>Opt-in:</b> set to <see cref="Optimization.MixedPrecisionPolicy.AutoCastBF16"/>
+    /// on Hopper/Ada/A100/Sapphire Rapids — BF16 has the same exponent range
+    /// as fp32 so no loss scaling is required and accuracy stays well within
+    /// noise for transformer training. Use <see cref="Optimization.MixedPrecisionPolicy.AutoCastFP16"/>
+    /// on Ampere or Turing where BF16 isn't natively supported by all ops;
+    /// requires loss scaling to keep small-magnitude gradients from
+    /// underflowing fp16's narrow exponent range.</para>
+    /// <para><b>Per-op opt-out:</b> ops that must preserve numerical accuracy
+    /// (running BN statistics accumulation, softmax denominator) MUST run in
+    /// the master dtype regardless of this policy — they don't honor the
+    /// autocast contract.</para>
+    /// <para>The TF32 path (Ampere+ fp32 → Tensor Cores via TF32 multiply +
+    /// fp32 accumulate) is gated separately by <see cref="DirectGpu.CUDA.CudaDispatchPolicy.AllowTF32"/>
+    /// and runs orthogonally — TF32 is the fp32-codepath speedup, autocast is
+    /// the fp16/bf16-codepath speedup.</para>
+    /// </remarks>
+    public MixedPrecisionPolicy MixedPrecisionPolicy { get; set; }
+        = MixedPrecisionPolicy.None;
 
     /// <summary>
     /// When true, tensor operations route through deterministic code paths — floating-point
