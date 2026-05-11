@@ -455,6 +455,14 @@ public partial class CpuEngine : ITensorLevelEngine
             return Unsafe.As<float, T>(ref result);
         }
 
+        if (typeof(T) == typeof(double))
+        {
+            T[] arr = vector.GetDataArray();
+            double[] dArr = Unsafe.As<T[], double[]>(ref arr);
+            double result = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, 0, vector.Length)) / vector.Length;
+            return Unsafe.As<double, T>(ref result);
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = Sum(vector);
         T length = numOps.FromDouble(vector.Length);
@@ -1806,6 +1814,21 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
+        else if (typeof(T) == typeof(double) && bArray.Length >= 8)
+        {
+            var bDouble = (double[])(object)bArray;
+            var aDouble = (double[])(object)aArray;
+
+            for (int i = 0; i < aDouble.Length; i++)
+            {
+                var rowData = new double[bDouble.Length];
+                Simd.SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowData.AsSpan());
+                for (int j = 0; j < bDouble.Length; j++)
+                {
+                    result[i, j] = (T)(object)rowData[j];
+                }
+            }
+        }
         else
         {
             // Fallback using NumOps
@@ -2338,18 +2361,54 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)result;
         }
 
-        // Generic scalar fallback for non-float T. Pre-combine scale/bias, then FMA.
+        // Double primitive fast path: pre-combine scale/bias then FMA, no
+        // INumericOperations<T> virtual dispatch. ResNet50 / VGG16-BN train at
+        // double precision through this op on every conv block — used by every
+        // BN inference pass in vision networks.
+        if (typeof(T) == typeof(double))
+        {
+            int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
+            int spatial = hh * ww;
+            var inSpanD = ((Tensor<double>)(object)x).AsSpan();
+            var gDataD = ((Tensor<double>)(object)gamma).AsSpan();
+            var bDataD = ((Tensor<double>)(object)beta).AsSpan();
+            var mDataD = ((Tensor<double>)(object)mean).AsSpan();
+            var vDataD = ((Tensor<double>)(object)variance).AsSpan();
+            var outTD = new Tensor<double>(x._shape) { Layout = x.Layout };
+            var outSpanD = outTD.AsWritableSpan();
+            var scaleArrD = new double[cc];
+            var biasArrD = new double[cc];
+            for (int c = 0; c < cc; c++)
+            {
+                double s = gDataD[c] / Math.Sqrt(vDataD[c] + epsilon);
+                scaleArrD[c] = s;
+                biasArrD[c] = bDataD[c] - s * mDataD[c];
+            }
+            for (int ni = 0; ni < nn; ni++)
+            {
+                for (int c = 0; c < cc; c++)
+                {
+                    int baseIdx = (ni * cc + c) * spatial;
+                    double s = scaleArrD[c], b2 = biasArrD[c];
+                    for (int sp = 0; sp < spatial; sp++)
+                        outSpanD[baseIdx + sp] = inSpanD[baseIdx + sp] * s + b2;
+                }
+            }
+            return (Tensor<T>)(object)outTD;
+        }
+
+        // Generic scalar fallback for non-primitive T. Pre-combine scale/bias, then FMA.
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
-        int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
-        int spatial = hh * ww;
+        int ccG = x._shape[1], hhG = x._shape[2], wwG = x._shape[3], nnG = x._shape[0];
+        int spatialG = hhG * wwG;
         var gData = gamma.GetDataArray();
         var bData = beta.GetDataArray();
         var mData = mean.GetDataArray();
         var vData = variance.GetDataArray();
-        var scaleArr = new T[cc];
-        var biasArr = new T[cc];
-        for (int c = 0; c < cc; c++)
+        var scaleArr = new T[ccG];
+        var biasArr = new T[ccG];
+        for (int c = 0; c < ccG; c++)
         {
             T s = numOps.Divide(gData[c], numOps.Sqrt(numOps.Add(vData[c], eps)));
             scaleArr[c] = s;
@@ -2358,13 +2417,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var outT = new Tensor<T>(x._shape) { Layout = x.Layout };
         var inSpan = x.AsSpan();
         var outSpan = outT.AsWritableSpan();
-        for (int ni = 0; ni < nn; ni++)
+        for (int ni = 0; ni < nnG; ni++)
         {
-            for (int c = 0; c < cc; c++)
+            for (int c = 0; c < ccG; c++)
             {
-                int baseIdx = (ni * cc + c) * spatial;
+                int baseIdx = (ni * ccG + c) * spatialG;
                 T s = scaleArr[c], b2 = biasArr[c];
-                for (int sp = 0; sp < spatial; sp++)
+                for (int sp = 0; sp < spatialG; sp++)
                     outSpan[baseIdx + sp] = numOps.Add(numOps.Multiply(inSpan[baseIdx + sp], s), b2);
             }
         }
@@ -2523,6 +2582,25 @@ public partial class CpuEngine : ITensorLevelEngine
                     { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                     return result;
                 }
+            }
+
+            // Double in-house SIMD fallback: when BLAS isn't available (TryGemm
+            // returned false above) and inputs are contiguous, use SimdGemm.Dgemm
+            // (AVX2 Vector256<double> FMA tiling) instead of falling through to
+            // the generic scalar matmul. ~10× faster on AVX2 hosts than the
+            // generic loop for moderate-size shapes.
+            if (typeof(T) == typeof(double) && a.IsContiguous && b.IsContiguous)
+            {
+                var aArrD = a._storage.GetDataArray();
+                var bArrD = b._storage.GetDataArray();
+                var rArrD = result.GetDataArray();
+                var aSpanD = new ReadOnlySpan<double>((double[])(object)aArrD, a._storageOffset, m * k);
+                var bSpanD = new ReadOnlySpan<double>((double[])(object)bArrD, b._storageOffset, k * n);
+                var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
+                Simd.SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
+                DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
+                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                return result;
             }
 
             // Generic fallback: stride-aware scalar matmul (raw storage for stride access)
@@ -3114,6 +3192,27 @@ public partial class CpuEngine : ITensorLevelEngine
                     int off = r * cols;
                     for (int c = 0; c < cols; c++)
                         rf[off + c] = af[off + c] - bf[c];
+                }
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                return res;
+            }
+        }
+        if (typeof(T) == typeof(double) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        {
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+                var ad = (double[])(object)a.GetDataArray();
+                var bd = (double[])(object)b.GetDataArray();
+                var rd = (double[])(object)res.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rd[off + c] = ad[off + c] - bd[c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
@@ -5602,6 +5701,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 return result;
             }
         }
+        if (typeof(T) == typeof(double))
+        {
+            double dExp = exponent is not null ? (double)(object)exponent : 0.0;
+            if (dExp == 2.0)
+            {
+                // x^2 = x * x — used by every L2 regularization / squared-error loss term.
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinSrc.Pointer, (double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
+                if (exponent is not null)
+                    DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
+                return result;
+            }
+        }
 
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
@@ -5665,6 +5781,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.FloorUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.FloorUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -5698,6 +5825,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.CeilingUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
             }
         }
         else
@@ -5734,6 +5872,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.RoundUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
             }
         }
         else

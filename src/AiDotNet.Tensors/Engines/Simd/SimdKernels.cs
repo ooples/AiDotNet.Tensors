@@ -922,6 +922,96 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD Round (double) using AVX RoundToNearestInteger on 4-lane Vector256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void RoundUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(output + i, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                    Avx.Store(output + i, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Round(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Floor (double) using AVX Floor on 4-lane Vector256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void FloorUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4, Avx.Floor(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8, Avx.Floor(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, Avx.Floor(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                    Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Floor(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Ceiling (double) using AVX Ceiling on 4-lane Vector256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void CeilingUnsafe(double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4, Avx.Ceiling(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8, Avx.Ceiling(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, Avx.Ceiling(Avx.LoadVector256(input + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                    Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = Math.Ceiling(input[i]);
+        }
+
+        /// <summary>
         /// SIMD Reciprocal: 1/x using AVX exact division (Avx.Divide).
         /// </summary>
         [MethodImpl(HotInline)]
