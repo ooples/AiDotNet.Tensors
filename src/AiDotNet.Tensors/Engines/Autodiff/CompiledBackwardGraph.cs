@@ -35,6 +35,16 @@ public sealed class CompiledBackwardGraph<T>
     private readonly IEngine _engine;
 
     /// <summary>
+    /// Optional reference to the owning tape's RetainGrad set. When non-null,
+    /// the cleanup phase of <see cref="Execute"/> preserves <c>.Grad</c> on any
+    /// tensor the user has explicitly marked with
+    /// <see cref="GradientTape{T}.RetainGrad"/>, matching the behavior of
+    /// <see cref="GradientTape{T}.CleanupTapeEntryGrad"/> and
+    /// <see cref="GradientTape{T}.ComputeGradientsViaGraphCore"/>.
+    /// </summary>
+    private readonly HashSet<Tensor<T>>? _retainGrad;
+
+    /// <summary>
     /// Compiles a backward graph by analyzing which tape entries are reachable
     /// from the loss tensor. Dead entries are eliminated from the execution plan.
     /// </summary>
@@ -42,7 +52,8 @@ public sealed class CompiledBackwardGraph<T>
         TapeEntryArena<T> entries,
         Tensor<T> loss,
         Tensor<T>[]? sources,
-        IEngine engine)
+        IEngine engine,
+        HashSet<Tensor<T>>? retainGrad = null)
     {
         // Arena reference is shared with the owning tape. Safe because:
         // 1. CompiledBackwardGraph is created inside ComputeGradients which holds the tape
@@ -52,6 +63,7 @@ public sealed class CompiledBackwardGraph<T>
         _loss = loss;
         _sources = sources;
         _engine = engine;
+        _retainGrad = retainGrad;
 
         // Dead node elimination: find which entries are reachable from loss
         var reachable = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -99,11 +111,14 @@ public sealed class CompiledBackwardGraph<T>
     {
         var loss = currentLoss ?? _loss;
 
-        // Phase C: try optimized backward with CSE + algebraic simplification
+        // Phase C: try optimized backward with CSE + algebraic simplification.
+        // OptimizedBackwardPlan applies the same RetainGrad-aware intermediate
+        // .Grad cleanup as the non-optimized path below, so taking this branch
+        // does not bypass the leak fix.
         if (Optimization.TensorCodecOptions.Current.EnableAlgebraicBackward)
         {
             var optimized = OptimizedBackwardPlan<T>.TryCreate(
-                _entries, _reachableEntryIndices, loss, _sources, _engine);
+                _entries, _reachableEntryIndices, loss, _sources, _engine, _retainGrad);
             if (optimized is not null)
                 return optimized.Execute();
         }
@@ -167,6 +182,26 @@ public sealed class CompiledBackwardGraph<T>
         finally
         {
             DifferentiableOps.ClearIndexedGrads();
+
+            // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
+            // cleanup: clear .Grad on forward intermediates so a consumer-side cache
+            // that retains an intermediate (e.g. a layer's `_lastInput`) doesn't pin
+            // one full backward's worth of gradient tensors across successive Execute
+            // calls. Same defense-in-depth pattern as GradientTape.cs PR for
+            // reopened-#283 / consumer-AiDotNet#1227.
+            //
+            // We DON'T clear .GradFn here — the compiled graph reuses the tape's
+            // forward graph for the next Execute, so the GradFn back-pointers must
+            // stay live. .Grad gets re-set by AccumulateGrad on the next Execute,
+            // so clearing it here only severs the per-tensor field; the data flows
+            // through the returned dictionary regardless.
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (_sources is not null)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in _sources) sourceSet.Add(s);
+            }
+
             foreach (int i in _reachableEntryIndices)
             {
                 ref var e = ref _entries[i];
@@ -176,6 +211,22 @@ public sealed class CompiledBackwardGraph<T>
                 if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+
+                // .Grad cleanup on this entry's output (every output is an
+                // intermediate — graph leaves never appear as outputs in the
+                // entries array). Inputs are NOT cleared because they may be
+                // graph leaves (parameters), and the consumer relies on
+                // `param.Grad` being populated after a sources=null Execute.
+                //
+                // Matches the parity rule used by
+                // GradientTape.CleanupTapeEntryGrad (line 635) and
+                // ComputeGradientsViaGraphCore (line 719): a tensor explicitly
+                // marked with RetainGrad() must keep its .Grad even though it
+                // is a graph intermediate.
+                bool keepGrad =
+                    (sourceSet?.Contains(e.Output) == true)
+                    || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                if (!keepGrad) e.Output.Grad = null;
             }
         }
 
