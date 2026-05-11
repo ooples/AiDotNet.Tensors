@@ -10534,6 +10534,35 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Double fast path via BLAS cblas_dgemm with transB=true. Mirrors the
+        // float branch's "skip the transpose materialization" trick. Used by
+        // every attention layer's QKᵀ on fp64 and by linear-layer backwards
+        // through MatMulTransposedBackward. Falls through to the materialize-
+        // transpose generic path below when BLAS isn't loaded (rare — the in-
+        // house SimdGemm.Dgemm doesn't carry a transB flag, so we don't have
+        // a non-BLAS fast path here; the existing TryGemmEx route gives us
+        // PyTorch-class throughput when libopenblas is available).
+        if (typeof(T) == typeof(double) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous && b.IsContiguous)
+        {
+            var aRaw = (double[])(object)a._storage.GetDataArray();
+            var bRaw = (double[])(object)b._storage.GetDataArray();
+            var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+            var rRaw = (double[])(object)result._storage.GetDataArray();
+            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+
+            if (Helpers.BlasProvider.TryGemmEx(M, N, K,
+                aRaw, aOff, K, false,
+                bRaw, bOff, K, true,
+                rRaw, rOff, N))
+            {
+                DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulTransposedBackward);
+                return result;
+            }
+            // BLAS not loaded — fall through to the materialize-transpose path
+            // (still better than nothing; future work: add an in-house
+            // DgemmTransposeB so we keep the fast path even without libopenblas).
+        }
+
         // Generic fallback: materialize the transpose and call TensorMatMul.
         // Slower than the fast path but correct for all dtypes / non-2D shapes.
         var bT = TensorTranspose(b);
@@ -10571,12 +10600,19 @@ public partial class CpuEngine : ITensorLevelEngine
                     // 2D/ND×2D/ND×ND cases to write-through kernels.
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
-                            cpuEng.TensorMatMulFloatInto(
+                            cpuEngF.TensorMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
                                 (Tensor<float>)(object)capturedB,
                                 (Tensor<float>)(object)output);
+                        }
+                        else if (typeof(T) == typeof(double) && eng is CpuEngine cpuEngD)
+                        {
+                            cpuEngD.TensorMatMulDoubleInto(
+                                (Tensor<double>)(object)capturedA,
+                                (Tensor<double>)(object)capturedB,
+                                (Tensor<double>)(object)output);
                         }
                         else
                         {
@@ -10661,6 +10697,110 @@ public partial class CpuEngine : ITensorLevelEngine
     internal void BatchMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
     {
         TensorMatMulFloatInto(a, b, output);
+    }
+
+    /// <summary>
+    /// Write-through MatMul for double — parallel to <see cref="TensorMatMulFloatInto"/>.
+    /// Routes through cblas_dgemm when BLAS is available (the typical case),
+    /// otherwise the in-house <see cref="Simd.SimdGemm.Dgemm"/>. Skips the
+    /// alloc+CopyTo round-trip of the public TensorMatMul entry point: BERT-
+    /// scale fp64 models call MatMul ~72× per layer, so per-call savings
+    /// compound across the inference. Dispatches 2D×2D, ND×2D, and ND×ND
+    /// same-rank cases — same shape contracts as the float counterpart.
+    /// </summary>
+    internal void TensorMatMulDoubleInto(Tensor<double> a, Tensor<double> b, Tensor<double> output)
+    {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var oArr = output.GetDataArray();
+
+        // 2D × 2D
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+            if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                aArr, 0, k, false,
+                bArr, 0, n, false,
+                oArr, 0, n))
+                return;
+            Simd.SimdGemm.Dgemm(
+                new System.ReadOnlySpan<double>(aArr, 0, m * k),
+                new System.ReadOnlySpan<double>(bArr, 0, k * n),
+                new System.Span<double>(oArr, 0, m * n),
+                m, k, n);
+            return;
+        }
+
+        // ND × 2D: collapse batch dims into m
+        if (b.Rank == 2)
+        {
+            int aRank = a.Rank;
+            int m = a._shape[aRank - 2];
+            int k = a._shape[aRank - 1];
+            int n = b._shape[1];
+            int batchSize = 1;
+            for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
+            int rows = batchSize * m;
+            if (Helpers.BlasProvider.TryGemmEx(rows, n, k,
+                aArr, 0, k, false,
+                bArr, 0, n, false,
+                oArr, 0, n))
+                return;
+            Simd.SimdGemm.Dgemm(
+                new System.ReadOnlySpan<double>(aArr, 0, rows * k),
+                new System.ReadOnlySpan<double>(bArr, 0, k * n),
+                new System.Span<double>(oArr, 0, rows * n),
+                rows, k, n);
+            return;
+        }
+
+        // ND × ND (same rank): per-batch GEMM
+        if (a.Rank == b.Rank)
+        {
+            int rank = a.Rank;
+            int m = a._shape[rank - 2];
+            int k = a._shape[rank - 1];
+            int n = b._shape[rank - 1];
+            int batchSize = 1;
+            for (int i = 0; i < rank - 2; i++) batchSize *= a._shape[i];
+            int sliceA = m * k, sliceB = k * n, sliceC = m * n;
+            if (batchSize == 1)
+            {
+                if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                    aArr, 0, k, false,
+                    bArr, 0, n, false,
+                    oArr, 0, n))
+                    return;
+                Simd.SimdGemm.Dgemm(
+                    new System.ReadOnlySpan<double>(aArr, 0, sliceA),
+                    new System.ReadOnlySpan<double>(bArr, 0, sliceB),
+                    new System.Span<double>(oArr, 0, sliceC),
+                    m, k, n);
+            }
+            else
+            {
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
+                {
+                    if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                        aArr, batch * sliceA, k, false,
+                        bArr, batch * sliceB, n, false,
+                        oArr, batch * sliceC, n))
+                        return;
+                    Simd.SimdGemm.DgemmSequential(
+                        new System.ReadOnlySpan<double>(aArr, batch * sliceA, sliceA),
+                        new System.ReadOnlySpan<double>(bArr, batch * sliceB, sliceB),
+                        new System.Span<double>(oArr, batch * sliceC, sliceC),
+                        m, k, n);
+                });
+            }
+            return;
+        }
+
+        throw new ArgumentException(
+            $"TensorMatMulDoubleInto: unsupported rank combination {a.Rank} and {b.Rank}");
     }
 
     internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
@@ -11096,6 +11236,40 @@ public partial class CpuEngine : ITensorLevelEngine
                     aF.AsSpan(aOffset, matrixSizeA),
                     bF.AsSpan(bOffset, matrixSizeB),
                     rF.AsSpan(resultOffset, matrixSizeResult),
+                    m, n, p);
+            });
+
+            return result;
+        }
+
+        // Double path: same rationale as the float branch above. DgemmSequential
+        // is the right variant inside this outer Parallel.For over batch — using
+        // Dgemm (which has its own internal parallel above ~16K work) would nest
+        // workers. BLAS dgemm via TryGemm is preferred when available; we hit
+        // the in-house Dgemm tiled FMA kernel only when BLAS isn't loaded.
+        if (typeof(T) == typeof(double))
+        {
+            var aD = (double[])(object)aData;
+            var bD = (double[])(object)bData;
+            var rD = (double[])(object)rData;
+
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
+            {
+                int aOffset = batch * matrixSizeA;
+                int bOffset = batch * matrixSizeB;
+                int resultOffset = batch * matrixSizeResult;
+
+                // Try BLAS dgemm first — that's the absolute fastest when libopenblas
+                // is loaded. Falls through to the in-house kernel below.
+                if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, n, p))
+                {
+                    return;
+                }
+
+                Simd.SimdGemm.DgemmSequential(
+                    aD.AsSpan(aOffset, matrixSizeA),
+                    bD.AsSpan(bOffset, matrixSizeB),
+                    rD.AsSpan(resultOffset, matrixSizeResult),
                     m, n, p);
             });
 
