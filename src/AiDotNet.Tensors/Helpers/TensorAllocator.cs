@@ -55,11 +55,62 @@ public static class TensorAllocator
             }
         }
 
+        // Streaming auto-engage for large pinned allocations. When a single
+        // tensor exceeds StreamingThresholdElements (100M elements ≈ 800 MB
+        // for double, 400 MB for float — matches the 125M-param threshold
+        // the model layer uses for ParameterBuffer skip), route through
+        // WeightRegistry.AllocateStreaming so the GPU-offload manager has
+        // a chance to evict cold weights to host RAM / disk and keep peak
+        // GC heap pressure bounded. The streaming pool itself decides
+        // whether to actually evict; this just makes the allocation visible
+        // to it. Element-type gate matches AllocateStreaming's contract
+        // (float, double, int, long, Half, BFloat16 only); other Ts skip
+        // streaming and fall through to plain `new Tensor<T>(shape)`.
+        if (totalSize >= StreamingThresholdElements && WeightRegistryAcceptsType<T>())
+        {
+            try
+            {
+                return AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming<T>(shape);
+            }
+            catch
+            {
+                // Streaming pool failure (budget exceeded, pool disposed, etc.)
+                // is non-fatal — fall through to plain allocation so the
+                // caller still gets a usable tensor.
+            }
+        }
+
         // No active arena — graceful degradation to standard CLR allocation.
         // The caller's "this lives across iterations" contract still holds
         // because plain Tensor<T> backing arrays aren't touched by Reset
         // (they were never in any arena pool to begin with).
         return new Tensor<T>(shape);
+    }
+
+    /// <summary>
+    /// Element-count threshold above which <see cref="RentPinned{T}"/> routes
+    /// through <see cref="AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming{T}"/>
+    /// instead of plain CLR allocation. 100M elements is the same order as the
+    /// 125M-param ParameterBuffer-skip threshold the model layer uses — picks
+    /// up the FC layers in BERT-large / VGG16-BN / GPT-3 attention banks
+    /// without engaging streaming for small Conv kernels (~10K elements).
+    /// </summary>
+    private const int StreamingThresholdElements = 100_000_000;
+
+    /// <summary>
+    /// Mirrors <see cref="AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming{T}"/>'s
+    /// supported-type whitelist so <see cref="RentPinned{T}"/> can skip the
+    /// streaming attempt for types it would throw on. Keep in sync with the
+    /// <c>IsStreamableType</c> check inside that method.
+    /// </summary>
+    private static bool WeightRegistryAcceptsType<T>()
+    {
+        var t = typeof(T);
+        return t == typeof(float) || t == typeof(double) || t == typeof(int) || t == typeof(long)
+#if NET5_0_OR_GREATER
+            || t == typeof(System.Half)
+#endif
+            ;
     }
 
     /// <summary>
