@@ -705,7 +705,7 @@ public class GradientTapeLeakTests
                 var ctx4 = engine.ScaledDotProductAttention(queries, keys, values,
                     mask: null,
                     scale: 1.0 / Math.Sqrt(HeadDim),
-                    out var attnWeights);
+                    out _);
 
                 // [B, H, S, D] -> [B, S, H, D] -> [B*S, Dim]
                 var ctxT = engine.TensorPermute(ctx4, new[] { 0, 2, 1, 3 });
@@ -808,10 +808,34 @@ public class GradientTapeLeakTests
             $"win1={w1PerCall} B/call, win2={w2PerCall} B/call " +
             $"(m0={m0} m1={m1} m2={m2}; {Measure} iters/window)");
 
-        // Hold the references to defeat the JIT's dead-code elimination —
-        // without this, the JIT can drop layerCaches early and we
-        // get a false-clean reading even pre-fix.
-        Assert.NotNull(layerCaches);
+        // Hold the references to defeat the JIT's dead-code elimination.
+        // Asserting `layerCaches != null` alone is not enough — the array
+        // identity stays live but the element-store code inside Step()
+        // (`layerCaches[L, k] = …`) can still be eliminated if no read
+        // ever observes the elements. Actually READ every slot and
+        // accumulate a checksum so the stores are provably load-bearing.
+        // A live cached intermediate is what makes this test reproduce
+        // reopened-AiDotNet#1227 — without it the autodiff arena's
+        // natural sweep masks the leak and the probe goes false-clean.
+        int liveCachedCount = 0;
+        long rankSum = 0;
+        for (int L = 0; L < NumLayers; L++)
+        {
+            for (int k = 0; k < 8; k++)
+            {
+                var cached = layerCaches[L, k];
+                if (cached is not null)
+                {
+                    liveCachedCount++;
+                    rankSum += cached.Rank;
+                }
+            }
+        }
+        GC.KeepAlive(layerCaches);
+        Assert.True(liveCachedCount > 0,
+            $"layerCaches expected at least one retained intermediate after Step() ran, " +
+            $"got {liveCachedCount}. JIT may have dead-store-eliminated the cache writes " +
+            $"(rankSum={rankSum}), which would invalidate the leak probe.");
 
         // 50 KB/call ceiling. Pre-fix this test produced ~100 KB/call;
         // with the cleanup-runs-for-null-sources fix it drops to 0 B/call
