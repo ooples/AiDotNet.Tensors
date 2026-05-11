@@ -219,11 +219,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
-            CuBlasNative.cublasSetMathMode(_cublasHandle, CuBlasNative.CUBLAS_TENSOR_OP_MATH);
 
+            // Math mode dispatch:
+            //   - Ampere+ (compute capability ≥ 8.0) + AllowTF32 = true:
+            //     CUBLAS_TF32_TENSOR_OP_MATH. Fp32 GEMMs run on the Tensor
+            //     Cores with TF32 multiply + fp32 accumulate, ~5× the FLOPs
+            //     of strict fp32. Loss curves match strict fp32 to within
+            //     measurement noise on every NVIDIA-published benchmark
+            //     (BERT, ResNet-50, Mask-R-CNN, T5).
+            //   - Volta / Turing (compute capability < 8.0) OR AllowTF32 = false:
+            //     legacy CUBLAS_TENSOR_OP_MATH, which gives the V100-class
+            //     fp16 Tensor-Core path for HGEMM but leaves fp32 GEMMs at
+            //     strict fp32.
+            // Compute-capability check uses the value we just read; AllowTF32
+            // honors AIDOTNET_DISABLE_TF32 env var + runtime override.
             var cc = GetComputeCapability(device);
             _ccMajor = cc.Major;
             _ccMinor = cc.Minor;
+
+            bool useTF32 = _ccMajor >= 8 && CudaDispatchPolicy.AllowTF32;
+            int mathMode = useTF32
+                ? CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
+                : CuBlasNative.CUBLAS_TENSOR_OP_MATH;
+            CuBlasNative.cublasSetMathMode(_cublasHandle, mathMode);
 
             // Query clock rate for theoretical GFLOPS calculation
             if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)

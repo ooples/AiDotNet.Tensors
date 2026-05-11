@@ -51,6 +51,41 @@ internal static class CudaDispatchPolicy
         => TensorCodecOptions.Current.UseCublas;
 
     /// <summary>
+    /// Returns true when fp32 cuBLAS GEMMs should use TF32 (TensorFloat-32)
+    /// accumulation on Ampere+ (compute capability ≥ 8.0). TF32 rounds the
+    /// 23-bit fp32 mantissa to 10 bits for the multiply, accumulates at full
+    /// fp32, and runs on the Tensor Cores. The result is ~5× the throughput
+    /// of strict fp32 with bit-comparable training-loss curves on every
+    /// published benchmark (NVIDIA: BERT, ResNet-50, Mask-R-CNN, T5).
+    /// </summary>
+    /// <remarks>
+    /// <para>Default: true. Opt out by:
+    /// <list type="bullet">
+    /// <item>setting <c>AIDOTNET_DISABLE_TF32</c> to any non-empty value
+    /// before process startup (checked at <see cref="CudaBackend"/> init time), or</item>
+    /// <item>flipping the static <see cref="AllowTF32"/> property at runtime —
+    /// changes take effect on the next <see cref="CudaBackend"/> instance
+    /// (current backends keep the math mode they were initialized with).</item>
+    /// </list></para>
+    /// <para>When to disable: numerical-reproducibility runs that need bit-exact
+    /// fp32 arithmetic (regression tests pinned to a reference output), Volta or
+    /// older hardware (the property short-circuits via compute-capability check
+    /// in <see cref="CudaBackend"/>, so this is for forcing the legacy path on
+    /// Ampere+ rather than relaxing it on older hardware).</para>
+    /// </remarks>
+    public static bool AllowTF32
+    {
+        get
+        {
+            if (_allowTF32Override.HasValue) return _allowTF32Override.Value;
+            return string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_TF32"));
+        }
+        set => _allowTF32Override = value;
+    }
+
+    private static bool? _allowTF32Override;
+
+    /// <summary>
     /// Push a <see cref="PerformanceProfiler"/> scope with a kernel-path
     /// label so downstream telemetry can distinguish vendor vs generic
     /// kernel runs.
