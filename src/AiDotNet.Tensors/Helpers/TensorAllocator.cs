@@ -306,6 +306,23 @@ public static class TensorAllocator
     }
 
     /// <summary>
+    /// Clearer-named alias for <see cref="Rent{T}(int[], T[])"/>. New call
+    /// sites should prefer this name — the <c>Rent</c> verb on the other
+    /// overload implies pool/arena renting, which can mislead readers of
+    /// code that's actually adopting caller-owned storage. <c>Adopt</c>
+    /// names the semantic precisely: this overload doesn't rent from any
+    /// pool; it takes ownership of an existing <c>T[]</c> and wraps it as
+    /// the tensor's backing storage. The other <see cref="Rent{T}(int[], T[])"/>
+    /// remains for the ~136 existing call sites; both are zero-copy and
+    /// have identical runtime behavior.
+    /// </summary>
+    /// <param name="shape">The tensor shape; product must equal <c>data.Length</c>.</param>
+    /// <param name="data">A caller-owned array. After this call returns, the
+    /// caller MUST NOT retain a reference — the tensor wraps it directly.</param>
+    public static Tensor<T> Adopt<T>(int[] shape, T[] data)
+        => Rent(shape, data);
+
+    /// <summary>
     /// Creates a tensor with the given shape and data from a Vector.
     /// Zero-copy when the Vector's backing array is exactly the right size
     /// (common pattern: caller does new T[n], computes into it, wraps in Vector).

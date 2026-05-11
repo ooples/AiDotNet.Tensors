@@ -171,18 +171,21 @@ internal static class BackwardScratch<T>
         // wrapper object. We avoid that wrapper alloc on the steady-
         // state path by also caching the last-reshaped view per shape.
         //
-        // Reshape's GradFn-attaching behavior is safe here:
+        // Reshape's GradFn-attaching behavior is sidestepped uniformly:
         //   * Common backward (createGraph=false): ComputeGradientsViaGraph
         //     suspends the current tape before calling chain.Execute, so
-        //     Tensor.Reshape sees Current==null and does not set GradFn.
+        //     Tensor.Reshape already sees Current==null and would not set
+        //     GradFn even without the local guard below.
         //   * Higher-order AD (createGraph=true): the tape is NOT
-        //     suspended; the seed legitimately needs a recorded GradFn
-        //     so the outer Hvp/Hessian pass can walk back through it.
-        // The cached view is invalidated whenever lossShape changes,
-        // so a stale GradFn from a prior createGraph=true call cannot
-        // bleed into a subsequent createGraph=false call (the latter
-        // would re-Reshape and the suspended tape produces a clean
-        // GradFn-free view).
+        //     suspended by the outer caller, so without a local guard the
+        //     cached seed's Reshape would record a GradFn back into the
+        //     outer graph. A cached *seed* must remain a pure constant —
+        //     it's the gradient identity at the loss tensor, not a
+        //     differentiable op — so the local NoGradScope below
+        //     suppresses recording in BOTH cases.
+        // Net effect: the cached view never carries a GradFn, regardless
+        // of createGraph mode. The wrapping NoGradScope at the reshape
+        // site (RentSeedGradient line ~217) is the load-bearing piece.
         if (_cachedSeed is null || _cachedSeedLength != length)
         {
             var numOps = MathHelper.GetNumericOperations<T>();

@@ -49,9 +49,29 @@ public class Issue319TransformerBlockPerfTests
     /// outputs must match within float32 rounding (the two paths
     /// reorder some FMAs / multiplies, so the LSB can differ slightly).
     /// </summary>
+    /// <remarks>
+    /// Skipped on hosts without AVX2 + FMA: both kernels gate their fast
+    /// path on <c>Avx2.IsSupported &amp;&amp; Fma.IsSupported</c> and fall
+    /// through to scalar on older hardware. The scalar paths are
+    /// trivially identical (same source expression), so the SIMD
+    /// equivalence assertion the test is named for only has signal on
+    /// hardware that actually runs the SIMD branch. Defensive guard so
+    /// CI workers without AVX2 (rare but possible on some ARM /
+    /// older-AMD images) skip cleanly instead of asserting against the
+    /// scalar fallback.
+    /// </remarks>
     [Fact]
     public void GELU_FusedKernel_NumericallyMatchesTanhDecomposition()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported
+            || !System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            // Both kernels would take the scalar fallback identically on
+            // this host — the SIMD-path equivalence assertion this test is
+            // designed for has no signal here.
+            return;
+        }
+
         const int Length = 4096;
         var rng = new Random(42);
         var input = new float[Length];

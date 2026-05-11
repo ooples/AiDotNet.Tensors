@@ -205,6 +205,97 @@ public class OptimizerKernelsTests
     }
 
     [Fact]
+    public void AdamInPlace_Double_MatchesReferenceFormula()
+    {
+        // Double-precision SIMD branch coverage (PR #322 review #5).
+        // OptimizerKernels.AdamInPlace<double> dispatches through
+        // FusedOptimizer.AdamUpdateSimd's double overload (AVX2+FMA on x64,
+        // scalar fallback elsewhere). The float test above covers the float
+        // path; this test does the same numerical equivalence check for
+        // double so the double SIMD branch can't silently regress.
+        const int N = 4096;
+        var rng = new Random(1002);
+        var paramKernel = MakeRandom<double>(N, rng);
+        var paramRef = CloneDouble(paramKernel);
+        var grad = MakeRandom<double>(N, rng);
+        var mKernel = new Tensor<double>(new[] { N });
+        var vKernel = new Tensor<double>(new[] { N });
+        var mRef = new Tensor<double>(new[] { N });
+        var vRef = new Tensor<double>(new[] { N });
+
+        const double lr = 1e-3;
+        const double b1 = 0.9;
+        const double b2 = 0.999;
+        const double eps = 1e-8;
+
+        for (int step = 1; step <= 5; step++)
+        {
+            OptimizerKernels.AdamInPlace(paramKernel, grad, mKernel, vKernel, lr, b1, b2, eps, step);
+            AdamReferenceDouble(paramRef, grad, mRef, vRef, lr, b1, b2, eps, step);
+
+            var spanK = paramKernel.AsSpan();
+            var spanR = paramRef.AsSpan();
+            double maxDiff = 0;
+            for (int i = 0; i < N; i++)
+            {
+                double diff = Math.Abs(spanK[i] - spanR[i]);
+                // 1e-13 relative tolerance is ~3 ULPs at double precision —
+                // tight enough to catch a formula bug, loose enough to
+                // tolerate the SIMD path's FMA-reordering.
+                double tol = 1e-13 * Math.Max(1.0, Math.Abs(spanR[i]));
+                Assert.True(diff <= tol,
+                    $"Step {step}: AdamInPlace<double> diverges at idx {i}: kernel={spanK[i]} ref={spanR[i]} diff={diff}");
+                if (diff > maxDiff) maxDiff = diff;
+            }
+            _output.WriteLine($"Adam<double> step {step}: max abs diff = {maxDiff:E4}");
+        }
+    }
+
+    [Fact]
+    public void AdamWInPlace_Double_AppliesDecoupledWeightDecay()
+    {
+        // Same parity check as the float AdamW test but on the double SIMD
+        // branch (PR #322 review #5). weightDecay=0 must be byte-identical
+        // to Adam; weightDecay>0 must diverge on most elements via the
+        // (1 - weightDecay*lr) pre-multiply.
+        const int N = 1024;
+        var rng = new Random(2003);
+        var p1 = MakeRandom<double>(N, rng);
+        var p2 = CloneDouble(p1);
+        var grad = MakeRandom<double>(N, rng);
+        var m1 = new Tensor<double>(new[] { N });
+        var v1 = new Tensor<double>(new[] { N });
+        var m2 = new Tensor<double>(new[] { N });
+        var v2 = new Tensor<double>(new[] { N });
+
+        OptimizerKernels.AdamInPlace(p1, grad, m1, v1, 1e-3, 0.9, 0.999, 1e-8, 1);
+        OptimizerKernels.AdamWInPlace(p2, grad, m2, v2, 1e-3, 0.9, 0.999, 1e-8, weightDecay: 0.0, step: 1);
+
+        var s1 = p1.AsSpan();
+        var s2 = p2.AsSpan();
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(s1[i], s2[i]);
+        }
+
+        var p3 = MakeRandom<double>(N, rng);
+        var p4 = CloneDouble(p3);
+        var m3 = new Tensor<double>(new[] { N });
+        var v3 = new Tensor<double>(new[] { N });
+        var m4 = new Tensor<double>(new[] { N });
+        var v4 = new Tensor<double>(new[] { N });
+        OptimizerKernels.AdamInPlace(p3, grad, m3, v3, 1e-3, 0.9, 0.999, 1e-8, 1);
+        OptimizerKernels.AdamWInPlace(p4, grad, m4, v4, 1e-3, 0.9, 0.999, 1e-8, weightDecay: 0.1, step: 1);
+
+        var s3 = p3.AsSpan();
+        var s4 = p4.AsSpan();
+        int differences = 0;
+        for (int i = 0; i < N; i++) if (s3[i] != s4[i]) differences++;
+        Assert.True(differences > N / 2,
+            $"AdamW<double> with weightDecay=0.1 should differ from Adam on most elements; observed {differences}/{N}.");
+    }
+
+    [Fact]
     public void AdamInPlace_RejectsBadArguments()
     {
         var p = new Tensor<float>(new[] { 4 });
@@ -337,6 +428,27 @@ public class OptimizerKernelsTests
             float mHat = ms[i] / bc1;
             float vHat = vs[i] / bc2;
             p[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    private static void AdamReferenceDouble(
+        Tensor<double> param, Tensor<double> grad,
+        Tensor<double> m, Tensor<double> v,
+        double lr, double beta1, double beta2, double eps, int step)
+    {
+        var p = param.AsWritableSpan();
+        var g = grad.AsSpan();
+        var ms = m.AsWritableSpan();
+        var vs = v.AsWritableSpan();
+        double bc1 = 1.0 - Math.Pow(beta1, step);
+        double bc2 = 1.0 - Math.Pow(beta2, step);
+        for (int i = 0; i < p.Length; i++)
+        {
+            ms[i] = beta1 * ms[i] + (1.0 - beta1) * g[i];
+            vs[i] = beta2 * vs[i] + (1.0 - beta2) * g[i] * g[i];
+            double mHat = ms[i] / bc1;
+            double vHat = vs[i] / bc2;
+            p[i] -= lr * mHat / (Math.Sqrt(vHat) + eps);
         }
     }
 
