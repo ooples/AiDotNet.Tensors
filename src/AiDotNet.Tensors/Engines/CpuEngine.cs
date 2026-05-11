@@ -9237,7 +9237,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("GLU", result, input, BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
         AutoTracer.RecordOp("GLU", result, eng => result);
         return result;
@@ -9297,7 +9297,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <summary>
@@ -9360,7 +9360,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("GeGLU", result, input, BackwardFunctions<T>.GeGLUBackward,
             new object[] { actualDim });
         return result;
@@ -9429,7 +9429,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <summary>
@@ -9491,7 +9491,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("SwiGLU", result, input, BackwardFunctions<T>.SwiGLUBackward,
             new object[] { actualDim });
         return result;
@@ -9554,7 +9554,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <summary>
@@ -9614,7 +9614,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReGLU", result, input, BackwardFunctions<T>.ReGLUBackward,
             new object[] { actualDim });
         return result;
@@ -9675,7 +9675,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
 
@@ -10997,7 +10997,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var ops2 = MathHelper.GetNumericOperations<T>();
             var resultArr = new T[gradInputF.Length];
             ops2.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(inputShape, new Vector<T>(resultArr));
+            return TensorAllocator.Rent<T>(inputShape, resultArr);
         }
 
         // Generic fallback for non-float types
@@ -11039,7 +11039,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInput));
+        return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
     /// <inheritdoc/>
@@ -11148,7 +11148,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var ops2 = MathHelper.GetNumericOperations<T>();
             var resultArr = new T[gradKernelF.Length];
             ops2.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(resultArr));
+            return TensorAllocator.Rent<T>(kernelShape, resultArr);
         }
 
         // Generic fallback for non-float types
@@ -11192,7 +11192,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, gradKernel);
     }
 
     /// <inheritdoc/>
@@ -11418,7 +11418,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], outputData);
         // Tape registration — without it, dL/dInput silently dropped on this overload (#255 audit).
         // Snapshot poolSize/stride: callers can reuse + mutate the int[] they passed in, which would
         // make backward replay with parameters that no longer match the forward result.
@@ -11609,7 +11609,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = new T[batch0 * outChannels0 * outputHeight0 * outputWidth0];
         DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
 
-        var dwConvResult = TensorAllocator.Rent<T>([batch0, outChannels0, outputHeight0, outputWidth0], new Vector<T>(outputData));
+        var dwConvResult = TensorAllocator.Rent<T>([batch0, outChannels0, outputHeight0, outputWidth0], outputData);
         DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
         AutoTracer.RecordOp("DepthwiseConv2D", dwConvResult, eng => dwConvResult);
         return dwConvResult;
@@ -11750,7 +11750,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInput));
+        return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
     /// <inheritdoc/>
@@ -11823,7 +11823,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, gradKernel);
     }
 
     /// <inheritdoc/>
@@ -12039,7 +12039,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 });
         }
 
-        var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], outputData);
         DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, inputOrig, kernelOrig,
             BackwardFunctions<T>.ConvTranspose2DBackward,
             savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
@@ -12214,7 +12214,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, gradKernel);
     }
 
     #region Deformable Convolution Operations
@@ -13643,7 +13643,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -13833,7 +13833,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernelData));
+        return TensorAllocator.Rent<T>(kernelShape, gradKernelData);
     }
 
     /// <inheritdoc/>
@@ -14127,7 +14127,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -14370,7 +14370,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -14434,7 +14434,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var up3dResult = TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        var up3dResult = TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], outputData);
         DifferentiableOps.RecordUnary("Upsample3D", up3dResult, input, BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
         AutoTracer.RecordOp("Upsample3D", up3dResult, eng => up3dResult);
         return up3dResult;
@@ -14497,7 +14497,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -14627,7 +14627,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], outputData);
         DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, inputOrig, kernelOrig, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
         { var ca = input; var cb = kernel; var cs2 = stride; var cp2 = padding; var cop2 = outputPadding; AutoTracer.RecordOp("ConvTranspose3D", ct3dResult, eng => eng.ConvTranspose3D(ca, cb, cs2, cp2, cop2)); }
         return ct3dResult;
@@ -14742,7 +14742,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernelData));
+        return TensorAllocator.Rent<T>(kernelShape, gradKernelData);
     }
 
     #endregion
@@ -14921,7 +14921,7 @@ public partial class CpuEngine : ITensorLevelEngine
             finalGradInput[idx] = sumGrad;
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(finalGradInput));
+        return TensorAllocator.Rent<T>(inputShape, finalGradInput);
     }
 
     /// <inheritdoc/>
@@ -14993,7 +14993,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradWeights[idx] = sum;
         });
 
-        return TensorAllocator.Rent<T>(weightsShape, new Vector<T>(gradWeights));
+        return TensorAllocator.Rent<T>(weightsShape, gradWeights);
     }
 
     /// <inheritdoc/>
@@ -15031,7 +15031,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradBias[oc] = sum;
         });
 
-        return TensorAllocator.Rent<T>(new[] { outChannels }, new Vector<T>(gradBias));
+        return TensorAllocator.Rent<T>(new[] { outChannels }, gradBias);
     }
 
     #endregion
@@ -15388,7 +15388,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var gInF = new float[outF.Length];
             SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, new Vector<T>((T[])(object)gInF));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInF);
         }
 #endif
 
@@ -15417,7 +15417,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output._shape, gradInputData);
     }
 
 #if NET5_0_OR_GREATER
@@ -15556,7 +15556,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> softResult;
         using (new NoGradScope<T>())
         {
-            var perturbedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(perturbedData));
+            var perturbedTensor = TensorAllocator.Rent<T>(shape, perturbedData);
             softResult = Softmax(perturbedTensor, axis);
         }
 
@@ -15605,7 +15605,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // We pass `softResult` (the soft sample) to GumbelSoftmaxBackward via
         // savedState — the engine kernel uses it for the softmax-Jacobian
         // step. inputs[0]=input is what gradient accumulates into.
-        var hardResult = TensorAllocator.Rent<T>(shape, new Vector<T>(hardData));
+        var hardResult = TensorAllocator.Rent<T>(shape, hardData);
         DifferentiableOps.RecordUnary("GumbelSoftmax", hardResult, input,
             BackwardFunctions<T>.GumbelSoftmaxStraightThroughBackward,
             new object[] { temperature, axis, softResult });
@@ -15634,7 +15634,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradData[i] = numOps.Multiply(gradData[i], scale);
         }
 
-        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(output._shape, gradData);
     }
 
     /// <inheritdoc/>
@@ -15717,7 +15717,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var taylorResult = TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        var taylorResult = TensorAllocator.Rent<T>(shape, outputData);
         DifferentiableOps.RecordUnary("TaylorSoftmax", taylorResult, input, BackwardFunctions<T>.TaylorSoftmaxBackward, new object[] { order, axis });
         { var ci = input; var co = order; var ca = axis; AutoTracer.RecordOp("TaylorSoftmax", taylorResult, eng => eng.TaylorSoftmax(ci, co, ca)); }
         return taylorResult;
@@ -15808,7 +15808,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -15877,7 +15877,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var sparsemaxResult = TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        var sparsemaxResult = TensorAllocator.Rent<T>(shape, outputData);
         DifferentiableOps.RecordUnary("Sparsemax", sparsemaxResult, input, BackwardFunctions<T>.SparsemaxBackward, new object[] { axis });
         { var ci = input; var ca = axis; AutoTracer.RecordOp("Sparsemax", sparsemaxResult, eng => eng.Sparsemax(ci, ca)); }
         return sparsemaxResult;
@@ -15936,7 +15936,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -15991,7 +15991,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> sphResult;
         using (new NoGradScope<T>())
         {
-            var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
+            var normalizedTensor = TensorAllocator.Rent<T>(shape, normalizedData);
             sphResult = Softmax(normalizedTensor, axis);
         }
         DifferentiableOps.RecordUnary("SphericalSoftmax", sphResult, input,
@@ -16053,7 +16053,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         // Get softmax gradient with respect to normalized input
-        var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
+        var normalizedTensor = TensorAllocator.Rent<T>(shape, normalizedData);
         var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
         var softmaxGradData = softmaxGrad.GetDataArray();
 
@@ -16084,7 +16084,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -16196,11 +16196,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = TensorAllocator.Rent<T>([features], new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>([features], new Vector<T>(varData));
+        mean = TensorAllocator.Rent<T>([features], meanData);
+        variance = TensorAllocator.Rent<T>([features], varData);
 
         // Return with original shape (restore 1D if input was 1D)
-        var result = TensorAllocator.Rent<T>(workingInput._shape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(workingInput._shape, outputData);
         var bnResult = was1D ? result.Reshape([features]) : result;
         DifferentiableOps.RecordIfActive("BatchNorm", bnResult, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
         return bnResult;
@@ -16267,9 +16267,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = TensorAllocator.Rent<T>([channels], new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>([channels], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>([channels], meanData);
+        variance = TensorAllocator.Rent<T>([channels], varData);
+        return TensorAllocator.Rent<T>(input._shape, outputData);
     }
 
 
@@ -16361,9 +16361,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mean = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>(new[] { channels }, meanData);
+        variance = TensorAllocator.Rent<T>(new[] { channels }, varData);
+        return TensorAllocator.Rent<T>(input._shape, outputData);
     }
 
     private static unsafe void BatchNorm4DFloat(float[] input, float[] gamma, float[] beta, float eps,
@@ -16700,9 +16700,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = TensorAllocator.Rent<T>([features], new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>([features], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([features], gradGammaData);
+        gradBeta = TensorAllocator.Rent<T>([features], gradBetaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
 
@@ -16852,9 +16852,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], gradGammaData);
+        gradBeta = TensorAllocator.Rent<T>([channels], gradBetaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <summary>
@@ -16930,9 +16930,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(new[] { channels }, gradGammaData);
+        gradBeta = TensorAllocator.Rent<T>(new[] { channels }, gradBetaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -17193,9 +17193,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Create mean and variance tensors with batch shape
-        mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>(batchShape, new Vector<T>(varData));
-        var lnResultG = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>(batchShape, meanData);
+        variance = TensorAllocator.Rent<T>(batchShape, varData);
+        var lnResultG = TensorAllocator.Rent<T>(input._shape, outputData);
         DifferentiableOps.RecordIfActive("LayerNorm", lnResultG, new[] { input, gamma, beta },
             BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
         AutoTracer.RecordOp("LayerNorm", lnResultG, eng => lnResultG);
@@ -18375,9 +18375,9 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], gradGammaData);
+        gradBeta = TensorAllocator.Rent<T>([channels], gradBetaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
 
@@ -18461,8 +18461,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
         });
 
-        rms = TensorAllocator.Rent<T>(batchShape, new Vector<T>(rmsData));
-        var rmsResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        rms = TensorAllocator.Rent<T>(batchShape, rmsData);
+        var rmsResult = TensorAllocator.Rent<T>(input._shape, outputData);
         DifferentiableOps.RecordIfActive("RMSNorm", rmsResult, new[] { inputOrig, gamma },
             BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
         AutoTracer.RecordOp("RMSNorm", rmsResult, eng => rmsResult);
@@ -18616,8 +18616,8 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(gamma._shape, gradGammaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     #endregion
@@ -18811,7 +18811,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        attentionWeights = TensorAllocator.Rent<T>([batch, heads, seqQ, seqK], new Vector<T>(weightsData));
+        attentionWeights = TensorAllocator.Rent<T>([batch, heads, seqQ, seqK], weightsData);
 
         // Compute output: weights @ V -> [batch, heads, seqQ, d_v]
         var outputData = new T[batch * heads * seqQ * d_v];
@@ -18839,7 +18839,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], outputData);
         DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultGen,
             new[] { queryOrig, keyOrig, valueOrig },
             BackwardFunctions<T>.ScaledDotProductAttentionBackward,
@@ -19326,9 +19326,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, gradQData);
+        gradKey = TensorAllocator.Rent<T>(key._shape, gradKData);
+        gradValue = TensorAllocator.Rent<T>(value._shape, gradVData);
 
         return gradOutput;
     }
@@ -19915,8 +19915,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], new Vector<T>(statsData));
-        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
+        softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], statsData);
+        var resultGen = TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], outputData);
         // Tape registration — variable-length savedState encodes optional
         // attentionBias (3 entries when null, 4 when present). See
         // FlashAttentionBackward and SavedStateSerializer for why DBNull /
@@ -20363,9 +20363,9 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, gradQData);
+        gradKey = TensorAllocator.Rent<T>(key._shape, gradKData);
+        gradValue = TensorAllocator.Rent<T>(value._shape, gradVData);
 
         return gradOutput;
     }
@@ -20663,8 +20663,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        attentionWeights = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, seqK], new Vector<T>(weightsData));
-        var gqaResult = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, headDim], new Vector<T>(outputData));
+        attentionWeights = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, seqK], weightsData);
+        var gqaResult = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, headDim], outputData);
         double gqaScale = scale ?? (1.0 / Math.Sqrt(headDim));
         DifferentiableOps.RecordIfActive("GroupedQueryAttention", gqaResult,
             new[] { query, key, value },
@@ -20814,9 +20814,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, gradQData);
+        gradKey = TensorAllocator.Rent<T>(key._shape, gradKData);
+        gradValue = TensorAllocator.Rent<T>(value._shape, gradVData);
 
         return gradOutput;
     }
@@ -20946,8 +20946,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
-        var gatResult = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
+        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, coeffsData);
+        var gatResult = TensorAllocator.Rent<T>(nodeFeatures._shape, outputData);
         // Snapshot the edge-index tensors as portable int[] data + int[] shape
         // pairs so the savedState round-trips through SavedStateSerializer.
         // Saving Tensor<int> directly would throw at checkpoint time when the
@@ -21126,9 +21126,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        gradNodeFeatures = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(gradNodeData));
-        gradAttentionWeightSource = TensorAllocator.Rent<T>(attentionWeightSource._shape, new Vector<T>(gradAttnSrc));
-        gradAttentionWeightTarget = TensorAllocator.Rent<T>(attentionWeightTarget._shape, new Vector<T>(gradAttnTgt));
+        gradNodeFeatures = TensorAllocator.Rent<T>(nodeFeatures._shape, gradNodeData);
+        gradAttentionWeightSource = TensorAllocator.Rent<T>(attentionWeightSource._shape, gradAttnSrc);
+        gradAttentionWeightTarget = TensorAllocator.Rent<T>(attentionWeightTarget._shape, gradAttnTgt);
 
         return gradOutput;
     }
@@ -21198,9 +21198,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Create transformed tensor for this head
-            var transformedTensor = TensorAllocator.Rent<T>(new[] { batchSize, numNodes, headDim }, new Vector<T>(transformedData));
-            var headAttnSrcTensor = TensorAllocator.Rent<T>(new[] { headDim }, new Vector<T>(headAttnSrc));
-            var headAttnTgtTensor = TensorAllocator.Rent<T>(new[] { headDim }, new Vector<T>(headAttnTgt));
+            var transformedTensor = TensorAllocator.Rent<T>(new[] { batchSize, numNodes, headDim }, transformedData);
+            var headAttnSrcTensor = TensorAllocator.Rent<T>(new[] { headDim }, headAttnSrc);
+            var headAttnTgtTensor = TensorAllocator.Rent<T>(new[] { headDim }, headAttnTgt);
 
             // Apply single-head GAT
             var headOutput = GraphAttention(
@@ -21268,8 +21268,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numHeads, numEdges }, new Vector<T>(allCoeffsData));
-        return TensorAllocator.Rent<T>(new[] { batchSize, numNodes, outFeatures }, new Vector<T>(outputData));
+        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numHeads, numEdges }, allCoeffsData);
+        return TensorAllocator.Rent<T>(new[] { batchSize, numNodes, outFeatures }, outputData);
     }
 
 
@@ -21345,7 +21345,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var scatterAddResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterAddResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ScatterAdd", scatterAddResult, source, BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, actualDim });
         { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterAdd", scatterAddResult, eng => eng.ScatterAdd(cs, ci, cd, co)); }
         return scatterAddResult;
@@ -21399,7 +21399,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, gradInputData);
     }
 
     /// <summary>
@@ -21571,7 +21571,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         counts = new Tensor<int>([outDimSize], new Vector<int>(countData));
-        var scatterMeanResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterMeanResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ScatterMean", scatterMeanResult, source, BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, counts });
         { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterMean", scatterMeanResult, eng => { eng.ScatterMean(cs, ci, out _, cd, co); return scatterMeanResult; }); }
         return scatterMeanResult;
@@ -21630,7 +21630,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, gradInputData);
     }
 
     /// <summary>
@@ -21704,7 +21704,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         argmax = new Tensor<int>(outputShape, new Vector<int>(argmaxData));
-        var scatterMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterMaxResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ScatterMax", scatterMaxResult, source, BackwardFunctions<T>.ScatterMaxBackward, new object[] { indices, argmax });
         { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterMax", scatterMaxResult, eng => { eng.ScatterMax(cs, ci, out _, cd, co); return scatterMaxResult; }); }
         return scatterMaxResult;
@@ -21761,7 +21761,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, gradInputData);
     }
 
     /// <summary>
@@ -21852,7 +21852,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var scatterSmResult = TensorAllocator.Rent<T>(source._shape, new Vector<T>(outputData));
+        var scatterSmResult = TensorAllocator.Rent<T>(source._shape, outputData);
         DifferentiableOps.RecordUnary("ScatterSoftmax", scatterSmResult, source, BackwardFunctions<T>.ScatterSoftmaxBackward, new object[] { indices });
         { var cs2 = source; var ci2 = indices; AutoTracer.RecordOp("ScatterSoftmax", scatterSmResult, eng => eng.ScatterSoftmax(cs2, ci2, dim, outputSize)); }
         return scatterSmResult;
@@ -21929,7 +21929,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output._shape, gradInputData);
     }
 
     #endregion
@@ -22134,7 +22134,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReduceMax", reduceMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
         { var ci = input; var ca = axes; var ck = keepDims; AutoTracer.RecordOp("ReduceMax", reduceMaxResult, eng => { eng.ReduceMax(ci, ca, ck, out _); return reduceMaxResult; }); }
         return reduceMaxResult;
@@ -22160,7 +22160,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -22313,7 +22313,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReduceMean", result, input,
             BackwardFunctions<T>.ReduceMeanBackward,
             savedState: new object[] { normalizedAxes.ToArray() });
@@ -22384,7 +22384,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(gradOutputData[outputIdx], scale);
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -22558,7 +22558,7 @@ public partial class CpuEngine : ITensorLevelEngine
             outputData[i] = numOps.Multiply(outputData[i], scale);
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, outputData);
     }
 
     /// <summary>
@@ -22630,7 +22630,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Multiply(outputData[i], scale);
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         // savedState order matches existing BackwardFunctions<T>.ReduceVarianceBackward: [axes, mean].
         // Snapshot axes (caller-owned int[]) and key the recorded op against the
         // ORIGINAL input reference, not the contiguous copy used by the math.
@@ -22686,7 +22686,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, scale), gradOutputData[outputIdx]);
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -22713,7 +22713,7 @@ public partial class CpuEngine : ITensorLevelEngine
             varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
         }
 
-        var logVarResult = TensorAllocator.Rent<T>(variance._shape, new Vector<T>(varianceData));
+        var logVarResult = TensorAllocator.Rent<T>(variance._shape, varianceData);
         // Compute mean inside NoGradScope to avoid adding disconnected tape entries
         Tensor<T> mean;
         using (new NoGradScope<T>())
@@ -22823,7 +22823,7 @@ public partial class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, gradScale), gradOutputData[outputIdx]);
         }
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     // Helper methods for reduction operations
@@ -23093,7 +23093,7 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape[heightIdx] = newHeight;
         outputShape[widthIdx] = newWidth;
 
-        var upsampleResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var upsampleResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("Upsample", upsampleResult, input,
             BackwardFunctions<T>.UpsampleBackward,
             savedState: new object[] { scaleH, scaleW });
@@ -23152,7 +23152,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <summary>
@@ -23338,7 +23338,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     public Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
@@ -23891,7 +23891,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <summary>
@@ -24052,7 +24052,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -24143,7 +24143,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 dstCgOffset += cgIn;
             }
-            var packedResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+            var packedResult = TensorAllocator.Rent<T>(outputShape, outputData);
             packedResult.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             return packedResult;
         }
@@ -24168,7 +24168,7 @@ public partial class CpuEngine : ITensorLevelEngine
             axisOffset += tensor._shape[axis];
         }
 
-        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, outputData);
         if (GradientTape<T>.Current is not null)
         {
             DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),
@@ -25389,7 +25389,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             });
 
-            var result = TensorAllocator.Rent<T>(outShape, new Vector<T>(resultData));
+            var result = TensorAllocator.Rent<T>(outShape, resultData);
             DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indicesOrig, normalizedAxis });
             { var cs = source; var ci = indices; var ca = normalizedAxis; AutoTracer.RecordOp("TensorGather", result, eng => eng.TensorGather(cs, ci, ca)); }
             return result;
@@ -27371,7 +27371,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, new Vector<T>(outputData));
+        var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
             BackwardFunctions<T>.LogSoftmaxBackward);
         AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => logSoftmaxResult);
@@ -30542,7 +30542,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * s * (1.0 - s));
         }
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
     private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
@@ -30630,7 +30630,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * (1.0 - t * t));
         }
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
     private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
@@ -30756,7 +30756,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -31158,9 +31158,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mean = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(varData));
-        var inResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        mean = TensorAllocator.Rent<T>([batch, channels], meanData);
+        variance = TensorAllocator.Rent<T>([batch, channels], varData);
+        var inResult = TensorAllocator.Rent<T>(input._shape, resultData);
         DifferentiableOps.RecordIfActive("InstanceNorm", inResult, new[] { input, gamma, beta },
             BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
         AutoTracer.RecordOp("InstanceNorm", inResult, eng => inResult);
@@ -31235,9 +31235,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], gradGammaData);
+        gradBeta = TensorAllocator.Rent<T>([channels], gradBetaData);
+        return TensorAllocator.Rent<T>(input._shape, gradInputData);
     }
 
     /// <inheritdoc/>
@@ -31340,7 +31340,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradOutput.Length; i++)
             resultData[i] = numOps.Multiply(gradData[i], maskData[i]);
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(gradOutput._shape, resultData);
     }
 
     /// <inheritdoc/>
@@ -31425,7 +31425,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 resultData[dstOffset + j] = numOps.Add(resultData[dstOffset + j], gradData[srcOffset + j]);
         }
 
-        return TensorAllocator.Rent<T>([vocabSize, embeddingDim], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([vocabSize, embeddingDim], resultData);
     }
 
     /// <inheritdoc/>
@@ -31576,7 +31576,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int b = 0; b < batchSize; b++) processBatch(b);
         }
 
-        return TensorAllocator.Rent<T>(predictions._shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(predictions._shape, gradData);
     }
 
     /// <inheritdoc/>
@@ -31660,7 +31660,7 @@ public partial class CpuEngine : ITensorLevelEngine
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
-        return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
     }
 
     /// <inheritdoc/>
@@ -31696,7 +31696,7 @@ public partial class CpuEngine : ITensorLevelEngine
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
-        return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
     }
 
     /// <summary>
@@ -32114,7 +32114,7 @@ public partial class CpuEngine : ITensorLevelEngine
             resultData[i] = numOps.Sqrt(v);
         }
 
-        return TensorAllocator.Rent<T>(variance._shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(variance._shape, resultData);
     }
 
     /// <inheritdoc/>

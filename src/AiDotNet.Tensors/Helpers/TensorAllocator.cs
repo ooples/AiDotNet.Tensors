@@ -256,6 +256,47 @@ public static class TensorAllocator
     // RentUninitialized is defined above (line ~95) with arena support
 
     /// <summary>
+    /// Adopts a caller-owned <c>T[]</c> as the backing storage for a new
+    /// tensor — zero-copy, no Vector wrapping, no pool churn. Use this on
+    /// backward-kernel hot paths where the kernel has already computed
+    /// into a fresh array: instead of
+    /// <c>Rent&lt;T&gt;(shape, new Vector&lt;T&gt;(arr))</c> (which goes
+    /// through <c>IEnumerable&lt;T&gt;.ToArray()</c>, a full copy), call
+    /// <see cref="Rent{T}(int[], T[])"/> to skip the duplicate alloc.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #319 Phase 4: this overload is the simplest replacement for
+    /// the <c>Rent&lt;T&gt;(shape, new Vector&lt;T&gt;(data))</c> pattern
+    /// that appears in ~136 sites in <c>CpuEngine.cs</c>. The Vector
+    /// constructor used to call <c>ToArray()</c> on its
+    /// <c>IEnumerable&lt;T&gt;</c> input, which means a freshly-computed
+    /// gradient array got copied once into the Vector and then again into
+    /// the rented tensor (or, on the existing zero-copy fast path, into
+    /// a new Vector backing array). This overload skips both steps.
+    /// </para>
+    /// <para>
+    /// <b>Ownership:</b> after this call returns, the caller MUST NOT
+    /// retain a reference to <paramref name="data"/>. The tensor wraps
+    /// it directly; mutations through the caller's variable become
+    /// visible through the tensor and vice versa.
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> Rent<T>(int[] shape, T[] data)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+        if (totalSize != data.Length)
+            throw new ArgumentException(
+                $"Data length ({data.Length}) must match shape total ({totalSize}).",
+                nameof(data));
+        return new Tensor<T>(data, shape);
+    }
+
+    /// <summary>
     /// Creates a tensor with the given shape and data from a Vector.
     /// Zero-copy when the Vector's backing array is exactly the right size
     /// (common pattern: caller does new T[n], computes into it, wraps in Vector).
