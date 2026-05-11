@@ -116,6 +116,193 @@ public static class OptimizerKernels
         }
     }
 
+    /// <summary>
+    /// In-place Adam parameter update with explicit step counter.
+    /// Uses the AVX2/FMA-vectorized kernel in
+    /// <c>FusedOptimizer.AdamUpdateSimd</c> for float/double; scalar
+    /// fallback for other numeric types.
+    /// </summary>
+    /// <typeparam name="T">Element type (float, double, or any type
+    /// with an <see cref="INumericOperations{T}"/> implementation).</typeparam>
+    /// <param name="param">Parameter tensor (mutated in place).</param>
+    /// <param name="grad">Gradient tensor. Must have the same length
+    /// as <paramref name="param"/>.</param>
+    /// <param name="m">First-moment buffer (mutated in place). Same
+    /// length as <paramref name="param"/>. Caller persists this
+    /// across optimizer steps.</param>
+    /// <param name="v">Second-moment buffer (mutated in place). Same
+    /// length as <paramref name="param"/>. Caller persists this
+    /// across optimizer steps.</param>
+    /// <param name="lr">Learning rate.</param>
+    /// <param name="beta1">First-moment decay (default 0.9 in standard Adam).</param>
+    /// <param name="beta2">Second-moment decay (default 0.999 in standard Adam).</param>
+    /// <param name="eps">Numerical-stability epsilon (default 1e-8 in standard Adam).</param>
+    /// <param name="step">Step counter, 1-indexed. Used for bias
+    /// correction; caller increments per optimizer step.</param>
+    public static unsafe void AdamInPlace<T>(
+        Tensor<T> param, Tensor<T> grad,
+        Tensor<T> m, Tensor<T> v,
+        T lr, T beta1, T beta2, T eps, int step)
+    {
+        ValidateMoments(param, grad, m, v);
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "Adam step must be >= 1 (1-indexed for bias correction).");
+        if (param.Length == 0) return;
+
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+
+        if (typeof(T) == typeof(float))
+        {
+            var paramMem = AsFloatMemory(param.Data);
+            var gradMem = AsFloatMemory(gradContig.Data);
+            var mMem = AsFloatMemory(m.Data);
+            var vMem = AsFloatMemory(v.Data);
+            using var pinP = paramMem.Pin();
+            using var pinG = gradMem.Pin();
+            using var pinM = mMem.Pin();
+            using var pinV = vMem.Pin();
+            FusedOptimizer.AdamUpdateSimd(
+                (float*)pinP.Pointer, (float*)pinG.Pointer,
+                (float*)pinM.Pointer, (float*)pinV.Pointer,
+                param.Length,
+                (float)(object)lr!, (float)(object)beta1!, (float)(object)beta2!, (float)(object)eps!,
+                step);
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var paramMem = AsDoubleMemory(param.Data);
+            var gradMem = AsDoubleMemory(gradContig.Data);
+            var mMem = AsDoubleMemory(m.Data);
+            var vMem = AsDoubleMemory(v.Data);
+            using var pinP = paramMem.Pin();
+            using var pinG = gradMem.Pin();
+            using var pinM = mMem.Pin();
+            using var pinV = vMem.Pin();
+            FusedOptimizer.AdamUpdateSimd(
+                (double*)pinP.Pointer, (double*)pinG.Pointer,
+                (double*)pinM.Pointer, (double*)pinV.Pointer,
+                param.Length,
+                (double)(object)lr!, (double)(object)beta1!, (double)(object)beta2!, (double)(object)eps!,
+                step);
+            return;
+        }
+
+        AdamFallback(param, gradContig, m, v, lr, beta1, beta2, eps, step);
+    }
+
+    /// <summary>
+    /// In-place AdamW parameter update — Adam with decoupled weight
+    /// decay (multiplies <paramref name="param"/> by
+    /// <c>1 - weightDecay·lr</c> before the Adam step).
+    /// AdamW is the standard optimizer for transformer training
+    /// including ViT — vision-transformer reference configs use it
+    /// almost universally over plain Adam.
+    /// </summary>
+    /// <param name="weightDecay">Decoupled weight-decay coefficient.</param>
+    /// <inheritdoc cref="AdamInPlace{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, T, T, T, T, int)"/>
+    public static unsafe void AdamWInPlace<T>(
+        Tensor<T> param, Tensor<T> grad,
+        Tensor<T> m, Tensor<T> v,
+        T lr, T beta1, T beta2, T eps, T weightDecay, int step)
+    {
+        ValidateMoments(param, grad, m, v);
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "AdamW step must be >= 1 (1-indexed for bias correction).");
+        if (param.Length == 0) return;
+
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+
+        if (typeof(T) == typeof(float))
+        {
+            var paramMem = AsFloatMemory(param.Data);
+            var gradMem = AsFloatMemory(gradContig.Data);
+            var mMem = AsFloatMemory(m.Data);
+            var vMem = AsFloatMemory(v.Data);
+            using var pinP = paramMem.Pin();
+            using var pinG = gradMem.Pin();
+            using var pinM = mMem.Pin();
+            using var pinV = vMem.Pin();
+            FusedOptimizer.AdamWUpdateSimd(
+                (float*)pinP.Pointer, (float*)pinG.Pointer,
+                (float*)pinM.Pointer, (float*)pinV.Pointer,
+                param.Length,
+                (float)(object)lr!, (float)(object)beta1!, (float)(object)beta2!, (float)(object)eps!,
+                (float)(object)weightDecay!, step);
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var paramMem = AsDoubleMemory(param.Data);
+            var gradMem = AsDoubleMemory(gradContig.Data);
+            var mMem = AsDoubleMemory(m.Data);
+            var vMem = AsDoubleMemory(v.Data);
+            using var pinP = paramMem.Pin();
+            using var pinG = gradMem.Pin();
+            using var pinM = mMem.Pin();
+            using var pinV = vMem.Pin();
+            FusedOptimizer.AdamWUpdateSimd(
+                (double*)pinP.Pointer, (double*)pinG.Pointer,
+                (double*)pinM.Pointer, (double*)pinV.Pointer,
+                param.Length,
+                (double)(object)lr!, (double)(object)beta1!, (double)(object)beta2!, (double)(object)eps!,
+                (double)(object)weightDecay!, step);
+            return;
+        }
+
+        // Scalar AdamW = (decoupled decay) ∘ Adam
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var paramSpan = param.AsWritableSpan();
+        T decayFactor = numOps.Subtract(numOps.One, numOps.Multiply(weightDecay, lr));
+        for (int i = 0; i < paramSpan.Length; i++)
+            paramSpan[i] = numOps.Multiply(paramSpan[i], decayFactor);
+        AdamFallback(param, gradContig, m, v, lr, beta1, beta2, eps, step);
+    }
+
+    private static void ValidateMoments<T>(Tensor<T> param, Tensor<T> grad, Tensor<T> m, Tensor<T> v)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (grad is null) throw new ArgumentNullException(nameof(grad));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (param.Length != grad.Length || param.Length != m.Length || param.Length != v.Length)
+        {
+            throw new ArgumentException(
+                $"Adam/AdamW require matching lengths; param={param.Length}, grad={grad.Length}, m={m.Length}, v={v.Length}.");
+        }
+    }
+
+    private static void AdamFallback<T>(
+        Tensor<T> param, Tensor<T> grad, Tensor<T> m, Tensor<T> v,
+        T lr, T beta1, T beta2, T eps, int step)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var pSpan = param.AsWritableSpan();
+        var gSpan = grad.AsSpan();
+        var mSpan = m.AsWritableSpan();
+        var vSpan = v.AsWritableSpan();
+
+        T oneMinusB1 = numOps.Subtract(numOps.One, beta1);
+        T oneMinusB2 = numOps.Subtract(numOps.One, beta2);
+        // Bias correction: 1 - beta^step. Computed via Pow for generality
+        // (some T may not support efficient integer power; this is the
+        // scalar fallback so polymorphism cost is amortized over the
+        // per-element loop).
+        T bc1 = numOps.Subtract(numOps.One, numOps.Power(beta1, numOps.FromDouble(step)));
+        T bc2 = numOps.Subtract(numOps.One, numOps.Power(beta2, numOps.FromDouble(step)));
+
+        for (int i = 0; i < pSpan.Length; i++)
+        {
+            mSpan[i] = numOps.Add(numOps.Multiply(beta1, mSpan[i]), numOps.Multiply(oneMinusB1, gSpan[i]));
+            T g2 = numOps.Multiply(gSpan[i], gSpan[i]);
+            vSpan[i] = numOps.Add(numOps.Multiply(beta2, vSpan[i]), numOps.Multiply(oneMinusB2, g2));
+            T mHat = numOps.Divide(mSpan[i], bc1);
+            T vHat = numOps.Divide(vSpan[i], bc2);
+            T denom = numOps.Add(numOps.Sqrt(vHat), eps);
+            pSpan[i] = numOps.Subtract(pSpan[i], numOps.Divide(numOps.Multiply(lr, mHat), denom));
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
         => Unsafe.As<Memory<T>, Memory<float>>(ref data);
