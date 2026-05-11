@@ -230,6 +230,99 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Element-wise max of two double arrays using AVX Max intrinsic (Vector256, 4 lanes).
+        /// Same NaN semantics as the float overload — hardware-defined (Avx.Max returns non-NaN
+        /// operand on collision). PyTorch parity, not IEEE 754.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void VectorMaxUnsafe(double* a, double* b, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 4, Avx.Max(Avx.LoadVector256(a + i + 4), Avx.LoadVector256(b + i + 4)));
+                    Avx.Store(result + i + 8, Avx.Max(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 12, Avx.Max(Avx.LoadVector256(a + i + 12), Avx.LoadVector256(b + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                    Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+            }
+#endif
+            for (; i < length; i++)
+                result[i] = Math.Max(a[i], b[i]);
+        }
+
+        /// <summary>
+        /// Element-wise min of two float arrays using AVX Min intrinsic (Vector256, 8 lanes).
+        /// Same hardware NaN semantics as <see cref="VectorMaxUnsafe(float*, float*, float*, int)"/>.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void VectorMinUnsafe(float* a, float* b, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 8, Avx.Min(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 16, Avx.Min(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                    Avx.Store(result + i + 24, Avx.Min(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+            }
+#endif
+            for (; i < length; i++)
+                result[i] = MathF.Min(a[i], b[i]);
+        }
+
+        /// <summary>
+        /// Element-wise min of two double arrays using AVX Min intrinsic (Vector256, 4 lanes).
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void VectorMinUnsafe(double* a, double* b, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 4, Avx.Min(Avx.LoadVector256(a + i + 4), Avx.LoadVector256(b + i + 4)));
+                    Avx.Store(result + i + 8, Avx.Min(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 12, Avx.Min(Avx.LoadVector256(a + i + 12), Avx.LoadVector256(b + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                    Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+            }
+#endif
+            for (; i < length; i++)
+                result[i] = Math.Min(a[i], b[i]);
+        }
+
+        /// <summary>
         /// Pointer-based VectorSubtract — zero bounds-checking overhead for hot paths.
         /// </summary>
         [MethodImpl(HotInline)]

@@ -6303,6 +6303,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.VectorMaxUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinD.Pointer, a.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMemA = AsDoubleMemory(a.Data);
+                var srcMemB = AsDoubleMemory(b.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMaxUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinD.Pointer, a.Length);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -6372,11 +6385,29 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fA = (float[])(object)a.GetDataArray();
-            var fB = (float[])(object)b.GetDataArray();
-            var fD = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fA.Length; i++)
-                fD[i] = MathF.Min(fA[i], fB[i]);
+            unsafe
+            {
+                var srcMemA = AsFloatMemory(a.Data);
+                var srcMemB = AsFloatMemory(b.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMinUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinD.Pointer, a.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMemA = AsDoubleMemory(a.Data);
+                var srcMemB = AsDoubleMemory(b.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMinUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinD.Pointer, a.Length);
+            }
         }
         else
         {
