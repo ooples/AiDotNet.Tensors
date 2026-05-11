@@ -112,6 +112,37 @@ public static class RandomHelper
     }
 
     /// <summary>
+    /// Creates a deterministically-seeded <see cref="Random"/> backed by a
+    /// counter-mode SHA-256 DRBG. Same seed produces the same stream on every
+    /// platform / process / run (matching <see cref="CreateSeededRandom"/>'s
+    /// reproducibility contract), but the output is cryptographically strong:
+    /// the next value is computationally indistinguishable from uniform random
+    /// given any prior outputs, under SHA-256's one-way assumption (NIST SP
+    /// 800-90A Hash_DRBG construction).
+    /// </summary>
+    /// <param name="seed">The seed value.</param>
+    /// <returns>A new <see cref="SecureSeededRandom"/> instance.</returns>
+    /// <remarks>
+    /// <para>
+    /// Use this when you need BOTH reproducibility AND cryptographically-
+    /// strong output (e.g., neural-network weight init that must be the
+    /// same every run for test determinism and Clone reproducibility, but
+    /// where you also want the higher statistical quality of a DRBG over
+    /// <see cref="System.Random"/>'s linear-congruential generator).
+    /// </para>
+    /// <para>
+    /// For pure reproducibility where output quality doesn't matter,
+    /// <see cref="CreateSeededRandom"/> is faster (System.Random-based).
+    /// For non-reproducible cryptographically-strong RNG, use
+    /// <see cref="CreateSecureRandom"/> (entropy-seeded each call).
+    /// </para>
+    /// </remarks>
+    public static Random CreateSecureSeededRandom(int seed)
+    {
+        return new SecureSeededRandom(seed);
+    }
+
+    /// <summary>
     /// Generates a cryptographically secure random integer within the specified range.
     /// </summary>
     /// <param name="minValue">The inclusive lower bound.</param>
