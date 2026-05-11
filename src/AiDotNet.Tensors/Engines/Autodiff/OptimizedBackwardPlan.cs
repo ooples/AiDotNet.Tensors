@@ -23,19 +23,29 @@ internal sealed class OptimizedBackwardPlan<T>
     private readonly Tensor<T>[]? _sources;
     private readonly IEngine _engine;
 
+    /// <summary>
+    /// Optional reference to the owning tape's RetainGrad set. Same parity rule
+    /// as <see cref="CompiledBackwardGraph{T}"/> — when a user marks a tensor
+    /// with <see cref="GradientTape{T}.RetainGrad"/>, its <c>.Grad</c> must
+    /// survive the cleanup phase below.
+    /// </summary>
+    private readonly HashSet<Tensor<T>>? _retainGrad;
+
     internal OptimizedBackwardPlan(
         TapeEntryArena<T> entries,
         int[] reachableIndices,
         Tensor<T> loss,
         Tensor<T>[]? sources,
         IEngine engine,
-        BackwardAnalysis analysis)
+        BackwardAnalysis analysis,
+        HashSet<Tensor<T>>? retainGrad = null)
     {
         _entries = entries;
         _reachableIndices = reachableIndices;
         _loss = loss;
         _sources = sources;
         _engine = engine;
+        _retainGrad = retainGrad;
         _ = analysis; // Retained for future backward optimization passes
     }
 
@@ -107,6 +117,22 @@ internal sealed class OptimizedBackwardPlan<T>
         {
             cse.Clear();
             DifferentiableOps.ClearIndexedGrads();
+
+            // Parity with CompiledBackwardGraph.Execute's finally block:
+            // a consumer-side cache that retains a forward intermediate
+            // (e.g. a layer's `_lastInput`) would otherwise pin one full
+            // backward's worth of gradient tensors across successive
+            // Execute calls when this optimized path is taken (the default
+            // when TensorCodecOptions.EnableAlgebraicBackward is on).
+            // Same RetainGrad / sourceSet preservation rule used by the
+            // non-optimized path so behavior is consistent.
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (_sources is not null)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in _sources) sourceSet.Add(s);
+            }
+
             foreach (int i in _reachableIndices)
             {
                 ref var e = ref _entries[i];
@@ -116,6 +142,13 @@ internal sealed class OptimizedBackwardPlan<T>
                 if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+
+                // e.Output is always a graph intermediate; inputs may be
+                // leaves (parameters) so we don't touch their .Grad here.
+                bool keepGrad =
+                    (sourceSet?.Contains(e.Output) == true)
+                    || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                if (!keepGrad) e.Output.Grad = null;
             }
         }
 
@@ -172,13 +205,14 @@ internal sealed class OptimizedBackwardPlan<T>
         int[] reachableIndices,
         Tensor<T> loss,
         Tensor<T>[]? sources,
-        IEngine engine)
+        IEngine engine,
+        HashSet<Tensor<T>>? retainGrad = null)
     {
         var analysis = SymbolicBackwardGraphBuilder.Analyze(entries, reachableIndices);
 
         if (!analysis.CanBenefit)
             return null;
 
-        return new OptimizedBackwardPlan<T>(entries, reachableIndices, loss, sources, engine, analysis);
+        return new OptimizedBackwardPlan<T>(entries, reachableIndices, loss, sources, engine, analysis, retainGrad);
     }
 }

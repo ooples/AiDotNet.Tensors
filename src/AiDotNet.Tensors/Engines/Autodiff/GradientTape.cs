@@ -527,32 +527,69 @@ public sealed class GradientTape<T> : IDisposable
 
         // Tape-walk parity for the .Grad / .GradFn cleanup that ComputeGradientsViaGraph does.
         // AccumulateGrad sets `tensor.Grad = stored` for every tensor that receives a
-        // gradient contribution — including forward intermediates — so on a
-        // non-persistent tape we null .Grad on non-source / non-RetainGrad tensors so
-        // the gradient lifetime doesn't get chained to whatever holds the intermediate.
-        // Tape-walk-specific cases (anomaly detection, hooks) all reach this cleanup
-        // the same way the graph path does.
+        // gradient contribution — including forward intermediates — and each tensor's
+        // GradFn pointer chains back through the entire forward graph via captured
+        // BackwardFunction closures. Without explicit cleanup, any external code that
+        // retains even ONE forward intermediate (e.g. a layer's `_lastInput` cache)
+        // keeps the whole graph alive across Train calls, surviving Gen2 GC.
+        //
+        // The previous guard `sources is not null` skipped cleanup whenever the caller
+        // didn't specify a source filter. In practice every long-running training loop
+        // calls ComputeGradients(loss, sources: null) — including AiDotNet's
+        // NeuralNetworkBase.TrainWithTape (passes null and consumes the returned Dictionary
+        // directly) — so the cleanup never ran and the heap grew linearly at the per-call
+        // saved-for-backward footprint. ooples/AiDotNet#1227 documented this at ~1.5 MB/call
+        // on a 4-encoder-layer Transformer; the same model on the equivalent raw-tape
+        // probe in this repo measured 0 B/call because the test always passed explicit
+        // sources.
+        //
+        // Fix: run the cleanup whether or not `sources` was provided. When sources is
+        // null we still clear .GradFn on every tape-recorded tensor (breaks the graph
+        // back-pointer chain) and clear .Grad on tensors that aren't pinned via
+        // RetainGrad. The returned `grads` Dictionary already holds the gradient
+        // references the caller needs — clearing the per-tensor .Grad field doesn't
+        // drop any data the caller can still access through the dictionary.
         //
         // SKIP cleanup when createGraph=true: the outer caller is computing higher-
         // order derivatives (Hvp / Hessian / double-backward), and forward
         // intermediates' .Grad / .GradFn fields are part of the higher-order graph
         // that the next backward pass needs to walk.
-        if (!_options.Persistent && !createGraph && sources is not null)
+        if (!_options.Persistent && !createGraph)
         {
-            HashSet<Tensor<T>> sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-            foreach (var s in sources) sourceSet.Add(s);
+            HashSet<Tensor<T>>? sourceSet = null;
+            if (sources is not null)
+            {
+                sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) sourceSet.Add(s);
+            }
+
+            // Pre-collect every output tensor in the arena: these are the
+            // intermediates produced by tape-recorded ops. Graph leaves
+            // (parameters / user-supplied roots) never appear as Output in
+            // an entry. We need this distinction so the BC contract
+            // "param.Grad stays populated after a sources=null backward"
+            // holds in the tape-walk path the same way it holds in
+            // ComputeGradientsViaGraphCore (line 776+). Without this,
+            // calling CleanupTapeEntryGrad on a leaf input would null
+            // param.Grad and silently break any consumer reading it.
+            var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                intermediates.Add(_entries[i].Output);
+            }
+
             for (int i = 0; i < _entries.Count; i++)
             {
                 ref var e = ref _entries[i];
-                CleanupTapeEntryGrad(e.Output, sourceSet);
-                if (e.Input0 != null) CleanupTapeEntryGrad(e.Input0, sourceSet);
-                if (e.InputCount >= 2 && e.Input1 != null) CleanupTapeEntryGrad(e.Input1, sourceSet);
-                if (e.InputCount >= 3 && e.Input2 != null) CleanupTapeEntryGrad(e.Input2, sourceSet);
+                CleanupTapeEntryGrad(e.Output, sourceSet, intermediates);
+                if (e.Input0 != null) CleanupTapeEntryGrad(e.Input0, sourceSet, intermediates);
+                if (e.InputCount >= 2 && e.Input1 != null) CleanupTapeEntryGrad(e.Input1, sourceSet, intermediates);
+                if (e.InputCount >= 3 && e.Input2 != null) CleanupTapeEntryGrad(e.Input2, sourceSet, intermediates);
                 if (e.InputsOverflow != null)
                 {
                     foreach (var inp in e.InputsOverflow)
                     {
-                        if (inp != null) CleanupTapeEntryGrad(inp, sourceSet);
+                        if (inp != null) CleanupTapeEntryGrad(inp, sourceSet, intermediates);
                     }
                 }
             }
@@ -600,12 +637,45 @@ public sealed class GradientTape<T> : IDisposable
         return grads;
     }
 
-    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>> sourceSet)
+    private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
     {
-        t.GradFn = null;
-        if (sourceSet.Contains(t)) return;
+        // Only null GradFn on tensors THIS tape owns. A tensor whose GradFn
+        // doesn't belong to this tape's graph (e.g. an output of an outer
+        // tape, fed in as input to this tape's ops) must keep its back-
+        // pointer intact — otherwise the outer tape's later backward
+        // would see a severed graph and either crash or silently drop
+        // gradients. The ownership signal is membership in `intermediates`,
+        // which holds every Output produced by this tape's entries.
+        bool ownedByThisTape = intermediates.Contains(t);
+        if (ownedByThisTape)
+        {
+            t.GradFn = null;
+        }
+        // Preserve .Grad when the caller explicitly listed this tensor as a source
+        // (they're going to read `tensor.Grad` rather than the returned Dictionary).
+        if (sourceSet?.Contains(t) == true) return;
+        // Preserve .Grad on tensors the user explicitly marked with RetainGrad().
         if (_retainGrad is not null && _retainGrad.Contains(t)) return;
-        t.Grad = null;
+        // Distinguish intermediate vs leaf when sources is null:
+        //   sourceSet != null + non-source: caller's explicit filter said
+        //     "only keep what I listed" — clear regardless of ownership.
+        //     Foreign-leaf .Grad wasn't populated by this backward pass
+        //     anyway (this tape only accumulates to its own reachable
+        //     graph), so clearing it is effectively a no-op on the typical
+        //     nested-tape case.
+        //   sourceSet == null + this-tape intermediate: clear (returned
+        //     dict still holds the gradient; .Grad is only the per-tensor
+        //     mirror).
+        //   sourceSet == null + leaf or foreign tensor:
+        //     preserve .Grad — for true leaves (params), the BC contract
+        //     that AiDotNet.NeuralNetworkBase.TrainWithTape and the graph-
+        //     walk path (ComputeGradientsViaGraphCore line 776+) honor;
+        //     for foreign tensors, their .Grad belongs to the outer tape
+        //     and we must not touch it.
+        if (sourceSet is not null || ownedByThisTape)
+        {
+            t.Grad = null;
+        }
     }
 
     /// <summary>
@@ -656,10 +726,40 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
-        // If we have a cached delegate chain from a previous backward, replay it directly
+        // If we have a cached delegate chain from a previous backward, replay it directly.
+        // Apply the same per-intermediate .Grad cleanup as the fresh-walk path so a
+        // persistent tape doesn't keep one full backward's worth of gradient tensors
+        // pinned on every intermediate between successive Execute calls. We CANNOT clear
+        // GradFn on persistent-cached chains because the chain itself reuses those
+        // tensors' Output.GradFn pointers for the next Execute's graph traversal —
+        // only .Grad is safe to clear (it gets re-set by AccumulateGrad on the next
+        // forward+backward pass).
         if (_cachedDelegateChain is not null)
         {
-            return _cachedDelegateChain.Execute(loss, sources, _engine);
+            var cachedResult = _cachedDelegateChain.Execute(loss, sources, _engine);
+
+            HashSet<Tensor<T>>? cachedSourceSet = null;
+            if (sources is not null)
+            {
+                cachedSourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) cachedSourceSet.Add(s);
+            }
+
+            // Walk the chain's steps to find every intermediate (step.Output)
+            // and clear its .Grad. Inputs to a step may be parameters
+            // (graph leaves) — leave their .Grad alone for the same reason
+            // the fresh-walk path does. Intermediate-as-input cases get
+            // cleared when they appear as Output in their own step.
+            var cachedSteps = _cachedDelegateChain.Steps;
+            for (int i = 0; i < cachedSteps.Length; i++)
+            {
+                ref var step = ref cachedSteps[i];
+                if (cachedSourceSet?.Contains(step.Output) == true) continue;
+                if (_retainGrad is not null && _retainGrad.Contains(step.Output)) continue;
+                step.Output.Grad = null;
+            }
+
+            return cachedResult;
         }
 
         var engine = _engine;
@@ -717,59 +817,134 @@ public sealed class GradientTape<T> : IDisposable
         if (!_options.Persistent)
         {
             // Build a set of source tensors for O(1) sourcehood check.
-            // sources == null means the caller wants the full grads dict,
-            //   so we can't safely null .Grad on anything.
-            // sources != null (even if empty) means the caller specified
-            //   the protected set explicitly — clear .Grad on everything
-            //   else, including the case where the explicit set is empty.
+            //   sources != null (even if empty): the caller specified the
+            //     protected set explicitly — clear .Grad on everything
+            //     else (including the case where the explicit set is empty).
+            //   sources == null: the caller is consuming gradients via the
+            //     returned dictionary (the standard pattern in
+            //     AiDotNet.NeuralNetworkBase.TrainWithTape, all auto-
+            //     differentiation-driven optimizers, etc.). We MUST still
+            //     clear .Grad on forward intermediates here — otherwise
+            //     each intermediate's gradient tensor (a fresh
+            //     ~outputSize-of-the-op backing array, NOT pooled past the
+            //     64-slot TensorPool cap) stays pinned for the lifetime of
+            //     the intermediate. When a consumer-side cache (a layer's
+            //     `_lastInput` field, a streaming-pool retention, etc.)
+            //     holds a single forward intermediate, all of that
+            //     intermediate's gradient memory bleeds across calls.
+            //     Reopened-#1227 measured this as ~1.5 MB/call retention
+            //     on a 4-encoder-layer Transformer.
+            //
+            // The dict returned to the caller keeps the gradient references
+            // by value — clearing the per-tensor .Grad field just severs
+            // the back-pointer from intermediates, not the dict's mapping.
             HashSet<Tensor<T>>? sourceSet = null;
             if (sources is not null)
             {
                 sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources) sourceSet.Add(s);
             }
-            // Local helper: should this tensor keep its .Grad?
-            // True when sources mode is off (sourceSet null), when the tensor
-            // is a source, or when the user retained grads on it explicitly.
+
+            // Should this tensor keep its .Grad after backward returns?
+            //   - Explicit source (caller asked for its grad by reference): yes
+            //   - RetainGrad-marked non-leaf: yes
+            //   - Otherwise: no — even when sources was null, because the
+            //     gradient is preserved in the returned dictionary
+            //     regardless of whether .Grad stays set on the tensor.
             bool ShouldKeepGrad(Tensor<T> t)
             {
-                if (sourceSet is null) return true;
-                if (sourceSet.Contains(t)) return true;
+                if (sourceSet?.Contains(t) == true) return true;
                 if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
                 return false;
             }
+
+            // Build the set of nodes THIS graph owns. A tensor produced by an
+            // op on a foreign tape (an outer/parent tape, fed in as input to
+            // this tape's ops) has a non-null GradFn that doesn't belong to
+            // any node in topoOrder. We must NOT null its GradFn or touch its
+            // .Grad — those belong to the outer tape and would be corrupted
+            // by indiscriminate cleanup. `GradFn != null` is NOT a safe proxy
+            // for "intermediate of this graph" because it conflates
+            // this-graph intermediates with foreign-tape outputs.
+            var ownedIntermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var n in topoOrder)
+                ownedIntermediates.Add(n.Output);
+
             foreach (var node in topoOrder)
             {
+                // node.Output is always owned by this graph (we just put it
+                // into ownedIntermediates). Safe to null its GradFn and clear
+                // its .Grad: parameters never appear as outputs.
                 node.Output.GradFn = null;
                 if (!ShouldKeepGrad(node.Output))
                     node.Output.Grad = null;
 
-                // Input0 is non-nullable on GradNode<T>; the recorder
-                // always populates it.
-                node.Input0.GradFn = null;
-                if (!ShouldKeepGrad(node.Input0))
+                // For Inputs: only touch GradFn / .Grad when the input is
+                // owned by THIS graph (i.e. is the Output of some node in
+                // topoOrder). The three cases:
+                //
+                //   sourceSet != null + non-source: clear .Grad (caller's
+                //     explicit "keep what I listed" contract). Foreign-leaf
+                //     .Grad wasn't populated by this backward anyway, so
+                //     clearing is effectively a no-op for nested-tape inputs.
+                //   sourceSet == null + owned intermediate: clear .Grad
+                //     (returned dict still holds the gradient).
+                //   sourceSet == null + leaf or foreign tensor: preserve
+                //     .Grad — for true leaves that's the BC contract
+                //     (param.Grad), for foreign tensors that's outer-tape
+                //     state we must not touch.
+                bool input0Owned = ownedIntermediates.Contains(node.Input0);
+                if (input0Owned) node.Input0.GradFn = null;
+                if (sourceSet is not null)
+                {
+                    if (!ShouldKeepGrad(node.Input0)) node.Input0.Grad = null;
+                }
+                else if (input0Owned && !ShouldKeepGrad(node.Input0))
+                {
                     node.Input0.Grad = null;
+                }
 
                 if (node.Input1 is not null)
                 {
-                    node.Input1.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input1))
+                    bool input1Owned = ownedIntermediates.Contains(node.Input1);
+                    if (input1Owned) node.Input1.GradFn = null;
+                    if (sourceSet is not null)
+                    {
+                        if (!ShouldKeepGrad(node.Input1)) node.Input1.Grad = null;
+                    }
+                    else if (input1Owned && !ShouldKeepGrad(node.Input1))
+                    {
                         node.Input1.Grad = null;
+                    }
                 }
                 if (node.Input2 is not null)
                 {
-                    node.Input2.GradFn = null;
-                    if (!ShouldKeepGrad(node.Input2))
+                    bool input2Owned = ownedIntermediates.Contains(node.Input2);
+                    if (input2Owned) node.Input2.GradFn = null;
+                    if (sourceSet is not null)
+                    {
+                        if (!ShouldKeepGrad(node.Input2)) node.Input2.Grad = null;
+                    }
+                    else if (input2Owned && !ShouldKeepGrad(node.Input2))
+                    {
                         node.Input2.Grad = null;
+                    }
                 }
                 if (node.InputsOverflow is not null)
                 {
                     foreach (var inp in node.InputsOverflow)
                     {
                         if (inp is null) continue;
-                        inp.GradFn = null;
-                        if (!ShouldKeepGrad(inp))
+                        bool inpOwned = ownedIntermediates.Contains(inp);
+                        if (inpOwned) inp.GradFn = null;
+                        if (sourceSet is not null)
+                        {
+                            if (!ShouldKeepGrad(inp)) inp.Grad = null;
+                        }
+                        else if (inpOwned && !ShouldKeepGrad(inp))
+                        {
                             inp.Grad = null;
+                        }
                     }
                 }
             }
@@ -952,7 +1127,7 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.Length != 1)
             throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
-        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine);
+        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
     }
 
     /// <summary>
