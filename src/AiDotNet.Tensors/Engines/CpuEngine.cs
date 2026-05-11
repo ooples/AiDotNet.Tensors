@@ -6896,9 +6896,15 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD reduction — no parallel-chunk wrapper yet (Min over double
             // doesn't have an unsafe-ptr overload the float ParallelReduceFloat
             // path uses), but still ~4× faster than the scalar numOps.Min
-            // fallback on AVX2 hosts.
-            var dArr = (double[])(object)tensor.GetDataArray();
-            double result = SimdKernels.Min(new ReadOnlySpan<double>(dArr, 0, tensor.Length));
+            // fallback on AVX2 hosts. Read through tensor.Data (logical view,
+            // sliced to Length) instead of GetDataArray() — the latter returns
+            // the underlying bucket-sized storage that ignores the tensor's
+            // _storageOffset, so contiguous-but-offset views would read the
+            // wrong elements. tensor was already Contiguous()-materialized
+            // above when not contiguous, so .Data is the right span here.
+            var span = AsDoubleMemory(tensor.Data).Span;
+            if (span.Length > tensor.Length) span = span[..tensor.Length];
+            double result = SimdKernels.Min(span);
             return Unsafe.As<double, T>(ref result);
         }
 
@@ -6960,11 +6966,16 @@ public partial class CpuEngine : ITensorLevelEngine
             return Unsafe.As<float, T>(ref result);
         }
 
-        // Double fast path: SIMD Sum over Span, then divide
+        // Double fast path: SIMD Sum over Span, then divide. Read through
+        // tensor.Data (logical view) so contiguous-but-offset views — and the
+        // future streaming-backed Memory<T> tensors — work correctly. The
+        // older GetDataArray() path returned bucket-sized backing storage
+        // that didn't honor _storageOffset.
         if (typeof(T) == typeof(double) && tensor.IsContiguous)
         {
-            var dArr = (double[])(object)tensor.GetDataArray();
-            double dSum = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, 0, tensor.Length));
+            var span = AsDoubleMemory(tensor.Data).Span;
+            if (span.Length > tensor.Length) span = span[..tensor.Length];
+            double dSum = SimdKernels.Sum(span);
             double result = dSum / tensor.Length;
             return Unsafe.As<double, T>(ref result);
         }
@@ -23791,7 +23802,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                     BackwardFunctions<T>.ReduceMeanBackward,
                     savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
-                AutoTracer.RecordOp("ReduceMean", scalarResult, eng => scalarResult);
+                // Record the actual operation so AutoTracer's replay
+                // recomputes ReduceMean against the current tensor instead of
+                // baking the scalar we just produced. Replaying `eng => scalarResult`
+                // poisons compiled graphs with a stale value when the same op
+                // pattern is run on a different input tensor of identical shape.
+                { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
+                  AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
                 return scalarResult;
             }
             if (typeof(T) == typeof(float))
@@ -23807,7 +23824,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
                         savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
-                    AutoTracer.RecordOp("ReduceMean", scalarResult, eng => scalarResult);
+                    // Replay the actual operation so AutoTracer doesn't bake
+                    // this branch as a stale scalar constant — same fix as the
+                    // double branch above.
+                    { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
+                      AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
                     return scalarResult;
                 }
             }

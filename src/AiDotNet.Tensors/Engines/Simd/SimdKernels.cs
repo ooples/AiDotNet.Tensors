@@ -225,8 +225,16 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
+            // Scalar tail mirrors AVX's NaN semantics — Avx.Max returns the
+            // SECOND operand when either input is NaN (Intel SDM MAXPS), but
+            // MathF.Max propagates NaN per IEEE 754. Using MathF.Max directly
+            // would make the kernel produce length-dependent results when NaNs
+            // are present (SIMD body picks b[i], scalar tail returns NaN).
             for (; i < length; i++)
-                result[i] = MathF.Max(a[i], b[i]);
+            {
+                float ai = a[i], bi = b[i];
+                result[i] = float.IsNaN(ai) || float.IsNaN(bi) ? bi : MathF.Max(ai, bi);
+            }
         }
 
         /// <summary>
@@ -257,8 +265,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
+            // Scalar tail mirrors AVX's NaN semantics — see float overload above.
             for (; i < length; i++)
-                result[i] = Math.Max(a[i], b[i]);
+            {
+                double ai = a[i], bi = b[i];
+                result[i] = double.IsNaN(ai) || double.IsNaN(bi) ? bi : Math.Max(ai, bi);
+            }
         }
 
         /// <summary>
@@ -288,8 +300,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
+            // Scalar tail mirrors AVX's NaN semantics — see VectorMaxUnsafe(float*) above.
             for (; i < length; i++)
-                result[i] = MathF.Min(a[i], b[i]);
+            {
+                float ai = a[i], bi = b[i];
+                result[i] = float.IsNaN(ai) || float.IsNaN(bi) ? bi : MathF.Min(ai, bi);
+            }
         }
 
         /// <summary>
@@ -318,8 +334,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
+            // Scalar tail mirrors AVX's NaN semantics — see VectorMaxUnsafe(float*) above.
             for (; i < length; i++)
-                result[i] = Math.Min(a[i], b[i]);
+            {
+                double ai = a[i], bi = b[i];
+                result[i] = double.IsNaN(ai) || double.IsNaN(bi) ? bi : Math.Min(ai, bi);
+            }
         }
 
         /// <summary>
