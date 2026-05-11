@@ -258,7 +258,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         // Warmup
         for (int i = 0; i < warmup; i++)
         {
-            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out _, out _, out _, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape, out _, out _, out _, out _, out _, out _, out _);
         }
 
         // Per-phase alloc tracking: measure forward / backward / opt separately
@@ -275,15 +275,22 @@ public static class Issue327TransformerTrainBatchedBenchmark
 
         var phaseTotals = new (double fwdMs, double bwdMs, double optMs)[iters];
         var sw = Stopwatch.StartNew();
+        // Sanity: verify gradients are actually computed (non-empty for sources).
+        // Persistent-tape pattern can silently break across iters when the cached
+        // chain references stale entries from iter 1, so we capture grad-count on
+        // every iter and assert at the end.
+        int sourcesPresentLastIter = 0;
         for (int i = 0; i < iters; i++)
         {
             DoTrainStep(engine, input, weights, optM, optV, sharedTape,
                 out var fwdMs, out var bwdMs, out var optMs,
-                out var fwdAlloc, out var bwdAlloc, out var optAlloc);
+                out var fwdAlloc, out var bwdAlloc, out var optAlloc,
+                out var sourcesPresent);
             phaseTotals[i] = (fwdMs, bwdMs, optMs);
             fwdAllocTotal += fwdAlloc;
             bwdAllocTotal += bwdAlloc;
             optAllocTotal += optAlloc;
+            sourcesPresentLastIter = sourcesPresent;
         }
         sw.Stop();
 
@@ -314,6 +321,8 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Console.WriteLine($"      fwd alloc     : {(fwdAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
         Console.WriteLine($"      bwd alloc     : {(bwdAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
         Console.WriteLine($"      opt alloc     : {(optAllocTotal / iters) / 1024.0 / 1024.0,7:F1} MB/iter");
+        Console.WriteLine($"    Sources w/ grad   : {sourcesPresentLastIter}/{weights.Length} on last iter " +
+                          $"{(sourcesPresentLastIter == weights.Length ? "(all weights got gradients — correct)" : "(MISSING GRADIENTS — measurement invalid)")}");
         Console.WriteLine($"    GC during run    : Gen0 {gen0After - gen0Before,3}  Gen1 {gen1After - gen1Before,3}  Gen2 {gen2After - gen2Before,3} (over {iters} iters)");
         Console.WriteLine();
         Console.WriteLine($"  Issue close target : ≤ 100.000 ms/step, ≥ 20 active cores");
@@ -334,8 +343,10 @@ public static class Issue327TransformerTrainBatchedBenchmark
         out double optMs,
         out long fwdAlloc,
         out long bwdAlloc,
-        out long optAlloc)
+        out long optAlloc,
+        out int sourcesPresent)
     {
+        sourcesPresent = 0;
         var swFwd = Stopwatch.StartNew();
         Dictionary<Tensor<float>, Tensor<float>> grads;
         Tensor<float> loss;
@@ -361,6 +372,12 @@ public static class Issue327TransformerTrainBatchedBenchmark
             swBwd.Stop();
             bwdMs = swBwd.Elapsed.TotalMilliseconds;
             bwdAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocFwdEnd;
+
+            // Sanity probe: count how many sources got gradients in this call.
+            // Persistent-tape pattern silently breaks across iters (cached chain
+            // points at stale iter-1 entries; iter-N's loss key never matches),
+            // and the fast 0.1 ms wall is meaningless without correct grads.
+            foreach (var w in weights) if (grads.ContainsKey(w)) sourcesPresent++;
         }
         finally
         {
@@ -440,14 +457,14 @@ public static class Issue327TransformerTrainBatchedBenchmark
         }) { IsBackground = true };
 
         // Warmup so JIT is stable
-        DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _);
+        DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _, out _);
 
         sampler.Start();
         var sw = Stopwatch.StartNew();
         int steps = 0;
         while (sw.Elapsed.TotalSeconds < targetSec)
         {
-            DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _);
+            DoTrainStep(engine, input, weights, optM, optV, sharedTape: null, out _, out _, out _, out _, out _, out _, out _);
             steps++;
         }
         sw.Stop();
@@ -503,12 +520,15 @@ public static class Issue327TransformerTrainBatchedBenchmark
             var wF1  = weights[offset + 2];
             var wF2  = weights[offset + 3];
 
-            // Attention block: QKV proj (sink-only — we measure the cost in Phase A)
+            // QKV projection: produces [B,Ctx,3D]. We collapse 3D back to D
+            // by slicing the first D channels (proxy for taking the Q
+            // portion). This keeps wQkv on the autodiff graph so its
+            // gradient flows correctly.
             var qkv = engine.TensorMatMul(x, wQkv);
-            _sink += qkv.GetFlatIndexValue(0);
+            var qProxy = engine.TensorSlice(qkv, new[] { 0, 0, 0 }, new[] { B, Ctx, D });
 
-            // Wo (synthetic — input shape preserved)
-            var attnOut = engine.TensorMatMul(x, wO);
+            // Wo applied to qProxy so Wo also remains live on the graph.
+            var attnOut = engine.TensorMatMul(qProxy, wO);
 
             // FFN
             var f1 = engine.TensorMatMul(attnOut, wF1);
