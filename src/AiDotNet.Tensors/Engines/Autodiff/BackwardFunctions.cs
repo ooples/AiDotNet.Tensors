@@ -1233,10 +1233,17 @@ internal static class BackwardFunctions<T>
         if (ShapesEqual(gradShape, targetShape))
             return grad;
 
-        // If grad is scalar-like (length 1), tile it to target shape
+        // If grad is scalar-like (length 1), tile it to target shape.
+        // Issue #327: previously used RentZeroed (Array.Clear of 64 MB
+        // for [32,64,8192] loss-shape) + TensorFill (another 64 MB
+        // write) = 128 MB memory traffic for what should be a single
+        // pass. RentUninitialized skips the zero — TensorFill
+        // overwrites every element anyway, so the prior zero was pure
+        // waste. Measured ReduceSumBackward 106 ms/call → expected
+        // ~halved by skipping the redundant clear.
         if (grad.Length == 1)
         {
-            var result = TensorPool<T>.RentZeroed(targetShape);
+            var result = TensorAllocator.RentUninitialized<T>(targetShape);
             engine.TensorFill(result, grad.GetFlat(0));
             return result;
         }

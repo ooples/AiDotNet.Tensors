@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -101,6 +102,7 @@ internal static class RebindablePlanCache<T>
         // Walk the cached reverse-topo indices, reading entries from the
         // CURRENT arena. entry.Output is this iteration's tensor, not the
         // recording-time tensor — that's the rebinding semantics.
+        bool timing = BackwardTiming.Enabled;
         var indices = _cachedReverseTopoIndices;
         for (int i = 0; i < indices.Length; i++)
         {
@@ -111,6 +113,7 @@ internal static class RebindablePlanCache<T>
             if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 continue;
 
+            long start = timing ? Stopwatch.GetTimestamp() : 0;
             entry.Backward(
                 gradOutput,
                 entry.GetInputsArray(),
@@ -118,6 +121,11 @@ internal static class RebindablePlanCache<T>
                 entry.SavedState ?? Array.Empty<object>(),
                 engine,
                 grads);
+            if (timing)
+            {
+                long ticks = Stopwatch.GetTimestamp() - start;
+                BackwardTiming.Record(entry.Backward.Method.Name, ticks);
+            }
         }
 
         // Source filter — same semantics as CompiledDelegateChain.Execute.
