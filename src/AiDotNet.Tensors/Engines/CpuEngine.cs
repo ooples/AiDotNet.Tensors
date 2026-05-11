@@ -17698,9 +17698,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
 
-        var gradGammaData = new T[featureSize];
-        var gradBetaData = new T[featureSize];
-        var gradInputData = new T[batchSize * featureSize];
+        // Issue #319 Phase 4: rent from the tensor pool instead of
+        // allocating fresh T[] per call. gradGamma/gradBeta are
+        // accumulators (kernel does +=), so they need zero-init —
+        // Rent (not RentUninitialized) gives that. gradInput is
+        // written directly (=), so RentUninitialized is safe.
+        // Each layer norm backward at ViT-Base shape [197, 768]
+        // would otherwise allocate ~605 KB for gradInput per layer
+        // per backward step.
+        var gradGammaTensor = TensorAllocator.Rent<T>(gamma._shape);
+        var gradBetaTensor = TensorAllocator.Rent<T>(gamma._shape);
+        var gradInputTensor = TensorAllocator.RentUninitialized<T>(input._shape);
+        var gradGammaData = gradGammaTensor.GetDataArray();
+        var gradBetaData = gradBetaTensor.GetDataArray();
+        var gradInputData = gradInputTensor.GetDataArray();
 
         // ────────────────────────────────────────────────────────────────────
         // Primitive fast paths: direct array access, no INumericOperations<T>
@@ -17894,9 +17905,15 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
-        gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
+        // The data arrays are owned by the pooled tensors rented above —
+        // adopt-not-copy, so the second alloc + Vector wrap + copy that
+        // the previous "Rent(shape, new Vector<T>(data))" pattern incurred
+        // is gone. Net savings on a ViT-Base layer norm backward at
+        // [197, 768]: 2× 768 floats (gradGamma/Beta) + 1× 197×768 floats
+        // (gradInput) = ~605 KB of duplicate allocation per call avoided.
+        gradGamma = gradGammaTensor;
+        gradBeta = gradBetaTensor;
+        return gradInputTensor;
     }
 
     /// <inheritdoc/>
