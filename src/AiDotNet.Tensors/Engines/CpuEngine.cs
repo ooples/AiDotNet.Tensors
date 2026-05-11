@@ -2597,7 +2597,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var aSpanD = new ReadOnlySpan<double>((double[])(object)aArrD, a._storageOffset, m * k);
                 var bSpanD = new ReadOnlySpan<double>((double[])(object)bArrD, b._storageOffset, k * n);
                 var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
-                Simd.SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
+                SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
@@ -10550,7 +10550,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var rRaw = (double[])(object)result._storage.GetDataArray();
             int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
 
-            if (Helpers.BlasProvider.TryGemmEx(M, N, K,
+            if (BlasProvider.TryGemmEx(M, N, K,
                 aRaw, aOff, K, false,
                 bRaw, bOff, K, true,
                 rRaw, rOff, N))
@@ -10726,10 +10726,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 bArr, 0, n, false,
                 oArr, 0, n))
                 return;
-            Simd.SimdGemm.Dgemm(
-                new System.ReadOnlySpan<double>(aArr, 0, m * k),
-                new System.ReadOnlySpan<double>(bArr, 0, k * n),
-                new System.Span<double>(oArr, 0, m * n),
+            SimdGemm.Dgemm(
+                new ReadOnlySpan<double>(aArr, 0, m * k),
+                new ReadOnlySpan<double>(bArr, 0, k * n),
+                new Span<double>(oArr, 0, m * n),
                 m, k, n);
             return;
         }
@@ -10744,15 +10744,15 @@ public partial class CpuEngine : ITensorLevelEngine
             int batchSize = 1;
             for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
             int rows = batchSize * m;
-            if (Helpers.BlasProvider.TryGemmEx(rows, n, k,
+            if (BlasProvider.TryGemmEx(rows, n, k,
                 aArr, 0, k, false,
                 bArr, 0, n, false,
                 oArr, 0, n))
                 return;
-            Simd.SimdGemm.Dgemm(
-                new System.ReadOnlySpan<double>(aArr, 0, rows * k),
-                new System.ReadOnlySpan<double>(bArr, 0, k * n),
-                new System.Span<double>(oArr, 0, rows * n),
+            SimdGemm.Dgemm(
+                new ReadOnlySpan<double>(aArr, 0, rows * k),
+                new ReadOnlySpan<double>(bArr, 0, k * n),
+                new Span<double>(oArr, 0, rows * n),
                 rows, k, n);
             return;
         }
@@ -10769,30 +10769,30 @@ public partial class CpuEngine : ITensorLevelEngine
             int sliceA = m * k, sliceB = k * n, sliceC = m * n;
             if (batchSize == 1)
             {
-                if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                if (BlasProvider.TryGemmEx(m, n, k,
                     aArr, 0, k, false,
                     bArr, 0, n, false,
                     oArr, 0, n))
                     return;
-                Simd.SimdGemm.Dgemm(
-                    new System.ReadOnlySpan<double>(aArr, 0, sliceA),
-                    new System.ReadOnlySpan<double>(bArr, 0, sliceB),
-                    new System.Span<double>(oArr, 0, sliceC),
+                SimdGemm.Dgemm(
+                    new ReadOnlySpan<double>(aArr, 0, sliceA),
+                    new ReadOnlySpan<double>(bArr, 0, sliceB),
+                    new Span<double>(oArr, 0, sliceC),
                     m, k, n);
             }
             else
             {
-                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
                 {
-                    if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                    if (BlasProvider.TryGemmEx(m, n, k,
                         aArr, batch * sliceA, k, false,
                         bArr, batch * sliceB, n, false,
                         oArr, batch * sliceC, n))
                         return;
-                    Simd.SimdGemm.DgemmSequential(
-                        new System.ReadOnlySpan<double>(aArr, batch * sliceA, sliceA),
-                        new System.ReadOnlySpan<double>(bArr, batch * sliceB, sliceB),
-                        new System.Span<double>(oArr, batch * sliceC, sliceC),
+                    SimdGemm.DgemmSequential(
+                        new ReadOnlySpan<double>(aArr, batch * sliceA, sliceA),
+                        new ReadOnlySpan<double>(bArr, batch * sliceB, sliceB),
+                        new Span<double>(oArr, batch * sliceC, sliceC),
                         m, k, n);
                 });
             }
@@ -11253,7 +11253,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var bD = (double[])(object)bData;
             var rD = (double[])(object)rData;
 
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
             {
                 int aOffset = batch * matrixSizeA;
                 int bOffset = batch * matrixSizeB;
@@ -11266,7 +11266,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     return;
                 }
 
-                Simd.SimdGemm.DgemmSequential(
+                SimdGemm.DgemmSequential(
                     aD.AsSpan(aOffset, matrixSizeA),
                     bD.AsSpan(bOffset, matrixSizeB),
                     rD.AsSpan(resultOffset, matrixSizeResult),
@@ -21558,12 +21558,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         for (int j = 0; j < headDim; j++)
                             kt[j * seqK + i] = kd[kOff + i * headDim + j];
 
-                    if (!Helpers.BlasProvider.TryGemmEx(seqQ, seqK, headDim,
+                    if (!BlasProvider.TryGemmEx(seqQ, seqK, headDim,
                         qd, qOff, headDim, false,
                         kt, 0, seqK, false,
                         scoresData, sOff, seqK))
                     {
-                        Engines.Simd.SimdGemm.DgemmSequential(
+                        SimdGemm.DgemmSequential(
                             qd.AsSpan(qOff, seqQ * headDim),
                             kt.AsSpan(0, headDim * seqK),
                             scoresData.AsSpan(sOff, seqQ * seqK),
@@ -21619,12 +21619,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 int wOff = bh * seqQ * seqK;
                 int vOff = bh * seqK * d_v;
                 int oOff = bh * seqQ * d_v;
-                if (!Helpers.BlasProvider.TryGemmEx(seqQ, d_v, seqK,
+                if (!BlasProvider.TryGemmEx(seqQ, d_v, seqK,
                     weightsData, wOff, seqK, false,
                     vd, vOff, d_v, false,
                     outputData, oOff, d_v))
                 {
-                    Engines.Simd.SimdGemm.DgemmSequential(
+                    SimdGemm.DgemmSequential(
                         weightsData.AsSpan(wOff, seqQ * seqK),
                         vd.AsSpan(vOff, seqK * d_v),
                         outputData.AsSpan(oOff, seqQ * d_v),

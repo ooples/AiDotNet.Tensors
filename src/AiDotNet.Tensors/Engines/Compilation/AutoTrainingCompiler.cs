@@ -195,13 +195,39 @@ internal static class AutoTrainingCompiler
             // tensors (the original use case that broke clone-then-train:
             // identical op pattern + identical shapes but different
             // underlying Tensor{T} references).
-            var inputs = entry.GetInputsArray();
-            if (inputs is not null)
+            //
+            // Read directly from the inline Input0/Input1/Input2/InputsOverflow
+            // fields instead of calling entry.GetInputsArray() — GetInputsArray
+            // allocates a fresh Tensor<T>[1..3] on every call, and this loop
+            // runs once per RecordStep / TryGetCompiledBackward / TryCompileBackward
+            // (every Train iteration), which adds noticeable GC churn on
+            // large graphs (BERT ~150 entries = 150 small-array allocs per
+            // Train call). The inline path also lets us skip the
+            // InputsOverflow branch entirely when InputCount ≤ 3.
+            if (entry.InputsOverflow is not null)
             {
-                foreach (var inp in inputs)
+                foreach (var inp in entry.InputsOverflow)
                 {
                     if (inp is null) continue;
                     hash ^= RuntimeHelpers.GetHashCode(inp);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+            }
+            else
+            {
+                if (entry.InputCount >= 1 && entry.Input0 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input0);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+                if (entry.InputCount >= 2 && entry.Input1 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input1);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+                if (entry.InputCount >= 3 && entry.Input2 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input2);
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }

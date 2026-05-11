@@ -70,14 +70,20 @@ public static class TensorAllocator
         {
             try
             {
-                return AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming<T>(shape);
+                return WeightRegistry.AllocateStreaming<T>(shape);
             }
-            catch
+            catch (ObjectDisposedException)
             {
-                // Streaming pool failure (budget exceeded, pool disposed, etc.)
-                // is non-fatal — fall through to plain allocation so the
-                // caller still gets a usable tensor.
+                // Streaming pool has been disposed — graceful fallback to plain
+                // allocation so the caller still gets a usable tensor.
             }
+            // NOTE: deliberately do NOT catch ArgumentException /
+            // NotSupportedException / InvalidOperationException / OutOfMemoryException
+            // from AllocateStreaming. Those signal real problems (invalid shape, type
+            // not actually streamable, byteCount > int.MaxValue forcing chunking,
+            // pool budget exceeded) that the caller needs to see — silently falling
+            // back to `new Tensor<T>(shape)` would replace an actionable error with
+            // a less informative OOM on a tensor the runtime can't actually hold.
         }
 
         // No active arena — graceful degradation to standard CLR allocation.
@@ -89,7 +95,7 @@ public static class TensorAllocator
 
     /// <summary>
     /// Element-count threshold above which <see cref="RentPinned{T}"/> routes
-    /// through <see cref="AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming{T}"/>
+    /// through <see cref="WeightRegistry.AllocateStreaming{T}"/>
     /// instead of plain CLR allocation. 100M elements is the same order as the
     /// 125M-param ParameterBuffer-skip threshold the model layer uses — picks
     /// up the FC layers in BERT-large / VGG16-BN / GPT-3 attention banks
@@ -98,20 +104,19 @@ public static class TensorAllocator
     private const int StreamingThresholdElements = 100_000_000;
 
     /// <summary>
-    /// Mirrors <see cref="AiDotNet.Tensors.LinearAlgebra.WeightRegistry.AllocateStreaming{T}"/>'s
-    /// supported-type whitelist so <see cref="RentPinned{T}"/> can skip the
-    /// streaming attempt for types it would throw on. Keep in sync with the
-    /// <c>IsStreamableType</c> check inside that method.
+    /// Delegates to <see cref="WeightRegistry.IsStreamableType{T}"/>
+    /// — the single source of truth for which element types
+    /// <see cref="WeightRegistry.AllocateStreaming{T}"/>
+    /// can serialize. Keeping the streamable-type table in one place means
+    /// adding a new supported T (e.g., when BF8 arrives) only requires
+    /// updating <c>WeightRegistry.StreamableTypeSize</c>; this gate picks
+    /// up the change automatically. Previously this lived as a hand-written
+    /// duplicate here and silently drifted out of sync (BFloat16 was
+    /// streamable in WeightRegistry but excluded here, causing fp16-like
+    /// large weights to skip streaming and OOM at <c>new Tensor&lt;T&gt;()</c>).
     /// </summary>
-    private static bool WeightRegistryAcceptsType<T>()
-    {
-        var t = typeof(T);
-        return t == typeof(float) || t == typeof(double) || t == typeof(int) || t == typeof(long)
-#if NET5_0_OR_GREATER
-            || t == typeof(System.Half)
-#endif
-            ;
-    }
+    private static bool WeightRegistryAcceptsType<T>() =>
+        WeightRegistry.IsStreamableType<T>();
 
     /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
