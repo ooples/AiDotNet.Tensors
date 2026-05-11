@@ -33547,6 +33547,24 @@ public partial class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
             return scalarResult;
         }
+        // Double fast path: same fused single-pass diff² sum.
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double sumSq = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double d = pArr[i] - tArr[i];
+                sumSq += d * d;
+            }
+            double dMean = sumSq / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
+            AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
+            return scalarResult;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
@@ -33596,6 +33614,21 @@ public partial class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
             return scalarResult;
         }
+        // Double fast path
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double sumAbs = 0.0;
+            for (int i = 0; i < len; i++)
+                sumAbs += Math.Abs(pArr[i] - tArr[i]);
+            double dMean = sumAbs / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
+            AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
+            return scalarResult;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
@@ -33631,18 +33664,62 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Float fast path: fused Huber loss over contiguous arrays.
+        if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (float[])(object)predictions.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            float deltaF = (float)delta;
+            float halfDelta = 0.5f * deltaF;
+            float sum = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float d = pArr[i] - tArr[i];
+                float ad = MathF.Abs(d);
+                sum += ad <= deltaF ? 0.5f * d * d : deltaF * (ad - halfDelta);
+            }
+            float fMean = sum / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
+            DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
+                BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+            AutoTracer.RecordOp("HuberLoss", scalarResult, eng => scalarResult);
+            return scalarResult;
+        }
+        // Double fast path
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double halfDelta = 0.5 * delta;
+            double sum = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double d = pArr[i] - tArr[i];
+                double ad = Math.Abs(d);
+                sum += ad <= delta ? 0.5 * d * d : delta * (ad - halfDelta);
+            }
+            double dMean = sum / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
+                BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+            AutoTracer.RecordOp("HuberLoss", scalarResult, eng => scalarResult);
+            return scalarResult;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         Tensor<T> diff;
         using (new NoGradScope<T>()) { diff = TensorSubtract(predictions, targets); }
-        T sum = numOps.Zero;
+        T sumGeneric = numOps.Zero;
         for (int i = 0; i < diff.Length; i++)
         {
             double d = numOps.ToDouble(diff[i]);
-            sum = numOps.Add(sum, Math.Abs(d) <= delta
+            sumGeneric = numOps.Add(sumGeneric, Math.Abs(d) <= delta
                 ? numOps.FromDouble(0.5 * d * d)
                 : numOps.FromDouble(delta * (Math.Abs(d) - 0.5 * delta)));
         }
-        T mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        T mean = numOps.Divide(sumGeneric, numOps.FromDouble(predictions.Length));
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("HuberLoss", result, predictions, targets,
             BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
@@ -33864,6 +33941,18 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.SELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            const double alpha = 1.6732632423543772;
+            const double scale = 1.0507009873554805;
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < tensor.Length; i++)
+            {
+                double x = dSrc[i];
+                dDst[i] = x > 0 ? scale * x : scale * alpha * (Math.Exp(x) - 1);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -33917,6 +34006,16 @@ public partial class CpuEngine : ITensorLevelEngine
             { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
             return result;
         }
+        if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < tensor.Length; i++)
+                dDst[i] = Math.Max(0.0, Math.Min(1.0, dSrc[i] / 6.0 + 0.5));
+            DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
+            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
+            return result;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < tensor.Length; i++)
         {
@@ -33956,6 +34055,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var fDst = (float[])(object)result.GetDataArray();
             for (int i = 0; i < length; i++)
                 fDst[i] = MathF.Max(0f, MathF.Min(6f, fSrc[i]));
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Max(0.0, Math.Min(6.0, dSrc[i]));
         }
         else
         {
@@ -34018,6 +34124,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
                     fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[channelIdx] * fSrc[i];
+                }
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dAlpha = (double[])(object)alpha.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            if (channels == tensor.Length)
+            {
+                for (int i = 0; i < dSrc.Length; i++)
+                    dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[i] * dSrc[i];
+            }
+            else
+            {
+                for (int i = 0; i < dSrc.Length; i++)
+                {
+                    int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
+                    dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[channelIdx] * dSrc[i];
                 }
             }
         }
