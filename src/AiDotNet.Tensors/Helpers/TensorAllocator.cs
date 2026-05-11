@@ -281,6 +281,15 @@ public static class TensorAllocator
     /// it directly; mutations through the caller's variable become
     /// visible through the tensor and vice versa.
     /// </para>
+    /// <para>
+    /// <b>Interaction with <see cref="TensorPool.ForceFreshAllocations"/>:</b>
+    /// this overload is implicitly compatible — its
+    /// <c>data.Length == product(shape)</c> precondition matches the
+    /// "backing array length is exactly product(shape)" guarantee that
+    /// flag was designed to enforce (no ArrayPool overhang, no pooled
+    /// over-sized buffers). Issue #318 callers can use this overload
+    /// freely without violating byte-equality contracts.
+    /// </para>
     /// </remarks>
     public static Tensor<T> Rent<T>(int[] shape, T[] data)
     {

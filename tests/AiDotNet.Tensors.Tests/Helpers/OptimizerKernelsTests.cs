@@ -19,6 +19,16 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// Disable xUnit parallel execution for this class — the two
+// alloc-comparison tests sample GC.GetTotalAllocatedBytes, which is
+// a process-wide counter. If another test in another class is
+// allocating concurrently, those bytes get attributed to our naive
+// vs fused measurement and the relative-reduction assertion can
+// trip on the noise.
+[CollectionDefinition("OptimizerKernelsAllocSerial", DisableParallelization = true)]
+public class OptimizerKernelsAllocSerialCollection { }
+
+[Collection("OptimizerKernelsAllocSerial")]
 public class OptimizerKernelsTests
 {
     private readonly ITestOutputHelper _output;
