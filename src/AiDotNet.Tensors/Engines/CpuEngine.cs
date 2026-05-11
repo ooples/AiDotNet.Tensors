@@ -2182,6 +2182,45 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path — mirrors the float branch above. Direct double
+        // arithmetic + parallelized over channels. CNN-heavy diffusion models
+        // (StableDiffusion, ControlNet, DiT) and any CNN trained at double
+        // precision hits this op on every inference / training-eval pass; the
+        // generic numOps fallback below pays ~3 virtual calls per output
+        // element and was a measurable share of ResNet50 BatchNorm wall time.
+        if (typeof(T) == typeof(double))
+        {
+            int Cd = x._shape[1], Hd = x._shape[2], Wd = x._shape[3], Nd = x._shape[0];
+            int spatialD = Hd * Wd;
+            var inD = (double[])(object)x.GetDataArray();
+            var gammaD = (double[])(object)gamma.GetDataArray();
+            var betaD  = (double[])(object)beta.GetDataArray();
+            var meanD  = (double[])(object)mean.GetDataArray();
+            var varD   = (double[])(object)variance.GetDataArray();
+            var outD   = (double[])(object)output.GetDataArray();
+            output.Layout = x.Layout;
+
+            var scaleD = new double[Cd];
+            var biasD  = new double[Cd];
+            for (int c = 0; c < Cd; c++)
+            {
+                double s = gammaD[c] / System.Math.Sqrt(varD[c] + epsilon);
+                scaleD[c] = s;
+                biasD[c]  = betaD[c] - s * meanD[c];
+            }
+
+            CpuParallelSettings.ParallelForOrSerial(0, Nd * Cd, (long)Nd * Cd * spatialD, ncIdx =>
+            {
+                int n = ncIdx / Cd;
+                int c = ncIdx % Cd;
+                int baseIdx = (n * Cd + c) * spatialD;
+                double s = scaleD[c], b2 = biasD[c];
+                for (int sp = 0; sp < spatialD; sp++)
+                    outD[baseIdx + sp] = inD[baseIdx + sp] * s + b2;
+            });
+            return;
+        }
+
         // Generic scalar fallback. Pre-combine scale/bias per channel, then FMA.
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
@@ -6827,6 +6866,49 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 MaxPool2DFloatGeneric(inArr, outArr, bc, h, w, oH, oW, ps, st, pd);
             }
+            return result;
+        }
+
+        // Double fast path: direct double arithmetic with the same parallel-
+        // over-(batch, channels) partition the generic fallback uses, but
+        // without the per-element numOps virtual dispatch. ResNet50's
+        // 3x3 maxpool over 1×64×112×112 hits this op once per train iter
+        // backward + forward; the generic numOps path was paying ~9
+        // GreaterThan + 9 ToDouble / output cell.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && result.GetDataArray() is double[] outArrD)
+        {
+            int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
+            int psD = poolSize, stD = stride, pdD = padding;
+            int bcD = batch * channels;
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            {
+                int inBase = idx * hD * wD;
+                int outBase = idx * oHD * oWD;
+                for (int oh = 0; oh < oHD; oh++)
+                {
+                    for (int ow = 0; ow < oWD; ow++)
+                    {
+                        double maxVal = double.NegativeInfinity;
+                        int ihStart = oh * stD - pdD;
+                        int iwStart = ow * stD - pdD;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = psD < (hD - ihStart) ? psD : (hD - ihStart);
+                        int kwEnd = psD < (wD - iwStart) ? psD : (wD - iwStart);
+
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inBase + (ihStart + kh) * wD + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                double v = inArrD[rowOff + kw];
+                                if (v > maxVal) maxVal = v;
+                            }
+                        }
+                        outArrD[outBase + oh * oWD + ow] = maxVal;
+                    }
+                }
+            });
             return result;
         }
 
@@ -16453,6 +16535,69 @@ public partial class CpuEngine : ITensorLevelEngine
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
+        }
+
+        // Double fast path — mirrors the float kernel structure with direct
+        // double arithmetic and per-channel parallelization. Without this
+        // branch, BatchNorm4D forward for double walks the generic numOps
+        // fallback below: ~6 virtual-call interface dispatches per output
+        // element, dominating BatchNorm wall time on ResNet50 training when
+        // the activation tape is enabled (BatchNorm4D forward runs on EVERY
+        // train pass, both as a primary op and inside Conv2D-fused-with-BN
+        // forward graphs).
+        if (inputData is double[] inD && gammaData is double[] gamD && betaData is double[] betD)
+        {
+            double epsD = numOps.ToDouble(eps);
+            var meanDArr = new double[channels];
+            var varDArr  = new double[channels];
+            int logicalLength = input.Length;
+#if NET5_0_OR_GREATER
+            var outDArr = GC.AllocateUninitializedArray<double>(logicalLength);
+#else
+            var outDArr = new double[logicalLength];
+#endif
+            int spD = spatialSize;
+            int epcD = elementsPerChannel;
+            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * epcD, c =>
+            {
+                double sum = 0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                        sum += inD[offset + s];
+                }
+                double meanC = sum / epcD;
+                meanDArr[c] = meanC;
+
+                double sumSq = 0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                    {
+                        double diff = inD[offset + s] - meanC;
+                        sumSq += diff * diff;
+                    }
+                }
+                double varC = sumSq / epcD;
+                varDArr[c] = varC;
+
+                double invStd = 1.0 / System.Math.Sqrt(varC + epsD);
+                double g = gamD[c], b2 = betD[c];
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spD + c * spD;
+                    for (int s = 0; s < spD; s++)
+                    {
+                        int idx = offset + s;
+                        outDArr[idx] = g * (inD[idx] - meanC) * invStd + b2;
+                    }
+                }
+            });
+            mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(meanDArr));
+            variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(varDArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(outDArr));
         }
 
         var meanData = new T[channels];
