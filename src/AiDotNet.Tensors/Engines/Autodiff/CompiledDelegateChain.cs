@@ -1,6 +1,56 @@
+using System.Diagnostics;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
+
+/// <summary>
+/// Per-op backward timing aggregator. Enabled when env var
+/// AIDOTNET_BWD_TIMING=1. Aggregates wall ticks by backward delegate
+/// method name across a backward pass and prints a summary on demand.
+/// Used to diagnose which backward function dominates the
+/// chain.Execute wall time (issue #327 investigation).
+/// </summary>
+public static class BackwardTiming
+{
+    private static readonly bool _enabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_BWD_TIMING") == "1";
+    [ThreadStatic]
+    private static Dictionary<string, (long ticks, int calls)>? _aggregator;
+
+    public static bool Enabled => _enabled;
+
+    internal static void Record(string op, long ticks)
+    {
+        if (!_enabled) return;
+        _aggregator ??= new Dictionary<string, (long, int)>();
+        var key = op ?? "(null)";
+        if (_aggregator.TryGetValue(key, out var prior))
+            _aggregator[key] = (prior.ticks + ticks, prior.calls + 1);
+        else
+            _aggregator[key] = (ticks, 1);
+    }
+
+    public static void DumpAndReset()
+    {
+        if (!_enabled || _aggregator is null) return;
+        Console.WriteLine();
+        Console.WriteLine($"{"Backward op",-40}{"calls",10}{"total ms",14}{"avg µs",14}");
+        long totalTicks = 0;
+        int totalCalls = 0;
+        foreach (var kv in _aggregator) { totalTicks += kv.Value.ticks; totalCalls += kv.Value.calls; }
+        var sorted = new List<(string op, long ticks, int calls)>();
+        foreach (var kv in _aggregator) sorted.Add((kv.Key, kv.Value.ticks, kv.Value.calls));
+        sorted.Sort((a, b) => b.ticks.CompareTo(a.ticks));
+        foreach (var (op, ticks, calls) in sorted)
+        {
+            double ms = ticks * 1000.0 / Stopwatch.Frequency;
+            double us = ticks * 1_000_000.0 / Stopwatch.Frequency / calls;
+            Console.WriteLine($"{op,-40}{calls,10}{ms,14:F3}{us,14:F1}");
+        }
+        Console.WriteLine($"{"TOTAL",-40}{totalCalls,10}{totalTicks * 1000.0 / Stopwatch.Frequency,14:F3}");
+        _aggregator.Clear();
+    }
+}
 
 /// <summary>
 /// Pre-compiled delegate chain for backward execution. Captures the exact
@@ -83,14 +133,21 @@ internal sealed class CompiledDelegateChain<T>
 
         // Replay chain — straight-line delegate calls, no traversal.
         // Iterate only over the live range [0, _count).
+        bool timing = BackwardTiming.Enabled;
         for (int i = 0; i < _count; i++)
         {
             ref var step = ref _steps[i];
             if (!grads.TryGetValue(step.Output, out var gradOutput))
                 continue;
 
+            long start = timing ? Stopwatch.GetTimestamp() : 0;
             step.Backward(gradOutput, step.Inputs, step.Output,
                 step.SavedState ?? Array.Empty<object>(), engine, grads);
+            if (timing)
+            {
+                long ticks = Stopwatch.GetTimestamp() - start;
+                BackwardTiming.Record(step.Backward.Method.Name, ticks);
+            }
         }
 
         if (sources is not null)

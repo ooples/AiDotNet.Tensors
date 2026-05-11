@@ -83,6 +83,13 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Console.WriteLine("─── Phase D — Sustained CPU utilization probe (5s window) ──");
         RunSustainedCpuProbe(engine);
 
+        // Phase E: dump per-backward-op timing aggregator (only populated
+        // when AIDOTNET_BWD_TIMING=1 is set). Helps identify which
+        // backward function dominates the 250 ms backward wall time.
+        Console.WriteLine();
+        Console.WriteLine("─── Phase E — Per-backward-op timing (AIDOTNET_BWD_TIMING=1) ─");
+        BackwardTiming.DumpAndReset();
+
         Console.WriteLine();
         Console.WriteLine($"Sink: {_sink:F6}");
     }
