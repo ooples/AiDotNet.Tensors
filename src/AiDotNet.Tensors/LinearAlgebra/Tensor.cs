@@ -1563,10 +1563,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (Engines.Autodiff.GradientTape<T>.Current != null)
         {
             var originalShape = _shape.ToArray();
-            result.GradFn = new Engines.Autodiff.GradNode<T>(
-                Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward,
-                result, this,
-                savedState: new object[] { originalShape });
+            // Issue #319 Phase 3: pooled GradNode rental, stamped with
+            // the current tape so cleanup only Returns nodes it owns.
+            var reshapeNode = Engines.Autodiff.GradNodePool<T>.Rent();
+            reshapeNode.OwningTape = Engines.Autodiff.GradientTape<T>.Current;
+            reshapeNode.Backward = Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward;
+            reshapeNode.Output = result;
+            reshapeNode.Input0 = this;
+            reshapeNode.InputCount = 1;
+            reshapeNode.SavedState = new object[] { originalShape };
+            result.GradFn = reshapeNode;
         }
 
         // Record the view in the active lazy graph so a forward lambda ending

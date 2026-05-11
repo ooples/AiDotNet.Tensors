@@ -155,14 +155,37 @@ internal static class DifferentiableOps
             slot.Input0 = inputs[0];
         }
 
-        // Set GradFn for graph-based backward
-        output.GradFn = inputs.Length switch
+        // Set GradFn for graph-based backward. Rent from the pool —
+        // returned during backward cleanup. Issue #319 Phase 3.
+        var node = GradNodePool<T>.Rent();
+        node.OwningTape = tape;
+        node.Backward = backward;
+        node.Output = output;
+        node.SavedState = savedState;
+        switch (inputs.Length)
         {
-            1 => new GradNode<T>(backward, output, inputs[0], savedState: savedState),
-            2 => new GradNode<T>(backward, output, inputs[0], inputs[1], savedState: savedState, inputCount: 2),
-            3 => new GradNode<T>(backward, output, inputs[0], inputs[1], inputs[2], savedState: savedState, inputCount: 3),
-            _ => new GradNode<T>(backward, output, inputs[0], inputsOverflow: inputs, inputCount: 0xFF, savedState: savedState)
-        };
+            case 1:
+                node.Input0 = inputs[0];
+                node.InputCount = 1;
+                break;
+            case 2:
+                node.Input0 = inputs[0];
+                node.Input1 = inputs[1];
+                node.InputCount = 2;
+                break;
+            case 3:
+                node.Input0 = inputs[0];
+                node.Input1 = inputs[1];
+                node.Input2 = inputs[2];
+                node.InputCount = 3;
+                break;
+            default:
+                node.Input0 = inputs[0];
+                node.InputsOverflow = inputs;
+                node.InputCount = 0xFF;
+                break;
+        }
+        output.GradFn = node;
     }
 
     /// <summary>
@@ -190,8 +213,16 @@ internal static class DifferentiableOps
         slot.InputCount = 1;
         slot.Version0 = input.Version;
 
-        // Set GradFn on output for O(1) graph-based backward traversal
-        output.GradFn = new GradNode<T>(backward, output, input, savedState: savedState);
+        // Set GradFn on output for O(1) graph-based backward traversal.
+        // Pooled rental — see GradNodePool<T>. Issue #319 Phase 3.
+        var node = GradNodePool<T>.Rent();
+        node.OwningTape = tape;
+        node.Backward = backward;
+        node.Output = output;
+        node.Input0 = input;
+        node.InputCount = 1;
+        node.SavedState = savedState;
+        output.GradFn = node;
     }
 
     /// <summary>
@@ -221,7 +252,16 @@ internal static class DifferentiableOps
         slot.Version0 = a.Version;
         slot.Version1 = b.Version;
 
-        output.GradFn = new GradNode<T>(backward, output, a, b, savedState: savedState, inputCount: 2);
+        // Pooled GradNode rental — issue #319 Phase 3.
+        var node = GradNodePool<T>.Rent();
+        node.OwningTape = tape;
+        node.Backward = backward;
+        node.Output = output;
+        node.Input0 = a;
+        node.Input1 = b;
+        node.InputCount = 2;
+        node.SavedState = savedState;
+        output.GradFn = node;
     }
 
     /// <summary>

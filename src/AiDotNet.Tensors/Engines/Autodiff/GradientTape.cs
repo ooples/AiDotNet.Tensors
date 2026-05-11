@@ -775,6 +775,15 @@ public sealed class GradientTape<T> : IDisposable
                     if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
                     return false;
                 }
+                // Issue #319 Phase 3: while clearing GradFn references on
+                // tape tensors, also return the GradNode itself to the
+                // pool. Safe only when:
+                //   - this isn't a createGraph=true backward (the
+                //     higher-order recorder added new ops that
+                //     reference these same nodes)
+                //   - the tape isn't persistent (the chain is cached
+                //     and may be re-executed on the next backward)
+                bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
                 foreach (var node in topoOrder)
                 {
                     node.Output.GradFn = null;
@@ -808,6 +817,16 @@ public sealed class GradientTape<T> : IDisposable
                             if (!ShouldKeepGrad(inp))
                                 inp.Grad = null;
                         }
+                    }
+
+                    // Issue #319 Phase 3: only Return nodes that THIS tape
+                    // recorded. Inner backward passes (e.g. GradientCheckpointing
+                    // recompute) follow GradFn pointers past their own ops into
+                    // outer-tape nodes via shared input tensors; pooling those
+                    // here would clear fields the outer cleanup still needs.
+                    if (canPoolNodes && ReferenceEquals(node.OwningTape, this))
+                    {
+                        GradNodePool<T>.Return(node);
                     }
                 }
             }
