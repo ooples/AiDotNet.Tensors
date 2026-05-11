@@ -26,6 +26,43 @@ public static class TensorAllocator
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
 
     /// <summary>
+    /// Creates a zero-initialized tensor with the given shape that's pinned
+    /// to the current <see cref="TensorArena"/>'s long-lived tier. Pinned
+    /// allocations survive <see cref="TensorArena.Reset"/> — use this for
+    /// model weights (layer EnsureInitialized), optimizer state (Adam m / v),
+    /// running BatchNorm statistics, anything that's part of the network's
+    /// learnable state and must NOT be re-issued as scratch on the next
+    /// training iteration. Falls back to a plain <see cref="Tensor{T}"/>
+    /// allocation when no arena is active (graceful degradation —
+    /// non-arena callers get GC-tracked allocation, same as
+    /// <see cref="Rent{T}(int[])"/> with TensorPool disabled).
+    /// </summary>
+    public static Tensor<T> RentPinned<T>(int[] shape)
+    {
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+        if (totalSize == 0) return new Tensor<T>(shape);
+
+        var arena = TensorArena.Current;
+        if (arena != null)
+        {
+            T[]? pinnedArray = arena.TryAllocatePinned<T>(totalSize);
+            if (pinnedArray != null)
+            {
+                var memory = new Memory<T>(pinnedArray, 0, totalSize);
+                return Tensor<T>.FromMemory(memory, shape);
+            }
+        }
+
+        // No active arena — graceful degradation to standard CLR allocation.
+        // The caller's "this lives across iterations" contract still holds
+        // because plain Tensor<T> backing arrays aren't touched by Reset
+        // (they were never in any arena pool to begin with).
+        return new Tensor<T>(shape);
+    }
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
     /// use standard CLR allocation. All paths return zeroed memory.
