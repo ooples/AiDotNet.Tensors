@@ -19369,26 +19369,86 @@ public partial class CpuEngine : ITensorLevelEngine
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+        // Primitive fast paths: direct float/double arithmetic, no
+        // INumericOperations<T> virtual dispatch. Used by every LLaMA-style
+        // transformer block — gets called per-token per-layer per-step.
+        // The backward (RMSNormBackward) already had these primitive branches;
+        // forward stayed generic, paying ~20× the cost per element on AVX2
+        // hosts vs the cast-to-primitive variant.
+        if (typeof(T) == typeof(float))
         {
-            int offset = b * featureSize;
-            T featureSizeT = numOps.FromDouble(featureSize);
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fRms = (float[])(object)rmsData;
+            var fOutput = (float[])(object)outputData;
+            float fEps = (float)epsilon;
+            int fs = featureSize;
+            float invFs = 1f / fs;
 
-            // RMS
-            T sumSq = numOps.Zero;
-            for (int f = 0; f < featureSize; f++)
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
             {
-                T val = inputData[offset + f];
-                sumSq = numOps.Add(sumSq, numOps.Multiply(val, val));
-            }
-            T rmsVal = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, featureSizeT), eps));
-            rmsData[b] = rmsVal;
+                int offset = b * fs;
+                float sumSq = 0f;
+                for (int f = 0; f < fs; f++)
+                {
+                    float val = fInput[offset + f];
+                    sumSq += val * val;
+                }
+                float rmsVal = MathF.Sqrt(sumSq * invFs + fEps);
+                fRms[b] = rmsVal;
+                float invRms = 1f / rmsVal;
+                for (int f = 0; f < fs; f++)
+                    fOutput[offset + f] = fGamma[f] * (fInput[offset + f] * invRms);
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dRms = (double[])(object)rmsData;
+            var dOutput = (double[])(object)outputData;
+            int fs = featureSize;
+            double invFs = 1.0 / fs;
 
-            // Normalize and scale
-            T invRms = numOps.Divide(numOps.One, rmsVal);
-            for (int f = 0; f < featureSize; f++)
-                outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
-        });
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            {
+                int offset = b * fs;
+                double sumSq = 0.0;
+                for (int f = 0; f < fs; f++)
+                {
+                    double val = dInput[offset + f];
+                    sumSq += val * val;
+                }
+                double rmsVal = Math.Sqrt(sumSq * invFs + epsilon);
+                dRms[b] = rmsVal;
+                double invRms = 1.0 / rmsVal;
+                for (int f = 0; f < fs; f++)
+                    dOutput[offset + f] = dGamma[f] * (dInput[offset + f] * invRms);
+            });
+        }
+        else
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            {
+                int offset = b * featureSize;
+                T featureSizeT = numOps.FromDouble(featureSize);
+
+                // RMS
+                T sumSq = numOps.Zero;
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T val = inputData[offset + f];
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(val, val));
+                }
+                T rmsVal = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, featureSizeT), eps));
+                rmsData[b] = rmsVal;
+
+                // Normalize and scale
+                T invRms = numOps.Divide(numOps.One, rmsVal);
+                for (int f = 0; f < featureSize; f++)
+                    outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
+            });
+        }
 
         rms = TensorAllocator.Rent<T>(batchShape, rmsData);
         var rmsResult = TensorAllocator.Rent<T>(input._shape, outputData);
