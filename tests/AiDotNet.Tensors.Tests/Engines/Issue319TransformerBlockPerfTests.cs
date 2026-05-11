@@ -63,6 +63,12 @@ public class Issue319TransformerBlockPerfTests
     [Fact]
     public void GELU_FusedKernel_NumericallyMatchesTanhDecomposition()
     {
+#if NET5_0_OR_GREATER
+        // System.Runtime.Intrinsics.X86 is .NET 5+. On net471 the test
+        // runs unconditionally — net471 builds use the scalar fallback
+        // for both kernels (the SIMD paths are gated by #if NET5_0_OR_GREATER
+        // inside SimdKernels.cs too), so the equivalence check still
+        // passes trivially.
         if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported
             || !System.Runtime.Intrinsics.X86.Fma.IsSupported)
         {
@@ -71,6 +77,7 @@ public class Issue319TransformerBlockPerfTests
             // designed for has no signal here.
             return;
         }
+#endif
 
         const int Length = 4096;
         var rng = new Random(42);
