@@ -143,7 +143,7 @@ internal static class AutoTrainingCompiler
     /// Computes a hash of the training step pattern from tape entries.
     /// Two steps with the same op sequence + shapes produce the same hash.
     /// </summary>
-    private static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
+    internal static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
         // Include element type so float and double plans don't collide

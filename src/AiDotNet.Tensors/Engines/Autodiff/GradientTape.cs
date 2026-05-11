@@ -1,4 +1,5 @@
-﻿using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -726,6 +727,40 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
+        // Fresh-tape rebindable plan cache lookup (closes the consumer
+        // backward-walk gap from issue #327). Eligible when:
+        //   * tape is non-persistent (entries reset per call so the cached
+        //     plan's entry indices remain meaningful)
+        //   * not inside a createGraph backward (higher-order AD records
+        //     new ops; the cached plan doesn't have them)
+        //   * tape has entries to walk
+        // Pattern hash is computed from current entries (op sequence +
+        // shapes); a match means the same forward executed previously on
+        // this thread and we can dispatch the backward by index without
+        // running DFS or building a step array. The cache holds no tensor
+        // references, only int[] of entry indices, so it survives across
+        // tape disposal.
+        if (!_options.Persistent
+            && !DifferentiableOps._isBackwardCreateGraph
+            && _entries.Count > 0)
+        {
+            long lookupHash = AutoTrainingCompiler.ComputePatternHash(_entries, _entries.Count);
+            // Quick signature check first — empty cache or hash mismatch
+            // both return false at the cost of three thread-static field
+            // reads, much cheaper than the full TryExecute call.
+            if (RebindablePlanCache<T>.TrySignature(lookupHash, _entries.Count))
+            {
+                var savedCurrent = _current;
+                SetCurrentTape(null);
+                try
+                {
+                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
+                    if (cached is not null) return cached;
+                }
+                finally { SetCurrentTape(savedCurrent); }
+            }
+        }
+
         // Issue #319 Phase 1: thread-local scratch buffers for the
         // backward dispatch path. Acquire once at the top of the call;
         // nested backwards (createGraph=true Hessian path) fall back to
@@ -824,6 +859,74 @@ public sealed class GradientTape<T> : IDisposable
 
             // Execute the chain
             var result = chain.Execute(loss, sources, engine, useScratch: acquiredScratch);
+
+            // Build rebindable plan for fresh-tape callers (closes the
+            // consumer fresh-tape gap from issue #327). MUST run AFTER
+            // chain.Execute — building the plan before Execute mutated
+            // state that broke higher-order AD (Hvp/Hessian); see the
+            // bisection comment in RebindablePlanCache for details.
+            //
+            // After Execute, we know:
+            //   * The backward pass completed and produced `result`.
+            //   * tape entries are stable (recording suspended during
+            //     non-createGraph backward; for createGraph, rebindEligible
+            //     is false).
+            // Building + storing the plan here lets the NEXT fresh tape
+            // with the same forward pattern hit the cache at the top of
+            // this method (TryGet) and skip DFS + step-build entirely.
+            if (!_options.Persistent
+                && !DifferentiableOps._isBackwardCreateGraph
+                && _entries.Count > 0)
+            {
+                // Detect cross-tape walks (Hvp / higher-order AD nests tapes;
+                // the topoOrder crosses into the inner tape's nodes). The
+                // cache only knows about THIS tape's entries — a cached plan
+                // would silently skip the inner tape's gradient contributions
+                // and produce wrong gradients on every replay. Punt to the
+                // DFS path on every call when any cross-tape node appears.
+                bool crossTape = false;
+                for (int i = 0; i < stepCount; i++)
+                {
+                    if (!ReferenceEquals(topoOrder[i].OwningTape, this))
+                    {
+                        crossTape = true;
+                        break;
+                    }
+                }
+
+                if (!crossTape)
+                {
+                    long patternHash = AutoTrainingCompiler.ComputePatternHash(_entries, _entries.Count);
+
+                    // Map each GradNode in topoOrder to its tape entry index.
+                    // Tape entries are recorded in forward (topological) order;
+                    // entry.Output.GradFn IS the GradNode for that op. One O(N)
+                    // walk gives us the map for the per-node lookup below.
+                    var nodeToEntryIndex = new Dictionary<GradNode<T>, int>(_entries.Count);
+                    for (int e = 0; e < _entries.Count; e++)
+                    {
+                        ref var rec = ref _entries[e];
+                        var fn = rec.Output?.GradFn;
+                        if (fn is not null && !nodeToEntryIndex.ContainsKey(fn))
+                            nodeToEntryIndex[fn] = e;
+                    }
+
+                    // reverseTopoIndices[i] = entry index of the i-th step
+                    // we'd dispatch in backward (topoOrder traversed in reverse).
+                    var reverseTopoIndices = new int[stepCount];
+                    int writeIdx = 0;
+                    for (int i = stepCount - 1; i >= 0; i--)
+                    {
+                        var node = topoOrder[i];
+                        if (nodeToEntryIndex.TryGetValue(node, out int entryIdx))
+                            reverseTopoIndices[writeIdx++] = entryIdx;
+                    }
+                    if (writeIdx < reverseTopoIndices.Length)
+                        Array.Resize(ref reverseTopoIndices, writeIdx);
+
+                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices);
+                }
+            }
 
         // Clear GradFn to release graph memory (non-persistent tapes
         // get new graphs each step). Walk inputs inline rather than
@@ -1036,7 +1139,7 @@ public sealed class GradientTape<T> : IDisposable
                     // here is a cheap no-op.
                     if (canPoolIntermediates && !ShouldKeepGrad(node.Output))
                     {
-                        Helpers.AutoTensorCache.Return(node.Output);
+                        AutoTensorCache.Return(node.Output);
                     }
                 }
             }
