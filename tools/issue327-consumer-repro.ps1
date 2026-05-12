@@ -1,51 +1,51 @@
 # Copyright (c) AiDotNet. All rights reserved.
 #
-# Issue #327 consumer-side repro driver. Clones HarmonicEngine at a
-# pinned commit, points its NuGet feed at this repo's locally-built
-# AiDotNet.Tensors package, and runs the consumer Transformer Train
-# benchmark that originally surfaced the 6-10× gap vs PyTorch CPU.
-#
-# Used to validate that the AiDotNet.Tensors-side fixes in this PR
-# (Phase 3 SgemmDirect gate, Phase 4 forward-intermediate pooling, etc.)
-# actually transfer through to the consumer Train wall-clock the
-# issue tracks.
+# Issue #327 consumer-side repro driver. Clones HarmonicEngine,
+# points its NuGet feed at this repo's locally-built AiDotNet.Tensors
+# package, and runs the consumer Transformer Train benchmark.
 #
 # Usage:
-#   pwsh tools/issue327-consumer-repro.ps1            # default: 100 steps
-#   pwsh tools/issue327-consumer-repro.ps1 -Steps 5000 -Seeds 8
+#   pwsh tools/issue327-consumer-repro.ps1 -Run                     # run with defaults
+#   pwsh tools/issue327-consumer-repro.ps1 -Steps 5000 -Seeds 8     # full 8-seed
 #   AIDOTNET_RUN_CONSUMER_INTEGRATION=1 pwsh tools/issue327-consumer-repro.ps1
 #
-# Prerequisites:
-#   - dotnet SDK 10.0+ on PATH
-#   - git on PATH
-#   - HarmonicEngine repo accessible (public on github.com/ooples)
+# -HarmonicEngineRef accepts a branch, tag, or full commit SHA. Pinning
+# a SHA is recommended for reproducibility (default branch is volatile).
 #
-# This script is INTENTIONALLY not wired into CI — the consumer
-# integration takes 3+ hours per full 8-seed run. Manual pre-PR
-# validation only. The xUnit gate at
-# tests/AiDotNet.Tensors.Tests/Engines/Issue327TransformerTrainPerfTests.cs
-# is the CI tripwire.
+# Prerequisites: dotnet SDK 10.0+, git, network access to github.com/ooples/HarmonicEngine.
+# Not wired into CI — the full run takes 3+ hours.
 
 param(
+    [switch]$Run,
     [int]$Steps = 100,
     [int]$Seeds = 1,
+    # Default tracks the current consumer main branch. Override with a
+    # SHA (e.g. -HarmonicEngineRef abc1234567890abc...) for reproducible
+    # bisection. Branch / tag / SHA all accepted.
     [string]$HarmonicEngineRef = "main",
-    [string]$WorkDir = "$env:TEMP\issue327-consumer-repro"
+    # Use Join-Path below for the directory so Windows / macOS / Linux
+    # all build a path with the right separator.
+    [string]$WorkDir = (Join-Path $env:TEMP "issue327-consumer-repro")
 )
 
 $ErrorActionPreference = "Stop"
 
-# Gate on env var unless explicitly invoked with -Force semantics. The
-# consumer integration is a manual pre-PR step, not an automatic CI gate.
-if ($env:AIDOTNET_RUN_CONSUMER_INTEGRATION -ne "1" -and -not $PSBoundParameters.ContainsKey('Steps')) {
-    Write-Host "Skipping consumer integration: AIDOTNET_RUN_CONSUMER_INTEGRATION != 1"
-    Write-Host "Pass -Steps <N> explicitly, or set AIDOTNET_RUN_CONSUMER_INTEGRATION=1 to run."
+# Run gate: require either explicit -Run, env var, or any non-default
+# arg to be set (to support `-Steps 5000` shorthand). Helps prevent
+# accidental 3-hour runs from a no-arg invocation.
+if (-not $Run -and $env:AIDOTNET_RUN_CONSUMER_INTEGRATION -ne "1" `
+    -and -not $PSBoundParameters.ContainsKey('Steps') `
+    -and -not $PSBoundParameters.ContainsKey('Seeds') `
+    -and -not $PSBoundParameters.ContainsKey('HarmonicEngineRef')) {
+    Write-Host "No -Run / explicit arg / AIDOTNET_RUN_CONSUMER_INTEGRATION env."
+    Write-Host "Usage: pwsh tools/issue327-consumer-repro.ps1 -Run"
+    Write-Host "       pwsh tools/issue327-consumer-repro.ps1 -Steps 5000 -Seeds 8"
     exit 0
 }
 
 # Repo root: this script lives in tools/, so .. is the repo root.
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$TensorsCsproj = Join-Path $RepoRoot "src\AiDotNet.Tensors\AiDotNet.Tensors.csproj"
+$TensorsCsproj = Join-Path (Join-Path $RepoRoot "src") (Join-Path "AiDotNet.Tensors" "AiDotNet.Tensors.csproj")
 
 if (-not (Test-Path $TensorsCsproj)) {
     Write-Error "AiDotNet.Tensors.csproj not found at $TensorsCsproj"
@@ -85,17 +85,35 @@ if (Test-Path $HarmonicEngineDir) {
     Write-Host "[2/4] Updating HarmonicEngine checkout..."
     Push-Location $HarmonicEngineDir
     & git fetch --quiet origin
+    # Reset to the ref. `git checkout <sha>` works for SHAs, branches,
+    # and tags. `git reset --hard origin/<x>` only works for branches —
+    # for SHAs or tags it'd fail. Try the origin-prefixed reset first
+    # and fall through to direct checkout for SHAs/tags.
     & git checkout --quiet $HarmonicEngineRef
-    & git reset --hard --quiet "origin/$HarmonicEngineRef"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "git checkout of $HarmonicEngineRef failed (exit $LASTEXITCODE)"
+        exit 1
+    }
+    & git reset --hard --quiet $HarmonicEngineRef 2>$null
     Pop-Location
 } else {
     Write-Host "[2/4] Cloning HarmonicEngine..."
-    & git clone --quiet --depth 1 --branch $HarmonicEngineRef `
-        https://github.com/ooples/HarmonicEngine.git $HarmonicEngineDir
+    # Clone the default branch first (shallow), then `git checkout` to
+    # the requested ref. `git clone --branch` only accepts branches /
+    # tags — passing a SHA fails. Two-step clone handles all three.
+    & git clone --quiet https://github.com/ooples/HarmonicEngine.git $HarmonicEngineDir
     if ($LASTEXITCODE -ne 0) {
         Write-Error "git clone HarmonicEngine failed (exit $LASTEXITCODE)"
         exit 1
     }
+    Push-Location $HarmonicEngineDir
+    & git checkout --quiet $HarmonicEngineRef
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "git checkout $HarmonicEngineRef failed (exit $LASTEXITCODE)"
+        Pop-Location
+        exit 1
+    }
+    Pop-Location
 }
 
 # Step 3: Configure local NuGet feed so HarmonicEngine picks up our build.
@@ -126,7 +144,7 @@ foreach ($key in $envOverrides.Keys) {
     Set-Item -Path "env:$key" -Value $envOverrides[$key]
 }
 
-& dotnet test tests\HarmonicEngine.Tests.csproj `
+& dotnet test (Join-Path "tests" "HarmonicEngine.Tests.csproj") `
     -p:UseLocalAiDotNet=false `
     -p:AiDotNetTensorsVersion=$TensorsNupkgVersion `
     --filter $reproFilter `
@@ -137,7 +155,7 @@ Pop-Location
 
 Write-Host ""
 Write-Host "=== Consumer repro complete ==="
-Write-Host "  Logs        : $HarmonicEngineDir\logs\"
+Write-Host "  Logs        : $(Join-Path $HarmonicEngineDir 'logs')"
 Write-Host "  Test exit   : $testExit"
 Write-Host ""
 Write-Host "Issue #327 close criteria:"

@@ -756,19 +756,7 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
-        // Fresh-tape rebindable plan cache lookup (closes the consumer
-        // backward-walk gap from issue #327). Eligible when:
-        //   * tape is non-persistent (entries reset per call so the cached
-        //     plan's entry indices remain meaningful)
-        //   * not inside a createGraph backward (higher-order AD records
-        //     new ops; the cached plan doesn't have them)
-        //   * tape has entries to walk
-        // Pattern hash is computed from current entries (op sequence +
-        // shapes); a match means the same forward executed previously on
-        // this thread and we can dispatch the backward by index without
-        // running DFS or building a step array. The cache holds no tensor
-        // references, only int[] of entry indices, so it survives across
-        // tape disposal.
+        // Rebindable plan cache: fresh-tape repeat-pattern fast path.
         if (!_options.Persistent
             && !DifferentiableOps._isBackwardCreateGraph
             && _entries.Count > 0)
@@ -784,7 +772,15 @@ public sealed class GradientTape<T> : IDisposable
                 try
                 {
                     var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
-                    if (cached is not null) return cached;
+                    if (cached is not null)
+                    {
+                        // Per-call cleanup parity with the fresh-walk path
+                        // below — clear GradFn / .Grad on intermediates so
+                        // they don't pin one full backward's worth of
+                        // gradient tensors across successive calls.
+                        CleanupAfterCachedReplay(cached, sources);
+                        return cached;
+                    }
                 }
                 finally { SetCurrentTape(savedCurrent); }
             }
@@ -1047,20 +1043,6 @@ public sealed class GradientTape<T> : IDisposable
                 //     and may be re-executed on the next backward)
                 bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
 
-                // Also return the forward intermediate tensor itself
-                // (node.Output) to AutoTensorCache so the next forward
-                // pass reuses the buffer instead of allocating fresh.
-                // Without this, the pool was empty because nothing
-                // returned to it — every forward op went straight to
-                // TensorAllocator.RentUninitialized. Measured on a
-                // representative 4-layer transformer Train step: forward
-                // allocation drops from 128 → 52 MB / iter.
-                // Same gates as canPoolNodes; additionally only pool when:
-                //   - tensor is contiguous (non-contiguous views can't pool)
-                //   - user hasn't marked it for grad retention (RetainGrad
-                //     consumers may read .Grad after backward returns, and
-                //     pooling the tensor would put it under reuse by an
-                //     unrelated next-iter forward op)
                 bool canPoolIntermediates = canPoolNodes;
                 foreach (var node in topoOrder)
                 {
@@ -1159,17 +1141,10 @@ public sealed class GradientTape<T> : IDisposable
                         GradNodePool<T>.Return(node);
                     }
 
-                    // Return the forward intermediate (node.Output) to
-                    // AutoTensorCache for next-iter reuse.
-                    // Skip when grad is retained on the output — that
-                    // signals the user is still reading from it. The pool
-                    // itself rejects non-contiguous tensors and tensors
-                    // that exceed the per-shape cap, so a duplicate enqueue
-                    // here is a cheap no-op.
-                    if (canPoolIntermediates && !ShouldKeepGrad(node.Output))
-                    {
-                        AutoTensorCache.Return(node.Output);
-                    }
+                    // node.Output is intentionally NOT pooled — user code
+                    // may still hold it (loss, logged intermediates). Safe
+                    // forward-intermediate pooling needs an opt-in API or
+                    // Tensor-side liveness tracking.
                 }
             }
 
@@ -1193,6 +1168,38 @@ public sealed class GradientTape<T> : IDisposable
         }
     }
 
+
+    // Per-call cleanup invoked when the rebindable plan cache hit fires.
+    // Walks tape entries, clears GradFn / .Grad on intermediates the
+    // caller didn't ask to keep, and returns GradNodes to the pool.
+    // Matches the fresh-walk path's cleanup at lines below — without
+    // this, every cache hit pins one backward's worth of gradient
+    // tensors across the per-tensor .Grad slot.
+    private void CleanupAfterCachedReplay(
+        Dictionary<Tensor<T>, Tensor<T>> result,
+        IReadOnlyList<Tensor<T>>? sources)
+    {
+        if (DifferentiableOps._isBackwardCreateGraph) return;
+        HashSet<Tensor<T>>? sourceSet = null;
+        if (sources is not null)
+        {
+            sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var s in sources) sourceSet.Add(s);
+        }
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var entry = ref _entries[i];
+            var output = entry.Output;
+            if (output is null) continue;
+            var fn = output.GradFn;
+            if (fn is null || !ReferenceEquals(fn.OwningTape, this)) continue;
+            output.GradFn = null;
+            bool keepGrad = sourceSet?.Contains(output) == true
+                || (_retainGrad is not null && _retainGrad.Contains(output));
+            if (!keepGrad) output.Grad = null;
+            GradNodePool<T>.Return(fn);
+        }
+    }
 
     private static void TopologicalSort(GradNode<T> node, HashSet<GradNode<T>> visited, List<GradNode<T>> result)
     {

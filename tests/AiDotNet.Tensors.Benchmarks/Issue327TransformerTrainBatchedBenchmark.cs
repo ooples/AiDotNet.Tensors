@@ -241,7 +241,11 @@ public static class Issue327TransformerTrainBatchedBenchmark
             Console.WriteLine($"  L={layers,-3} forward only: {ms,8:F3} ms/step  active cores: {cores,5:F1}");
         }
         var allFour = MakeWeights(Layers);
-        Console.WriteLine($"  (L=4 expected: ~4× L=1; if not, dispatch overhead is per-call, not per-layer)");
+        // L=4 includes the same single output-projection that L=1 does;
+        // the per-layer scaling ratio is best read as (L=4 - output_proj_ms)
+        // ÷ (L=1 - output_proj_ms). Direct multiplication overestimates
+        // per-layer cost.
+        Console.WriteLine($"  (per-layer cost = (L=4 - output_proj) / (L=1 - output_proj))");
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -254,15 +258,18 @@ public static class Issue327TransformerTrainBatchedBenchmark
         var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
 
         // Optimizer state: m, v moments for Adam (same shape as each weight)
-        var optM = weights.Select(w => MakeFloatTensor(w._shape, new Random(0))).ToArray();
-        var optV = weights.Select(w => MakeFloatTensor(w._shape, new Random(0))).ToArray();
+        // Adam m_0 = v_0 = 0 per the algorithm.
+        var optM = weights.Select(w => new Tensor<float>(new float[w.Length], (int[])w._shape.Clone())).ToArray();
+        var optV = weights.Select(w => new Tensor<float>(new float[w.Length], (int[])w._shape.Clone())).ToArray();
 
         const int warmup = 3;
         const int iters = 20;
 
-        // For persistent mode, hold one tape across all iters so the
-        // compiled-chain cache engages on iter 2+. For non-persistent,
-        // each call creates a fresh tape inside DoTrainStep.
+        // For persistent mode, hold one tape across all iters and
+        // Reset() it between steps (required by AutoTrainingCompiler's
+        // contract — without Reset() entries accumulate every iter and
+        // pattern-hashed plans never match). For non-persistent, each
+        // call creates a fresh tape inside DoTrainStep.
         GradientTape<float>? sharedTape = persistent
             ? new GradientTape<float>(new GradientTapeOptions { Persistent = true })
             : null;
@@ -364,6 +371,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Tensor<float> loss;
         GradientTape<float>? ownTape = sharedTape is null ? new GradientTape<float>() : null;
         var tape = sharedTape ?? ownTape!;
+        if (sharedTape is not null) sharedTape.Reset();
         GradientsScope<float>? gradScope = null;
         long allocFwdStart = GC.GetTotalAllocatedBytes(precise: true);
         try
@@ -511,8 +519,9 @@ public static class Issue327TransformerTrainBatchedBenchmark
     {
         var weights = MakeWeights(Layers);
         var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
-        var optM = weights.Select(w => MakeFloatTensor(w._shape, new Random(0))).ToArray();
-        var optV = weights.Select(w => MakeFloatTensor(w._shape, new Random(0))).ToArray();
+        // Adam m_0 = v_0 = 0 per the algorithm.
+        var optM = weights.Select(w => new Tensor<float>(new float[w.Length], (int[])w._shape.Clone())).ToArray();
+        var optV = weights.Select(w => new Tensor<float>(new float[w.Length], (int[])w._shape.Clone())).ToArray();
 
         // 5-second sustained train run with 100ms CPU sampling.
         const double targetSec = 5.0;
@@ -586,10 +595,12 @@ public static class Issue327TransformerTrainBatchedBenchmark
     // ────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Forward pass over L stacked transformer-encoder-style layers. Each
-    /// layer runs: QKV proj → Wo proj → FFN-up → GELU → FFN-down. The
-    /// output projection to vocab runs once at the end. Faithfully hits
-    /// every matmul shape from the issue.
+    /// Forward over L encoder-style layers: QKV proj → slice → Wo →
+    /// FFN-up → GELU → FFN-down, then a final output projection to
+    /// vocab. Mirrors 4 of the 5 matmul shapes from issue #327 — the
+    /// per-head attention-scores shape is measured separately in Phase
+    /// A (we collapse the multi-head attention to a single Wo path in
+    /// the synthetic forward so we don't need a real softmax).
     /// </summary>
     private static Tensor<float> ForwardL(
         CpuEngine engine,
