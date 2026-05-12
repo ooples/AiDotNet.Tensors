@@ -7351,6 +7351,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
+        // GPU SoftmaxBackward diverges from CpuEngine reference on the
+        // SDPA chain — gradient sign came back wrong on the small 2×2 test
+        // shape. Route to CpuEngine until the kernel formula is verified.
+        return base.SoftmaxBackward(gradOutput, output, axis);
+#pragma warning disable CS0162 // unreachable
         if (!TryGetBackend(out var backend))
             return base.SoftmaxBackward(gradOutput, output, axis);
 
@@ -7419,6 +7424,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.SoftmaxBackward(gradOutput, output, axis);
         }
+#pragma warning restore CS0162
     }
 
     /// <summary>
