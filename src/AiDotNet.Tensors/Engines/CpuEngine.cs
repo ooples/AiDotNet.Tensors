@@ -22151,7 +22151,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// GQA allows multiple query heads to share the same key-value head,
     /// reducing memory bandwidth and KV-cache size during inference.
     /// </remarks>
-    public Tensor<T> GroupedQueryAttention<T>(
+    public virtual Tensor<T> GroupedQueryAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
