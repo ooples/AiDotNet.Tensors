@@ -152,10 +152,13 @@ public class Issue327TransformerTrainPerfTests
         for (int l = 0; l < Layers; l++)
         {
             int offset = l * 4;
-            // QKV proj (sink-only — kept for measurement parity with harness)
-            _ = engine.TensorMatMul(x, weights[offset + 0]);
-            // Wo (uses input shape so result is [B,S,D])
-            var attnOut = engine.TensorMatMul(x, weights[offset + 1]);
+            // QKV proj routed through a slice → Wo path so weights[0]
+            // stays on the autodiff graph (reviewer feedback: the prior
+            // sink-only `_ = engine.TensorMatMul(...)` disconnected
+            // weights[offset+0] from the loss).
+            var qkv = engine.TensorMatMul(x, weights[offset + 0]);
+            var qProxy = engine.TensorSlice(qkv, new[] { 0, 0, 0 }, new[] { B, Ctx, D });
+            var attnOut = engine.TensorMatMul(qProxy, weights[offset + 1]);
             // FFN up + GELU + FFN down
             var f1 = engine.TensorMatMul(attnOut, weights[offset + 2]);
             var f1g = engine.GELU(f1);

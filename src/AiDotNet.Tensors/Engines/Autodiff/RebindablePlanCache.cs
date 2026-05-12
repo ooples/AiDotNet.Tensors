@@ -107,7 +107,13 @@ internal static class RebindablePlanCache<T>
         for (int i = 0; i < indices.Length; i++)
         {
             int idx = indices[i];
-            if (idx < 0 || idx >= currentEntries.Count) continue;
+            // Out-of-range index signals a stale cache — entry count
+            // dropped between Store and TryExecute. The pre-loop
+            // signature check should have caught this; if we reach
+            // here, the cache key is no longer valid and silent skip
+            // would produce wrong gradients. Bail out so the caller
+            // falls back to the fresh-walk path.
+            if (idx < 0 || idx >= currentEntries.Count) return null;
             ref var entry = ref currentEntries[idx];
 
             if (!grads.TryGetValue(entry.Output, out var gradOutput))

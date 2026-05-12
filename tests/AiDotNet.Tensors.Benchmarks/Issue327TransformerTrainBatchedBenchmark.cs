@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.Intrinsics.X86;
 using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -410,7 +411,11 @@ public static class Issue327TransformerTrainBatchedBenchmark
         var swOpt = Stopwatch.StartNew();
         const float lr = 1e-3f;
         const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
-        System.Threading.Tasks.Parallel.For(0, weights.Length, wi =>
+        var parallelOpts = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = CpuParallelSettings.MaxDegreeOfParallelism
+        };
+        Parallel.For(0, weights.Length, parallelOpts, wi =>
         {
             if (!grads.TryGetValue(weights[wi], out var g)) return;
             var w = weights[wi];

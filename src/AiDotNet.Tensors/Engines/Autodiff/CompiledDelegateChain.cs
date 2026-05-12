@@ -10,14 +10,14 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// Used to diagnose which backward function dominates the
 /// chain.Execute wall time (issue #327 investigation).
 /// </summary>
-public static class BackwardTiming
+internal static class BackwardTiming
 {
     private static readonly bool _enabled =
         Environment.GetEnvironmentVariable("AIDOTNET_BWD_TIMING") == "1";
     [ThreadStatic]
     private static Dictionary<string, (long ticks, int calls)>? _aggregator;
 
-    public static bool Enabled => _enabled;
+    internal static bool Enabled => _enabled;
 
     internal static void Record(string op, long ticks)
     {
@@ -30,7 +30,7 @@ public static class BackwardTiming
             _aggregator[key] = (ticks, 1);
     }
 
-    public static void DumpAndReset()
+    internal static void DumpAndReset()
     {
         if (!_enabled || _aggregator is null) return;
         Console.WriteLine();
