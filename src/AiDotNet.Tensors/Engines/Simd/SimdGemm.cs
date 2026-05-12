@@ -1236,7 +1236,10 @@ internal static partial class SimdGemm
     // packed cache-blocking; the direct path's A-panel-per-iter approach
     // doesn't amortize at that scale.
     private const long TallThinMatmulWorkThreshold = 4L * 1024 * 1024 * 1024;
-    private const int TallThinMatmulKThreshold = 256;
+    // Raised 256 → 512 to capture the FFN-down backward shape (K=FfDim=512)
+    // in the consumer Transformer. L1d cache footprint: 6-row × K=512 × 4 B
+    // = 12 KB, still well under Zen 2's 32 KB L1d.
+    private const int TallThinMatmulKThreshold = 512;
     private const int TallThinMatmulMinM = 256;
 
     // For transB=true (e.g. AttentionQKT Q·K^T), now that SgemmDirect has
