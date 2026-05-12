@@ -2004,17 +2004,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Returns true when a GradientTape is active on the current thread and
-    /// gradient recording is not suppressed by a NoGradScope. When true, all
-    /// fused/GPU public overrides that bypass DifferentiableOps.Record* must
-    /// defer to <c>base.X()</c> (the CpuEngine impl) so the forward op is
-    /// recorded on the tape. Going through the GPU kernel directly silently
-    /// disconnects the op from autograd — gradients drop to zero on this
-    /// tensor and any downstream params it produced.
+    /// gradient recording is not suppressed by a NoGradScope, OR an
+    /// <see cref="Autodiff.AnomalyModeScope"/> is active. When true, all
+    /// fused/GPU public overrides that bypass DifferentiableOps.Record*
+    /// must defer to <c>base.X()</c> (the CpuEngine impl) so the forward
+    /// op is recorded on the tape. The AnomalyMode branch keeps backward
+    /// arithmetic deterministic IEEE 754 — some GPU kernels normalize
+    /// `1/0` or `log(0)` away from +/-Inf, which suppresses the NaN/Inf
+    /// check downstream and causes Anomaly tests to spuriously pass
+    /// without flagging the real anomaly. Going through CpuEngine
+    /// preserves the canonical IEEE behaviour the anomaly detector
+    /// expects.
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static bool IsTapeActive<T>()
-        => Autodiff.GradientTape<T>.Current is not null
-           && !Autodiff.NoGradScope<T>.IsSuppressed;
+        => (Autodiff.GradientTape<T>.Current is not null
+            && !Autodiff.NoGradScope<T>.IsSuppressed)
+           || Autodiff.AnomalyModeScope.IsActive;
 
     Vector<T> IEngine.Add<T>(Vector<T> a, Vector<T> b)
     {
@@ -11928,6 +11934,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        // AnomalyMode: skip the GPU kernel so divide-by-zero produces the
+        // canonical +/-Inf the anomaly detector watches for. Some GPU
+        // Divide kernels return 0 or NaN for x/0 and mask the anomaly.
+        if (Autodiff.AnomalyModeScope.IsActive)
+            return base.TensorDivide(a, b);
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorDivide(a, b);
         try
