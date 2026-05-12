@@ -15,7 +15,20 @@ namespace AiDotNet.Tensors.Tests.Engines
     /// </summary>
     public class LazyGraphModeTests
     {
+        // Elementwise-op tolerance — both paths emit identical scalar instructions
+        // so we hold them to single-ulp parity at typical operand magnitudes.
         private const float Tolerance = 1e-6f;
+
+        // GEMM-op tolerance — eager 2D MatMul uses `TensorMatMul2D` while the
+        // lazy graph's write-through path uses `SimdGemm.SgemmWithCachedB`.
+        // Both are correct SGEMM implementations but they tile + accumulate K
+        // in a different order, so the float32 reduction error compounds at
+        // ~K·eps_float per element. For K=64 the expected drift is ~K·eps ≈
+        // 8e-6; observed worst-case at this test's shapes is ~1.6e-5 (well
+        // within the 5·K·eps numerical-stability band). The strict 1e-6
+        // tolerance below is appropriate ONLY for ops with no reduction;
+        // every test that drives a GEMM dispatch must use this looser bound.
+        private const float MatMulTolerance = 5e-5f;
 
         private static Tensor<float> MakeRandom(int[] shape, int seed = 42)
         {
@@ -28,15 +41,17 @@ namespace AiDotNet.Tensors.Tests.Engines
             return new Tensor<float>(data, shape);
         }
 
-        private static void AssertTensorsEqual(Tensor<float> expected, Tensor<float> actual, string op)
+        private static void AssertTensorsEqual(Tensor<float> expected, Tensor<float> actual, string op, float? tolerance = null)
         {
+            float tol = tolerance ?? Tolerance;
             Assert.Equal(expected._shape, actual._shape);
             var expSpan = expected.AsSpan();
             var actSpan = actual.AsSpan();
             for (int i = 0; i < expSpan.Length; i++)
             {
-                Assert.True(Math.Abs(expSpan[i] - actSpan[i]) < Tolerance,
-                    op + ": element [" + i + "] expected " + expSpan[i] + " but got " + actSpan[i]);
+                Assert.True(Math.Abs(expSpan[i] - actSpan[i]) < tol,
+                    op + ": element [" + i + "] expected " + expSpan[i] + " but got " + actSpan[i]
+                    + " (|delta|=" + Math.Abs(expSpan[i] - actSpan[i]) + ", tol=" + tol + ")");
             }
         }
 
@@ -158,7 +173,7 @@ namespace AiDotNet.Tensors.Tests.Engines
                 scope.Realize();
             }
 
-            AssertTensorsEqual(eagerResult, lazyResult, "TensorMatMul");
+            AssertTensorsEqual(eagerResult, lazyResult, "TensorMatMul", MatMulTolerance);
         }
 
         [Fact]
