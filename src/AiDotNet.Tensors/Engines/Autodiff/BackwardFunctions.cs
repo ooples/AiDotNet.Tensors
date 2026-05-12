@@ -446,15 +446,62 @@ internal static class BackwardFunctions<T>
             }
         }
 
-        // Fallback: transpose last two dims (works for all ranks).
-        // bT and aT are local intermediates feeding TensorMatMul; after
-        // gradAFallback/gradBFallback are produced they have no further
-        // use in this backward. The pool-return is safe by virtue of
-        // AutoTensorCache.Return's GradFn check: when createGraph=true
-        // records the consuming matmul on the tape, bT/aT's GradFn is
-        // set (they came from TransposeLastTwoDims which records), so
-        // Return refuses to pool them. When createGraph=false they
-        // have no recorded references and pool cleanly.
+        // ND × 2D collapsed fast path: when inputs[0] is rank >= 2 and
+        // inputs[1] is rank-2, BOTH contiguous, we can flatten inputs[0]'s
+        // leading dims into M and run a single 2D MatMul backward through
+        // the existing parallel TensorMatMul dispatcher. Avoids the
+        // TransposeLastTwoDims of inputs[0] (a 3-MB write for our
+        // [B,S,D] consumer shape) and the rank-3 × rank-3 batched matmul
+        // that the rank-mismatched fallback below would otherwise
+        // dispatch into per-batch sequential calls.
+        //
+        // Math: forward y = A·B where A is [...batch, M_inner, K] and
+        // B is [K, N]. Collapsed: A_flat is [M*M_inner, K] (M = product
+        // of batch dims). Backward:
+        //   gradA_flat = gradOutput_flat · Bᵀ   [M*M_inner, N] @ [N, K]
+        //   gradB      = A_flatᵀ · gradOutput_flat   [K, M*M_inner] @ [M*M_inner, N]
+        // Both are 2D GEMMs through TensorMatMul's full parallel path.
+        // Reshape gradA back to inputs[0]._shape at the end (zero-copy
+        // since the data layout is identical for contiguous tensors).
+        if (inputs[0].Rank >= 2 && inputs[1].Rank == 2
+            && inputs[0].IsContiguous && inputs[1].IsContiguous
+            && gradOutput.IsContiguous)
+        {
+            int aRank0 = inputs[0].Rank;
+            int Mflat = 1;
+            for (int i = 0; i < aRank0 - 1; i++) Mflat *= inputs[0]._shape[i];
+            int Kflat = inputs[0]._shape[aRank0 - 1];
+            int Nflat = inputs[1]._shape[1];
+
+            // Reshape A and gradOutput to 2D views ([M*..., K] and [M*..., N]).
+            // Reshape on contiguous is zero-copy (no data motion).
+            var a2D = engine.Reshape(inputs[0], new[] { Mflat, Kflat });
+            var g2D = engine.Reshape(gradOutput, new[] { Mflat, Nflat });
+
+            // bT = inputs[1]ᵀ via TensorTranspose (2D, small — weight matrix).
+            // Then gradA_2D = g2D · bT through the engine's parallel 2D dispatcher.
+            var bT2 = engine.TensorTranspose(inputs[1]);
+            var gradA2D = engine.TensorMatMul(g2D, bT2);
+
+            // aT2 = a2Dᵀ. For tall-thin A (M*M_inner >> K) this is the
+            // expensive transpose, but its cost is mostly memory write
+            // (M·K writes) which we'd otherwise pay anyway via the
+            // per-batch transpose in TransposeLastTwoDims; the SAVING is
+            // the rank-3 × rank-3 BatchMatMul → 2D GEMM swap below.
+            var aT2 = engine.TensorTranspose(a2D);
+            var gradB2 = engine.TensorMatMul(aT2, g2D);
+
+            // Reshape gradA back to inputs[0]'s original shape.
+            var gradAReshaped = engine.Reshape(gradA2D, (int[])inputs[0]._shape.Clone());
+
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAReshaped, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB2, engine);
+            return;
+        }
+
+        // Generic fallback for rank mismatch or non-contiguous: transpose
+        // last two dims (works for all ranks). Slower because it allocates
+        // the full ND transpose AND dispatches rank-3+ matmul per-batch.
         var bT = TransposeLastTwoDims(inputs[1], engine);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
