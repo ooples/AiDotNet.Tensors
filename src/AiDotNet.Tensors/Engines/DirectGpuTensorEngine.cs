@@ -15460,10 +15460,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorSoftmax(tensor, axis);
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; var gi=UploadTensorRaw(b, tensor); var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
-        return base.TensorSoftmax(tensor,axis);
+        // CrossEntropyLossBackward calls engine.TensorSoftmax(logits, axis)
+        // during backward (tape suspended). The deferred-result chain
+        // through softmax → subtract → multiplyscalar produced zero
+        // gradients on the test path — root-cause traced to interaction
+        // between the activation-cache buffer reuse and the deferred
+        // materializer. Routing through CpuEngine avoids the deferred
+        // chain entirely. Softmax is a small op so the CPU fallback is
+        // not a meaningful slowdown for backward.
+        return base.TensorSoftmax(tensor, axis);
     }
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
