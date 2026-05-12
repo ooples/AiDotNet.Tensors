@@ -9781,6 +9781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var safeAxes = axes ?? Array.Empty<int>();
+        if (IsTapeActive<T>()) return base.ReduceMean(input, safeAxes, keepDims);
         if (!TryGetBackend(out var backend))
             return base.ReduceMean(input, safeAxes, keepDims);
 
@@ -9981,6 +9982,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
+        if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
         if (!TryGetBackend(out var backend))
             return base.ReduceSum(tensor, axes, keepDims);
 
@@ -12337,25 +12339,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-        try
-        {
-            if (TryGetBackend(out var backend))
-            {
-                const float alpha = 1.6732632423543772f;
-                const float scale = 1.0507009873554805f;
-                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
-                using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
-                try
-                {
-                    backend.SeluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, alpha, scale, gradOutput.Length);
-                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
-                    return new Tensor<T>(result, gradOutput.Shape._dims);
-                }
-                catch { oBuf.Dispose(); throw; }
-            }
-        }
-        catch { }
+        // GPU SeluBackward kernel produces values that disagree with the
+        // mathematically-correct CpuEngine formula:
+        //   deriv = x >= 0 ? scale : scale * alpha * exp(x)
+        // Route to CpuEngine until the kernel arg order / formula is
+        // straightened out — gradient correctness wins over a small per-op
+        // speed-up here. Issue surfaced by SELU_Gradient_MatchesNumerical.
         return base.SeluBackward(gradOutput, input);
     }
 
@@ -12427,23 +12416,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-        try
-        {
-            if (TryGetBackend(out var backend))
-            {
-                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
-                using var oBuf2 = GetOrAllocateBuffer(backend, output);
-                var rBuf = AllocateOutputBuffer(backend, gradOutput.Length);
-                try
-                {
-                    backend.ReciprocalBackward(gBuf.Buffer, oBuf2.Buffer, rBuf.Buffer, gradOutput.Length);
-                    var result = FinishGpuOp<T>(backend, rBuf, gradOutput.Length);
-                    return new Tensor<T>(result, gradOutput.Shape._dims);
-                }
-                catch { rBuf.Dispose(); throw; }
-            }
-        }
-        catch { }
+        // GPU kernel `backend.ReciprocalBackward` was implemented as
+        // `grad * -1 / output^2` (which is `-grad * x^2`) — wrong sign of
+        // exponent. The correct derivative is d(1/x)/dx = -1/x^2 =
+        // -output^2 (since output = 1/x). The CpuEngine.ReciprocalBackward
+        // computes `-grad * output^2` correctly, so route through base
+        // until the GPU kernel is fixed. Hits the tape-active path which
+        // wants the correct gradient anyway.
         return base.ReciprocalBackward(gradOutput, output);
     }
 
@@ -12720,6 +12699,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
+        // ClampBackward unpacks savedState[0]/savedState[1] as boxed double,
+        // matching the CpuEngine.TensorClamp recording path. Defer to base
+        // when tape is active so the boxed-double contract is preserved and
+        // the public override doesn't have to duplicate the double-box logic.
+        if (IsTapeActive<T>()) return base.TensorClamp(tensor, min, max);
+
         if (!TryGetBackend(out var backend))
             return base.TensorClamp(tensor, min, max);
 
@@ -12731,10 +12716,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufferOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufferA.Buffer, bufferOut.Buffer, minF, maxF, tensor.Length);
             var result = FinishGpuOp<T>(backend, bufferOut, tensor.Length);
-            var output = new Tensor<T>(result, tensor.Shape._dims);
-            Autodiff.DifferentiableOps.RecordUnary("Clamp", output, tensor,
-                Autodiff.BackwardFunctions<T>.ClampBackward, new object[] { min as object ?? new object(), max as object ?? new object() });
-            return output;
+            return new Tensor<T>(result, tensor.Shape._dims);
         }
         catch (Exception)
         {
@@ -12892,6 +12874,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
+        // GPU Transpose kernel produces gradients that disagree with the
+        // CpuEngine reference; the engine.TensorTranspose dispatch happens
+        // again inside TransposeBackward and goes back through this
+        // override on the gradient, so a buggy kernel poisons backward too.
+        // Defer to CpuEngine when a tape is active.
+        if (IsTapeActive<T>()) return base.TensorTranspose(tensor);
+
         if (!TryGetBackend(out var backend) || tensor.Rank != 2)
             return base.TensorTranspose(tensor);
 
@@ -12903,9 +12892,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, rows * cols);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
             var result = FinishGpuOp<T>(backend, bufOut, rows * cols);
-            var output = new Tensor<T>(result, new[] { cols, rows });
-            Autodiff.DifferentiableOps.RecordUnary("Transpose", output, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
-            return output;
+            return new Tensor<T>(result, new[] { cols, rows });
         }
         catch (Exception)
         {
@@ -12915,6 +12902,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
+        // See TensorTranspose: PermuteBackward also re-enters TensorPermute
+        // on the gradient, so a faulty kernel propagates into backward.
+        if (IsTapeActive<T>()) return base.TensorPermute(tensor, axes);
+
         if (!TryGetBackend(out var backend))
             return base.TensorPermute(tensor, axes);
 
@@ -12927,10 +12918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int[] outShape = new int[axes.Length];
             for (int i = 0; i < axes.Length; i++)
                 outShape[i] = tensor.Shape._dims[axes[i]];
-            var output = new Tensor<T>(result, outShape);
-            Autodiff.DifferentiableOps.RecordUnary("Permute", output, tensor,
-                Autodiff.BackwardFunctions<T>.PermuteBackward, new object[] { axes });
-            return output;
+            return new Tensor<T>(result, outShape);
         }
         catch (Exception)
         {
@@ -14377,6 +14365,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower, double upper, bool training)
     {
+        // RReLUBackward expects savedState[3] as Tensor<T>, but FinishGpuOp
+        // resolves to T[] when called eagerly here, so the boxed slot ends
+        // up as Tensor<Double>/object and ClampBackward-style casts fail.
+        // Defer to CpuEngine's recording path which packages noise as
+        // Tensor<T> correctly.
+        if (IsTapeActive<T>()) return base.TensorRReLU(tensor, lower, upper, training);
         if (!TryGetBackend(out var backend))
             return base.TensorRReLU(tensor, lower, upper, training);
 
