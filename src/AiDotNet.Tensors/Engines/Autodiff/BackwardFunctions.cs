@@ -477,11 +477,17 @@ internal static class BackwardFunctions<T>
             var a2D = engine.Reshape(inputs[0], new[] { Mflat, Kflat });
             var g2D = engine.Reshape(gradOutput, new[] { Mflat, Nflat });
 
-            // Use TensorTranspose + TensorMatMul via the engine's full
-            // parallel dispatcher. Direct SimdGemm.Sgemm with trans flags
-            // was tried and falls to SgemmTiled which underperforms the
-            // explicit-transpose + parallel SgemmDirectParallelM path
-            // for our consumer shapes (2.85 active cores vs 8.7).
+            // Explicit transpose + TensorMatMul. Two earlier alternatives
+            // both lost wall time:
+            //   1. Direct SimdGemm.Sgemm with trans flags → falls to
+            //      single-threaded SgemmTiled. 2.85 active cores.
+            //   2. TensorMatMulTransposed (avoids materializing the
+            //      weight transpose) → its float fast path is also
+            //      SimdGemm.Sgemm with transB=true, same single-thread.
+            //      Measured 140 → 210 ms regression.
+            // Until SgemmTiled gains parallel-tiles for transposed cases,
+            // the explicit-transpose + non-transposed parallel matmul is
+            // the fastest path.
             var bT2 = engine.TensorTranspose(inputs[1]);
             var gradA2D = engine.TensorMatMul(g2D, bT2);
 
