@@ -223,7 +223,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // CAUTION: ClearActivationCache should not be called during active GPU operations.
     private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
     private readonly object _activationCacheLock = new();
-    private const int DefaultActivationCacheSize = 4096;
+    // Lowered from 4096 (2026-05-12): the larger cap was tuned for batched
+    // inference where many activations could be in-flight, but in long-running
+    // training loops (issue #283 1000-iter stress test) it pinned hundreds of
+    // MB of intermediates per epoch — the eviction skip-pending guard meant
+    // unused activations rode along until the next deliberate cache clear.
+    // 128 is sized to hold one Transformer-block forward pass worth of
+    // intermediates (~ 10 ops × 12 layers) without the long-loop leak.
+    private const int DefaultActivationCacheSize = 128;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
 
     /// <summary>
