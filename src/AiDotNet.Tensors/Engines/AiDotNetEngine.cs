@@ -84,27 +84,6 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
-    /// Automatically detects and configures GPU acceleration if available.     
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// This method attempts to initialize DirectGpu acceleration. If successful, the Current
-    /// engine is switched to DirectGpuTensorEngine. If GPU is not available or initialization fails,
-    /// the engine remains on CpuEngine.
-    /// </para>
-    /// <para><b>For Beginners:</b> Call this once at application startup for automatic optimization.
-    ///
-    /// <code>
-    /// // In your Program.cs or Main():
-    /// AiDotNetEngine.AutoDetectAndConfigureGpu();
-    ///
-    /// // Now all operations will automatically use GPU if available!
-    /// </code>
-    ///
-    /// This is safe to call even if you don't have a GPU - it will just stay on CPU mode.
-    /// </para>
-    /// </remarks>
-    /// <summary>
     /// User-configurable log sink for engine-level events (GPU auto-detect status,
     /// engine resets, etc.). When non-null, replaces the default Console.WriteLine
     /// destination — wire to your own logger (Microsoft.Extensions.Logging, Serilog,
@@ -157,17 +136,39 @@ public static class AiDotNetEngine
         catch { /* stdout transport errors are non-fatal */ }
     }
 
-    /// <returns>True if GPU was successfully configured, false otherwise.</returns>
+    /// <summary>
+    /// Automatically detects and configures GPU acceleration if available.
+    /// </summary>
     /// <remarks>
-    /// Original parameterless overload. Preserved as a separate method (not a
-    /// `verbose = true` default on the new overload) so previously-compiled
-    /// consumers that took a binary reference to <c>AutoDetectAndConfigureGpu()</c>
-    /// keep linking against the same metadata signature. Forwards to the
-    /// verbose-aware overload with the default-verbose value.
+    /// <para>
+    /// Attempts to initialize DirectGpu acceleration. If successful, the <see cref="Current"/>
+    /// engine is switched to <c>DirectGpuTensorEngine</c>. If GPU is not available or
+    /// initialization fails, the engine remains on <c>CpuEngine</c>.
+    /// </para>
+    /// <para><b>For Beginners:</b> Call this once at application startup for automatic optimization.
+    /// <code>
+    /// // In your Program.cs or Main():
+    /// AiDotNetEngine.AutoDetectAndConfigureGpu();
+    ///
+    /// // Now all operations will automatically use GPU if available!
+    /// </code>
+    /// Safe to call even without a GPU — falls back to CPU silently.</para>
+    /// <para>
+    /// Original parameterless overload. Preserved as a distinct method (not collapsed
+    /// into a <c>verbose = true</c> default on the verbose-aware overload below) so
+    /// previously-compiled consumers that took a binary reference to
+    /// <c>AutoDetectAndConfigureGpu()</c> keep linking against the same metadata signature.
+    /// Forwards to <see cref="AutoDetectAndConfigureGpu(bool)"/> with verbose enabled.</para>
     /// </remarks>
+    /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu()
         => AutoDetectAndConfigureGpu(verbose: true);
 
+    /// <summary>
+    /// Verbose-aware overload of <see cref="AutoDetectAndConfigureGpu()"/>. Same GPU
+    /// detection / fallback behavior; the <paramref name="verbose"/> flag gates whether
+    /// the status banner is emitted through the configured log sink.
+    /// </summary>
     /// <param name="verbose">When true, emits status via <see cref="Logger"/>
     /// if set, otherwise Console.WriteLine. Pass false for module-init or library-internal
     /// use where polluting stdout is undesirable (test runners, hosted services, anything

@@ -110,10 +110,15 @@ public static class TensorAllocator
     /// (CPU pinned tier). The returned tensor still survives
     /// <see cref="TensorArena.Reset"/>, so the model can keep its weights
     /// stable across iterations even when no GPU is available.</item>
-    /// <item>GpuOffload allocator is registered but throws (out of GPU
-    /// memory, allocator disposed) → falls back to CPU <see cref="RentPinned{T}"/>
-    /// and the caller proceeds on CPU. No silent OOM — the underlying
-    /// exception is rethrown after the fallback succeeds.</item>
+    /// <item>GpuOffload allocator is registered but throws
+    /// <see cref="NotSupportedException"/> (per-tensor size &gt;
+    /// <see cref="int.MaxValue"/>, element type not streamable, backend
+    /// doesn't support the lifetime) or <see cref="InvalidOperationException"/>
+    /// (allocator in a bad state) → caught and downgraded to CPU
+    /// <see cref="RentPinned{T}"/> fallback. The training step continues
+    /// on CPU instead of failing. Critical exceptions (<see cref="OutOfMemoryException"/>,
+    /// <see cref="System.Threading.ThreadAbortException"/>, etc.) propagate
+    /// — silent CPU drift would mask a real allocation failure.</item>
     /// </list></para>
     /// <para><b>Initial state:</b> the returned tensor's data is zero-initialized
     /// (same contract as <see cref="Rent{T}(int[])"/>). Host writes to the
@@ -122,17 +127,26 @@ public static class TensorAllocator
     /// (managed scheme). GPU kernel writes are visible to CPU code on the
     /// next access (with a host-side fence for write-after-write ordering
     /// on the kernel-launch stream).</para>
-    /// <para><b>Lifetime:</b> registered with <see cref="WeightRegistry"/> and
-    /// pool-pinned in <see cref="TensorArena"/>. Survives Reset. The GPU
-    /// memory is freed when the tensor is collected by GC (via the registry's
-    /// finalizer-tracked handle) or when <see cref="WeightRegistry.UnregisterWeight{T}"/>
-    /// is called explicitly.</para>
+    /// <para><b>Lifetime:</b> registered with <see cref="WeightRegistry"/>;
+    /// the GPU memory is freed when the tensor is collected by GC (via the
+    /// registry's finalizer-tracked handle) or when
+    /// <see cref="WeightRegistry.UnregisterWeight{T}"/> is called explicitly.
+    /// The GPU-resident path does NOT touch the <see cref="TensorArena"/>
+    /// pinned tier (the OffloadHostPointer lives outside any managed array
+    /// pool); the fallback CPU path DOES use the arena pinned tier and
+    /// survives <see cref="TensorArena.Reset"/> there.</para>
     /// </remarks>
     public static Tensor<T> RentPinnedOnGpu<T>(int[] shape)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
         int totalSize = 1;
         for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape),
+                    $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative.");
             totalSize = checked(totalSize * shape[i]);
+        }
         if (totalSize == 0) return new Tensor<T>(shape);
 
         // No GPU offload allocator registered → CPU pinned fallback. Same

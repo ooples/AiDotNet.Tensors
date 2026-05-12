@@ -241,7 +241,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             int mathMode = useTF32
                 ? CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
                 : CuBlasNative.CUBLAS_TENSOR_OP_MATH;
-            CuBlasNative.cublasSetMathMode(_cublasHandle, mathMode);
+            // Wrap in CheckCublasStatus so a math-mode set failure surfaces
+            // immediately rather than leaving the handle in an unknown state.
+            // Same pattern as cublasCreate / cublasSetStream above; a silent
+            // failure here would make every subsequent fp32 GEMM run with
+            // unspecified Tensor-Core behaviour (could be CUBLAS_DEFAULT_MATH,
+            // strict fp32 with no acceleration; could be undefined).
+            CuBlasNative.CheckCublasStatus(
+                CuBlasNative.cublasSetMathMode(_cublasHandle, mathMode),
+                "cublasSetMathMode");
 
             // Query clock rate for theoretical GFLOPS calculation
             if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)

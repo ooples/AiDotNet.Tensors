@@ -65,13 +65,14 @@ internal static class GpuAutoDetectModuleInit
             // that parse stdout (xUnit reporters, MSBuild diagnostics),
             // hosted services that route stdout to structured loggers, and
             // any consumer that expects clean program output. Users who
-            // WANT init-time logging can opt in via the
-            // AIDOTNET_VERBOSE_INIT env var, set their own logger via
-            // AiDotNetEngine.Logger before any tensor work, or call
-            // AutoDetectAndConfigureGpu() explicitly later with the default
-            // verbose: true. AIDOTNET_QUIET overrides everything — sets verbose=false
-            // even when AIDOTNET_VERBOSE_INIT is set, for the "I want zero
-            // noise" override.
+            // WANT init-time logging have ONE opt-in: set the
+            // AIDOTNET_VERBOSE_INIT env var BEFORE process startup. The
+            // AiDotNetEngine.Logger property is too late at this point —
+            // module initializers run at assembly load, before any consumer
+            // code can set in-assembly statics — so Logger only affects
+            // log lines emitted by AutoDetectAndConfigureGpu / ResetToCpu
+            // calls made AFTER the assembly is loaded. AIDOTNET_QUIET
+            // overrides AIDOTNET_VERBOSE_INIT for callers who want zero noise.
             var verboseInit = !string.IsNullOrEmpty(
                 Environment.GetEnvironmentVariable("AIDOTNET_VERBOSE_INIT"));
             AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: verboseInit);

@@ -12,6 +12,19 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+/// <summary>
+/// Marker collection that disables xUnit parallel execution for the
+/// TensorArena pinned-tier tests. These tests mutate the process-wide
+/// <c>TensorArena.Current</c> static via <see cref="TensorArena.Create"/>;
+/// running them concurrently with each other or with anything else that
+/// touches the arena stack would cause cross-test interference and flaky
+/// failures (e.g. one test's arena observed by another's PinnedArrayCount
+/// assertion).
+/// </summary>
+[CollectionDefinition(nameof(TensorArenaPinnedTests), DisableParallelization = true)]
+public sealed class TensorArenaPinnedTestsCollection { }
+
+[Collection(nameof(TensorArenaPinnedTests))]
 public class TensorArenaPinnedTests
 {
     /// <summary>
