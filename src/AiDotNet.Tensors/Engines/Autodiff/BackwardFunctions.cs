@@ -1171,13 +1171,40 @@ internal static class BackwardFunctions<T>
     {
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
-        var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Create zeros with input shape, set the sliced region to gradOutput.
-        // TensorSetSlice returns a new tensor (does not modify in-place).
-        var data = new T[inputShape.Aggregate(1, (a, b) => a * b)];
-        var zeros = new Tensor<T>(data, inputShape);
-        var grad = engine.TensorSetSlice(zeros, gradOutput, start);
+        // Issue #327: write directly into a fresh zero-init buffer
+        // instead of going through engine.TensorSetSlice (which Rent's
+        // a new result tensor and Array.Copy's the zeros input into it
+        // before scattering — two passes over the same data).
+        // `new T[]` is CLR-zero-init which is faster than
+        // TensorPool.RentZeroed's per-element virtual-call zero loop
+        // for any tensor over ~10 K elements.
+        int total = 1;
+        for (int i = 0; i < inputShape.Length; i++) total *= inputShape[i];
+        var data = new T[total];
+        var grad = new Tensor<T>(data, inputShape);
+        var goutData = gradOutput.GetFlattenedData();
+        var goutShape = gradOutput._shape;
+        int sourceTotal = gradOutput.Length;
+
+        CpuParallelSettings.ParallelForOrSerial(
+            0, sourceTotal, sourceTotal, flatIdx =>
+            {
+                // Map flat source index → flat dest index, applying the
+                // per-axis start offset.
+                int remaining = flatIdx;
+                int destFlat = 0;
+                int stride = 1;
+                for (int d = inputShape.Length - 1; d >= 0; d--)
+                {
+                    int srcIdx = remaining % goutShape[d];
+                    remaining /= goutShape[d];
+                    destFlat += (start[d] + srcIdx) * stride;
+                    stride *= inputShape[d];
+                }
+                data[destFlat] = goutData[flatIdx];
+            });
+
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
