@@ -206,17 +206,19 @@ public sealed class CompiledBackwardGraph<T>
             DifferentiableOps.ClearIndexedGrads();
 
             // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
-            // cleanup: clear .Grad on forward intermediates so a consumer-side cache
-            // that retains an intermediate (e.g. a layer's `_lastInput`) doesn't pin
-            // one full backward's worth of gradient tensors across successive Execute
-            // calls. Same defense-in-depth pattern as GradientTape.cs PR for
-            // reopened-#283 / consumer-AiDotNet#1227.
-            //
-            // We DON'T clear .GradFn here — the compiled graph reuses the tape's
-            // forward graph for the next Execute, so the GradFn back-pointers must
-            // stay live. .Grad gets re-set by AccumulateGrad on the next Execute,
-            // so clearing it here only severs the per-tensor field; the data flows
-            // through the returned dictionary regardless.
+            // cleanup: clear .GradFn AND .Grad on forward intermediates so they don't
+            // get pinned across iterations. CompiledBackwardGraph walks the tape via
+            // the arena's entry array (`_entries[i]` for `i in _reachableEntryIndices`)
+            // — it does NOT follow GradFn pointers — so nulling GradFn here doesn't
+            // break the next Execute call's traversal. The next forward will re-set
+            // GradFn on every intermediate before the next backward runs, restoring
+            // any back-pointers a consumer of the public `tensor.GradFn` API might
+            // expect. Leaving GradFn live across Execute calls is what previously
+            // made every step's intermediates appear leaked under
+            // GradientTapeLeakTests — the GradFn back-chain kept compilation-step
+            // intermediates (which are the same Tensor instances as later iters'
+            // intermediates after tensor-arena pool reuse) reachable from any
+            // consumer that holds even one downstream tensor.
             HashSet<Tensor<T>>? sourceSet = null;
             if (_sources is not null)
             {
@@ -234,11 +236,11 @@ public sealed class CompiledBackwardGraph<T>
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
 
-                // .Grad cleanup on this entry's output (every output is an
-                // intermediate — graph leaves never appear as outputs in the
-                // entries array). Inputs are NOT cleared because they may be
-                // graph leaves (parameters), and the consumer relies on
-                // `param.Grad` being populated after a sources=null Execute.
+                // .GradFn / .Grad cleanup on this entry's output (every output is an
+                // intermediate — graph leaves never appear as outputs in the entries
+                // array). Inputs are NOT cleared because they may be graph leaves
+                // (parameters), and the consumer relies on `param.Grad` being
+                // populated after a sources=null Execute.
                 //
                 // Matches the parity rule used by
                 // GradientTape.CleanupTapeEntryGrad (line 635) and
@@ -248,6 +250,7 @@ public sealed class CompiledBackwardGraph<T>
                 bool keepGrad =
                     (sourceSet?.Contains(e.Output) == true)
                     || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                e.Output.GradFn = null;
                 if (!keepGrad) e.Output.Grad = null;
             }
         }
