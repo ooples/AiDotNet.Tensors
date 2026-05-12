@@ -2252,47 +2252,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return output;
     }
 
-    Tensor<T> IEngine.TensorAdd<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorAdd(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Add(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorAdd(a, b);
-    }
-
-    Tensor<T> IEngine.TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorSubtract(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Subtract(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorSubtract(a, b);
-    }
-
-    Tensor<T> IEngine.TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorMultiply(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Multiply(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMultiply(a, b);
-    }
-
-    Tensor<T> IEngine.TensorDivide<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorDivide(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Divide(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorDivide(a, b);
-    }
-
-    Tensor<T> IEngine.TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
-    {
-        var result = TryRunScalar(tensor.GetDataArray(), scalar, static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorMultiplyScalar(tensor, scalar);
-    }
+    // Explicit IEngine.* impls for TensorAdd / TensorSubtract / TensorMultiply
+    // / TensorDivide / TensorMultiplyScalar were DELETED — the public overrides
+    // further down this file are the authoritative implementations: same
+    // GPU+fallback path PLUS the Autodiff.DifferentiableOps.RecordBinary /
+    // RecordUnary calls these explicit duplicates silently omitted. When
+    // a caller reaches the op through the IEngine interface (the common case —
+    // `AiDotNetEngine.Current` returns IEngine), C# selects the EXPLICIT
+    // interface implementation in preference to the public override. So
+    // every IEngine-typed `engine.TensorMultiply(a, b)` was skipping the
+    // tape entirely, making gradients impossible to compute on a
+    // DirectGpuTensorEngine-backed training step. Removing the explicit
+    // versions lets the public override satisfy the interface contract via
+    // implicit implementation, so virtual dispatch now reaches the
+    // recording path correctly.
 
     // GPU-accelerated in-place operations.
     // Uses the same GPU buffer for input and output where safe (element-wise ops).
@@ -2884,93 +2857,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    Tensor<T> IEngine.TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
-    {
-        var scalarValue = ToFloatScalar(scalar);
-        if (scalarValue == 0)
-            return base.TensorDivideScalar(tensor, scalar);
-
-        var result = TryRunScalar(tensor.GetDataArray(), scalar, static (backend, input, output, value, size) => backend.Scale(input, output, 1.0f / value, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorDivideScalar(tensor, scalar);
-    }
-
-    Tensor<T> IEngine.TensorAbs<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Abs(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorAbs(tensor);
-    }
-
-    Tensor<T> IEngine.TensorExp<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Exp(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorExp(tensor);
-    }
-
-    Tensor<T> IEngine.TensorLog<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Log(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorLog(tensor);
-    }
-
-    Tensor<T> IEngine.TensorSqrt<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sqrt(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSqrt(tensor);
-    }
-
-    Tensor<T> IEngine.TensorNegate<T>(Tensor<T> tensor)
-    {
-        var result = TryRunScalar(tensor.GetDataArray(), FromFloatScalar<T>(-1.0f), static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorNegate(tensor);
-    }
-
-    Tensor<T> IEngine.TensorPower<T>(Tensor<T> tensor, T exponent)
-    {
-        var result = TryRunScalar(tensor.GetDataArray(), exponent, static (backend, input, output, value, size) => backend.Power(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorPower(tensor, exponent);
-    }
-
-    Tensor<T> IEngine.TensorMax<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorMax(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Max(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMax(a, b);
-    }
-
-    Tensor<T> IEngine.TensorMin<T>(Tensor<T> a, Tensor<T> b)
-    {
-        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-            return base.TensorMin(a, b);
-
-        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Min(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMin(a, b);
-    }
-
-    Tensor<T> IEngine.Tanh<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Tanh(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Tanh(tensor);
-    }
-
-    Tensor<T> IEngine.Sigmoid<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Sigmoid(tensor);
-    }
-
-    Tensor<T> IEngine.ReLU<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.ReLU(tensor);
-    }
-
-    Tensor<T> IEngine.GELU<T>(Tensor<T> tensor)
-    {
-        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.GELU(tensor);
-    }
+    // Explicit IEngine.* impls for TensorDivideScalar / TensorAbs / TensorExp /
+    // TensorLog / TensorSqrt / TensorNegate / TensorPower / TensorMax /
+    // TensorMin / Tanh / Sigmoid / ReLU / GELU were DELETED — same rationale
+    // as the TensorAdd/Multiply block above: the public overrides further
+    // down this file are the authoritative implementations and record on
+    // the gradient tape; these explicit duplicates were swallowing the
+    // RecordUnary / RecordBinary calls and causing IEngine-typed callers to
+    // skip the tape entirely.
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
@@ -9812,31 +9706,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    /// <summary>
-    /// GPU-accelerated Softplus activation.
-    /// </summary>
-    Tensor<T> IEngine.Softplus<T>(Tensor<T> input)
-    {
-        if (!TryGetBackend(out var backend))
-            return base.Softplus(input);
-
-        try
-        {
-            int size = input.Length;
-
-            using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
-            using var outputBuffer = AllocateOutputBuffer(backend, size);
-
-            backend.Softplus(inputBuffer.Buffer, outputBuffer.Buffer, size);
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
-            float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), input.Shape.ToArray());
-        }
-        catch
-        {
-            return base.Softplus(input);
-        }
-    }
+    // IEngine.Softplus explicit impl removed — public override at line ~12243
+    // records on the gradient tape via DifferentiableOps.RecordUnary; this
+    // explicit version was swallowing the recording call on IEngine-typed
+    // dispatch.
 
     /// <summary>
     /// GPU-accelerated HardSwish activation.
@@ -14837,33 +14710,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorSubtractScalar(input,scalar);
     }
 
-    Tensor<T> IEngine.TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b2)
-    {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; var ga=UploadTensorRaw(b, a); var gb=UploadTensorRaw(b, b2); var go=b.AllocateBuffer(a.Length); b.BroadcastAddLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
-        return base.TensorBroadcastAdd(a,b2);
-    }
-
-    Tensor<T> IEngine.TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b2)
-    {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; var ga=UploadTensorRaw(b, a); var gb=UploadTensorRaw(b, b2); var go=b.AllocateBuffer(a.Length); b.BroadcastSubLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
-        return base.TensorBroadcastSubtract(a,b2);
-    }
-
-    Tensor<T> IEngine.TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b2)
-    {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; var ga=UploadTensorRaw(b, a); var gb=UploadTensorRaw(b, b2); var go=b.AllocateBuffer(a.Length); b.BroadcastMulLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
-        return base.TensorBroadcastMultiply(a,b2);
-    }
-
-    Tensor<T> IEngine.TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b2)
-    {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; var ga=UploadTensorRaw(b, a); var gb=UploadTensorRaw(b, b2); var go=b.AllocateBuffer(a.Length); b.BroadcastDivLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
-        return base.TensorBroadcastDivide(a,b2);
-    }
+    // IEngine.TensorBroadcast{Add,Subtract,Multiply,Divide} explicit impls
+    // removed — public overrides record on the gradient tape; these explicit
+    // versions were stealing dispatch when reached through IEngine.
 
     Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
     {
@@ -15114,7 +14963,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
                 int[] outShape = (int[])a.Shape._dims.Clone();
                 outShape[a.Rank - 1] = N;
-                return DeferTensorResult<T>(b, go, batchSize * M * N, outShape);
+                var output = DeferTensorResult<T>(b, go, batchSize * M * N, outShape);
+                // Record on the tape so the IEngine-typed dispatch path
+                // doesn't silently disconnect this op from autograd. The
+                // recording-path equivalent in CpuEngine.TensorBatchMatMul
+                // also delegates to RecordBinary under the "BatchMatMul"
+                // op name; mirror that here so backward dispatch picks
+                // the same BackwardFunction<T>.BatchMatMulBackward.
+                Autodiff.DifferentiableOps.RecordBinary("BatchMatMul", output, a, b2,
+                    Autodiff.BackwardFunctions<T>.BatchMatMulBackward);
+                return output;
             }
             catch { }
         }
@@ -15600,12 +15458,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // FillZero returns Vector<T>(length), not void — handled in base
 
-    Tensor<T> IEngine.BatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
-    {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank>=2 && b2.Rank>=2)
-        { try { int M=a.Shape._dims[a.Rank-2],K=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; int batchSize=a.Length/(M*K); int total=batchSize*M*N; var ga=UploadTensorRaw(b, a); var gb=UploadTensorRaw(b, b2); var go=b.AllocateBuffer(total); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[a.Rank-1]=N; return DeferTensorResult<T>(b,go,total,outShape); } catch{} }
-        return base.BatchMatMul(a,b2);
-    }
+    // IEngine.BatchMatMul explicit impl removed — public override at line ~13031
+    // records via DifferentiableOps.RecordBinary.
 
     Tensor<T> IEngine.TensorTriangularMask<T>(int size, bool upper, int diagonal)
     {

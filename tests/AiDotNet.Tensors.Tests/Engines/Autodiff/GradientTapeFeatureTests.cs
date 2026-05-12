@@ -345,10 +345,19 @@ public class GradientTapeFeatureTests
         using var tape = new GradientTape<float>();
         tape.DetectAnomaly = true;
 
-        var x = new Tensor<float>(new float[] { 0f }, [1]);
-
-        // log(0) = -inf, gradient of log at 0 = 1/0 = inf
-        var y = _engine.TensorLog(x);
+        // Use a direct NaN gradient source rather than relying on the
+        // engine's divide-by-zero / log-of-zero behaviour to produce one.
+        // Different backends honour IEEE 754 differently in edge cases:
+        // CpuEngine.TensorDivide(1, 0) emits +Inf as the standard
+        // requires, but the DirectGpu vendored kernels clamp the result
+        // to 0 instead, which silently turns this test into a no-op on
+        // GPU-backed runners. Mark the input tensor with a pre-baked NaN
+        // and let TensorMultiply propagate it through the backward —
+        // every backend honours NaN propagation through arithmetic
+        // (it's a hardware-level invariant), so the anomaly check fires
+        // on every engine.
+        var x = new Tensor<float>(new float[] { float.NaN }, [1]);
+        var y = _engine.TensorMultiply(x, x);
 
         // Anomaly detection throws the dedicated AnomalyDetectedException
         // (which inherits from ArithmeticException for back-compat).
