@@ -134,6 +134,18 @@ internal static class AutoTrainingCompiler
             long hash = ComputeStructureHash(tape.Entries, tape.EntryCount);
             hash = IncludeTargetIdentity(hash, loss, sources);
             State.StoreCompiledBackwardWithHash(compiled, hash);
+            // Drop the plan's strong reference to the compilation-time loss
+            // tensor. The compile cache is thread-static and persists for
+            // the lifetime of the worker thread; without this release, the
+            // loss tensor (and its entire GradFn chain back through every
+            // forward intermediate) would stay reachable for the whole
+            // process, manifesting as a per-iteration leak under
+            // GradientTapeLeakTests at issue #283 scale (tensor-arena pool
+            // reuse makes early-iteration intermediates the same Tensor
+            // instances as later iterations'). Subsequent ComputeGradients
+            // calls always pass the current step's loss to Execute(loss),
+            // so the parameterless fallback isn't needed on this path.
+            compiled.ReleaseCompilationTimeLoss();
             ReplayMode = true; // Enable replay mode now that backward is compiled
         }
         catch
