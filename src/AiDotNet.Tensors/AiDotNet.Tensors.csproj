@@ -124,6 +124,23 @@
   </ItemGroup>
 
   <!--
+    CPU BLAS native (#327): industry-standard pattern matching PyTorch / NumPy
+    / TensorFlow — ship libopenblas alongside the managed package so consumers
+    get MKL-class GEMM throughput out of the box. Without this reference,
+    BlasProvider.ProbeNativeLibrary fails (libopenblas.dll not on the runtime
+    load path), every TensorMatMul falls to SimdGemm's AVX2 managed kernel,
+    and Transformer training pays a 6-10× wall-time gap to PyTorch. The
+    BlasProvider doc-comment already claims this is the default ("AiDotNet
+    ships AiDotNet.Native.OpenBLAS as a transitive NuGet dependency, so
+    libopenblas is loadable on every consumer install") — this reference
+    makes the claim true.
+    Conditional on net10.0 only (net471 doesn't ship the native shims).
+  -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="AiDotNet.Native.OpenBLAS" Version="0.75.6" />
+  </ItemGroup>
+
+  <!--
     GPU-side optional packages — separate supply-chain surface (users opt in
     per-hardware): AiDotNet.Native.CLBlast (OpenCL), AiDotNet.Native.CUDA
     (NVIDIA), AiDotNet.Native.ROCm (AMD), AiDotNet.Native.MoltenVK (macOS/iOS).
