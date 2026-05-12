@@ -30908,7 +30908,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> FusedConv2D<T>(
+    public virtual Tensor<T> FusedConv2D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,

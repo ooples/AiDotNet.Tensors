@@ -3787,7 +3787,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Uses cached GPU buffers for registered persistent tensors (kernel/bias) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
     /// </summary>
-    public new Tensor<T> FusedConv2D<T>(
+    public override Tensor<T> FusedConv2D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
@@ -3796,6 +3796,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationH, int dilationW,
         FusedActivationType activation)
     {
+        // Same rationale as FusedLinear: when a tape is active, defer to
+        // the base CpuEngine implementation which decomposes into recorded
+        // primitives. The GPU fused kernel below bypasses
+        // DifferentiableOps entirely, so taking it during training would
+        // silently disconnect the op from autograd. Pure-inference callers
+        // still take the fused-kernel speedup.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+
         if (!TryGetBackend(out var backend))
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
