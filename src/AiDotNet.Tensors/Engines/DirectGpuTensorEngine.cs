@@ -7218,82 +7218,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     #region Normalization Operations (GPU Accelerated)
 
-    /// <summary>
-    /// GPU-accelerated Softmax operation.
-    /// Supports arbitrary axes by treating the tensor as 2D (outerSize, features).
-    /// </summary>
-    Tensor<T> IEngine.Softmax<T>(Tensor<T> input, int axis)
-    {
-        if (!TryGetBackend(out var backend))
-            return base.Softmax(input, axis);
-
-        // Handle negative axis
-        int rank = input.Rank;
-        if (axis < 0) axis = rank + axis;
-        if (axis < 0 || axis >= rank)
-            return base.Softmax(input, axis);
-
-        try
-        {
-            // For softmax over the last dimension, we can use GPU directly
-            // by treating the tensor as 2D: (product of all dims except last) x (last dim)
-            if (axis == rank - 1)
-            {
-                int features = input.Shape._dims[rank - 1];
-                int outerSize = input.Length / features;
-
-                using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
-                using var outputBuffer = AllocateOutputBuffer(backend, input.Length);
-
-                backend.Softmax(inputBuffer.Buffer, outputBuffer.Buffer, outerSize, features);
-                float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), input.Shape.ToArray());
-            }
-
-            // For softmax over a non-last axis, permute to move the axis to the end,
-            // apply softmax, then permute back
-            if (axis < rank - 1)
-            {
-                // Build permutation: move axis to end
-                var permutation = new int[rank];
-                int j = 0;
-                for (int i = 0; i < rank; i++)
-                {
-                    if (i != axis) permutation[j++] = i;
-                }
-                permutation[rank - 1] = axis;
-
-                // Permute input
-                var permutedInput = PermuteImpl(input, permutation);
-
-                // Now apply softmax over the last axis
-                int features = permutedInput.Shape._dims[rank - 1];
-                int outerSize = permutedInput.Length / features;
-
-                using var inputBuffer = GetOrAllocateBuffer(backend, permutedInput.GetDataArray());
-                using var outputBuffer = AllocateOutputBuffer(backend, permutedInput.Length);
-
-                backend.Softmax(inputBuffer.Buffer, outputBuffer.Buffer, outerSize, features);
-                float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-                var permutedOutput = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), permutedInput.Shape.ToArray());
-
-                // Build inverse permutation and permute back
-                var inversePermutation = new int[rank];
-                for (int i = 0; i < rank; i++)
-                {
-                    inversePermutation[permutation[i]] = i;
-                }
-                return PermuteImpl(permutedOutput, inversePermutation);
-            }
-
-            // Fall back to CPU for any other edge cases
-            return base.Softmax(input, axis);
-        }
-        catch
-        {
-            return base.Softmax(input, axis);
-        }
-    }
+    // IEngine.Softmax explicit impl removed — public override at line ~13518
+    // records via DifferentiableOps.RecordUnary; this version was swallowing
+    // recording on IEngine-typed callers. (TensorLogSoftmax still routes
+    // through the explicit IEngine impl below — see its dedicated `public
+    // override` shim a couple of lines down.)
 
     /// <summary>
     /// GPU-accelerated Softmax backward operation.
@@ -13520,10 +13449,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return base.Softmax(input, axis);
 
+        // The GPU softmax kernel here only handles softmax over the LAST
+        // axis correctly — it reshapes the tensor as (outerSize, features)
+        // where features = the chosen dim's size and reduces over features.
+        // For a non-last axis, that's the wrong reduction order. The CpuEngine
+        // base path handles arbitrary axes with the right permutation
+        // dance, so route there instead of producing wrong results silently.
+        int rank = input.Rank;
+        int ea = axis < 0 ? rank + axis : axis;
+        if (ea != rank - 1)
+            return base.Softmax(input, axis);
+
         try
         {
-            int rank = input.Rank;
-            int ea = axis < 0 ? rank + axis : axis;
             int features = input.Shape._dims[ea];
             int outerSize = input.Length / features;
             using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
@@ -13531,8 +13469,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Softmax(bufIn.Buffer, bufOut.Buffer, outerSize, features);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             var output = new Tensor<T>(result, input.Shape._dims);
+            // SoftmaxBackward reads the axis from savedState[0] — pass it
+            // along (the previous version omitted savedState entirely and
+            // tripped an IndexOutOfRangeException on every backward call).
             Autodiff.DifferentiableOps.RecordUnary("Softmax", output, input,
-                Autodiff.BackwardFunctions<T>.SoftmaxBackward);
+                Autodiff.BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             return output;
         }
         catch (Exception)
