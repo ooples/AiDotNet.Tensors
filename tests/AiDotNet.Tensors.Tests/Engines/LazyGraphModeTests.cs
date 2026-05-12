@@ -49,9 +49,17 @@ namespace AiDotNet.Tensors.Tests.Engines
             var actSpan = actual.AsSpan();
             for (int i = 0; i < expSpan.Length; i++)
             {
-                Assert.True(Math.Abs(expSpan[i] - actSpan[i]) < tol,
+                // Compute |delta| once per iteration — the comparison and the
+                // failure message both need it, and re-evaluating MathF.Abs on
+                // the second call shows up as measurable overhead in the
+                // tight loop over wide tensors. Inclusive `<=` rather than
+                // strict `<` so a delta sitting exactly on the tolerance
+                // boundary doesn't trip a false negative on deterministic
+                // bit-exact paths that produce delta == tol naturally.
+                float delta = MathF.Abs(expSpan[i] - actSpan[i]);
+                Assert.True(delta <= tol,
                     op + ": element [" + i + "] expected " + expSpan[i] + " but got " + actSpan[i]
-                    + " (|delta|=" + Math.Abs(expSpan[i] - actSpan[i]) + ", tol=" + tol + ")");
+                    + " (|delta|=" + delta + ", tol=" + tol + ")");
             }
         }
 
@@ -301,7 +309,10 @@ namespace AiDotNet.Tensors.Tests.Engines
                 scope.Realize();
             }
 
-            AssertTensorsEqual(eagerResult, lazyResult, "FusedLinear+ReLU");
+            // FusedLinear dispatches a GEMM under the hood (input @ weights),
+            // so the same K-dependent reduction-order drift as TensorMatMul
+            // applies — use MatMulTolerance per the convention on Line 31.
+            AssertTensorsEqual(eagerResult, lazyResult, "FusedLinear+ReLU", MatMulTolerance);
         }
 
         [Fact]
@@ -329,7 +340,9 @@ namespace AiDotNet.Tensors.Tests.Engines
                 scope.Realize();
             }
 
-            AssertTensorsEqual(eagerRelu, lazyRelu, "MultiOpChain");
+            // Chain includes TensorMatMul, so it dispatches a GEMM — use
+            // MatMulTolerance per the convention on Line 31.
+            AssertTensorsEqual(eagerRelu, lazyRelu, "MultiOpChain", MatMulTolerance);
         }
 
         [Fact]
@@ -468,7 +481,10 @@ namespace AiDotNet.Tensors.Tests.Engines
                 scope.Realize();
             }
 
-            AssertTensorsEqual(eagerResult, lazyResult, "FusionPass_MatMulBiasReLU");
+            // Pattern includes a TensorMatMul (and the fusion pass folds it
+            // into a single FusedLinearReLU op), so it dispatches a GEMM —
+            // use MatMulTolerance per the convention on Line 31.
+            AssertTensorsEqual(eagerResult, lazyResult, "FusionPass_MatMulBiasReLU", MatMulTolerance);
         }
 
         [Fact]
