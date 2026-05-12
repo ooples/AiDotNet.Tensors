@@ -390,17 +390,19 @@ public static class Issue327TransformerTrainBatchedBenchmark
         }
         long allocOptStart = GC.GetTotalAllocatedBytes(precise: true);
 
-        // In-place Adam-style optimizer update.
+        // In-place Adam-style optimizer update — parallelized across
+        // weights. Each weight's update is independent so we can split
+        // the 17-weight loop across cores. Inner per-element loop stays
+        // SIMD-friendly via JIT auto-vectorization on the M·g²·sqrt path.
         var swOpt = Stopwatch.StartNew();
         const float lr = 1e-3f;
         const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
-        for (int wi = 0; wi < weights.Length; wi++)
+        System.Threading.Tasks.Parallel.For(0, weights.Length, wi =>
         {
-            if (!grads.TryGetValue(weights[wi], out var g)) continue;
+            if (!grads.TryGetValue(weights[wi], out var g)) return;
             var w = weights[wi];
             var m = optM[wi];
             var v = optV[wi];
-            // Element-wise: m = β1·m + (1-β1)·g; v = β2·v + (1-β2)·g²; w -= lr · m / (sqrt(v) + ε)
             var wData = w.Data.Span;
             var gData = g.Data.Span;
             var mData = m.Data.Span;
@@ -413,7 +415,7 @@ public static class Issue327TransformerTrainBatchedBenchmark
                 vData[idx] = beta2 * vData[idx] + (1 - beta2) * gi * gi;
                 wData[idx] -= lr * mData[idx] / (MathF.Sqrt(vData[idx]) + eps);
             }
-        }
+        });
         swOpt.Stop();
         optMs = swOpt.Elapsed.TotalMilliseconds;
         optAlloc = GC.GetTotalAllocatedBytes(precise: true) - allocOptStart;
