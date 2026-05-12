@@ -4708,8 +4708,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated 2D average pooling with array parameters.
     /// </summary>
-    public new Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
+    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
+        // Defer to CpuEngine when a tape is active so AvgPool2DBackward
+        // is recorded against the correct primitive path; also avoids the
+        // CUDA kernel-launch crash (0xC0000005) on the int[] overload
+        // surfaced by AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient.
+        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride);
         if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride);
 
@@ -4757,8 +4762,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated backward pass for 2D average pooling.
     /// Distributes gradients evenly across the input elements that contributed to each output.
     /// </summary>
-    public new Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
+    public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
+        // CUDA kernel-launch crashes (0xC0000005) on this overload for
+        // small 1x1xHxW inputs surfaced by
+        // AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient. Route
+        // through CpuEngine until the kernel parameter layout is fixed.
+        return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+#pragma warning disable CS0162 // Unreachable code
         if (!TryGetBackend(out var backend))
             return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
 
@@ -4796,6 +4807,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
         }
+#pragma warning restore CS0162
     }
 
     /// <summary>
