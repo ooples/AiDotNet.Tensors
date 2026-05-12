@@ -7,8 +7,9 @@
 // test family is the explicit guard.
 //
 // AutoTrainingCompiler clone-then-train safety is a separate concern
-// covered by AutoTrainingCompilerHashTests — this file only verifies
-// the default-flag wiring, not the cache-key behavior.
+// covered by AutoTrainingCompilerTests and GradientTapeReplayModeTests —
+// this file only verifies the default-flag wiring, not the cache-key
+// behavior.
 
 using AiDotNet.Tensors.Engines.Autodiff;
 using Xunit;

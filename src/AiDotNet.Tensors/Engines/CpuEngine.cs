@@ -3210,14 +3210,26 @@ public partial class CpuEngine : ITensorLevelEngine
             if (cols == bCols)
             {
                 var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-                var ad = (double[])(object)a.GetDataArray();
-                var bd = (double[])(object)b.GetDataArray();
-                var rd = (double[])(object)res.GetDataArray();
+                // Use raw storage + offset rather than GetDataArray() —
+                // for contiguous slice/view tensors with a non-zero
+                // storage offset, GetDataArray() falls back to ToArray()
+                // and allocates a fresh copy on every call, defeating
+                // the allocation-free fast path. The Contiguous() call
+                // above only rebinds when IsContiguous is false, so
+                // offset-bearing contiguous views still reach this point.
+                var aStorage = a._storage.GetDataArray();
+                var bStorage = b._storage.GetDataArray();
+                var rStorage = res._storage.GetDataArray();
+                var ad = (double[])(object)aStorage;
+                var bd = (double[])(object)bStorage;
+                var rd = (double[])(object)rStorage;
+                int aOff = a._storageOffset, bOff = b._storageOffset, rOff = res._storageOffset;
                 for (int r = 0; r < rows; r++)
                 {
-                    int off = r * cols;
+                    int aRow = aOff + r * cols;
+                    int rRow = rOff + r * cols;
                     for (int c = 0; c < cols; c++)
-                        rd[off + c] = ad[off + c] - bd[c];
+                        rd[rRow + c] = ad[aRow + c] - bd[bOff + c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
@@ -6592,12 +6604,17 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Double fast path — Span-based SIMD reduction. Single-call (no
         // multi-chunk partials yet) but still 4× faster than the scalar
-        // IVectorizedOperations.Sum fallback on AVX2 hosts.
+        // IVectorizedOperations.Sum fallback on AVX2 hosts. Use the raw
+        // storage + offset rather than GetDataArray() — GetDataArray()
+        // falls back to ToArray() for contiguous views with a non-zero
+        // storage offset, which would defeat the allocation-free fast
+        // path on every slice / view caller. Same pattern as the BLAS
+        // GEMM paths above.
         if (typeof(T) == typeof(double))
         {
-            T[] arr = tensor.GetDataArray();
-            double[] dArr = Unsafe.As<T[], double[]>(ref arr);
-            double sum = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, 0, tensor.Length));
+            T[] storageArr = tensor._storage.GetDataArray();
+            double[] dArr = Unsafe.As<T[], double[]>(ref storageArr);
+            double sum = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, tensor._storageOffset, tensor.Length));
             return Unsafe.As<double, T>(ref sum);
         }
 
@@ -10736,23 +10753,34 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var oArr = output.GetDataArray();
+        // Use raw storage + _storageOffset rather than GetDataArray() —
+        // GetDataArray() falls back to ToArray() for contiguous views
+        // with a non-zero storage offset (e.g. slices into a larger
+        // tensor), allocating a fresh copy on every call. The
+        // write-through fast path exists to skip exactly that kind of
+        // hidden alloc, so we read the backing storage directly and
+        // thread the per-tensor storage offset into every BLAS / SIMD
+        // GEMM call. Same pattern as TensorMatMulTransposed's BLAS path.
+        var aArr = a._storage.GetDataArray();
+        var bArr = b._storage.GetDataArray();
+        var oArr = output._storage.GetDataArray();
+        int aOff = a._storageOffset;
+        int bOff = b._storageOffset;
+        int oOff = output._storageOffset;
 
         // 2D × 2D
         if (a.Rank == 2 && b.Rank == 2)
         {
             int m = a._shape[0], k = a._shape[1], n = b._shape[1];
             if (Helpers.BlasProvider.TryGemmEx(m, n, k,
-                aArr, 0, k, false,
-                bArr, 0, n, false,
-                oArr, 0, n))
+                aArr, aOff, k, false,
+                bArr, bOff, n, false,
+                oArr, oOff, n))
                 return;
             SimdGemm.Dgemm(
-                new ReadOnlySpan<double>(aArr, 0, m * k),
-                new ReadOnlySpan<double>(bArr, 0, k * n),
-                new Span<double>(oArr, 0, m * n),
+                new ReadOnlySpan<double>(aArr, aOff, m * k),
+                new ReadOnlySpan<double>(bArr, bOff, k * n),
+                new Span<double>(oArr, oOff, m * n),
                 m, k, n);
             return;
         }
@@ -10768,14 +10796,14 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
             int rows = batchSize * m;
             if (BlasProvider.TryGemmEx(rows, n, k,
-                aArr, 0, k, false,
-                bArr, 0, n, false,
-                oArr, 0, n))
+                aArr, aOff, k, false,
+                bArr, bOff, n, false,
+                oArr, oOff, n))
                 return;
             SimdGemm.Dgemm(
-                new ReadOnlySpan<double>(aArr, 0, rows * k),
-                new ReadOnlySpan<double>(bArr, 0, k * n),
-                new Span<double>(oArr, 0, rows * n),
+                new ReadOnlySpan<double>(aArr, aOff, rows * k),
+                new ReadOnlySpan<double>(bArr, bOff, k * n),
+                new Span<double>(oArr, oOff, rows * n),
                 rows, k, n);
             return;
         }
@@ -10793,14 +10821,14 @@ public partial class CpuEngine : ITensorLevelEngine
             if (batchSize == 1)
             {
                 if (BlasProvider.TryGemmEx(m, n, k,
-                    aArr, 0, k, false,
-                    bArr, 0, n, false,
-                    oArr, 0, n))
+                    aArr, aOff, k, false,
+                    bArr, bOff, n, false,
+                    oArr, oOff, n))
                     return;
                 SimdGemm.Dgemm(
-                    new ReadOnlySpan<double>(aArr, 0, sliceA),
-                    new ReadOnlySpan<double>(bArr, 0, sliceB),
-                    new Span<double>(oArr, 0, sliceC),
+                    new ReadOnlySpan<double>(aArr, aOff, sliceA),
+                    new ReadOnlySpan<double>(bArr, bOff, sliceB),
+                    new Span<double>(oArr, oOff, sliceC),
                     m, k, n);
             }
             else
@@ -10808,14 +10836,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
                 {
                     if (BlasProvider.TryGemmEx(m, n, k,
-                        aArr, batch * sliceA, k, false,
-                        bArr, batch * sliceB, n, false,
-                        oArr, batch * sliceC, n))
+                        aArr, aOff + batch * sliceA, k, false,
+                        bArr, bOff + batch * sliceB, n, false,
+                        oArr, oOff + batch * sliceC, n))
                         return;
                     SimdGemm.DgemmSequential(
-                        new ReadOnlySpan<double>(aArr, batch * sliceA, sliceA),
-                        new ReadOnlySpan<double>(bArr, batch * sliceB, sliceB),
-                        new Span<double>(oArr, batch * sliceC, sliceC),
+                        new ReadOnlySpan<double>(aArr, aOff + batch * sliceA, sliceA),
+                        new ReadOnlySpan<double>(bArr, bOff + batch * sliceB, sliceB),
+                        new Span<double>(oArr, oOff + batch * sliceC, sliceC),
                         m, k, n);
                 });
             }
@@ -24057,6 +24085,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var fOut = (float[])(object)result.GetDataArray();
+                // AutoTensorCache.RentOrAllocate returns an UNINITIALIZED
+                // buffer (the cache reuses pooled arrays without zeroing).
+                // The variance accumulator below uses `+=` so it must start
+                // from zero — otherwise the previous renter's stale bytes
+                // get folded into the variance and the result becomes
+                // nondeterministic across runs. Clear just the logical
+                // region so we don't pay for any backing-array padding.
+                Array.Clear(fOut, 0, cols);
                 // First compute means
                 var means = new float[cols];
                 for (int r = 0; r < rows; r++)
@@ -24101,6 +24137,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var dOut = (double[])(object)result.GetDataArray();
+                // Same rationale as the float axis==0 branch above —
+                // AutoTensorCache returns an uninitialized buffer and the
+                // accumulator below uses `+=`, so the logical region must
+                // start from zero.
+                Array.Clear(dOut, 0, cols);
                 var means = new double[cols];
                 for (int r = 0; r < rows; r++)
                     for (int c = 0; c < cols; c++) means[c] += dData[r * cols + c];
