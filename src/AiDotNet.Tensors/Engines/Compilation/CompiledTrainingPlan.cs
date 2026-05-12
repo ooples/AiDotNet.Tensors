@@ -815,8 +815,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // delegate-array benefit.
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && step.OutputBuffer.IsContiguous
             && typeof(T) == typeof(float))
         {
+            // Contiguity guard: collapsing A's leading dims to M and treating
+            // the buffer as row-major dense produces wrong results for views
+            // (e.g. TensorSlice). Non-contiguous operands fall through to
+            // the generic engine path below.
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
             var output = step.OutputBuffer;
@@ -1989,6 +1995,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && step.OutputBuffer.IsContiguous
             && BlasProvider.IsAvailable)
         {
             var inputA = step.Inputs[0];

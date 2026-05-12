@@ -23,9 +23,11 @@ param(
     # SHA (e.g. -HarmonicEngineRef abc1234567890abc...) for reproducible
     # bisection. Branch / tag / SHA all accepted.
     [string]$HarmonicEngineRef = "main",
-    # Use Join-Path below for the directory so Windows / macOS / Linux
-    # all build a path with the right separator.
-    [string]$WorkDir = (Join-Path $env:TEMP "issue327-consumer-repro")
+    # [System.IO.Path]::GetTempPath() resolves to %TEMP% on Windows and
+    # $TMPDIR (with /tmp fallback) on POSIX hosts, so the default works
+    # on every supported PowerShell host. $env:TEMP would be null on
+    # macOS / Linux and Join-Path would fail before any work happened.
+    [string]$WorkDir = (Join-Path ([System.IO.Path]::GetTempPath()) "issue327-consumer-repro")
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,9 +125,11 @@ if (Test-Path $HarmonicEngineDir) {
     Pop-Location
 } else {
     Write-Host "[2/4] Cloning HarmonicEngine..."
-    # Clone the default branch first (shallow), then `git checkout` to
-    # the requested ref. `git clone --branch` only accepts branches /
-    # tags — passing a SHA fails. Two-step clone handles all three.
+    # Clone the default branch first (full clone — `git checkout <sha>`
+    # below requires the SHA's object to be present, which a shallow
+    # clone wouldn't guarantee), then `git checkout` to the requested
+    # ref. `git clone --branch` only accepts branches / tags — passing
+    # a SHA fails. Two-step clone handles branch, tag, and SHA.
     & git clone --quiet https://github.com/ooples/HarmonicEngine.git $HarmonicEngineDir
     if ($LASTEXITCODE -ne 0) {
         Write-Error "git clone HarmonicEngine failed (exit $LASTEXITCODE)"

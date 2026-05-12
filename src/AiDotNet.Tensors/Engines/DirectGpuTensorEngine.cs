@@ -12919,6 +12919,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int M = a.Shape._dims[0];
             int K = a.Shape._dims[1];
             int N = b.Shape._dims[1];
+
+            // Shape validation: K of A must match leading dim of B. Without
+            // this, mismatched shapes would pass garbage dimensions to
+            // backend.Gemm and either produce wrong results or trigger a
+            // native crash. Matches CpuEngine.TensorMatMul's contract.
+            int bLeadingDim = b.Shape._dims[0];
+            if (K != bLeadingDim)
+                throw new ArgumentException(
+                    $"TensorMatMul shape mismatch: a.Shape[1]={K} but b.Shape[0]={bLeadingDim}.");
+
             using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
             using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
             var bufOut = AllocateOutputBuffer(backend, M * N);
