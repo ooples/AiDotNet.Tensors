@@ -2906,8 +2906,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Uses cached GPU buffers for registered persistent tensors (weights/bias) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
     /// </summary>
-    public new Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
+        // When a tape is active, defer to the base (CpuEngine) tape-aware
+        // path which decomposes into TensorMatMul + TensorBroadcastAdd and
+        // collapses them into a single recorded "FusedLinear" entry. The
+        // GPU fused kernels below bypass tape recording (they call
+        // backend.GemmBiasRelu / etc directly without going through
+        // DifferentiableOps), so taking them during training would
+        // silently disconnect this op from autograd. The inner
+        // TensorMatMul + TensorBroadcastAdd dispatch via virtual on
+        // `this`, so they still hit the DirectGpu GPU path for the
+        // forward — only the SINGLE-CALL fused kernel is given up.
+        // Pure-inference callers (no tape) still get the full fused
+        // kernel speedup.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+            return base.FusedLinear(input, weights, bias, activation);
+
         if (!TryGetBackend(out var backend))
             return base.FusedLinear(input, weights, bias, activation);
 
@@ -12945,18 +12960,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
 
+        // Only the 2D × 2D case has a single-call GPU GEMM here. The rank-3+
+        // shapes (broadcast 2D weights over batch dims, full ND × ND, etc.)
+        // need flatten + reshape orchestration that this override didn't do —
+        // the previous code took `a.Shape._dims[a.Rank - 2]` as M, which
+        // silently dropped every leading batch dimension and only multiplied
+        // the last [M, K] slice against B. That produced a rank-2 output for
+        // a rank-3 input, breaking shape contracts downstream (caught by
+        // FusedLinearBiasGradIntegrationTests.TwoLayerFFL_Rank3Double — the
+        // rank-3 TensorMatMul output was [S, N] instead of [B, S, N], and
+        // the next TensorSubtract failed on shape mismatch). Route non-2D
+        // through the base CpuEngine path, which correctly handles ND × 2D
+        // (collapse leading dims into M, single GEMM, reshape back) and
+        // ND × ND (per-batch GEMM). Both base paths record on the tape too.
+        if (a.Rank != 2 || b.Rank != 2)
+            return base.TensorMatMul(a, b);
+
         try
         {
-            int M = a.Shape._dims[a.Rank - 2];
-            int K = a.Shape._dims[a.Rank - 1];
-            int N = b.Shape._dims[b.Rank - 1];
+            int M = a.Shape._dims[0];
+            int K = a.Shape._dims[1];
+            int N = b.Shape._dims[1];
             using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
             using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
             var bufOut = AllocateOutputBuffer(backend, M * N);
             backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
             var result = FinishGpuOp<T>(backend, bufOut, M * N);
-            int[] outShape = a.Rank == 1 ? new[] { N } : new[] { M, N };
-            var output = new Tensor<T>(result, outShape);
+            var output = new Tensor<T>(result, new[] { M, N });
             Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", output, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
             return output;
         }
