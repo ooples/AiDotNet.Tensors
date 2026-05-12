@@ -420,7 +420,14 @@ public class GradientTapeTests
     [Fact]
     public void Gradient_NonPersistentTape_ClearsAfterCompute()
     {
-        using var tape = new GradientTape<float>();
+        // Construct an explicitly non-persistent tape. PR #333 flipped the
+        // default GradientTapeOptions.Persistent to true (it gates the
+        // AutoTrainingCompiler fast path), so `new GradientTape<float>()`
+        // now means PERSISTENT — entries survive ComputeGradients. The
+        // non-persistent contract this test asserts (auto-clear on compute,
+        // second compute throws because tape is empty) only applies when
+        // Persistent is explicitly false.
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
 
         var a = new Tensor<float>(new[] { 2 }, new Vector<float>(new float[] { 1, 2 }));
         var b = new Tensor<float>(new[] { 2 }, new Vector<float>(new float[] { 3, 4 }));

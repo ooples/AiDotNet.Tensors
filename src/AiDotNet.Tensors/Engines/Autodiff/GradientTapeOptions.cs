@@ -22,11 +22,17 @@ public sealed class GradientTapeOptions
     /// fraction substantially.
     /// </para>
     /// <para>
-    /// Clone-then-train safety is handled inside <c>AutoTrainingCompiler.ComputePatternHash</c>
-    /// — the cache hash includes input / output tensor identities, so a
-    /// cloned model (same architecture but fresh tensor instances) hashes
-    /// differently from its source and triggers a fresh compile rather than
-    /// replaying the original's backward plan on the wrong tensors.
+    /// Clone-then-train safety is handled inside <c>AutoTrainingCompiler</c>
+    /// via two cooperating mechanisms: (1) the cache lookup key composes
+    /// <c>ComputeStructureHash</c> (op + shape + element type) with
+    /// <c>IncludeTargetIdentity</c> (<c>RuntimeHelpers.GetHashCode</c> over
+    /// <c>sources</c>) so a cloned model with fresh parameter tensors
+    /// produces a different cache key and triggers a fresh compile rather
+    /// than replaying the original's backward plan on the wrong tensors;
+    /// (2) <c>TryCompileBackward</c> refuses to store a plan when
+    /// <c>sources</c> is null, so the structure-only fallback can never be
+    /// cached and a null-sources caller cannot accidentally hit a
+    /// clone-mismatched plan.
     /// </para>
     /// </remarks>
     public static readonly GradientTapeOptions Default = new() { Persistent = true };
