@@ -2287,6 +2287,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Same version-counter bump rationale as the `public override`
+        // path above — keep the in-place contract intact on IEngine-typed
+        // dispatch.
+        a.IncrementVersion();
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
@@ -5795,7 +5799,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Supports optional attention bias (ALiBi) — the bias is uploaded to GPU and passed to the kernel.
     /// Falls back to CPU implementation when GPU is unavailable or on any GPU error.
     /// </summary>
-    public new Tensor<T> FlashAttention<T>(
+    public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
@@ -5804,6 +5808,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> softmaxStats,
         Tensor<T>? attentionBias = null)
     {
+        // Same rationale as FusedLinear / GroupedQueryAttention: the GPU
+        // FlashAttention kernel produces softmaxStats + output without
+        // calling DifferentiableOps.Record*. When a tape is active, defer
+        // to base.FlashAttention (CpuEngine) which decomposes (or records)
+        // a tape entry with FlashAttentionBackward so gradient flow to Q,
+        // K, V works. Keeping `public override` makes the IEngine dispatch
+        // reach this method instead of CpuEngine's implicit-interface impl.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
+
         if (!TryGetBackend(out var backend))
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
@@ -13719,6 +13733,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Version-counter bump is part of the in-place contract — callers
+        // use `Tensor<T>.Version` to detect mutations between tape record
+        // and replay. The GPU fast path here didn't bump it, so anything
+        // that watched Version (e.g. the InferenceMode tests) would see
+        // a stale "no change" value. Bump first; the InferenceModeScope
+        // suppresses the bump itself via IncrementVersion, so this is
+        // the same semantic CpuEngine.TensorAddInPlace already follows.
+        a.IncrementVersion();
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Add(ia, ib, ia, size)))
             return;
         base.TensorAddInPlace(a, b);

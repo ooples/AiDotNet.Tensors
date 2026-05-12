@@ -21080,7 +21080,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// While the CPU version doesn't benefit as much from the memory hierarchy optimizations
     /// as GPU, it still provides memory savings for long sequences.
     /// </remarks>
-    public Tensor<T> FlashAttention<T>(
+    public virtual Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
