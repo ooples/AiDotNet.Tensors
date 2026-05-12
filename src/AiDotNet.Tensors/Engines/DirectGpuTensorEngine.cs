@@ -13015,6 +13015,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (IsTapeActive<T>()) return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -13071,6 +13072,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -13111,6 +13113,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -13150,6 +13153,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -13189,6 +13193,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
+        if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
@@ -15491,6 +15496,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        // FusedLinearGradientTests asserts the fused path produces gradients
+        // equal-to-3-decimals with the unfused TensorMatMul + TensorBroadcastAdd
+        // + ReLU chain. The CpuEngine fused path delegates to those same ops
+        // before collapsing the tape, so the precision matches. The GPU
+        // Gemm+BiasAdd+ReLU chain diverges enough to fail the 3-decimal
+        // assertion. Defer to base when the tape is active.
+        if (IsTapeActive<T>()) return base.FusedLinearReLU(input, weight, bias);
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -15504,17 +15516,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var preActBuf = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.Gemm(gi, gw, preActBuf, batchSize, outFeatures, inFeatures);
                 backend.BiasAdd(preActBuf, gb, preActBuf, batchSize, outFeatures);
-                var preActivation = DeferTensorResult<T>(backend, preActBuf, batchSize * outFeatures, new[] { batchSize, outFeatures });
 
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.Relu(preActBuf, go, batchSize * outFeatures);
-                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-
-                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
-                    new[] { input, weight, bias },
-                    Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward,
-                    new object[] { preActivation });
-                return result;
+                return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
         catch { }
@@ -15523,6 +15528,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (IsTapeActive<T>()) return base.FusedLinearSigmoid(input, weight, bias);
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -15534,12 +15540,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gb = UploadTensorRaw(backend, bias);
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.FusedLinearSigmoid(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
-                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // Sigmoid backward uses output directly: grad * out * (1 - out)
-                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSigmoid", result,
-                    new[] { input, weight, bias },
-                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSigmoidBackward);
-                return result;
+                return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
         catch { }
@@ -15548,6 +15549,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (IsTapeActive<T>()) return base.FusedLinearTanh(input, weight, bias);
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -15559,12 +15561,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gb = UploadTensorRaw(backend, bias);
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.FusedLinearTanh(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
-                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // Tanh backward uses output directly: grad * (1 - out^2)
-                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearTanh", result,
-                    new[] { input, weight, bias },
-                    Autodiff.BackwardFunctions<T>.FusedMatMulAddTanhBackward);
-                return result;
+                return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
         catch { }
@@ -15573,6 +15570,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (IsTapeActive<T>()) return base.FusedLinearGELU(input, weight, bias);
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -15584,19 +15582,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gb = UploadTensorRaw(backend, bias);
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.FusedLinearGELU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
-                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // GELU backward needs pre-activation (MatMul+Bias output before GELU).
-                // Compute without tape recording to avoid polluting the tape.
-                Tensor<T> preActivation;
-                using (new Autodiff.NoGradScope<T>())
-                {
-                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
-                }
-                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
-                    new[] { input, weight, bias },
-                    Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward,
-                    new object[] { preActivation });
-                return result;
+                return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
         catch { }
@@ -15605,6 +15591,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (IsTapeActive<T>()) return base.FusedLinearSwish(input, weight, bias);
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -15616,19 +15603,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gb = UploadTensorRaw(backend, bias);
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.FusedLinearSwish(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
-                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // Swish backward needs pre-activation to compute sigmoid(x) derivative.
-                // Compute without tape recording to avoid polluting the tape.
-                Tensor<T> preActivation;
-                using (new Autodiff.NoGradScope<T>())
-                {
-                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
-                }
-                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
-                    new[] { input, weight, bias },
-                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward,
-                    new object[] { preActivation });
-                return result;
+                return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
         catch { }
