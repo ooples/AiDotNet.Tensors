@@ -48,11 +48,21 @@ internal static class AutoTrainingCompiler
     internal static void RecordStep<T>(TapeEntryArena<T> entries, int entryCount, Tensor<T>? loss = null)
     {
         if (!Enabled) return;
-        // Repeat-detection hash: STRUCTURE ONLY (op sequence + shapes). Every
-        // forward pass creates fresh activation/loss tensors, so including
-        // their identities here would make every step produce a different hash
-        // and pattern repeats would never trigger the compile threshold.
-        long hash = ComputeStructureHash(entries, entryCount);
+        // Single full-identity hash. We considered splitting into a structure-only
+        // hash for repeat detection + identity-augmented hash for cache lookup
+        // (see PR #333 review thread), but actually splitting them exposes latent
+        // bugs in the compiled-replay path: tests in BatchNorm3DIntegrationTests,
+        // GradientTapeReplayModeTests, TensorCopyToTests, and TorchFuncPhase1Tests
+        // start failing because auto-compile fires in scenarios it didn't before,
+        // and the compiled backward graph stores tensor references that aren't
+        // valid in those scenarios (KeyNotFoundException on gradients dictionary).
+        // The TODO is to fix the compiled-replay path so it handles createGraph,
+        // gradient-dict consistency, and cross-tape replay correctly — only then
+        // can we safely split the hashes. Until then keep the full hash so compile
+        // only fires when activation / loss / parameter identities all match,
+        // which is rare in practice (every forward creates fresh intermediates)
+        // and limits the scope of replay-path bugs that can be triggered.
+        long hash = ComputePatternHash(entries, entryCount);
         State.RecordStepHash(hash);
     }
 
@@ -71,15 +81,11 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
-        // Compiled-plan retrieval hash: structure + parameter-tensor identities.
-        // The compiled backward graph holds direct Tensor<T> references to the
-        // specific parameter tensors it was built against; replaying it on a
-        // cloned model (same architecture, fresh parameter instances) would
-        // silently produce wrong gradients. So the cache key must include
-        // SOURCE identities. Activation/loss identities are deliberately NOT
-        // included — only sources, which are the long-lived parameter tensors
-        // the caller actually wants gradients for.
-        long currentHash = ComputeStructureHash(tape.Entries, tape.EntryCount);
+        // Validate current tape pattern AND loss/sources identity match the
+        // compiled plan. Full-hash matching keeps the compile cache safe
+        // against clone-then-train (different parameter tensors) and against
+        // tape-aliasing (same op pattern, different activation/loss objects).
+        long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
         currentHash = IncludeTargetIdentity(currentHash, loss, sources);
         if (!State.MatchesCompiledHash(currentHash))
         {
@@ -112,9 +118,10 @@ internal static class AutoTrainingCompiler
         try
         {
             var compiled = tape.CompileBackward(loss, sources);
-            // Store the cache key (structure + sources). Matches the lookup
-            // computation in TryGetCompiledBackward — both must agree.
-            long hash = ComputeStructureHash(tape.Entries, tape.EntryCount);
+            // Store the same hash TryGetCompiledBackward will compute for
+            // lookup — full identity-augmented pattern hash so cache lookup
+            // and cache store agree.
+            long hash = ComputePatternHash(tape.Entries, tape.EntryCount);
             hash = IncludeTargetIdentity(hash, loss, sources);
             State.StoreCompiledBackwardWithHash(compiled, hash);
             ReplayMode = true; // Enable replay mode now that backward is compiled
@@ -147,25 +154,37 @@ internal static class AutoTrainingCompiler
     }
 
     /// <summary>
-    /// Structure-only hash: op name sequence + output shapes + element type.
-    /// Two training steps with the same model architecture and same input
-    /// shapes produce the same hash even though their activation / loss
-    /// tensors are different object instances (which they always are —
-    /// each forward pass creates fresh intermediates).
+    /// Computes a hash of the training step pattern: op names + output identities
+    /// + output shapes + input identities + element type. Used by both
+    /// <see cref="RecordStep{T}"/> for repeat detection and by
+    /// <see cref="TryGetCompiledBackward{T}"/> / <see cref="TryCompileBackward{T}"/>
+    /// (after composition with <see cref="IncludeTargetIdentity{T}"/>) for the
+    /// compiled-plan cache key.
     /// </summary>
     /// <remarks>
-    /// <para>This is the right hash for <see cref="RecordStep{T}"/>'s repeat
-    /// detection: we want consecutive train steps of the same model to be
-    /// recognized as a repeat so the compile threshold actually fires.
-    /// Including activation / intermediate / loss identities would make
-    /// every step hash differently and pattern repeats would never trigger.</para>
-    /// <para>Per-Train cost: O(entryCount) — one hash op per tape entry. On
-    /// VGG16-BN that's ~100 hash ops out of a 38 s iteration — negligible.</para>
+    /// <para>
+    /// Output tensor identities (<c>RuntimeHelpers.GetHashCode</c>) are included
+    /// so a cloned model — same architecture, fresh parameter tensors — produces
+    /// a different hash from its source and gets a fresh compile rather than
+    /// replaying the original's backward plan against the wrong tensor refs.
+    /// </para>
+    /// <para>
+    /// <b>Repeat-detection trade-off:</b> activation / loss tensors are typically
+    /// recreated each forward pass, so the hash differs across steps and the
+    /// compile threshold rarely fires unless the consumer reuses tensor instances
+    /// (e.g. via <c>TensorArena</c>'s pooled reuse). A future refactor could split
+    /// this into a structure-only hash for repeat detection + an identity-augmented
+    /// hash for cache lookup so compile fires more aggressively, but that requires
+    /// the compiled-replay path to first correctly handle createGraph, gradient-dict
+    /// consistency, and cross-tape replay — see BatchNorm3DIntegrationTests and
+    /// GradientTapeReplayModeTests for the surface that would need to be fixed
+    /// alongside the split.
+    /// </para>
     /// </remarks>
-    private static long ComputeStructureHash<T>(TapeEntryArena<T> entries, int entryCount)
+    private static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
-        // Include element type so float and double plans don't collide.
+        // Include element type so float and double plans don't collide
         hash ^= typeof(T).GetHashCode();
         hash *= unchecked((long)0x100000001b3L);
         for (int i = 0; i < entryCount; i++)
@@ -175,11 +194,46 @@ internal static class AutoTrainingCompiler
             hash *= unchecked((long)0x100000001b3L);
             if (entry.Output is not null)
             {
-                // Shape only — NOT identity. Two steps with the same model
-                // shape produce the same structure hash.
+                // Identity disambiguates same-shape outputs across models
+                // (e.g., cloned network's intermediates vs original's).
+                hash ^= RuntimeHelpers.GetHashCode(entry.Output);
+                hash *= unchecked((long)0x100000001b3L);
                 foreach (int dim in entry.Output._shape)
                 {
                     hash ^= dim;
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+            }
+            // Hash input tensor identities directly from the inline
+            // Input0/Input1/Input2/InputsOverflow fields. GetInputsArray()
+            // allocates a Tensor<T>[1..3] on every call and this hash runs
+            // per RecordStep / TryGetCompiledBackward / TryCompileBackward,
+            // so on large graphs (BERT ~150 entries) that's 150 small-array
+            // allocs per Train call we avoid here.
+            if (entry.InputsOverflow is not null)
+            {
+                foreach (var inp in entry.InputsOverflow)
+                {
+                    if (inp is null) continue;
+                    hash ^= RuntimeHelpers.GetHashCode(inp);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+            }
+            else
+            {
+                if (entry.InputCount >= 1 && entry.Input0 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input0);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+                if (entry.InputCount >= 2 && entry.Input1 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input1);
+                    hash *= unchecked((long)0x100000001b3L);
+                }
+                if (entry.InputCount >= 3 && entry.Input2 is not null)
+                {
+                    hash ^= RuntimeHelpers.GetHashCode(entry.Input2);
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }
