@@ -43,6 +43,15 @@ public class Issue327TransformerTrainPerfTests
         // narrower hardware (CI workers with 2-4 cores, ARM emulation)
         // the wall-time floor is dominated by per-core compute and
         // doesn't reflect the regression this test is designed to catch.
+        // Skip unless opt-in: env var AIDOTNET_RUN_PERF_GATES=1 plus
+        // 16+ logical cores. Other perf-regression guards in this repo
+        // follow the same env-var-gated pattern so the default test
+        // run on slower CI runners doesn't flap on wall-time variance.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
         if (Environment.ProcessorCount < 16)
         {
             _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16 (issue scope).");
@@ -100,6 +109,15 @@ public class Issue327TransformerTrainPerfTests
     [Trait("Category", "Perf")]
     public void Issue327_Transformer_FreshTape_TrainStep_DoesNotExplodeCatastrophically()
     {
+        // Skip unless opt-in: env var AIDOTNET_RUN_PERF_GATES=1 plus
+        // 16+ logical cores. Other perf-regression guards in this repo
+        // follow the same env-var-gated pattern so the default test
+        // run on slower CI runners doesn't flap on wall-time variance.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
         if (Environment.ProcessorCount < 16)
         {
             _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16 (issue scope).");
