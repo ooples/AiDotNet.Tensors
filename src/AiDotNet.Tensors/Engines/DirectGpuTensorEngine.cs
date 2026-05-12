@@ -223,14 +223,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // CAUTION: ClearActivationCache should not be called during active GPU operations.
     private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
     private readonly object _activationCacheLock = new();
-    // Lowered from 4096 (2026-05-12): the larger cap was tuned for batched
-    // inference where many activations could be in-flight, but in long-running
-    // training loops (issue #283 1000-iter stress test) it pinned hundreds of
-    // MB of intermediates per epoch — the eviction skip-pending guard meant
-    // unused activations rode along until the next deliberate cache clear.
-    // 128 is sized to hold one Transformer-block forward pass worth of
-    // intermediates (~ 10 ops × 12 layers) without the long-loop leak.
-    private const int DefaultActivationCacheSize = 128;
+    private const int DefaultActivationCacheSize = 4096;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
 
     /// <summary>
@@ -993,28 +986,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long threshold = timestamps[removeCount - 1];
 
         // Remove entries at or below threshold, collect for disposal outside lock.
-        // For entries whose key still has a pending deferred materializer, FIRST
-        // materialize (download to the CPU array) so the GPU buffer can be safely
-        // freed, THEN evict — this stops the unbounded growth pattern that issue
-        // #283 / AiDotNet#1227 observed (1000-iter training stress test leaking
-        // hundreds of KB/call because materializer pinning kept old activations
-        // off the eviction list forever, and unused activations couldn't be GC'd
-        // either since the materializer dictionary held strong refs to their
-        // backing arrays). Materialize before evict keeps the issue-#226
-        // CL_INVALID_MEM_OBJECT crash from re-appearing — the callback runs
-        // against a still-live buffer, not a freed one.
+        // Skip entries whose key still has a pending deferred materializer — otherwise
+        // the later TryMaterialize call reads a freed OpenCL buffer and crashes with
+        // CL_INVALID_MEM_OBJECT (issue #226). DeferredArrayMaterializer is the single
+        // source of truth; both FinishGpuOp and DeferTensorResult register here.
         int removed = 0;
         for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
             if (entries[i].Value.Timestamp <= threshold)
             {
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                {
-                    // Materialize the pending download now so the GPU buffer can be
-                    // safely freed below. TryMaterialize is a no-op if the entry
-                    // was already drained on another thread.
-                    Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key);
-                }
+                    continue;
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
