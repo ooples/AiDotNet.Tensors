@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 #if NET5_0_OR_GREATER
@@ -453,6 +454,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 result = SimdKernels.SumUnsafe(ptr, vector.Length) / vector.Length;
             }
             return Unsafe.As<float, T>(ref result);
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            T[] arr = vector.GetDataArray();
+            double[] dArr = Unsafe.As<T[], double[]>(ref arr);
+            double result = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, 0, vector.Length)) / vector.Length;
+            return Unsafe.As<double, T>(ref result);
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -1787,24 +1796,43 @@ public partial class CpuEngine : ITensorLevelEngine
         var aArray = a.GetDataArray();
         var bArray = b.GetDataArray();
 
-        // Use SIMD-optimized TensorPrimitives for float type
+        // Use SIMD-optimized TensorPrimitives for float type. Single rented
+        // scratch buffer reused across rows — earlier passes allocated a
+        // fresh row[] per outer-loop iteration, which dominated runtime on
+        // large vectors and produced O(rows × cols) GC churn.
         if (typeof(T) == typeof(float) && bArray.Length >= 16)
         {
             var bFloat = (float[])(object)bArray;
             var aFloat = (float[])(object)aArray;
-
-            for (int i = 0; i < aFloat.Length; i++)
+            var rowData = ArrayPool<float>.Shared.Rent(bFloat.Length);
+            try
             {
-                var rowData = new float[bFloat.Length];
-                // SIMD vectorized: multiply vector b by scalar a[i]
-                Simd.SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowData.AsSpan());
-
-                // Copy result to matrix
-                for (int j = 0; j < bFloat.Length; j++)
+                var rowSpan = rowData.AsSpan(0, bFloat.Length);
+                for (int i = 0; i < aFloat.Length; i++)
                 {
-                    result[i, j] = (T)(object)rowData[j];
+                    SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowSpan);
+                    for (int j = 0; j < bFloat.Length; j++)
+                        result[i, j] = (T)(object)rowData[j];
                 }
             }
+            finally { ArrayPool<float>.Shared.Return(rowData, clearArray: false); }
+        }
+        else if (typeof(T) == typeof(double) && bArray.Length >= 8)
+        {
+            var bDouble = (double[])(object)bArray;
+            var aDouble = (double[])(object)aArray;
+            var rowData = ArrayPool<double>.Shared.Rent(bDouble.Length);
+            try
+            {
+                var rowSpan = rowData.AsSpan(0, bDouble.Length);
+                for (int i = 0; i < aDouble.Length; i++)
+                {
+                    SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowSpan);
+                    for (int j = 0; j < bDouble.Length; j++)
+                        result[i, j] = (T)(object)rowData[j];
+                }
+            }
+            finally { ArrayPool<double>.Shared.Return(rowData, clearArray: false); }
         }
         else
         {
@@ -2338,18 +2366,54 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)result;
         }
 
-        // Generic scalar fallback for non-float T. Pre-combine scale/bias, then FMA.
+        // Double primitive fast path: pre-combine scale/bias then FMA, no
+        // INumericOperations<T> virtual dispatch. ResNet50 / VGG16-BN train at
+        // double precision through this op on every conv block — used by every
+        // BN inference pass in vision networks.
+        if (typeof(T) == typeof(double))
+        {
+            int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
+            int spatial = hh * ww;
+            var inSpanD = ((Tensor<double>)(object)x).AsSpan();
+            var gDataD = ((Tensor<double>)(object)gamma).AsSpan();
+            var bDataD = ((Tensor<double>)(object)beta).AsSpan();
+            var mDataD = ((Tensor<double>)(object)mean).AsSpan();
+            var vDataD = ((Tensor<double>)(object)variance).AsSpan();
+            var outTD = new Tensor<double>(x._shape) { Layout = x.Layout };
+            var outSpanD = outTD.AsWritableSpan();
+            var scaleArrD = new double[cc];
+            var biasArrD = new double[cc];
+            for (int c = 0; c < cc; c++)
+            {
+                double s = gDataD[c] / Math.Sqrt(vDataD[c] + epsilon);
+                scaleArrD[c] = s;
+                biasArrD[c] = bDataD[c] - s * mDataD[c];
+            }
+            for (int ni = 0; ni < nn; ni++)
+            {
+                for (int c = 0; c < cc; c++)
+                {
+                    int baseIdx = (ni * cc + c) * spatial;
+                    double s = scaleArrD[c], b2 = biasArrD[c];
+                    for (int sp = 0; sp < spatial; sp++)
+                        outSpanD[baseIdx + sp] = inSpanD[baseIdx + sp] * s + b2;
+                }
+            }
+            return (Tensor<T>)(object)outTD;
+        }
+
+        // Generic scalar fallback for non-primitive T. Pre-combine scale/bias, then FMA.
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
-        int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
-        int spatial = hh * ww;
+        int ccG = x._shape[1], hhG = x._shape[2], wwG = x._shape[3], nnG = x._shape[0];
+        int spatialG = hhG * wwG;
         var gData = gamma.GetDataArray();
         var bData = beta.GetDataArray();
         var mData = mean.GetDataArray();
         var vData = variance.GetDataArray();
-        var scaleArr = new T[cc];
-        var biasArr = new T[cc];
-        for (int c = 0; c < cc; c++)
+        var scaleArr = new T[ccG];
+        var biasArr = new T[ccG];
+        for (int c = 0; c < ccG; c++)
         {
             T s = numOps.Divide(gData[c], numOps.Sqrt(numOps.Add(vData[c], eps)));
             scaleArr[c] = s;
@@ -2358,13 +2422,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var outT = new Tensor<T>(x._shape) { Layout = x.Layout };
         var inSpan = x.AsSpan();
         var outSpan = outT.AsWritableSpan();
-        for (int ni = 0; ni < nn; ni++)
+        for (int ni = 0; ni < nnG; ni++)
         {
-            for (int c = 0; c < cc; c++)
+            for (int c = 0; c < ccG; c++)
             {
-                int baseIdx = (ni * cc + c) * spatial;
+                int baseIdx = (ni * ccG + c) * spatialG;
                 T s = scaleArr[c], b2 = biasArr[c];
-                for (int sp = 0; sp < spatial; sp++)
+                for (int sp = 0; sp < spatialG; sp++)
                     outSpan[baseIdx + sp] = numOps.Add(numOps.Multiply(inSpan[baseIdx + sp], s), b2);
             }
         }
@@ -2523,6 +2587,25 @@ public partial class CpuEngine : ITensorLevelEngine
                     { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                     return result;
                 }
+            }
+
+            // Double in-house SIMD fallback: when BLAS isn't available (TryGemm
+            // returned false above) and inputs are contiguous, use SimdGemm.Dgemm
+            // (AVX2 Vector256<double> FMA tiling) instead of falling through to
+            // the generic scalar matmul. ~10× faster on AVX2 hosts than the
+            // generic loop for moderate-size shapes.
+            if (typeof(T) == typeof(double) && a.IsContiguous && b.IsContiguous)
+            {
+                var aArrD = a._storage.GetDataArray();
+                var bArrD = b._storage.GetDataArray();
+                var rArrD = result.GetDataArray();
+                var aSpanD = new ReadOnlySpan<double>((double[])(object)aArrD, a._storageOffset, m * k);
+                var bSpanD = new ReadOnlySpan<double>((double[])(object)bArrD, b._storageOffset, k * n);
+                var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
+                SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
+                DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
+                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                return result;
             }
 
             // Generic fallback: stride-aware scalar matmul (raw storage for stride access)
@@ -2898,6 +2981,38 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path mirroring the float branch — same parallel-chunk
+        // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
+            }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
@@ -2941,6 +3056,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
             else
                 Simd.SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
         }
         else
         {
@@ -3072,6 +3197,39 @@ public partial class CpuEngine : ITensorLevelEngine
                     int off = r * cols;
                     for (int c = 0; c < cols; c++)
                         rf[off + c] = af[off + c] - bf[c];
+                }
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                return res;
+            }
+        }
+        if (typeof(T) == typeof(double) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        {
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+                // Use raw storage + offset rather than GetDataArray() —
+                // for contiguous slice/view tensors with a non-zero
+                // storage offset, GetDataArray() falls back to ToArray()
+                // and allocates a fresh copy on every call, defeating
+                // the allocation-free fast path. The Contiguous() call
+                // above only rebinds when IsContiguous is false, so
+                // offset-bearing contiguous views still reach this point.
+                var aStorage = a._storage.GetDataArray();
+                var bStorage = b._storage.GetDataArray();
+                var rStorage = res._storage.GetDataArray();
+                var ad = (double[])(object)aStorage;
+                var bd = (double[])(object)bStorage;
+                var rd = (double[])(object)rStorage;
+                int aOff = a._storageOffset, bOff = b._storageOffset, rOff = res._storageOffset;
+                for (int r = 0; r < rows; r++)
+                {
+                    int aRow = aOff + r * cols;
+                    int rRow = rOff + r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rd[rRow + c] = ad[aRow + c] - bd[bOff + c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
@@ -3423,6 +3581,14 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdKernels.VectorMultiplyUnsafe(pSrc, pDst, pDst, input.Length);
             return;
         }
+        if (typeof(T) == typeof(double))
+        {
+            // SIMD double Swish via Span overload.
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            Simd.SimdKernels.Swish(srcSpan, dstSpan);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
         numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
@@ -3454,6 +3620,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length);
         }
         else
         {
@@ -3489,6 +3663,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.TanhUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3518,6 +3700,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            // SIMD double-precision Mish via the Span overload (no unsafe ptr
+            // variant exists for double Mish yet — same elementwise cost
+            // class either way).
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            Simd.SimdKernels.Mish(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3551,6 +3743,13 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
             unsafe { Simd.SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, alphaF); }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
+            Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
         }
         else
         {
@@ -3693,6 +3892,48 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path for last-axis softmax (innerSize == 1). Used by
+        // every attention layer's QKᵀ softmax and every classifier head
+        // when running fp64. Inline 3-pass max / exp-sum / normalize per
+        // row avoids the generic Softmax() fallback's per-element numOps
+        // virtual dispatch + intermediate allocation + CopyTo. Parallel
+        // across rows for cache locality and core saturation.
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            using var pinIn = input.Data.Pin();
+            using var pinOut = destination.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                int axisSz = axisSize;
+                int outerSz = outerSize;
+                Action<int> rowKernel = row =>
+                {
+                    double* rIn = pIn + row * axisSz;
+                    double* rOut = pOut + row * axisSz;
+                    double max = rIn[0];
+                    for (int i = 1; i < axisSz; i++)
+                        if (rIn[i] > max) max = rIn[i];
+                    double sum = 0;
+                    for (int i = 0; i < axisSz; i++)
+                    {
+                        double e = Math.Exp(rIn[i] - max);
+                        rOut[i] = e;
+                        sum += e;
+                    }
+                    double inv = 1.0 / sum;
+                    for (int i = 0; i < axisSz; i++) rOut[i] *= inv;
+                };
+                // Route through CpuParallelSettings so the loop respects the
+                // configured MaxDegreeOfParallelism and falls back to serial
+                // for small inputs (skipping ThreadPool dispatch overhead).
+                // The totalWork estimate is outerSz*axisSz fmac operations.
+                CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
+            }
+            return;
+        }
+
         // Fallback: compute and copy, return pooled tensor
         var result = Softmax(input, axis);
         try
@@ -3770,6 +4011,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorSubtractUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorSubtractUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3797,6 +4048,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorDivideUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorDivideUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -3819,6 +4080,15 @@ public partial class CpuEngine : ITensorLevelEngine
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
             return;
         }
+        if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -3836,6 +4106,15 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3857,6 +4136,14 @@ public partial class CpuEngine : ITensorLevelEngine
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.SqrtUnsafe);
             return;
         }
+        if (typeof(T) == typeof(double))
+        {
+            // SIMD double sqrt via Span overload (no unsafe ptr variant in SimdKernels).
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            SimdKernels.Sqrt(srcSpan, dstSpan);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -3874,6 +4161,15 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3900,6 +4196,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             return;
         }
+        if (typeof(T) == typeof(double))
+        {
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            SimdKernels.Sin(srcSpan, dstSpan);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sin(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -3922,6 +4225,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fDst = (float[])(object)destination.GetDataArray();
                 for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             }
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
+            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            SimdKernels.Cos(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4309,6 +4619,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
+            }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
         if (savedA is not null)
@@ -4346,6 +4686,16 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
             Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
         }
         else
         {
@@ -4414,6 +4764,36 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
                     }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
+            }
+            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
                 });
             }
             else
@@ -5316,10 +5696,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
-        // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x)
+        // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x).
+        // Use Unsafe.As<T, float> rather than (float)(object)exponent — the
+        // cast chain box/unboxes a value type on every TensorPower call (BERT
+        // hits this op per attention layer's loss term, so the allocation is
+        // measurable). The `exponent is not null` guard is also redundant here:
+        // we're inside `typeof(T) == typeof(float)`, so T is a value type and
+        // a non-nullable parameter cannot be null. The same fix applies to the
+        // double branch below.
         if (typeof(T) == typeof(float))
         {
-            float fExp = exponent is not null ? (float)(object)exponent : 0f;
+            float fExp = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref exponent);
             if (fExp == 2.0f)
             {
                 // x^2 = x * x — use SIMD multiply
@@ -5328,8 +5715,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
-                if (exponent is not null)
-                    DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                // T is value-type float in this branch — exponent cannot be null,
+                // so the prior `exponent is not null` gate was always true. Box
+                // the already-extracted float (not the generic T) so the
+                // compiler sees a concrete value type and the savedState slot
+                // gets the same float boxing the slow path would produce.
+                DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { (object)fExp });
+                { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
+                return result;
+            }
+        }
+        if (typeof(T) == typeof(double))
+        {
+            // Non-boxing conversion — see the float branch comment above.
+            double dExp = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref exponent);
+            if (dExp == 2.0)
+            {
+                // x^2 = x * x — used by every L2 regularization / squared-error loss term.
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinSrc.Pointer, (double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
+                // T is value-type double in this branch — same rationale as the float branch.
+                DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { (object)dExp });
                 { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
                 return result;
             }
@@ -5397,6 +5806,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.FloorUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.FloorUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -5430,6 +5850,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.CeilingUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
             }
         }
         else
@@ -5466,6 +5897,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMem = AsDoubleMemory(tensor.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.RoundUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
             }
         }
         else
@@ -5886,6 +6328,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.VectorMaxUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinD.Pointer, a.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMemA = AsDoubleMemory(a.Data);
+                var srcMemB = AsDoubleMemory(b.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMaxUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinD.Pointer, a.Length);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -5955,11 +6410,29 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fA = (float[])(object)a.GetDataArray();
-            var fB = (float[])(object)b.GetDataArray();
-            var fD = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fA.Length; i++)
-                fD[i] = MathF.Min(fA[i], fB[i]);
+            unsafe
+            {
+                var srcMemA = AsFloatMemory(a.Data);
+                var srcMemB = AsFloatMemory(b.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMinUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinD.Pointer, a.Length);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                var srcMemA = AsDoubleMemory(a.Data);
+                var srcMemB = AsDoubleMemory(b.Data);
+                var dstMem = AsDoubleMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMinUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinD.Pointer, a.Length);
+            }
         }
         else
         {
@@ -6129,6 +6602,22 @@ public partial class CpuEngine : ITensorLevelEngine
             return Unsafe.As<float, T>(ref result);
         }
 
+        // Double fast path — Span-based SIMD reduction. Single-call (no
+        // multi-chunk partials yet) but still 4× faster than the scalar
+        // IVectorizedOperations.Sum fallback on AVX2 hosts. Use the raw
+        // storage + offset rather than GetDataArray() — GetDataArray()
+        // falls back to ToArray() for contiguous views with a non-zero
+        // storage offset, which would defeat the allocation-free fast
+        // path on every slice / view caller. Same pattern as the BLAS
+        // GEMM paths above.
+        if (typeof(T) == typeof(double))
+        {
+            T[] storageArr = tensor._storage.GetDataArray();
+            double[] dArr = Unsafe.As<T[], double[]>(ref storageArr);
+            double sum = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, tensor._storageOffset, tensor.Length));
+            return Unsafe.As<double, T>(ref sum);
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         // Use SIMD-optimized sum via IVectorizedOperations
         return numOps.Sum(tensor.AsSpan());
@@ -6293,6 +6782,50 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Fast path: single-axis sum on 2D contiguous double tensor — mirrors float branch.
+        // Heavily used by gradient accumulation paths (loss/bias sums, axis-wise reductions in
+        // attention) on double networks; eliminates INumericOperations<T> dispatch.
+        if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(double))
+        {
+            int axis = normalizedAxes[0];
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var srcArr = (double[])(object)tensor.GetDataArray();
+
+            if (axis == 0)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var rArr = (double[])(object)fastResult.GetDataArray();
+                Array.Clear(rArr, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rArr[c] += srcArr[offset + c];
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+            else if (axis == 1)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var rArr = (double[])(object)fastResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    double sum = 0;
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sum += srcArr[offset + c];
+                    rArr[r] = sum;
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+        }
+
         // Calculate output shape
         var outputShape = new List<int>();
         for (int i = 0; i < tensor.Rank; i++)
@@ -6387,6 +6920,24 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (typeof(T) == typeof(double))
+        {
+            // Double Min via SimdKernels.Min(ReadOnlySpan<double>). Single-call
+            // SIMD reduction — no parallel-chunk wrapper yet (Min over double
+            // doesn't have an unsafe-ptr overload the float ParallelReduceFloat
+            // path uses), but still ~4× faster than the scalar numOps.Min
+            // fallback on AVX2 hosts. Read through tensor.Data (logical view,
+            // sliced to Length) instead of GetDataArray() — the latter returns
+            // the underlying bucket-sized storage that ignores the tensor's
+            // _storageOffset, so contiguous-but-offset views would read the
+            // wrong elements. tensor was already Contiguous()-materialized
+            // above when not contiguous, so .Data is the right span here.
+            var span = AsDoubleMemory(tensor.Data).Span;
+            if (span.Length > tensor.Length) span = span[..tensor.Length];
+            double result = SimdKernels.Min(span);
+            return Unsafe.As<double, T>(ref result);
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Min(tensor.AsSpan());
     }
@@ -6443,6 +6994,20 @@ public partial class CpuEngine : ITensorLevelEngine
             float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, tensor.Length);
             float result = fSum / tensor.Length;
             return Unsafe.As<float, T>(ref result);
+        }
+
+        // Double fast path: SIMD Sum over Span, then divide. Read through
+        // tensor.Data (logical view) so contiguous-but-offset views — and the
+        // future streaming-backed Memory<T> tensors — work correctly. The
+        // older GetDataArray() path returned bucket-sized backing storage
+        // that didn't honor _storageOffset.
+        if (typeof(T) == typeof(double) && tensor.IsContiguous)
+        {
+            var span = AsDoubleMemory(tensor.Data).Span;
+            if (span.Length > tensor.Length) span = span[..tensor.Length];
+            double dSum = SimdKernels.Sum(span);
+            double result = dSum / tensor.Length;
+            return Unsafe.As<double, T>(ref result);
         }
 
         // Generic path
@@ -7001,6 +7566,45 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast path: direct double arithmetic with batch×channel parallelism,
+        // bypassing the per-element numOps virtual dispatch. Mirrors the allocating
+        // MaxPool2D's double path that VGG / ResNet / DenseNet hit on every pool layer.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        {
+            int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
+            int psD = poolSize, stD = stride, pdD = padding;
+            int bcD = batch * channels;
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            {
+                int inBase = idx * hD * wD;
+                int outBase = idx * oHD * oWD;
+                for (int oh = 0; oh < oHD; oh++)
+                {
+                    for (int ow = 0; ow < oWD; ow++)
+                    {
+                        double maxVal = double.NegativeInfinity;
+                        int ihStart = oh * stD - pdD;
+                        int iwStart = ow * stD - pdD;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = psD < (hD - ihStart) ? psD : (hD - ihStart);
+                        int kwEnd = psD < (wD - iwStart) ? psD : (wD - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inBase + (ihStart + kh) * wD + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                double v = inArrD[rowOff + kw];
+                                if (v > maxVal) maxVal = v;
+                            }
+                        }
+                        outArrD[outBase + oh * oWD + ow] = maxVal;
+                    }
+                }
+            });
+            return;
+        }
+
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
@@ -7102,6 +7706,46 @@ public partial class CpuEngine : ITensorLevelEngine
             };
             if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
             else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            return;
+        }
+
+        // Double fast path: direct double arithmetic with the same batch×channel
+        // parallel partition, but without the per-element numOps virtual dispatch.
+        // Used by ResNet's global-average-pool final step and by GAP blocks in
+        // various CV architectures running fp64.
+        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        {
+            int bc = batch * channels;
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+            Action<int> poolKernel = idx =>
+            {
+                int inputBase = idx * h * w;
+                int outputBase = idx * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        double sum = 0;
+                        int count = 0;
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = Math.Min(ps, h - ihStart);
+                        int kwEnd = Math.Min(ps, w - iwStart);
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                sum += inArrD[rowOff + kw];
+                                count++;
+                            }
+                        }
+                        outArrD[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0.0;
+                    }
+            };
+            CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, poolKernel);
             return;
         }
 
@@ -8569,6 +9213,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Double fast-path — the SIMD kernel exists, the dispatch didn't.
+        if (typeof(T) == typeof(double))
+        {
+            var mem = AsDoubleMemory(tensor.Data);
+            using var pin = mem.Pin();
+            double* p = (double*)pin.Pointer;
+
+            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            if (sigChunks >= 2)
+            {
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.SigmoidUnsafe(p, p, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -8596,6 +9270,14 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             Simd.SimdKernels.SigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.SigmoidUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
         }
         else
         {
@@ -8788,6 +9470,20 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Symmetric fast path for double — same SimdKernels covers both
+        // element types but the dispatching in CpuEngine wasn't routing
+        // doubles to it. Closes the float-fast / double-slow gap on the
+        // hottest activation (every Conv/Dense forward pass calls this).
+        if (typeof(T) == typeof(double))
+        {
+            var mem = AsDoubleMemory(tensor.Data);
+            using var pin = mem.Pin();
+            double* p = (double*)pin.Pointer;
+
+            SimdKernels.ReLUUnsafe(p, p, length);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -8820,6 +9516,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 JitUnaryDispatch(pSrc, pDst, length);
             else
                 Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var srcMem = AsDoubleMemory(input.Data);
+            var dstMem = AsDoubleMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+            Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
         }
         else
         {
@@ -9127,6 +9833,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
             }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels).
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(tensor.Data)).Span;
+            var dstSpan = AsDoubleMemory(result.Data).Span;
+            SimdKernels.ELU(srcSpan, alpha, dstSpan);
         }
         else
         {
@@ -9861,6 +10574,35 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Double fast path via BLAS cblas_dgemm with transB=true. Mirrors the
+        // float branch's "skip the transpose materialization" trick. Used by
+        // every attention layer's QKᵀ on fp64 and by linear-layer backwards
+        // through MatMulTransposedBackward. Falls through to the materialize-
+        // transpose generic path below when BLAS isn't loaded (rare — the in-
+        // house SimdGemm.Dgemm doesn't carry a transB flag, so we don't have
+        // a non-BLAS fast path here; the existing TryGemmEx route gives us
+        // PyTorch-class throughput when libopenblas is available).
+        if (typeof(T) == typeof(double) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous && b.IsContiguous)
+        {
+            var aRaw = (double[])(object)a._storage.GetDataArray();
+            var bRaw = (double[])(object)b._storage.GetDataArray();
+            var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+            var rRaw = (double[])(object)result._storage.GetDataArray();
+            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+
+            if (BlasProvider.TryGemmEx(M, N, K,
+                aRaw, aOff, K, false,
+                bRaw, bOff, K, true,
+                rRaw, rOff, N))
+            {
+                DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulTransposedBackward);
+                return result;
+            }
+            // BLAS not loaded — fall through to the materialize-transpose path
+            // (still better than nothing; future work: add an in-house
+            // DgemmTransposeB so we keep the fast path even without libopenblas).
+        }
+
         // Generic fallback: materialize the transpose and call TensorMatMul.
         // Slower than the fast path but correct for all dtypes / non-2D shapes.
         var bT = TensorTranspose(b);
@@ -9898,12 +10640,19 @@ public partial class CpuEngine : ITensorLevelEngine
                     // 2D/ND×2D/ND×ND cases to write-through kernels.
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
-                            cpuEng.TensorMatMulFloatInto(
+                            cpuEngF.TensorMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
                                 (Tensor<float>)(object)capturedB,
                                 (Tensor<float>)(object)output);
+                        }
+                        else if (typeof(T) == typeof(double) && eng is CpuEngine cpuEngD)
+                        {
+                            cpuEngD.TensorMatMulDoubleInto(
+                                (Tensor<double>)(object)capturedA,
+                                (Tensor<double>)(object)capturedB,
+                                (Tensor<double>)(object)output);
                         }
                         else
                         {
@@ -9988,6 +10737,121 @@ public partial class CpuEngine : ITensorLevelEngine
     internal void BatchMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
     {
         TensorMatMulFloatInto(a, b, output);
+    }
+
+    /// <summary>
+    /// Write-through MatMul for double — parallel to <see cref="TensorMatMulFloatInto"/>.
+    /// Routes through cblas_dgemm when BLAS is available (the typical case),
+    /// otherwise the in-house <see cref="Simd.SimdGemm.Dgemm"/>. Skips the
+    /// alloc+CopyTo round-trip of the public TensorMatMul entry point: BERT-
+    /// scale fp64 models call MatMul ~72× per layer, so per-call savings
+    /// compound across the inference. Dispatches 2D×2D, ND×2D, and ND×ND
+    /// same-rank cases — same shape contracts as the float counterpart.
+    /// </summary>
+    internal void TensorMatMulDoubleInto(Tensor<double> a, Tensor<double> b, Tensor<double> output)
+    {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        // Use raw storage + _storageOffset rather than GetDataArray() —
+        // GetDataArray() falls back to ToArray() for contiguous views
+        // with a non-zero storage offset (e.g. slices into a larger
+        // tensor), allocating a fresh copy on every call. The
+        // write-through fast path exists to skip exactly that kind of
+        // hidden alloc, so we read the backing storage directly and
+        // thread the per-tensor storage offset into every BLAS / SIMD
+        // GEMM call. Same pattern as TensorMatMulTransposed's BLAS path.
+        var aArr = a._storage.GetDataArray();
+        var bArr = b._storage.GetDataArray();
+        var oArr = output._storage.GetDataArray();
+        int aOff = a._storageOffset;
+        int bOff = b._storageOffset;
+        int oOff = output._storageOffset;
+
+        // 2D × 2D
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+            if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+                aArr, aOff, k, false,
+                bArr, bOff, n, false,
+                oArr, oOff, n))
+                return;
+            SimdGemm.Dgemm(
+                new ReadOnlySpan<double>(aArr, aOff, m * k),
+                new ReadOnlySpan<double>(bArr, bOff, k * n),
+                new Span<double>(oArr, oOff, m * n),
+                m, k, n);
+            return;
+        }
+
+        // ND × 2D: collapse batch dims into m
+        if (b.Rank == 2)
+        {
+            int aRank = a.Rank;
+            int m = a._shape[aRank - 2];
+            int k = a._shape[aRank - 1];
+            int n = b._shape[1];
+            int batchSize = 1;
+            for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
+            int rows = batchSize * m;
+            if (BlasProvider.TryGemmEx(rows, n, k,
+                aArr, aOff, k, false,
+                bArr, bOff, n, false,
+                oArr, oOff, n))
+                return;
+            SimdGemm.Dgemm(
+                new ReadOnlySpan<double>(aArr, aOff, rows * k),
+                new ReadOnlySpan<double>(bArr, bOff, k * n),
+                new Span<double>(oArr, oOff, rows * n),
+                rows, k, n);
+            return;
+        }
+
+        // ND × ND (same rank): per-batch GEMM
+        if (a.Rank == b.Rank)
+        {
+            int rank = a.Rank;
+            int m = a._shape[rank - 2];
+            int k = a._shape[rank - 1];
+            int n = b._shape[rank - 1];
+            int batchSize = 1;
+            for (int i = 0; i < rank - 2; i++) batchSize *= a._shape[i];
+            int sliceA = m * k, sliceB = k * n, sliceC = m * n;
+            if (batchSize == 1)
+            {
+                if (BlasProvider.TryGemmEx(m, n, k,
+                    aArr, aOff, k, false,
+                    bArr, bOff, n, false,
+                    oArr, oOff, n))
+                    return;
+                SimdGemm.Dgemm(
+                    new ReadOnlySpan<double>(aArr, aOff, sliceA),
+                    new ReadOnlySpan<double>(bArr, bOff, sliceB),
+                    new Span<double>(oArr, oOff, sliceC),
+                    m, k, n);
+            }
+            else
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
+                {
+                    if (BlasProvider.TryGemmEx(m, n, k,
+                        aArr, aOff + batch * sliceA, k, false,
+                        bArr, bOff + batch * sliceB, n, false,
+                        oArr, oOff + batch * sliceC, n))
+                        return;
+                    SimdGemm.DgemmSequential(
+                        new ReadOnlySpan<double>(aArr, aOff + batch * sliceA, sliceA),
+                        new ReadOnlySpan<double>(bArr, bOff + batch * sliceB, sliceB),
+                        new Span<double>(oArr, oOff + batch * sliceC, sliceC),
+                        m, k, n);
+                });
+            }
+            return;
+        }
+
+        throw new ArgumentException(
+            $"TensorMatMulDoubleInto: unsupported rank combination {a.Rank} and {b.Rank}");
     }
 
     internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
@@ -10423,6 +11287,40 @@ public partial class CpuEngine : ITensorLevelEngine
                     aF.AsSpan(aOffset, matrixSizeA),
                     bF.AsSpan(bOffset, matrixSizeB),
                     rF.AsSpan(resultOffset, matrixSizeResult),
+                    m, n, p);
+            });
+
+            return result;
+        }
+
+        // Double path: same rationale as the float branch above. DgemmSequential
+        // is the right variant inside this outer Parallel.For over batch — using
+        // Dgemm (which has its own internal parallel above ~16K work) would nest
+        // workers. BLAS dgemm via TryGemm is preferred when available; we hit
+        // the in-house Dgemm tiled FMA kernel only when BLAS isn't loaded.
+        if (typeof(T) == typeof(double))
+        {
+            var aD = (double[])(object)aData;
+            var bD = (double[])(object)bData;
+            var rD = (double[])(object)rData;
+
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)result.Length, batch =>
+            {
+                int aOffset = batch * matrixSizeA;
+                int bOffset = batch * matrixSizeB;
+                int resultOffset = batch * matrixSizeResult;
+
+                // Try BLAS dgemm first — that's the absolute fastest when libopenblas
+                // is loaded. Falls through to the in-house kernel below.
+                if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, n, p))
+                {
+                    return;
+                }
+
+                SimdGemm.DgemmSequential(
+                    aD.AsSpan(aOffset, matrixSizeA),
+                    bD.AsSpan(bOffset, matrixSizeB),
+                    rD.AsSpan(resultOffset, matrixSizeResult),
                     m, n, p);
             });
 
@@ -15703,6 +16601,30 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInF);
         }
 #endif
+        // Double primitive fast path for last-axis softmax backward.
+        // Inline scalar arithmetic (no Vector256<double> kernel yet) but still
+        // ~4× the throughput of the generic INumericOperations<T> loop because
+        // it eliminates virtual-dispatch + Multiply/Add boxing on every element.
+        if (typeof(T) == typeof(double) && innerSize == 1
+            && gradOutput.GetFlattenedData() is double[] gOutD
+            && output.GetFlattenedData() is double[] outD)
+        {
+            var gInD = new double[outD.Length];
+            bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
+            int axisSz = axisSize;
+            Action<int> rowKernel = row =>
+            {
+                int baseIdx = row * axisSz;
+                double dot = 0.0;
+                for (int i = 0; i < axisSz; i++) dot += gOutD[baseIdx + i] * outD[baseIdx + i];
+                for (int i = 0; i < axisSz; i++) gInD[baseIdx + i] = outD[baseIdx + i] * (gOutD[baseIdx + i] - dot);
+            };
+            if (useParallel)
+                CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, rowKernel);
+            else
+                for (int row = 0; row < outerSize; row++) rowKernel(row);
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInD);
+        }
 
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -18876,26 +19798,86 @@ public partial class CpuEngine : ITensorLevelEngine
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+        // Primitive fast paths: direct float/double arithmetic, no
+        // INumericOperations<T> virtual dispatch. Used by every LLaMA-style
+        // transformer block — gets called per-token per-layer per-step.
+        // The backward (RMSNormBackward) already had these primitive branches;
+        // forward stayed generic, paying ~20× the cost per element on AVX2
+        // hosts vs the cast-to-primitive variant.
+        if (typeof(T) == typeof(float))
         {
-            int offset = b * featureSize;
-            T featureSizeT = numOps.FromDouble(featureSize);
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fRms = (float[])(object)rmsData;
+            var fOutput = (float[])(object)outputData;
+            float fEps = (float)epsilon;
+            int fs = featureSize;
+            float invFs = 1f / fs;
 
-            // RMS
-            T sumSq = numOps.Zero;
-            for (int f = 0; f < featureSize; f++)
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
             {
-                T val = inputData[offset + f];
-                sumSq = numOps.Add(sumSq, numOps.Multiply(val, val));
-            }
-            T rmsVal = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, featureSizeT), eps));
-            rmsData[b] = rmsVal;
+                int offset = b * fs;
+                float sumSq = 0f;
+                for (int f = 0; f < fs; f++)
+                {
+                    float val = fInput[offset + f];
+                    sumSq += val * val;
+                }
+                float rmsVal = MathF.Sqrt(sumSq * invFs + fEps);
+                fRms[b] = rmsVal;
+                float invRms = 1f / rmsVal;
+                for (int f = 0; f < fs; f++)
+                    fOutput[offset + f] = fGamma[f] * (fInput[offset + f] * invRms);
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dInput = (double[])(object)inputData;
+            var dGamma = (double[])(object)gammaData;
+            var dRms = (double[])(object)rmsData;
+            var dOutput = (double[])(object)outputData;
+            int fs = featureSize;
+            double invFs = 1.0 / fs;
 
-            // Normalize and scale
-            T invRms = numOps.Divide(numOps.One, rmsVal);
-            for (int f = 0; f < featureSize; f++)
-                outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
-        });
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            {
+                int offset = b * fs;
+                double sumSq = 0.0;
+                for (int f = 0; f < fs; f++)
+                {
+                    double val = dInput[offset + f];
+                    sumSq += val * val;
+                }
+                double rmsVal = Math.Sqrt(sumSq * invFs + epsilon);
+                dRms[b] = rmsVal;
+                double invRms = 1.0 / rmsVal;
+                for (int f = 0; f < fs; f++)
+                    dOutput[offset + f] = dGamma[f] * (dInput[offset + f] * invRms);
+            });
+        }
+        else
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            {
+                int offset = b * featureSize;
+                T featureSizeT = numOps.FromDouble(featureSize);
+
+                // RMS
+                T sumSq = numOps.Zero;
+                for (int f = 0; f < featureSize; f++)
+                {
+                    T val = inputData[offset + f];
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(val, val));
+                }
+                T rmsVal = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, featureSizeT), eps));
+                rmsData[b] = rmsVal;
+
+                // Normalize and scale
+                T invRms = numOps.Divide(numOps.One, rmsVal);
+                for (int f = 0; f < featureSize; f++)
+                    outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
+            });
+        }
 
         rms = TensorAllocator.Rent<T>(batchShape, rmsData);
         var rmsResult = TensorAllocator.Rent<T>(input._shape, outputData);
@@ -20197,6 +21179,36 @@ public partial class CpuEngine : ITensorLevelEngine
             return resultFCast;
         }
 
+        // Double fast path mirrors the float branch but uses inline double
+        // arithmetic + DgemmSequential (or BLAS dgemm when libopenblas is
+        // loaded) instead of SgemmSequential. Same materialized-softmax
+        // strategy: scores = Q · K^T (per head, with a pre-transposed K
+        // scratch buffer because SimdGemm.Dgemm has no transB flag), then
+        // fused scale + mask + bias + numerically stable softmax row-wise,
+        // then output = softmax · V.
+        if (typeof(T) == typeof(double))
+        {
+            double scaleValD = scale ?? 1.0 / Math.Sqrt(headDim);
+            var resultD = FlashAttentionDouble(
+                (Tensor<double>)(object)query,
+                (Tensor<double>)(object)key,
+                (Tensor<double>)(object)value,
+                attentionBias is null ? null : (Tensor<double>)(object)attentionBias,
+                scaleValD, isCausal,
+                batch, heads, seqQ, headDim, seqK,
+                out var statsD);
+            softmaxStats = (Tensor<T>)(object)statsD;
+            var resultDCast = (Tensor<T>)(object)resultD;
+            var savedD = attentionBias is null
+                ? new object[] { softmaxStats, scaleValD, isCausal }
+                : new object[] { softmaxStats, scaleValD, isCausal, attentionBias };
+            DifferentiableOps.RecordIfActive("FlashAttention", resultDCast,
+                new[] { query, key, value },
+                BackwardFunctions<T>.FlashAttentionBackward,
+                savedD);
+            return resultDCast;
+        }
+
         // Extract bias data for the scalar path (shape already validated above).
         T[]? biasData = null;
         bool hasBias = false;
@@ -20525,6 +21537,162 @@ public partial class CpuEngine : ITensorLevelEngine
         finally
         {
             System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// Double-precision counterpart of <see cref="FlashAttentionFloat"/>. Same
+    /// materialized-softmax structure (per-head pre-transpose of K, fused
+    /// scale + causal/bias mask + numerically stable softmax, output = P · V).
+    /// Routes scores=Q·K^T and out=P·V through cblas_dgemm via
+    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> when libopenblas is loaded;
+    /// falls back to the in-house <see cref="Simd.SimdGemm.DgemmSequential"/>
+    /// tiled Vector256&lt;double&gt; FMA kernel when BLAS is absent. The outer
+    /// <c>Parallel.For</c> across (batch * heads) demands the sequential GEMM
+    /// variant so workers don't nest.
+    /// </summary>
+    private Tensor<double> FlashAttentionDouble(
+        Tensor<double> query,
+        Tensor<double> key,
+        Tensor<double> value,
+        Tensor<double>? attentionBias,
+        double scaleValue,
+        bool isCausal,
+        int batch, int heads, int seqQ, int headDim, int seqK,
+        out Tensor<double> softmaxStats)
+    {
+        int bhCount = batch * heads;
+        int d_v = headDim;
+
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+
+        var qd = query.GetFlattenedData();
+        var kd = key.GetFlattenedData();
+        var vd = value.GetDataArray();
+        double[]? biasData = null;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            if (!attentionBias.IsContiguous) attentionBias = attentionBias.Contiguous();
+            biasData = attentionBias.GetDataArray();
+            biasBroadcastBatch = attentionBias.Rank == 3;
+        }
+
+        int scoresLen = bhCount * seqQ * seqK;
+        var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
+        try
+        {
+            var weightsData = new double[scoresLen];
+            var outputData = new double[bhCount * seqQ * d_v];
+            var statsData = new double[bhCount * seqQ];
+
+            double scaleD = scaleValue;
+            double negInfD = double.NegativeInfinity;
+
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+
+                int qOff = bh * seqQ * headDim;
+                int kOff = bh * seqK * headDim;
+                int sOff = bh * seqQ * seqK;
+
+                // Step 1: scores = Q · K^T. Pre-transpose this head's K into a
+                // pooled scratch buffer so the GEMM doesn't need transB support.
+                var kt = System.Buffers.ArrayPool<double>.Shared.Rent(headDim * seqK);
+                try
+                {
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < headDim; j++)
+                            kt[j * seqK + i] = kd[kOff + i * headDim + j];
+
+                    if (!BlasProvider.TryGemmEx(seqQ, seqK, headDim,
+                        qd, qOff, headDim, false,
+                        kt, 0, seqK, false,
+                        scoresData, sOff, seqK))
+                    {
+                        SimdGemm.DgemmSequential(
+                            qd.AsSpan(qOff, seqQ * headDim),
+                            kt.AsSpan(0, headDim * seqK),
+                            scoresData.AsSpan(sOff, seqQ * seqK),
+                            seqQ, headDim, seqK);
+                    }
+                }
+                finally { System.Buffers.ArrayPool<double>.Shared.Return(kt); }
+
+                // Step 2: fused scale + causal-mask + bias + stable softmax per row.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    double maxVal = negInfD;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double v = scoresData[rowOff + j] * scaleD;
+                        if (biasData is not null)
+                        {
+                            int biasIdx = biasBroadcastBatch
+                                ? (h * seqQ * seqK + i * seqK + j)
+                                : (b * heads * seqQ * seqK + h * seqQ * seqK + i * seqK + j);
+                            v += biasData[biasIdx];
+                        }
+                        if (isCausal && j > i) v = negInfD;
+                        if (v > maxVal) maxVal = v;
+                        scoresData[rowOff + j] = v;
+                    }
+
+                    // Fully-masked row guard — matches the float path.
+                    if (double.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++)
+                            weightsData[rowOff + j] = 0.0;
+                        statsData[bh * seqQ + i] = negInfD;
+                        continue;
+                    }
+
+                    double sumExp = 0.0;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double e = Math.Exp(scoresData[rowOff + j] - maxVal);
+                        weightsData[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    double inv = sumExp != 0.0 ? 1.0 / sumExp : 0.0;
+                    for (int j = 0; j < seqK; j++)
+                        weightsData[rowOff + j] *= inv;
+
+                    statsData[bh * seqQ + i] = maxVal + Math.Log(sumExp);
+                }
+
+                // Step 3: output = softmax · V. No transpose, V is row-major.
+                int wOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+                if (!BlasProvider.TryGemmEx(seqQ, d_v, seqK,
+                    weightsData, wOff, seqK, false,
+                    vd, vOff, d_v, false,
+                    outputData, oOff, d_v))
+                {
+                    SimdGemm.DgemmSequential(
+                        weightsData.AsSpan(wOff, seqQ * seqK),
+                        vd.AsSpan(vOff, seqK * d_v),
+                        outputData.AsSpan(oOff, seqQ * d_v),
+                        seqQ, seqK, d_v);
+                }
+            });
+
+            softmaxStats = TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ },
+                new Vector<double>(statsData));
+            return TensorAllocator.Rent<double>(
+                new[] { batch, heads, seqQ, headDim },
+                new Vector<double>(outputData));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
         }
     }
 
@@ -22664,6 +23832,25 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (isFullReduction && input.IsContiguous)
         {
+            if (typeof(T) == typeof(double))
+            {
+                var dSpan = AsDoubleMemory(input.Data).Span;
+                double dSum = SimdKernels.Sum(dSpan);
+                double dMean = dSum / input.Length;
+                var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                ((double[])(object)scalarResult.GetDataArray())[0] = dMean;
+                DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
+                    BackwardFunctions<T>.ReduceMeanBackward,
+                    savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
+                // Record the actual operation so AutoTracer's replay
+                // recomputes ReduceMean against the current tensor instead of
+                // baking the scalar we just produced. Replaying `eng => scalarResult`
+                // poisons compiled graphs with a stale value when the same op
+                // pattern is run on a different input tensor of identical shape.
+                { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
+                  AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                return scalarResult;
+            }
             if (typeof(T) == typeof(float))
             {
                 unsafe
@@ -22677,7 +23864,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
                         savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
-                    AutoTracer.RecordOp("ReduceMean", scalarResult, eng => scalarResult);
+                    // Replay the actual operation so AutoTracer doesn't bake
+                    // this branch as a stale scalar constant — same fix as the
+                    // double branch above.
+                    { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
+                      AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
                     return scalarResult;
                 }
             }
@@ -22894,6 +24085,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var fOut = (float[])(object)result.GetDataArray();
+                // AutoTensorCache.RentOrAllocate returns an UNINITIALIZED
+                // buffer (the cache reuses pooled arrays without zeroing).
+                // The variance accumulator below uses `+=` so it must start
+                // from zero — otherwise the previous renter's stale bytes
+                // get folded into the variance and the result becomes
+                // nondeterministic across runs. Clear just the logical
+                // region so we don't pay for any backing-array padding.
+                Array.Clear(fOut, 0, cols);
                 // First compute means
                 var means = new float[cols];
                 for (int r = 0; r < rows; r++)
@@ -22903,6 +24102,53 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int r = 0; r < rows; r++)
                     for (int c = 0; c < cols; c++) { float d = fData[r * cols + c] - means[c]; fOut[c] += d * d; }
                 for (int c = 0; c < cols; c++) fOut[c] /= rows;
+                return result;
+            }
+        }
+
+        // Double fast path for 2D single-axis variance — mirrors float branch above.
+        // Eliminates INumericOperations<T> dispatch per element for the LayerNorm /
+        // BatchNorm / Instructor mean-pool inference critical paths on double tensors.
+        if (typeof(T) == typeof(double) && input.IsContiguous && axes.Length == 1 && input.Rank == 2)
+        {
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var dData = (double[])(object)input.GetDataArray();
+            int rows = input._shape[0], cols = input._shape[1];
+
+            if (axis == 1) // variance along columns (per-row)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dOut = (double[])(object)result.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    double rowSum = 0.0;
+                    for (int c = 0; c < cols; c++) rowSum += dData[off + c];
+                    double rowMean = rowSum / cols;
+                    double varSum = 0.0;
+                    for (int c = 0; c < cols; c++) { double d = dData[off + c] - rowMean; varSum += d * d; }
+                    dOut[r] = varSum / cols;
+                }
+                return result;
+            }
+            else if (axis == 0) // variance along rows (per-column)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dOut = (double[])(object)result.GetDataArray();
+                // Same rationale as the float axis==0 branch above —
+                // AutoTensorCache returns an uninitialized buffer and the
+                // accumulator below uses `+=`, so the logical region must
+                // start from zero.
+                Array.Clear(dOut, 0, cols);
+                var means = new double[cols];
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) means[c] += dData[r * cols + c];
+                for (int c = 0; c < cols; c++) means[c] /= rows;
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) { double d = dData[r * cols + c] - means[c]; dOut[c] += d * d; }
+                for (int c = 0; c < cols; c++) dOut[c] /= rows;
                 return result;
             }
         }
@@ -24227,8 +25473,28 @@ public partial class CpuEngine : ITensorLevelEngine
                                      oW * sizeof(float));
                 }
             };
-            if (totalBC > 8) Parallel.For(0, totalBC, kernel);
-            else for (int bc = 0; bc < totalBC; bc++) kernel(bc);
+            CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
+            return;
+        }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            int totalBC = batch * channels;
+            int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
+            int t = top, l = left;
+            Action<int> kernel = bc =>
+            {
+                int inBase = bc * iH * iW + t * iW + l;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    Buffer.BlockCopy(inArrD, (inBase + oh * iW) * sizeof(double),
+                                     outArrD, (outBase + oh * oW) * sizeof(double),
+                                     oW * sizeof(double));
+                }
+            };
+            CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
             return;
         }
 
@@ -24383,8 +25649,36 @@ public partial class CpuEngine : ITensorLevelEngine
                                      w * sizeof(float));
                 }
             };
-            if (batchSize > 4) Parallel.For(0, batchSize, kernel);
-            else for (int b = 0; b < batchSize; b++) kernel(b);
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
+            return;
+        }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            double padD = padValue is double dv ? dv : 0.0;
+            if (padD == 0.0)
+            {
+                Array.Clear(outArrD, 0, outArrD.Length);
+            }
+            else
+            {
+                outArrD.AsSpan().Fill(padD);
+            }
+            int h = height, w = width, nH = newHeight, nW = newWidth;
+            int pt = padTop, pl = padLeft;
+            Action<int> kernel = b =>
+            {
+                int inBase = b * h * w;
+                int outBase = b * nH * nW + pt * nW + pl;
+                for (int ih = 0; ih < h; ih++)
+                {
+                    Buffer.BlockCopy(inArrD, (inBase + ih * w) * sizeof(double),
+                                     outArrD, (outBase + ih * nW) * sizeof(double),
+                                     w * sizeof(double));
+                }
+            };
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
             return;
         }
 
@@ -24633,11 +25927,70 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             return Unsafe.As<float, T>(ref result);
         }
+
+        if (typeof(T) == typeof(double))
+        {
+            T[] arr = tensor.GetFlattenedData();
+            double[] dArr = Unsafe.As<T[], double[]>(ref arr);
+            int length = tensor.Length;
+            double result;
+            fixed (double* ptr = dArr)
+            {
+                result = SumOfSquaresUnsafeDouble(ptr, length);
+            }
+            return Unsafe.As<double, T>(ref result);
+        }
 #endif
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Dot(tensor.AsSpan(), tensor.AsSpan());
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD sum of squares (double): sum(x[i] * x[i]) with 4x unrolled FMA accumulation.
+    /// Hits L2-regularization terms on Adam/SGD weight decay for fp64 networks.
+    /// </summary>
+    private static unsafe double SumOfSquaresUnsafeDouble(double* data, int length)
+    {
+        int i = 0;
+        double result = 0.0;
+
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && length >= 16)
+        {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = length & ~15;
+            for (; i < simdLen; i += 16)
+            {
+                var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i);
+                var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 4);
+                var v2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 8);
+                var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 12);
+                vsum0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsum0);
+                vsum1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsum1);
+                vsum2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2, v2, vsum2);
+                vsum3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsum3);
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            // Horizontal sum across 4 doubles
+            var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
+            var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
+            var s128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
+            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01_00_11_10);
+            s128 = System.Runtime.Intrinsics.X86.Sse2.Add(s128, shuf);
+            double tmp;
+            System.Runtime.Intrinsics.X86.Sse2.StoreScalar(&tmp, s128);
+            result = tmp;
+        }
+
+        for (; i < length; i++)
+            result += data[i] * data[i];
+        return result;
+    }
+#endif
 
 #if NET5_0_OR_GREATER
     /// <summary>
@@ -25887,7 +27240,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dst = (float[])(object)result.GetDataArray();
             Simd.ScanKernels.PrefixSumFloat(src, dst);
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
 
@@ -25904,7 +27257,40 @@ public partial class CpuEngine : ITensorLevelEngine
                     new Span<float>(dst, start, axisSize));
             }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            // Record the actual op against captured inputs so AutoTracer's
+            // compiled-replay recomputes the cumulative sum for the live
+            // tensor instead of baking the scalar we just produced.
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
+            return result;
+        }
+
+        // Double fast paths: scalar accumulation but no virtual dispatch.
+        // (PrefixSumDouble SIMD scan is a separate follow-up.) The scalar
+        // loop runs ~3-4× faster than INumericOperations<T>.Add by inlining
+        // the add and saving the v-table indirection.
+        if (typeof(T) == typeof(double) && tensor.Rank == 1)
+        {
+            var srcD = (double[])(object)tensor.GetDataArray();
+            var dstD = (double[])(object)result.GetDataArray();
+            double accD = 0.0;
+            int len = tensor.Length;
+            for (int i = 0; i < len; i++) { accD += srcD[i]; dstD[i] = accD; }
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
+            return result;
+        }
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            var srcD = (double[])(object)tensor.GetDataArray();
+            var dstD = (double[])(object)result.GetDataArray();
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                int start = outer * axisSize;
+                double accD = 0.0;
+                for (int a = 0; a < axisSize; a++) { accD += srcD[start + a]; dstD[start + a] = accD; }
+            }
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
 
@@ -25939,7 +27325,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-        AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+        if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
         return result;
     }
 
@@ -26878,7 +28264,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     fDst[r] = MathF.Sqrt(sumSq);
                 }
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                if (AutoTracer.ShouldRecord) { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
             else if (normAxis == 0)
@@ -26897,7 +28287,63 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < cols; c++)
                     fDst[c] = MathF.Sqrt(fDst[c]);
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                if (AutoTracer.ShouldRecord) { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
+                return normResult;
+            }
+        }
+
+        // Double fast path for 2D L2 norm — mirrors float branch.
+        if (typeof(T) == typeof(double) && tensor.Rank == 2 && tensor.IsContiguous)
+        {
+            int normAxis = axis < 0 ? tensor.Rank + axis : axis;
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var dSrc = (double[])(object)tensor.GetDataArray();
+
+            if (normAxis == 1)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dDst = (double[])(object)normResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    double sumSq = 0.0;
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sumSq += dSrc[off + c] * dSrc[off + c];
+                    dDst[r] = Math.Sqrt(sumSq);
+                }
+                DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                if (AutoTracer.ShouldRecord) { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
+                return normResult;
+            }
+            else if (normAxis == 0)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var dDst = (double[])(object)normResult.GetDataArray();
+                Array.Clear(dDst, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        dDst[c] += dSrc[off + c] * dSrc[off + c];
+                }
+                for (int c = 0; c < cols; c++)
+                    dDst[c] = Math.Sqrt(dDst[c]);
+                DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                if (AutoTracer.ShouldRecord) { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
         }
@@ -27765,8 +29211,41 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
                 BackwardFunctions<T>.LogSoftmaxBackward);
-            AutoTracer.RecordOp("LogSoftmax", result, eng => result);
+            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
             return result;
+        }
+        // Double primitive fast path for last-axis log-softmax. Inline 3-pass
+        // max / log-sum-exp / shift per row, parallel across rows. No
+        // INumericOperations<T> virtual dispatch and no per-element boxing.
+        // Hit by every classifier head and NLLLoss flow on fp64 networks.
+        if (typeof(T) == typeof(double) && innerSize == 1)
+        {
+            var resultD = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+            using var pinIn = tensor.Data.Pin();
+            using var pinOut = resultD.Data.Pin();
+            unsafe
+            {
+                double* pIn = (double*)pinIn.Pointer;
+                double* pOut = (double*)pinOut.Pointer;
+                int axisSz = axisSize;
+                int outerSz = outerSize;
+                Action<int> rowKernel = row =>
+                {
+                    double* rIn = pIn + row * axisSz;
+                    double* rOut = pOut + row * axisSz;
+                    double max = rIn[0];
+                    for (int i = 1; i < axisSz; i++) if (rIn[i] > max) max = rIn[i];
+                    double sumExp = 0.0;
+                    for (int i = 0; i < axisSz; i++) sumExp += Math.Exp(rIn[i] - max);
+                    double logSumExp = Math.Log(sumExp);
+                    for (int i = 0; i < axisSz; i++) rOut[i] = (rIn[i] - max) - logSumExp;
+                };
+                CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
+            }
+            DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
+                BackwardFunctions<T>.LogSoftmaxBackward);
+            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
+            return resultD;
         }
 
         // Generic scalar fallback
@@ -27810,7 +29289,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
             BackwardFunctions<T>.LogSoftmaxBackward);
-        AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => logSoftmaxResult);
+        if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
         return logSoftmaxResult;
     }
 
@@ -29008,6 +30487,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.CoshUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Cosh(dSrc[i]);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -29054,6 +30540,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SinhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Sinh(dSrc[i]);
         }
         else
         {
@@ -31738,6 +33231,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
+            double dScale = 1.0 / (1.0 - dropoutRate);
+            var inArr = (double[])(object)input.GetDataArray();
+            var outArr = (double[])(object)dropResult.GetDataArray();
+            var mArr = (double[])(object)mask.GetDataArray();
+            for (int i = 0; i < input.Length; i++)
+            {
+                if (rand.NextDouble() >= dropoutRate)
+                {
+                    mArr[i] = dScale;
+                    outArr[i] = inArr[i] * dScale;
+                }
+                else
+                {
+                    mArr[i] = 0.0;
+                    outArr[i] = 0.0;
+                }
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -32081,6 +33595,46 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
 
+        // Float primitive fast path (non-Nchwc8 layouts): inline sum + divide,
+        // no INumericOperations<T> virtual dispatch. Used by every CNN classifier
+        // head that doesn't hit the Nchwc8 SIMD branch.
+        if (typeof(T) == typeof(float))
+        {
+            var inArrF = (float[])(object)inputData;
+            var outArrF = (float[])(object)resultData;
+            float invSp = 1f / spatialSize;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                float sum = 0f;
+                for (int s = 0; s < spatialSize; s++) sum += inArrF[offset + s];
+                outArrF[bc] = sum * invSp;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var inArrD = (double[])(object)inputData;
+            var outArrD = (double[])(object)resultData;
+            double invSp = 1.0 / spatialSize;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                double sum = 0.0;
+                for (int s = 0; s < spatialSize; s++) sum += inArrD[offset + s];
+                outArrD[bc] = sum * invSp;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+
         // Parallelize across batch*channels (each channel is independent)
         Action<int> processChannel = bc =>
         {
@@ -32114,6 +33668,46 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
+
+        // Float / double primitive fast paths: inline max-finding loop,
+        // no INumericOperations<T> dispatch. CNN classifier heads hit this
+        // per-step.
+        if (typeof(T) == typeof(float))
+        {
+            var inArrF = (float[])(object)inputData;
+            var outArrF = (float[])(object)resultData;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                float maxVal = inArrF[offset];
+                for (int s = 1; s < spatialSize; s++)
+                    if (inArrF[offset + s] > maxVal) maxVal = inArrF[offset + s];
+                outArrF[bc] = maxVal;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var inArrD = (double[])(object)inputData;
+            var outArrD = (double[])(object)resultData;
+            Action<int> kernel = bc =>
+            {
+                int offset = bc * spatialSize;
+                double maxVal = inArrD[offset];
+                for (int s = 1; s < spatialSize; s++)
+                    if (inArrD[offset + s] > maxVal) maxVal = inArrD[offset + s];
+                outArrD[bc] = maxVal;
+            };
+            if (totalChannels > 32)
+                CpuParallelSettings.ParallelForOrSerial(0, totalChannels, (long)totalChannels * spatialSize, kernel);
+            else
+                for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            return TensorAllocator.Rent<T>([batch, channels, 1, 1], resultData);
+        }
 
         Action<int> processChannel = bc =>
         {
@@ -32756,7 +34350,25 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMean = sumSq / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
-            AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", scalarResult, eng => eng.TensorMSELoss(cp, ct)); }
+            return scalarResult;
+        }
+        // Double fast path: same fused single-pass diff² sum.
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double sumSq = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double d = pArr[i] - tArr[i];
+                sumSq += d * d;
+            }
+            double dMean = sumSq / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", scalarResult, eng => eng.TensorMSELoss(cp, ct)); }
             return scalarResult;
         }
 
@@ -32771,7 +34383,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("MSELoss", result, predictions, targets, BackwardFunctions<T>.MSELossBackward);
-        AutoTracer.RecordOp("MSELoss", result, eng => result);
+        if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", result, eng => eng.TensorMSELoss(cp, ct)); }
         return result;
     }
 
@@ -32805,7 +34417,22 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMean = sumAbs / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
-            AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", scalarResult, eng => eng.TensorL1Loss(cp, ct)); }
+            return scalarResult;
+        }
+        // Double fast path
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double sumAbs = 0.0;
+            for (int i = 0; i < len; i++)
+                sumAbs += Math.Abs(pArr[i] - tArr[i]);
+            double dMean = sumAbs / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", scalarResult, eng => eng.TensorL1Loss(cp, ct)); }
             return scalarResult;
         }
 
@@ -32820,7 +34447,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("L1Loss", result, predictions, targets, BackwardFunctions<T>.L1LossBackward);
-        AutoTracer.RecordOp("L1Loss", result, eng => result);
+        if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", result, eng => eng.TensorL1Loss(cp, ct)); }
         return result;
     }
 
@@ -32843,22 +34470,66 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Float fast path: fused Huber loss over contiguous arrays.
+        if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (float[])(object)predictions.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            float deltaF = (float)delta;
+            float halfDelta = 0.5f * deltaF;
+            float sum = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float d = pArr[i] - tArr[i];
+                float ad = MathF.Abs(d);
+                sum += ad <= deltaF ? 0.5f * d * d : deltaF * (ad - halfDelta);
+            }
+            float fMean = sum / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
+            DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
+                BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", scalarResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
+            return scalarResult;
+        }
+        // Double fast path
+        if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (double[])(object)predictions.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            double halfDelta = 0.5 * delta;
+            double sum = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double d = pArr[i] - tArr[i];
+                double ad = Math.Abs(d);
+                sum += ad <= delta ? 0.5 * d * d : delta * (ad - halfDelta);
+            }
+            double dMean = sum / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
+            DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
+                BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", scalarResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
+            return scalarResult;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         Tensor<T> diff;
         using (new NoGradScope<T>()) { diff = TensorSubtract(predictions, targets); }
-        T sum = numOps.Zero;
+        T sumGeneric = numOps.Zero;
         for (int i = 0; i < diff.Length; i++)
         {
             double d = numOps.ToDouble(diff[i]);
-            sum = numOps.Add(sum, Math.Abs(d) <= delta
+            sumGeneric = numOps.Add(sumGeneric, Math.Abs(d) <= delta
                 ? numOps.FromDouble(0.5 * d * d)
                 : numOps.FromDouble(delta * (Math.Abs(d) - 0.5 * delta)));
         }
-        T mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        T mean = numOps.Divide(sumGeneric, numOps.FromDouble(predictions.Length));
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("HuberLoss", result, predictions, targets,
             BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
-        AutoTracer.RecordOp("HuberLoss", result, eng => result);
+        if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", result, eng => eng.TensorHuberLoss(cp, ct, cd)); }
         return result;
     }
 
@@ -32880,6 +34551,49 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Float fast path: fused stable BCE.
+        if (typeof(T) == typeof(float) && logits.IsContiguous && targets.IsContiguous)
+        {
+            var lArr = (float[])(object)logits.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = logits.Length;
+            float sumF = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float x = lArr[i];
+                float ti = tArr[i];
+                float loss = MathF.Max(x, 0f) - x * ti + MathF.Log(1f + MathF.Exp(-MathF.Abs(x)));
+                sumF += loss;
+            }
+            float meanF = sumF / len;
+            var scalarResultF = new Tensor<T>(new[] { Unsafe.As<float, T>(ref meanF) }, [1]);
+            DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultF, logits, targets,
+                BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            if (AutoTracer.ShouldRecord) { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultF, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
+            return scalarResultF;
+        }
+        // Double fast path: same numerically stable form, inline arithmetic.
+        if (typeof(T) == typeof(double) && logits.IsContiguous && targets.IsContiguous)
+        {
+            var lArr = (double[])(object)logits.GetDataArray();
+            var tArr = (double[])(object)targets.GetDataArray();
+            int len = logits.Length;
+            double sumD = 0.0;
+            for (int i = 0; i < len; i++)
+            {
+                double x = lArr[i];
+                double ti = tArr[i];
+                double loss = Math.Max(x, 0.0) - x * ti + Math.Log(1.0 + Math.Exp(-Math.Abs(x)));
+                sumD += loss;
+            }
+            double meanD = sumD / len;
+            var scalarResultD = new Tensor<T>(new[] { Unsafe.As<double, T>(ref meanD) }, [1]);
+            DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultD, logits, targets,
+                BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            if (AutoTracer.ShouldRecord) { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultD, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
+            return scalarResultD;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
         for (int i = 0; i < logits.Length; i++)
@@ -32894,7 +34608,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("BCEWithLogitsLoss", result, logits, targets,
             BackwardFunctions<T>.BCEWithLogitsLossBackward);
-        AutoTracer.RecordOp("BCEWithLogitsLoss", result, eng => result);
+        if (AutoTracer.ShouldRecord) { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", result, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
         return result;
     }
 
@@ -33076,6 +34790,18 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.SELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
         }
+        else if (typeof(T) == typeof(double))
+        {
+            const double alpha = 1.6732632423543772;
+            const double scale = 1.0507009873554805;
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < tensor.Length; i++)
+            {
+                double x = dSrc[i];
+                dDst[i] = x > 0 ? scale * x : scale * alpha * (Math.Exp(x) - 1);
+            }
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -33129,6 +34855,16 @@ public partial class CpuEngine : ITensorLevelEngine
             { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
             return result;
         }
+        if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < tensor.Length; i++)
+                dDst[i] = Math.Max(0.0, Math.Min(1.0, dSrc[i] / 6.0 + 0.5));
+            DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
+            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
+            return result;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < tensor.Length; i++)
         {
@@ -33168,6 +34904,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var fDst = (float[])(object)result.GetDataArray();
             for (int i = 0; i < length; i++)
                 fDst[i] = MathF.Max(0f, MathF.Min(6f, fSrc[i]));
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                dDst[i] = Math.Max(0.0, Math.Min(6.0, dSrc[i]));
         }
         else
         {
@@ -33230,6 +34973,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
                     fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[channelIdx] * fSrc[i];
+                }
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dSrc = (double[])(object)tensor.GetDataArray();
+            var dAlpha = (double[])(object)alpha.GetDataArray();
+            var dDst = (double[])(object)result.GetDataArray();
+            if (channels == tensor.Length)
+            {
+                for (int i = 0; i < dSrc.Length; i++)
+                    dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[i] * dSrc[i];
+            }
+            else
+            {
+                for (int i = 0; i < dSrc.Length; i++)
+                {
+                    int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
+                    dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[channelIdx] * dSrc[i];
                 }
             }
         }
@@ -33529,6 +35291,22 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int r = 0; r < srcRows; r++)
                 Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
         }
+        else if (typeof(T) == typeof(double) && rank == 2 && padding.Length >= 4 && tensor.IsContiguous)
+        {
+            double dVal = value is not null ? (double)(object)value : 0.0;
+            var srcArr = (double[])(object)tensor.GetDataArray();
+            var dstArr = (double[])(object)result.GetDataArray();
+            int srcRows = tensor._shape[0], srcCols = tensor._shape[1];
+            int padLeft = padding[0];
+            int padTop = padding[2];
+            int dstCols = newShape[1];
+            if (dVal == 0.0)
+                Array.Clear(dstArr, 0, dstArr.Length);
+            else
+                for (int i = 0; i < dstArr.Length; i++) dstArr[i] = dVal;
+            for (int r = 0; r < srcRows; r++)
+                Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
+        }
         else
         {
             result.Fill(value);
@@ -33618,6 +35396,45 @@ public partial class CpuEngine : ITensorLevelEngine
             };
             if (total > 4) Parallel.For(0, total, kernel);
             else for (int bc = 0; bc < total; bc++) kernel(bc);
+            return;
+        }
+        if (typeof(T) == typeof(double)
+            && input.GetDataArray() is double[] inArrD
+            && output.GetDataArray() is double[] outArrD)
+        {
+            int total = n * c;
+            int hh = h, ww = w, oH = outH, oW = outW;
+            long work = (long)total * oH * oW;
+            // Route through CpuParallelSettings so MaxDegreeOfParallelism is
+            // honored and the small-shape serial cutover matches the rest of
+            // the engine's hot paths (LightweightParallel / ParallelForOrSerial
+            // are the documented entry points — raw Parallel.For bypasses both
+            // the work threshold and the global concurrency cap).
+            CpuParallelSettings.ParallelForOrSerial(0, total, work, bc =>
+            {
+                int inBase = bc * hh * ww;
+                int outBase = bc * oH * oW;
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int h0 = h0Arr[oh], h1 = h1Arr[oh];
+                    double fh = fhArr[oh];
+                    double omfh = 1.0 - fh;
+                    int rowH0 = inBase + h0 * ww;
+                    int rowH1 = inBase + h1 * ww;
+                    int rowOut = outBase + oh * oW;
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int w0 = w0Arr[ow], w1 = w1Arr[ow];
+                        double fw = fwArr[ow];
+                        double omfw = 1.0 - fw;
+                        double v = omfh * omfw * inArrD[rowH0 + w0]
+                                 + omfh * fw   * inArrD[rowH0 + w1]
+                                 + fh   * omfw * inArrD[rowH1 + w0]
+                                 + fh   * fw   * inArrD[rowH1 + w1];
+                        outArrD[rowOut + ow] = v;
+                    }
+                }
+            });
             return;
         }
 
@@ -34984,6 +36801,42 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>Recompose float array to real Tensor.</summary>
     private static Tensor<T> RecomposeRealFromFloat<T>(float[] data, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = data.Length;
+        var result = new Tensor<T>(shape);
+        for (int i = 0; i < n; i++) result[i] = ops.FromDouble(data[i]);
+        return result;
+    }
+
+    /// <summary>Decompose Complex&lt;double&gt; tensor to split double arrays for SIMD.</summary>
+    private static (double[] real, double[] imag) DecomposeToDouble<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = tensor.Length;
+        var real = new double[n];
+        var imag = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = ops.ToDouble(tensor[i].Real);
+            imag[i] = ops.ToDouble(tensor[i].Imaginary);
+        }
+        return (real, imag);
+    }
+
+    /// <summary>Recompose double split arrays back to Complex tensor.</summary>
+    private static Tensor<Complex<T>> RecomposeFromDouble<T>(double[] real, double[] imag, int[] shape)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = real.Length;
+        var result = new Tensor<Complex<T>>(shape);
+        for (int i = 0; i < n; i++)
+            result[i] = new Complex<T>(ops.FromDouble(real[i]), ops.FromDouble(imag[i]));
+        return result;
+    }
+
+    /// <summary>Recompose double array to real Tensor.</summary>
+    private static Tensor<T> RecomposeRealFromDouble<T>(double[] data, int[] shape)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int n = data.Length;
@@ -36886,6 +38739,13 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdComplexKernels.ComplexConjugate(aR, aI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexConjugateDouble(aR, aI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
+        }
         else
         {
             for (int i = 0; i < n; i++)
@@ -36914,6 +38774,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var output = new float[n];
             Simd.SimdComplexKernels.ComplexMagnitude(aR, aI, output);
             result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var output = new double[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeDouble(aR, aI, output);
+            result = RecomposeRealFromDouble<T>(output, a._shape);
         }
         else
         {
@@ -36947,6 +38814,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var output = new float[n];
             Simd.SimdComplexKernels.ComplexMagnitudeSquared(aR, aI, output);
             result = RecomposeRealFromFloat<T>(output, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var output = new double[n];
+            Simd.SimdComplexKernels.ComplexMagnitudeSquaredDouble(aR, aI, output);
+            result = RecomposeRealFromDouble<T>(output, a._shape);
         }
         else
         {
@@ -37054,6 +38928,13 @@ public partial class CpuEngine : ITensorLevelEngine
             Simd.SimdComplexKernels.ComplexScale(aR, aI, oR, oI, (float)ops.ToDouble(scalar));
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexScaleDouble(aR, aI, oR, oI, ops.ToDouble(scalar));
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
+        }
         else
         {
             for (int i = 0; i < n; i++)
@@ -37088,6 +38969,14 @@ public partial class CpuEngine : ITensorLevelEngine
             var oR = new float[n]; var oI = new float[n];
             Simd.SimdComplexKernels.ComplexCrossSpectral(xR, xI, yR, yI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, x._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (xR, xI) = DecomposeToDouble(x);
+            var (yR, yI) = DecomposeToDouble(y);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexCrossSpectralDouble(xR, xI, yR, yI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, x._shape);
         }
         else
         {
@@ -37574,6 +39463,14 @@ public partial class CpuEngine : ITensorLevelEngine
             var oR = new float[n]; var oI = new float[n];
             Simd.SimdComplexKernels.ComplexAdd(aR, aI, bR, bI, oR, oI);
             result = RecomposeFromFloat<T>(oR, oI, a._shape);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var (aR, aI) = DecomposeToDouble(a);
+            var (bR, bI) = DecomposeToDouble(b);
+            var oR = new double[n]; var oI = new double[n];
+            Simd.SimdComplexKernels.ComplexAddDouble(aR, aI, bR, bI, oR, oI);
+            result = RecomposeFromDouble<T>(oR, oI, a._shape);
         }
         else
         {

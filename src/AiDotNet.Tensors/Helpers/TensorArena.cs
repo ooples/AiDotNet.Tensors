@@ -33,16 +33,32 @@ public sealed class TensorArena : IDisposable
     private static TensorArena? _current;
 
     /// <summary>
-    /// Pool of arrays allocated during warmup, keyed by (element type, element count).
-    /// Each bucket holds a list of arrays available for reuse.
+    /// SCRATCH pool: short-lived per-step intermediates. Pool of arrays allocated
+    /// during warmup, keyed by (element type, element count). Cursors rewind on
+    /// <see cref="Reset"/> so the next iteration reuses these arrays. This is
+    /// what every <see cref="TensorAllocator.Rent{T}(int[])"/> call lands in.
     /// </summary>
     private readonly Dictionary<(Type, int), List<Array>> _pool = new();
 
     /// <summary>
-    /// Tracks the reuse cursor per bucket — how many arrays of each (type, size)
-    /// have been handed out since the last Reset().
+    /// Scratch-pool reuse cursor — how many arrays of each (type, size) have
+    /// been handed out since the last <see cref="Reset"/>.
     /// </summary>
     private readonly Dictionary<(Type, int), int> _cursor = new();
+
+    /// <summary>
+    /// PINNED list: long-lived allocations that survive <see cref="Reset"/>.
+    /// Model weights (from layer EnsureInitialized), optimizer moment state
+    /// (Adam m / v), running BatchNorm statistics, positional embeddings —
+    /// anything carried across training steps lives here. Tracked so
+    /// <see cref="Dispose"/> can drop references for GC, but the cursor never
+    /// rewinds, so Reset can't accidentally hand a pinned array out as scratch
+    /// on the next iteration. This eliminates the corruption hazard that
+    /// would otherwise happen if model weights and per-step intermediates
+    /// shared one cursor: rewinding the cursor would let Rent re-issue the
+    /// weight tensor's underlying array as scratch storage.
+    /// </summary>
+    private readonly List<Array> _pinnedArrays = new();
 
     private bool _disposed;
     private readonly TensorArena? _previous;
@@ -90,6 +106,25 @@ public sealed class TensorArena : IDisposable
     internal T[]? TryAllocateUninitialized<T>(int elementCount)
     {
         return TryAllocateCore<T>(elementCount, clear: false);
+    }
+
+    /// <summary>
+    /// Allocates a long-lived array tracked in the PINNED tier. Unlike
+    /// <see cref="TryAllocate{T}"/> (scratch), pinned allocations are NOT
+    /// rewound by <see cref="Reset"/> — the caller can hold a reference
+    /// across many training iterations without risk of the arena re-issuing
+    /// the same backing array as scratch on the next iteration. Use for
+    /// model weights (layer EnsureInitialized), optimizer state (Adam m / v),
+    /// running BatchNorm statistics, anything that's part of the network's
+    /// learnable state. Returns null only when the arena is disposed.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal T[]? TryAllocatePinned<T>(int elementCount)
+    {
+        if (_disposed) return null;
+        var arr = new T[elementCount];
+        _pinnedArrays.Add(arr);
+        return arr;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -227,6 +262,7 @@ public sealed class TensorArena : IDisposable
 
         _pool.Clear();
         _cursor.Clear();
+        _pinnedArrays.Clear();
 
         // Clear tensor ring pools
         if (_tensorRing != null)
@@ -235,4 +271,13 @@ public sealed class TensorArena : IDisposable
             _tensorRingCount = 0;
         }
     }
+
+    /// <summary>
+    /// Number of arrays currently held in the PINNED tier. Diagnostic — lets
+    /// tests / benchmarks verify that long-lived allocations (weights,
+    /// optimizer state) are landing in the right tier and not bloating the
+    /// scratch pool. Pinned count grows monotonically across <see cref="Reset"/>
+    /// calls (only <see cref="Dispose"/> drops these references).
+    /// </summary>
+    public int PinnedArrayCount => _pinnedArrays.Count;
 }

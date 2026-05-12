@@ -761,7 +761,7 @@ public sealed class GradientTape<T> : IDisposable
             && !DifferentiableOps._isBackwardCreateGraph
             && _entries.Count > 0)
         {
-            long lookupHash = AutoTrainingCompiler.ComputePatternHash(_entries, _entries.Count);
+            long lookupHash = AutoTrainingCompiler.ComputeStructureHash(_entries, _entries.Count);
             // Quick signature check first — empty cache or hash mismatch
             // both return false at the cost of three thread-static field
             // reads, much cheaper than the full TryExecute call.
@@ -921,7 +921,7 @@ public sealed class GradientTape<T> : IDisposable
 
                 if (!crossTape)
                 {
-                    long patternHash = AutoTrainingCompiler.ComputePatternHash(_entries, _entries.Count);
+                    long patternHash = AutoTrainingCompiler.ComputeStructureHash(_entries, _entries.Count);
 
                     // Map each GradNode in topoOrder to its tape entry index.
                     // Tape entries are recorded in forward (topological) order;

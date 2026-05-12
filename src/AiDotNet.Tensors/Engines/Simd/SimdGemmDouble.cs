@@ -44,7 +44,34 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
-            DgemmAvx2(a, b, c, m, k, n);
+            DgemmAvx2(a, b, c, m, k, n, allowParallel: true);
+            return;
+        }
+#endif
+        DgemmScalar(a, b, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Sequential variant — same kernel as <see cref="Dgemm"/> but never
+    /// spawns inner parallelism. Use when called from inside an already-
+    /// parallel batch loop (e.g. BatchMatMul over batch slices) so the
+    /// thread pool isn't oversubscribed by nested Parallel.For dispatches.
+    /// Companion to <see cref="SgemmSequential"/>; same rationale.
+    /// </summary>
+    internal static void DgemmSequential(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        Span<double> c,
+        int m, int k, int n)
+    {
+        if (m <= 0 || n <= 0) return;
+        c.Clear();
+        if (k <= 0) return;
+
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            DgemmAvx2(a, b, c, m, k, n, allowParallel: false);
             return;
         }
 #endif
@@ -66,11 +93,12 @@ internal static partial class SimdGemm
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
         Span<double> c,
-        int m, int k, int n)
+        int m, int k, int n,
+        bool allowParallel)
     {
         int numRowBlocks = (m + DgemmBlockSize - 1) / DgemmBlockSize;
         int numColBlocks = (n + DgemmBlockSize - 1) / DgemmBlockSize;
-        bool doParallel = (long)m * n >= 16384 && Environment.ProcessorCount > 1;
+        bool doParallel = allowParallel && (long)m * n >= 16384 && Environment.ProcessorCount > 1;
 
         // Pin once at the top level so the inner kernels can do raw
         // pointer arithmetic — the Span's pointers are already pinned
