@@ -35351,7 +35351,13 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int total = n * c;
             int hh = h, ww = w, oH = outH, oW = outW;
-            Action<int> kernel = bc =>
+            long work = (long)total * oH * oW;
+            // Route through CpuParallelSettings so MaxDegreeOfParallelism is
+            // honored and the small-shape serial cutover matches the rest of
+            // the engine's hot paths (LightweightParallel / ParallelForOrSerial
+            // are the documented entry points — raw Parallel.For bypasses both
+            // the work threshold and the global concurrency cap).
+            CpuParallelSettings.ParallelForOrSerial(0, total, work, bc =>
             {
                 int inBase = bc * hh * ww;
                 int outBase = bc * oH * oW;
@@ -35375,9 +35381,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         outArrD[rowOut + ow] = v;
                     }
                 }
-            };
-            if (total > 4) Parallel.For(0, total, kernel);
-            else for (int bc = 0; bc < total; bc++) kernel(bc);
+            });
             return;
         }
 
