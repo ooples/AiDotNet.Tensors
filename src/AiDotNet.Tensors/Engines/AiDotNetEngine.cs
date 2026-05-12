@@ -84,28 +84,99 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
-    /// Automatically detects and configures GPU acceleration if available.     
+    /// User-configurable log sink for engine-level events (GPU auto-detect status,
+    /// engine resets, etc.). When non-null, replaces the default Console.WriteLine
+    /// destination — wire to your own logger (Microsoft.Extensions.Logging, Serilog,
+    /// xUnit ITestOutputHelper, structured-event bus, etc.). Defaults to null
+    /// (Console output preserved for backwards-compat) but settable at any time;
+    /// changes take effect on the next event emission.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // Route engine events to ILogger:
+    /// AiDotNetEngine.Logger = msg =&gt; logger.LogInformation(msg);
+    ///
+    /// // Suppress all engine output:
+    /// AiDotNetEngine.Logger = _ =&gt; { };
+    ///
+    /// // Restore default Console output:
+    /// AiDotNetEngine.Logger = null;
+    /// </code>
+    /// </example>
+    public static Action<string>? Logger { get; set; }
+
+    /// <summary>
+    /// Emits an engine log line. Honors (in order) the explicit <paramref name="verbose"/>
+    /// flag passed by the caller, the <c>AIDOTNET_QUIET</c> env var (forces silence), and
+    /// the <see cref="Logger"/> callback (overrides Console destination).
+    /// </summary>
+    private static void EmitLog(string message, bool verbose)
+    {
+        if (!verbose) return;
+        // AIDOTNET_QUIET forces silence regardless of caller's verbose flag.
+        // Lets users globally silence engine chatter from a single env var
+        // without threading the flag through every caller.
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_QUIET")))
+            return;
+
+        // Guard sink invocation — a user-supplied Logger callback that
+        // throws (broken ILogger pipeline, disposed sink, malformed format
+        // string) must NOT break engine startup or ResetToCpu. Same logic
+        // for Console.WriteLine: a redirected/closed stdout (Windows
+        // service contexts, build hosts piping logs through a fragile
+        // wrapper) can throw IOException, and the engine has no business
+        // failing because the host's log transport is misconfigured.
+        var sink = Logger;
+        if (sink is not null)
+        {
+            try { sink(message); return; }
+            catch { /* sink errors are non-fatal — fall through to Console */ }
+        }
+        try { Console.WriteLine(message); }
+        catch { /* stdout transport errors are non-fatal */ }
+    }
+
+    /// <summary>
+    /// Automatically detects and configures GPU acceleration if available.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This method attempts to initialize DirectGpu acceleration. If successful, the Current
-    /// engine is switched to DirectGpuTensorEngine. If GPU is not available or initialization fails,
-    /// the engine remains on CpuEngine.
+    /// Attempts to initialize DirectGpu acceleration. If successful, the <see cref="Current"/>
+    /// engine is switched to <c>DirectGpuTensorEngine</c>. If GPU is not available or
+    /// initialization fails, the engine remains on <c>CpuEngine</c>.
     /// </para>
     /// <para><b>For Beginners:</b> Call this once at application startup for automatic optimization.
-    ///
     /// <code>
     /// // In your Program.cs or Main():
     /// AiDotNetEngine.AutoDetectAndConfigureGpu();
     ///
     /// // Now all operations will automatically use GPU if available!
     /// </code>
-    ///
-    /// This is safe to call even if you don't have a GPU - it will just stay on CPU mode.
-    /// </para>
+    /// Safe to call even without a GPU — falls back to CPU silently.</para>
+    /// <para>
+    /// Original parameterless overload. Preserved as a distinct method (not collapsed
+    /// into a <c>verbose = true</c> default on the verbose-aware overload below) so
+    /// previously-compiled consumers that took a binary reference to
+    /// <c>AutoDetectAndConfigureGpu()</c> keep linking against the same metadata signature.
+    /// Forwards to <see cref="AutoDetectAndConfigureGpu(bool)"/> with verbose enabled.</para>
     /// </remarks>
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu()
+        => AutoDetectAndConfigureGpu(verbose: true);
+
+    /// <summary>
+    /// Verbose-aware overload of <see cref="AutoDetectAndConfigureGpu()"/>. Same GPU
+    /// detection / fallback behavior; the <paramref name="verbose"/> flag gates whether
+    /// the status banner is emitted through the configured log sink.
+    /// </summary>
+    /// <param name="verbose">When true, emits status via <see cref="Logger"/>
+    /// if set, otherwise Console.WriteLine. Pass false for module-init or library-internal
+    /// use where polluting stdout is undesirable (test runners, hosted services, anything
+    /// parsing stdout). Override globally via the <c>AIDOTNET_QUIET</c> env var — when
+    /// set to any non-empty value, suppresses output regardless of this parameter.
+    /// Plug your own log sink via the <see cref="Logger"/> property.</param>
+    /// <returns>True if GPU was successfully configured, false otherwise.</returns>
+    public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
         try
         {
@@ -114,18 +185,18 @@ public static class AiDotNetEngine
             if (gpuEngine.SupportsGpu)
             {
                 Current = gpuEngine;
-                Console.WriteLine($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}");
+                EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
                 return true;
             }
 
             gpuEngine.Dispose();
-            Console.WriteLine("[AiDotNet] GPU not available, using CPU");
+            EmitLog("[AiDotNet] GPU not available, using CPU", verbose);
             return false;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[AiDotNet] Failed to initialize DirectGpu: {ex.Message}");
-            Console.WriteLine("[AiDotNet] Falling back to CPU");
+            EmitLog($"[AiDotNet] Failed to initialize DirectGpu: {ex.Message}", verbose);
+            EmitLog("[AiDotNet] Falling back to CPU", verbose);
             return false;
         }
     }
@@ -141,7 +212,7 @@ public static class AiDotNetEngine
     public static void ResetToCpu()
     {
         Current = new CpuEngine();
-        Console.WriteLine("[AiDotNet] Reset to CPU engine");
+        EmitLog("[AiDotNet] Reset to CPU engine", verbose: true);
     }
 
     /// <summary>

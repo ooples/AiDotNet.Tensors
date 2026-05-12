@@ -48,10 +48,17 @@ internal static class AutoTrainingCompiler
     internal static void RecordStep<T>(TapeEntryArena<T> entries, int entryCount, Tensor<T>? loss = null)
     {
         if (!Enabled) return;
-        // Pattern hash is based on op sequence + shapes only — NOT loss tensor identity.
-        // Loss tensors are recreated each forward pass (different object each step),
-        // so including identity would prevent pattern detection across steps.
-        long hash = ComputePatternHash(entries, entryCount);
+        // Repeat-detection hash: STRUCTURE ONLY (op sequence + shapes + element
+        // type). Every forward pass creates fresh activation / loss tensors,
+        // so folding their identities in here would make every step hash
+        // differently and the compile threshold would never fire on real
+        // training loops (which is exactly what happened on PR #333's first
+        // attempt at a unified-hash design — the AutoTrainingCompilerTests
+        // PersistentTape_* assertions all failed). Cache LOOKUP uses a stricter
+        // key (structure + parameter-tensor identities, via
+        // <see cref="TryGetCompiledBackward{T}"/>) so cloned models still miss
+        // the cache and trigger a fresh compile.
+        long hash = ComputeStructureHash(entries, entryCount);
         State.RecordStepHash(hash);
     }
 
@@ -70,10 +77,15 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
-        // Validate current tape pattern AND loss/sources identity match the compiled plan.
-        // IncludeTargetIdentity hashes both loss tensor and source tensors so different
-        // loss functions or source sets don't reuse the wrong backward plan.
-        long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
+        // Compiled-plan retrieval hash: structure + parameter-tensor identities.
+        // The compiled backward graph holds direct Tensor<T> references to the
+        // specific parameter tensors it was built against; replaying it on a
+        // cloned model (same architecture, fresh parameter instances) would
+        // silently produce wrong gradients. So the cache key must include
+        // SOURCE identities. Activation / loss identities are deliberately NOT
+        // included — only sources, which are the long-lived parameter tensors
+        // the caller actually wants gradients for.
+        long currentHash = ComputeStructureHash(tape.Entries, tape.EntryCount);
         currentHash = IncludeTargetIdentity(currentHash, loss, sources);
         if (!State.MatchesCompiledHash(currentHash))
         {
@@ -103,13 +115,37 @@ internal static class AutoTrainingCompiler
         if (!tape.Options.Persistent) return;
         if (!State.ShouldCompile) return;
 
+        // Clone-then-train safety: when `sources` is null the cache key
+        // collapses to structure-only, which would let a cloned model with
+        // identical architecture hit the original's compiled plan and replay
+        // gradients against the wrong parameter tensors. Refuse to compile
+        // until the caller passes an explicit sources set — they almost
+        // always do (every consumer that actually uses
+        // <c>tape.ComputeGradients(loss, parameters)</c> passes parameters),
+        // and the rare null-sources callers simply pay the recording-path
+        // cost rather than risk a wrong-gradient replay.
+        if (sources is null) return;
+
         try
         {
             var compiled = tape.CompileBackward(loss, sources);
-            // Store with target identity so the hash includes loss/sources
-            long hash = ComputePatternHash(tape.Entries, tape.EntryCount);
+            // Store the cache key (structure + sources). Matches the lookup
+            // computation in TryGetCompiledBackward — both must agree.
+            long hash = ComputeStructureHash(tape.Entries, tape.EntryCount);
             hash = IncludeTargetIdentity(hash, loss, sources);
             State.StoreCompiledBackwardWithHash(compiled, hash);
+            // Drop the plan's strong reference to the compilation-time loss
+            // tensor. The compile cache is thread-static and persists for
+            // the lifetime of the worker thread; without this release, the
+            // loss tensor (and its entire GradFn chain back through every
+            // forward intermediate) would stay reachable for the whole
+            // process, manifesting as a per-iteration leak under
+            // GradientTapeLeakTests at issue #283 scale (tensor-arena pool
+            // reuse makes early-iteration intermediates the same Tensor
+            // instances as later iterations'). Subsequent ComputeGradients
+            // calls always pass the current step's loss to Execute(loss),
+            // so the parameterless fallback isn't needed on this path.
+            compiled.ReleaseCompilationTimeLoss();
             ReplayMode = true; // Enable replay mode now that backward is compiled
         }
         catch
@@ -126,6 +162,12 @@ internal static class AutoTrainingCompiler
     /// each forward pass. The op structure (captured in tape entries hash) already
     /// identifies the computation pattern including the loss function type.
     /// </summary>
+    /// <remarks>
+    /// When <paramref name="sources"/> is null the function is a no-op. That
+    /// path is now closed inside <see cref="TryCompileBackward"/> via a
+    /// short-circuit return, so the cache cannot store a plan keyed on
+    /// structure-only — clone-then-train remains safe.
+    /// </remarks>
     private static long IncludeTargetIdentity<T>(long hash, Tensor<T> loss, Tensor<T>[]? sources)
     {
         if (sources is not null)
@@ -140,13 +182,25 @@ internal static class AutoTrainingCompiler
     }
 
     /// <summary>
-    /// Computes a hash of the training step pattern from tape entries.
-    /// Two steps with the same op sequence + shapes produce the same hash.
+    /// Structure-only hash: op name sequence + output shapes + element type.
+    /// Two training steps with the same model architecture and same input
+    /// shapes produce the same hash even though their activation / loss
+    /// tensors are different object instances (which they always are —
+    /// each forward pass creates fresh intermediates).
     /// </summary>
-    private static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
+    /// <remarks>
+    /// <para>This is the right hash for <see cref="RecordStep{T}"/>'s repeat
+    /// detection: we want consecutive train steps of the same model to be
+    /// recognized as a repeat so the compile threshold actually fires.
+    /// Including activation / intermediate / loss identities would make
+    /// every step hash differently and pattern repeats would never trigger.</para>
+    /// <para>Per-Train cost: O(entryCount) — one hash op per tape entry. On
+    /// VGG16-BN that's ~100 hash ops out of a 38 s iteration — negligible.</para>
+    /// </remarks>
+    private static long ComputeStructureHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
-        // Include element type so float and double plans don't collide
+        // Include element type so float and double plans don't collide.
         hash ^= typeof(T).GetHashCode();
         hash *= unchecked((long)0x100000001b3L);
         for (int i = 0; i < entryCount; i++)
@@ -156,6 +210,8 @@ internal static class AutoTrainingCompiler
             hash *= unchecked((long)0x100000001b3L);
             if (entry.Output is not null)
             {
+                // Shape only — NOT identity. Two steps with the same model
+                // shape produce the same structure hash.
                 foreach (int dim in entry.Output._shape)
                 {
                     hash ^= dim;

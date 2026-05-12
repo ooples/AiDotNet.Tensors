@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Profiling.Memory;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -24,6 +25,182 @@ public static class TensorAllocator
     /// Public accessor for the ArrayPool threshold used by TensorWorkspace and other helpers.
     /// </summary>
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
+
+    /// <summary>
+    /// Creates a zero-initialized tensor with the given shape that's pinned
+    /// to the current <see cref="TensorArena"/>'s long-lived tier. Pinned
+    /// allocations survive <see cref="TensorArena.Reset"/> — use this for
+    /// model weights (layer EnsureInitialized), optimizer state (Adam m / v),
+    /// running BatchNorm statistics, anything that's part of the network's
+    /// learnable state and must NOT be re-issued as scratch on the next
+    /// training iteration. Falls back to a plain <see cref="Tensor{T}"/>
+    /// allocation when no arena is active (graceful degradation —
+    /// non-arena callers get GC-tracked allocation, same as
+    /// <see cref="Rent{T}(int[])"/> with TensorPool disabled).
+    /// </summary>
+    public static Tensor<T> RentPinned<T>(int[] shape)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape),
+                    $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative.");
+            totalSize = checked(totalSize * shape[i]);
+        }
+        if (totalSize == 0) return new Tensor<T>(shape);
+
+        // MemoryProfiler hook — pinned tier is always a fresh allocation
+        // (TensorArena's pinned list grows monotonically; the fallback is
+        // `new Tensor<T>`). Mirror Rent<T>'s pattern: record on every path
+        // that actually allocates so CurrentBytes tracks pinned weights /
+        // optimizer state alongside scratch tensors instead of silently
+        // undercounting.
+        long bytesIfTracking = (long)totalSize * Unsafe.SizeOf<T>();
+
+        var arena = TensorArena.Current;
+        if (arena != null)
+        {
+            T[]? pinnedArray = arena.TryAllocatePinned<T>(totalSize);
+            if (pinnedArray != null)
+            {
+                MemoryProfiler.RecordAllocation(
+                    "TensorAllocator.Pinned", bytesIfTracking, shape, typeof(T).Name);
+                var memory = new Memory<T>(pinnedArray, 0, totalSize);
+                return Tensor<T>.FromMemory(memory, shape);
+            }
+        }
+
+        // NOTE: an earlier draft of this method tried to auto-engage
+        // WeightRegistry.AllocateStreaming for tensors above ~100M elements,
+        // but AllocateStreaming only RESERVES pool budget — it requires a
+        // follow-on RegisterWeight call to actually commit the bytes into
+        // the streaming pool and drop the in-memory storage. RentPinned
+        // callers (LayerBase.EnsureInitialized, Adam moments, BN running
+        // stats) hold the tensor as plain GC-managed memory and never
+        // perform that handshake, so the auto-engage stranded the
+        // reservation without buying any streaming benefit. Use the
+        // explicit WeightRegistry API instead when a caller really wants
+        // pool-backed streaming.
+
+        // No active arena — graceful degradation to standard CLR allocation.
+        // The caller's "this lives across iterations" contract still holds
+        // because plain Tensor<T> backing arrays aren't touched by Reset
+        // (they were never in any arena pool to begin with).
+        MemoryProfiler.RecordAllocation(
+            "TensorAllocator.Pinned", bytesIfTracking, shape, typeof(T).Name);
+        return new Tensor<T>(shape);
+    }
+
+    /// <summary>
+    /// Rents a tensor whose storage is registered with the active GPU
+    /// backend's offload allocator — pinned-host memory DMA-mapped to the
+    /// GPU (no per-op cudaMemcpy on read) or managed/unified memory (driver
+    /// handles migration). Use for weights, optimizer state (Adam m / v),
+    /// running BatchNorm statistics on the GPU training path: every kernel
+    /// reads/writes the pinned region directly via the DMA mapping, and
+    /// CPU code sees the updated values without an explicit download.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Fallback behavior:</b>
+    /// <list type="bullet">
+    /// <item>No GPU offload allocator registered (CPU-only host, or GPU
+    /// engine but no backend yet) → falls back to <see cref="RentPinned{T}"/>
+    /// (CPU pinned tier). The returned tensor still survives
+    /// <see cref="TensorArena.Reset"/>, so the model can keep its weights
+    /// stable across iterations even when no GPU is available.</item>
+    /// <item>GpuOffload allocator is registered but throws
+    /// <see cref="NotSupportedException"/> (per-tensor size &gt;
+    /// <see cref="int.MaxValue"/>, element type not streamable, backend
+    /// doesn't support the lifetime) or <see cref="InvalidOperationException"/>
+    /// (allocator in a bad state) → caught and downgraded to CPU
+    /// <see cref="RentPinned{T}"/> fallback. The training step continues
+    /// on CPU instead of failing. Critical exceptions (<see cref="OutOfMemoryException"/>,
+    /// <see cref="System.Threading.ThreadAbortException"/>, etc.) propagate
+    /// — silent CPU drift would mask a real allocation failure.</item>
+    /// </list></para>
+    /// <para><b>Initial state:</b> the returned tensor's data is zero-initialized
+    /// (same contract as <see cref="Rent{T}(int[])"/>). Host writes to the
+    /// returned tensor's <see cref="Tensor{T}.Data"/> propagate to GPU reads via
+    /// the DMA mapping (pinned scheme) or driver-managed migration
+    /// (managed scheme). GPU kernel writes are visible to CPU code on the
+    /// next access (with a host-side fence for write-after-write ordering
+    /// on the kernel-launch stream).</para>
+    /// <para><b>Lifetime:</b> registered with <see cref="WeightRegistry"/>;
+    /// the GPU memory is freed when the tensor is collected by GC (via the
+    /// registry's finalizer-tracked handle) or when
+    /// <see cref="WeightRegistry.UnregisterWeight{T}"/> is called explicitly.
+    /// The GPU-resident path does NOT touch the <see cref="TensorArena"/>
+    /// pinned tier (the OffloadHostPointer lives outside any managed array
+    /// pool); the fallback CPU path DOES use the arena pinned tier and
+    /// survives <see cref="TensorArena.Reset"/> there.</para>
+    /// </remarks>
+    public static Tensor<T> RentPinnedOnGpu<T>(int[] shape)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape),
+                    $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative.");
+            totalSize = checked(totalSize * shape[i]);
+        }
+        if (totalSize == 0) return new Tensor<T>(shape);
+
+        // No GPU offload allocator registered → CPU pinned fallback. Same
+        // semantics as RentPinned (survives Reset), so consumer code that
+        // unconditionally calls RentPinnedOnGpu still works on CPU-only hosts.
+        var allocator = WeightRegistry.OffloadAllocator;
+        if (allocator is null || !allocator.IsAvailable)
+            return RentPinned<T>(shape);
+
+        // Streamable-type gate matches the WeightRegistry contract — non-
+        // streamable element types (decimal, custom structs) can't be
+        // serialized to the pinned-host stage buffer that RegisterWeight uses.
+        if (!WeightRegistry.IsStreamableType<T>())
+            return RentPinned<T>(shape);
+
+        long bytesIfTracking = (long)totalSize * Unsafe.SizeOf<T>();
+
+        try
+        {
+            // Construct a zero-initialized tensor and register it under the
+            // GpuOffload lifetime. RegisterWeight handles allocator dispatch,
+            // copies the (zero-initialized) bytes into the pinned region,
+            // and persists the OffloadDevicePointer / OffloadHostPointer
+            // metadata on the tensor for later kernel launches.
+            var tensor = new Tensor<T>(shape)
+            {
+                Lifetime = WeightLifetime.GpuOffload,
+            };
+            WeightRegistry.RegisterWeight(tensor);
+
+            // After RegisterWeight, the tensor's data lives in pinned host
+            // memory DMA-mapped to the GPU. Lifetime stays GpuOffload (the
+            // registry does not flip back to Default on success — only on
+            // allocator-unavailable fallback inside the registry, which we
+            // already short-circuited above).
+            MemoryProfiler.RecordAllocation(
+                "TensorAllocator.PinnedOnGpu", bytesIfTracking, shape, typeof(T).Name);
+            return tensor;
+        }
+        catch (NotSupportedException)
+        {
+            // Per-tensor size > int.MaxValue (the offload stage byte[] limit),
+            // unsupported element type, or backend doesn't support the lifetime.
+            // Caller-side chunking is the documented remedy; the CPU pinned
+            // fallback at least lets the model run.
+            return RentPinned<T>(shape);
+        }
+        catch (InvalidOperationException)
+        {
+            // Backend in a bad state (e.g., already-disposed allocator). Falling
+            // back to CPU is non-fatal for the train step.
+            return RentPinned<T>(shape);
+        }
+    }
 
     /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
@@ -57,7 +234,7 @@ public static class TensorAllocator
         if (!TensorPool.Enabled || TensorPool.ForceFreshAllocations || totalSize == 0)
         {
             if (bytesIfTracking > 0)
-                AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+                MemoryProfiler.RecordAllocation(
                     "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             return new Tensor<T>(shape);
         }
@@ -105,7 +282,7 @@ public static class TensorAllocator
         // unconditionally here (RentUninitialized records on the same path).
         if (totalSize >= ArrayPoolThreshold)
         {
-            AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+            MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             // Issue #311: clear the entire array, including the padding
@@ -117,13 +294,13 @@ public static class TensorAllocator
         }
 
         // Tier 4: Standard managed allocation for small tensors — always a fresh alloc.
-        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+        MemoryProfiler.RecordAllocation(
             "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         T[] arr = new T[totalSize];
         var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
-        AiDotNet.Tensors.Engines.Profiling.Memory.MemoryProfiler.RecordAllocation(
+        MemoryProfiler.RecordAllocation(
             "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
         return new Tensor<T>(shape);
 #endif

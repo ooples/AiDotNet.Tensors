@@ -145,9 +145,12 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 // e.Output is always a graph intermediate; inputs may be
                 // leaves (parameters) so we don't touch their .Grad here.
+                // GradFn cleanup parity with the recording path — see the
+                // matching comment in CompiledBackwardGraph.Execute.
                 bool keepGrad =
                     (sourceSet?.Contains(e.Output) == true)
                     || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                e.Output.GradFn = null;
                 if (!keepGrad) e.Output.Grad = null;
             }
         }

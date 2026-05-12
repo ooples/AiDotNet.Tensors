@@ -18,9 +18,24 @@ public sealed class CompiledBackwardGraph<T>
     private readonly int[] _reachableEntryIndices;
 
     /// <summary>
-    /// The loss tensor this graph was compiled for.
+    /// The loss tensor this graph was compiled for. Nullable because
+    /// long-lived holders of the plan (e.g. the thread-static
+    /// <c>AutoTrainingState</c> cache) can call
+    /// <see cref="ReleaseCompilationTimeLoss"/> to drop this reference once
+    /// they're committed to always passing a current-step loss into
+    /// <see cref="Execute(Tensor{T})"/>. Strong references here pin the
+    /// compilation-time forward chain (loss.GradFn → upstream
+    /// intermediates) for the whole plan lifetime, which (combined with
+    /// tensor-arena pool reuse of <see cref="Tensor{T}"/> instances across
+    /// training iterations) causes every later step's intermediates to
+    /// appear leaked under <see cref="GradientTapeLeakTests"/> /
+    /// Issue #283. Production replay always feeds in the current-step
+    /// loss; this field exists only for the parameterless
+    /// <see cref="Execute()"/> overload used by tests that call
+    /// <c>tape.CompileBackward(loss)</c> + <c>compiled.Execute()</c>
+    /// inline (where the original loss is still in caller scope).
     /// </summary>
-    private readonly Tensor<T> _loss;
+    private Tensor<T>? _loss;
 
     /// <summary>
     /// Optional source filter — if non-null, only these tensors get gradients.
@@ -110,6 +125,13 @@ public sealed class CompiledBackwardGraph<T>
     internal Dictionary<Tensor<T>, Tensor<T>> Execute(Tensor<T>? currentLoss)
     {
         var loss = currentLoss ?? _loss;
+        if (loss is null)
+            throw new InvalidOperationException(
+                "CompiledBackwardGraph.Execute requires a current-step loss. " +
+                "The compilation-time loss was released — call Execute(loss) " +
+                "with the current step's loss tensor (this is the production " +
+                "replay path; only the inline-test usage relies on the cached " +
+                "compilation-time loss, which is still present at that call site).");
 
         // Phase C: try optimized backward with CSE + algebraic simplification.
         // OptimizedBackwardPlan applies the same RetainGrad-aware intermediate
@@ -184,17 +206,19 @@ public sealed class CompiledBackwardGraph<T>
             DifferentiableOps.ClearIndexedGrads();
 
             // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
-            // cleanup: clear .Grad on forward intermediates so a consumer-side cache
-            // that retains an intermediate (e.g. a layer's `_lastInput`) doesn't pin
-            // one full backward's worth of gradient tensors across successive Execute
-            // calls. Same defense-in-depth pattern as GradientTape.cs PR for
-            // reopened-#283 / consumer-AiDotNet#1227.
-            //
-            // We DON'T clear .GradFn here — the compiled graph reuses the tape's
-            // forward graph for the next Execute, so the GradFn back-pointers must
-            // stay live. .Grad gets re-set by AccumulateGrad on the next Execute,
-            // so clearing it here only severs the per-tensor field; the data flows
-            // through the returned dictionary regardless.
+            // cleanup: clear .GradFn AND .Grad on forward intermediates so they don't
+            // get pinned across iterations. CompiledBackwardGraph walks the tape via
+            // the arena's entry array (`_entries[i]` for `i in _reachableEntryIndices`)
+            // — it does NOT follow GradFn pointers — so nulling GradFn here doesn't
+            // break the next Execute call's traversal. The next forward will re-set
+            // GradFn on every intermediate before the next backward runs, restoring
+            // any back-pointers a consumer of the public `tensor.GradFn` API might
+            // expect. Leaving GradFn live across Execute calls is what previously
+            // made every step's intermediates appear leaked under
+            // GradientTapeLeakTests — the GradFn back-chain kept compilation-step
+            // intermediates (which are the same Tensor instances as later iters'
+            // intermediates after tensor-arena pool reuse) reachable from any
+            // consumer that holds even one downstream tensor.
             HashSet<Tensor<T>>? sourceSet = null;
             if (_sources is not null)
             {
@@ -212,11 +236,11 @@ public sealed class CompiledBackwardGraph<T>
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
 
-                // .Grad cleanup on this entry's output (every output is an
-                // intermediate — graph leaves never appear as outputs in the
-                // entries array). Inputs are NOT cleared because they may be
-                // graph leaves (parameters), and the consumer relies on
-                // `param.Grad` being populated after a sources=null Execute.
+                // .GradFn / .Grad cleanup on this entry's output (every output is an
+                // intermediate — graph leaves never appear as outputs in the entries
+                // array). Inputs are NOT cleared because they may be graph leaves
+                // (parameters), and the consumer relies on `param.Grad` being
+                // populated after a sources=null Execute.
                 //
                 // Matches the parity rule used by
                 // GradientTape.CleanupTapeEntryGrad (line 635) and
@@ -226,6 +250,7 @@ public sealed class CompiledBackwardGraph<T>
                 bool keepGrad =
                     (sourceSet?.Contains(e.Output) == true)
                     || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                e.Output.GradFn = null;
                 if (!keepGrad) e.Output.Grad = null;
             }
         }
@@ -243,6 +268,18 @@ public sealed class CompiledBackwardGraph<T>
 
         return grads;
     }
+
+    /// <summary>
+    /// Drops the strong reference to the compilation-time loss tensor.
+    /// Long-lived plan holders (the thread-static
+    /// <c>AutoTrainingCompiler</c> cache) call this immediately after
+    /// storing the plan so the compilation-time forward chain can be GCed
+    /// once user code drops it. Subsequent <see cref="Execute(Tensor{T})"/>
+    /// calls must pass a current-step loss — production replay always does.
+    /// The parameterless <see cref="Execute()"/> overload throws after this
+    /// is called, which is fine: production never uses it.
+    /// </summary>
+    internal void ReleaseCompilationTimeLoss() => _loss = null;
 
     /// <summary>
     /// Gets the number of entries that will be executed (after dead node elimination).
