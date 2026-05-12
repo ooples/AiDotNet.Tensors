@@ -371,6 +371,17 @@ public abstract class TensorBase<T> : IDisposable
     internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
 
     /// <summary>
+    /// Version counter at the time <see cref="_gpuBuffer"/> was last uploaded.
+    /// Compared against current <see cref="Version"/> in GPU upload paths so
+    /// in-place CPU-side mutation invalidates the cached GPU buffer. Without
+    /// this, GetOrAllocateBuffer would return a stale GPU snapshot for any
+    /// tensor that was mutated after the previous GPU op (numerical-gradient
+    /// tests perturb input[i] in place, then re-call forward — the second
+    /// call must see the mutated data).
+    /// </summary>
+    internal int _gpuBufferVersion = -1;
+
+    /// <summary>
     /// The GPU memory management role for this tensor (weight, activation, gradient, etc.).
     /// Used by the GPU memory planner for allocation and eviction decisions.
     /// </summary>
@@ -1021,6 +1032,14 @@ public abstract class TensorBase<T> : IDisposable
             _data[flatIndex + _storageOffset] = value;
         else
             _data[FlatIndexToStorageIndex(flatIndex)] = value;
+        // Element-level CPU mutation: bump the version counter so cached GPU
+        // buffers (DirectGpuTensorEngine activation cache, _gpuBufferVersion)
+        // detect the change and re-upload. Without this, the GPU snapshot is
+        // pinned to whatever data was uploaded before the first per-element
+        // SetFlat — numerical-gradient tests perturb input[i] in-place and
+        // then re-call forward; the GPU sees the stale snapshot and the
+        // perturbation effectively becomes a no-op, yielding numGrad == 0.
+        IncrementVersion();
     }
 
     /// <summary>

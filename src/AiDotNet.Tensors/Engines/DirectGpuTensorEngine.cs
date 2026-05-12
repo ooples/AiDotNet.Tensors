@@ -611,11 +611,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
-        // Fast path: tensor already has a GPU buffer from a previous GPU operation.
-        // This is the PyTorch-like path — no cache lookup, no CPU materialization.
+        // Fast path: tensor already has a GPU buffer from a previous GPU operation
+        // AND nothing has mutated the tensor's CPU data since that upload (Version
+        // bumps on IncrementVersion). If Version mismatched, the cached buffer
+        // is stale (e.g. test perturbed `input[i]` in place between calls) — drop
+        // the GPU pointer and force a re-upload.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+            if (tensor._gpuBufferVersion == tensor.Version)
+                return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+
+            // Stale snapshot — also clear any matching activation-cache entry so
+            // the lookup below re-uploads instead of returning the same stale buffer.
+            var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
+            if (staleArray is not null)
+                InvalidateActivationCacheEntry(staleArray);
+            tensor._gpuBuffer = null;
+            tensor._gpuBackend = null;
+            tensor._gpuBufferVersion = -1;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -654,6 +667,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+    }
+
+    private void InvalidateActivationCacheEntry(object key)
+    {
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryRemove(key, out var entry))
+            {
+                _currentActivationCacheBytes -= entry.Buffer.SizeInBytes;
+                entry.Dispose();
+            }
+        }
     }
 
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, T[] data)
@@ -719,9 +744,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer UploadTensor<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
-        // Fast path: tensor has a GPU buffer from a previous GPU operation
+        // Fast path: tensor has a GPU buffer from a previous GPU operation, and
+        // the tensor's CPU-side Version hasn't advanced since the upload. Stale-
+        // version case is handled by GetOrAllocateBuffer(Tensor<T>) above —
+        // here we also defensively drop the pointer to avoid serving a stale
+        // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
-            return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+        {
+            if (tensor._gpuBufferVersion == tensor.Version)
+                return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+
+            var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
+            if (staleArray is not null)
+                InvalidateActivationCacheEntry(staleArray);
+            tensor._gpuBuffer = null;
+            tensor._gpuBackend = null;
+            tensor._gpuBufferVersion = -1;
+        }
 
         // Check caches without triggering CPU materialization
         var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
@@ -760,6 +799,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Also set the tensor's _gpuBuffer so future operations find it directly.
             tensor._gpuBuffer = owned.Buffer;
             tensor._gpuBackend = backend;
+            tensor._gpuBufferVersion = tensor.Version;
             var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
             if (backingArray is not null)
             {
@@ -12911,37 +12951,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
-        // GPU Transpose kernel produces gradients that disagree with the
-        // CpuEngine reference; the engine.TensorTranspose dispatch happens
-        // again inside TransposeBackward and goes back through this
-        // override on the gradient, so a buggy kernel poisons backward too.
-        // Defer to CpuEngine when a tape is active.
-        if (IsTapeActive<T>()) return base.TensorTranspose(tensor);
-
-        if (!TryGetBackend(out var backend) || tensor.Rank != 2)
-            return base.TensorTranspose(tensor);
-
-        try
-        {
-            int rows = tensor.Shape._dims[0];
-            int cols = tensor.Shape._dims[1];
-            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, rows * cols);
-            backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
-            var result = FinishGpuOp<T>(backend, bufOut, rows * cols);
-            return new Tensor<T>(result, new[] { cols, rows });
-        }
-        catch (Exception)
-        {
-            return base.TensorTranspose(tensor);
-        }
+        // The GPU Transpose kernel diverges from the CpuEngine reference on
+        // arbitrary inputs and, because TransposeBackward / PermuteBackward
+        // re-enter TensorTranspose on gradOutput inside the backward walk,
+        // even a small per-element error poisons gradient flow. Route
+        // through CpuEngine unconditionally — Transpose is rarely the
+        // bottleneck and correctness wins.
+        return base.TensorTranspose(tensor);
     }
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
-        // See TensorTranspose: PermuteBackward also re-enters TensorPermute
-        // on the gradient, so a faulty kernel propagates into backward.
-        if (IsTapeActive<T>()) return base.TensorPermute(tensor, axes);
+        // Same rationale as TensorTranspose: the GPU Permute kernel is
+        // off for non-trivial axes mixes and PermuteBackward re-enters
+        // this method on the gradient. Defer to CpuEngine.
+        return base.TensorPermute(tensor, axes);
+        #pragma warning disable CS0162 // unreachable
 
         if (!TryGetBackend(out var backend))
             return base.TensorPermute(tensor, axes);
@@ -12961,6 +12986,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.TensorPermute(tensor, axes);
         }
+        #pragma warning restore CS0162
     }
 
     /// <inheritdoc/>
@@ -13570,50 +13596,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        if (IsTapeActive<T>()) return base.TensorBCEWithLogitsLoss(logits, targets);
-        if (!TryGetBackend(out var backend))
-            return base.TensorBCEWithLogitsLoss(logits, targets);
-
-        try
-        {
-            using var bufL = GetOrAllocateBuffer(backend, logits.GetDataArray());
-            using var bufT = GetOrAllocateBuffer(backend, targets.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, logits.Length);
-            backend.BceWithLogitsLoss(bufL.Buffer, bufT.Buffer, bufOut.Buffer, logits.Length);
-            var result = FinishGpuOp<T>(backend, bufOut, logits.Length);
-            return new Tensor<T>(result, logits.Shape._dims);
-        }
-        catch (Exception)
-        {
-            return base.TensorBCEWithLogitsLoss(logits, targets);
-        }
+        // GPU kernel returns per-element loss but the CpuEngine reference
+        // returns the mean — the shape and value mismatch corrupts
+        // numerical-gradient comparisons. Route through CpuEngine until
+        // the GPU output is normalized.
+        return base.TensorBCEWithLogitsLoss(logits, targets);
     }
 
     public override Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        if (IsTapeActive<T>()) return base.TensorCrossEntropyLoss(logits, targets);
-        if (!TryGetBackend(out var backend) || logits.Rank < 2)
-            return base.TensorCrossEntropyLoss(logits, targets);
-
-        try
-        {
-            int batchSize = logits.Shape._dims[0];
-            int numClasses = logits.Shape._dims[1];
-            float loss = backend.CrossEntropyLoss(
-                GetOrAllocateBuffer(backend, logits.GetDataArray()).Buffer,
-                GetOrAllocateBuffer(backend, targets.GetDataArray()).Buffer,
-                batchSize, numClasses);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            return new Tensor<T>(new[] { numOps.FromDouble(loss) }, new[] { 1 });
-        }
-        catch (Exception)
-        {
-            return base.TensorCrossEntropyLoss(logits, targets);
-        }
+        // GPU `backend.CrossEntropyLoss` and CpuEngine.TensorCrossEntropyLoss
+        // diverge on small batches — route through CpuEngine until the
+        // kernel matches the reference formula bit-for-bit.
+        return base.TensorCrossEntropyLoss(logits, targets);
     }
 
     public override Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
+        // GPU NllLoss outputs shape [batchSize] (per-batch loss) while
+        // CpuEngine.TensorNLLLoss outputs shape [1] (mean across batch).
+        // The shape mismatch produces wrong numerical gradients in the
+        // test harness. Route through CpuEngine.
+        return base.TensorNLLLoss(logProbs, targets);
+#pragma warning disable CS0162 // Unreachable
         if (IsTapeActive<T>()) return base.TensorNLLLoss(logProbs, targets);
         if (!TryGetBackend(out var backend) || logProbs.Rank < 2)
             return base.TensorNLLLoss(logProbs, targets);
@@ -13633,10 +13638,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.TensorNLLLoss(logProbs, targets);
         }
+#pragma warning restore CS0162
     }
 
     public override Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
+        // GPU kernel diverges from CpuEngine reference — route through base.
+        return base.TensorKLDivLoss(input, target);
+#pragma warning disable CS0162 // Unreachable
         if (IsTapeActive<T>()) return base.TensorKLDivLoss(input, target);
         if (!TryGetBackend(out var backend))
             return base.TensorKLDivLoss(input, target);
@@ -13654,6 +13663,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.TensorKLDivLoss(input, target);
         }
+#pragma warning restore CS0162
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -14024,6 +14034,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
+        // GPU bilinear upsample diverges from CpuEngine reference (0.21
+        // relError in gradient correctness test). Route to base until
+        // BilinearUpsample2D kernel is verified.
+        return base.TensorUpsampleBilinear(input, outputSize);
+#pragma warning disable CS0162
         if (IsTapeActive<T>()) return base.TensorUpsampleBilinear(input, outputSize);
         if (!TryGetBackend(out var backend) || input.Rank != 4 || outputSize.Length < 2)
             return base.TensorUpsampleBilinear(input, outputSize);
@@ -14039,6 +14054,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return new Tensor<T>(result, new[] { batch, channels, outH, outW });
         }
         catch { return base.TensorUpsampleBilinear(input, outputSize); }
+#pragma warning restore CS0162
     }
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
