@@ -198,10 +198,17 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// Element-wise max of two arrays using AVX Max intrinsic.
-        /// NaN semantics: follows hardware behavior (AVX maxps returns non-NaN operand).
-        /// This matches PyTorch torch.max behavior and is the industry standard for
-        /// performance-critical SIMD paths. Use MathF.Max for IEEE 754 NaN propagation.
         /// </summary>
+        /// <remarks>
+        /// <para><b>AVX selection semantics (per Intel SDM MAXPS):</b> when either
+        /// operand is NaN — or both are ±0 with any sign combination — the second
+        /// operand (b) is written to the result. Otherwise the larger value wins.
+        /// The scalar tail mirrors this behaviour so SIMD body and remainder
+        /// produce identical results for the same input regardless of length.</para>
+        /// <para>This matches PyTorch <c>torch.max</c> behaviour and is the industry
+        /// standard for performance-critical SIMD paths. Use <c>MathF.Max</c>
+        /// when IEEE 754 NaN propagation / signed-zero ordering is required.</para>
+        /// </remarks>
         [MethodImpl(HotInline)]
         public static unsafe void VectorMaxUnsafe(float* a, float* b, float* result, int length)
         {
@@ -225,15 +232,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
-            // Scalar tail mirrors AVX's NaN semantics — Avx.Max returns the
-            // SECOND operand when either input is NaN (Intel SDM MAXPS), but
-            // MathF.Max propagates NaN per IEEE 754. Using MathF.Max directly
-            // would make the kernel produce length-dependent results when NaNs
-            // are present (SIMD body picks b[i], scalar tail returns NaN).
+            // Scalar tail mirrors AVX's NaN AND signed-zero semantics — Avx.Max
+            // returns the SECOND operand both when either input is NaN AND when
+            // both are ±0 with any sign combination (Intel SDM MAXPS). MathF.Max
+            // propagates NaN per IEEE 754 and orders -0 < +0 per IEEE 754:2019,
+            // so using it directly would make the kernel produce length-dependent
+            // results for (NaN, _), (_, NaN), and (+0, -0)-style inputs (SIMD body
+            // picks b[i], scalar tail returns the IEEE 754-preferred value instead).
             for (; i < length; i++)
             {
                 float ai = a[i], bi = b[i];
-                result[i] = float.IsNaN(ai) || float.IsNaN(bi) ? bi : MathF.Max(ai, bi);
+                bool useB = float.IsNaN(ai) || float.IsNaN(bi) || (ai == 0f && bi == 0f);
+                result[i] = useB ? bi : MathF.Max(ai, bi);
             }
         }
 
@@ -265,17 +275,20 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Max(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
-            // Scalar tail mirrors AVX's NaN semantics — see float overload above.
+            // Scalar tail mirrors AVX's NaN AND signed-zero semantics — see float overload above.
             for (; i < length; i++)
             {
                 double ai = a[i], bi = b[i];
-                result[i] = double.IsNaN(ai) || double.IsNaN(bi) ? bi : Math.Max(ai, bi);
+                bool useB = double.IsNaN(ai) || double.IsNaN(bi) || (ai == 0.0 && bi == 0.0);
+                result[i] = useB ? bi : Math.Max(ai, bi);
             }
         }
 
         /// <summary>
         /// Element-wise min of two float arrays using AVX Min intrinsic (Vector256, 8 lanes).
-        /// Same hardware NaN semantics as <see cref="VectorMaxUnsafe(float*, float*, float*, int)"/>.
+        /// Same hardware NaN + signed-zero semantics as
+        /// <see cref="VectorMaxUnsafe(float*, float*, float*, int)"/>: the second
+        /// operand wins on either NaN-present or both-zero inputs.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void VectorMinUnsafe(float* a, float* b, float* result, int length)
@@ -300,16 +313,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
-            // Scalar tail mirrors AVX's NaN semantics — see VectorMaxUnsafe(float*) above.
+            // Scalar tail mirrors AVX's NaN + signed-zero semantics — see VectorMaxUnsafe(float*) above.
             for (; i < length; i++)
             {
                 float ai = a[i], bi = b[i];
-                result[i] = float.IsNaN(ai) || float.IsNaN(bi) ? bi : MathF.Min(ai, bi);
+                bool useB = float.IsNaN(ai) || float.IsNaN(bi) || (ai == 0f && bi == 0f);
+                result[i] = useB ? bi : MathF.Min(ai, bi);
             }
         }
 
         /// <summary>
         /// Element-wise min of two double arrays using AVX Min intrinsic (Vector256, 4 lanes).
+        /// Same hardware NaN + signed-zero semantics as the float Max/Min overloads.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void VectorMinUnsafe(double* a, double* b, double* result, int length)
@@ -334,11 +349,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(result + i, Avx.Min(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 #endif
-            // Scalar tail mirrors AVX's NaN semantics — see VectorMaxUnsafe(float*) above.
+            // Scalar tail mirrors AVX's NaN + signed-zero semantics — see VectorMaxUnsafe(float*) above.
             for (; i < length; i++)
             {
                 double ai = a[i], bi = b[i];
-                result[i] = double.IsNaN(ai) || double.IsNaN(bi) ? bi : Math.Min(ai, bi);
+                bool useB = double.IsNaN(ai) || double.IsNaN(bi) || (ai == 0.0 && bi == 0.0);
+                result[i] = useB ? bi : Math.Min(ai, bi);
             }
         }
 

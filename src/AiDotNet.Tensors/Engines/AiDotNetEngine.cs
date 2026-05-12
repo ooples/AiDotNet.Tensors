@@ -139,19 +139,43 @@ public static class AiDotNetEngine
         // without threading the flag through every caller.
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_QUIET")))
             return;
+
+        // Guard sink invocation — a user-supplied Logger callback that
+        // throws (broken ILogger pipeline, disposed sink, malformed format
+        // string) must NOT break engine startup or ResetToCpu. Same logic
+        // for Console.WriteLine: a redirected/closed stdout (Windows
+        // service contexts, build hosts piping logs through a fragile
+        // wrapper) can throw IOException, and the engine has no business
+        // failing because the host's log transport is misconfigured.
         var sink = Logger;
-        if (sink is not null) sink(message);
-        else Console.WriteLine(message);
+        if (sink is not null)
+        {
+            try { sink(message); return; }
+            catch { /* sink errors are non-fatal — fall through to Console */ }
+        }
+        try { Console.WriteLine(message); }
+        catch { /* stdout transport errors are non-fatal */ }
     }
 
-    /// <param name="verbose">When true (default), emits status via <see cref="Logger"/>
+    /// <returns>True if GPU was successfully configured, false otherwise.</returns>
+    /// <remarks>
+    /// Original parameterless overload. Preserved as a separate method (not a
+    /// `verbose = true` default on the new overload) so previously-compiled
+    /// consumers that took a binary reference to <c>AutoDetectAndConfigureGpu()</c>
+    /// keep linking against the same metadata signature. Forwards to the
+    /// verbose-aware overload with the default-verbose value.
+    /// </remarks>
+    public static bool AutoDetectAndConfigureGpu()
+        => AutoDetectAndConfigureGpu(verbose: true);
+
+    /// <param name="verbose">When true, emits status via <see cref="Logger"/>
     /// if set, otherwise Console.WriteLine. Pass false for module-init or library-internal
     /// use where polluting stdout is undesirable (test runners, hosted services, anything
     /// parsing stdout). Override globally via the <c>AIDOTNET_QUIET</c> env var — when
     /// set to any non-empty value, suppresses output regardless of this parameter.
     /// Plug your own log sink via the <see cref="Logger"/> property.</param>
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
-    public static bool AutoDetectAndConfigureGpu(bool verbose = true)
+    public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
         try
         {

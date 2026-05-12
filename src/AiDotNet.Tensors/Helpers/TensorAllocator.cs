@@ -40,9 +40,15 @@ public static class TensorAllocator
     /// </summary>
     public static Tensor<T> RentPinned<T>(int[] shape)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
         int totalSize = 1;
         for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape),
+                    $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative.");
             totalSize = checked(totalSize * shape[i]);
+        }
         if (totalSize == 0) return new Tensor<T>(shape);
 
         // MemoryProfiler hook — pinned tier is always a fresh allocation

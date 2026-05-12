@@ -253,6 +253,14 @@ public static class SimdComplexKernels
         Span<double> outR, Span<double> outI)
     {
         int n = inR.Length;
+        // Explicit length guards on all companion spans — ReadVector256 /
+        // WriteVector256 use unchecked Unsafe.Add so a shorter peer span
+        // would read/write past its allocation with undefined behavior.
+        // Match ComplexMultiplyDouble's contract.
+        if (inI.Length != n || outR.Length != n || outI.Length != n)
+            throw new ArgumentException(
+                "All four spans (inR, inI, outR, outI) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)
@@ -278,6 +286,10 @@ public static class SimdComplexKernels
     public static void ComplexMagnitudeDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI, Span<double> output)
     {
         int n = inR.Length;
+        if (inI.Length != n || output.Length != n)
+            throw new ArgumentException(
+                "All three spans (inR, inI, output) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)
@@ -301,6 +313,10 @@ public static class SimdComplexKernels
     public static void ComplexMagnitudeSquaredDouble(ReadOnlySpan<double> inR, ReadOnlySpan<double> inI, Span<double> output)
     {
         int n = inR.Length;
+        if (inI.Length != n || output.Length != n)
+            throw new ArgumentException(
+                "All three spans (inR, inI, output) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)
@@ -325,6 +341,10 @@ public static class SimdComplexKernels
         Span<double> outR, Span<double> outI)
     {
         int n = aR.Length;
+        if (aI.Length != n || bR.Length != n || bI.Length != n || outR.Length != n || outI.Length != n)
+            throw new ArgumentException(
+                "All six spans (aR, aI, bR, bI, outR, outI) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)
@@ -350,6 +370,10 @@ public static class SimdComplexKernels
         Span<double> outR, Span<double> outI, double scalar)
     {
         int n = inR.Length;
+        if (inI.Length != n || outR.Length != n || outI.Length != n)
+            throw new ArgumentException(
+                "All four spans (inR, inI, outR, outI) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)
@@ -377,6 +401,10 @@ public static class SimdComplexKernels
         Span<double> outR, Span<double> outI)
     {
         int n = xR.Length;
+        if (xI.Length != n || yR.Length != n || yI.Length != n || outR.Length != n || outI.Length != n)
+            throw new ArgumentException(
+                "All six spans (xR, xI, yR, yI, outR, outI) must have identical length.");
+
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 4)

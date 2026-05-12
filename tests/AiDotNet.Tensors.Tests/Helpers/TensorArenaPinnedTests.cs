@@ -109,6 +109,11 @@ public class TensorArenaPinnedTests
     [Fact]
     public void RentPinned_NoActiveArena_FallsBackToCleanAllocation()
     {
+        // Precondition: no active arena on this thread. Without this assert
+        // the test would silently pass even if an outer harness was leaking
+        // arenas — the "no active arena" branch of RentPinned would never run.
+        Assert.Null(TensorArena.Current);
+
         // Outside any `using var arena = TensorArena.Create()` block.
         var pinned = TensorAllocator.RentPinned<double>(new[] { 5 });
         Assert.NotNull(pinned);

@@ -27187,7 +27187,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dst = (float[])(object)result.GetDataArray();
             Simd.ScanKernels.PrefixSumFloat(src, dst);
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
 
@@ -27204,7 +27204,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     new Span<float>(dst, start, axisSize));
             }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            // Record the actual op against captured inputs so AutoTracer's
+            // compiled-replay recomputes the cumulative sum for the live
+            // tensor instead of baking the scalar we just produced.
+            { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
 
@@ -27220,7 +27223,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int len = tensor.Length;
             for (int i = 0; i < len; i++) { accD += srcD[i]; dstD[i] = accD; }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
         if (typeof(T) == typeof(double) && innerSize == 1)
@@ -27234,7 +27237,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int a = 0; a < axisSize; a++) { accD += srcD[start + a]; dstD[start + a] = accD; }
             }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+            { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
             return result;
         }
 
@@ -27269,7 +27272,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
-        AutoTracer.RecordOp("TensorCumSum", result, eng => result);
+        { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
         return result;
     }
 
@@ -28208,7 +28211,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     fDst[r] = MathF.Sqrt(sumSq);
                 }
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
             else if (normAxis == 0)
@@ -28227,7 +28234,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < cols; c++)
                     fDst[c] = MathF.Sqrt(fDst[c]);
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
         }
@@ -28253,7 +28264,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     dDst[r] = Math.Sqrt(sumSq);
                 }
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
             else if (normAxis == 0)
@@ -28271,7 +28286,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < cols; c++)
                     dDst[c] = Math.Sqrt(dDst[c]);
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
-                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
+                // Record the actual op against captured inputs so AutoTracer's
+                // compiled-replay recomputes the norm for the live tensor
+                // instead of baking the result tensor we just produced as a
+                // constant in the graph.
+                { var c = tensor; var ca = normAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
                 return normResult;
             }
         }
@@ -29139,7 +29158,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
                 BackwardFunctions<T>.LogSoftmaxBackward);
-            AutoTracer.RecordOp("LogSoftmax", result, eng => result);
+            { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
             return result;
         }
         // Double primitive fast path for last-axis log-softmax. Inline 3-pass
@@ -29172,7 +29191,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
                 BackwardFunctions<T>.LogSoftmaxBackward);
-            AutoTracer.RecordOp("LogSoftmax", resultD, eng => resultD);
+            { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
             return resultD;
         }
 
@@ -29217,7 +29236,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
             BackwardFunctions<T>.LogSoftmaxBackward);
-        AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => logSoftmaxResult);
+        { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
         return logSoftmaxResult;
     }
 
@@ -34278,7 +34297,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMean = sumSq / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
-            AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", scalarResult, eng => eng.TensorMSELoss(cp, ct)); }
             return scalarResult;
         }
         // Double fast path: same fused single-pass diff² sum.
@@ -34296,7 +34315,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double dMean = sumSq / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
             DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
-            AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", scalarResult, eng => eng.TensorMSELoss(cp, ct)); }
             return scalarResult;
         }
 
@@ -34311,7 +34330,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("MSELoss", result, predictions, targets, BackwardFunctions<T>.MSELossBackward);
-        AutoTracer.RecordOp("MSELoss", result, eng => result);
+        { var cp = predictions; var ct = targets; AutoTracer.RecordOp("MSELoss", result, eng => eng.TensorMSELoss(cp, ct)); }
         return result;
     }
 
@@ -34345,7 +34364,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMean = sumAbs / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
-            AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", scalarResult, eng => eng.TensorL1Loss(cp, ct)); }
             return scalarResult;
         }
         // Double fast path
@@ -34360,7 +34379,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double dMean = sumAbs / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
             DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
-            AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", scalarResult, eng => eng.TensorL1Loss(cp, ct)); }
             return scalarResult;
         }
 
@@ -34375,7 +34394,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("L1Loss", result, predictions, targets, BackwardFunctions<T>.L1LossBackward);
-        AutoTracer.RecordOp("L1Loss", result, eng => result);
+        { var cp = predictions; var ct = targets; AutoTracer.RecordOp("L1Loss", result, eng => eng.TensorL1Loss(cp, ct)); }
         return result;
     }
 
@@ -34417,7 +34436,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
                 BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
-            AutoTracer.RecordOp("HuberLoss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", scalarResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
             return scalarResult;
         }
         // Double fast path
@@ -34438,7 +34457,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<double, T>(ref dMean) }, [1]);
             DifferentiableOps.RecordBinary("HuberLoss", scalarResult, predictions, targets,
                 BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
-            AutoTracer.RecordOp("HuberLoss", scalarResult, eng => scalarResult);
+            { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", scalarResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
             return scalarResult;
         }
 
@@ -34457,7 +34476,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("HuberLoss", result, predictions, targets,
             BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
-        AutoTracer.RecordOp("HuberLoss", result, eng => result);
+        { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", result, eng => eng.TensorHuberLoss(cp, ct, cd)); }
         return result;
     }
 
@@ -34497,7 +34516,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scalarResultF = new Tensor<T>(new[] { Unsafe.As<float, T>(ref meanF) }, [1]);
             DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultF, logits, targets,
                 BackwardFunctions<T>.BCEWithLogitsLossBackward);
-            AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultF, eng => scalarResultF);
+            { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultF, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
             return scalarResultF;
         }
         // Double fast path: same numerically stable form, inline arithmetic.
@@ -34518,7 +34537,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scalarResultD = new Tensor<T>(new[] { Unsafe.As<double, T>(ref meanD) }, [1]);
             DifferentiableOps.RecordBinary("BCEWithLogitsLoss", scalarResultD, logits, targets,
                 BackwardFunctions<T>.BCEWithLogitsLossBackward);
-            AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultD, eng => scalarResultD);
+            { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultD, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
             return scalarResultD;
         }
 
@@ -34536,7 +34555,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("BCEWithLogitsLoss", result, logits, targets,
             BackwardFunctions<T>.BCEWithLogitsLossBackward);
-        AutoTracer.RecordOp("BCEWithLogitsLoss", result, eng => result);
+        { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", result, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
         return result;
     }
 
