@@ -110,6 +110,29 @@ public struct TapeEntry<T>
     }
 
     /// <summary>
+    /// Populates a caller-supplied 3-slot buffer from the inline input
+    /// fields and returns either that buffer (for <see cref="InputCount"/>
+    /// ≤ 3) or <see cref="InputsOverflow"/> (for ≥ 4 inputs). Caller MUST
+    /// guarantee <paramref name="buffer"/>.Length ≥ 3. Both paths preserve
+    /// the `BackwardFunction&lt;T&gt;` contract of receiving inputs as a
+    /// <c>Tensor&lt;T&gt;[]</c> without allocating a fresh array per call,
+    /// closing the steady-state alloc that <see cref="GetInputsArray"/>
+    /// pays on every backward step. Use ONLY where re-entrant backward is
+    /// impossible — i.e. when the buffer's lifetime is dominated by a
+    /// single backward dispatch — because the buffer is shared across
+    /// successive calls and would be clobbered by a nested call.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Tensor<T>[] GetInputsArrayInto(Tensor<T>[] buffer)
+    {
+        if (InputsOverflow is not null) return InputsOverflow;
+        buffer[0] = Input0;
+        if (InputCount >= 2) buffer[1] = Input1!;
+        if (InputCount >= 3) buffer[2] = Input2!;
+        return buffer;
+    }
+
+    /// <summary>
     /// Validates that no input tensor has been mutated since this entry was recorded.
     /// Throws if any input's version counter has changed.
     /// </summary>

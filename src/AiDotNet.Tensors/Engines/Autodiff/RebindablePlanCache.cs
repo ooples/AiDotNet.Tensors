@@ -38,6 +38,19 @@ internal static class RebindablePlanCache<T>
     [ThreadStatic]
     private static int[]? _cachedReverseTopoIndices;
 
+    /// <summary>
+    /// Thread-local 3-slot inputs buffer reused across every entry in a
+    /// single <see cref="TryExecute"/> walk. <see cref="TapeEntry{T}.GetInputsArrayInto"/>
+    /// populates the slots from <see cref="TapeEntry{T}.Input0"/> /
+    /// <see cref="TapeEntry{T}.Input1"/> / <see cref="TapeEntry{T}.Input2"/>
+    /// (≤3 inputs) or returns the entry's <see cref="TapeEntry{T}.InputsOverflow"/>
+    /// array directly (≥4 inputs). Either path avoids the per-entry
+    /// fresh-array allocation that <see cref="TapeEntry{T}.GetInputsArray"/>
+    /// pays. Allocated lazily on first call per thread.
+    /// </summary>
+    [ThreadStatic]
+    private static Tensor<T>[]? s_inputsBuffer;
+
     /// <summary>Quick-check for cache presence without a full lookup.</summary>
     internal static bool IsEmpty => _cachedReverseTopoIndices is null;
 
@@ -102,36 +115,63 @@ internal static class RebindablePlanCache<T>
         // Walk the cached reverse-topo indices, reading entries from the
         // CURRENT arena. entry.Output is this iteration's tensor, not the
         // recording-time tensor — that's the rebinding semantics.
+        //
+        // Reuse a single per-walk Tensor<T>[3] for the inputs argument so
+        // the steady-state replay doesn't allocate a fresh 1-3 element
+        // Tensor<T>[] per op (entry.GetInputsArray() does that, and on a
+        // 100-op tape that's 100 small-array allocs per Train step —
+        // exactly the GC churn that motivated the cached-replay path in
+        // the first place). Safe because (a) this replay path is only
+        // reached when !_isBackwardCreateGraph (no re-entrant backward
+        // can clobber the buffer mid-walk) and (b) `Backward` consumes
+        // inputs synchronously — no backward function in the codebase
+        // retains the inputs[] reference past its own return.
+        var inputsBuffer = s_inputsBuffer ??= new Tensor<T>[3];
         bool timing = BackwardTiming.Enabled;
         var indices = _cachedReverseTopoIndices;
-        for (int i = 0; i < indices.Length; i++)
+        try
         {
-            int idx = indices[i];
-            // Out-of-range index signals a stale cache — entry count
-            // dropped between Store and TryExecute. The pre-loop
-            // signature check should have caught this; if we reach
-            // here, the cache key is no longer valid and silent skip
-            // would produce wrong gradients. Bail out so the caller
-            // falls back to the fresh-walk path.
-            if (idx < 0 || idx >= currentEntries.Count) return null;
-            ref var entry = ref currentEntries[idx];
-
-            if (!grads.TryGetValue(entry.Output, out var gradOutput))
-                continue;
-
-            long start = timing ? Stopwatch.GetTimestamp() : 0;
-            entry.Backward(
-                gradOutput,
-                entry.GetInputsArray(),
-                entry.Output,
-                entry.SavedState ?? Array.Empty<object>(),
-                engine,
-                grads);
-            if (timing)
+            for (int i = 0; i < indices.Length; i++)
             {
-                long ticks = Stopwatch.GetTimestamp() - start;
-                BackwardTiming.Record(entry.Backward.Method.Name, ticks);
+                int idx = indices[i];
+                // Out-of-range index signals a stale cache — entry count
+                // dropped between Store and TryExecute. The pre-loop
+                // signature check should have caught this; if we reach
+                // here, the cache key is no longer valid and silent skip
+                // would produce wrong gradients. Bail out so the caller
+                // falls back to the fresh-walk path.
+                if (idx < 0 || idx >= currentEntries.Count) return null;
+                ref var entry = ref currentEntries[idx];
+
+                if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                    continue;
+
+                long start = timing ? Stopwatch.GetTimestamp() : 0;
+                entry.Backward(
+                    gradOutput,
+                    entry.GetInputsArrayInto(inputsBuffer),
+                    entry.Output,
+                    entry.SavedState ?? Array.Empty<object>(),
+                    engine,
+                    grads);
+                if (timing)
+                {
+                    long ticks = Stopwatch.GetTimestamp() - start;
+                    BackwardTiming.Record(entry.Backward.Method.Name, ticks);
+                }
             }
+        }
+        finally
+        {
+            // Clear the buffer's references so a forward intermediate
+            // that just rode through here (as an Input field of some
+            // entry) doesn't get pinned in the thread-static buffer for
+            // the rest of the worker thread's lifetime. The
+            // GradientTapeLeakTests gradient-cleanup assertions catch
+            // exactly this kind of cross-call retention.
+            inputsBuffer[0] = null!;
+            inputsBuffer[1] = null!;
+            inputsBuffer[2] = null!;
         }
 
         // Source filter — same semantics as CompiledDelegateChain.Execute.

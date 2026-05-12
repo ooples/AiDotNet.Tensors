@@ -18,8 +18,15 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public class FusedConv2DResnetSpeedupTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
+
+    public FusedConv2DResnetSpeedupTests(Xunit.Abstractions.ITestOutputHelper output)
+    {
+        _output = output;
+    }
 
     [Fact]
+    [Trait("Category", "Perf")]
     public void FusedConv2D_ResnetBottleneck_FasterThanConvPlusBroadcastAdd()
     {
         // ResNet50 bottleneck-projection shape: [1, 256, 14, 14] →
@@ -36,6 +43,20 @@ public class FusedConv2DResnetSpeedupTests
         // single-iter spikes, so the same 5% tolerance now actually
         // measures the kernel-vs-kernel comparison the test claims to
         // make.
+        //
+        // Env-var gate matches the pattern used by Issue327TransformerTrainPerfTests:
+        // shared CI runners can't reliably measure a 5% kernel-vs-kernel
+        // delta (a single competing process inflates either side by
+        // arbitrary amounts), so this test only runs when the harness
+        // is explicitly placed on dedicated hardware via
+        // AIDOTNET_RUN_PERF_GATES=1. The CI default filter excludes
+        // `Category=Perf` so the runner doesn't even try.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1 (shared-runner perf gates are flaky).");
+            return;
+        }
+
         const int batch = 1, inC = 256, H = 14, W = 14, outC = 64;
         const int Warmup = 10;
         const int Iters = 50;
