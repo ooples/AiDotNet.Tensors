@@ -473,25 +473,21 @@ internal static class BackwardFunctions<T>
             int Kflat = inputs[0]._shape[aRank0 - 1];
             int Nflat = inputs[1]._shape[1];
 
-            // Reshape A and gradOutput to 2D views ([M*..., K] and [M*..., N]).
-            // Reshape on contiguous is zero-copy (no data motion).
+            // Reshape A and gradOutput to 2D views (zero-copy on contiguous).
             var a2D = engine.Reshape(inputs[0], new[] { Mflat, Kflat });
             var g2D = engine.Reshape(gradOutput, new[] { Mflat, Nflat });
 
-            // bT = inputs[1]ᵀ via TensorTranspose (2D, small — weight matrix).
-            // Then gradA_2D = g2D · bT through the engine's parallel 2D dispatcher.
+            // Use TensorTranspose + TensorMatMul via the engine's full
+            // parallel dispatcher. Direct SimdGemm.Sgemm with trans flags
+            // was tried and falls to SgemmTiled which underperforms the
+            // explicit-transpose + parallel SgemmDirectParallelM path
+            // for our consumer shapes (2.85 active cores vs 8.7).
             var bT2 = engine.TensorTranspose(inputs[1]);
             var gradA2D = engine.TensorMatMul(g2D, bT2);
 
-            // aT2 = a2Dᵀ. For tall-thin A (M*M_inner >> K) this is the
-            // expensive transpose, but its cost is mostly memory write
-            // (M·K writes) which we'd otherwise pay anyway via the
-            // per-batch transpose in TransposeLastTwoDims; the SAVING is
-            // the rank-3 × rank-3 BatchMatMul → 2D GEMM swap below.
             var aT2 = engine.TensorTranspose(a2D);
             var gradB2 = engine.TensorMatMul(aT2, g2D);
 
-            // Reshape gradA back to inputs[0]'s original shape.
             var gradAReshaped = engine.Reshape(gradA2D, (int[])inputs[0]._shape.Clone());
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAReshaped, engine);
