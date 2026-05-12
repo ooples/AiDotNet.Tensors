@@ -119,11 +119,26 @@ public sealed class GpuStreamScheduler
 
             var events = new IGpuEvent[launches.Count];
             int start = (int)((uint)Interlocked.Increment(ref _nextStream)) % streamCount;
-            for (int i = 0; i < launches.Count; i++)
+            int recorded = 0;
+            try
             {
-                var stream = leased[(start + i) % streamCount];
-                launches[i](stream);
-                events[i] = stream.RecordEvent();
+                for (int i = 0; i < launches.Count; i++)
+                {
+                    var stream = leased[(start + i) % streamCount];
+                    launches[i](stream);
+                    events[i] = stream.RecordEvent();
+                    recorded = i + 1;
+                }
+            }
+            catch
+            {
+                // A launch delegate threw. Dispose every event we already
+                // recorded for prior launches — otherwise the native event
+                // handles leak (the caller never gets a GpuEventBatch to
+                // dispose). Then propagate the original exception.
+                for (int j = 0; j < recorded; j++)
+                    events[j]?.Dispose();
+                throw;
             }
             return new GpuEventBatch(events);
         }
@@ -182,41 +197,71 @@ public sealed class GpuStreamScheduler
             IGpuEvent[]? lastEvents = null;
             int rotation = (int)((uint)Interlocked.Increment(ref _nextStream)) % streams.Length;
 
-            for (int b = 0; b < batches.Count; b++)
+            IGpuEvent[]? thisBatchEvents = null;
+            int thisBatchRecorded = 0;
+            try
             {
-                var batch = batches[b];
-                if (batch is null || batch.Count == 0) continue;
-
-                var thisBatchEvents = new IGpuEvent[batch.Count];
-                for (int i = 0; i < batch.Count; i++)
+                for (int b = 0; b < batches.Count; b++)
                 {
-                    var stream = streams[(rotation + i) % streams.Length];
+                    var batch = batches[b];
+                    if (batch is null || batch.Count == 0) continue;
 
+                    thisBatchEvents = new IGpuEvent[batch.Count];
+                    thisBatchRecorded = 0;
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        var stream = streams[(rotation + i) % streams.Length];
+
+                        if (prevEvents is not null)
+                        {
+                            for (int p = 0; p < prevEvents.Length; p++)
+                                stream.WaitEvent(prevEvents[p]);
+                        }
+
+                        batch[i](stream);
+                        thisBatchEvents[i] = stream.RecordEvent();
+                        thisBatchRecorded = i + 1;
+                    }
+
+                    // The previous batch's events have been consumed by every
+                    // stream in the current batch that needed them. CUDA /
+                    // HIP / Metal / OpenCL all capture the event state at
+                    // WaitEvent submission time, so disposing the wrapper now
+                    // does not break the wait that's already queued on the
+                    // GPU. This is the only path that keeps DispatchSequential
+                    // from leaking event handles proportional to batch count.
                     if (prevEvents is not null)
                     {
                         for (int p = 0; p < prevEvents.Length; p++)
-                            stream.WaitEvent(prevEvents[p]);
+                            prevEvents[p]?.Dispose();
                     }
 
-                    batch[i](stream);
-                    thisBatchEvents[i] = stream.RecordEvent();
+                    prevEvents = thisBatchEvents;
+                    lastEvents = thisBatchEvents;
+                    thisBatchEvents = null; // ownership transferred to prevEvents/lastEvents
                 }
-
-                // The previous batch's events have been consumed by every
-                // stream in the current batch that needed them. CUDA /
-                // HIP / Metal / OpenCL all capture the event state at
-                // WaitEvent submission time, so disposing the wrapper now
-                // does not break the wait that's already queued on the
-                // GPU. This is the only path that keeps DispatchSequential
-                // from leaking event handles proportional to batch count.
+            }
+            catch
+            {
+                // A launch delegate threw mid-batch. Dispose every event we
+                // already recorded so the native event handles don't leak —
+                // the caller never gets a returned GpuEventBatch on the
+                // exception path. Cover (a) the in-progress batch up to the
+                // last successfully-recorded slot, and (b) the previous
+                // batch whose events haven't been disposed yet (the dispose
+                // happens AFTER the next batch finishes recording, so a
+                // mid-recording throw leaves prevEvents un-disposed).
+                if (thisBatchEvents is not null)
+                {
+                    for (int j = 0; j < thisBatchRecorded; j++)
+                        thisBatchEvents[j]?.Dispose();
+                }
                 if (prevEvents is not null)
                 {
                     for (int p = 0; p < prevEvents.Length; p++)
                         prevEvents[p]?.Dispose();
                 }
-
-                prevEvents = thisBatchEvents;
-                lastEvents = thisBatchEvents;
+                throw;
             }
 
             return lastEvents is null ? GpuEventBatch.Empty : new GpuEventBatch(lastEvents);
@@ -245,10 +290,24 @@ public sealed class GpuStreamScheduler
     private GpuEventBatch DispatchOnSingleStream(IGpuStream stream, IReadOnlyList<Action<IGpuStream>> launches)
     {
         var events = new IGpuEvent[launches.Count];
-        for (int i = 0; i < launches.Count; i++)
+        int recorded = 0;
+        try
         {
-            launches[i](stream);
-            events[i] = stream.RecordEvent();
+            for (int i = 0; i < launches.Count; i++)
+            {
+                launches[i](stream);
+                events[i] = stream.RecordEvent();
+                recorded = i + 1;
+            }
+        }
+        catch
+        {
+            // Same exception-safety contract as Dispatch — dispose any
+            // events we already recorded so the caller's exception path
+            // doesn't leak native event handles.
+            for (int j = 0; j < recorded; j++)
+                events[j]?.Dispose();
+            throw;
         }
         return new GpuEventBatch(events);
     }

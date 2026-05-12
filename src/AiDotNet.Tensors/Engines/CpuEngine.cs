@@ -5684,10 +5684,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
-        // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x)
+        // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x).
+        // Use Unsafe.As<T, float> rather than (float)(object)exponent — the
+        // cast chain box/unboxes a value type on every TensorPower call (BERT
+        // hits this op per attention layer's loss term, so the allocation is
+        // measurable). The `exponent is not null` guard is also redundant here:
+        // we're inside `typeof(T) == typeof(float)`, so T is a value type and
+        // a non-nullable parameter cannot be null. The same fix applies to the
+        // double branch below.
         if (typeof(T) == typeof(float))
         {
-            float fExp = exponent is not null ? (float)(object)exponent : 0f;
+            float fExp = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref exponent);
             if (fExp == 2.0f)
             {
                 // x^2 = x * x — use SIMD multiply
@@ -5696,15 +5703,20 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
-                if (exponent is not null)
-                    DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                // T is value-type float in this branch — exponent cannot be null,
+                // so the prior `exponent is not null` gate was always true. Box
+                // the already-extracted float (not the generic T) so the
+                // compiler sees a concrete value type and the savedState slot
+                // gets the same float boxing the slow path would produce.
+                DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { (object)fExp });
                 { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
                 return result;
             }
         }
         if (typeof(T) == typeof(double))
         {
-            double dExp = exponent is not null ? (double)(object)exponent : 0.0;
+            // Non-boxing conversion — see the float branch comment above.
+            double dExp = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref exponent);
             if (dExp == 2.0)
             {
                 // x^2 = x * x — used by every L2 regularization / squared-error loss term.
@@ -5713,8 +5725,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinSrc.Pointer, (double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
-                if (exponent is not null)
-                    DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                // T is value-type double in this branch — same rationale as the float branch.
+                DifferentiableOps.RecordUnary("TensorPower", result, tensorOrig, BackwardFunctions<T>.PowerBackward, new object[] { (object)dExp });
                 { var c = tensor; AutoTracer.RecordOp("TensorPower", result, eng => eng.TensorPower(c, exponent)); }
                 return result;
             }
