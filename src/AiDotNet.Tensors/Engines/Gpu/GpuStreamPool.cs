@@ -60,6 +60,17 @@ public sealed class GpuStreamPool : IDisposable
     public IAsyncGpuBackend Backend => _backend;
 
     /// <summary>
+    /// Returns the upper bound on how many streams of <paramref name="streamType"/>
+    /// the pool will lazily create before <see cref="AcquireStream"/> starts
+    /// throwing. Consumers like <see cref="GpuStreamScheduler"/> use this to
+    /// pre-size their leased working set so a single dispatch call can hold
+    /// every pool stream concurrently rather than acquire-and-release on each
+    /// launch (which collapses onto one stream under <c>ConcurrentBag</c>'s
+    /// thread-local cache).
+    /// </summary>
+    public int GetMaxStreams(GpuStreamType streamType) => GetMaxStreamsForType(streamType);
+
+    /// <summary>
     /// Creates a new stream pool for the given backend.
     /// </summary>
     /// <param name="backend">The async GPU backend.</param>

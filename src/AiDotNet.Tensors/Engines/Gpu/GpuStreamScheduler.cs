@@ -6,6 +6,8 @@
 // attention (per-head launches), and any other consumer that has a list
 // of data-independent launches.
 
+using System.Collections;
+
 namespace AiDotNet.Tensors.Engines.Gpu;
 
 /// <summary>
@@ -16,10 +18,11 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 ///
 /// <para>This is the high-level consumer API for <see cref="GpuStreamPool"/>.
 /// Callers describe their independent work as a list of <c>Action&lt;IGpuStream&gt;</c>
-/// delegates; the scheduler picks a stream from the pool for each, runs
-/// the delegate (which is expected to call kernel-launch methods bound to
-/// the supplied stream), and returns completion events the caller can
-/// wait on or chain into downstream work.</para>
+/// delegates; the scheduler leases up to <see cref="GpuExecutionOptions.MaxComputeStreams"/>
+/// streams from the pool, round-robins the launches across the leased set,
+/// and returns a <see cref="GpuEventBatch"/> the caller can wait on or
+/// chain into downstream work. The batch owns the recorded events and
+/// disposes them when the caller disposes the batch.</para>
 ///
 /// <para><b>Concurrency model:</b> Each launch in a single <see cref="Dispatch"/>
 /// call is independent of every other launch in that call — the caller is
@@ -28,10 +31,16 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// For DAG-ordered dispatch (batch N depends on batch N-1), use
 /// <see cref="DispatchSequential"/>.</para>
 ///
-/// <para><b>Stream count:</b> Bounded by <see cref="GpuExecutionOptions.MaxComputeStreams"/>.
-/// When the number of launches exceeds the stream count, multiple launches
-/// share each stream and serialize on it; the scheduler still spreads work
-/// across all available streams.</para>
+/// <para><b>Stream leasing model:</b> <see cref="Dispatch"/> leases
+/// <c>min(launches.Count, MaxComputeStreams)</c> streams for the entire
+/// call, indexes into the leased set with a round-robin counter, and
+/// releases all leased streams when the dispatch returns. This avoids the
+/// trap where per-launch acquire+release through <c>ConcurrentBag</c>
+/// returns the same stream to the calling thread (LIFO cache) and
+/// serializes every launch onto a single stream. If the pool is exhausted
+/// by concurrent callers and we can't lease anything, the scheduler falls
+/// back to the pool's default compute stream so the work still completes
+/// — without parallelism, but correctly.</para>
 ///
 /// <para><b>Hot-path use cases:</b>
 /// <list type="bullet">
@@ -50,6 +59,7 @@ public sealed class GpuStreamScheduler
 {
     private readonly GpuStreamPool _pool;
     private readonly GpuStreamType _streamType;
+    private readonly int _maxStreams;
     private int _nextStream;
 
     /// <summary>
@@ -62,14 +72,18 @@ public sealed class GpuStreamScheduler
     {
         _pool = pool ?? throw new ArgumentNullException(nameof(pool));
         _streamType = streamType;
+        _maxStreams = pool.GetMaxStreams(streamType);
+        if (_maxStreams < 1) _maxStreams = 1;
     }
 
     /// <summary>
     /// Dispatches a batch of independent launches across pool streams.
-    /// Returns one completion event per launch, in the same order as the
-    /// input list. Callers waiting for all to complete should call
-    /// <see cref="SynchronizeEvents"/> with the returned events or call
-    /// <see cref="GpuStreamPool.SynchronizeAll"/> on the underlying pool.
+    /// Returns a <see cref="GpuEventBatch"/> with one completion event per
+    /// launch in the same order as the input list. The returned batch owns
+    /// the events — callers SHOULD <c>using var batch = scheduler.Dispatch(...)</c>
+    /// or call <see cref="GpuEventBatch.Dispose"/> explicitly to release
+    /// the native event handles. Failing to dispose leaks native GPU event
+    /// objects.
     /// </summary>
     /// <remarks>
     /// The launches must be data-independent — neither reads nor writes
@@ -79,31 +93,45 @@ public sealed class GpuStreamScheduler
     /// access warnings under racy access patterns. Use
     /// <see cref="DispatchSequential"/> when ordering matters.
     /// </remarks>
-    public IReadOnlyList<IGpuEvent> Dispatch(IReadOnlyList<Action<IGpuStream>> launches)
+    public GpuEventBatch Dispatch(IReadOnlyList<Action<IGpuStream>> launches)
     {
         if (launches is null) throw new ArgumentNullException(nameof(launches));
-        if (launches.Count == 0) return Array.Empty<IGpuEvent>();
+        if (launches.Count == 0) return GpuEventBatch.Empty;
 
-        var events = new IGpuEvent[launches.Count];
-        // Acquire streams round-robin from the pool. The pool caps stream
-        // count at GpuExecutionOptions.MaxComputeStreams; when launches.Count
-        // exceeds that, we wrap and reuse streams — which serializes the
-        // wrapped launches on each stream, but still spreads work across
-        // the cap-limited stream count.
-        for (int i = 0; i < launches.Count; i++)
+        // Lease the streams up front so each launch lands on a distinct
+        // stream via round-robin. With per-launch acquire+release, the
+        // pool's ConcurrentBag returns the same stream to the calling
+        // thread (LIFO thread-local cache) and every launch serializes
+        // onto a single stream — the very perf gap this scheduler exists
+        // to close.
+        int target = Math.Min(launches.Count, _maxStreams);
+        var leased = LeaseStreams(target);
+        try
         {
-            var stream = AcquireNextStream();
-            try
+            int streamCount = leased.Count;
+            if (streamCount == 0)
             {
+                // Pool exhausted by concurrent callers. Fall back to the
+                // default compute stream — work still executes, just
+                // without parallelism on this call.
+                return DispatchOnSingleStream(_pool.DefaultComputeStream, launches);
+            }
+
+            var events = new IGpuEvent[launches.Count];
+            int start = (int)((uint)Interlocked.Increment(ref _nextStream)) % streamCount;
+            for (int i = 0; i < launches.Count; i++)
+            {
+                var stream = leased[(start + i) % streamCount];
                 launches[i](stream);
                 events[i] = stream.RecordEvent();
             }
-            finally
-            {
-                _pool.ReleaseStream(stream);
-            }
+            return new GpuEventBatch(events);
         }
-        return events;
+        finally
+        {
+            for (int i = 0; i < leased.Count; i++)
+                _pool.ReleaseStream(leased[i]);
+        }
     }
 
     /// <summary>
@@ -115,40 +143,88 @@ public sealed class GpuStreamScheduler
     /// but downstream layers depend on upstream completion (forward pass
     /// over per-attention-head Q · K^T → softmax → output).
     /// </summary>
-    public void DispatchSequential(IReadOnlyList<IReadOnlyList<Action<IGpuStream>>> batches)
+    /// <returns>
+    /// A <see cref="GpuEventBatch"/> covering the FINAL batch's recorded
+    /// events. Earlier batches' events are owned by the scheduler and
+    /// disposed internally once the next batch has installed waits on
+    /// them. The returned batch is the caller's responsibility — dispose
+    /// it (or wrap in <c>using</c>) to release the final batch's native
+    /// event handles. Returns <see cref="GpuEventBatch.Empty"/> when every
+    /// supplied batch is null or empty.
+    /// </returns>
+    public GpuEventBatch DispatchSequential(IReadOnlyList<IReadOnlyList<Action<IGpuStream>>> batches)
     {
         if (batches is null) throw new ArgumentNullException(nameof(batches));
+        if (batches.Count == 0) return GpuEventBatch.Empty;
 
-        IReadOnlyList<IGpuEvent>? prevEvents = null;
+        int maxBatchSize = 0;
         for (int b = 0; b < batches.Count; b++)
         {
             var batch = batches[b];
-            if (batch is null || batch.Count == 0) continue;
+            if (batch is not null && batch.Count > maxBatchSize) maxBatchSize = batch.Count;
+        }
+        if (maxBatchSize == 0) return GpuEventBatch.Empty;
 
-            var thisBatchEvents = new IGpuEvent[batch.Count];
-            for (int i = 0; i < batch.Count; i++)
+        int target = Math.Min(maxBatchSize, _maxStreams);
+        var leased = LeaseStreams(target);
+        try
+        {
+            // Build the effective stream set. If the pool was exhausted by
+            // concurrent callers and we couldn't lease anything, fall back
+            // to the default compute stream — single-stream execution still
+            // respects the DAG ordering because everything runs in submit
+            // order on one stream.
+            IGpuStream[] streams = leased.Count > 0
+                ? leased.ToArray()
+                : new[] { _pool.DefaultComputeStream };
+
+            IGpuEvent[]? prevEvents = null;
+            IGpuEvent[]? lastEvents = null;
+            int rotation = (int)((uint)Interlocked.Increment(ref _nextStream)) % streams.Length;
+
+            for (int b = 0; b < batches.Count; b++)
             {
-                var stream = AcquireNextStream();
-                try
+                var batch = batches[b];
+                if (batch is null || batch.Count == 0) continue;
+
+                var thisBatchEvents = new IGpuEvent[batch.Count];
+                for (int i = 0; i < batch.Count; i++)
                 {
-                    // Block this stream on every event from the previous
-                    // batch — batch N can't start until batch N-1 is fully
-                    // done. The GPU still runs batch N's launches in
-                    // parallel across streams; it just won't start them
-                    // until the cross-stream wait is satisfied.
+                    var stream = streams[(rotation + i) % streams.Length];
+
                     if (prevEvents is not null)
-                        foreach (var ev in prevEvents)
-                            stream.WaitEvent(ev);
+                    {
+                        for (int p = 0; p < prevEvents.Length; p++)
+                            stream.WaitEvent(prevEvents[p]);
+                    }
 
                     batch[i](stream);
                     thisBatchEvents[i] = stream.RecordEvent();
                 }
-                finally
+
+                // The previous batch's events have been consumed by every
+                // stream in the current batch that needed them. CUDA /
+                // HIP / Metal / OpenCL all capture the event state at
+                // WaitEvent submission time, so disposing the wrapper now
+                // does not break the wait that's already queued on the
+                // GPU. This is the only path that keeps DispatchSequential
+                // from leaking event handles proportional to batch count.
+                if (prevEvents is not null)
                 {
-                    _pool.ReleaseStream(stream);
+                    for (int p = 0; p < prevEvents.Length; p++)
+                        prevEvents[p]?.Dispose();
                 }
+
+                prevEvents = thisBatchEvents;
+                lastEvents = thisBatchEvents;
             }
-            prevEvents = thisBatchEvents;
+
+            return lastEvents is null ? GpuEventBatch.Empty : new GpuEventBatch(lastEvents);
+        }
+        finally
+        {
+            for (int i = 0; i < leased.Count; i++)
+                _pool.ReleaseStream(leased[i]);
         }
     }
 
@@ -156,22 +232,103 @@ public sealed class GpuStreamScheduler
     /// Waits for every event in <paramref name="events"/> to complete on
     /// the host. Cheaper than synchronizing the whole pool when you only
     /// need a subset of dispatched launches done — e.g. waiting on the
-    /// last layer's events before reading the loss to CPU.
+    /// last layer's events before reading the loss to CPU. Equivalent to
+    /// <see cref="GpuEventBatch.SynchronizeAll"/> for the batch case.
     /// </summary>
     public void SynchronizeEvents(IReadOnlyList<IGpuEvent> events)
     {
         if (events is null) return;
-        foreach (var ev in events)
-            ev?.Synchronize();
+        for (int i = 0; i < events.Count; i++)
+            events[i]?.Synchronize();
     }
 
-    private IGpuStream AcquireNextStream()
+    private GpuEventBatch DispatchOnSingleStream(IGpuStream stream, IReadOnlyList<Action<IGpuStream>> launches)
     {
-        // Round-robin across pool streams. We use AcquireStream rather than
-        // tracking our own stream pool because the GpuStreamPool already
-        // caps total streams at MaxComputeStreams and reuses them.
-        int idx = Interlocked.Increment(ref _nextStream);
-        _ = idx; // suppress unused; kept for future logging / debugging
-        return _pool.AcquireStream(_streamType);
+        var events = new IGpuEvent[launches.Count];
+        for (int i = 0; i < launches.Count; i++)
+        {
+            launches[i](stream);
+            events[i] = stream.RecordEvent();
+        }
+        return new GpuEventBatch(events);
+    }
+
+    private List<IGpuStream> LeaseStreams(int count)
+    {
+        var leased = new List<IGpuStream>(count);
+        for (int i = 0; i < count; i++)
+        {
+            try
+            {
+                leased.Add(_pool.AcquireStream(_streamType));
+            }
+            catch (InvalidOperationException)
+            {
+                // Pool exhausted by concurrent callers — break and use
+                // whatever subset we managed to lease. Caller path also
+                // tolerates Count == 0 by routing to the default stream.
+                break;
+            }
+        }
+        return leased;
+    }
+}
+
+/// <summary>
+/// Disposable list of recorded GPU events returned by
+/// <see cref="GpuStreamScheduler.Dispatch"/> and
+/// <see cref="GpuStreamScheduler.DispatchSequential"/>. Owns the underlying
+/// <see cref="IGpuEvent"/> handles — dispose the batch (e.g. via
+/// <c>using var batch = scheduler.Dispatch(...)</c>) to release the native
+/// event objects. Failing to dispose leaks GPU event handles.
+/// </summary>
+public sealed class GpuEventBatch : IReadOnlyList<IGpuEvent>, IDisposable
+{
+    /// <summary>
+    /// Shared empty batch — returned when there is nothing to dispatch.
+    /// Safe to dispose any number of times.
+    /// </summary>
+    public static readonly GpuEventBatch Empty = new GpuEventBatch(Array.Empty<IGpuEvent>());
+
+    private readonly IGpuEvent[] _events;
+    private bool _disposed;
+
+    internal GpuEventBatch(IGpuEvent[] events)
+    {
+        _events = events ?? throw new ArgumentNullException(nameof(events));
+    }
+
+    /// <inheritdoc />
+    public IGpuEvent this[int index] => _events[index];
+
+    /// <inheritdoc />
+    public int Count => _events.Length;
+
+    /// <inheritdoc />
+    public IEnumerator<IGpuEvent> GetEnumerator() => ((IEnumerable<IGpuEvent>)_events).GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() => _events.GetEnumerator();
+
+    /// <summary>
+    /// Blocks the calling thread until every event in this batch
+    /// completes on the device. Equivalent to calling
+    /// <see cref="IGpuEvent.Synchronize"/> on each event in order.
+    /// </summary>
+    public void SynchronizeAll()
+    {
+        for (int i = 0; i < _events.Length; i++)
+            _events[i]?.Synchronize();
+    }
+
+    /// <summary>
+    /// Disposes every event in the batch, releasing the underlying native
+    /// GPU event handles. Idempotent. The batch is unusable after disposal.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        for (int i = 0; i < _events.Length; i++)
+            _events[i]?.Dispose();
     }
 }
