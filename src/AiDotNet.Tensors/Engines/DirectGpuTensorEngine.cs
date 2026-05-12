@@ -986,17 +986,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long threshold = timestamps[removeCount - 1];
 
         // Remove entries at or below threshold, collect for disposal outside lock.
-        // Skip entries whose key still has a pending deferred materializer — otherwise
-        // the later TryMaterialize call reads a freed OpenCL buffer and crashes with
-        // CL_INVALID_MEM_OBJECT (issue #226). DeferredArrayMaterializer is the single
-        // source of truth; both FinishGpuOp and DeferTensorResult register here.
+        // For entries whose key still has a pending deferred materializer, FIRST
+        // materialize (download to the CPU array) so the GPU buffer can be safely
+        // freed, THEN evict — this stops the unbounded growth pattern that issue
+        // #283 / AiDotNet#1227 observed (1000-iter training stress test leaking
+        // hundreds of KB/call because materializer pinning kept old activations
+        // off the eviction list forever, and unused activations couldn't be GC'd
+        // either since the materializer dictionary held strong refs to their
+        // backing arrays). Materialize before evict keeps the issue-#226
+        // CL_INVALID_MEM_OBJECT crash from re-appearing — the callback runs
+        // against a still-live buffer, not a freed one.
         int removed = 0;
         for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
             if (entries[i].Value.Timestamp <= threshold)
             {
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                    continue;
+                {
+                    // Materialize the pending download now so the GPU buffer can be
+                    // safely freed below. TryMaterialize is a no-op if the entry
+                    // was already drained on another thread.
+                    Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key);
+                }
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
@@ -1259,6 +1270,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var tensor = Tensor<T>.CreateGpuResident(shape, deviceType);
         tensor._gpuBuffer = outputBuffer;
         tensor._gpuBackend = backend;
+        // Sync _gpuBufferVersion to the tensor's current Version. Without this
+        // the field stays at the -1 default and GetOrAllocateBuffer's
+        // version-aware check (added for issue #283 / cache-staleness) treats
+        // the freshly-allocated GPU buffer as stale and re-uploads from an
+        // empty CPU backing array, zeroing out downstream ops that reference
+        // the deferred result (e.g. StopGradient → TensorMultiply chain).
+        tensor._gpuBufferVersion = tensor.Version;
 
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU.
