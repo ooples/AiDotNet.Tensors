@@ -223,7 +223,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // CAUTION: ClearActivationCache should not be called during active GPU operations.
     private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
     private readonly object _activationCacheLock = new();
-    private const int DefaultActivationCacheSize = 4096;
+    // Lowered from 4096 (2026-05-12, issue #283): the larger cap was tuned
+    // for batched inference where many activations could be in-flight, but
+    // in long-running training loops the eviction skip-pending guard meant
+    // unused intermediates rode along until the next deliberate cache clear.
+    // 512 keeps long-loop memory pressure bounded while leaving headroom for
+    // chained-op GPU pipelines (BatchNorm/LayerNorm get unhappy below ~128).
+    private const int DefaultActivationCacheSize = 512;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
 
     /// <summary>
@@ -1273,35 +1279,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // source of truth for activation-cache eviction (#226): the eviction guard
         // checks IsPending on this same vector key to decide whether to spare the
         // underlying GPU buffer.
+        //
+        // IMPORTANT: capture *only* the GPU buffer + backend in the closure, NOT the
+        // Tensor<T> itself. Capturing `tensor` would keep the materializer dict
+        // strongly referencing the whole tensor object — and the materializer dict
+        // is process-static, so every per-step intermediate would survive forever
+        // (issue #283 / AiDotNet#1227 leak signature). When the user-facing tensor
+        // goes out of scope and the activation-cache key (vector) becomes its only
+        // strong reference, the eviction sweep can drop both entries without the
+        // tensor itself being pinned by the registry.
         var vector = tensor.DataVector;
+        var capturedBuffer = outputBuffer;
+        var capturedBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(vector, obj =>
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
-            if (tensor._gpuBuffer is not null && tensor._gpuBackend is not null)
+            float[] floatData;
+            try
             {
-                float[] floatData;
-                try
-                {
-                    floatData = tensor._gpuBackend.DownloadBuffer(tensor._gpuBuffer);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    // Surface a clearer error — historically this manifested as a raw
-                    // "Failed to read OpenCL buffer: -38" with no context on why the
-                    // buffer was invalid. The lifetime fix in this engine covers the
-                    // known case; this wrap guards against any future regression.
-                    throw new InvalidOperationException(
-                        "Deferred GPU download failed because the underlying buffer was " +
-                        "released before materialization. This typically indicates an " +
-                        "activation-cache eviction raced with a pending materializer " +
-                        "(issue #226). See DirectGpuTensorEngine.DeferTensorResult / " +
-                        "EvictOldestActivationsUnsafe.", ex);
-                }
-                var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
-                var arr = vec.GetBackingArrayUnsafe();
-                if (arr is not null)
-                    Array.Copy(converted, arr, Math.Min(converted.Length, arr.Length));
+                floatData = capturedBackend.DownloadBuffer(capturedBuffer);
             }
+            catch (InvalidOperationException ex)
+            {
+                // Surface a clearer error — historically this manifested as a raw
+                // "Failed to read OpenCL buffer: -38" with no context on why the
+                // buffer was invalid. The lifetime fix in this engine covers the
+                // known case; this wrap guards against any future regression.
+                throw new InvalidOperationException(
+                    "Deferred GPU download failed because the underlying buffer was " +
+                    "released before materialization. This typically indicates an " +
+                    "activation-cache eviction raced with a pending materializer " +
+                    "(issue #226). See DirectGpuTensorEngine.DeferTensorResult / " +
+                    "EvictOldestActivationsUnsafe.", ex);
+            }
+            var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+            var arr = vec.GetBackingArrayUnsafe();
+            if (arr is not null)
+                Array.Copy(converted, arr, Math.Min(converted.Length, arr.Length));
         });
 
         // Cache the GPU buffer so GetOrAllocateBuffer finds it
