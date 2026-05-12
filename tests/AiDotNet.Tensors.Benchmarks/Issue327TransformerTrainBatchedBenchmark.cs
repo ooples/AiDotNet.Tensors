@@ -7,6 +7,7 @@ using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -78,6 +79,10 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Console.WriteLine();
         Console.WriteLine("─── Phase C2 — Same step, Persistent tape (compiled chain) ─");
         RunFullTrainStep(engine, persistent: true);
+
+        Console.WriteLine();
+        Console.WriteLine("─── Phase CT — Compiled training plan (JIT-compiled fast path) ─");
+        RunCompiledTrainingPlan(engine);
 
         Console.WriteLine();
         Console.WriteLine("─── Phase D — Sustained CPU utilization probe (5s window) ──");
@@ -426,6 +431,76 @@ public static class Issue327TransformerTrainBatchedBenchmark
         gradScope?.Dispose();
 
         _sink += loss.GetFlatIndexValue(0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Phase CT — JIT-compiled training plan via GraphMode + CompileTraining
+    // ────────────────────────────────────────────────────────────────────
+    private static void RunCompiledTrainingPlan(CpuEngine engine)
+    {
+        var weights = MakeWeights(Layers);
+        var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+
+        CompiledTrainingPlan<float> plan;
+        try
+        {
+            using var scope = GraphMode.Enable();
+            // Build the same forward pattern in lazy graph mode so the
+            // scope captures the op DAG. Lazy graph records each engine
+            // call as a node; CompileTraining lowers the DAG to flat
+            // delegate arrays with pre-allocated gradient buffers and
+            // pinned GCHandles — zero per-step alloc on the hot loop.
+            var y = ForwardL(engine, input, weights, Layers);
+            var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+            plan = scope.CompileTraining(weights);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  CompiledTrainingPlan compile FAILED: {ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        using (plan)
+        {
+            // Warmup so the plan's caches / GC stabilize before timing.
+            const int warmup = 3;
+            const int iters = 20;
+            for (int i = 0; i < warmup; i++) plan.Step();
+
+            long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+            long gen0Before = GC.CollectionCount(0);
+            long gen1Before = GC.CollectionCount(1);
+            long gen2Before = GC.CollectionCount(2);
+            var proc = Process.GetCurrentProcess();
+            proc.Refresh();
+            TimeSpan cpuBefore = proc.TotalProcessorTime;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                var lossOut = plan.Step();
+                _sink += lossOut.GetFlatIndexValue(0);
+            }
+            sw.Stop();
+            proc.Refresh();
+            TimeSpan cpuAfter = proc.TotalProcessorTime;
+            long allocAfter = GC.GetTotalAllocatedBytes(precise: true);
+
+            double msPer = sw.Elapsed.TotalMilliseconds / iters;
+            double cpuSec = (cpuAfter - cpuBefore).TotalSeconds;
+            double wallSec = sw.Elapsed.TotalSeconds;
+            double activeCores = cpuSec / wallSec;
+            long allocPer = (allocAfter - allocBefore) / iters;
+            Console.WriteLine();
+            Console.WriteLine($"  Compiled-plan train step:");
+            Console.WriteLine($"    Per-iter wall      : {msPer,8:F3} ms");
+            Console.WriteLine($"    CPU/wall           : {cpuSec:F2}s / {wallSec:F2}s = {activeCores:F2} active cores ({100 * activeCores / Environment.ProcessorCount:F0}%)");
+            Console.WriteLine($"    Allocation         : {allocPer / 1024.0:F1} KB/iter");
+            Console.WriteLine($"    GC during run      : Gen0 {GC.CollectionCount(0) - gen0Before,3}  Gen1 {GC.CollectionCount(1) - gen1Before,3}  Gen2 {GC.CollectionCount(2) - gen2Before,3} (over {iters} iters)");
+            Console.WriteLine($"    Forward steps      : {plan.ForwardStepCount}");
+            Console.WriteLine($"    Backward steps     : {plan.BackwardStepCount}");
+            Console.WriteLine($"    Issue close target : ≤ 100 ms; stretch ≤ 50 ms");
+            Console.WriteLine($"    Status             : ms-step  : {(msPer <= 50.0 ? "PASS stretch" : msPer <= 100.0 ? "PASS issue-close" : "FAIL")}");
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
