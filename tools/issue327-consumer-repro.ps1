@@ -85,16 +85,41 @@ if (Test-Path $HarmonicEngineDir) {
     Write-Host "[2/4] Updating HarmonicEngine checkout..."
     Push-Location $HarmonicEngineDir
     & git fetch --quiet origin
-    # Reset to the ref. `git checkout <sha>` works for SHAs, branches,
-    # and tags. `git reset --hard origin/<x>` only works for branches —
-    # for SHAs or tags it'd fail. Try the origin-prefixed reset first
-    # and fall through to direct checkout for SHAs/tags.
-    & git checkout --quiet $HarmonicEngineRef
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "git checkout of $HarmonicEngineRef failed (exit $LASTEXITCODE)"
-        exit 1
+    # Reset to the ref. The previous code did `git checkout $ref` +
+    # `git reset --hard $ref` — that's correct for SHAs and tags
+    # (they're immutable), but for BRANCH refs (e.g. `main`) the local
+    # branch stays pinned to whatever commit it had before the fetch.
+    # `git fetch` only updates `origin/<branch>`, not the local
+    # `<branch>`, so the reproducer would silently test an outdated
+    # consumer checkout.
+    #
+    # Probe whether the requested ref is a remote branch. If yes,
+    # hard-reset onto `origin/<ref>` so we pick up upstream commits.
+    # If no (SHA or tag), fall back to the direct-checkout path —
+    # SHAs / tags are immutable so the prior behavior was already
+    # correct for them.
+    & git show-ref --quiet --verify "refs/remotes/origin/$HarmonicEngineRef"
+    if ($LASTEXITCODE -eq 0) {
+        # Branch ref — force-create local branch tracking origin/<ref>
+        # so subsequent runs converge on the same state regardless of
+        # whatever the local branch was at.
+        & git checkout --quiet -B $HarmonicEngineRef "origin/$HarmonicEngineRef"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "git checkout -B $HarmonicEngineRef origin/$HarmonicEngineRef failed (exit $LASTEXITCODE)"
+            Pop-Location
+            exit 1
+        }
+        & git reset --hard --quiet "origin/$HarmonicEngineRef"
+    } else {
+        # SHA or tag — immutable, direct checkout converges trivially.
+        & git checkout --quiet $HarmonicEngineRef
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "git checkout of $HarmonicEngineRef failed (exit $LASTEXITCODE)"
+            Pop-Location
+            exit 1
+        }
+        & git reset --hard --quiet $HarmonicEngineRef 2>$null
     }
-    & git reset --hard --quiet $HarmonicEngineRef 2>$null
     Pop-Location
 } else {
     Write-Host "[2/4] Cloning HarmonicEngine..."
