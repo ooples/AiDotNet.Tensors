@@ -81,6 +81,13 @@ public static class TensorPool<T>
     public static void Return(Tensor<T> tensor)
     {
         if (tensor == null || tensor.Length == 0) return;
+        // Issue #338 tape-pinning: tensors recorded as inputs (or
+        // saved-state) on an active GradientTape must not be reissued as
+        // scratch — a later backward op will still consume them. Without
+        // this guard, PR #331's per-op pooling attempt regressed
+        // Hvp_MatchesHessianTimesVec. DifferentiableOps.Record* sets the
+        // pin; the tape's cleanup walk clears it after backward.
+        if (tensor._pinnedByTape) return;
         if (_totalPooled >= MaxTotalPooled) return;
 
         _pools ??= new Dictionary<int, Stack<Tensor<T>>>();

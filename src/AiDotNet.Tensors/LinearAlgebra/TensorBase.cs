@@ -382,6 +382,24 @@ public abstract class TensorBase<T> : IDisposable
     internal int _gpuBufferVersion = -1;
 
     /// <summary>
+    /// Issue #338: when true, this tensor has been recorded as an input
+    /// (or saved-state) of an active <see cref="Engines.Autodiff.GradientTape{T}"/>
+    /// entry and MUST NOT be returned to <see cref="Engines.Autodiff.TensorPool{T}"/>
+    /// until the tape's backward walk completes.
+    /// <para>
+    /// PR #331 attempted "Pool-return for MatMul backward bT2/aT2" but
+    /// broke <c>Hvp_MatchesHessianTimesVec</c> because the pooled scratch
+    /// could be reissued under a Hvp / SumToScalarTensor alias before
+    /// the tape's later backward op consumed it. The pin flag is the fix:
+    /// <see cref="Engines.Autodiff.DifferentiableOps"/>'s RecordUnary /
+    /// RecordBinary / RecordIfActive set it on every input that goes onto
+    /// the tape, and the pool's Return refuses pinned tensors. Cleared by
+    /// the tape's cleanup walk when the backward pass finishes.
+    /// </para>
+    /// </summary>
+    internal bool _pinnedByTape;
+
+    /// <summary>
     /// The GPU memory management role for this tensor (weight, activation, gradient, etc.).
     /// Used by the GPU memory planner for allocation and eviction decisions.
     /// </summary>

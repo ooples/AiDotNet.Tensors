@@ -681,6 +681,12 @@ public sealed class GradientTape<T> : IDisposable
         {
             t.GradFn = null;
         }
+        // Issue #338: clear the tape-pinning flag set by
+        // DifferentiableOps.Record* — the backward walk has completed and
+        // the tensor is safe to pool again. Cleared regardless of source /
+        // RetainGrad status because the pin guards against pool reuse, not
+        // .Grad lifecycle.
+        t._pinnedByTape = false;
         // Preserve .Grad when the caller explicitly listed this tensor as a source
         // (they're going to read `tensor.Grad` rather than the returned Dictionary).
         if (sourceSet?.Contains(t) == true) return;
@@ -1061,8 +1067,18 @@ public sealed class GradientTape<T> : IDisposable
                     // node.Output is always owned by this tape (we just verified
                     // nodeOwnedByThisTape above). Safe to clear both fields.
                     node.Output.GradFn = null;
+                    // Issue #338: clear the tape-pinning flag on every
+                    // tape-owned tensor we touch — the backward walk has
+                    // consumed it and pooling is safe again.
+                    node.Output._pinnedByTape = false;
                     if (!ShouldKeepGrad(node.Output))
                         node.Output.Grad = null;
+                    node.Input0._pinnedByTape = false;
+                    if (node.Input1 is not null) node.Input1._pinnedByTape = false;
+                    if (node.Input2 is not null) node.Input2._pinnedByTape = false;
+                    if (node.InputsOverflow is not null)
+                        foreach (var inp in node.InputsOverflow)
+                            inp._pinnedByTape = false;
 
                     // Input0 is non-nullable on GradNode<T>; the recorder
                     // always populates it. But it CAN be a leaf (no GradFn)
@@ -1147,6 +1163,28 @@ public sealed class GradientTape<T> : IDisposable
                     // Tensor-side liveness tracking.
                 }
             }
+            else
+            {
+                // Issue #338: even on the persistent-tape path (where the
+                // full cleanup is skipped because the chain is cached for
+                // replay), the tape-pinning flags must be cleared after
+                // backward — pool safety is independent of graph-retention
+                // semantics. Without this, persistent-tape users would
+                // accumulate "permanently pinned" tensors that
+                // TensorPool.Return refuses, defeating the entire pooling
+                // win the pin flag was designed to unlock.
+                foreach (var node in topoOrder)
+                {
+                    if (!ReferenceEquals(node.OwningTape, this)) continue;
+                    node.Output._pinnedByTape = false;
+                    node.Input0._pinnedByTape = false;
+                    if (node.Input1 is not null) node.Input1._pinnedByTape = false;
+                    if (node.Input2 is not null) node.Input2._pinnedByTape = false;
+                    if (node.InputsOverflow is not null)
+                        foreach (var inp in node.InputsOverflow)
+                            inp._pinnedByTape = false;
+                }
+            }
 
             // Drop captured refs in the steps array's live range so they
             // don't extend tensor lifetimes through the scratch pool.
@@ -1213,6 +1251,11 @@ public sealed class GradientTape<T> : IDisposable
             if (fn is not null && ReferenceEquals(fn.OwningTape, this))
             {
                 output.GradFn = null;
+                // Issue #338 tape-pinning: backward replay has consumed
+                // this output (and the entry above re-registered it via
+                // Record*). Cleared regardless of source/retain — the pin
+                // guards the pool, not .Grad.
+                output._pinnedByTape = false;
                 bool keepGrad = sourceSet?.Contains(output) == true
                     || (_retainGrad is not null && _retainGrad.Contains(output));
                 if (!keepGrad) output.Grad = null;
@@ -1244,6 +1287,9 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T>? t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
     {
         if (t is null) return;
+        // Issue #338: clear the tape-pinning flag set by DifferentiableOps.Record*
+        // — backward replay has consumed this tensor and pooling is safe again.
+        t._pinnedByTape = false;
         bool ownedByThisTape = intermediates.Contains(t);
         if (ownedByThisTape)
         {
