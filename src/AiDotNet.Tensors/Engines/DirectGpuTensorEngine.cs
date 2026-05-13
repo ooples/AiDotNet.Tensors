@@ -417,6 +417,45 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool SupportsDeferredExecution => GetAsyncBackend() != null;
 
     /// <summary>
+    /// Acquires a <see cref="GpuStreamScheduler"/> bound to this engine's
+    /// async backend's stream pool. Use <see cref="GpuStreamScheduler.Dispatch"/>
+    /// to fan independent kernel launches across multiple streams in
+    /// parallel — e.g. per-head attention scoring, parallel branches in
+    /// ResNet bottleneck blocks, batched matmul slices.
+    /// </summary>
+    /// <param name="streamPool">Optional pre-built stream pool. When
+    /// null, a fresh pool sized to the backend's
+    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> is created
+    /// (callers should dispose the returned scheduler + pool to release
+    /// native stream handles).</param>
+    /// <param name="streamType">Stream class used for the scheduler's
+    /// leases. Defaults to <see cref="GpuStreamType.Compute"/>.</param>
+    /// <returns>A scheduler, or null when the engine has no async-capable
+    /// backend OR the backend doesn't support multiple concurrent streams.</returns>
+    /// <remarks>
+    /// Closes the consumer-side gap surfaced by issue #335: the
+    /// scheduler exists in <c>AiDotNet.Tensors.Engines.Gpu</c> but had
+    /// no engine-level entry point. AiDotNet's parallel-dispatch
+    /// callers (multi-head attention, multi-branch CNN blocks) can now
+    /// reach it without inspecting backend internals.
+    /// </remarks>
+    public GpuStreamScheduler? GetStreamScheduler(
+        GpuStreamPool? streamPool = null,
+        GpuStreamType streamType = GpuStreamType.Compute)
+    {
+        var asyncBackend = GetAsyncBackend();
+        if (asyncBackend is null) return null;
+        if (!asyncBackend.SupportsMultiStream) return null;
+
+        if (streamPool is not null)
+            return new GpuStreamScheduler(streamPool, streamType);
+
+        var options = GpuExecutionOptions.FromEnvironment();
+        var ownedPool = new GpuStreamPool(asyncBackend, options);
+        return new GpuStreamScheduler(ownedPool, streamType);
+    }
+
+    /// <summary>
     /// Gets the current GPU execution context for this thread, if any.
     /// This allows operations to check if GPU-resident mode is active.
     /// </summary>
