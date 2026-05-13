@@ -39,17 +39,19 @@ internal static class RebindablePlanCache<T>
     private static int[]? _cachedReverseTopoIndices;
 
     /// <summary>
-    /// Thread-local 3-slot inputs buffer reused across every entry in a
-    /// single <see cref="TryExecute"/> walk. <see cref="TapeEntry{T}.GetInputsArrayInto"/>
-    /// populates the slots from <see cref="TapeEntry{T}.Input0"/> /
-    /// <see cref="TapeEntry{T}.Input1"/> / <see cref="TapeEntry{T}.Input2"/>
-    /// (≤3 inputs) or returns the entry's <see cref="TapeEntry{T}.InputsOverflow"/>
-    /// array directly (≥4 inputs). Either path avoids the per-entry
-    /// fresh-array allocation that <see cref="TapeEntry{T}.GetInputsArray"/>
-    /// pays. Allocated lazily on first call per thread.
+    /// Thread-local per-arity inputs buffers (length 1 / 2 / 3) reused
+    /// across every entry in a single <see cref="TryExecute"/> walk.
+    /// <see cref="TapeEntry{T}.GetInputsArrayInto"/> returns the buffer
+    /// whose <c>.Length</c> matches the entry's <c>InputCount</c>, or
+    /// the entry's <see cref="TapeEntry{T}.InputsOverflow"/> array for
+    /// ≥4 inputs. The arity-matched length preserves the existing
+    /// <c>BackwardFunction&lt;T&gt;</c> contract that <c>inputs.Length
+    /// == InputCount</c> (many backward functions branch on
+    /// <c>inputs.Length</c>). Allocated lazily on first call per thread.
     /// </summary>
-    [ThreadStatic]
-    private static Tensor<T>[]? s_inputsBuffer;
+    [ThreadStatic] private static Tensor<T>[]? s_inputsBuffer1;
+    [ThreadStatic] private static Tensor<T>[]? s_inputsBuffer2;
+    [ThreadStatic] private static Tensor<T>[]? s_inputsBuffer3;
 
     /// <summary>Quick-check for cache presence without a full lookup.</summary>
     internal static bool IsEmpty => _cachedReverseTopoIndices is null;
@@ -126,7 +128,9 @@ internal static class RebindablePlanCache<T>
         // can clobber the buffer mid-walk) and (b) `Backward` consumes
         // inputs synchronously — no backward function in the codebase
         // retains the inputs[] reference past its own return.
-        var inputsBuffer = s_inputsBuffer ??= new Tensor<T>[3];
+        var inputsBuffer1 = s_inputsBuffer1 ??= new Tensor<T>[1];
+        var inputsBuffer2 = s_inputsBuffer2 ??= new Tensor<T>[2];
+        var inputsBuffer3 = s_inputsBuffer3 ??= new Tensor<T>[3];
         bool timing = BackwardTiming.Enabled;
         var indices = _cachedReverseTopoIndices;
         try
@@ -149,7 +153,7 @@ internal static class RebindablePlanCache<T>
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
                 entry.Backward(
                     gradOutput,
-                    entry.GetInputsArrayInto(inputsBuffer),
+                    entry.GetInputsArrayInto(inputsBuffer1, inputsBuffer2, inputsBuffer3),
                     entry.Output,
                     entry.SavedState ?? Array.Empty<object>(),
                     engine,
@@ -163,15 +167,18 @@ internal static class RebindablePlanCache<T>
         }
         finally
         {
-            // Clear the buffer's references so a forward intermediate
-            // that just rode through here (as an Input field of some
-            // entry) doesn't get pinned in the thread-static buffer for
-            // the rest of the worker thread's lifetime. The
-            // GradientTapeLeakTests gradient-cleanup assertions catch
-            // exactly this kind of cross-call retention.
-            inputsBuffer[0] = null!;
-            inputsBuffer[1] = null!;
-            inputsBuffer[2] = null!;
+            // Clear every per-arity buffer's references so a forward
+            // intermediate that just rode through here (as an Input
+            // field of some entry) doesn't get pinned in the thread-
+            // static buffer for the rest of the worker thread's
+            // lifetime. The GradientTapeLeakTests gradient-cleanup
+            // assertions catch exactly this kind of cross-call retention.
+            inputsBuffer1[0] = null!;
+            inputsBuffer2[0] = null!;
+            inputsBuffer2[1] = null!;
+            inputsBuffer3[0] = null!;
+            inputsBuffer3[1] = null!;
+            inputsBuffer3[2] = null!;
         }
 
         // Source filter — same semantics as CompiledDelegateChain.Execute.

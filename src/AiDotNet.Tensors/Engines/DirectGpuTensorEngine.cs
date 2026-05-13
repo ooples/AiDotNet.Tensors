@@ -677,11 +677,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void InvalidateActivationCacheEntry(object key)
     {
+        // Byte-accounting units must match the add/remove/evict paths
+        // (CacheActivation, RemoveActivationCacheEntry, EvictOldestActivationsUnsafe).
+        // All four go through Interlocked.Add(ref _currentActivationCacheBytes, ±SizeInBytes)
+        // so the counter is unit-consistent across FP32 and FP16 (AutocastScope)
+        // entries and stays well-formed under concurrent eviction.
         lock (_activationCacheLock)
         {
             if (_activationCache.TryRemove(key, out var entry))
             {
-                _currentActivationCacheBytes -= entry.Buffer.SizeInBytes;
+                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
+                    -entry.Buffer.SizeInBytes);
                 entry.Dispose();
             }
         }
@@ -898,8 +904,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Evict old entries if cache is full by count or GPU memory budget
             bool overCount = _activationCache.Count >= _maxActivationCacheSize;
+            // Use IGpuBuffer.SizeInBytes (per-backend, dtype-aware) instead of
+            // `Size * sizeof(float)` so the accounting stays correct when
+            // AutocastScope inserts FP16 buffers — see InvalidateActivationCacheEntry
+            // for the unit-consistency contract.
             bool overMemory = _maxActivationCacheBytes > 0
-                && _currentActivationCacheBytes + (buffer.Size * sizeof(float)) > _maxActivationCacheBytes;
+                && _currentActivationCacheBytes + buffer.SizeInBytes > _maxActivationCacheBytes;
             if (overCount || overMemory)
             {
                 evicted = EvictOldestActivationsUnsafe();
@@ -920,7 +930,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 else
                 {
-                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, buffer.Size * sizeof(float));
+                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, buffer.SizeInBytes);
                 }
             }
         }
@@ -940,7 +950,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (_activationCache.TryRemove(cacheKey, out var entry))
             {
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                    -(entry.Buffer.Size * sizeof(float)));
+                    -entry.Buffer.SizeInBytes);
                 removed = entry;
             }
         }
@@ -1007,7 +1017,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
                     System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                        -(entry.Buffer.Size * sizeof(float)));
+                        -entry.Buffer.SizeInBytes);
                     toDispose.Add(entry);
                     removed++;
                 }
@@ -4820,55 +4830,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// GPU-accelerated backward pass for 2D average pooling.
-    /// Distributes gradients evenly across the input elements that contributed to each output.
+    /// 2D average-pooling backward. Routes unconditionally through
+    /// <see cref="CpuEngine"/> because the GPU kernel for this overload
+    /// crashed with 0xC0000005 on small 1×1×H×W inputs surfaced by
+    /// <c>AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient</c>.
+    /// The prior GPU implementation was retained as dead code under a
+    /// <c>#pragma warning disable CS0162</c> suppression — that's a
+    /// maintenance liability (silent edits to the unreachable block,
+    /// false sense of GPU coverage). The kernel and its parameter
+    /// layout remain in git history (commit 3aedf69) if and when the
+    /// crash root cause is fixed and the GPU path is re-enabled.
     /// </summary>
     public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
-        // CUDA kernel-launch crashes (0xC0000005) on this overload for
-        // small 1x1xHxW inputs surfaced by
-        // AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient. Route
-        // through CpuEngine until the kernel parameter layout is fixed.
         return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
-#pragma warning disable CS0162 // Unreachable code
-        if (!TryGetBackend(out var backend))
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
-
-        if (gradOutput.Rank != 4 || inputShape.Length != 4)
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
-
-        int batch = inputShape[0];
-        int channels = inputShape[1];
-        int inHeight = inputShape[2];
-        int inWidth = inputShape[3];
-        int outHeight = gradOutput.Shape._dims[2];
-        int outWidth = gradOutput.Shape._dims[3];
-
-        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
-        using var gradInputBuffer = AllocateOutputBuffer(backend, batch * channels * inHeight * inWidth);
-
-        try
-        {
-            backend.AvgPool2DBackward(gradOutputBuffer.Buffer, gradInputBuffer.Buffer,
-                batch, channels, inHeight, inWidth,
-                outHeight, outWidth,
-                poolSize[0], poolSize[1],
-                stride[0], stride[1], 0, 0,
-                countIncludePad: true);
-
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
-            int inputSize = batch * channels * inHeight * inWidth;
-            float[] resultFloat = new float[inputSize];
-            backend.DownloadBuffer(gradInputBuffer.Buffer, resultFloat);
-
-            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            return new Tensor<T>(resultData, inputShape);
-        }
-        catch
-        {
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
-        }
-#pragma warning restore CS0162
     }
 
     /// <summary>

@@ -30,19 +30,21 @@ public class Issue327TransformerTrainPerfTests
     private const int Layers = 4;
 
     /// <summary>
-    /// Regression guard for the Phase 3 persistent-tape Train step on a
-    /// 16+ logical-core x64 host. Issue #327's close target is ≤ 100 ms;
-    /// the PyTorch-parity stretch target is ≤ 50 ms — this phase HAS NOT
-    /// hit the stretch yet (Phase 3 measurements land ~135-140 ms/iter
-    /// steady-state on the reference 16-core dev box). The Assert.True
-    /// gate below is intentionally set at ≤ 250 ms — well above the
-    /// observed mean — so CI noise and slower runners don't flap; the
+    /// Regression ceiling for the Phase 3 persistent-tape Train step on
+    /// a 16+ logical-core x64 host. Issue #327's close target is ≤ 100 ms
+    /// and the PyTorch-parity stretch target is ≤ 50 ms; Phase 3 lands
+    /// ~135-140 ms/iter steady-state on the reference 16-core dev box,
+    /// so neither finer target is hit yet. This test gates at ≤ 250 ms
+    /// — well above the observed mean — as a coarse no-regression
+    /// ceiling that won't flap on CI noise or slower runners. The
     /// tighter close / stretch targets are validated by the BDN harness
-    /// in tests/AiDotNet.Tensors.Benchmarks instead.
+    /// in tests/AiDotNet.Tensors.Benchmarks instead. The test name
+    /// reflects the regression-ceiling intent rather than the unmet
+    /// 100 ms close target (PR #331 review).
     /// </summary>
     [Fact]
     [Trait("Category", "Perf")]
-    public void Issue327_Transformer_PersistentTape_TrainStep_BelowIssueCloseTarget()
+    public void Issue327_Transformer_PersistentTape_TrainStep_BelowPerfRegressionGate()
     {
         // Hardware gate: the issue scope is 16+ logical core x64. On
         // narrower hardware (CI workers with 2-4 cores, ARM emulation)
