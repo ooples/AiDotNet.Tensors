@@ -55,42 +55,61 @@ public class GroupNormOpTests
     [Fact]
     public void Backward_GradientsMatchAutodiff()
     {
-        var engine = new CpuEngine();
-
-        var input = Tensor<float>.CreateRandom([2, 4, 3]);
-        var gamma = Tensor<float>.CreateRandom([4]);
-        var beta  = Tensor<float>.CreateRandom([4]);
-        int numGroups = 2;
-
-        // Compile a training plan that uses GroupNorm → ReduceSum
-        ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.Enable())
+        // The LazyTensorScope captures AiDotNetEngine.Current at construction
+        // time and uses it to drive the forward closures at plan.Step() time.
+        // Since PR #333 enabled GPU auto-detect via ModuleInitializer, on
+        // machines with a GPU the captured engine is DirectGpuTensorEngine
+        // even when a test instantiates `new CpuEngine()` locally. Some GPU
+        // backends produce zeros for the GroupNorm path on small shapes
+        // (probed: [2,4,3], numGroups=2 returns all-zero output) which broke
+        // this test's `Assert.NotEqual(0f, loss[0])`. Pin the engine to CPU
+        // for the lifetime of this test so the compiled-plan replay path
+        // exercises a known-correct GroupNorm implementation.
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
         {
-            var normed = engine.GroupNorm(input, numGroups, gamma, beta, 1e-5,
-                out _, out _);
-            engine.ReduceSum(normed, null);
-            plan = scope.CompileTraining(new[] { gamma, beta });
+            var engine = new CpuEngine();
+
+            var input = Tensor<float>.CreateRandom([2, 4, 3]);
+            var gamma = Tensor<float>.CreateRandom([4]);
+            var beta  = Tensor<float>.CreateRandom([4]);
+            int numGroups = 2;
+
+            // Compile a training plan that uses GroupNorm → ReduceSum
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var normed = engine.GroupNorm(input, numGroups, gamma, beta, 1e-5,
+                    out _, out _);
+                engine.ReduceSum(normed, null);
+                plan = scope.CompileTraining(new[] { gamma, beta });
+            }
+
+            var loss = plan.Step();
+            Assert.False(float.IsNaN(loss[0]), "GroupNorm training loss is NaN");
+            Assert.NotEqual(0f, loss[0]);
+
+            // Gradients should be non-trivial
+            Assert.Equal(2, plan.Gradients.Length);
+            bool gammaGradNonZero = false;
+            var gammaGrad = plan.Gradients[0].AsSpan();
+            for (int i = 0; i < gammaGrad.Length; i++)
+                if (Math.Abs(gammaGrad[i]) > 1e-8f) { gammaGradNonZero = true; break; }
+            Assert.True(gammaGradNonZero, "Gamma gradients are all zero");
+
+            bool betaGradNonZero = false;
+            var betaGrad = plan.Gradients[1].AsSpan();
+            for (int i = 0; i < betaGrad.Length; i++)
+                if (Math.Abs(betaGrad[i]) > 1e-8f) { betaGradNonZero = true; break; }
+            Assert.True(betaGradNonZero, "Beta gradients are all zero");
+
+            plan.Dispose();
         }
-
-        var loss = plan.Step();
-        Assert.False(float.IsNaN(loss[0]), "GroupNorm training loss is NaN");
-        Assert.NotEqual(0f, loss[0]);
-
-        // Gradients should be non-trivial
-        Assert.Equal(2, plan.Gradients.Length);
-        bool gammaGradNonZero = false;
-        var gammaGrad = plan.Gradients[0].AsSpan();
-        for (int i = 0; i < gammaGrad.Length; i++)
-            if (Math.Abs(gammaGrad[i]) > 1e-8f) { gammaGradNonZero = true; break; }
-        Assert.True(gammaGradNonZero, "Gamma gradients are all zero");
-
-        bool betaGradNonZero = false;
-        var betaGrad = plan.Gradients[1].AsSpan();
-        for (int i = 0; i < betaGrad.Length; i++)
-            if (Math.Abs(betaGrad[i]) > 1e-8f) { betaGradNonZero = true; break; }
-        Assert.True(betaGradNonZero, "Beta gradients are all zero");
-
-        plan.Dispose();
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
     }
 
     // ── Attributes accessible for fusion pass introspection ──────────────────
