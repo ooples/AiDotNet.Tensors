@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels
+public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
