@@ -3015,7 +3015,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // forward — only the SINGLE-CALL fused kernel is given up.
         // Pure-inference callers (no tape) still get the full fused
         // kernel speedup.
-        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        if (IsTapeActive<T>())
             return base.FusedLinear(input, weights, bias, activation);
 
         if (!TryGetBackend(out var backend))
@@ -3897,7 +3897,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // DifferentiableOps entirely, so taking it during training would
         // silently disconnect the op from autograd. Pure-inference callers
         // still take the fused-kernel speedup.
-        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        if (IsTapeActive<T>())
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         if (!TryGetBackend(out var backend))
@@ -5906,7 +5906,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // a tape entry with FlashAttentionBackward so gradient flow to Q,
         // K, V works. Keeping `public override` makes the IEngine dispatch
         // reach this method instead of CpuEngine's implicit-interface impl.
-        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        if (IsTapeActive<T>())
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
         if (!TryGetBackend(out var backend))
@@ -6064,7 +6064,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // into recorded primitives. The fused GPU kernel below bypasses
         // DifferentiableOps, so taking it during training would
         // silently disconnect this op from autograd.
-        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        if (IsTapeActive<T>())
             return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
 
         if (!TryGetBackend(out var backend))

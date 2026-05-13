@@ -938,6 +938,16 @@ public abstract class TensorBase<T> : IDisposable
             ThrowIfSparse();
             ValidateIndices(indices);
             _data[GetFlatIndex(indices)] = value;
+            // Element-level CPU mutation: bump the version counter so cached
+            // GPU buffers (DirectGpuTensorEngine activation cache,
+            // _gpuBufferVersion) detect the change and re-upload. Mirrors
+            // SetFlat's invariant — any element write goes through one of
+            // these two paths and both bump the version. GetFlatIndex
+            // returns a STORAGE index (already includes _storageOffset and
+            // _strides) so we can't route this through SetFlat directly
+            // without an extra logical-flat translation; the manual bump is
+            // the smallest change that closes the gap.
+            IncrementVersion();
         }
     }
 
