@@ -146,10 +146,11 @@ public class GradientTapeLeakTests
             _output.WriteLine("");
             _output.WriteLine("=== Issue #283 leak diagnostic (scanning static state) ===");
             var aidotnetAssembly = typeof(Tensor<float>).Assembly;
-            var visited = new System.Collections.Generic.HashSet<object>(
-                ReferenceEqualityComparer.Instance);
-            var survivorSet = new System.Collections.Generic.HashSet<object>(
-                ReferenceEqualityComparer.Instance);
+            // Reference-equality set without .NET 5+'s ReferenceEqualityComparer
+            // (the test multi-targets net471 which doesn't ship it).
+            var refEq = new ReferenceEqualityComparerLocal();
+            var visited = new System.Collections.Generic.HashSet<object>(refEq);
+            var survivorSet = new System.Collections.Generic.HashSet<object>(refEq);
             foreach (var (_, t) in survivorTargets) survivorSet.Add(t);
 
             foreach (var type in aidotnetAssembly.GetTypes())
@@ -185,6 +186,14 @@ public class GradientTapeLeakTests
             $"survived Gen2 GC after GradientTape.Dispose. Surviving labels: " +
             string.Join(", ", survivors));
 
+    }
+
+    // Reference-equality comparer for object — net471 doesn't have
+    // System.Collections.Generic.ReferenceEqualityComparer (added in .NET 5).
+    private sealed class ReferenceEqualityComparerLocal : System.Collections.Generic.IEqualityComparer<object>
+    {
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
+        public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 
     // Walks an object graph up to maxDepth looking for any of the survivors.
