@@ -251,7 +251,31 @@ public sealed class GradientTape<T> : IDisposable
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
             {
-                return compiledBwd.Execute(loss);
+                // Issue #283: suspend the tape during compiled-backward
+                // replay. Without this, engine ops invoked from BackwardFunctions
+                // (TensorMatMul/TensorTranspose/etc.) see Current != null and
+                // record fresh tape entries whose GradNodes hold the FORWARD
+                // intermediates as inputs. The compiled plan's cleanup only
+                // visits the forward _reachableEntryIndices — backward-
+                // recorded entries' GradFn chains are NEVER cleared, pinning
+                // ~7 forward intermediates × ~40KB each per iter (the
+                // 133KB-1MB/call signature in the GradientTapeLeakTests
+                // transformer-scale probes). The non-compiled path
+                // (ComputeGradientsViaGraph) already suspends — this is the
+                // missing parity. Same gating: createGraph=true intentionally
+                // keeps recording so higher-order ops (Hvp/Hessian) land in
+                // the outer tape, but the compiled-replay path is gated on
+                // !createGraph (line 249 above) so we always suspend here.
+                var savedCompiledReplayCurrent = _current;
+                SetCurrentTape(null);
+                try
+                {
+                    return compiledBwd.Execute(loss);
+                }
+                finally
+                {
+                    SetCurrentTape(savedCompiledReplayCurrent);
+                }
             }
         }
 

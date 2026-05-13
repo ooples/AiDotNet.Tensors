@@ -133,15 +133,49 @@ internal sealed class OptimizedBackwardPlan<T>
                 foreach (var s in _sources) sourceSet.Add(s);
             }
 
+            // Pool-return gating: createGraph=true keeps the recorded backward
+            // ops alive past this cleanup; skipping pool-return on that path
+            // matches ComputeGradientsViaGraphCore's behaviour.
+            bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
+
+            // Issue #283 parity: pre-collect intermediates owned by this plan.
+            // Used by CleanupInput below to decide whether an input is an
+            // intermediate (clear GradFn/Grad) or a leaf (preserve .Grad).
+            var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (int j in _reachableIndices)
+            {
+                var o = _entries[j].Output;
+                if (o is not null) intermediates.Add(o);
+            }
+
             foreach (int i in _reachableIndices)
             {
                 ref var e = ref _entries[i];
                 e.Output._gradIndex = -1;
-                if (e.Input0 != null) e.Input0._gradIndex = -1;
-                if (e.InputCount >= 2 && e.Input1 != null) e.Input1._gradIndex = -1;
-                if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
+                e.Output._pinnedByTape = false;
+                if (e.Input0 != null)
+                {
+                    e.Input0._gradIndex = -1;
+                    e.Input0._pinnedByTape = false;
+                }
+                if (e.InputCount >= 2 && e.Input1 != null)
+                {
+                    e.Input1._gradIndex = -1;
+                    e.Input1._pinnedByTape = false;
+                }
+                if (e.InputCount >= 3 && e.Input2 != null)
+                {
+                    e.Input2._gradIndex = -1;
+                    e.Input2._pinnedByTape = false;
+                }
                 if (e.InputsOverflow != null)
-                    foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+                {
+                    foreach (var inp in e.InputsOverflow)
+                    {
+                        inp._gradIndex = -1;
+                        inp._pinnedByTape = false;
+                    }
+                }
 
                 // e.Output is always a graph intermediate; inputs may be
                 // leaves (parameters) so we don't touch their .Grad here.
@@ -150,8 +184,26 @@ internal sealed class OptimizedBackwardPlan<T>
                 bool keepGrad =
                     (sourceSet?.Contains(e.Output) == true)
                     || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                // Issue #283: capture the GradNode before nulling so it can
+                // be pool-returned. Parity with ComputeGradientsViaGraphCore's
+                // GradNodePool<T>.Return call.
+                var node = e.Output.GradFn;
                 e.Output.GradFn = null;
                 if (!keepGrad) e.Output.Grad = null;
+                if (canPoolNodes && node is not null)
+                {
+                    GradNodePool<T>.Return(node);
+                }
+
+                // Issue #283 parity: clear input-side back-pointers too.
+                CleanupInput(e.Input0, intermediates, sourceSet, canPoolNodes);
+                if (e.InputCount >= 2) CleanupInput(e.Input1, intermediates, sourceSet, canPoolNodes);
+                if (e.InputCount >= 3) CleanupInput(e.Input2, intermediates, sourceSet, canPoolNodes);
+                if (e.InputsOverflow is not null)
+                {
+                    foreach (var inp in e.InputsOverflow)
+                        CleanupInput(inp, intermediates, sourceSet, canPoolNodes);
+                }
             }
         }
 
@@ -167,6 +219,22 @@ internal sealed class OptimizedBackwardPlan<T>
         }
 
         return grads;
+    }
+
+    private void CleanupInput(
+        Tensor<T>? t,
+        HashSet<Tensor<T>> intermediates,
+        HashSet<Tensor<T>>? sourceSet,
+        bool canPoolNodes)
+    {
+        if (t is null) return;
+        if (!intermediates.Contains(t)) return;
+        var inNode = t.GradFn;
+        t.GradFn = null;
+        if (canPoolNodes && inNode is not null) GradNodePool<T>.Return(inNode);
+        bool keep = (sourceSet?.Contains(t) == true)
+                    || (_retainGrad is not null && _retainGrad.Contains(t));
+        if (!keep) t.Grad = null;
     }
 
     /// <summary>
