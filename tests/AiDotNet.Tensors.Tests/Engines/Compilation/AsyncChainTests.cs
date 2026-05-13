@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
@@ -15,8 +16,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// validation at chain time, and proper rejection of disposed /
 /// foreign / shape-mismatched plans.
 /// </summary>
-public class AsyncChainTests
+public class AsyncChainTests : IDisposable
 {
+    // PR #333's GPU auto-detect ModuleInitializer flips AiDotNetEngine.Current
+    // to DirectGpuTensorEngine on GPU machines, but CompiledModelCache /
+    // GetOrCompileInference capture Current as the plan's execution engine.
+    // The tests instantiate `new CpuEngine()` locally for record-time op
+    // dispatch, but plan replay runs on the captured engine — and on GPU
+    // the SetInput-rebind path on this test's small-shape plan yields
+    // identical output for distinct inputs (see SetInput_MatchesSetInputs_*),
+    // tripping the differs-assert. Pin Current to CPU for the suite's
+    // lifetime so plan replay sees the same engine that authored the ops.
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    public AsyncChainTests() { AiDotNetEngine.Current = new CpuEngine(); }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
+
     private static (CompiledModelCache<float> cache, ICompiledPlan<float> plan) BuildLinearReluPlan(
         CpuEngine engine, Tensor<float> input, Tensor<float> w, Tensor<float> b)
     {

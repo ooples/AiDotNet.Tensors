@@ -16,8 +16,19 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation.Serialization;
 /// Validates SaveAsync → LoadInferenceAsync round-trip produces plans whose
 /// Execute() returns bitwise-identical outputs to the original.
 /// </summary>
-public class InferencePlanSerializationTests
+public class InferencePlanSerializationTests : IDisposable
 {
+    // PR #333's GPU auto-detect ModuleInitializer makes plan compilation
+    // capture DirectGpuTensorEngine from Current even when tests pass
+    // `new CpuEngine()` to the builder. Round-trip bit-identity only holds
+    // when the same engine kernel runs at both Save and Load time — GPU
+    // engines produce ULP-level drift that breaks `Assert.Equal(expected,
+    // actual)` per-element comparison. Pin to CPU for this serialization
+    // suite (which the test name "Bitwise" advertises as its contract).
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    public InferencePlanSerializationTests() { AiDotNetEngine.Current = new CpuEngine(); }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static ICompiledPlan<float> CompileMatMulSigmoid(

@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -9,9 +10,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Verifies that fused Linear+Activation ops produce identical gradients
 /// to the equivalent unfused (separate MatMul + Add + Activation) ops.
 /// </summary>
-public class FusedLinearGradientTests
+public class FusedLinearGradientTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    // PR #333's GPU auto-detect ModuleInitializer flips AiDotNetEngine.Current
+    // to DirectGpuTensorEngine on GPU machines. The fused-vs-unfused gradient
+    // identity exercised here only holds on the CPU engine where the fused
+    // kernel and the unfused composition share the same accumulator order.
+    // Pin to CPU so this test isn't a host-config flake.
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    public FusedLinearGradientTests()
+    {
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
 
     private static Tensor<float> CreateRandom(int[] shape, int seed)
     {

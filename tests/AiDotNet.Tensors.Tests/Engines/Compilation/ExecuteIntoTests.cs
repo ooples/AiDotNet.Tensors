@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -12,8 +13,17 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// rebind storage so every Replay reads and writes the caller's buffers
 /// instead of the plan's compile-time allocations.
 /// </summary>
-public class ExecuteIntoTests
+public class ExecuteIntoTests : IDisposable
 {
+    // Same engine-pinning rationale as AsyncChainTests / GroupNormOpTests:
+    // PR #333's GPU auto-detect makes the LazyTensorScope capture
+    // DirectGpuTensorEngine even when the test instantiates `new CpuEngine()`
+    // locally, which breaks SetInputs-rebind semantics on small shapes.
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    public ExecuteIntoTests() { AiDotNetEngine.Current = new CpuEngine(); }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
+
+
     [Fact]
     public void ExecuteInto_WritesIntoCallerBuffer()
     {
