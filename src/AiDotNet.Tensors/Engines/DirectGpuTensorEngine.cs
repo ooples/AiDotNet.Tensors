@@ -2369,10 +2369,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        // Same version-counter bump rationale as the `public override`
-        // path above — keep the in-place contract intact on IEngine-typed
-        // dispatch.
-        a.IncrementVersion();
+        // Version-counter contract is enforced inside TryRunBinaryInPlace
+        // (and CpuEngine's base implementation on the fallback path).
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
@@ -2933,6 +2931,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float[] resultFloat = backend.DownloadBuffer(bufferA.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
         Array.Copy(resultT, aData, aData.Length);
+        // Version-counter contract: in-place ops must bump Version so
+        // tape-replay correctness and GPU buffer-version checks see the
+        // mutation. After bumping, sync `_gpuBufferVersion` to the new
+        // value — the buffer we just wrote IS the current snapshot, so
+        // the next GPU op shouldn't trigger a CPU→GPU re-upload via
+        // GetOrAllocateBuffer's staleness check.
+        a.IncrementVersion();
+        a._gpuBufferVersion = a.Version;
         return true;
     }
 
@@ -2954,6 +2960,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float[] resultFloat = backend.DownloadBuffer(buffer.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
         Array.Copy(resultT, data, data.Length);
+        // Same version-counter contract as TryRunBinaryInPlace: bump
+        // Version + sync _gpuBufferVersion so subsequent GPU ops reuse
+        // the freshly-written buffer instead of re-uploading.
+        tensor.IncrementVersion();
+        tensor._gpuBufferVersion = tensor.Version;
         return true;
     }
 
@@ -13851,14 +13862,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        // Version-counter bump is part of the in-place contract — callers
-        // use `Tensor<T>.Version` to detect mutations between tape record
-        // and replay. The GPU fast path here didn't bump it, so anything
-        // that watched Version (e.g. the InferenceMode tests) would see
-        // a stale "no change" value. Bump first; the InferenceModeScope
-        // suppresses the bump itself via IncrementVersion, so this is
-        // the same semantic CpuEngine.TensorAddInPlace already follows.
-        a.IncrementVersion();
+        // Version-counter contract is enforced inside TryRunBinaryInPlace
+        // (and CpuEngine's base implementation on the fallback path), so
+        // tape-replay safety + GPU buffer staleness checks observe the
+        // mutation regardless of which path runs.
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Add(ia, ib, ia, size)))
             return;
         base.TensorAddInPlace(a, b);
@@ -13901,6 +13908,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] result = backend.DownloadBuffer(buf.Buffer);
             var ops = MathHelper.GetNumericOperations<T>();
             ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpan());
+            // Version-counter contract — same rationale as TryRunUnaryInPlace.
+            tensor.IncrementVersion();
+            tensor._gpuBufferVersion = tensor.Version;
             return;
         }
         catch { }
