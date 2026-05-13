@@ -417,17 +417,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool SupportsDeferredExecution => GetAsyncBackend() != null;
 
     /// <summary>
-    /// Acquires a <see cref="GpuStreamScheduler"/> bound to this engine's
-    /// async backend's stream pool. Use <see cref="GpuStreamScheduler.Dispatch"/>
+    /// Acquires a <see cref="GpuStreamScheduler"/> bound to a caller-
+    /// supplied stream pool. Use <see cref="GpuStreamScheduler.Dispatch"/>
     /// to fan independent kernel launches across multiple streams in
     /// parallel — e.g. per-head attention scoring, parallel branches in
     /// ResNet bottleneck blocks, batched matmul slices.
     /// </summary>
-    /// <param name="streamPool">Optional pre-built stream pool. When
-    /// null, a fresh pool sized to the backend's
-    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> is created
-    /// (callers should dispose the returned scheduler + pool to release
-    /// native stream handles).</param>
+    /// <param name="streamPool">The stream pool the scheduler should
+    /// lease from. The caller owns the pool's lifetime — the scheduler
+    /// holds a reference but does NOT dispose the pool. Pass the pool
+    /// returned by <see cref="DirectGpuTensorEngine.CreateStreamPool"/>
+    /// (or built directly via <c>new GpuStreamPool(backend, options)</c>)
+    /// and dispose it alongside the scheduler when both are done.</param>
     /// <param name="streamType">Stream class used for the scheduler's
     /// leases. Defaults to <see cref="GpuStreamType.Compute"/>.</param>
     /// <returns>A scheduler, or null when the engine has no async-capable
@@ -438,21 +439,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// no engine-level entry point. AiDotNet's parallel-dispatch
     /// callers (multi-head attention, multi-branch CNN blocks) can now
     /// reach it without inspecting backend internals.
+    /// <para>
+    /// Explicit pool ownership: the prior auto-create overload could
+    /// leak native stream handles when callers disposed the scheduler
+    /// but didn't realize a pool had been created internally. Use
+    /// <see cref="CreateStreamPool"/> for the lifetime-bundled pattern.
+    /// </para>
     /// </remarks>
     public GpuStreamScheduler? GetStreamScheduler(
-        GpuStreamPool? streamPool = null,
+        GpuStreamPool streamPool,
         GpuStreamType streamType = GpuStreamType.Compute)
+    {
+        if (streamPool is null) throw new ArgumentNullException(nameof(streamPool));
+        var asyncBackend = GetAsyncBackend();
+        if (asyncBackend is null) return null;
+        if (!asyncBackend.SupportsMultiStream) return null;
+        return new GpuStreamScheduler(streamPool, streamType);
+    }
+
+    /// <summary>
+    /// Convenience: builds a <see cref="GpuStreamPool"/> sized to this
+    /// engine's async backend's
+    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> and returns it
+    /// to the caller as a disposable. Caller takes ownership.
+    /// </summary>
+    /// <param name="options">Optional execution options; defaults to
+    /// <see cref="GpuExecutionOptions.FromEnvironment"/>.</param>
+    /// <returns>A new <see cref="GpuStreamPool"/>, or null when no
+    /// async-capable backend is available or it doesn't support multiple
+    /// streams.</returns>
+    public GpuStreamPool? CreateStreamPool(GpuExecutionOptions? options = null)
     {
         var asyncBackend = GetAsyncBackend();
         if (asyncBackend is null) return null;
         if (!asyncBackend.SupportsMultiStream) return null;
-
-        if (streamPool is not null)
-            return new GpuStreamScheduler(streamPool, streamType);
-
-        var options = GpuExecutionOptions.FromEnvironment();
-        var ownedPool = new GpuStreamPool(asyncBackend, options);
-        return new GpuStreamScheduler(ownedPool, streamType);
+        return new GpuStreamPool(asyncBackend, options ?? GpuExecutionOptions.FromEnvironment());
     }
 
     /// <summary>
