@@ -682,15 +682,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // All four go through Interlocked.Add(ref _currentActivationCacheBytes, ±SizeInBytes)
         // so the counter is unit-consistent across FP32 and FP16 (AutocastScope)
         // entries and stays well-formed under concurrent eviction.
+        // Disposal happens OUTSIDE the lock (parity with CacheActivation /
+        // RemoveActivationCacheEntry / EvictOldestActivationsUnsafe) so a slow
+        // GPU-backend free doesn't block concurrent cache lookups.
+        ActivationCacheEntry? removed = null;
         lock (_activationCacheLock)
         {
             if (_activationCache.TryRemove(key, out var entry))
             {
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
                     -entry.Buffer.SizeInBytes);
-                entry.Dispose();
+                removed = entry;
             }
         }
+        removed?.Dispose();
     }
 
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, T[] data)

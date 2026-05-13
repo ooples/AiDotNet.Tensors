@@ -57,16 +57,10 @@ internal static class RebindablePlanCache<T>
     internal static bool IsEmpty => _cachedReverseTopoIndices is null;
 
     /// <summary>Validates the cached signature against the caller's pattern.</summary>
-    /// <remarks>
-    /// Issue #283 CI repro: 7-of-14 intermediates survive Gen2 GC on Linux
-    /// Server GC when the cached-replay path is taken. The DFS path passes
-    /// the same test reliably on the same Linux box. Until the cached-replay
-    /// reference path can be tracked down (cache stores only int[], so the
-    /// retention must come through the per-entry walk or its scratch state),
-    /// disable the fast path on this branch.
-    /// </remarks>
     internal static bool TrySignature(long patternHash, int currentEntryCount)
-        => false;
+        => _cachedReverseTopoIndices is not null
+           && _cachedPatternHash == patternHash
+           && _cachedRecordedEntryCount == currentEntryCount;
 
     /// <summary>
     /// Stores the reverse-topo entry-index sequence for the most recent
