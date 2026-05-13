@@ -1172,9 +1172,13 @@ public sealed class GradientTape<T> : IDisposable
     // Per-call cleanup invoked when the rebindable plan cache hit fires.
     // Walks tape entries, clears GradFn / .Grad on intermediates the
     // caller didn't ask to keep, and returns GradNodes to the pool.
-    // Matches the fresh-walk path's cleanup at lines below — without
+    // Mirrors BOTH the tape-walk path's input cleanup (lines 611-625)
+    // AND the graph-walk path's pool-return (lines 1047-1148) — without
     // this, every cache hit pins one backward's worth of gradient
-    // tensors across the per-tensor .Grad slot.
+    // tensors AND leaves intermediate inputs' .Grad / .GradFn pointing
+    // at recycled GradNodes, which on Linux Server GC manifests as
+    // 7-of-14 forward intermediates surviving Gen2 GC (issue #283
+    // CI repro: xNorm, q, k, attn-softmax, ctx, residual, h2-relu).
     private void CleanupAfterCachedReplay(
         Dictionary<Tensor<T>, Tensor<T>> result,
         IReadOnlyList<Tensor<T>>? sources)
@@ -1186,18 +1190,77 @@ public sealed class GradientTape<T> : IDisposable
             sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
             foreach (var s in sources) sourceSet.Add(s);
         }
+
+        // Pre-collect the set of tensors that are outputs of THIS tape's
+        // entries — those are the intermediates we own. Inputs that don't
+        // appear in this set are leaves (sources, externally-supplied
+        // values) and must be left alone: their .Grad is the BC contract
+        // the optimizer-step pattern reads, and their .GradFn is either
+        // null (leaf) or owned by an OUTER tape (nested-tape pattern).
+        var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            var o = _entries[i].Output;
+            if (o is not null) intermediates.Add(o);
+        }
+
         for (int i = 0; i < _entries.Count; i++)
         {
             ref var entry = ref _entries[i];
             var output = entry.Output;
             if (output is null) continue;
             var fn = output.GradFn;
-            if (fn is null || !ReferenceEquals(fn.OwningTape, this)) continue;
-            output.GradFn = null;
-            bool keepGrad = sourceSet?.Contains(output) == true
-                || (_retainGrad is not null && _retainGrad.Contains(output));
-            if (!keepGrad) output.Grad = null;
-            GradNodePool<T>.Return(fn);
+            if (fn is not null && ReferenceEquals(fn.OwningTape, this))
+            {
+                output.GradFn = null;
+                bool keepGrad = sourceSet?.Contains(output) == true
+                    || (_retainGrad is not null && _retainGrad.Contains(output));
+                if (!keepGrad) output.Grad = null;
+                GradNodePool<T>.Return(fn);
+            }
+
+            // Also clear .GradFn / .Grad on every INPUT that this tape
+            // owns. The graph-walk cleanup at the bottom of
+            // ComputeGradientsViaGraphCore does this via topoOrder; the
+            // tape-walk path does it via _entries (lines 611-625). The
+            // cached-replay path was visiting Outputs only — leaving each
+            // intermediate's .Grad mirror (set during backward by
+            // AccumulateGrad) pinned through the GradNode that was about
+            // to be pool-recycled. On Linux Server GC the timing exposed
+            // this as 7 surviving intermediates; on Workstation GC the
+            // promotion order hid it.
+            CleanupCachedReplayInput(entry.Input0, sourceSet, intermediates);
+            if (entry.InputCount >= 2) CleanupCachedReplayInput(entry.Input1, sourceSet, intermediates);
+            if (entry.InputCount >= 3) CleanupCachedReplayInput(entry.Input2, sourceSet, intermediates);
+            if (entry.InputsOverflow is not null)
+            {
+                foreach (var inp in entry.InputsOverflow)
+                    CleanupCachedReplayInput(inp, sourceSet, intermediates);
+            }
+        }
+    }
+
+    private void CleanupCachedReplayInput(
+        Tensor<T>? t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
+    {
+        if (t is null) return;
+        bool ownedByThisTape = intermediates.Contains(t);
+        if (ownedByThisTape)
+        {
+            // Idempotent — the Output-loop already cleared this for entries
+            // visited earlier in the walk. Cheap to repeat; cheap to skip.
+            t.GradFn = null;
+        }
+        if (sourceSet?.Contains(t) == true) return;
+        if (_retainGrad is not null && _retainGrad.Contains(t)) return;
+        // Same gating as CleanupTapeEntryGrad: clear .Grad only when
+        // the caller explicitly filtered (sourceSet != null) OR the
+        // tensor is one of this tape's intermediates. Leaves with no
+        // source filter keep their .Grad — that's the optimizer-step
+        // BC contract.
+        if (sourceSet is not null || ownedByThisTape)
+        {
+            t.Grad = null;
         }
     }
 
