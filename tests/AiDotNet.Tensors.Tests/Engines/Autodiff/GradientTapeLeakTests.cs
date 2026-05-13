@@ -141,6 +141,7 @@ public class GradientTapeLeakTests
         // chain pins each tensor. Cheap to run only on the failing path; off
         // entirely when the test passes. The output prints to xUnit so it lands
         // in the CI log.
+#nullable enable
         if (survivors.Count > 0 && survivorTargets.Count > 0)
         {
             _output.WriteLine("");
@@ -180,6 +181,7 @@ public class GradientTapeLeakTests
             }
             _output.WriteLine("=== end diagnostic ===");
         }
+#nullable disable
 
         Assert.True(survivors.Count == 0,
             $"Issue #283 — {survivors.Count} of {trackedRefs.Count} forward intermediates " +
@@ -190,6 +192,7 @@ public class GradientTapeLeakTests
 
     // Reference-equality comparer for object — net471 doesn't have
     // System.Collections.Generic.ReferenceEqualityComparer (added in .NET 5).
+#nullable enable
     private sealed class ReferenceEqualityComparerLocal : System.Collections.Generic.IEqualityComparer<object>
     {
         public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
@@ -262,6 +265,7 @@ public class GradientTapeLeakTests
         }
         return null;
     }
+#nullable disable
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void Issue283Step_TransformerBlock(
