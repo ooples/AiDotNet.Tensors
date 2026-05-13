@@ -88,6 +88,21 @@ public static class TensorPool<T>
         // Hvp_MatchesHessianTimesVec. DifferentiableOps.Record* sets the
         // pin; the tape's cleanup walk clears it after backward.
         if (tensor._pinnedByTape) return;
+
+        // Issue #338 view-safety: refuse view-tensors whose backing
+        // storage is shared with another tensor (strided permute views,
+        // reshape views, and offset/sliced views). Recycling such a
+        // tensor would let the next Rent caller write through the
+        // shared backing into the source tensor — a silent correctness
+        // bug exposed by PR #331's attempt to pool TransposeLastTwoDims
+        // results (which call TensorPermute on rank-3+ inputs, producing
+        // strided views). GetLiveBackingArrayOrNull returns null for
+        // non-owned layouts (non-contiguous, _storageOffset != 0, or
+        // storage length != logical length), giving exactly the
+        // discriminator we need. CPU-only — GPU-resident tensors also
+        // fail this check so we don't pool device buffers.
+        if (tensor.GetLiveBackingArrayOrNull() is null) return;
+
         if (_totalPooled >= MaxTotalPooled) return;
 
         _pools ??= new Dictionary<int, Stack<Tensor<T>>>();

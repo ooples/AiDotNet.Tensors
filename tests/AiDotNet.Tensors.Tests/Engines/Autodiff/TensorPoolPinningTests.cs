@@ -114,4 +114,48 @@ public class TensorPoolPinningTests
         var fresh = TensorPool<float>.Rent(new[] { 8 });
         Assert.NotSame(t, fresh);
     }
+
+    [Fact]
+    public void TensorPool_Return_RefusesStridedView()
+    {
+        // PR #331's pooling attempt broke gradients because
+        // TransposeLastTwoDims of a rank-3+ tensor returns a strided
+        // permute view, not a fresh allocation — and the pool's
+        // Reshape on Rent would let a later caller write through the
+        // shared storage into the source tensor. The view-safety
+        // guard in TensorPool.Return must refuse such tensors.
+        TensorPool<float>.Clear();
+        var source = new Tensor<float>(new[] { 2, 3, 4 });
+        // Construct a permute view that swaps the last two dims —
+        // this is what TransposeLastTwoDims produces.
+        var permView = source.Transpose(new[] { 0, 2, 1 });
+        Assert.False(permView.IsContiguous,
+            "Test setup invalid — permute should produce non-contiguous view.");
+
+        TensorPool<float>.Return(permView);
+
+        // Pool must be empty — the view was refused. A Rent of the
+        // same length must allocate fresh, not hand back the view.
+        var rented = TensorPool<float>.Rent(new[] { 2, 4, 3 });
+        Assert.NotSame(permView, rented);
+    }
+
+    [Fact]
+    public void TensorPool_Return_RefusesReshapeView()
+    {
+        // A Reshape on contiguous storage returns a view sharing the
+        // backing array. Same pooling hazard as the permute view —
+        // the view-safety guard catches both via
+        // GetLiveBackingArrayOrNull, which requires _storageOffset == 0
+        // AND _storage.Length == Length (i.e. owned-not-aliased).
+        TensorPool<float>.Clear();
+        var source = new Tensor<float>(new[] { 24 });
+        var reshapeView = source.Reshape(new[] { 2, 3, 4 });
+
+        TensorPool<float>.Return(reshapeView);
+
+        var rented = TensorPool<float>.Rent(new[] { 24 });
+        Assert.NotSame(reshapeView, rented);
+        Assert.NotSame(source, rented);
+    }
 }
