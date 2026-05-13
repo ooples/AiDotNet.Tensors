@@ -981,6 +981,236 @@ internal static class FusedOptimizer
             }
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Adaptive learning-rate kernels (Issue #348)
+    //
+    // These three kernels self-tune the learning rate inside the fused
+    // pass — no scheduler call needed, no managed-side hyperparameter
+    // search. PyTorch has no fused equivalent for any of them:
+    //   - Hypergradient: not built in; community implementations are
+    //     all eager Python (per-element loops in Python).
+    //   - Schedule-Free (Defazio 2024): the `schedulefree` package
+    //     ships an eager-Python implementation; CUDA fused is not
+    //     released as of 2024.
+    //   - D-Adaptation: the `dadaptation` package is eager Python +
+    //     external reductions.
+    //
+    // Because these write learning-rate / distance state through
+    // `ref` (or via a single-element scratch buffer), the caller owns
+    // the state lifetime — same pattern as Adam's `m`/`v` buffers but
+    // a single scalar.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>Hypergradient SGD (Baydin et al., 2018).
+    /// Tunes <paramref name="lr"/> online via the inner product of the
+    /// current and previous gradients:
+    ///   lr_t = lr_{t-1} + hyperLr · ⟨g_t, g_{t-1}⟩
+    ///   p   -= lr_t · g_t
+    /// The +sign on the inner product is correct: ∂L/∂lr = -⟨g_t, g_{t-1}⟩,
+    /// so descent on lr adds the inner product to lr. Returns the new lr
+    /// so the caller can persist it across steps.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe float HypergradientSgdUpdateSimd(
+        float* param, float* grad, float* prevGrad, int length,
+        float lr, float hyperLr)
+    {
+        // Pass 1: inner product g·g_prev. AVX2 FMA reduction.
+        float innerProduct = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var gp = Avx.LoadVector256(prevGrad + i);
+                acc = Fma.MultiplyAdd(g, gp, acc);
+            }
+            innerProduct = SimdKernels.HorizontalSum(acc);
+        }
+#endif
+        for (; i < length; i++)
+            innerProduct += grad[i] * prevGrad[i];
+
+        float newLr = lr + hyperLr * innerProduct;
+
+        // Pass 2: param -= newLr * grad ; prevGrad = grad
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vLr = Vector256.Create(-newLr);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, g, Avx.LoadVector256(param + i)));
+                Avx.Store(prevGrad + i, g);
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            param[i] -= newLr * grad[i];
+            prevGrad[i] = grad[i];
+        }
+        return newLr;
+    }
+
+    /// <summary>Schedule-Free SGD (Defazio et al., 2024 — "The Road Less Scheduled").
+    /// Maintains two parameter copies: <paramref name="z"/> is the "primary"
+    /// (SGD-on-z trajectory) and <paramref name="x"/> is the
+    /// weighted-average evaluation copy returned for inference.
+    ///   y      = (1-β) z + β x         — done by ScheduleFreeYUpdateSimd, before the forward
+    ///   z      -= lr · grad             — standard SGD on z
+    ///   w_t    = lr²                    — weight for this step (p=2, q=0 default)
+    ///   c_t    = w_t / (weightSum + w_t)
+    ///   x      = (1-c_t) x + c_t z      — running weighted average
+    /// Caller persists <paramref name="weightSum"/> across steps. Returns
+    /// the new weightSum.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe float ScheduleFreeSgdUpdateSimd(
+        float* z, float* x, float* grad, int length,
+        float lr, float weightSum)
+    {
+        // weight_t = lr^2 — Defazio default (p=2, q=0). Empirically the
+        // most stable choice from the paper; we expose it as the default
+        // and let users tune via overloads if they need other (p, q).
+        float w_t = lr * lr;
+        float c_t = w_t / (weightSum + w_t);
+        float oneMinusC = 1f - c_t;
+
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vLr = Vector256.Create(-lr);
+            var vC = Vector256.Create(c_t);
+            var vOneMinusC = Vector256.Create(oneMinusC);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var zNew = Fma.MultiplyAdd(vLr, g, Avx.LoadVector256(z + i));
+                Avx.Store(z + i, zNew);
+                var xNew = Fma.MultiplyAdd(vOneMinusC, Avx.LoadVector256(x + i), Avx.Multiply(vC, zNew));
+                Avx.Store(x + i, xNew);
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            z[i] -= lr * grad[i];
+            x[i] = oneMinusC * x[i] + c_t * z[i];
+        }
+        return weightSum + w_t;
+    }
+
+    /// <summary>Schedule-Free y-update — caller must run this BEFORE the
+    /// forward pass each step. Writes <c>y[i] = (1-β) z[i] + β x[i]</c>
+    /// into the supplied <paramref name="y"/> buffer; the forward then
+    /// reads from <paramref name="y"/>. PyTorch's eager implementation
+    /// does this per-element in Python, which dominates wall time on
+    /// small models — fusing it removes that overhead entirely.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void ScheduleFreeYUpdateSimd(
+        float* y, float* z, float* x, int length, float beta)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vBeta = Vector256.Create(beta);
+            var vOneMinusBeta = Vector256.Create(1f - beta);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var zV = Avx.LoadVector256(z + i);
+                var xV = Avx.LoadVector256(x + i);
+                Avx.Store(y + i, Fma.MultiplyAdd(vBeta, xV, Avx.Multiply(vOneMinusBeta, zV)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+            y[i] = (1f - beta) * z[i] + beta * x[i];
+    }
+
+    /// <summary>D-Adaptation SGD (Defazio &amp; Mishchenko, 2023 — "Learning-Rate-Free
+    /// Learning by D-Adaptation"). Provably converges to the optimal SGD lr
+    /// without any tuning. State per parameter group:
+    ///   d_k        — current distance estimate (scalar; caller persists)
+    ///   s_buf      — running grad sum (same shape as params)
+    ///   r_scalar   — accumulator for d update (scalar; caller persists)
+    /// Update rule (per step):
+    ///   s_buf  += d_k · g
+    ///   r     += d_k² · ⟨g, g⟩
+    ///   d_hat  = ||s_buf||² / (√r + ε)
+    ///   d_{k+1}= max(d_k, d_hat · γ)       — γ ∈ [0.1, 1.0], growth coef
+    ///   p     -= d_{k+1} · g
+    /// Returns the new d value. <paramref name="growthCoef"/> bounds how
+    /// fast d can grow per step — paper default is 1.0 but 0.5 reduces
+    /// early-step oscillation on small models.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe float DAdaptationSgdUpdateSimd(
+        float* param, float* grad, float* sBuf, int length,
+        float d, ref float rAccum, float growthCoef, float eps)
+    {
+        // Pass 1: update s_buf, accumulate r += d² · ⟨g, g⟩ and ||s||² (for d_hat).
+        float gNorm2 = 0f;
+        float sNorm2 = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vD = Vector256.Create(d);
+            var gAcc = Vector256<float>.Zero;
+            var sAcc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var s = Fma.MultiplyAdd(vD, g, Avx.LoadVector256(sBuf + i));
+                Avx.Store(sBuf + i, s);
+                gAcc = Fma.MultiplyAdd(g, g, gAcc);
+                sAcc = Fma.MultiplyAdd(s, s, sAcc);
+            }
+            gNorm2 = SimdKernels.HorizontalSum(gAcc);
+            sNorm2 = SimdKernels.HorizontalSum(sAcc);
+        }
+#endif
+        for (; i < length; i++)
+        {
+            sBuf[i] += d * grad[i];
+            gNorm2 += grad[i] * grad[i];
+            sNorm2 += sBuf[i] * sBuf[i];
+        }
+
+        rAccum += d * d * gNorm2;
+        float dHat = sNorm2 / (MathF.Sqrt(rAccum) + eps);
+        float dNew = MathF.Max(d, dHat * growthCoef);
+
+        // Pass 2: param -= dNew · g.
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vLr = Vector256.Create(-dNew);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, g, Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+            param[i] -= dNew * grad[i];
+
+        return dNew;
+    }
 }
 
 /// <summary>Optimizer type for fused parameter updates.</summary>
@@ -1023,5 +1253,11 @@ public enum OptimizerType
     /// <summary>Rprop: Resilient back-propagation (Riedmiller, 1993)</summary>
     Rprop = 17,
     /// <summary>LBFGS: Limited-memory BFGS (closure-based, see <c>LBFGSOptimizer</c>)</summary>
-    LBFGS = 18
+    LBFGS = 18,
+    /// <summary>Hypergradient SGD: online lr tuning via gradient inner product (Baydin et al., 2018)</summary>
+    HypergradientSGD = 19,
+    /// <summary>Schedule-Free SGD: scheduler-free, weighted-average evaluation (Defazio et al., 2024)</summary>
+    ScheduleFreeSGD = 20,
+    /// <summary>D-Adaptation SGD: learning-rate-free SGD (Defazio &amp; Mishchenko, 2023)</summary>
+    DAdaptationSGD = 21
 }

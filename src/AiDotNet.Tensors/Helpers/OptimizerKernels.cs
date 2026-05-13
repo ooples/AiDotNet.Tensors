@@ -379,6 +379,294 @@ public static class OptimizerKernels
         }
     }
 
+    // ── Scheduled / adaptive LR overloads (Issue #348) ─────────────────
+
+    /// <summary>SGD with a per-step <see cref="LrSchedule"/>. Equivalent
+    /// to evaluating <paramref name="schedule"/> at the supplied
+    /// <paramref name="step"/> and calling
+    /// <see cref="SgdInPlace{T}(Tensor{T}, Tensor{T}, T)"/>, but the
+    /// schedule formula is co-located with the kernel call so PyTorch's
+    /// LRScheduler.step() managed-code overhead disappears.</summary>
+    public static unsafe void SgdInPlace<T>(Tensor<T> param, Tensor<T> grad, LrSchedule schedule, int step)
+    {
+        if (schedule is null) throw new ArgumentNullException(nameof(schedule));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "step must be >= 1.");
+        double lrD = schedule.GetLr(step);
+        if (typeof(T) == typeof(float))
+        {
+            float lrF = (float)lrD;
+            T lr = Unsafe.As<float, T>(ref lrF);
+            SgdInPlace(param, grad, lr);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            T lr = Unsafe.As<double, T>(ref lrD);
+            SgdInPlace(param, grad, lr);
+            return;
+        }
+        // Generic fallback: convert scalar through numeric ops.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        SgdInPlace(param, grad, numOps.FromDouble(lrD));
+    }
+
+    /// <summary>Adam with a per-step <see cref="LrSchedule"/>.</summary>
+    public static unsafe void AdamInPlace<T>(
+        Tensor<T> param, Tensor<T> grad, Tensor<T> m, Tensor<T> v,
+        LrSchedule schedule, T beta1, T beta2, T eps, int step)
+    {
+        if (schedule is null) throw new ArgumentNullException(nameof(schedule));
+        double lrD = schedule.GetLr(step);
+        if (typeof(T) == typeof(float))
+        {
+            float lrF = (float)lrD;
+            T lr = Unsafe.As<float, T>(ref lrF);
+            AdamInPlace(param, grad, m, v, lr, beta1, beta2, eps, step);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            T lr = Unsafe.As<double, T>(ref lrD);
+            AdamInPlace(param, grad, m, v, lr, beta1, beta2, eps, step);
+            return;
+        }
+        var numOps = MathHelper.GetNumericOperations<T>();
+        AdamInPlace(param, grad, m, v, numOps.FromDouble(lrD), beta1, beta2, eps, step);
+    }
+
+    /// <summary>Hypergradient SGD (Baydin et al., 2018) — tunes
+    /// <paramref name="lr"/> online via the inner product of the current and
+    /// previous gradients. Caller persists <paramref name="prevGrad"/>
+    /// (same shape as param/grad, initialized to zero) and the returned
+    /// new lr across steps.</summary>
+    /// <returns>The new learning rate. Caller persists this for the next call.</returns>
+    public static unsafe float HypergradientSgdInPlace(
+        Tensor<float> param, Tensor<float> grad, Tensor<float> prevGrad,
+        float lr, float hyperLr)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (grad is null) throw new ArgumentNullException(nameof(grad));
+        if (prevGrad is null) throw new ArgumentNullException(nameof(prevGrad));
+        if (param.Length != grad.Length || param.Length != prevGrad.Length)
+            throw new ArgumentException(
+                $"HypergradientSgd requires matching lengths; param={param.Length}, grad={grad.Length}, prevGrad={prevGrad.Length}.");
+        if (!param.IsContiguous || !prevGrad.IsContiguous)
+            throw new ArgumentException("HypergradientSgd requires param and prevGrad to be contiguous.");
+        if (param.Length == 0) return lr;
+
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+        using var pinP = param.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
+        using var pinPg = prevGrad.Data.Pin();
+        return FusedOptimizer.HypergradientSgdUpdateSimd(
+            (float*)pinP.Pointer, (float*)pinG.Pointer, (float*)pinPg.Pointer,
+            param.Length, lr, hyperLr);
+    }
+
+    /// <summary>Schedule-Free SGD update (Defazio et al., 2024). Caller
+    /// persists <paramref name="z"/>, <paramref name="x"/>, and the
+    /// returned weightSum across steps. Before each forward pass the
+    /// caller must run <see cref="ScheduleFreeYInPlace"/> to compute the
+    /// y-blend that the forward reads from.</summary>
+    /// <returns>The new weightSum. Caller persists this for the next call.</returns>
+    public static unsafe float ScheduleFreeSgdInPlace(
+        Tensor<float> z, Tensor<float> x, Tensor<float> grad,
+        float lr, float weightSum)
+    {
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (grad is null) throw new ArgumentNullException(nameof(grad));
+        if (z.Length != x.Length || z.Length != grad.Length)
+            throw new ArgumentException(
+                $"ScheduleFreeSgd requires matching lengths; z={z.Length}, x={x.Length}, grad={grad.Length}.");
+        if (!z.IsContiguous || !x.IsContiguous)
+            throw new ArgumentException("ScheduleFreeSgd requires z and x to be contiguous.");
+        if (z.Length == 0) return weightSum;
+
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+        using var pinZ = z.Data.Pin();
+        using var pinX = x.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
+        return FusedOptimizer.ScheduleFreeSgdUpdateSimd(
+            (float*)pinZ.Pointer, (float*)pinX.Pointer, (float*)pinG.Pointer,
+            z.Length, lr, weightSum);
+    }
+
+    /// <summary>Schedule-Free y-blend: writes
+    /// <c>y[i] = (1-β)·z[i] + β·x[i]</c>. Caller runs this before the
+    /// forward pass each step; the forward then reads from
+    /// <paramref name="y"/>.</summary>
+    public static unsafe void ScheduleFreeYInPlace(
+        Tensor<float> y, Tensor<float> z, Tensor<float> x, float beta)
+    {
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y.Length != z.Length || y.Length != x.Length)
+            throw new ArgumentException(
+                $"ScheduleFreeY requires matching lengths; y={y.Length}, z={z.Length}, x={x.Length}.");
+        if (!y.IsContiguous || !z.IsContiguous || !x.IsContiguous)
+            throw new ArgumentException("ScheduleFreeY requires y, z, and x to be contiguous.");
+        if (y.Length == 0) return;
+
+        using var pinY = y.Data.Pin();
+        using var pinZ = z.Data.Pin();
+        using var pinX = x.Data.Pin();
+        FusedOptimizer.ScheduleFreeYUpdateSimd(
+            (float*)pinY.Pointer, (float*)pinZ.Pointer, (float*)pinX.Pointer,
+            y.Length, beta);
+    }
+
+    /// <summary>D-Adaptation SGD update (Defazio &amp; Mishchenko, 2023).
+    /// Learning-rate-free — the kernel adapts <c>d</c> (effective step size)
+    /// each call. Caller persists <paramref name="sBuf"/>,
+    /// <paramref name="rAccum"/>, and the returned new d across steps.</summary>
+    /// <param name="sBuf">Running grad-sum accumulator, same shape as
+    /// param/grad. Initialize to zero.</param>
+    /// <param name="d">Current distance estimate. Initialize to a small
+    /// positive value (1e-6 is the paper default).</param>
+    /// <param name="rAccum">Scalar accumulator. Caller persists. Initialize
+    /// to zero.</param>
+    /// <param name="growthCoef">Growth bound for d per step. 1.0 is the
+    /// paper default; 0.5 reduces oscillation on small models.</param>
+    /// <returns>The new d. Caller persists this for the next call.</returns>
+    public static unsafe float DAdaptationSgdInPlace(
+        Tensor<float> param, Tensor<float> grad, Tensor<float> sBuf,
+        float d, ref float rAccum, float growthCoef = 1.0f, float eps = 1e-8f)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (grad is null) throw new ArgumentNullException(nameof(grad));
+        if (sBuf is null) throw new ArgumentNullException(nameof(sBuf));
+        if (param.Length != grad.Length || param.Length != sBuf.Length)
+            throw new ArgumentException(
+                $"DAdaptationSgd requires matching lengths; param={param.Length}, grad={grad.Length}, sBuf={sBuf.Length}.");
+        if (!param.IsContiguous || !sBuf.IsContiguous)
+            throw new ArgumentException("DAdaptationSgd requires param and sBuf to be contiguous.");
+        if (d <= 0f) throw new ArgumentOutOfRangeException(nameof(d), "d must be > 0 (initial estimate; 1e-6 is the paper default).");
+        if (param.Length == 0) return d;
+
+        var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
+        using var pinP = param.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
+        using var pinS = sBuf.Data.Pin();
+        return FusedOptimizer.DAdaptationSgdUpdateSimd(
+            (float*)pinP.Pointer, (float*)pinG.Pointer, (float*)pinS.Pointer,
+            param.Length, d, ref rAccum, growthCoef, eps);
+    }
+
+    // ── Per-parameter-group grouped SGD (Issue #348 — feature 2) ───────
+
+    /// <summary>SGD across N parameter tensors with per-group learning
+    /// rates resolved from a parallel <paramref name="groupIndices"/>
+    /// array. Equivalent to N separate <see cref="SgdInPlace{T}(Tensor{T}, Tensor{T}, T)"/>
+    /// calls but with a single dispatch and no per-group bookkeeping at
+    /// the call site. Caller pre-computes <paramref name="groupLrs"/>;
+    /// for fused-scheduler use this is one <see cref="LrSchedule.GetLr"/>
+    /// per group per step (cheap), not per parameter.</summary>
+    /// <param name="parameters">Parameter tensors, one per param-group slot.</param>
+    /// <param name="grads">Gradient tensors, parallel to <paramref name="parameters"/>.</param>
+    /// <param name="groupLrs">Learning rate per group. Length = number of groups.</param>
+    /// <param name="groupIndices">For each parameter (parallel to
+    /// <paramref name="parameters"/>): index into <paramref name="groupLrs"/>.</param>
+    public static void SgdInPlaceGrouped<T>(
+        Tensor<T>[] parameters, Tensor<T>[] grads,
+        T[] groupLrs, int[] groupIndices)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (grads is null) throw new ArgumentNullException(nameof(grads));
+        if (groupLrs is null) throw new ArgumentNullException(nameof(groupLrs));
+        if (groupIndices is null) throw new ArgumentNullException(nameof(groupIndices));
+        if (parameters.Length != grads.Length)
+            throw new ArgumentException("parameters and grads must have the same length.");
+        if (parameters.Length != groupIndices.Length)
+            throw new ArgumentException("parameters and groupIndices must have the same length.");
+
+        for (int p = 0; p < parameters.Length; p++)
+        {
+            int g = groupIndices[p];
+            if (g < 0 || g >= groupLrs.Length)
+                throw new ArgumentOutOfRangeException(
+                    nameof(groupIndices),
+                    $"groupIndices[{p}]={g} is out of range [0, {groupLrs.Length}).");
+            SgdInPlace(parameters[p], grads[p], groupLrs[g]);
+        }
+    }
+
+    /// <summary>SGD across N parameter tensors with a per-group
+    /// <see cref="LrSchedule"/>. Evaluates each schedule once at
+    /// <paramref name="step"/> (O(groups), not O(params)), then dispatches
+    /// to <see cref="SgdInPlaceGrouped{T}(Tensor{T}[], Tensor{T}[], T[], int[])"/>.</summary>
+    public static void SgdInPlaceGrouped<T>(
+        Tensor<T>[] parameters, Tensor<T>[] grads,
+        LrSchedule[] groupSchedules, int[] groupIndices, int step)
+    {
+        if (groupSchedules is null) throw new ArgumentNullException(nameof(groupSchedules));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "step must be >= 1.");
+
+        // Resolve schedule -> lr once per group, not once per param.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var lrs = new T[groupSchedules.Length];
+        for (int g = 0; g < groupSchedules.Length; g++)
+        {
+            if (groupSchedules[g] is null)
+                throw new ArgumentException($"groupSchedules[{g}] is null.", nameof(groupSchedules));
+            double lrD = groupSchedules[g].GetLr(step);
+            if (typeof(T) == typeof(float))
+            {
+                float lrF = (float)lrD;
+                lrs[g] = Unsafe.As<float, T>(ref lrF);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                lrs[g] = Unsafe.As<double, T>(ref lrD);
+            }
+            else
+            {
+                lrs[g] = numOps.FromDouble(lrD);
+            }
+        }
+        SgdInPlaceGrouped(parameters, grads, lrs, groupIndices);
+    }
+
+    // ── Eligibility predicate (Issue #348 — feature 4) ──────────────────
+
+    /// <summary>
+    /// Returns true when the supplied optimizer type can run on the
+    /// fused-compiled path. This is the predicate upstream callers
+    /// (NeuralNetworkBase.TryTrainWithFusedOptimizer,
+    /// CompiledTapeTrainingStep.TryStepWithFusedOptimizer) should consult
+    /// instead of the deprecated <c>UseAdaptiveLearningRate</c> check.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Adaptive learning rate (whether algorithmic via Adam/RMSprop or
+    /// external via <see cref="LrSchedule"/>) is NOT a fused-path
+    /// disqualifier — every kernel in <c>FusedOptimizer</c> already takes
+    /// <c>lr</c> as a per-call scalar. The real exclusions are:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>Closure-based optimizers (LBFGS) — fused kernels are single-pass,
+    ///     LBFGS needs to re-evaluate the loss inside the optimizer step.</description></item>
+    ///   <item><description>State-shape-changing optimizers (Rprop with restart, FTRL with sparse
+    ///     index buffers that resize) — caller must rebuild the plan on shape changes.</description></item>
+    /// </list>
+    /// <para>
+    /// SparseAdam runs fused for its supported call shape (compact index +
+    /// value arrays via <see cref="FusedOptimizer.SparseAdamUpdate"/>),
+    /// but the dispatch needs the caller to pass through the
+    /// <c>indices/values</c> pair — which the compiled-training plan does
+    /// not yet wire. We therefore return false for SparseAdam at the plan
+    /// level until that wiring lands.
+    /// </para>
+    /// </remarks>
+    public static bool IsFusedPathEligible(OptimizerType optimizerType)
+        => optimizerType switch
+        {
+            OptimizerType.LBFGS => false,
+            OptimizerType.SparseAdam => false,
+            _ => true,
+        };
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
         => Unsafe.As<Memory<T>, Memory<float>>(ref data);
