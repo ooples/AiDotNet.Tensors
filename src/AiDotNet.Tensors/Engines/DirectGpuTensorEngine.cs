@@ -7364,13 +7364,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated Softmax backward operation.
     /// Supports arbitrary axes by treating the tensor as 2D (outerSize, features).
     /// </summary>
+    /// <remarks>
+    /// The previous "gradient sign came back wrong on the small 2×2 test
+    /// shape" finding correlates with the CUDA Transpose dispatch bug
+    /// (1D launch of a 2D-indexed kernel) — non-last-axis SoftmaxBackward
+    /// uses <see cref="PermuteImpl"/> which delegates to Transpose for
+    /// rank-2 swaps. With the Transpose dispatch fixed (gridX/Y = ceil
+    /// (cols|rows / 16)), the kernel formula
+    /// <c>gradIn[i] = out[i] · (grad[i] - dot(grad, out))</c> matches
+    /// CpuEngine.SoftmaxBackward bit-for-bit on contiguous last-axis input.
+    /// </remarks>
     Tensor<T> IEngine.SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
-        // GPU SoftmaxBackward diverges from CpuEngine reference on the
-        // SDPA chain — gradient sign came back wrong on the small 2×2 test
-        // shape. Route to CpuEngine until the kernel formula is verified.
-        return base.SoftmaxBackward(gradOutput, output, axis);
-#pragma warning disable CS0162 // unreachable
+        if (IsTapeActive<T>())
+            return base.SoftmaxBackward(gradOutput, output, axis);
         if (!TryGetBackend(out var backend))
             return base.SoftmaxBackward(gradOutput, output, axis);
 
@@ -7439,7 +7446,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.SoftmaxBackward(gradOutput, output, axis);
         }
-#pragma warning restore CS0162
     }
 
     /// <summary>
@@ -12990,23 +12996,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
-        // The GPU Transpose kernel diverges from the CpuEngine reference on
-        // arbitrary inputs and, because TransposeBackward / PermuteBackward
-        // re-enter TensorTranspose on gradOutput inside the backward walk,
-        // even a small per-element error poisons gradient flow. Route
-        // through CpuEngine unconditionally — Transpose is rarely the
-        // bottleneck and correctness wins.
-        return base.TensorTranspose(tensor);
+        // Previously routed through CpuEngine because the CUDA Transpose
+        // kernel "diverged from the CpuEngine reference". Root cause: the
+        // transpose_2d kernel uses 2D blockIdx.{x,y} indexing but the
+        // dispatch in CudaBackend.Transpose launched 1D — every thread
+        // saw blockIdx.y == 0 / threadIdx.y == 0, so only row 0 was
+        // written and rows ≥ 1 of B stayed uninitialized. Fixed in
+        // CudaBackend.Transpose with a real 2D launch
+        // (gridX = ceil(cols/16), gridY = ceil(rows/16)).
+        if (IsTapeActive<T>())
+            return base.TensorTranspose(tensor);
+        if (!TryGetBackend(out var backend))
+            return base.TensorTranspose(tensor);
+        if (tensor.Rank != 2)
+            return base.TensorTranspose(tensor);
+        try
+        {
+            int rows = tensor.Shape._dims[0];
+            int cols = tensor.Shape._dims[1];
+            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
+            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            return new Tensor<T>(result, new[] { cols, rows });
+        }
+        catch (Exception)
+        {
+            return base.TensorTranspose(tensor);
+        }
     }
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
-        // Same rationale as TensorTranspose: the GPU Permute kernel is
-        // off for non-trivial axes mixes and PermuteBackward re-enters
-        // this method on the gradient. Defer to CpuEngine.
-        return base.TensorPermute(tensor, axes);
-        #pragma warning disable CS0162 // unreachable
-
+        // Previously routed through CpuEngine because the CUDA Permute
+        // kernel "is off for non-trivial axes mixes". Root cause for the
+        // 2×D permute fast path was the transpose_2d launch bug above
+        // (CudaBackend.Permute delegates rank-2 permutation [1,0] to
+        // Transpose, and rank-3 [0,2,1] to BatchedTranspose). The
+        // permute_general kernel formula itself is correct
+        // (see verification in CudaNeuralNetKernels.permute_general).
+        // Routing back to GPU now that the underlying transpose dispatch
+        // is fixed.
+        if (IsTapeActive<T>())
+            return base.TensorPermute(tensor, axes);
         if (!TryGetBackend(out var backend))
             return base.TensorPermute(tensor, axes);
 
@@ -13025,7 +13057,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.TensorPermute(tensor, axes);
         }
-        #pragma warning restore CS0162
     }
 
     /// <inheritdoc/>
@@ -13652,12 +13683,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
-        // GPU NllLoss outputs shape [batchSize] (per-batch loss) while
-        // CpuEngine.TensorNLLLoss outputs shape [1] (mean across batch).
-        // The shape mismatch produces wrong numerical gradients in the
-        // test harness. Route through CpuEngine.
-        return base.TensorNLLLoss(logProbs, targets);
-#pragma warning disable CS0162 // Unreachable
+        // Previously routed through CpuEngine because the GPU wrapper
+        // returned shape [batchSize] (the per-batch kernel output) while
+        // CpuEngine returns [1] (mean across batch). Fix: keep the GPU
+        // per-batch kernel for the heavy log-lookup, then reduce on CPU
+        // to match the contract. Allocations are O(batchSize) so the
+        // mean reduction is negligible vs the GPU compute itself.
         if (IsTapeActive<T>()) return base.TensorNLLLoss(logProbs, targets);
         if (!TryGetBackend(out var backend) || logProbs.Rank < 2)
             return base.TensorNLLLoss(logProbs, targets);
@@ -13670,21 +13701,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufT = GetOrAllocateBuffer(backend, targets.GetDataArray());
             var bufOut = AllocateOutputBuffer(backend, batchSize);
             backend.NllLoss(bufLP.Buffer, bufT.Buffer, bufOut.Buffer, batchSize, numClasses);
-            var result = FinishGpuOp<T>(backend, bufOut, batchSize);
-            return new Tensor<T>(result, new[] { batchSize });
+            float[] perBatch = backend.DownloadBuffer(bufOut.Buffer);
+            double sum = 0.0;
+            for (int b = 0; b < batchSize; b++) sum += perBatch[b];
+            float mean = (float)(sum / batchSize);
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(new[] { mean });
+            return new Tensor<T>(resultData, new[] { 1 });
         }
         catch (Exception)
         {
             return base.TensorNLLLoss(logProbs, targets);
         }
-#pragma warning restore CS0162
     }
 
     public override Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
-        // GPU kernel diverges from CpuEngine reference — route through base.
-        return base.TensorKLDivLoss(input, target);
-#pragma warning disable CS0162 // Unreachable
+        // Previously routed through CpuEngine because the GPU wrapper
+        // returned the per-element loss tensor (shape == input.Shape)
+        // while CpuEngine.TensorKLDivLoss returns the MEAN as a [1]
+        // scalar tensor. Same root cause as TensorNLLLoss: kernel is
+        // per-element, contract is mean-reduced. Keep the GPU per-element
+        // kernel for the element-wise log(target) - input compute, then
+        // sum + divide on CPU to match the contract.
         if (IsTapeActive<T>()) return base.TensorKLDivLoss(input, target);
         if (!TryGetBackend(out var backend))
             return base.TensorKLDivLoss(input, target);
@@ -13695,14 +13733,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufT = GetOrAllocateBuffer(backend, target.GetDataArray());
             var bufOut = AllocateOutputBuffer(backend, input.Length);
             backend.KlDivLoss(bufI.Buffer, bufT.Buffer, bufOut.Buffer, input.Length);
-            var result = FinishGpuOp<T>(backend, bufOut, input.Length);
-            return new Tensor<T>(result, input.Shape._dims);
+            float[] perElem = backend.DownloadBuffer(bufOut.Buffer);
+            double sum = 0.0;
+            for (int i = 0; i < input.Length; i++) sum += perElem[i];
+            float mean = (float)(sum / input.Length);
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(new[] { mean });
+            return new Tensor<T>(resultData, new[] { 1 });
         }
         catch (Exception)
         {
             return base.TensorKLDivLoss(input, target);
         }
-#pragma warning restore CS0162
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -14073,11 +14114,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
-        // GPU bilinear upsample diverges from CpuEngine reference (0.21
-        // relError in gradient correctness test). Route to base until
-        // BilinearUpsample2D kernel is verified.
-        return base.TensorUpsampleBilinear(input, outputSize);
-#pragma warning disable CS0162
+        // Previously routed through CpuEngine because the CUDA
+        // bilinear_upsample2d kernel used align_corners=True
+        // coordinate mapping (oh * (inH-1)/(outH-1)) while
+        // CpuEngine.TensorUpsampleBilinearInto uses
+        // align_corners=False ((oh + 0.5) * inH/outH - 0.5). The
+        // half-pixel divergence near edges produced 0.21 relError in
+        // the gradient correctness test. Kernel now matches the
+        // CpuEngine convention.
         if (IsTapeActive<T>()) return base.TensorUpsampleBilinear(input, outputSize);
         if (!TryGetBackend(out var backend) || input.Rank != 4 || outputSize.Length < 2)
             return base.TensorUpsampleBilinear(input, outputSize);
@@ -14093,7 +14137,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return new Tensor<T>(result, new[] { batch, channels, outH, outW });
         }
         catch { return base.TensorUpsampleBilinear(input, outputSize); }
-#pragma warning restore CS0162
     }
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)

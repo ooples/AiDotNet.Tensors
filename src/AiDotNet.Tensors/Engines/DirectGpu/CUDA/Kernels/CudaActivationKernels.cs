@@ -542,6 +542,14 @@ extern ""C"" __global__ __launch_bounds__(256) void max_pool1d(const float* __re
 // ===========================================================================
 // Bilinear Upsample 2D
 // ===========================================================================
+// Bilinear upsample matching PyTorch's align_corners=False convention.
+// Source coordinate mapping uses pixel-center alignment:
+//   srcH = (oh + 0.5) * inH / outH - 0.5
+//   srcW = (ow + 0.5) * inW / outW - 0.5
+// (CpuEngine.TensorUpsampleBilinearInto uses this same formula.) The
+// alternative align_corners=True mapping `oh * (inH-1)/(outH-1)` was
+// previously used here, producing ~half-pixel divergence near edges
+// (observed as 0.21 relError in gradient correctness test).
 extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int inH, int inW, int outH, int outW)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -551,19 +559,22 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const fl
     int oh = (idx / outW) % outH;
     int c = (idx / (outW * outH)) % channels;
     int b = idx / (outW * outH * channels);
-    float h_ratio = (outH > 1) ? (float)(inH - 1) / (float)(outH - 1) : 0.0f;
-    float w_ratio = (outW > 1) ? (float)(inW - 1) / (float)(outW - 1) : 0.0f;
-    float h_in = oh * h_ratio;
-    float w_in = ow * w_ratio;
-    int h0 = (int)h_in; int h1 = min(h0 + 1, inH - 1);
-    int w0 = (int)w_in; int w1 = min(w0 + 1, inW - 1);
-    float hd = h_in - h0; float wd = w_in - w0;
+    float srcH = ((float)oh + 0.5f) * (float)inH / (float)outH - 0.5f;
+    float srcW = ((float)ow + 0.5f) * (float)inW / (float)outW - 0.5f;
+    int h0 = max(0, (int)floorf(srcH));
+    int w0 = max(0, (int)floorf(srcW));
+    int h1 = min(h0 + 1, inH - 1);
+    int w1 = min(w0 + 1, inW - 1);
+    float hd = srcH - (float)h0;
+    float wd = srcW - (float)w0;
+    if (hd < 0.0f) hd = 0.0f;
+    if (wd < 0.0f) wd = 0.0f;
     int base_idx = (b * channels + c) * inH * inW;
     float v00 = input[base_idx + h0 * inW + w0];
     float v01 = input[base_idx + h0 * inW + w1];
     float v10 = input[base_idx + h1 * inW + w0];
     float v11 = input[base_idx + h1 * inW + w1];
-    output[idx] = (1-hd)*(1-wd)*v00 + (1-hd)*wd*v01 + hd*(1-wd)*v10 + hd*wd*v11;
+    output[idx] = (1.0f-hd)*(1.0f-wd)*v00 + (1.0f-hd)*wd*v01 + hd*(1.0f-wd)*v10 + hd*wd*v11;
 }
 
 // ===========================================================================
