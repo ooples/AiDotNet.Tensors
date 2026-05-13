@@ -1071,10 +1071,26 @@ internal static partial class SimdGemm
             //     fall through to the normal split. For DiT-XL shapes n=256
             //     and n=72 both have n % 8 == 0.
             long directWork = (long)m * k * n;
+            // Tall-thin gate: M≥256, K≤256, work ≤ 4G.
+            // Targets transformer GEMMs that fall above the standard
+            // small-matmul threshold but where SgemmTiled's two-phase
+            // dispatch starves PersistentParallelExecutor (measured: 5-12
+            // active cores of 32 on M=2048,K=128,N=384). SgemmDirectParallelM
+            // skips packing and dispatches Mr=6 row blocks → near-32-core
+            // saturation for M=2048. Same n%8==0 alignment requirement as
+            // the standard gate so the masked-tail kernel handles narrow-N
+            // cleanly.
+            bool tallThin = !transA && !transB
+                && n >= Nr
+                && (n % 8 == 0)
+                && m >= TallThinMatmulMinM
+                && k <= TallThinMatmulKThreshold
+                && directWork <= TallThinMatmulWorkThreshold;
+
             if (!transA && !transB
                 && n >= Nr
-                && directWork <= SmallMatmulWorkThreshold
-                && k <= SmallMatmulKThreshold
+                && (directWork <= SmallMatmulWorkThreshold || tallThin)
+                && (k <= SmallMatmulKThreshold || tallThin)
                 && (n % 8 == 0))
             {
                 // #209 close-parity: parallel-M dispatcher for medium shapes.
@@ -1199,6 +1215,32 @@ internal static partial class SimdGemm
     // Above 32M (e.g. 512³ = 134M, 1024² = 1B), the packed SgemmTiled path's
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
+
+    // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
+    // 100M-2.1G FMAs were going through SgemmTiled, where at K=128 the inner
+    // compute per tile is small (~12KB packed A panel, ~50K FMAs/tile) so the
+    // two-phase dispatch (PackA||PackB, then compute) burned more wall in
+    // PersistentParallelExecutor wake/wait than in actual FMAs. SgemmDirect
+    // skips packing entirely and dispatches Mr=6 row blocks via a single
+    // PersistentParallelExecutor call: M=2048 yields 341 row blocks, clean
+    // numChunks=32 → 32-core saturation.
+    //
+    // The tall-thin gate qualifies M ≥ 256 AND K ≤ 256 AND work ≤ 4G:
+    //   - M ≥ 256 ensures ≥ 43 Mr=6 row blocks (plenty of slicing).
+    //   - K ≤ 256 keeps the 6-row A panel ≤ 6 KB (well within L1d).
+    //   - work ≤ 4G absorbs QKV (100M), FFN up (134M), FFN down (134M),
+    //     AND the 2.1G output proj — measured Phase A: 12 cores → ~22 cores
+    //     after this raise on the [32,64,128]×[128,8192] shape.
+    //
+    // Above 4G, square shapes (4608² = 97G, etc.) still need SgemmTiled's
+    // packed cache-blocking; the direct path's A-panel-per-iter approach
+    // doesn't amortize at that scale.
+    private const long TallThinMatmulWorkThreshold = 4L * 1024 * 1024 * 1024;
+    // Raised 256 → 512 to capture the FFN-down backward shape (K=FfDim=512)
+    // in the consumer Transformer. L1d cache footprint: 6-row × K=512 × 4 B
+    // = 12 KB, still well under Zen 2's 32 KB L1d.
+    private const int TallThinMatmulKThreshold = 512;
+    private const int TallThinMatmulMinM = 256;
 
     // For transB=true (e.g. AttentionQKT Q·K^T), now that SgemmDirect has
     // a parallel-M dispatcher (SgemmDirectParallelM), the pre-transpose +

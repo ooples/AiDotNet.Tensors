@@ -805,15 +805,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // MatMul forward: direct BLAS into output buffer
+        // MatMul forward (ND × 2D): collapse A's leading dims into M and
+        // run a single 2D SGEMM directly into the pre-allocated output
+        // buffer. Critical for the consumer Transformer's rank-3
+        // [B,S,D] × rank-2 [D,N] forward pattern (issue #327) — without
+        // this, the rank-3 × rank-2 fallback below recurses through
+        // engine.TensorMatMul's full dispatcher chain and dispatches
+        // through TensorMatMulBatched, costing the per-step plan flat-
+        // delegate-array benefit.
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
-            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && step.OutputBuffer.IsContiguous
             && typeof(T) == typeof(float))
         {
+            // Contiguity guard: collapsing A's leading dims to M and treating
+            // the buffer as row-major dense produces wrong results for views
+            // (e.g. TensorSlice). Non-contiguous operands fall through to
+            // the generic engine path below.
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
             var output = step.OutputBuffer;
-            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+            int aRank = inputA.Rank;
+            int M = 1;
+            for (int i = 0; i < aRank - 1; i++) M *= inputA._shape[i];
+            int K = inputA._shape[aRank - 1];
+            int N = inputB._shape[1];
 
             // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
             var cA = (float[])(object)inputA.GetDataArray();
@@ -1960,9 +1977,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // MatMul backward: dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc
+        // MatMul backward (ND × 2D): dA = dC @ B^T, dB = A^T @ dC. For
+        // rank-3 [B,S,D] × rank-2 [D,N] input (consumer Transformer
+        // pattern from issue #327), collapse A's leading dims into M
+        // and run two 2D transposed GEMMs directly into the pre-allocated
+        // gradient buffers. Falls back to engine.TensorMatMul+Transpose
+        // when BLAS is unavailable.
+        //
+        // Contiguity guard: the BLAS path interprets the input buffers as
+        // row-major dense matrices with leading dim K (for A) / N (for B,
+        // dC). Strided views (non-unit-stride permutations, slices that
+        // skip rows) violate that layout and would silently produce
+        // wrong gradients if we forced them through TryGemmEx. The
+        // generic engine fallback path handles arbitrary strides
+        // correctly, so route non-contiguous inputs there instead of
+        // through this fast path.
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
-            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && step.OutputBuffer.IsContiguous
             && BlasProvider.IsAvailable)
         {
             var inputA = step.Inputs[0];
@@ -1976,27 +2009,58 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
 
-            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+            // gradOut may be the producer of an upstream op's output that
+            // is itself a view, and gradA / gradB are plan-owned but
+            // could in principle be sliced into a larger arena buffer
+            // (issue #327's compile-time arena pre-pack). Require
+            // contiguity on every buffer that participates in TryGemmEx
+            // so the row-major-with-stride-LD interpretation holds.
+            if (!gradOut.IsContiguous || !gradA.IsContiguous || !gradB.IsContiguous)
+                return null;
 
-            // Cache array references on first call to avoid GetDataArray() overhead per step
+            int aRank = inputA.Rank;
+            int M = 1;
+            for (int i = 0; i < aRank - 1; i++) M *= inputA._shape[i];
+            int K = inputA._shape[aRank - 1];
+            int N = inputB._shape[1];
+
+            // Cache the underlying storage arrays + storage offsets on first
+            // call. We deliberately use `_storage.GetDataArray()` rather than
+            // `GetDataArray()` — the latter falls back to ToArray() for
+            // contiguous views with a non-zero storage offset and would
+            // pin the cache to a stale snapshot copy that subsequent forward
+            // passes don't write into. The raw storage array is shape-stable
+            // for the plan's lifetime (the forward pass writes into the
+            // same backing buffer every step), so caching it is correct AND
+            // allocation-free even when the logical Tensor view has an
+            // offset.
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
+            int dcOff = 0, aOff = 0, bOff = 0, destAOff = 0, destBOff = 0;
 
             return eng =>
             {
-                cachedDC ??= (float[])(object)gradOut.GetDataArray();
-                cachedA ??= (float[])(object)inputA.GetDataArray();
-                cachedB ??= (float[])(object)inputB.GetDataArray();
-                cachedDestA ??= (float[])(object)gradA.GetDataArray();
-                cachedDestB ??= (float[])(object)gradB.GetDataArray();
+                if (cachedDC is null)
+                {
+                    cachedDC = (float[])(object)gradOut._storage.GetDataArray();
+                    cachedA = (float[])(object)inputA._storage.GetDataArray();
+                    cachedB = (float[])(object)inputB._storage.GetDataArray();
+                    cachedDestA = (float[])(object)gradA._storage.GetDataArray();
+                    cachedDestB = (float[])(object)gradB._storage.GetDataArray();
+                    dcOff = gradOut._storageOffset;
+                    aOff = inputA._storageOffset;
+                    bOff = inputB._storageOffset;
+                    destAOff = gradA._storageOffset;
+                    destBOff = gradB._storageOffset;
+                }
 
                 // dA = dC @ B^T — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, 0, N, false, cachedB, 0, N, true, cachedDestA, 0, K))
+                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
                     dA.AsSpan().CopyTo(gradA.AsWritableSpan());
                 }
                 // dB = A^T @ dC — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(K, N, M, cachedA, 0, K, true, cachedDC, 0, N, false, cachedDestB, 0, N))
+                if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
                 {
                     var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
                     dB.AsSpan().CopyTo(gradB.AsWritableSpan());

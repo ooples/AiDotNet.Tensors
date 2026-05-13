@@ -1,4 +1,5 @@
-﻿using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -191,6 +192,35 @@ public sealed class GradientTape<T> : IDisposable
 #if !NETFRAMEWORK
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
 #endif
+    /// <summary>
+    /// Identical to <see cref="ComputeGradients"/> but returns the
+    /// gradient dictionary wrapped in a <see cref="GradientsScope{T}"/>
+    /// disposable. When the caller disposes the scope (typically at
+    /// the end of a training step), every gradient tensor is returned
+    /// to <see cref="AutoTensorCache"/> so the next iteration's
+    /// backward can reuse the buffers instead of allocating fresh.
+    /// Closes the per-step gradient-tensor allocation cost reported
+    /// in issue #327.
+    /// </summary>
+    /// <param name="loss">The scalar loss tensor to differentiate.</param>
+    /// <param name="sources">Optional source tensors whose gradients
+    /// the caller will read. Required for safe pooling — the scope's
+    /// dispose path pools every dictionary value, so unfiltered
+    /// callers would observe corrupted tensors on the next iter.</param>
+    /// <param name="createGraph">Same semantics as
+    /// <see cref="ComputeGradients"/>. createGraph=true is unusual
+    /// here; consumers using higher-order AD should hold the
+    /// gradient dict themselves rather than scope-pool it.</param>
+    public GradientsScope<T> ComputeGradientsScope(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        bool createGraph = false)
+    {
+        if (sources is null) throw new ArgumentNullException(nameof(sources));
+        var grads = ComputeGradients(loss, sources, createGraph);
+        return new GradientsScope<T>(grads);
+    }
+
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources = null,
@@ -726,6 +756,36 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
+        // Rebindable plan cache: fresh-tape repeat-pattern fast path.
+        if (!_options.Persistent
+            && !DifferentiableOps._isBackwardCreateGraph
+            && _entries.Count > 0)
+        {
+            long lookupHash = AutoTrainingCompiler.ComputeStructureHash(_entries, _entries.Count);
+            // Quick signature check first — empty cache or hash mismatch
+            // both return false at the cost of three thread-static field
+            // reads, much cheaper than the full TryExecute call.
+            if (RebindablePlanCache<T>.TrySignature(lookupHash, _entries.Count))
+            {
+                var savedCurrent = _current;
+                SetCurrentTape(null);
+                try
+                {
+                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
+                    if (cached is not null)
+                    {
+                        // Per-call cleanup parity with the fresh-walk path
+                        // below — clear GradFn / .Grad on intermediates so
+                        // they don't pin one full backward's worth of
+                        // gradient tensors across successive calls.
+                        CleanupAfterCachedReplay(cached, sources);
+                        return cached;
+                    }
+                }
+                finally { SetCurrentTape(savedCurrent); }
+            }
+        }
+
         // Issue #319 Phase 1: thread-local scratch buffers for the
         // backward dispatch path. Acquire once at the top of the call;
         // nested backwards (createGraph=true Hessian path) fall back to
@@ -825,6 +885,74 @@ public sealed class GradientTape<T> : IDisposable
             // Execute the chain
             var result = chain.Execute(loss, sources, engine, useScratch: acquiredScratch);
 
+            // Build rebindable plan for fresh-tape callers (closes the
+            // consumer fresh-tape gap from issue #327). MUST run AFTER
+            // chain.Execute — building the plan before Execute mutated
+            // state that broke higher-order AD (Hvp/Hessian); see the
+            // bisection comment in RebindablePlanCache for details.
+            //
+            // After Execute, we know:
+            //   * The backward pass completed and produced `result`.
+            //   * tape entries are stable (recording suspended during
+            //     non-createGraph backward; for createGraph, rebindEligible
+            //     is false).
+            // Building + storing the plan here lets the NEXT fresh tape
+            // with the same forward pattern hit the cache at the top of
+            // this method (TryGet) and skip DFS + step-build entirely.
+            if (!_options.Persistent
+                && !DifferentiableOps._isBackwardCreateGraph
+                && _entries.Count > 0)
+            {
+                // Detect cross-tape walks (Hvp / higher-order AD nests tapes;
+                // the topoOrder crosses into the inner tape's nodes). The
+                // cache only knows about THIS tape's entries — a cached plan
+                // would silently skip the inner tape's gradient contributions
+                // and produce wrong gradients on every replay. Punt to the
+                // DFS path on every call when any cross-tape node appears.
+                bool crossTape = false;
+                for (int i = 0; i < stepCount; i++)
+                {
+                    if (!ReferenceEquals(topoOrder[i].OwningTape, this))
+                    {
+                        crossTape = true;
+                        break;
+                    }
+                }
+
+                if (!crossTape)
+                {
+                    long patternHash = AutoTrainingCompiler.ComputeStructureHash(_entries, _entries.Count);
+
+                    // Map each GradNode in topoOrder to its tape entry index.
+                    // Tape entries are recorded in forward (topological) order;
+                    // entry.Output.GradFn IS the GradNode for that op. One O(N)
+                    // walk gives us the map for the per-node lookup below.
+                    var nodeToEntryIndex = new Dictionary<GradNode<T>, int>(_entries.Count);
+                    for (int e = 0; e < _entries.Count; e++)
+                    {
+                        ref var rec = ref _entries[e];
+                        var fn = rec.Output?.GradFn;
+                        if (fn is not null && !nodeToEntryIndex.ContainsKey(fn))
+                            nodeToEntryIndex[fn] = e;
+                    }
+
+                    // reverseTopoIndices[i] = entry index of the i-th step
+                    // we'd dispatch in backward (topoOrder traversed in reverse).
+                    var reverseTopoIndices = new int[stepCount];
+                    int writeIdx = 0;
+                    for (int i = stepCount - 1; i >= 0; i--)
+                    {
+                        var node = topoOrder[i];
+                        if (nodeToEntryIndex.TryGetValue(node, out int entryIdx))
+                            reverseTopoIndices[writeIdx++] = entryIdx;
+                    }
+                    if (writeIdx < reverseTopoIndices.Length)
+                        Array.Resize(ref reverseTopoIndices, writeIdx);
+
+                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices);
+                }
+            }
+
         // Clear GradFn to release graph memory (non-persistent tapes
         // get new graphs each step). Walk inputs inline rather than
         // via GetInputsArray() — that helper allocates a fresh
@@ -914,6 +1042,8 @@ public sealed class GradientTape<T> : IDisposable
                 //   - the tape isn't persistent (the chain is cached
                 //     and may be re-executed on the next backward)
                 bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
+
+                bool canPoolIntermediates = canPoolNodes;
                 foreach (var node in topoOrder)
                 {
                     // Cross-tape guard (PR #322 review #17): the topo
@@ -1010,6 +1140,11 @@ public sealed class GradientTape<T> : IDisposable
                     {
                         GradNodePool<T>.Return(node);
                     }
+
+                    // node.Output is intentionally NOT pooled — user code
+                    // may still hold it (loss, logged intermediates). Safe
+                    // forward-intermediate pooling needs an opt-in API or
+                    // Tensor-side liveness tracking.
                 }
             }
 
@@ -1033,6 +1168,101 @@ public sealed class GradientTape<T> : IDisposable
         }
     }
 
+
+    // Per-call cleanup invoked when the rebindable plan cache hit fires.
+    // Walks tape entries, clears GradFn / .Grad on intermediates the
+    // caller didn't ask to keep, and returns GradNodes to the pool.
+    // Mirrors BOTH the tape-walk path's input cleanup (lines 611-625)
+    // AND the graph-walk path's pool-return (lines 1047-1148) — without
+    // this, every cache hit pins one backward's worth of gradient
+    // tensors AND leaves intermediate inputs' .Grad / .GradFn pointing
+    // at recycled GradNodes, which on Linux Server GC manifests as
+    // 7-of-14 forward intermediates surviving Gen2 GC (issue #283
+    // CI repro: xNorm, q, k, attn-softmax, ctx, residual, h2-relu).
+    private void CleanupAfterCachedReplay(
+        Dictionary<Tensor<T>, Tensor<T>> result,
+        IReadOnlyList<Tensor<T>>? sources)
+    {
+        if (DifferentiableOps._isBackwardCreateGraph) return;
+        HashSet<Tensor<T>>? sourceSet = null;
+        if (sources is not null)
+        {
+            sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var s in sources) sourceSet.Add(s);
+        }
+
+        // Pre-collect the set of tensors that are outputs of THIS tape's
+        // entries — those are the intermediates we own. Inputs that don't
+        // appear in this set are leaves (sources, externally-supplied
+        // values) and must be left alone: their .Grad is the BC contract
+        // the optimizer-step pattern reads, and their .GradFn is either
+        // null (leaf) or owned by an OUTER tape (nested-tape pattern).
+        var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            var o = _entries[i].Output;
+            if (o is not null) intermediates.Add(o);
+        }
+
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var entry = ref _entries[i];
+            var output = entry.Output;
+            if (output is null) continue;
+            var fn = output.GradFn;
+            if (fn is not null && ReferenceEquals(fn.OwningTape, this))
+            {
+                output.GradFn = null;
+                bool keepGrad = sourceSet?.Contains(output) == true
+                    || (_retainGrad is not null && _retainGrad.Contains(output));
+                if (!keepGrad) output.Grad = null;
+                GradNodePool<T>.Return(fn);
+            }
+
+            // Also clear .GradFn / .Grad on every INPUT that this tape
+            // owns. The graph-walk cleanup at the bottom of
+            // ComputeGradientsViaGraphCore does this via topoOrder; the
+            // tape-walk path does it via _entries (lines 611-625). The
+            // cached-replay path was visiting Outputs only — leaving each
+            // intermediate's .Grad mirror (set during backward by
+            // AccumulateGrad) pinned through the GradNode that was about
+            // to be pool-recycled. On Linux Server GC the timing exposed
+            // this as 7 surviving intermediates; on Workstation GC the
+            // promotion order hid it.
+            CleanupCachedReplayInput(entry.Input0, sourceSet, intermediates);
+            if (entry.InputCount >= 2) CleanupCachedReplayInput(entry.Input1, sourceSet, intermediates);
+            if (entry.InputCount >= 3) CleanupCachedReplayInput(entry.Input2, sourceSet, intermediates);
+            if (entry.InputsOverflow is not null)
+            {
+                foreach (var inp in entry.InputsOverflow)
+                    CleanupCachedReplayInput(inp, sourceSet, intermediates);
+            }
+        }
+    }
+
+    private void CleanupCachedReplayInput(
+        Tensor<T>? t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
+    {
+        if (t is null) return;
+        bool ownedByThisTape = intermediates.Contains(t);
+        if (ownedByThisTape)
+        {
+            // Idempotent — the Output-loop already cleared this for entries
+            // visited earlier in the walk. Cheap to repeat; cheap to skip.
+            t.GradFn = null;
+        }
+        if (sourceSet?.Contains(t) == true) return;
+        if (_retainGrad is not null && _retainGrad.Contains(t)) return;
+        // Same gating as CleanupTapeEntryGrad: clear .Grad only when
+        // the caller explicitly filtered (sourceSet != null) OR the
+        // tensor is one of this tape's intermediates. Leaves with no
+        // source filter keep their .Grad — that's the optimizer-step
+        // BC contract.
+        if (sourceSet is not null || ownedByThisTape)
+        {
+            t.Grad = null;
+        }
+    }
 
     private static void TopologicalSort(GradNode<T> node, HashSet<GradNode<T>> visited, List<GradNode<T>> result)
     {

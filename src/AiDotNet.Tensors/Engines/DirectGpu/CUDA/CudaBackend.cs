@@ -4291,7 +4291,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr gradInPtr = gradInput.Handle;
         int countPad = countIncludePad ? 1 : 0;
-        void** args = stackalloc void*[14];
+        // Kernel signature has 15 parameters — gradOutput, gradInput, the 12
+        // shape/stride/pad ints, and countIncludePad. The original 14-slot
+        // stackalloc dropped the countIncludePad slot, so cuLaunchKernel read
+        // garbage stack memory for parameter 15 and crashed with 0xC0000005
+        // on small inputs (issue surfaced by
+        // AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient). Match
+        // the kernel signature exactly.
+        void** args = stackalloc void*[15];
         args[0] = &gradOutPtr;
         args[1] = &gradInPtr;
         args[2] = &batch;
@@ -4306,6 +4313,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[11] = &strideW;
         args[12] = &padH;
         args[13] = &padW;
+        args[14] = &countPad;
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
@@ -5583,8 +5591,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: transpose_2d");
 
         using var _ = PushContext();
-        int total = rows * cols;
-        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        // Kernel reads `row = blockIdx.y * blockDim.y + threadIdx.y` and
+        // `col = blockIdx.x * blockDim.x + threadIdx.x` — it needs a real
+        // 2D launch. A 1D launch leaves blockIdx.y/threadIdx.y == 0, so
+        // only row 0 ever gets written and rows ≥ 1 of B stay uninitialized
+        // (this was the root cause of the prior "GPU Transpose kernel
+        // diverges from CpuEngine reference" observation).
+        const uint blockX = 16, blockY = 16;
+        uint gridX = ((uint)cols + blockX - 1) / blockX;
+        uint gridY = ((uint)rows + blockY - 1) / blockY;
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[4];
@@ -5592,7 +5607,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[1] = &bPtr;
         args[2] = &rows;
         args[3] = &cols;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, 1, blockX, blockY, args);
     }
 
     public unsafe void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
@@ -5601,8 +5616,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: batched_transpose");
 
         using var _ = PushContext();
-        int total = batch * rows * cols;
-        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        // batched_transpose reads blockIdx.{x,y,z} and threadIdx.{x,y}.
+        // Must be launched 3D so each batch slice's rows are reached;
+        // the prior 1D dispatch only covered the slice-0 first-row corner.
+        const uint blockX = 16, blockY = 16;
+        uint gridX = ((uint)cols + blockX - 1) / blockX;
+        uint gridY = ((uint)rows + blockY - 1) / blockY;
+        uint gridZ = (uint)batch;
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[5];
@@ -5611,7 +5631,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &batch;
         args[3] = &rows;
         args[4] = &cols;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel3D(kernel, gridX, gridY, gridZ, blockX, blockY, 1, args);
     }
 
     public unsafe void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)

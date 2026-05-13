@@ -8,6 +8,20 @@
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Issue #283 / AiDotNet#1227: force Workstation GC for the test
+         process. Server GC's concurrent background collection on
+         multi-core CI hosts leaves Gen2-promoted objects floating past
+         GC.Collect() + WaitForPendingFinalizers, which breaks the
+         WeakReference-based GradientTapeLeakTests that assume
+         deterministic Gen2 reclamation. The same tests pass locally under
+         Workstation GC. ConcurrentGarbageCollection=false additionally
+         disables background collection so .Clear()/null-out + GC.Collect()
+         from the test produces an immediately-visible drop in survivor
+         counts rather than racing the concurrent sweep thread. Production
+         callers of the library can re-enable Server / concurrent GC on
+         their host config — this setting only affects the test process. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>

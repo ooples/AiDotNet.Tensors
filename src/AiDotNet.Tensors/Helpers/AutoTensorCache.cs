@@ -207,6 +207,22 @@ internal static class AutoTensorCache
         if (!Enabled || tensor == null || !tensor.IsContiguous)
             return;
 
+        // Tape-pinning safety check: when a tensor has a live GradFn, it
+        // is the recorded output of an op that may still be needed by an
+        // outstanding backward pass (especially for higher-order AD where
+        // createGraph=true records gradient ops onto the tape and those
+        // recorded ops reference this tensor as an input). Pooling such a
+        // tensor would let the next RentOrAllocate hand the same buffer
+        // out to an unrelated op which would overwrite the data the
+        // recorded entry still needs to read. Refusing to pool here is
+        // the .NET equivalent of PyTorch's refcount-based "alive while
+        // referenced" lifecycle. The cleanup path in
+        // GradientTape.ComputeGradientsViaGraphCore explicitly nulls
+        // GradFn on forward intermediates BEFORE calling Return, so this
+        // check is a safety net for callers that pool from inside the
+        // backward (per-op intermediate pooling).
+        if (tensor.GradFn is not null) return;
+
         long elements = tensor.Length;
         if (elements > MaxElementsPerTensor)
             return;

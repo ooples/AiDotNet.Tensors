@@ -122,6 +122,7 @@ public class GradientTapeLeakTests
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
         var survivors = new System.Collections.Generic.List<string>();
+        var survivorTargets = new System.Collections.Generic.List<(string label, Tensor<float> t)>();
         foreach (var (label, wr) in trackedRefs)
         {
             if (!wr.IsAlive) continue;
@@ -129,10 +130,66 @@ public class GradientTapeLeakTests
             string gradState = t is null ? "(collected during inspection)"
                 : $"GradFn={(t.GradFn is null ? "null" : "SET")}, Grad={(t.Grad is null ? "null" : "SET")}";
             survivors.Add($"{label} [{gradState}]");
+            if (t is not null) survivorTargets.Add((label, t));
         }
 
         _output.WriteLine($"Tracked {trackedRefs.Count} forward intermediates; {survivors.Count} survived GC after Dispose:");
         foreach (var s in survivors) _output.WriteLine($"  - {s}");
+
+        // Issue #283 diagnostic: when survivors exist, scan static / thread-static
+        // fields in the AiDotNet.Tensors assembly via reflection to find which
+        // chain pins each tensor. Cheap to run only on the failing path; off
+        // entirely when the test passes. The output prints to xUnit so it lands
+        // in the CI log.
+#nullable enable
+        if (survivors.Count > 0 && survivorTargets.Count > 0)
+        {
+            _output.WriteLine("");
+            _output.WriteLine("=== Issue #283 leak diagnostic (scanning static state) ===");
+            var aidotnetAssembly = typeof(Tensor<float>).Assembly;
+            // Reference-equality set without .NET 5+'s ReferenceEqualityComparer
+            // (the test multi-targets net471 which doesn't ship it).
+            var refEq = new ReferenceEqualityComparerLocal();
+            var visited = new System.Collections.Generic.HashSet<object>(refEq);
+            var survivorSet = new System.Collections.Generic.HashSet<object>(refEq);
+            foreach (var (_, t) in survivorTargets) survivorSet.Add(t);
+
+            // GetTypes() throws ReflectionTypeLoadException when an optional
+            // dependency fails to load; ex.Types still contains the partially-
+            // loaded type set (with nulls for the failures). Catch and continue
+            // so a load failure doesn't mask the original leak assertion.
+            System.Type?[] allTypes;
+            try { allTypes = aidotnetAssembly.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex) { allTypes = ex.Types; }
+            foreach (var type in allTypes)
+            {
+                if (type is null) continue;
+                if (!type.IsClass && !type.IsValueType) continue;
+                System.Reflection.FieldInfo[] fields;
+                try { fields = type.GetFields(
+                    System.Reflection.BindingFlags.Static |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic); }
+                catch { continue; }
+
+                foreach (var field in fields)
+                {
+                    object? value;
+                    try { value = field.GetValue(null); }
+                    catch { continue; }
+                    if (value is null) continue;
+                    if (visited.Contains(value)) continue;
+                    var path = $"{type.FullName}.{field.Name}";
+                    var found = WalkForSurvivor(value, survivorSet, visited, path, depth: 0, maxDepth: 6);
+                    if (found is not null)
+                    {
+                        _output.WriteLine($"PIN: {found}");
+                    }
+                }
+            }
+            _output.WriteLine("=== end diagnostic ===");
+        }
+#nullable disable
 
         Assert.True(survivors.Count == 0,
             $"Issue #283 — {survivors.Count} of {trackedRefs.Count} forward intermediates " +
@@ -140,6 +197,83 @@ public class GradientTapeLeakTests
             string.Join(", ", survivors));
 
     }
+
+    // Reference-equality comparer for object — net471 doesn't have
+    // System.Collections.Generic.ReferenceEqualityComparer (added in .NET 5).
+#nullable enable
+    private sealed class ReferenceEqualityComparerLocal : System.Collections.Generic.IEqualityComparer<object>
+    {
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
+        public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+    }
+
+    // Walks an object graph up to maxDepth looking for any of the survivors.
+    // Returns the path string when a survivor is reachable from `value`, null
+    // otherwise. Reference-equality visited-set caps the walk on cycles.
+    private static string? WalkForSurvivor(
+        object value,
+        System.Collections.Generic.HashSet<object> survivorSet,
+        System.Collections.Generic.HashSet<object> visited,
+        string path,
+        int depth,
+        int maxDepth)
+    {
+        if (depth > maxDepth) return null;
+        if (!visited.Add(value)) return null;
+        if (survivorSet.Contains(value)) return $"{path} ({value.GetType().Name})";
+
+        // Arrays: walk elements.
+        if (value is System.Array arr)
+        {
+            int len = arr.Length;
+            int cap = System.Math.Min(len, 64);
+            for (int i = 0; i < cap; i++)
+            {
+                var el = arr.GetValue(i);
+                if (el is null) continue;
+                var r = WalkForSurvivor(el, survivorSet, visited, $"{path}[{i}]", depth + 1, maxDepth);
+                if (r is not null) return r;
+            }
+            return null;
+        }
+
+        // IEnumerable: walk a bounded prefix.
+        if (value is System.Collections.IEnumerable enumerable && value is not string)
+        {
+            int idx = 0;
+            try
+            {
+                foreach (var el in enumerable)
+                {
+                    if (idx++ > 64) break;
+                    if (el is null) continue;
+                    var r = WalkForSurvivor(el, survivorSet, visited, $"{path}<{idx-1}>", depth + 1, maxDepth);
+                    if (r is not null) return r;
+                }
+            }
+            catch { /* enumeration may throw for some collections — keep walking */ }
+        }
+
+        // Instance fields.
+        var type = value.GetType();
+        System.Reflection.FieldInfo[] fields;
+        try { fields = type.GetFields(
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic); }
+        catch { return null; }
+        foreach (var field in fields)
+        {
+            if (field.FieldType.IsPrimitive || field.FieldType == typeof(string)) continue;
+            object? fv;
+            try { fv = field.GetValue(value); } catch { continue; }
+            if (fv is null) continue;
+            var r = WalkForSurvivor(fv, survivorSet, visited, $"{path}.{field.Name}", depth + 1, maxDepth);
+            if (r is not null) return r;
+        }
+        return null;
+    }
+#nullable disable
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void Issue283Step_TransformerBlock(

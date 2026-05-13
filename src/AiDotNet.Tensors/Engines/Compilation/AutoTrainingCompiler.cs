@@ -196,8 +196,14 @@ internal static class AutoTrainingCompiler
     /// every step hash differently and pattern repeats would never trigger.</para>
     /// <para>Per-Train cost: O(entryCount) — one hash op per tape entry. On
     /// VGG16-BN that's ~100 hash ops out of a 38 s iteration — negligible.</para>
+    /// <para><b>Visibility:</b> internal (not private) because PR #331's
+    /// RebindablePlanCache fresh-tape path and the cross-tape detection
+    /// walk in GradientTape both consult this hash directly to keep the
+    /// non-persistent fast path in sync with the persistent compile cache.
+    /// Keep both consumers on the SAME hash function — splitting them
+    /// would let the cache lookups disagree silently.</para>
     /// </remarks>
-    private static long ComputeStructureHash<T>(TapeEntryArena<T> entries, int entryCount)
+    internal static long ComputeStructureHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
         // Include element type so float and double plans don't collide.

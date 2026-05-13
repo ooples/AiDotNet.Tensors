@@ -12573,7 +12573,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
+    public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -12638,7 +12638,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
+    public virtual Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
 
@@ -21080,7 +21080,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// While the CPU version doesn't benefit as much from the memory hierarchy optimizations
     /// as GPU, it still provides memory savings for long sequences.
     /// </remarks>
-    public Tensor<T> FlashAttention<T>(
+    public virtual Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
@@ -22151,7 +22151,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// GQA allows multiple query heads to share the same key-value head,
     /// reducing memory bandwidth and KV-cache size during inference.
     /// </remarks>
-    public Tensor<T> GroupedQueryAttention<T>(
+    public virtual Tensor<T> GroupedQueryAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
@@ -30597,7 +30597,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
@@ -30908,7 +30908,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> FusedConv2D<T>(
+    public virtual Tensor<T> FusedConv2D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,

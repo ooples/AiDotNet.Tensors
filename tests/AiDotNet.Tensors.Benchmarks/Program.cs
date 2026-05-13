@@ -412,6 +412,13 @@ class Program
             return;
         }
 
+        // Issue #327 Transformer TrainBatched baseline harness
+        if (args[0] == "--327-transformer")
+        {
+            Issue327TransformerTrainBatchedBenchmark.Run();
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
@@ -517,6 +524,7 @@ class Program
 #if NET8_0_OR_GREATER
         Console.WriteLine("  --305-init          : First-forward weight-init peak benchmark vs old temp+copy and TorchSharp");
         Console.WriteLine("  --305-init-gpu      : GPU random initialization benchmark for Issue #305");
+        Console.WriteLine("  --327-transformer   : Issue #327 Transformer TrainBatched d=128/L=4/B=32 baseline harness");
 #endif
 #endif
     }

@@ -110,6 +110,49 @@ public struct TapeEntry<T>
     }
 
     /// <summary>
+    /// Populates one of the caller-supplied per-arity buffers (length 1,
+    /// 2, or 3) and returns the buffer whose <c>.Length</c> matches this
+    /// entry's <see cref="InputCount"/>. Returns <see cref="InputsOverflow"/>
+    /// directly when the entry has ≥4 inputs. The arity-matched return
+    /// preserves the existing <c>BackwardFunction&lt;T&gt;</c> contract
+    /// that <c>inputs.Length == InputCount</c> — many backward functions
+    /// branch on <c>inputs.Length</c> (optional bias detection, masked
+    /// reductions, etc.) and a fixed-length-3 view would feed stale
+    /// references from buffer[1] / buffer[2] into unary / binary ops.
+    /// Use ONLY where re-entrant backward is impossible — i.e. when the
+    /// buffer's lifetime is dominated by a single backward dispatch —
+    /// because each buffer is shared across successive calls and would
+    /// be clobbered by a nested call.
+    /// </summary>
+    /// <param name="buffer1">Length-1 buffer (used when <see cref="InputCount"/> == 1).</param>
+    /// <param name="buffer2">Length-2 buffer (used when <see cref="InputCount"/> == 2).</param>
+    /// <param name="buffer3">Length-3 buffer (used when <see cref="InputCount"/> == 3).</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Tensor<T>[] GetInputsArrayInto(
+        Tensor<T>[] buffer1,
+        Tensor<T>[] buffer2,
+        Tensor<T>[] buffer3)
+    {
+        if (InputsOverflow is not null) return InputsOverflow;
+        if (InputCount == 1)
+        {
+            buffer1[0] = Input0;
+            return buffer1;
+        }
+        if (InputCount == 2)
+        {
+            buffer2[0] = Input0;
+            buffer2[1] = Input1!;
+            return buffer2;
+        }
+        // InputCount == 3 (or unexpected — same shape for safety).
+        buffer3[0] = Input0;
+        buffer3[1] = Input1!;
+        buffer3[2] = Input2!;
+        return buffer3;
+    }
+
+    /// <summary>
     /// Validates that no input tensor has been mutated since this entry was recorded.
     /// Throws if any input's version counter has changed.
     /// </summary>
