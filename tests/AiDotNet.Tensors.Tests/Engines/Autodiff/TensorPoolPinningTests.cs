@@ -99,20 +99,75 @@ public class TensorPoolPinningTests
     [Fact]
     public void HvpScenario_PinnedTensor_NotPooledDuringSecondBackward()
     {
-        // Higher-order AD: the inner backward consumes a tensor that the
-        // outer tape has also recorded. Without pinning, the inner could
-        // pool-return the tensor while the outer's later backward still
-        // references it. With pinning, the pool refuses the return —
-        // tensor stays valid for the outer's consumption.
+        // Higher-order AD via createGraph: true: the first backward records
+        // gradient-of-gradient ops back onto the same tape, then the second
+        // backward replays. Both backwards reference the parameter tensor
+        // `x`. The forward and the inner backward must NOT pool-return `x`
+        // while the outer (second) backward still needs to walk through it.
+        AiDotNet.Tensors.Engines.Autodiff.RebindablePlanCache<float>.ResetForTests();
+        TensorPool<float>.Clear();
+        var engine = new CpuEngine();
+
+        var x = new Tensor<float>(new[] { 1 });
+        x.SetFlat(0, 3f);
+
+        using (var tape = new GradientTape<float>())
+        {
+            // y = x · x · x  (y'  = 3x², y'' = 6x)
+            var xx = engine.TensorMultiply(x, x);
+            var y  = engine.TensorMultiply(xx, x);
+
+            // First backward with createGraph: true so the d/dx ops are
+            // themselves recorded onto the tape — that's the moment a
+            // naive pool-return on `x` would corrupt the second backward.
+            var firstGrads  = tape.ComputeGradients(y, new[] { x }, createGraph: true);
+            // y' at x=3 = 27
+            Assert.Equal(27f, firstGrads[x][0], precision: 3);
+
+            // Second backward must still see correct math — would be
+            // broken if any of {x, xx} got recycled out from under us.
+            // The ref-count semantics matter here: the createGraph=true
+            // first backward re-pins inputs through its own Record* calls,
+            // and a naive blanket `_pinnedByTape = false` cleanup would
+            // unpin the originals while the second backward still walks
+            // them. The fact that this Assert.Equal holds is the test.
+            var secondGrads = tape.ComputeGradients(firstGrads[x], new[] { x });
+            // y'' at x=3 = 18
+            Assert.Equal(18f, secondGrads[x][0], precision: 3);
+        }
+    }
+
+    [Fact]
+    public void RefCount_OverlappingPins_StayPinnedUntilAllCleared()
+    {
+        // The ref-counted pin survives one tape's cleanup pass when an
+        // outer tape is still pinning the same tensor. This is the
+        // scenario the plain-bool pin got wrong (PR #347 review): inner
+        // tape's blanket `_pinnedByTape = false` would unpin a tensor
+        // the outer tape still depends on.
         TensorPool<float>.Clear();
         var t = new Tensor<float>(new[] { 8 });
-        t._pinnedByTape = true;
 
+        t._pinnedByTape = true;   // outer-tape pin
+        t._pinnedByTape = true;   // inner-tape pin (count -> 2)
+
+        // Inner tape cleanup clears its pin once.
+        t._pinnedByTape = false;
+        Assert.True(t._pinnedByTape, "First clear must NOT fully unpin while outer tape still holds a pin");
+
+        // Pool still refuses while the outer pin is live.
         TensorPool<float>.Return(t);
-        // Confirm pool is empty after rejected return — Rent must
-        // allocate fresh, not hand back the pinned tensor.
         var fresh = TensorPool<float>.Rent(new[] { 8 });
         Assert.NotSame(t, fresh);
+
+        // Outer tape cleanup clears the last pin.
+        t._pinnedByTape = false;
+        Assert.False(t._pinnedByTape, "Final clear must fully unpin");
+
+        // Extra clears are safe no-ops (clamped at 0): a stale cleanup
+        // from a different tape must not flip the count negative.
+        t._pinnedByTape = false;
+        Assert.False(t._pinnedByTape);
     }
 
     [Fact]

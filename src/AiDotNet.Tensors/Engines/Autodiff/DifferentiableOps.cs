@@ -186,6 +186,12 @@ internal static class DifferentiableOps
                 break;
         }
         output.GradFn = node;
+
+        // Issue #338 tape-pinning: see RecordUnary rationale. Pin every
+        // recorded input so a 4+ input op cannot have any of its tape-held
+        // tensors recycled before the backward walk consumes them.
+        for (int i = 0; i < inputs.Length; i++)
+            inputs[i]._pinnedByTape = true;
     }
 
     /// <summary>

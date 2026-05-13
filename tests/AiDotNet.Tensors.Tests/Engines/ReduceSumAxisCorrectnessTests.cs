@@ -140,6 +140,7 @@ public class ReduceSumAxisCorrectnessTests
         var target = NewRandomFloat(new[] { B, T, FOut }, rng, 0.5f);
 
         float initialLoss = 0, finalLoss = 0;
+        float? previousLoss = null;
         for (int step = 0; step < 5; step++)
         {
             using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
@@ -150,8 +151,18 @@ public class ReduceSumAxisCorrectnessTests
             var loss = _engine.ReduceSum(sq, null);
             var grads = tape.ComputeGradients(loss, new[] { w1, b1, w2, b2 });
 
-            if (step == 0) initialLoss = loss.AsSpan()[0];
-            finalLoss = loss.AsSpan()[0];
+            var currentLoss = loss.AsSpan()[0];
+            if (step == 0) initialLoss = currentLoss;
+            // Enforce monotonic decrease step-by-step — a wrong reduction
+            // axis in any bias gradient lets one mid-training step
+            // INCREASE the loss while the final < initial check still
+            // passes by coincidence. Catching the intermediate violation
+            // is the whole point of this regression guard.
+            if (previousLoss.HasValue)
+                Assert.True(currentLoss <= previousLoss.Value,
+                    $"Loss increased at step {step}: {previousLoss.Value:G4} -> {currentLoss:G4}");
+            previousLoss = currentLoss;
+            finalLoss = currentLoss;
 
             ApplyGradFloat(w1, grads[w1], 0.01f);
             ApplyGradFloat(b1, grads[b1], 0.01f);
