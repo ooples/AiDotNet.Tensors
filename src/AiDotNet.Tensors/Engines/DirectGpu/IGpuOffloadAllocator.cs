@@ -33,6 +33,35 @@ public interface IGpuOffloadAllocator : IDisposable
     void Free(GpuOffloadHandle handle);
 }
 
+/// <summary>
+/// Issue #336: optional capability — allocators that implement this can
+/// wrap a previously-allocated device pointer as a non-owning
+/// <see cref="IGpuBuffer"/>. Used by
+/// <see cref="LinearAlgebra.TensorBase{T}.TryGetGpuBuffer"/> to bridge
+/// the <see cref="WeightLifetime.GpuPinned"/> path to cuBLAS / cuDNN /
+/// custom-kernel callers without round-tripping through the host pointer.
+/// <para>
+/// Not on <see cref="IGpuOffloadAllocator"/> directly because the
+/// net471 target doesn't support default interface methods, and
+/// backends that don't ship a buffer-wrap path shouldn't have to.
+/// </para>
+/// </summary>
+public interface IGpuDevicePointerWrapper
+{
+    /// <summary>
+    /// Wraps a device pointer as a non-owning <see cref="IGpuBuffer"/>.
+    /// The buffer's <c>Dispose</c> is a no-op — the underlying allocation
+    /// is owned by the registry / allocator that produced the pointer.
+    /// </summary>
+    /// <param name="devicePointer">Device pointer (e.g. from
+    /// <see cref="LinearAlgebra.TensorBase{T}.OffloadDevicePointer"/>).</param>
+    /// <param name="elementCount">Number of T-typed elements.</param>
+    /// <param name="elementByteSize">Byte size of each element.</param>
+    /// <returns>A non-owning buffer, or null if the pointer is unknown
+    /// to this allocator.</returns>
+    IGpuBuffer? WrapDevicePointerAsBuffer(IntPtr devicePointer, int elementCount, int elementByteSize);
+}
+
 /// <summary>Result of an offload allocation. <see cref="HostPointer"/> is
 /// safe for host writes; <see cref="DevicePointer"/> is what kernels read
 /// (often the same value for pinned/managed schemes).</summary>

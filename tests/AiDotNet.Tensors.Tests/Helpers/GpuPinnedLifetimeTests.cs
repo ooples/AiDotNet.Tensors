@@ -63,4 +63,65 @@ public class GpuPinnedLifetimeTests
         };
         Assert.Equal(WeightLifetime.GpuPinned, t.Lifetime);
     }
+
+    [Fact]
+    public void TryGetGpuBuffer_CpuOnlyHost_ReturnsNull()
+    {
+        var t = new Tensor<float>(new[] { 16 });
+        Assert.Null(t.TryGetGpuBuffer());
+    }
+
+    [Fact]
+    public void TryGetGpuBuffer_GpuPinnedTagWithoutPointer_ReturnsNull()
+    {
+        var t = new Tensor<float>(new[] { 16 })
+        {
+            Lifetime = WeightLifetime.GpuPinned,
+        };
+        Assert.Null(t.TryGetGpuBuffer());
+    }
+
+    [Fact]
+    public void GpuOptimizer_TryAdamStep_CpuEngine_ReturnsFalse()
+    {
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = new AiDotNet.Tensors.Engines.CpuEngine();
+        try
+        {
+            var param = new Tensor<float>(new[] { 4 });
+            var grad = new Tensor<float>(new[] { 4 });
+            var m = new Tensor<float>(new[] { 4 });
+            var v = new Tensor<float>(new[] { 4 });
+            var ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
+                param, grad, m, v,
+                learningRate: 0.01f, beta1: 0.9f, beta2: 0.999f,
+                epsilon: 1e-8f, weightDecay: 0f, step: 1);
+            Assert.False(ran);
+        }
+        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine; }
+    }
+
+    [Fact]
+    public void GpuOptimizer_TrySgdStep_CpuEngine_ReturnsFalse()
+    {
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = new AiDotNet.Tensors.Engines.CpuEngine();
+        try
+        {
+            var param = new Tensor<float>(new[] { 4 });
+            var grad = new Tensor<float>(new[] { 4 });
+            var ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(param, grad, 0.01f);
+            Assert.False(ran);
+        }
+        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine; }
+    }
+
+    [Fact]
+    public void GpuOptimizer_TryAdamStep_NullArg_Throws()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        Assert.Throws<System.ArgumentNullException>(() =>
+            AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
+                null!, t, t, t, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+    }
 }

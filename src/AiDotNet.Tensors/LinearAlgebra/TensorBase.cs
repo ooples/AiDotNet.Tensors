@@ -416,6 +416,53 @@ public abstract class TensorBase<T> : IDisposable
             : throw new InvalidOperationException("Tensor is not GPU-resident. Call .Gpu() or .To(device) first.");
 
     /// <summary>
+    /// Issue #336: returns the GPU buffer backing this tensor, or null
+    /// when the tensor isn't reachable from an active GPU backend. Unlike
+    /// <see cref="Buffer"/>, this never throws — callers (cuBLAS-backed
+    /// optimizer kernels, custom op dispatchers) get a clean null/non-null
+    /// signal they can branch on without try/catch.
+    /// <para>
+    /// Path priority:
+    /// 1. Direct GPU-resident buffer (set by previous GPU op on this tensor).
+    /// 2. <see cref="WeightLifetime.GpuPinned"/> / <see cref="WeightLifetime.GpuOffload"/>
+    ///    tensor with an <see cref="OffloadDevicePointer"/> — wrapped on
+    ///    demand into an <see cref="Engines.DirectGpu.IGpuBuffer"/> by the
+    ///    active backend.
+    /// 3. CPU-resident with no GPU mapping — returns null.
+    /// </para>
+    /// </summary>
+    /// <returns>The GPU buffer, or null when no GPU mapping exists.</returns>
+    public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
+    {
+        if (_gpuBuffer is not null) return _gpuBuffer;
+        // GpuPinned / GpuOffload tensors carry a device pointer set by
+        // WeightRegistry.RegisterWeight. Wrap it on demand for caller use.
+        if (OffloadDevicePointer != IntPtr.Zero
+            && (Lifetime == WeightLifetime.GpuPinned
+                || Lifetime == WeightLifetime.GpuOffload
+                || Lifetime == WeightLifetime.GpuManaged))
+        {
+            var allocator = WeightRegistry.OffloadAllocator;
+            // Only backends implementing IGpuDevicePointerWrapper can
+            // produce an IGpuBuffer view onto an externally-owned device
+            // pointer. CUDA ships this; other backends fall back to null
+            // until they wire their own non-owning buffer types.
+            if (allocator is Engines.DirectGpu.IGpuDevicePointerWrapper wrapper)
+            {
+                return wrapper.WrapDevicePointerAsBuffer(
+                    OffloadDevicePointer, Length, ElementByteSize());
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Element byte size for the tensor's T parameter — used by
+    /// <see cref="TryGetGpuBuffer"/> when wrapping a device pointer for
+    /// callers that need the byte count without round-tripping through
+    /// <c>Unsafe.SizeOf&lt;T&gt;</c>.</summary>
+    internal abstract int ElementByteSize();
+
+    /// <summary>
     /// Gets the GPU memory management role for this tensor.
     /// </summary>
     public Engines.Gpu.GpuTensorRole Role => _gpuRole;
