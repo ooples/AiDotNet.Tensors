@@ -628,10 +628,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
-            // the lookup below re-uploads instead of returning the same stale buffer.
+            // the lookup below re-uploads instead of returning the same stale
+            // buffer. Activation entries can be keyed by EITHER the backing
+            // array (CacheActivation(T[] resultData, ...) path) OR the
+            // DataVector (DeferTensorResult path when no backing array
+            // existed at upload time). If the tensor later materialized a
+            // backing array and mutated, only the backing-array invalidation
+            // ran on this branch and the vector-keyed entry stayed orphaned,
+            // consuming cache budget. Invalidate BOTH keys: each is a
+            // TryRemove, so the one that wasn't used is a no-op.
             var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
             if (staleArray is not null)
                 InvalidateActivationCacheEntry(staleArray);
+            InvalidateActivationCacheEntry(tensor.DataVector);
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;

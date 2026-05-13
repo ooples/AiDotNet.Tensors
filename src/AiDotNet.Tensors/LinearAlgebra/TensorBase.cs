@@ -940,13 +940,16 @@ public abstract class TensorBase<T> : IDisposable
             _data[GetFlatIndex(indices)] = value;
             // Element-level CPU mutation: bump the version counter so cached
             // GPU buffers (DirectGpuTensorEngine activation cache,
-            // _gpuBufferVersion) detect the change and re-upload. Mirrors
-            // SetFlat's invariant — any element write goes through one of
-            // these two paths and both bump the version. GetFlatIndex
-            // returns a STORAGE index (already includes _storageOffset and
-            // _strides) so we can't route this through SetFlat directly
-            // without an extra logical-flat translation; the manual bump is
-            // the smallest change that closes the gap.
+            // _gpuBufferVersion) detect the change and re-upload. Public
+            // CPU-side mutation entry points that bump Version on the way
+            // out: this indexer setter, the flat-index indexer, SetFlat,
+            // and CopyFromArray.
+            // CAVEAT: the internal raw-storage escape hatches
+            // (AsWritableSpan, RawWritableStorageSpan) hand the caller a
+            // writable span and DO NOT bump Version — they're an explicit
+            // performance escape valve. Callers that mutate through those
+            // spans (CpuEngine in-place kernels, codec writes) call
+            // IncrementVersion themselves at the point of mutation.
             IncrementVersion();
         }
     }
@@ -1013,6 +1016,12 @@ public abstract class TensorBase<T> : IDisposable
             for (int i = 0; i < Length; i++)
                 dstData[FlatIndexToStorageIndex(i)] = source[i];
         }
+        // Bulk CPU-side mutation: bump the version counter so any cached
+        // GPU snapshot tied to the pre-CopyFromArray state gets invalidated
+        // by GetOrAllocateBuffer's version check (parity with SetFlat and
+        // the indexer setter — every bulk-write path through the public
+        // contiguous-array API now updates Version).
+        IncrementVersion();
     }
 
     /// <summary>
@@ -1083,6 +1092,16 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Gets a writable span over the tensor data. Throws for non-contiguous views.
     /// </summary>
+    /// <remarks>
+    /// Version-counter escape valve: this method DOES NOT bump
+    /// <see cref="Version"/>. Callers that mutate through the returned
+    /// span are responsible for calling <see cref="IncrementVersion"/>
+    /// at the point of mutation if the tape-replay / GPU-cache-staleness
+    /// contract matters for their op (every CpuEngine in-place kernel
+    /// already does this). The public mutation entry points
+    /// (indexer setters, <see cref="SetFlat"/>, <see cref="CopyFromArray"/>)
+    /// bump Version unconditionally.
+    /// </remarks>
     internal Span<T> AsWritableSpan()
     {
         EnsureMaterialized();
@@ -1574,6 +1593,13 @@ public abstract class TensorBase<T> : IDisposable
     /// Gets the raw underlying writable data span (full storage, no offset applied).
     /// Use with LogicalToStorageIndex for stride-aware element writes.
     /// </summary>
+    /// <remarks>
+    /// Same Version-counter caveat as <see cref="AsWritableSpan"/>: this
+    /// escape valve DOES NOT bump <see cref="Version"/>. Callers writing
+    /// through the returned span must call <see cref="IncrementVersion"/>
+    /// at the point of mutation if tape-replay safety or GPU-cache
+    /// staleness checks matter for the calling op.
+    /// </remarks>
     internal Span<T> RawWritableStorageSpan => _data.AsWritableSpan();
 
     /// <summary>

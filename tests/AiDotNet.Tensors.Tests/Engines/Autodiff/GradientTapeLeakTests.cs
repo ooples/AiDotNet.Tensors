@@ -154,8 +154,16 @@ public class GradientTapeLeakTests
             var survivorSet = new System.Collections.Generic.HashSet<object>(refEq);
             foreach (var (_, t) in survivorTargets) survivorSet.Add(t);
 
-            foreach (var type in aidotnetAssembly.GetTypes())
+            // GetTypes() throws ReflectionTypeLoadException when an optional
+            // dependency fails to load; ex.Types still contains the partially-
+            // loaded type set (with nulls for the failures). Catch and continue
+            // so a load failure doesn't mask the original leak assertion.
+            System.Type?[] allTypes;
+            try { allTypes = aidotnetAssembly.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex) { allTypes = ex.Types; }
+            foreach (var type in allTypes)
             {
+                if (type is null) continue;
                 if (!type.IsClass && !type.IsValueType) continue;
                 System.Reflection.FieldInfo[] fields;
                 try { fields = type.GetFields(
