@@ -517,22 +517,30 @@ public static class OptimizerKernels
             y.Length, beta);
     }
 
-    /// <summary>D-Adaptation SGD update (Defazio &amp; Mishchenko, 2023).
-    /// Learning-rate-free — the kernel adapts <c>d</c> (effective step size)
-    /// each call. Caller persists <paramref name="sBuf"/>,
+    /// <summary>D-Adaptation SGD update (Defazio &amp; Mishchenko, 2023;
+    /// Prodigy growth bound from Mishchenko &amp; Defazio 2024).
+    /// Learning-rate-free — the kernel adapts <c>d</c> (effective step
+    /// estimate) each call. Caller persists <paramref name="sBuf"/>,
     /// <paramref name="rAccum"/>, and the returned new d across steps.</summary>
-    /// <param name="sBuf">Running grad-sum accumulator, same shape as
-    /// param/grad. Initialize to zero.</param>
+    /// <param name="sBuf">Running weighted-grad accumulator, same shape
+    /// as param/grad. Initialize to zero.</param>
     /// <param name="d">Current distance estimate. Initialize to a small
     /// positive value (1e-6 is the paper default).</param>
     /// <param name="rAccum">Scalar accumulator. Caller persists. Initialize
     /// to zero.</param>
-    /// <param name="growthCoef">Growth bound for d per step. 1.0 is the
-    /// paper default; 0.5 reduces oscillation on small models.</param>
+    /// <param name="lr">User-supplied scaling on the effective step
+    /// γ_k = d_k · lr. Default 1.0 — the algorithm picks d for you, so
+    /// most users leave this alone. Use values &lt;1 to scale down
+    /// proportionally if numeric stability requires.</param>
+    /// <param name="growthRate">Cap on per-step ratio d_{k+1} / d_k.
+    /// Prodigy default 1.5 (50% growth per step) prevents a too-small
+    /// initial d from blowing the trajectory up on steep problems
+    /// before s/r catch up. Set higher for faster adaptation, lower for
+    /// more stability.</param>
     /// <returns>The new d. Caller persists this for the next call.</returns>
     public static unsafe float DAdaptationSgdInPlace(
         Tensor<float> param, Tensor<float> grad, Tensor<float> sBuf,
-        float d, ref float rAccum, float growthCoef = 1.0f, float eps = 1e-8f)
+        float d, ref float rAccum, float lr = 1.0f, float growthRate = 1.5f)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (grad is null) throw new ArgumentNullException(nameof(grad));
@@ -543,6 +551,8 @@ public static class OptimizerKernels
         if (!param.IsContiguous || !sBuf.IsContiguous)
             throw new ArgumentException("DAdaptationSgd requires param and sBuf to be contiguous.");
         if (d <= 0f) throw new ArgumentOutOfRangeException(nameof(d), "d must be > 0 (initial estimate; 1e-6 is the paper default).");
+        if (lr <= 0f) throw new ArgumentOutOfRangeException(nameof(lr), "lr must be > 0.");
+        if (growthRate <= 1.0f) throw new ArgumentOutOfRangeException(nameof(growthRate), "growthRate must be > 1 (paper default 1.5).");
         if (param.Length == 0) return d;
 
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
@@ -551,7 +561,7 @@ public static class OptimizerKernels
         using var pinS = sBuf.Data.Pin();
         return FusedOptimizer.DAdaptationSgdUpdateSimd(
             (float*)pinP.Pointer, (float*)pinG.Pointer, (float*)pinS.Pointer,
-            param.Length, d, ref rAccum, growthCoef, eps);
+            param.Length, d, ref rAccum, lr, growthRate);
     }
 
     // ── Per-parameter-group grouped SGD (Issue #348 — feature 2) ───────

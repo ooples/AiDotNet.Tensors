@@ -1139,40 +1139,47 @@ internal static class FusedOptimizer
     }
 
     /// <summary>D-Adaptation SGD (Defazio &amp; Mishchenko, 2023 — "Learning-Rate-Free
-    /// Learning by D-Adaptation"). Provably converges to the optimal SGD lr
-    /// without any tuning. State per parameter group:
+    /// Learning by D-Adaptation"; growth-bounded variant from Prodigy,
+    /// Mishchenko &amp; Defazio 2024). Provably converges to the optimal SGD
+    /// lr without any tuning. State per parameter group:
     ///   d_k        — current distance estimate (scalar; caller persists)
-    ///   s_buf      — running grad sum (same shape as params)
+    ///   s_buf      — running weighted-grad accumulator (same shape as params)
     ///   r_scalar   — accumulator for d update (scalar; caller persists)
     /// Update rule (per step):
-    ///   s_buf  += d_k · g
-    ///   r     += d_k² · ⟨g, g⟩
-    ///   d_hat  = ||s_buf||² / (√r + ε)
-    ///   d_{k+1}= max(d_k, d_hat · γ)       — γ ∈ [0.1, 1.0], growth coef
-    ///   p     -= d_{k+1} · g
-    /// Returns the new d value. <paramref name="growthCoef"/> bounds how
-    /// fast d can grow per step — paper default is 1.0 but 0.5 reduces
-    /// early-step oscillation on small models.</summary>
+    ///   γ_k    = d_k · lr                   — effective step (lr ≈ 1.0 typical)
+    ///   s_buf += γ_k · g
+    ///   r     += γ_k² · ⟨g, g⟩
+    ///   d_hat  = ||s_buf||² / (√r + 1e-30)
+    ///   d_{k+1}= max(d_k, min(d_hat, d_k · growthRate))
+    ///   p     -= γ_{k+1} · g
+    /// <paramref name="growthRate"/> caps per-step growth so a too-small
+    /// initial d_0 can't blow up the trajectory on steep problems —
+    /// matches the Prodigy "growth_rate" hyperparameter.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe float DAdaptationSgdUpdateSimd(
         float* param, float* grad, float* sBuf, int length,
-        float d, ref float rAccum, float growthCoef, float eps)
+        float d, ref float rAccum, float lr, float growthRate)
     {
-        // Pass 1: update s_buf, accumulate r += d² · ⟨g, g⟩ and ||s||² (for d_hat).
+        // γ_k = d * lr. Paper's "step at iteration k" — separate from the
+        // updated γ_{k+1} we'll use to write parameters at the END of the
+        // step, which uses the new d.
+        float gammaCur = d * lr;
+
+        // Pass 1: update s_buf with current γ, accumulate ||g||² and ||s||².
         float gNorm2 = 0f;
         float sNorm2 = 0f;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Fma.IsSupported && length >= 8)
         {
-            var vD = Vector256.Create(d);
+            var vGamma = Vector256.Create(gammaCur);
             var gAcc = Vector256<float>.Zero;
             var sAcc = Vector256<float>.Zero;
             int simdLen = length & ~7;
             for (; i < simdLen; i += 8)
             {
                 var g = Avx.LoadVector256(grad + i);
-                var s = Fma.MultiplyAdd(vD, g, Avx.LoadVector256(sBuf + i));
+                var s = Fma.MultiplyAdd(vGamma, g, Avx.LoadVector256(sBuf + i));
                 Avx.Store(sBuf + i, s);
                 gAcc = Fma.MultiplyAdd(g, g, gAcc);
                 sAcc = Fma.MultiplyAdd(s, s, sAcc);
@@ -1183,31 +1190,38 @@ internal static class FusedOptimizer
 #endif
         for (; i < length; i++)
         {
-            sBuf[i] += d * grad[i];
+            sBuf[i] += gammaCur * grad[i];
             gNorm2 += grad[i] * grad[i];
             sNorm2 += sBuf[i] * sBuf[i];
         }
 
-        rAccum += d * d * gNorm2;
-        float dHat = sNorm2 / (MathF.Sqrt(rAccum) + eps);
-        float dNew = MathF.Max(d, dHat * growthCoef);
+        rAccum += gammaCur * gammaCur * gNorm2;
+        // 1e-30 (not eps) — numerical floor only; we don't want to dampen
+        // the distance signal.
+        float dHat = sNorm2 / (MathF.Sqrt(rAccum) + 1e-30f);
+        // Cap per-step growth (Prodigy growth_rate). Without this bound,
+        // an initial d_0 ≪ d* causes d to leap orders of magnitude per
+        // step and blow up before s/r catch up.
+        float dCapped = MathF.Min(dHat, d * growthRate);
+        float dNew = MathF.Max(d, dCapped);
 
-        // Pass 2: param -= dNew · g.
+        // Pass 2: param -= d_new · lr · g.
+        float gammaNew = dNew * lr;
         i = 0;
 #if NET5_0_OR_GREATER
         if (Fma.IsSupported && length >= 8)
         {
-            var vLr = Vector256.Create(-dNew);
+            var vStep = Vector256.Create(-gammaNew);
             int simdLen = length & ~7;
             for (; i < simdLen; i += 8)
             {
                 var g = Avx.LoadVector256(grad + i);
-                Avx.Store(param + i, Fma.MultiplyAdd(vLr, g, Avx.LoadVector256(param + i)));
+                Avx.Store(param + i, Fma.MultiplyAdd(vStep, g, Avx.LoadVector256(param + i)));
             }
         }
 #endif
         for (; i < length; i++)
-            param[i] -= dNew * grad[i];
+            param[i] -= gammaNew * grad[i];
 
         return dNew;
     }
