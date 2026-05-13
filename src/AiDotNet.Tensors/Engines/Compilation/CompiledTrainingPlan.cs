@@ -868,8 +868,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // ReLU forward: direct SIMD into output buffer
-        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        // ReLU forward: direct SIMD into output buffer (float-only fast path).
+        // Issue #340: this branch previously fired for any T because the
+        // outer gate omitted `typeof(T) == typeof(float)`. T=double tensors
+        // would then crash inside the closure on `(Tensor<float>)(object)input`
+        // — InvalidCastException at plan.Step() during VGGNetwork<double>
+        // training. Gate the SIMD path and add an eager engine fallback for
+        // non-float T so the fused plan still applies the op without falling
+        // back to eager retraining.
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -882,6 +890,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var pinO = oMem.Pin();
                 SimdKernels.ReLUUnsafe((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
             };
+        }
+        // ReLU forward non-float fallback (T=double etc.): route through the
+        // engine's ReLUInto so the fused plan still owns the op without
+        // requiring the float-only SIMD kernel.
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            return eng => eng.ReLUInto(output, input);
         }
 
         // ReduceSum forward: direct sum, skip engine dispatch
@@ -930,12 +947,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     unsafe { cOut[0] = SimdKernels.SumUnsafe((float*)inH.AddrOfPinnedObject(), len); }
                 };
             }
+            // Non-float ReduceSum fallback. Issue #340: the prior version
+            // unconditionally did `cOut ??= (float[])(object)output.GetDataArray()`
+            // even on the non-float path — T=double would have crashed
+            // here on first replay. Store the engine's T sum directly into
+            // the output tensor via SetFlat so the generic numeric path
+            // works for any T.
             return eng =>
             {
-                cOut ??= (float[])(object)output.GetDataArray();
                 T sum = eng.TensorSum(input);
-                if (typeof(T) == typeof(float))
-                    cOut[0] = Unsafe.As<T, float>(ref sum);
+                output.SetFlat(0, sum);
             };
         }
 
@@ -1992,11 +2013,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // generic engine fallback path handles arbitrary strides
         // correctly, so route non-contiguous inputs there instead of
         // through this fast path.
+        // Issue #340: gate the BLAS-Sgemm fast path on typeof(T) == typeof(float).
+        // The pinned-pointer block below casts every storage array to
+        // float[]; T=double would crash with InvalidCastException at
+        // first replay. (The matching double path is the BLAS-Dgemm
+        // backward elsewhere; non-float / non-double types fall through
+        // to the generic engine path.)
         if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && step.OutputBuffer.IsContiguous
-            && BlasProvider.IsAvailable)
+            && BlasProvider.IsAvailable
+            && typeof(T) == typeof(float))
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
@@ -2103,9 +2131,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 input.Grad = gradIn;
             };
         }
-        // ReLU backward fallback: full input tensor path (non-float types)
+        // ReLU backward — secondary float-only path. Issue #340: the
+        // outer comment claimed this was the "non-float types" fallback
+        // but the body casts to Tensor<float>, so T=double would have
+        // crashed here. The primary block above is already gated on
+        // typeof(T) == typeof(float); gate this duplicate the same way
+        // and add a real non-float fallback that routes through the
+        // engine.
         if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
-            && step.Inputs[0].IsContiguous)
+            && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -2126,6 +2161,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var pinD = dMem.Pin();
                 SimdKernels.ReluBackwardUnsafe(
                     (float*)pinG.Pointer, (float*)pinI.Pointer, (float*)pinD.Pointer, input.Length);
+                input.Grad = gradIn;
+            };
+        }
+        // ReLU backward — true non-float fallback. Routes through the
+        // engine's ReluBackward so T=double / BFloat16 etc. still get a
+        // working fused plan instead of an InvalidCastException.
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
+            && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var computed = eng.ReluBackward(gradOut, input);
+                computed.AsSpan().CopyTo(gradIn.AsWritableSpan());
                 input.Grad = gradIn;
             };
         }
@@ -2622,6 +2679,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 consumedIndices.Add(i + 1);
                 consumedIndices.Add(i + 2);
                 i += 2;
+                continue;
+            }
+
+            // Issue #340: the block below is float-only (FusedMultiLayerGemm
+            // takes float[]; every cast is to (float[])(object)X). The
+            // T=double branch above continues; any other T (e.g. BFloat16)
+            // would crash on the cast at first replay. Skip the fused
+            // float kernel for non-float T so the plan falls through to
+            // the generic step path.
+            if (typeof(T) != typeof(float))
+            {
+                TensorAllocator.Return(activatedBuffer);
                 continue;
             }
 
