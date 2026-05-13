@@ -1189,14 +1189,34 @@ public sealed class GradientTape<T> : IDisposable
             }
             else
             {
-                // Issue #338: even on the persistent-tape path (where the
-                // full cleanup is skipped because the chain is cached for
-                // replay), the tape-pinning flags must be cleared after
-                // backward — pool safety is independent of graph-retention
-                // semantics. Without this, persistent-tape users would
-                // accumulate "permanently pinned" tensors that
-                // TensorPool.Return refuses, defeating the entire pooling
-                // win the pin flag was designed to unlock.
+                // Issue #283 / #338: persistent-tape path. Pre-fix this branch
+                // only cleared _pinnedByTape flags; .GradFn / .Grad were left
+                // set, so any consumer holding an intermediate tensor (the
+                // layer-cache pattern: MultiHeadAttentionLayer's _lastInput
+                // etc.) pinned the entire backward graph through that
+                // intermediate's GradFn pointer. The chain.Execute uses
+                // BackwardStep[] which stores Output / Inputs directly — it
+                // does NOT follow tensor.GradFn at execute time — so nulling
+                // GradFn here is safe even though the chain is cached for
+                // replay. The next forward will re-set GradFn on every
+                // intermediate before the next backward runs.
+                //
+                // sourceSet collection mirrors the !Persistent branch above
+                // so the keepGrad rule (explicit sources / RetainGrad)
+                // applies consistently.
+                HashSet<Tensor<T>>? persistentSourceSet = null;
+                if (sources is not null)
+                {
+                    persistentSourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                    foreach (var s in sources) persistentSourceSet.Add(s);
+                }
+                bool PersistentShouldKeepGrad(Tensor<T> t)
+                {
+                    if (persistentSourceSet?.Contains(t) == true) return true;
+                    if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
+                    return false;
+                }
+
                 foreach (var node in topoOrder)
                 {
                     if (!ReferenceEquals(node.OwningTape, this)) continue;
@@ -1207,6 +1227,40 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
+
+                    // Issue #283 fix: destructive cleanup on Output AND on
+                    // intermediate Inputs. Output is always an intermediate
+                    // (leaves never appear as Output of an entry). Inputs
+                    // may be leaves (params / raw inputs) — preserve their
+                    // .Grad and don't touch their .GradFn (leaves have
+                    // GradFn=null anyway, or it belongs to an outer tape).
+                    node.Output.GradFn = null;
+                    if (!PersistentShouldKeepGrad(node.Output))
+                        node.Output.Grad = null;
+
+                    static void ClearIfIntermediate(Tensor<T>? t, GradientTape<T> self,
+                        Func<Tensor<T>, bool> shouldKeep, bool canPool)
+                    {
+                        if (t is null) return;
+                        var fn = t.GradFn;
+                        if (fn is null) return;
+                        if (!ReferenceEquals(fn.OwningTape, self)) return;
+                        t.GradFn = null;
+                        if (!shouldKeep(t)) t.Grad = null;
+                        if (canPool) GradNodePool<T>.Return(fn);
+                    }
+                    bool canPoolPersist = !DifferentiableOps._isBackwardCreateGraph;
+                    ClearIfIntermediate(node.Input0, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputCount >= 2) ClearIfIntermediate(node.Input1, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputCount >= 3) ClearIfIntermediate(node.Input2, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputsOverflow is not null)
+                    {
+                        foreach (var inp in node.InputsOverflow)
+                            ClearIfIntermediate(inp, this, PersistentShouldKeepGrad, canPoolPersist);
+                    }
+
+                    // Pool-return this node too (already nulled GradFn on output above).
+                    if (canPoolPersist) GradNodePool<T>.Return(node);
                 }
             }
 
