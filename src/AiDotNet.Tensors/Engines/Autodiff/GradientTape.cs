@@ -1613,6 +1613,46 @@ public sealed class GradientTape<T> : IDisposable
         // sets it (e.g. a future code change that caches across a
         // re-execute call) from leaking BackwardStep[] across Dispose.
         _cachedDelegateChain = null;
+
+        // Issue #283 fix: invalidate ONLY this tape's forward-recorded
+        // outputs from the GPU activation cache BEFORE resetting the
+        // entries (reset zeros Output refs, leaving nothing to walk).
+        // The cache is designed for inference-side layer chaining, but
+        // during TRAINING each forward op registers a deferred-download
+        // materializer keyed on its result array. Those registrations
+        // strong-ref the result arrays — and once user code holds an
+        // intermediate externally (the layer-cache pattern: AiDotNet's
+        // MultiHeadAttentionLayer _lastQueryInput etc.), the array →
+        // cache-entry → GPU-buffer chain pins ~16-32 KB per cached
+        // activation for the rest of the process. Measured 547 KB/call
+        // retention on the 4L Transformer NullSources probe; this fix
+        // drops it to 0 B/call.
+        //
+        // Why per-tape-entry instead of ClearActivationCache: a tape's
+        // forward might run AFTER a separate inference-chain that
+        // populated the cache with entries the outer scope still wants
+        // (e.g. cached weights/biases the next inference reuses).
+        // Wholesale clearing breaks ~64 unrelated test scenarios that
+        // share the cache across tape boundaries. Walking _entries
+        // touches only the recorded outputs of THIS tape — exactly
+        // what's at risk of being pinned across our Dispose.
+        //
+        // Only the OUTERMOST tape invalidates — nested tapes
+        // (Hvp/Hessian) must not clear their parent's pending
+        // materializers mid-backward. Detect outermost via
+        // _parent == null. Engine check gates the virtual dispatch.
+        if (_parent is null && _entries.Count > 0
+            && _engine is Engines.DirectGpuTensorEngine gpuEngine)
+        {
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var entry = ref _entries[i];
+                var output = entry.Output;
+                if (output is null) continue;
+                gpuEngine.InvalidateGpuCacheForTensor(output);
+            }
+        }
+
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;

@@ -684,6 +684,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
     }
 
+    /// <summary>
+    /// Invalidates this tensor's activation-cache and pending deferred-
+    /// download registrations. Called from GradientTape.Dispose to drop
+    /// per-step forward intermediates that would otherwise pin GPU
+    /// buffers across iterations (issue #283).
+    ///
+    /// <para>Removes both the cache entry and the pending materializer
+    /// registration. If the entry was pending, force-materialize first
+    /// so any subsequent CPU read sees correct data instead of
+    /// uninitialized.</para>
+    /// </summary>
+    internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        // Both the array-keyed and vector-keyed activation cache
+        // entries may have been added (different cache paths use
+        // different keys). Invalidate both to be safe.
+        var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backingArray is not null)
+        {
+            if (Helpers.DeferredArrayMaterializer.IsPending(backingArray))
+            {
+                // Force-materialize before invalidating so the array
+                // ends up with valid CPU data (user might still read
+                // tensor.GetDataArray() after Dispose).
+                try { Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray); }
+                catch { Helpers.DeferredArrayMaterializer.Remove(backingArray); }
+            }
+            InvalidateActivationCacheEntry(backingArray);
+        }
+        if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+        {
+            try { Helpers.DeferredArrayMaterializer.TryMaterialize(tensor.DataVector); }
+            catch { Helpers.DeferredArrayMaterializer.Remove(tensor.DataVector); }
+        }
+        InvalidateActivationCacheEntry(tensor.DataVector);
+    }
+
     private void InvalidateActivationCacheEntry(object key)
     {
         // Byte-accounting units must match the add/remove/evict paths
