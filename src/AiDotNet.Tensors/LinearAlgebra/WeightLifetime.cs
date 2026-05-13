@@ -30,6 +30,23 @@ public enum WeightLifetime
     /// (cudaMallocManaged / hipMallocManaged / Metal shared MTLBuffer / OpenCL
     /// SVM). Driver handles page migration; no explicit copies.</summary>
     GpuManaged = 3,
+
+    /// <summary>
+    /// Weight tagged for GPU-resident lifetime — same storage strategy as
+    /// <see cref="GpuOffload"/> (pinned-host + DMA mapping) but with the
+    /// semantic intent of "this lives on the GPU side of the train loop".
+    /// Used by issue #336's optimizer-state-on-GPU work: Adam <c>m</c> /
+    /// <c>v</c> buffers, BatchNorm running stats, and weights all tagged
+    /// GpuPinned avoid the per-train-step <c>cuMemcpyHtoD</c> /
+    /// <c>cuMemcpyDtoH</c> round-trip that dominates small-batch wall-time.
+    /// <para>
+    /// On CPU-only hosts, falls back to <see cref="Default"/> with a
+    /// CPU-pinned arena tier (<c>TensorAllocator.RentPinnedOnGpu</c> handles
+    /// the fallback transparently). The lifetime value is an intent hint;
+    /// the actual allocator is dispatched by the active engine.
+    /// </para>
+    /// </summary>
+    GpuPinned = 4,
 }
 
 /// <summary>

@@ -177,6 +177,7 @@ public static class WeightRegistry
                     }
                 case WeightLifetime.GpuOffload:
                 case WeightLifetime.GpuManaged:
+                case WeightLifetime.GpuPinned:
                     {
                         var alloc = _offloadAllocator;
                         if (alloc is null || !alloc.IsAvailable)
@@ -192,6 +193,13 @@ public static class WeightRegistry
                                 $"(stage byte[] limit). Tensor has {weight.Length} elements × {ElementSize<T>()} bytes = " +
                                 $"{offloadByteCountLong} bytes. Chunk the tensor on the consumer side.");
                         int byteCount = (int)offloadByteCountLong;
+                        // GpuPinned shares the pinned-host + DMA scheme with
+                        // GpuOffload; GpuManaged uses unified/managed memory.
+                        // The semantic difference (GpuPinned ⇒ "this lives on
+                        // the GPU side of the train loop", GpuOffload ⇒ "may
+                        // live on host for memory-constrained models") is
+                        // visible to consumer code via the Lifetime tag but
+                        // doesn't change the allocator path.
                         var scheme = weight.Lifetime == WeightLifetime.GpuManaged
                             ? OffloadScheme.Managed : OffloadScheme.Pinned;
                         // Serialize FIRST so a SerializeToBytes failure (e.g.,
