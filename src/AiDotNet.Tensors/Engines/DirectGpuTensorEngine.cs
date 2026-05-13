@@ -4830,20 +4830,57 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// 2D average-pooling backward. Routes unconditionally through
-    /// <see cref="CpuEngine"/> because the GPU kernel for this overload
-    /// crashed with 0xC0000005 on small 1×1×H×W inputs surfaced by
-    /// <c>AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient</c>.
-    /// The prior GPU implementation was retained as dead code under a
-    /// <c>#pragma warning disable CS0162</c> suppression — that's a
-    /// maintenance liability (silent edits to the unreachable block,
-    /// false sense of GPU coverage). The kernel and its parameter
-    /// layout remain in git history (commit 3aedf69) if and when the
-    /// crash root cause is fixed and the GPU path is re-enabled.
+    /// GPU-accelerated backward pass for 2D average pooling.
+    /// Distributes gradients evenly across the input elements that contributed to each output.
     /// </summary>
+    /// <remarks>
+    /// The prior 0xC0000005 crash on small 1×1×H×W inputs was a
+    /// kernel-arg mismatch in CudaBackend.AvgPool2DBackward: the kernel
+    /// declares 15 parameters (the 14 shape/stride/pad ints plus
+    /// <c>countIncludePad</c>) but the C# caller stack-allocated only 14
+    /// slots, so cuLaunchKernel read garbage for parameter 15. Fixed in
+    /// CudaBackend with a 15-slot args buffer matching the kernel
+    /// signature; HIP / OpenCL / Vulkan / Metal / WebGpu were already
+    /// passing the full 15-arg layout.
+    /// </remarks>
     public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
-        return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+        if (!TryGetBackend(out var backend))
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+
+        if (gradOutput.Rank != 4 || inputShape.Length != 4)
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+
+        int batch = inputShape[0];
+        int channels = inputShape[1];
+        int inHeight = inputShape[2];
+        int inWidth = inputShape[3];
+        int outHeight = gradOutput.Shape._dims[2];
+        int outWidth = gradOutput.Shape._dims[3];
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
+        using var gradInputBuffer = AllocateOutputBuffer(backend, batch * channels * inHeight * inWidth);
+
+        try
+        {
+            backend.AvgPool2DBackward(gradOutputBuffer.Buffer, gradInputBuffer.Buffer,
+                batch, channels, inHeight, inWidth,
+                outHeight, outWidth,
+                poolSize[0], poolSize[1],
+                stride[0], stride[1], 0, 0,
+                countIncludePad: true);
+
+            int inputSize = batch * channels * inHeight * inWidth;
+            float[] resultFloat = new float[inputSize];
+            backend.DownloadBuffer(gradInputBuffer.Buffer, resultFloat);
+
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            return new Tensor<T>(resultData, inputShape);
+        }
+        catch
+        {
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+        }
     }
 
     /// <summary>

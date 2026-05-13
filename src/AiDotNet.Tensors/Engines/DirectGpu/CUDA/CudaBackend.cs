@@ -4291,7 +4291,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr gradInPtr = gradInput.Handle;
         int countPad = countIncludePad ? 1 : 0;
-        void** args = stackalloc void*[14];
+        // Kernel signature has 15 parameters — gradOutput, gradInput, the 12
+        // shape/stride/pad ints, and countIncludePad. The original 14-slot
+        // stackalloc dropped the countIncludePad slot, so cuLaunchKernel read
+        // garbage stack memory for parameter 15 and crashed with 0xC0000005
+        // on small inputs (issue surfaced by
+        // AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient). Match
+        // the kernel signature exactly.
+        void** args = stackalloc void*[15];
         args[0] = &gradOutPtr;
         args[1] = &gradInPtr;
         args[2] = &batch;
@@ -4306,6 +4313,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[11] = &strideW;
         args[12] = &padH;
         args[13] = &padW;
+        args[14] = &countPad;
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
