@@ -410,6 +410,58 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float weightDecay = 0f);
 
     /// <summary>
+    /// Configures fused optimizer updates with a per-step
+    /// <see cref="LrSchedule"/>. Equivalent to
+    /// <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float)"/>
+    /// but the schedule is evaluated inline inside the kernel-call wrapper
+    /// each <see cref="Step"/>, removing the managed-code dispatch cost
+    /// of PyTorch's eager <c>LRScheduler.step()</c>. Issue #348.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #348):</b> same
+    /// rationale as <see cref="EnableCheckpointing"/> — adding to this
+    /// interface breaks third-party implementers, but no default-interface
+    /// polyfill is possible on net471.
+    /// </para>
+    /// </remarks>
+    void ConfigureOptimizer(
+        OptimizerType optimizerType,
+        LrSchedule schedule,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f);
+
+    /// <summary>
+    /// Configures fused optimizer updates with a per-parameter-group
+    /// <see cref="LrSchedule"/>. Each parameter is mapped to a schedule
+    /// slot via <paramref name="paramToGroup"/> (parallel to the
+    /// compiled parameter array). Single launch, no per-group bookkeeping
+    /// in the hot path — schedules are resolved once per group per step,
+    /// not once per parameter. PyTorch's <c>param_groups</c> mechanism
+    /// dispatches a separate optimizer call per group. Issue #348.
+    /// </summary>
+    /// <param name="groupSchedules">Per-group learning-rate schedule.
+    /// <c>groupSchedules.Count</c> = number of distinct groups.</param>
+    /// <param name="paramToGroup">For each compiled parameter (parallel
+    /// order), an index into <paramref name="groupSchedules"/>.</param>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #348):</b> same
+    /// rationale as <see cref="EnableCheckpointing"/>.
+    /// </para>
+    /// </remarks>
+    void ConfigureOptimizerGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f);
+
+    /// <summary>
     /// Enables gradient checkpointing for this plan, reducing activation memory from
     /// O(N) to O(sqrt(N)) at the cost of ~33% more compute (each segment's forward
     /// runs twice during backward). Call once after compilation, before the training loop.
