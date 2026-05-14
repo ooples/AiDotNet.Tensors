@@ -33,6 +33,318 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 public class BatchNormGradSlotResidualTests
 {
     /// <summary>
+    /// Diagnostic: take the SAME inputF/gammaF/betaF that compile-mode
+    /// captured in the lazy delegate, and run engine.BatchNorm on them
+    /// directly RIGHT BEFORE plan.Step(). If THIS diverges from eager,
+    /// the input data was mutated post-compile (root cause is buffer
+    /// aliasing or a stale sticky GraphMode state). If it matches, the
+    /// bug is in plan.Step's invocation context (re-entrant GraphMode,
+    /// lazy result aliasing the input buffer, etc).
+    /// </summary>
+    [Fact]
+    public void Diagnostic_BatchNorm_3D_DOUBLE_DirectCallAfterCompile_MatchesEager()
+    {
+        var engine = new CpuEngine();
+        const int C = 8, H = 4, W = 4;
+        const double epsilon = 1e-5;
+        var rng = new System.Random(42);
+        var inputData = new double[C * H * W];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+
+        var inputE = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = inputData[i];
+        var gammaE = new Tensor<double>(new[] { C });
+        var betaE = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+        var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+        var snapE = new double[bnE.Length];
+        for (int i = 0; i < bnE.Length; i++) snapE[i] = bnE[i];
+
+        var inputF = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = inputData[i];
+        var gammaF = new Tensor<double>(new[] { C });
+        var betaF = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            engine.ReduceSum(bnF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+
+        // Snapshot inputF/gammaF/betaF data RIGHT NOW (post-Compile, pre-Step)
+        var inSnap = new double[inputF.Length];
+        for (int i = 0; i < inputF.Length; i++) inSnap[i] = inputF[i];
+        var gSnap = new double[gammaF.Length];
+        for (int i = 0; i < gammaF.Length; i++) gSnap[i] = gammaF[i];
+        var bSnap = new double[betaF.Length];
+        for (int i = 0; i < betaF.Length; i++) bSnap[i] = betaF[i];
+
+        // Direct call — this is what plan.Step's lazy execute will do internally.
+        // GraphMode is now disabled. If this diverges from snapE, the data was
+        // already wrong by the time we got here.
+        var bnDirect = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool dataDrift = false, outputDrift = false;
+        const double tol = 1e-12;
+        for (int i = 0; i < inputData.Length; i++)
+            if (System.Math.Abs(inputData[i] - inSnap[i]) > tol) { dataDrift = true; lines.Add($"  inputF[{i}] orig={inputData[i]:F8} now={inSnap[i]:F8}"); }
+        for (int i = 0; i < C; i++)
+        {
+            if (System.Math.Abs(1.0 - gSnap[i]) > tol) { dataDrift = true; lines.Add($"  gammaF[{i}] orig=1.0 now={gSnap[i]:F8}"); }
+            if (System.Math.Abs(0.0 - bSnap[i]) > tol) { dataDrift = true; lines.Add($"  betaF[{i}] orig=0.0 now={bSnap[i]:F8}"); }
+        }
+        for (int i = 0; i < bnE.Length; i++)
+        {
+            double d = System.Math.Abs(snapE[i] - bnDirect[i]);
+            if (d > tol) { outputDrift = true; lines.Add($"  bn[{i}] eager={snapE[i]:F8} direct={bnDirect[i]:F8} (Δ={d:E2})"); }
+        }
+        Assert.False(dataDrift || outputDrift,
+            $"dataDrift={dataDrift}, outputDrift={outputDrift}. First mismatches:\n" + string.Join("\n", lines.Take(20)));
+    }
+
+    /// <summary>
+    /// T=double rank-3 [C,H,W] forward-only diff. Pre-Step (right after
+    /// CompileTraining returns) bnF should hold the eager-time-copied
+    /// values. Post-Step bnF should be the result of the lazy execute
+    /// delegate. Both should equal the standalone eager call. If post-Step
+    /// diverges, the lazy execute's eng.BatchNorm replay gives a different
+    /// output than the eager call did — pointing the bug at the rank-3
+    /// double BN forward path under Step().
+    /// </summary>
+    [Fact]
+    public void BatchNorm_3D_DOUBLE_CHW_ForwardReplay_MatchesEager()
+    {
+        var engine = new CpuEngine();
+        const int C = 8, H = 4, W = 4;
+        const double epsilon = 1e-5;
+        var rng = new System.Random(42);
+        var inputData = new double[C * H * W];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+
+        var inputE = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = inputData[i];
+        var gammaE = new Tensor<double>(new[] { C });
+        var betaE = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+        var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+        var snapE = new double[bnE.Length];
+        for (int i = 0; i < bnE.Length; i++) snapE[i] = bnE[i];
+
+        var inputF = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = inputData[i];
+        var gammaF = new Tensor<double>(new[] { C });
+        var betaF = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+
+        Tensor<double> bnF;
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            engine.ReduceSum(bnF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+
+        var snapPre = new double[bnF.Length];
+        for (int i = 0; i < bnF.Length; i++) snapPre[i] = bnF[i];
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+
+        var snapPost = new double[bnF.Length];
+        for (int i = 0; i < bnF.Length; i++) snapPost[i] = bnF[i];
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool preDiff = false, postDiff = false;
+        const double tol = 1e-12;
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                {
+                    int i = c * H * W + h * W + w;
+                    double dPre = System.Math.Abs(snapE[i] - snapPre[i]);
+                    double dPost = System.Math.Abs(snapE[i] - snapPost[i]);
+                    if (dPre > tol) preDiff = true;
+                    if (dPost > tol) postDiff = true;
+                    if (dPre > tol || dPost > tol)
+                        lines.Add($"  [{c},{h},{w}]  eager={snapE[i],14:F8} preStep={snapPre[i],14:F8} (Δ={dPre,9:E2})  postStep={snapPost[i],14:F8} (Δ={dPost,9:E2})");
+                }
+        Assert.False(preDiff || postDiff,
+            $"BN forward diverges (preDiff={preDiff}, postDiff={postDiff}). First {lines.Count} mismatches:\n" +
+            string.Join("\n", lines.Take(10)));
+    }
+
+    /// <summary>
+    /// T=double, rank-3 [C, H, W] — the actual layout GraFPrint's 18
+    /// BatchNorm layers see (and the Conv1×1 / Conv3×3 image-stack pyramid
+    /// in general). If the 2D test passes within tolerance but THIS fails,
+    /// the bug is rank-3 specific in the double compile-mode path.
+    /// </summary>
+    [Fact]
+    public void BatchNorm_3D_DOUBLE_CHW_GradGamma_BeforeOptimizer_MatchesEager_PerElement()
+    {
+        var engine = new CpuEngine();
+        const int C = 8, H = 4, W = 4;
+        const double epsilon = 1e-5;
+
+        var rng = new System.Random(42);
+        int len = C * H * W;
+        var inputData = new double[len];
+        var targetData = new double[len];
+        for (int i = 0; i < len; i++) inputData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < len; i++) targetData[i] = rng.NextDouble() - 0.5;
+
+        var inputE = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = inputData[i];
+        var targetE = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < targetE.Length; i++) targetE[i] = targetData[i];
+        var gammaE = new Tensor<double>(new[] { C });
+        var betaE = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+
+        Tensor<double> eagerGradGamma, eagerGradBeta;
+        using (var tape = new GradientTape<double>())
+        {
+            var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+            var diffE = engine.TensorSubtract(bnE, targetE);
+            var sqE = engine.TensorMultiply(diffE, diffE);
+            var lossE = engine.ReduceSum(sqE, null);
+            var grads = tape.ComputeGradients(lossE, sources: new[] { gammaE, betaE });
+            eagerGradGamma = grads[gammaE];
+            eagerGradBeta = grads[betaE];
+        }
+
+        var inputF = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = inputData[i];
+        var targetF = new Tensor<double>(new[] { C, H, W });
+        for (int i = 0; i < targetF.Length; i++) targetF[i] = targetData[i];
+        var gammaF = new Tensor<double>(new[] { C });
+        var betaF = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            var diffF = engine.TensorSubtract(bnF, targetF);
+            var sqF = engine.TensorMultiply(diffF, diffF);
+            engine.ReduceSum(sqF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+
+        var fusedGradGamma = gammaF.Grad ?? throw new System.InvalidOperationException("gammaF.Grad not set");
+        var fusedGradBeta = betaF.Grad ?? throw new System.InvalidOperationException("betaF.Grad not set");
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool anyMismatch = false;
+        // Tolerance: 1e-9 catches anything above double-precision noise
+        // (~1e-15) without flagging legitimate FMA reordering effects
+        // that can creep up to ~1e-12 in batched reductions.
+        const double tol = 1e-9;
+        for (int p = 0; p < C; p++)
+        {
+            double dG = System.Math.Abs(eagerGradGamma[p] - fusedGradGamma[p]);
+            double dB = System.Math.Abs(eagerGradBeta[p] - fusedGradBeta[p]);
+            if (dG >= tol || dB >= tol) anyMismatch = true;
+            lines.Add($"  ch[{p}]  gamma_grad eager={eagerGradGamma[p],14:F8} fused={fusedGradGamma[p],14:F8} |Δ|={dG,14:E6}    beta_grad eager={eagerGradBeta[p],14:F8} fused={fusedGradBeta[p],14:F8} |Δ|={dB,14:E6}");
+        }
+        Assert.False(anyMismatch, "T=double rank-3 [C,H,W] compiled BN backward routes wrong per-channel gradients:\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// T=double version of the per-element gradient diff. The float-only
+    /// BatchNormInferenceUnsafe layout fix can't help here (the
+    /// specialization is gated on typeof(T) == typeof(float)), so if this
+    /// fails the divergence is in a separate code path that affects the
+    /// double-precision compile-mode BN backward — exactly the symptom
+    /// GraFPrint hits in its T=double model-family invariant tests.
+    /// </summary>
+    [Fact]
+    public void BatchNorm_2D_DOUBLE_GradGamma_BeforeOptimizer_MatchesEager_PerElement()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, features = 4;
+        const double epsilon = 1e-5;
+
+        var rng = new System.Random(42);
+        var inputData = new double[batch * features];
+        var targetData = new double[batch * features];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < targetData.Length; i++) targetData[i] = rng.NextDouble() - 0.5;
+
+        var inputE = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = inputData[i];
+        var targetE = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < targetE.Length; i++) targetE[i] = targetData[i];
+        var gammaE = new Tensor<double>(new[] { features });
+        var betaE = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+
+        Tensor<double> eagerGradGamma, eagerGradBeta;
+        using (var tape = new GradientTape<double>())
+        {
+            var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+            var diffE = engine.TensorSubtract(bnE, targetE);
+            var sqE = engine.TensorMultiply(diffE, diffE);
+            var lossE = engine.ReduceSum(sqE, null);
+            var grads = tape.ComputeGradients(lossE, sources: new[] { gammaE, betaE });
+            eagerGradGamma = grads[gammaE];
+            eagerGradBeta = grads[betaE];
+        }
+
+        var inputF = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = inputData[i];
+        var targetF = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < targetF.Length; i++) targetF[i] = targetData[i];
+        var gammaF = new Tensor<double>(new[] { features });
+        var betaF = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            var diffF = engine.TensorSubtract(bnF, targetF);
+            var sqF = engine.TensorMultiply(diffF, diffF);
+            engine.ReduceSum(sqF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+
+        var fusedGradGamma = gammaF.Grad ?? throw new System.InvalidOperationException("gammaF.Grad not set");
+        var fusedGradBeta = betaF.Grad ?? throw new System.InvalidOperationException("betaF.Grad not set");
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool anyMismatch = false;
+        for (int p = 0; p < features; p++)
+        {
+            double dG = System.Math.Abs(eagerGradGamma[p] - fusedGradGamma[p]);
+            double dB = System.Math.Abs(eagerGradBeta[p] - fusedGradBeta[p]);
+            if (dG >= 1e-8 || dB >= 1e-8) anyMismatch = true;
+            lines.Add($"  ch[{p}]  gamma_grad eager={eagerGradGamma[p],14:F8} fused={fusedGradGamma[p],14:F8} |Δ|={dG,14:E6}    beta_grad eager={eagerGradBeta[p],14:F8} fused={fusedGradBeta[p],14:F8} |Δ|={dB,14:E6}");
+        }
+        Assert.False(anyMismatch, "T=double compiled BN backward routes wrong per-channel gradients:\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>
     /// Pinpoint: capture bnF BEFORE plan.Step() (when it should hold the
     /// eager-time copied values) and AFTER plan.Step() (when forward replay
     /// has overwritten it). Compare both with the eager BN result.

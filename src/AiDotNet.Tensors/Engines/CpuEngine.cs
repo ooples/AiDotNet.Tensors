@@ -17348,6 +17348,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+        // Pin the active gradient tape (if any) to THIS engine so the backward
+        // walk replays on the same engine instance the user invoked forward
+        // on. Without this, an active tape constructed before any explicit
+        // engine instantiation defaults to AiDotNetEngine.Current — which on
+        // auto-detect-GPU systems is DirectGpuTensorEngine — and the backward
+        // pass dispatches to a different engine than the forward pass. See
+        // BindEngineIfUnset's docstring for the full rationale (issue #350).
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
         if (GraphMode.IsActive)
@@ -17361,6 +17369,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // Bind THIS engine to the scope so the compiled plan replays on
+                // the same engine the user called the op on (issue #350: scope
+                // captures AiDotNetEngine.Current at scope-construction time,
+                // which on auto-detect-GPU systems is DirectGpuTensorEngine —
+                // wrong if the user explicitly calls a CPU instance, since BN
+                // results would be GPU-routed at Step time and diverge from
+                // the CPU eager-time output).
+                scope.BindEngineIfUnset(this);
                 // Record in graph so compiled plan captures the dependency
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
