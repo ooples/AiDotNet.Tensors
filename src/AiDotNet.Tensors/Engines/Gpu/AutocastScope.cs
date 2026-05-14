@@ -110,6 +110,69 @@ public sealed class AutocastScope : IDisposable
     }
 
     /// <summary>
+    /// Issue #337 helper: opens an autocast scope when the
+    /// <c>AIDOTNET_AUTOCAST</c> environment variable selects a non-FP32
+    /// precision. Returns null otherwise so the caller can wrap the
+    /// result in a using statement without branching:
+    /// <code>
+    /// using var autocast = AutocastScope.EnableFromEnvironment();
+    /// // model forward / backward — runs in env-selected precision if set,
+    /// // otherwise full FP32.
+    /// </code>
+    /// Recognized values (case-insensitive): <c>fp16</c> / <c>float16</c> /
+    /// <c>half</c> → FP16; <c>fp8</c> / <c>float8</c> / <c>e5m2</c> →
+    /// Float8E5M2. Any other value (including unset / empty) yields a
+    /// no-op (returns null). <c>BFloat16</c> intentionally not auto-engaged
+    /// because the in-tree BFloat16 autocast is not yet implemented.
+    /// </summary>
+    /// <returns>An active <see cref="AutocastScope"/> when the env-var
+    /// selects a supported precision, otherwise null.</returns>
+    public static AutocastScope? EnableFromEnvironment()
+    {
+        var raw = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var trimmed = raw.Trim();
+        if (string.Equals(trimmed, "fp16", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "float16", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "half", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AutocastScope(PrecisionMode.Float16);
+        }
+        if (string.Equals(trimmed, "fp8", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "float8", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "e5m2", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AutocastScope(PrecisionMode.Float8E5M2);
+        }
+        // Unknown / explicitly-fp32 / disabled — return null so the caller
+        // gets a no-op `using var x = null;` without throwing.
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the <c>AIDOTNET_AUTOCAST</c> environment variable and returns
+    /// the corresponding <see cref="PrecisionMode"/> for inspection by
+    /// consumer code (e.g. AiDotNet's <c>Train()</c> dispatcher logging
+    /// the active autocast precision). Returns <see cref="PrecisionMode.Float32"/>
+    /// when the variable is unset / unrecognized / explicitly "fp32".
+    /// </summary>
+    public static PrecisionMode EnvironmentRequestedPrecision()
+    {
+        var raw = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
+        if (string.IsNullOrWhiteSpace(raw)) return PrecisionMode.Float32;
+        var trimmed = raw.Trim();
+        if (string.Equals(trimmed, "fp16", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "float16", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "half", StringComparison.OrdinalIgnoreCase))
+            return PrecisionMode.Float16;
+        if (string.Equals(trimmed, "fp8", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "float8", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "e5m2", StringComparison.OrdinalIgnoreCase))
+            return PrecisionMode.Float8E5M2;
+        return PrecisionMode.Float32;
+    }
+
+    /// <summary>
     /// Registers <paramref name="fp32"/> as the FP32 master copy for
     /// <paramref name="name"/>, casts it to FP16 compute copy, and caches
     /// both. Subsequent calls with the same name return the cached FP16
