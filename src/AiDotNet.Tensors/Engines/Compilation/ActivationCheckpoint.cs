@@ -45,14 +45,37 @@ internal static class ActivationCheckpoint
         int safeLength = Math.Min(length, activationData.Length);
         int byteCount = (safeLength + 7) / 8;
         var mask = new byte[byteCount];
+        FillReluBitmask(activationData, mask, safeLength);
+        return mask;
+    }
 
+    /// <summary>
+    /// In-place variant: fills a caller-supplied bitmask buffer. Used by
+    /// the compiled-training ReLU backward closure so the buffer is
+    /// allocated ONCE at compile time and refilled per step. The
+    /// allocating overload (<see cref="CreateReluBitmask(float[], int)"/>)
+    /// is kept for the eager path. Each call clears the buffer before
+    /// writing so stale bits from a prior step don't leak through.
+    /// </summary>
+    internal static void FillReluBitmask(float[] activationData, byte[] mask, int length)
+    {
+        if (activationData is null) throw new ArgumentNullException(nameof(activationData));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+        int safeLength = Math.Min(length, activationData.Length);
+        int byteCount = (safeLength + 7) / 8;
+        if (mask.Length < byteCount)
+            throw new ArgumentException(
+                $"mask is too small: needs {byteCount} bytes for {safeLength} elements, got {mask.Length}.",
+                nameof(mask));
+        // Clear only the bytes we'll write into — replay reuses the same
+        // buffer across steps, and bits set in a prior step would
+        // otherwise survive into the current one.
+        Array.Clear(mask, 0, byteCount);
         for (int i = 0; i < safeLength; i++)
         {
             if (activationData[i] > 0f)
                 mask[i / 8] |= (byte)(1 << (i % 8));
         }
-
-        return mask;
     }
 
     /// <summary>
