@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -9138,6 +9139,36 @@ public interface IEngine
     /// lossy formats (JPEG, WebP).
     /// </summary>
     byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90);
+
+    #endregion
+
+    #region GPU stream-scheduler capability (Issue #335)
+
+    /// <summary>
+    /// Returns a <see cref="GpuStreamScheduler"/> when this engine is a
+    /// multi-stream-capable GPU engine; null otherwise. CPU engines and
+    /// GPU engines without async backends return null cleanly without
+    /// throwing, so callers route to a CPU path on null.
+    /// </summary>
+    /// <param name="streamPool">Optional pool whose backend must match
+    /// this engine's backend. When null, multi-stream-capable implementations
+    /// create a fresh pool owned by the returned scheduler. When non-null,
+    /// ownership and lifetime responsibility remain with the caller.
+    /// Engines that do not support multi-streaming return null.</param>
+    /// <param name="streamType">Default stream type for scheduled ops.</param>
+    /// <exception cref="System.ArgumentException">If
+    /// <paramref name="streamPool"/> was created with a different backend
+    /// than this engine's. Cross-backend stream misuse would otherwise
+    /// surface as opaque CUDA errors deep inside cuMemcpy.</exception>
+    GpuStreamScheduler? GetStreamScheduler(GpuStreamPool? streamPool = null, GpuStreamType streamType = GpuStreamType.Compute);
+
+    /// <summary>
+    /// Creates a <see cref="GpuStreamPool"/> sized to this engine's
+    /// backend's <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> when
+    /// this engine is a multi-stream-capable GPU engine; null otherwise.
+    /// Caller owns the returned pool's lifetime.
+    /// </summary>
+    GpuStreamPool? CreateStreamPool(GpuExecutionOptions? options = null);
 
     #endregion
 }

@@ -62,6 +62,18 @@ public partial class CpuEngine : ITensorLevelEngine
         => AiDotNet.Tensors.Engines.DevicePrimitives.Cpu.CpuDevicePrimitivesSingleton.Instance;
 
     /// <inheritdoc/>
+    /// <remarks>CpuEngine has no GPU streams — always null. GPU-capable
+    /// subclasses (DirectGpuTensorEngine) override.</remarks>
+    public virtual AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler? GetStreamScheduler(
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamPool? streamPool = null,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamType streamType = AiDotNet.Tensors.Engines.Gpu.GpuStreamType.Compute)
+        => null;
+
+    /// <inheritdoc/>
+    public virtual AiDotNet.Tensors.Engines.Gpu.GpuStreamPool? CreateStreamPool(
+        AiDotNet.Tensors.Engines.Gpu.GpuExecutionOptions? options = null) => null;
+
+    /// <inheritdoc/>
     public Vector<T> Add<T>(Vector<T> a, Vector<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

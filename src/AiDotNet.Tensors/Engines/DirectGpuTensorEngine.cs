@@ -417,6 +417,82 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool SupportsDeferredExecution => GetAsyncBackend() != null;
 
     /// <summary>
+    /// Acquires a <see cref="GpuStreamScheduler"/> for this engine. Use
+    /// <see cref="GpuStreamScheduler.Dispatch"/> to fan independent kernel
+    /// launches across multiple streams in parallel, for example per-head
+    /// attention scoring, parallel ResNet branches, or batched matmul slices.
+    /// </summary>
+    /// <param name="streamPool">Optional stream pool the scheduler should
+    /// lease from. When provided, the caller owns the pool and must dispose
+    /// it separately. When null, this method creates an engine-bound pool
+    /// and the returned scheduler owns that pool.</param>
+    /// <param name="streamType">Stream class used for the scheduler's
+    /// leases. Defaults to <see cref="GpuStreamType.Compute"/>.</param>
+    /// <returns>A scheduler, or null when the engine has no async-capable
+    /// backend OR the backend doesn't support multiple concurrent streams.</returns>
+    /// <remarks>
+    /// Closes the consumer-side gap surfaced by issue #335: the
+    /// scheduler exists in <c>AiDotNet.Tensors.Engines.Gpu</c> but had
+    /// no engine-level entry point. AiDotNet's parallel-dispatch
+    /// callers (multi-head attention, multi-branch CNN blocks) can now
+    /// reach it without inspecting backend internals.
+    /// <para>
+    /// Explicit pool ownership: caller-provided pools remain caller-owned;
+    /// internally-created pools are released when the returned scheduler is
+    /// disposed.
+    /// </para>
+    /// </remarks>
+    public override GpuStreamScheduler? GetStreamScheduler(
+        GpuStreamPool? streamPool = null,
+        GpuStreamType streamType = GpuStreamType.Compute)
+    {
+        var asyncBackend = GetAsyncBackend();
+        if (asyncBackend is null) return null;
+        if (!asyncBackend.SupportsMultiStream) return null;
+        if (streamPool is null)
+        {
+            var ownedPool = new GpuStreamPool(
+                asyncBackend,
+                GpuExecutionOptions.FromEnvironment());
+            return new GpuStreamScheduler(ownedPool, streamType, ownsPool: true);
+        }
+
+        // PR #344 review (critical): refuse a pool bound to a different
+        // backend. Streams created against backend A can't be enqueued
+        // on backend B's contexts — the CUDA driver returns
+        // CUDA_ERROR_INVALID_HANDLE deep inside cuMemcpy / cuLaunchKernel,
+        // which surfaces here as opaque "GPU failed" rather than the
+        // mismatched-pool diagnostic the caller actually needs.
+        if (!ReferenceEquals(streamPool.Backend, asyncBackend))
+            throw new ArgumentException(
+                "Supplied GpuStreamPool is bound to a different backend than this engine. " +
+                "Pools must be created with the same backend that schedules them — " +
+                "use this engine's CreateStreamPool() to obtain an affinity-correct pool.",
+                nameof(streamPool));
+        return new GpuStreamScheduler(streamPool, streamType);
+    }
+
+    /// <summary>
+    /// Convenience: builds a <see cref="GpuStreamPool"/> for this engine's
+    /// async backend and returns it to the caller as a disposable. Pool
+    /// capacity is bounded by the backend's
+    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> and adjusted by
+    /// the supplied <see cref="GpuExecutionOptions"/>. Caller takes ownership.
+    /// </summary>
+    /// <param name="options">Optional execution options; defaults to
+    /// <see cref="GpuExecutionOptions.FromEnvironment"/>.</param>
+    /// <returns>A new <see cref="GpuStreamPool"/>, or null when no
+    /// async-capable backend is available or it doesn't support multiple
+    /// streams.</returns>
+    public override GpuStreamPool? CreateStreamPool(GpuExecutionOptions? options = null)
+    {
+        var asyncBackend = GetAsyncBackend();
+        if (asyncBackend is null) return null;
+        if (!asyncBackend.SupportsMultiStream) return null;
+        return new GpuStreamPool(asyncBackend, options ?? GpuExecutionOptions.FromEnvironment());
+    }
+
+    /// <summary>
     /// Gets the current GPU execution context for this thread, if any.
     /// This allows operations to check if GPU-resident mode is active.
     /// </summary>

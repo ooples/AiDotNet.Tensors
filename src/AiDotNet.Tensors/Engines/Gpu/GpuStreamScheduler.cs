@@ -54,13 +54,23 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// <item>ResNet bottleneck blocks with parallel 1×1 conv branches — each
 /// branch on its own stream.</item>
 /// </list></para>
+///
+/// <para><b>Lifetime:</b> A scheduler created with a caller-supplied
+/// <see cref="GpuStreamPool"/> does not own that pool. A scheduler created
+/// by an engine with no pool argument owns the internally-created pool and
+/// releases it from <see cref="Dispose"/>.</para>
 /// </summary>
-public sealed class GpuStreamScheduler
+public sealed class GpuStreamScheduler : IDisposable
 {
     private readonly GpuStreamPool _pool;
     private readonly GpuStreamType _streamType;
+    private readonly bool _ownsPool;
+    private readonly object _lifetimeLock = new();
     private readonly int _maxStreams;
     private int _nextStream;
+    private int _activeOperations;
+    private bool _disposing;
+    private bool _disposed;
 
     /// <summary>
     /// Creates a scheduler bound to a stream pool. Launches dispatched
@@ -69,9 +79,15 @@ public sealed class GpuStreamScheduler
     /// which matches the most common training/inference use case.
     /// </summary>
     public GpuStreamScheduler(GpuStreamPool pool, GpuStreamType streamType = GpuStreamType.Compute)
+        : this(pool, streamType, ownsPool: false)
+    {
+    }
+
+    internal GpuStreamScheduler(GpuStreamPool pool, GpuStreamType streamType, bool ownsPool)
     {
         _pool = pool ?? throw new ArgumentNullException(nameof(pool));
         _streamType = streamType;
+        _ownsPool = ownsPool;
         _maxStreams = pool.GetMaxStreams(streamType);
         if (_maxStreams < 1) _maxStreams = 1;
     }
@@ -95,6 +111,7 @@ public sealed class GpuStreamScheduler
     /// </remarks>
     public GpuEventBatch Dispatch(IReadOnlyList<Action<IGpuStream>> launches)
     {
+        using var operation = EnterOperation();
         if (launches is null) throw new ArgumentNullException(nameof(launches));
         if (launches.Count == 0) return GpuEventBatch.Empty;
 
@@ -169,6 +186,7 @@ public sealed class GpuStreamScheduler
     /// </returns>
     public GpuEventBatch DispatchSequential(IReadOnlyList<IReadOnlyList<Action<IGpuStream>>> batches)
     {
+        using var operation = EnterOperation();
         if (batches is null) throw new ArgumentNullException(nameof(batches));
         if (batches.Count == 0) return GpuEventBatch.Empty;
 
@@ -282,9 +300,87 @@ public sealed class GpuStreamScheduler
     /// </summary>
     public void SynchronizeEvents(IReadOnlyList<IGpuEvent> events)
     {
+        using var operation = EnterOperation();
         if (events is null) return;
         for (int i = 0; i < events.Count; i++)
             events[i]?.Synchronize();
+    }
+
+    /// <summary>
+    /// Disposes the internally-created stream pool when this scheduler
+    /// owns one. Caller-supplied pools remain owned by the caller.
+    /// </summary>
+    public void Dispose()
+    {
+        GpuStreamPool? poolToDispose = null;
+
+        lock (_lifetimeLock)
+        {
+            if (_disposed) return;
+            if (_disposing)
+            {
+                while (!_disposed)
+                    Monitor.Wait(_lifetimeLock);
+                return;
+            }
+
+            _disposing = true;
+            while (_activeOperations > 0)
+                Monitor.Wait(_lifetimeLock);
+
+            if (_ownsPool)
+                poolToDispose = _pool;
+        }
+
+        try
+        {
+            poolToDispose?.Dispose();
+        }
+        finally
+        {
+            lock (_lifetimeLock)
+            {
+                _disposed = true;
+                Monitor.PulseAll(_lifetimeLock);
+            }
+        }
+    }
+
+    private OperationLease EnterOperation()
+    {
+        lock (_lifetimeLock)
+        {
+            ThrowIfDisposed();
+            _activeOperations++;
+            return new OperationLease(this);
+        }
+    }
+
+    private void ExitOperation()
+    {
+        lock (_lifetimeLock)
+        {
+            _activeOperations--;
+            if (_activeOperations == 0)
+                Monitor.PulseAll(_lifetimeLock);
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed || _disposing) throw new ObjectDisposedException(nameof(GpuStreamScheduler));
+    }
+
+    private readonly struct OperationLease : IDisposable
+    {
+        private readonly GpuStreamScheduler _scheduler;
+
+        public OperationLease(GpuStreamScheduler scheduler)
+        {
+            _scheduler = scheduler;
+        }
+
+        public void Dispose() => _scheduler.ExitOperation();
     }
 
     private GpuEventBatch DispatchOnSingleStream(IGpuStream stream, IReadOnlyList<Action<IGpuStream>> launches)
