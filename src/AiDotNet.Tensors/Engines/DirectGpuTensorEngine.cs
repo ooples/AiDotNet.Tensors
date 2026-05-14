@@ -308,6 +308,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
     {
+        // Issue #350: when CompiledTrainingPlan / CompiledModelCache is tracing
+        // a graph (GraphMode.IsActive), the GPU fast paths must NOT run — they
+        // call backend kernels directly into GPU buffers without recording a
+        // LazyNode, so the resulting compiled graph has no consumer for the
+        // op's trainable inputs. Backward then produces zero gradients for
+        // those parameters and training silently no-ops. Refusing the GPU
+        // backend during GraphMode forces every caller through its
+        // `return base.OpName(...)` fallback, where CpuEngine's GraphMode-aware
+        // overload records the op into the active LazyNode scope. The trace
+        // itself runs on CPU — once compiled, the plan can route ops back to
+        // GPU at replay time via its specialized step builder. Same gate
+        // semantic as IsTapeActive.
+        if (Compilation.GraphMode.IsActive)
+        {
+            backend = null!;
+            return false;
+        }
+
         // Check if there's an active DeferredScope - use its RecordingBackend for deferred execution
         var deferredScope = Gpu.DeferredScope.Current;
         if (deferredScope != null && deferredScope.IsRecording)
@@ -2138,11 +2156,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// preserves the canonical IEEE behaviour the anomaly detector
     /// expects.
     /// </summary>
+    /// <summary>
+    /// Returns true when the current op MUST be recorded by autograd or
+    /// GraphMode tracing rather than executed via the GPU fast path that
+    /// bypasses both. The GPU fast paths skip <c>DifferentiableOps</c> /
+    /// <c>scope.RecordVariadic</c> entirely (they call backend kernels
+    /// directly into GPU buffers), so taking them would silently
+    /// disconnect this op from the gradient graph the caller is building.
+    ///
+    /// <para>Three conditions select the "defer-to-base" path:</para>
+    /// <list type="bullet">
+    /// <item>An active <see cref="Autodiff.GradientTape{T}"/> not inside a
+    /// <see cref="Autodiff.NoGradScope{T}"/> — eager-tape training.</item>
+    /// <item>An active anomaly-mode scope — backward sanity checks rely on
+    /// every op being tape-recorded.</item>
+    /// <item><see cref="Compilation.GraphMode.IsActive"/> — compile-time
+    /// tracing for <c>CompileInference</c> / <c>CompileTraining</c>. Prior
+    /// to fix #350 this case was missing and the GPU fast path executed
+    /// for every fused op even under GraphMode, leaving the compiled
+    /// graph empty of consumers for trainable parameters — every
+    /// <c>plan.Step()</c> backward returned zero gradients.</item>
+    /// </list>
+    /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static bool IsTapeActive<T>()
         => (Autodiff.GradientTape<T>.Current is not null
             && !Autodiff.NoGradScope<T>.IsSuppressed)
-           || Autodiff.AnomalyModeScope.IsActive;
+           || Autodiff.AnomalyModeScope.IsActive
+           || Compilation.GraphMode.IsActive;
 
     Vector<T> IEngine.Add<T>(Vector<T> a, Vector<T> b)
     {
