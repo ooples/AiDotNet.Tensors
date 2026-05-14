@@ -7704,12 +7704,16 @@ public partial class CpuEngine : ITensorLevelEngine
                         outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
                     }
             };
-            // Issue #319: route through ParallelForOrSerial so dispatch
-            // overhead is amortized by total work. Pool sums `bc * oH * oW * ps^2`
-            // float ops; below the 32K grain size we run inline on the calling
-            // thread (no LowLevelLifoSemaphore wakeup).
+            // Issue #319 / PR #343 review: route through LightweightParallel
+            // so dispatch goes to PersistentParallelExecutor's ManualResetEventSlim-
+            // backed worker pool (the actual point of the fix). ParallelForOrSerial
+            // dispatches to System.Threading.Tasks.Parallel.For above grain size,
+            // which still parks workers on LowLevelLifoSemaphore — the symbol
+            // the ViT-Base profile flagged. LightweightParallel skips both
+            // ThreadPool and that semaphore on the parallel branch and inlines
+            // serially below 32K elementwise work.
             long avgPoolWork = (long)bc * oH * oW * ps * ps;
-            CpuParallelSettings.ParallelForOrSerial(0, bc, avgPoolWork, poolKernel);
+            CpuParallelSettings.LightweightParallel(bc, avgPoolWork, poolKernel);
             return;
         }
 
@@ -24647,7 +24651,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // (one element write per (fb, oh, ow)). Avoids Parallel.For
             // dispatch overhead for small upsamples (CIFAR-class shapes).
             long upWork = (long)flatBatch * nH * nW;
-            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, upWork, kernel);
+            CpuParallelSettings.LightweightParallel(flatBatch, upWork, kernel);
             return;
         }
 
@@ -24905,7 +24909,7 @@ public partial class CpuEngine : ITensorLevelEngine
             };
             // Issue #319: grain-size dispatch. Total work = batch * newChannels * outH * outW.
             long pixelShuffleWork = (long)totalBOC * oH * oW;
-            CpuParallelSettings.ParallelForOrSerial(0, totalBOC, pixelShuffleWork, kernel);
+            CpuParallelSettings.LightweightParallel(totalBOC, pixelShuffleWork, kernel);
             return;
         }
 
@@ -33793,7 +33797,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Issue #319: grain-size dispatch. Global avg pool reads every
                 // spatial element once — total work = totalChannels * spatial.
                 long gapWork = (long)totalChannelsG * spatialG;
-                CpuParallelSettings.ParallelForOrSerial(0, totalChannelsG, gapWork, kernelG);
+                CpuParallelSettings.LightweightParallel(totalChannelsG, gapWork, kernelG);
                 return;
             }
         }
@@ -33836,7 +33840,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // input per channel and writes `oH*oW` per channel. Total work
             // approximates input element traversal.
             long adapPoolWork = (long)totalChannels * iH * iW;
-            CpuParallelSettings.ParallelForOrSerial(0, totalChannels, adapPoolWork, kernel);
+            CpuParallelSettings.LightweightParallel(totalChannels, adapPoolWork, kernel);
             return;
         }
 
@@ -35411,7 +35415,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // 4 input reads + 1 output write per (oh, ow) — total work
             // ≈ total * oH * oW.
             long bilinearWork = (long)total * oH * oW;
-            CpuParallelSettings.ParallelForOrSerial(0, total, bilinearWork, kernel);
+            CpuParallelSettings.LightweightParallel(total, bilinearWork, kernel);
             return;
         }
         if (typeof(T) == typeof(double)
