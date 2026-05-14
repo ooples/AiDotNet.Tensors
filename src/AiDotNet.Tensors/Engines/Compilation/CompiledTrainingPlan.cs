@@ -1769,8 +1769,44 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
         // Lazy node records: Inputs = [input, gamma, beta], SavedState = [mean, variance, epsilon]
+        //
+        // The FusedKernels.BatchNormInferenceUnsafe kernel assumes the layout
+        // [channels, spatial] — that is, all elements of channel `c` are
+        // contiguous at offset `c * spatialSize`, where `spatialSize = length
+        // / channels`. That assumption holds for:
+        //   • Rank-3 [C, H, W] inputs (channel c's data is contiguous at
+        //     c*H*W, by row-major flatten)
+        //   • Rank-4 [1, C, H, W] inputs with N=1 (degenerates to rank-3 case
+        //     once the leading singleton is collapsed)
+        //
+        // It DOES NOT hold for:
+        //   • Rank-2 [batch, features] inputs — features are the FAST axis;
+        //     element [b, f] sits at flat index b*F + f, so channel f's data
+        //     is interleaved at stride F, not contiguous at offset f * batch.
+        //     Applying this kernel to 2D input picks up neighbour channels'
+        //     mean/var per batch row, which gives off-diagonal corruption
+        //     (the off-diagonal-only divergence pattern that surfaced in
+        //     ooples/AiDotNet branch fix/pr-1290-cluster-4-5 — testconsole
+        //     `BnFusedGradDiff` isolated the failure to a 4-feature, batch-4
+        //     case where every off-diagonal element diverged from eager but
+        //     diagonal elements [b, b] matched coincidentally because
+        //     channel b's mean happens to apply to element [b, b]).
+        //   • Rank-4 [N>1, C, H, W] inputs — for N>1, channel c's elements
+        //     are interleaved across batches, not laid out as [c*N*H*W ..
+        //     (c+1)*N*H*W).
+        //
+        // Restrict the specialization to ranks where the channels-first
+        // layout assumption is actually true. Other ranks fall through to
+        // the generic execute delegate (which calls back into the engine's
+        // correct rank-aware BN forward).
+        bool layoutIsChannelsFirstContiguous =
+            step.Inputs.Length > 0 &&
+            (step.Inputs[0]._shape.Length == 3
+             || (step.Inputs[0]._shape.Length == 4 && step.Inputs[0]._shape[0] == 1));
+
         if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
             && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
+            && layoutIsChannelsFirstContiguous
             && step.SavedState is { Length: >= 2 }
             && step.SavedState[0] is Tensor<T> meanTensor
             && step.SavedState[1] is Tensor<T> varTensor)
