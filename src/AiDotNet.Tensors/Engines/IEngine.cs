@@ -9145,22 +9145,20 @@ public interface IEngine
     #region GPU stream-scheduler capability (Issue #335)
 
     /// <summary>
-    /// Returns a <see cref="GpuStreamScheduler"/> backed by
-    /// <paramref name="streamPool"/> when this engine is a multi-stream-
-    /// capable GPU engine; null otherwise. CPU engines and GPU engines
-    /// without async backends return null cleanly without throwing —
-    /// callers route to a CPU path on null.
+    /// Returns a <see cref="GpuStreamScheduler"/> when this engine is a
+    /// multi-stream-capable GPU engine; null otherwise. CPU engines and
+    /// GPU engines without async backends return null cleanly without
+    /// throwing, so callers route to a CPU path on null.
     /// </summary>
-    /// <param name="streamPool">Pool whose backend must match this
-    /// engine's backend.</param>
+    /// <param name="streamPool">Optional pool whose backend must match
+    /// this engine's backend. When null, implementations may create a pool
+    /// owned by the returned scheduler.</param>
     /// <param name="streamType">Default stream type for scheduled ops.</param>
-    /// <exception cref="System.ArgumentNullException">If
-    /// <paramref name="streamPool"/> is null.</exception>
     /// <exception cref="System.ArgumentException">If
     /// <paramref name="streamPool"/> was created with a different backend
     /// than this engine's. Cross-backend stream misuse would otherwise
     /// surface as opaque CUDA errors deep inside cuMemcpy.</exception>
-    GpuStreamScheduler? GetStreamScheduler(GpuStreamPool streamPool, GpuStreamType streamType = GpuStreamType.Compute);
+    GpuStreamScheduler? GetStreamScheduler(GpuStreamPool? streamPool = null, GpuStreamType streamType = GpuStreamType.Compute);
 
     /// <summary>
     /// Creates a <see cref="GpuStreamPool"/> sized to this engine's

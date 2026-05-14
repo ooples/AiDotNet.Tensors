@@ -6,23 +6,45 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 
 /// <summary>
 /// Issue #335: validates the engine-level accessor that exposes
-/// <c>GpuStreamScheduler</c> to consumers. Pool ownership is explicit —
-/// caller builds via <c>CreateStreamPool()</c> and disposes it
-/// alongside the scheduler.
+/// <c>GpuStreamScheduler</c> to consumers. Callers may either pass an
+/// owned pool or let the engine create one owned by the scheduler.
 /// </summary>
 public class GetStreamSchedulerTests
 {
     [Fact]
-    public void GetStreamScheduler_NullPoolArg_Throws()
+    public void GetStreamScheduler_NoPool_DoesNotThrow()
     {
-        // Explicit pool ownership: passing null is a usage error, not a
-        // valid fallback. Throws ArgumentNullException so the caller
-        // discovers the contract immediately. DirectGpuTensorEngine is
-        // IDisposable — wrap in `using` so the test doesn't leak native
-        // backend handles on failure paths.
         using var engine = new DirectGpuTensorEngine();
-        Assert.Throws<System.ArgumentNullException>(() =>
-            engine.GetStreamScheduler(streamPool: null!));
+        var asyncBackend = engine.GetAsyncBackend();
+
+        using var scheduler = engine.GetStreamScheduler();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream)
+            Assert.Null(scheduler);
+        else
+            Assert.NotNull(scheduler);
+    }
+
+    [Fact]
+    public void IEngineGetStreamScheduler_NoPool_DoesNotThrow()
+    {
+        using var concrete = new DirectGpuTensorEngine();
+        IEngine engine = concrete;
+        var asyncBackend = concrete.GetAsyncBackend();
+
+        using var scheduler = engine.GetStreamScheduler();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream)
+            Assert.Null(scheduler);
+        else
+            Assert.NotNull(scheduler);
+    }
+
+    [Fact]
+    public void CpuEngineGetStreamScheduler_NoPool_ReturnsNull()
+    {
+        IEngine engine = new CpuEngine();
+
+        using var scheduler = engine.GetStreamScheduler();
+        Assert.Null(scheduler);
     }
 
     [Fact]
@@ -51,7 +73,7 @@ public class GetStreamSchedulerTests
 
         using var pool = engine.CreateStreamPool();
         Assert.NotNull(pool);
-        var scheduler = engine.GetStreamScheduler(pool!);
+        using var scheduler = engine.GetStreamScheduler(pool!);
         Assert.NotNull(scheduler);
     }
 

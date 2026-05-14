@@ -417,18 +417,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool SupportsDeferredExecution => GetAsyncBackend() != null;
 
     /// <summary>
-    /// Acquires a <see cref="GpuStreamScheduler"/> bound to a caller-
-    /// supplied stream pool. Use <see cref="GpuStreamScheduler.Dispatch"/>
-    /// to fan independent kernel launches across multiple streams in
-    /// parallel — e.g. per-head attention scoring, parallel branches in
-    /// ResNet bottleneck blocks, batched matmul slices.
+    /// Acquires a <see cref="GpuStreamScheduler"/> for this engine. Use
+    /// <see cref="GpuStreamScheduler.Dispatch"/> to fan independent kernel
+    /// launches across multiple streams in parallel, for example per-head
+    /// attention scoring, parallel ResNet branches, or batched matmul slices.
     /// </summary>
-    /// <param name="streamPool">The stream pool the scheduler should
-    /// lease from. The caller owns the pool's lifetime — the scheduler
-    /// holds a reference but does NOT dispose the pool. Pass the pool
-    /// returned by <see cref="DirectGpuTensorEngine.CreateStreamPool"/>
-    /// (or built directly via <c>new GpuStreamPool(backend, options)</c>)
-    /// and dispose it alongside the scheduler when both are done.</param>
+    /// <param name="streamPool">Optional stream pool the scheduler should
+    /// lease from. When provided, the caller owns the pool and must dispose
+    /// it separately. When null, this method creates an engine-bound pool
+    /// and the returned scheduler owns that pool.</param>
     /// <param name="streamType">Stream class used for the scheduler's
     /// leases. Defaults to <see cref="GpuStreamType.Compute"/>.</param>
     /// <returns>A scheduler, or null when the engine has no async-capable
@@ -440,20 +437,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// callers (multi-head attention, multi-branch CNN blocks) can now
     /// reach it without inspecting backend internals.
     /// <para>
-    /// Explicit pool ownership: the prior auto-create overload could
-    /// leak native stream handles when callers disposed the scheduler
-    /// but didn't realize a pool had been created internally. Use
-    /// <see cref="CreateStreamPool"/> for the lifetime-bundled pattern.
+    /// Explicit pool ownership: caller-provided pools remain caller-owned;
+    /// internally-created pools are released when the returned scheduler is
+    /// disposed.
     /// </para>
     /// </remarks>
     public override GpuStreamScheduler? GetStreamScheduler(
-        GpuStreamPool streamPool,
+        GpuStreamPool? streamPool = null,
         GpuStreamType streamType = GpuStreamType.Compute)
     {
-        if (streamPool is null) throw new ArgumentNullException(nameof(streamPool));
         var asyncBackend = GetAsyncBackend();
         if (asyncBackend is null) return null;
         if (!asyncBackend.SupportsMultiStream) return null;
+        if (streamPool is null)
+        {
+            var ownedPool = new GpuStreamPool(
+                asyncBackend,
+                GpuExecutionOptions.FromEnvironment());
+            return new GpuStreamScheduler(ownedPool, streamType, ownsPool: true);
+        }
+
         // PR #344 review (critical): refuse a pool bound to a different
         // backend. Streams created against backend A can't be enqueued
         // on backend B's contexts — the CUDA driver returns
