@@ -17,8 +17,10 @@ public class GetStreamSchedulerTests
     {
         // Explicit pool ownership: passing null is a usage error, not a
         // valid fallback. Throws ArgumentNullException so the caller
-        // discovers the contract immediately.
-        var engine = new DirectGpuTensorEngine();
+        // discovers the contract immediately. DirectGpuTensorEngine is
+        // IDisposable — wrap in `using` so the test doesn't leak native
+        // backend handles on failure paths.
+        using var engine = new DirectGpuTensorEngine();
         Assert.Throws<System.ArgumentNullException>(() =>
             engine.GetStreamScheduler(streamPool: null!));
     }
@@ -29,7 +31,7 @@ public class GetStreamSchedulerTests
         // The accessor must be callable from any host — CPU-only or
         // GPU-equipped. Returns null on CPU-only, a usable pool on
         // multi-stream-capable hosts.
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var pool = engine.CreateStreamPool();
         if (pool is not null)
             pool.Dispose();
@@ -42,7 +44,7 @@ public class GetStreamSchedulerTests
         // backend, building a pool via CreateStreamPool + passing it to
         // GetStreamScheduler yields a usable scheduler. Caller owns pool
         // lifetime; dispose pool after scheduler is done.
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var asyncBackend = engine.GetAsyncBackend();
         if (asyncBackend is null || !asyncBackend.SupportsMultiStream)
             return; // No multi-stream backend on this host.
@@ -57,12 +59,42 @@ public class GetStreamSchedulerTests
     public void CreateStreamPool_NoMultiStreamBackend_ReturnsNull()
     {
         // On a CPU-only host the pool factory returns null without throwing.
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var asyncBackend = engine.GetAsyncBackend();
         if (asyncBackend is not null && asyncBackend.SupportsMultiStream)
             return; // GPU host — covered by the scheduler test.
 
         var pool = engine.CreateStreamPool();
         Assert.Null(pool);
+    }
+
+    [Fact]
+    public void GetStreamScheduler_PoolFromDifferentEngine_ThrowsArgumentException()
+    {
+        // PR #344 critical review: GetStreamScheduler must refuse a pool
+        // whose backend doesn't match this engine's. Cross-backend stream
+        // misuse manifests as CUDA_ERROR_INVALID_HANDLE deep inside
+        // cuMemcpy / cuLaunchKernel — surfacing the affinity mismatch at
+        // the API boundary gives the caller an actionable error.
+        using var engineA = new DirectGpuTensorEngine();
+        using var engineB = new DirectGpuTensorEngine();
+        var backendA = engineA.GetAsyncBackend();
+        var backendB = engineB.GetAsyncBackend();
+        if (backendA is null || backendB is null
+            || !backendA.SupportsMultiStream || !backendB.SupportsMultiStream)
+            return; // Need multi-stream backends on both engines.
+        // Practical note: two DirectGpuTensorEngine instances may share
+        // the same singleton backend instance, in which case the affinity
+        // guard short-circuits to "same backend, accept". The test still
+        // documents the contract; the negative case becomes meaningful
+        // only when two engines hold distinct backend references (e.g.
+        // a future test fixture that overrides backend creation).
+        if (ReferenceEquals(backendA, backendB))
+            return;
+
+        using var poolFromA = engineA.CreateStreamPool();
+        Assert.NotNull(poolFromA);
+        Assert.Throws<System.ArgumentException>(() =>
+            engineB.GetStreamScheduler(poolFromA!));
     }
 }

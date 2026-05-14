@@ -454,6 +454,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var asyncBackend = GetAsyncBackend();
         if (asyncBackend is null) return null;
         if (!asyncBackend.SupportsMultiStream) return null;
+        // PR #344 review (critical): refuse a pool bound to a different
+        // backend. Streams created against backend A can't be enqueued
+        // on backend B's contexts — the CUDA driver returns
+        // CUDA_ERROR_INVALID_HANDLE deep inside cuMemcpy / cuLaunchKernel,
+        // which surfaces here as opaque "GPU failed" rather than the
+        // mismatched-pool diagnostic the caller actually needs.
+        if (!ReferenceEquals(streamPool.Backend, asyncBackend))
+            throw new ArgumentException(
+                "Supplied GpuStreamPool is bound to a different backend than this engine. " +
+                "Pools must be created with the same backend that schedules them — " +
+                "use this engine's CreateStreamPool() to obtain an affinity-correct pool.",
+                nameof(streamPool));
         return new GpuStreamScheduler(streamPool, streamType);
     }
 
