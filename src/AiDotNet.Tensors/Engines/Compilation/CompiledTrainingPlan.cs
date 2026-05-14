@@ -2118,11 +2118,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                // Create bitmask from forward output (output > 0 ↔ input > 0 for ReLU)
+                // Create bitmask from forward output (output > 0 ↔ input > 0 for ReLU).
+                // PR #341 review: the allocating overload returned a fresh
+                // array that we silently dropped on the floor — the
+                // pre-allocated reluBitmask stayed all-zero and
+                // ApplyReluBackwardFromBitmask wrote zeros into gradIn,
+                // killing ReLU gradient flow. The FillReluBitmask overload
+                // writes into the pre-allocated buffer, preserving the
+                // intended allocation-free replay semantics.
                 var outputData = (float[])(object)output.GetDataArray();
                 int len = output.Length;
                 reluBitmask ??= new byte[(len + 7) / 8];
-                ActivationCheckpoint.CreateReluBitmask(outputData, len);
+                ActivationCheckpoint.FillReluBitmask(outputData, reluBitmask, len);
 
                 // Apply backward using bitmask
                 var gradOutData = (float[])(object)gradOut.GetDataArray();

@@ -278,6 +278,40 @@ public class CompilationComponentTests
     }
 
     [Fact]
+    public void FillReluBitmask_WritesIntoPreallocatedBuffer()
+    {
+        // PR #341 regression test: the compiled-training closure pre-allocates
+        // the bitmask buffer at compile time and refills it each step. If
+        // FillReluBitmask did NOT write into the supplied buffer (the prior
+        // bug — only the allocating overload existed and its return value
+        // was dropped), the buffer would stay all-zero and ReLU backward
+        // would zero out every gradient.
+        var data = new float[] { 1f, -1f, 2f, -2f, 3f, -3f, 4f, -4f, 5f };
+        var allocating = ActivationCheckpoint.CreateReluBitmask(data, data.Length);
+
+        var preallocated = new byte[(data.Length + 7) / 8];
+        ActivationCheckpoint.FillReluBitmask(data, preallocated, data.Length);
+        Assert.Equal(allocating, preallocated);
+    }
+
+    [Fact]
+    public void FillReluBitmask_ClearsStaleBitsAcrossReplay()
+    {
+        // Replay reuses the same buffer across steps. Stale bits from a
+        // prior step where activations were positive must NOT leak into a
+        // later step where the same positions went negative.
+        var buffer = new byte[2];
+        var allPositive = new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f };
+        ActivationCheckpoint.FillReluBitmask(allPositive, buffer, 8);
+        Assert.Equal((byte)0xFF, buffer[0]);
+
+        // Second "step": all negative. Buffer must be cleared first.
+        var allNegative = new float[] { -1f, -2f, -3f, -4f, -5f, -6f, -7f, -8f };
+        ActivationCheckpoint.FillReluBitmask(allNegative, buffer, 8);
+        Assert.Equal((byte)0x00, buffer[0]);
+    }
+
+    [Fact]
     public void ActivationStorageType_CorrectClassification()
     {
         Assert.Equal(ActivationStorageType.Bitmask, ActivationCheckpoint.GetStorageType("ReLU"));
