@@ -7704,8 +7704,16 @@ public partial class CpuEngine : ITensorLevelEngine
                         outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
                     }
             };
-            if (h * w >= 1024) Parallel.For(0, bc, poolKernel);
-            else for (int idx = 0; idx < bc; idx++) poolKernel(idx);
+            // Issue #319 / PR #343 review: route through LightweightParallel
+            // so dispatch goes to PersistentParallelExecutor's ManualResetEventSlim-
+            // backed worker pool (the actual point of the fix). ParallelForOrSerial
+            // dispatches to System.Threading.Tasks.Parallel.For above grain size,
+            // which still parks workers on LowLevelLifoSemaphore — the symbol
+            // the ViT-Base profile flagged. LightweightParallel skips both
+            // ThreadPool and that semaphore on the parallel branch and inlines
+            // serially below 32K elementwise work.
+            long avgPoolWork = (long)bc * oH * oW * ps * ps;
+            CpuParallelSettings.LightweightParallel(bc, avgPoolWork, poolKernel);
             return;
         }
 
@@ -24639,8 +24647,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             };
-            if (flatBatch > 8) Parallel.For(0, flatBatch, kernel);
-            else for (int fb = 0; fb < flatBatch; fb++) kernel(fb);
+            // Issue #319: grain-size dispatch. Total work is the output size
+            // (one element write per (fb, oh, ow)). Avoids Parallel.For
+            // dispatch overhead for small upsamples (CIFAR-class shapes).
+            long upWork = (long)flatBatch * nH * nW;
+            CpuParallelSettings.LightweightParallel(flatBatch, upWork, kernel);
             return;
         }
 
@@ -24896,8 +24907,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             };
-            if (totalBOC > 4) Parallel.For(0, totalBOC, kernel);
-            else for (int boc = 0; boc < totalBOC; boc++) kernel(boc);
+            // Issue #319: grain-size dispatch. Total work = batch * newChannels * outH * outW.
+            long pixelShuffleWork = (long)totalBOC * oH * oW;
+            CpuParallelSettings.LightweightParallel(totalBOC, pixelShuffleWork, kernel);
             return;
         }
 
@@ -33782,8 +33794,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int s = 0; s < spatialG; s++) sum += inArrG[off + s];
                     outArrG[bc] = sum * invG;
                 };
-                if (totalChannelsG > 32) Parallel.For(0, totalChannelsG, kernelG);
-                else for (int bc = 0; bc < totalChannelsG; bc++) kernelG(bc);
+                // Issue #319: grain-size dispatch. Global avg pool reads every
+                // spatial element once — total work = totalChannels * spatial.
+                long gapWork = (long)totalChannelsG * spatialG;
+                CpuParallelSettings.LightweightParallel(totalChannelsG, gapWork, kernelG);
                 return;
             }
         }
@@ -33822,8 +33836,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             };
-            if (totalChannels > 16) Parallel.For(0, totalChannels, kernel);
-            else for (int bc = 0; bc < totalChannels; bc++) kernel(bc);
+            // Issue #319: grain-size dispatch. Adaptive pool reads `iH*iW`
+            // input per channel and writes `oH*oW` per channel. Total work
+            // approximates input element traversal.
+            long adapPoolWork = (long)totalChannels * iH * iW;
+            CpuParallelSettings.LightweightParallel(totalChannels, adapPoolWork, kernel);
             return;
         }
 
@@ -35394,8 +35411,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             };
-            if (total > 4) Parallel.For(0, total, kernel);
-            else for (int bc = 0; bc < total; bc++) kernel(bc);
+            // Issue #319: grain-size dispatch. Each (bc) chunk does
+            // 4 input reads + 1 output write per (oh, ow) — total work
+            // ≈ total * oH * oW.
+            long bilinearWork = (long)total * oH * oW;
+            CpuParallelSettings.LightweightParallel(total, bilinearWork, kernel);
             return;
         }
         if (typeof(T) == typeof(double)
