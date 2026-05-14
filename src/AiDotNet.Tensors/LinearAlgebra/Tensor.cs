@@ -3825,6 +3825,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Element byte size for T. Used by <see cref="TensorBase{T}.TryGetGpuBuffer"/>
+    /// when wrapping a GPU device pointer for cuBLAS / cuDNN / custom
+    /// kernel callers — they need the byte count without an
+    /// Unsafe.SizeOf round-trip on every call.
+    /// </summary>
+    internal override int ElementByteSize()
+        => System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+
+    /// <summary>
     /// Creates a new instance of the tensor with the specified data and shape.
     /// </summary>
     /// <param name="data">The data to populate the new tensor with.</param>

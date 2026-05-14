@@ -167,18 +167,23 @@ public static class TensorAllocator
         try
         {
             // Construct a zero-initialized tensor and register it under the
-            // GpuOffload lifetime. RegisterWeight handles allocator dispatch,
-            // copies the (zero-initialized) bytes into the pinned region,
-            // and persists the OffloadDevicePointer / OffloadHostPointer
+            // GpuPinned lifetime (issue #336 — semantic intent "lives on
+            // the GPU side of the train loop"). The underlying allocator
+            // path is shared with GpuOffload (pinned-host + DMA mapping),
+            // so consumers tagging Adam m/v, BatchNorm running stats, and
+            // weights as GpuPinned avoid the per-train-step
+            // cuMemcpyHtoD/DtoH round-trip that dominates small-batch
+            // wall-time. RegisterWeight handles allocator dispatch and
+            // persists the OffloadDevicePointer / OffloadHostPointer
             // metadata on the tensor for later kernel launches.
             var tensor = new Tensor<T>(shape)
             {
-                Lifetime = WeightLifetime.GpuOffload,
+                Lifetime = WeightLifetime.GpuPinned,
             };
             WeightRegistry.RegisterWeight(tensor);
 
             // After RegisterWeight, the tensor's data lives in pinned host
-            // memory DMA-mapped to the GPU. Lifetime stays GpuOffload (the
+            // memory DMA-mapped to the GPU. Lifetime stays GpuPinned (the
             // registry does not flip back to Default on success — only on
             // allocator-unavailable fallback inside the registry, which we
             // already short-circuited above).

@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>cuMemAllocHost</c> (mapped + portable); Managed-scheme uses
 /// <c>cuMemAllocManaged</c> with <c>CU_MEM_ATTACH_GLOBAL</c>.
 /// </summary>
-public sealed class CudaOffloadAllocator : IGpuOffloadAllocator
+public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper
 {
     private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
     private readonly object _lifecycleLock = new();
@@ -147,6 +147,51 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator
                 CuBlasNative.cuCtxPopCurrent(out _);
             }
         }
+    }
+
+    /// <summary>
+    /// Issue #336: wraps a device pointer (returned by <see cref="Allocate"/>)
+    /// as a non-owning <see cref="IGpuBuffer"/>. Use case: cuBLAS-backed
+    /// Adam / SGD optimizer kernels reading a <see cref="WeightLifetime.GpuPinned"/>
+    /// tensor's <c>OffloadDevicePointer</c> need the buffer abstraction
+    /// without taking ownership — the buffer's <c>Dispose</c> is a no-op
+    /// because the allocation is owned by this allocator's
+    /// <c>_live</c> map (freed via <see cref="Free"/>).
+    /// </summary>
+    public IGpuBuffer? WrapDevicePointerAsBuffer(IntPtr devicePointer, int elementCount, int elementByteSize)
+    {
+        if (devicePointer == IntPtr.Zero) return null;
+        if (elementCount <= 0 || elementByteSize <= 0) return null;
+        if (!_live.ContainsKey(devicePointer))
+        {
+            // Pointer wasn't allocated by this instance — refuse rather
+            // than fabricate a buffer over unknown memory. Caller should
+            // have used the same allocator that produced the pointer.
+            return null;
+        }
+        return new CudaNonOwningBuffer(devicePointer, elementCount, (long)elementCount * elementByteSize);
+    }
+
+    /// <summary>
+    /// Non-owning <see cref="IGpuBuffer"/> that wraps a device pointer
+    /// allocated elsewhere. Dispose is a no-op; the owning
+    /// <see cref="CudaOffloadAllocator"/> frees the underlying allocation
+    /// when <see cref="Free"/> is called for the matching handle.
+    /// </summary>
+    private sealed class CudaNonOwningBuffer : IGpuBuffer
+    {
+        public IntPtr Handle { get; }
+        public int Size { get; }
+        public long SizeInBytes { get; }
+
+        public CudaNonOwningBuffer(IntPtr handle, int size, long sizeInBytes)
+        {
+            Handle = handle;
+            Size = size;
+            SizeInBytes = sizeInBytes;
+        }
+
+        public void Dispose() { /* non-owning */ }
     }
 
     private static void FreeNative(GpuOffloadHandle handle)
