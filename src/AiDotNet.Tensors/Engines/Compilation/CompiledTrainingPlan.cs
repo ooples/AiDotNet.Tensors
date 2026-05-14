@@ -425,10 +425,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             paramArrays[p] = (float[])(object)liveParam;
             if (_gradients[p] is not null)
             {
+                // Mirror the parameter contract: gradients also have to expose
+                // a live CPU backing array. A copy-fallback here would let
+                // _optimizerUpdate's `fixed (T* pGrad = gradArrays[p])` read
+                // a snapshot taken at compile time while backward writes to a
+                // different storage — the same stale-buffer bug the parameter
+                // fix above is fixing, but on the gradient side. Fail fast so
+                // the bug cannot resurrect through the gradient path.
                 var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                gradArrays[p] = liveGrad is not null
-                    ? (float[])(object)liveGrad
-                    : (float[])(object)_gradients[p].GetDataArray();
+                if (liveGrad is null)
+                    throw new InvalidOperationException(
+                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
+                        $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
+                        $"ConfigureOptimizer requires live gradient storage so the fused optimizer step reads the " +
+                        $"current gradient values produced by each plan.Step()'s backward pass.");
+                gradArrays[p] = (float[])(object)liveGrad;
             }
             else
             {
@@ -525,10 +536,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             paramArrays[p] = (float[])(object)liveParam;
             if (_gradients[p] is not null)
             {
+                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
                 var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                gradArrays[p] = liveGrad is not null
-                    ? (float[])(object)liveGrad
-                    : (float[])(object)_gradients[p].GetDataArray();
+                if (liveGrad is null)
+                    throw new InvalidOperationException(
+                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
+                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
+                gradArrays[p] = (float[])(object)liveGrad;
             }
             else
             {
@@ -629,10 +643,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             paramArrays[p] = (double[])(object)liveParam;
             if (_gradients[p] is not null)
             {
+                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
                 var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                gradArrays[p] = liveGrad is not null
-                    ? (double[])(object)liveGrad
-                    : (double[])(object)_gradients[p].GetDataArray();
+                if (liveGrad is null)
+                    throw new InvalidOperationException(
+                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
+                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
+                gradArrays[p] = (double[])(object)liveGrad;
             }
             else
             {
@@ -724,10 +741,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             paramArrays[p] = (double[])(object)liveParam;
             if (_gradients[p] is not null)
             {
+                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
                 var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                gradArrays[p] = liveGrad is not null
-                    ? (double[])(object)liveGrad
-                    : (double[])(object)_gradients[p].GetDataArray();
+                if (liveGrad is null)
+                    throw new InvalidOperationException(
+                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
+                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
+                gradArrays[p] = (double[])(object)liveGrad;
             }
             else
             {
