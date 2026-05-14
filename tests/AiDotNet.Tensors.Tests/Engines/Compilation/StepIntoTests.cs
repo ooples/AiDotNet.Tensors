@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -11,8 +12,18 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// contract as the inference plan: caller owns the loss / input buffers,
 /// the plan copies in + out, kernels stay compile-time-specialised.
 /// </summary>
-public class StepIntoTests
+public class StepIntoTests : IDisposable
 {
+    // Same engine-pinning rationale as AsyncChainTests / ExecuteIntoTests:
+    // GraphMode.Enable() captures AiDotNetEngine.Current as the scope's
+    // execution engine, so plan replay runs on the auto-detected GPU
+    // even though BuildPlan() takes a `new CpuEngine()`. On GPU the
+    // SetInputs-rebind on a 2×3 / 3×2 MatMul produces identical output
+    // for different inputs, tripping the test's NotEqual assertion.
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    public StepIntoTests() { AiDotNetEngine.Current = new CpuEngine(); }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
+
     private static ICompiledTrainingPlan<float> BuildPlan(CpuEngine engine, Tensor<float> input, Tensor<float> weight)
     {
         using var scope = GraphMode.Enable();

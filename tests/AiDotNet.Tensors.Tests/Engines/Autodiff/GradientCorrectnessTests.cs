@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
@@ -11,9 +12,23 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// finite-difference numerical gradients. Every backward function must
 /// produce gradients that match within tolerance.
 /// </summary>
-public class GradientCorrectnessTests
+public class GradientCorrectnessTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    // PR #333 added a [ModuleInitializer] that flips AiDotNetEngine.Current
+    // to DirectGpuTensorEngine on GPU machines. Several GPU op overrides
+    // (NLLLoss, UpsampleBilinear, ...) compute gradients that don't match
+    // their finite-difference baselines — they're math-correctness-tested
+    // separately. Pin to CPU for this gradient-correctness suite so the
+    // VerifyGradient comparison hits the engine path the autodiff tape
+    // was actually authored against.
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    public GradientCorrectnessTests()
+    {
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+    public void Dispose() { AiDotNetEngine.Current = _priorEngine; }
     private const double Epsilon = 1e-3; // Central difference: O(eps^2) truncation error
     private const double RelTolerance = 5e-2; // 5% tolerance accounts for float finite-difference error
     // Note: finite-difference gradient has O(eps^2) truncation + O(1/eps) roundoff error.

@@ -497,11 +497,22 @@ internal static class BackwardFunctions<T>
             // Until SgemmTiled gains parallel-tiles for transposed cases,
             // the explicit-transpose + non-transposed parallel matmul is
             // the fastest path.
+            // Issue #338 per-op pooling: bT2 and aT2 are fresh 2D-
+            // transpose buffers consumed once each by the following
+            // TensorMatMul. Pool after use — the pin flag in
+            // TensorPool.Return refuses the return when an outer tape
+            // recorded them (createGraph=true Hvp path), and the
+            // view-safety guard refuses non-owned layouts. Under
+            // normal training (no active tape during backward), both
+            // checks pass and the pool recycles the buffer for the
+            // next backward pass.
             var bT2 = engine.TensorTranspose(inputs[1]);
             var gradA2D = engine.TensorMatMul(g2D, bT2);
+            TensorPool<T>.Return(bT2);
 
             var aT2 = engine.TensorTranspose(a2D);
             var gradB2 = engine.TensorMatMul(aT2, g2D);
+            TensorPool<T>.Return(aT2);
 
             var gradAReshaped = engine.Reshape(gradA2D, (int[])inputs[0]._shape.Clone());
 

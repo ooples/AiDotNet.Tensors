@@ -226,15 +226,54 @@ public sealed class CompiledBackwardGraph<T>
                 foreach (var s in _sources) sourceSet.Add(s);
             }
 
+            // Pool-return gating: createGraph=true keeps the recorded backward
+            // ops alive past this cleanup; skipping pool-return on that path
+            // matches ComputeGradientsViaGraphCore's behaviour (line 1050).
+            bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
+
+            // Issue #283 parity: pre-collect the set of intermediate tensors
+            // owned by this plan's entries. An INPUT to an entry that is ALSO
+            // an Output of another entry is an intermediate — its .GradFn /
+            // .Grad must be cleared to break the back-pointer chain that
+            // pinned forward intermediates across iterations (the leak source
+            // when a consumer cached one of these intermediates externally).
+            // Inputs that are NOT in this set are leaves (parameters, raw
+            // inputs) and the consumer relies on their .Grad being populated.
+            var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (int j in _reachableEntryIndices)
+            {
+                var o = _entries[j].Output;
+                if (o is not null) intermediates.Add(o);
+            }
+
             foreach (int i in _reachableEntryIndices)
             {
                 ref var e = ref _entries[i];
                 e.Output._gradIndex = -1;
-                if (e.Input0 != null) e.Input0._gradIndex = -1;
-                if (e.InputCount >= 2 && e.Input1 != null) e.Input1._gradIndex = -1;
-                if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
+                e.Output._pinnedByTape = false;
+                if (e.Input0 != null)
+                {
+                    e.Input0._gradIndex = -1;
+                    e.Input0._pinnedByTape = false;
+                }
+                if (e.InputCount >= 2 && e.Input1 != null)
+                {
+                    e.Input1._gradIndex = -1;
+                    e.Input1._pinnedByTape = false;
+                }
+                if (e.InputCount >= 3 && e.Input2 != null)
+                {
+                    e.Input2._gradIndex = -1;
+                    e.Input2._pinnedByTape = false;
+                }
                 if (e.InputsOverflow != null)
-                    foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+                {
+                    foreach (var inp in e.InputsOverflow)
+                    {
+                        inp._gradIndex = -1;
+                        inp._pinnedByTape = false;
+                    }
+                }
 
                 // .GradFn / .Grad cleanup on this entry's output (every output is an
                 // intermediate — graph leaves never appear as outputs in the entries
@@ -250,8 +289,38 @@ public sealed class CompiledBackwardGraph<T>
                 bool keepGrad =
                     (sourceSet?.Contains(e.Output) == true)
                     || (_retainGrad is not null && _retainGrad.Contains(e.Output));
+                // Issue #283: capture the GradNode before nulling so it can
+                // be pool-returned. Parity with ComputeGradientsViaGraphCore's
+                // GradNodePool<T>.Return call at line 1157 — the recording-
+                // path returns GradNodes after backward; the compiled-replay
+                // path was dropping them, which accumulated ~13 fresh
+                // allocations per iter (the cost of NOT pooling 96-byte
+                // structs over 200 iters is the bulk of the heap delta the
+                // leak test sees).
+                var node = e.Output.GradFn;
                 e.Output.GradFn = null;
                 if (!keepGrad) e.Output.Grad = null;
+                if (canPoolNodes && node is not null)
+                {
+                    GradNodePool<T>.Return(node);
+                }
+
+                // Issue #283 parity: clear .GradFn/.Grad on EVERY input that
+                // is an intermediate owned by this plan. Without this, the
+                // back-pointer chain (xNorm → q-MatMul-node → xNorm) would
+                // pin forward intermediates whenever a consumer holds onto
+                // even one downstream tensor — the reopened-AiDotNet#1227
+                // pattern. The non-compiled path does this at line 1094-1133
+                // of ComputeGradientsViaGraphCore; pre-fix the compiled-replay
+                // path skipped it entirely.
+                CleanupInput(e.Input0, intermediates, sourceSet, canPoolNodes);
+                if (e.InputCount >= 2) CleanupInput(e.Input1, intermediates, sourceSet, canPoolNodes);
+                if (e.InputCount >= 3) CleanupInput(e.Input2, intermediates, sourceSet, canPoolNodes);
+                if (e.InputsOverflow is not null)
+                {
+                    foreach (var inp in e.InputsOverflow)
+                        CleanupInput(inp, intermediates, sourceSet, canPoolNodes);
+                }
             }
         }
 
@@ -267,6 +336,26 @@ public sealed class CompiledBackwardGraph<T>
         }
 
         return grads;
+    }
+
+    private void CleanupInput(
+        Tensor<T>? t,
+        HashSet<Tensor<T>> intermediates,
+        HashSet<Tensor<T>>? sourceSet,
+        bool canPoolNodes)
+    {
+        if (t is null) return;
+        bool ownedByThisPlan = intermediates.Contains(t);
+        if (ownedByThisPlan)
+        {
+            var inNode = t.GradFn;
+            t.GradFn = null;
+            if (canPoolNodes && inNode is not null) GradNodePool<T>.Return(inNode);
+        }
+        if (!ownedByThisPlan) return;
+        bool keep = (sourceSet?.Contains(t) == true)
+                    || (_retainGrad is not null && _retainGrad.Contains(t));
+        if (!keep) t.Grad = null;
     }
 
     /// <summary>

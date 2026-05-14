@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
@@ -380,6 +381,68 @@ public abstract class TensorBase<T> : IDisposable
     /// call must see the mutated data).
     /// </summary>
     internal int _gpuBufferVersion = -1;
+
+    /// <summary>
+    /// Issue #338: reference count of active <see cref="Engines.Autodiff.GradientTape{T}"/>
+    /// pins on this tensor. Each <see cref="Engines.Autodiff.DifferentiableOps"/> Record*
+    /// call increments once per input it captures; each backward-cleanup site decrements
+    /// once per visit. <see cref="Engines.Autodiff.TensorPool{T}"/>.Return refuses the
+    /// tensor whenever this count is &gt; 0.
+    /// </summary>
+    internal int _pinnedByTapeCount;
+
+    /// <summary>
+    /// Issue #338: backward-compatible boolean façade over <see cref="_pinnedByTapeCount"/>.
+    /// <para>
+    /// PR #331 attempted "Pool-return for MatMul backward bT2/aT2" but
+    /// broke <c>Hvp_MatchesHessianTimesVec</c> because the pooled scratch
+    /// could be reissued under a Hvp / SumToScalarTensor alias before
+    /// the tape's later backward op consumed it. The pin flag is the fix:
+    /// <see cref="Engines.Autodiff.DifferentiableOps"/>'s RecordUnary /
+    /// RecordBinary / RecordIfActive set it on every input that goes onto
+    /// the tape, and the pool's Return refuses pinned tensors. Cleared by
+    /// the tape's cleanup walk when the backward pass finishes.
+    /// </para>
+    /// <para>
+    /// PR #347 review: a plain bool unconditionally cleared by every cleanup
+    /// path lets one tape unpin tensors a concurrently-active outer tape
+    /// still depends on (HVP / nested-tape pattern). Backing this with a
+    /// ref-counted int — Increment on assign-true, safe Decrement (no
+    /// underflow) on assign-false — keeps the &quot;set true / set false&quot;
+    /// call-site API while making overlapping ownership correct: the
+    /// tensor stays pinned until every recording tape has cleared its
+    /// own pin. The Volatile.Read get + Interlocked.CompareExchange set
+    /// keep the path thread-safe for the rare cross-thread tape pattern
+    /// (one training thread, a separate inference thread sharing a
+    /// parameter tensor).
+    /// </para>
+    /// </summary>
+    internal bool _pinnedByTape
+    {
+        get => Volatile.Read(ref _pinnedByTapeCount) > 0;
+        set
+        {
+            if (value)
+            {
+                Interlocked.Increment(ref _pinnedByTapeCount);
+            }
+            else
+            {
+                // Safe decrement: never underflow. Cleanup paths visit
+                // both inputs (which Record* pinned) AND outputs (which
+                // Record* did NOT pin) — and re-visit shared inputs once
+                // per record. Each record-then-cleanup pair nets to 0;
+                // any extra cleanup calls on an already-zero count are
+                // silently absorbed so an unrelated tape's pin survives.
+                int current;
+                do
+                {
+                    current = Volatile.Read(ref _pinnedByTapeCount);
+                    if (current <= 0) return;
+                } while (Interlocked.CompareExchange(ref _pinnedByTapeCount, current - 1, current) != current);
+            }
+        }
+    }
 
     /// <summary>
     /// The GPU memory management role for this tensor (weight, activation, gradient, etc.).

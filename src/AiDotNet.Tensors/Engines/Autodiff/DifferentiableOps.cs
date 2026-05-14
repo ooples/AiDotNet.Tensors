@@ -186,6 +186,12 @@ internal static class DifferentiableOps
                 break;
         }
         output.GradFn = node;
+
+        // Issue #338 tape-pinning: see RecordUnary rationale. Pin every
+        // recorded input so a 4+ input op cannot have any of its tape-held
+        // tensors recycled before the backward walk consumes them.
+        for (int i = 0; i < inputs.Length; i++)
+            inputs[i]._pinnedByTape = true;
     }
 
     /// <summary>
@@ -223,6 +229,13 @@ internal static class DifferentiableOps
         node.InputCount = 1;
         node.SavedState = savedState;
         output.GradFn = node;
+
+        // Issue #338 tape-pinning: mark input as held by the active tape so
+        // TensorPool.Return refuses to reissue it as scratch before the
+        // backward walk consumes it. Output stays unpinned — it's freshly
+        // produced and may be safely pooled if the consumer drops it before
+        // backward runs.
+        input._pinnedByTape = true;
     }
 
     /// <summary>
@@ -262,6 +275,11 @@ internal static class DifferentiableOps
         node.InputCount = 2;
         node.SavedState = savedState;
         output.GradFn = node;
+
+        // Issue #338 tape-pinning: see RecordUnary rationale. Pin BOTH
+        // inputs since the binary backward consumes both.
+        a._pinnedByTape = true;
+        b._pinnedByTape = true;
     }
 
     /// <summary>

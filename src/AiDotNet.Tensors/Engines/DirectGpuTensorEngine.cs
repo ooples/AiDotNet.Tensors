@@ -684,6 +684,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
     }
 
+    /// <summary>
+    /// Invalidates this tensor's activation-cache and pending deferred-
+    /// download registrations. Called from GradientTape.Dispose to drop
+    /// per-step forward intermediates that would otherwise pin GPU
+    /// buffers across iterations (issue #283).
+    ///
+    /// <para>Removes both the cache entry and the pending materializer
+    /// registration. If the entry was pending, force-materialize first
+    /// so any subsequent CPU read sees correct data instead of
+    /// uninitialized.</para>
+    /// </summary>
+    internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        // Both the array-keyed and vector-keyed activation cache
+        // entries may have been added (different cache paths use
+        // different keys). Invalidate both to be safe.
+        var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backingArray is not null)
+        {
+            if (Helpers.DeferredArrayMaterializer.IsPending(backingArray))
+            {
+                // Force-materialize before invalidating so the array
+                // ends up with valid CPU data (user might still read
+                // tensor.GetDataArray() after Dispose).
+                try { Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray); }
+                catch { Helpers.DeferredArrayMaterializer.Remove(backingArray); }
+            }
+            InvalidateActivationCacheEntry(backingArray);
+        }
+        if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+        {
+            try { Helpers.DeferredArrayMaterializer.TryMaterialize(tensor.DataVector); }
+            catch { Helpers.DeferredArrayMaterializer.Remove(tensor.DataVector); }
+        }
+        InvalidateActivationCacheEntry(tensor.DataVector);
+    }
+
     private void InvalidateActivationCacheEntry(object key)
     {
         // Byte-accounting units must match the add/remove/evict paths
@@ -10196,7 +10233,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     permutation.Add(i);
                     outerSize *= inputShape[i];
-                    outputShapeList.Add(inputShape[i]);
                 }
             }
 
@@ -10205,7 +10241,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 permutation.Add(axis);
                 reduceSize *= inputShape[axis];
-                if (keepDims) outputShapeList.Add(1);
+            }
+
+            // PyTorch-parity output shape: if keepDims, each reduced
+            // axis stays at its ORIGINAL position with size 1 — NOT
+            // appended at the end (which would scramble downstream
+            // broadcast semantics, e.g. FusedLinear's [1, N] bias
+            // gradient would emerge as [N, 1] after reducing axis 0
+            // of [B, N], breaking the bias add update). For non-
+            // keepDims, drop the reduced axes entirely while keeping
+            // non-reduced axes in their original positions.
+            for (int i = 0; i < inputRank; i++)
+            {
+                if (reduceDims.Contains(i))
+                {
+                    if (keepDims) outputShapeList.Add(1);
+                }
+                else
+                {
+                    outputShapeList.Add(inputShape[i]);
+                }
             }
 
             // Permute the input tensor
@@ -14883,23 +14938,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)
     {
         if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
+        // GPU fast path only valid when the reduce axis is the INNERMOST.
+        // backend.SumAxis treats the buffer as [N, reduceSize] and sums
+        // each row — that math only matches the requested reduction when
+        // the reduce axis is contiguous (axis == rank - 1). For any
+        // middle/outer axis the row-major layout puts non-reduce
+        // strides between consecutive reduce elements, so SumAxis would
+        // silently sum the wrong axis (silently reduced the wrong dim
+        // for axes=[0] on rank-3 inputs, breaking FusedLinear's
+        // [B,T,F]→[1,F] bias gradient — discovered via
+        // TwoLayerFFL_Rank3Float_TrainsCleanly). The public ReduceSum
+        // override handles non-innermost axes via PermuteImpl; route
+        // there for correctness.
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes is not null && axes.Length == 1)
         {
             try
             {
                 int rank = tensor.Rank;
                 int axis = axes[0] < 0 ? rank + axes[0] : axes[0];
-                if (axis >= 0 && axis < rank)
+                if (axis == rank - 1)
                 {
                     int outerSize = 1;
                     for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
                     int reduceSize = tensor.Shape._dims[axis];
-                    int innerSize = 1;
-                    for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape._dims[i];
-                    int totalOuter = outerSize * innerSize;
                     var gi = UploadTensorRaw(b, tensor);
-                    var go = b.AllocateBuffer(totalOuter);
-                    b.SumAxis(gi, go, totalOuter, reduceSize);
+                    var go = b.AllocateBuffer(outerSize);
+                    b.SumAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
                     {
@@ -14912,34 +14976,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = tensor.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, totalOuter, outShape);
+                    return DeferTensorResult<T>(b, go, outerSize, outShape);
                 }
             }
             catch { }
         }
-        return base.ReduceSum(tensor, axes, keepDims);
+        // Non-innermost axis or multi-axis or non-float: defer to the
+        // public override, which handles arbitrary axes correctly via
+        // permute-then-sum.
+        return ReduceSum(tensor, axes, keepDims);
     }
 
     Tensor<T> IEngine.ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         if (IsTapeActive<T>()) return base.ReduceMean(input, axes, keepDims);
+        // Same axis-must-be-innermost constraint as ReduceSum: backend.MeanAxis
+        // treats the buffer as [N, reduceSize] rows; correct only when the
+        // reduce axis is contiguous (axis == rank - 1). For middle/outer
+        // axes the row-major strides scatter reduce elements across the
+        // buffer, so MeanAxis would silently reduce the wrong axis.
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes.Length == 1)
         {
             try
             {
                 int rank = input.Rank;
                 int axis = axes[0] < 0 ? rank + axes[0] : axes[0];
-                if (axis >= 0 && axis < rank)
+                if (axis == rank - 1)
                 {
                     int outerSize = 1;
                     for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
                     int reduceSize = input.Shape._dims[axis];
-                    int innerSize = 1;
-                    for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape._dims[i];
-                    int totalOuter = outerSize * innerSize;
                     var gi = UploadTensorRaw(b, input);
-                    var go = b.AllocateBuffer(totalOuter);
-                    b.MeanAxis(gi, go, totalOuter, reduceSize);
+                    var go = b.AllocateBuffer(outerSize);
+                    b.MeanAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
                     {
@@ -14952,12 +15021,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = input.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, totalOuter, outShape);
+                    return DeferTensorResult<T>(b, go, outerSize, outShape);
                 }
             }
             catch { }
         }
-        return base.ReduceMean(input, axes, keepDims);
+        return ReduceMean(input, axes, keepDims);
     }
 
     Tensor<T> IEngine.TensorBatchMatMul<T>(Tensor<T> a, Tensor<T> b2)

@@ -251,7 +251,31 @@ public sealed class GradientTape<T> : IDisposable
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
             {
-                return compiledBwd.Execute(loss);
+                // Issue #283: suspend the tape during compiled-backward
+                // replay. Without this, engine ops invoked from BackwardFunctions
+                // (TensorMatMul/TensorTranspose/etc.) see Current != null and
+                // record fresh tape entries whose GradNodes hold the FORWARD
+                // intermediates as inputs. The compiled plan's cleanup only
+                // visits the forward _reachableEntryIndices — backward-
+                // recorded entries' GradFn chains are NEVER cleared, pinning
+                // ~7 forward intermediates × ~40KB each per iter (the
+                // 133KB-1MB/call signature in the GradientTapeLeakTests
+                // transformer-scale probes). The non-compiled path
+                // (ComputeGradientsViaGraph) already suspends — this is the
+                // missing parity. Same gating: createGraph=true intentionally
+                // keeps recording so higher-order ops (Hvp/Hessian) land in
+                // the outer tape, but the compiled-replay path is gated on
+                // !createGraph (line 249 above) so we always suspend here.
+                var savedCompiledReplayCurrent = _current;
+                SetCurrentTape(null);
+                try
+                {
+                    return compiledBwd.Execute(loss);
+                }
+                finally
+                {
+                    SetCurrentTape(savedCompiledReplayCurrent);
+                }
             }
         }
 
@@ -681,6 +705,12 @@ public sealed class GradientTape<T> : IDisposable
         {
             t.GradFn = null;
         }
+        // Issue #338: clear the tape-pinning flag set by
+        // DifferentiableOps.Record* — the backward walk has completed and
+        // the tensor is safe to pool again. Cleared regardless of source /
+        // RetainGrad status because the pin guards against pool reuse, not
+        // .Grad lifecycle.
+        t._pinnedByTape = false;
         // Preserve .Grad when the caller explicitly listed this tensor as a source
         // (they're going to read `tensor.Grad` rather than the returned Dictionary).
         if (sourceSet?.Contains(t) == true) return;
@@ -1061,8 +1091,18 @@ public sealed class GradientTape<T> : IDisposable
                     // node.Output is always owned by this tape (we just verified
                     // nodeOwnedByThisTape above). Safe to clear both fields.
                     node.Output.GradFn = null;
+                    // Issue #338: clear the tape-pinning flag on every
+                    // tape-owned tensor we touch — the backward walk has
+                    // consumed it and pooling is safe again.
+                    node.Output._pinnedByTape = false;
                     if (!ShouldKeepGrad(node.Output))
                         node.Output.Grad = null;
+                    node.Input0._pinnedByTape = false;
+                    if (node.Input1 is not null) node.Input1._pinnedByTape = false;
+                    if (node.Input2 is not null) node.Input2._pinnedByTape = false;
+                    if (node.InputsOverflow is not null)
+                        foreach (var inp in node.InputsOverflow)
+                            inp._pinnedByTape = false;
 
                     // Input0 is non-nullable on GradNode<T>; the recorder
                     // always populates it. But it CAN be a leaf (no GradFn)
@@ -1147,6 +1187,82 @@ public sealed class GradientTape<T> : IDisposable
                     // Tensor-side liveness tracking.
                 }
             }
+            else
+            {
+                // Issue #283 / #338: persistent-tape path. Pre-fix this branch
+                // only cleared _pinnedByTape flags; .GradFn / .Grad were left
+                // set, so any consumer holding an intermediate tensor (the
+                // layer-cache pattern: MultiHeadAttentionLayer's _lastInput
+                // etc.) pinned the entire backward graph through that
+                // intermediate's GradFn pointer. The chain.Execute uses
+                // BackwardStep[] which stores Output / Inputs directly — it
+                // does NOT follow tensor.GradFn at execute time — so nulling
+                // GradFn here is safe even though the chain is cached for
+                // replay. The next forward will re-set GradFn on every
+                // intermediate before the next backward runs.
+                //
+                // sourceSet collection mirrors the !Persistent branch above
+                // so the keepGrad rule (explicit sources / RetainGrad)
+                // applies consistently.
+                HashSet<Tensor<T>>? persistentSourceSet = null;
+                if (sources is not null)
+                {
+                    persistentSourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                    foreach (var s in sources) persistentSourceSet.Add(s);
+                }
+                bool PersistentShouldKeepGrad(Tensor<T> t)
+                {
+                    if (persistentSourceSet?.Contains(t) == true) return true;
+                    if (_retainGrad is not null && _retainGrad.Contains(t)) return true;
+                    return false;
+                }
+
+                foreach (var node in topoOrder)
+                {
+                    if (!ReferenceEquals(node.OwningTape, this)) continue;
+                    node.Output._pinnedByTape = false;
+                    node.Input0._pinnedByTape = false;
+                    if (node.Input1 is not null) node.Input1._pinnedByTape = false;
+                    if (node.Input2 is not null) node.Input2._pinnedByTape = false;
+                    if (node.InputsOverflow is not null)
+                        foreach (var inp in node.InputsOverflow)
+                            inp._pinnedByTape = false;
+
+                    // Issue #283 fix: destructive cleanup on Output AND on
+                    // intermediate Inputs. Output is always an intermediate
+                    // (leaves never appear as Output of an entry). Inputs
+                    // may be leaves (params / raw inputs) — preserve their
+                    // .Grad and don't touch their .GradFn (leaves have
+                    // GradFn=null anyway, or it belongs to an outer tape).
+                    node.Output.GradFn = null;
+                    if (!PersistentShouldKeepGrad(node.Output))
+                        node.Output.Grad = null;
+
+                    static void ClearIfIntermediate(Tensor<T>? t, GradientTape<T> self,
+                        Func<Tensor<T>, bool> shouldKeep, bool canPool)
+                    {
+                        if (t is null) return;
+                        var fn = t.GradFn;
+                        if (fn is null) return;
+                        if (!ReferenceEquals(fn.OwningTape, self)) return;
+                        t.GradFn = null;
+                        if (!shouldKeep(t)) t.Grad = null;
+                        if (canPool) GradNodePool<T>.Return(fn);
+                    }
+                    bool canPoolPersist = !DifferentiableOps._isBackwardCreateGraph;
+                    ClearIfIntermediate(node.Input0, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputCount >= 2) ClearIfIntermediate(node.Input1, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputCount >= 3) ClearIfIntermediate(node.Input2, this, PersistentShouldKeepGrad, canPoolPersist);
+                    if (node.InputsOverflow is not null)
+                    {
+                        foreach (var inp in node.InputsOverflow)
+                            ClearIfIntermediate(inp, this, PersistentShouldKeepGrad, canPoolPersist);
+                    }
+
+                    // Pool-return this node too (already nulled GradFn on output above).
+                    if (canPoolPersist) GradNodePool<T>.Return(node);
+                }
+            }
 
             // Drop captured refs in the steps array's live range so they
             // don't extend tensor lifetimes through the scratch pool.
@@ -1213,6 +1329,11 @@ public sealed class GradientTape<T> : IDisposable
             if (fn is not null && ReferenceEquals(fn.OwningTape, this))
             {
                 output.GradFn = null;
+                // Issue #338 tape-pinning: backward replay has consumed
+                // this output (and the entry above re-registered it via
+                // Record*). Cleared regardless of source/retain — the pin
+                // guards the pool, not .Grad.
+                output._pinnedByTape = false;
                 bool keepGrad = sourceSet?.Contains(output) == true
                     || (_retainGrad is not null && _retainGrad.Contains(output));
                 if (!keepGrad) output.Grad = null;
@@ -1244,6 +1365,9 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T>? t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
     {
         if (t is null) return;
+        // Issue #338: clear the tape-pinning flag set by DifferentiableOps.Record*
+        // — backward replay has consumed this tensor and pooling is safe again.
+        t._pinnedByTape = false;
         bool ownedByThisTape = intermediates.Contains(t);
         if (ownedByThisTape)
         {
@@ -1489,6 +1613,46 @@ public sealed class GradientTape<T> : IDisposable
         // sets it (e.g. a future code change that caches across a
         // re-execute call) from leaking BackwardStep[] across Dispose.
         _cachedDelegateChain = null;
+
+        // Issue #283 fix: invalidate ONLY this tape's forward-recorded
+        // outputs from the GPU activation cache BEFORE resetting the
+        // entries (reset zeros Output refs, leaving nothing to walk).
+        // The cache is designed for inference-side layer chaining, but
+        // during TRAINING each forward op registers a deferred-download
+        // materializer keyed on its result array. Those registrations
+        // strong-ref the result arrays — and once user code holds an
+        // intermediate externally (the layer-cache pattern: AiDotNet's
+        // MultiHeadAttentionLayer _lastQueryInput etc.), the array →
+        // cache-entry → GPU-buffer chain pins ~16-32 KB per cached
+        // activation for the rest of the process. Measured 547 KB/call
+        // retention on the 4L Transformer NullSources probe; this fix
+        // drops it to 0 B/call.
+        //
+        // Why per-tape-entry instead of ClearActivationCache: a tape's
+        // forward might run AFTER a separate inference-chain that
+        // populated the cache with entries the outer scope still wants
+        // (e.g. cached weights/biases the next inference reuses).
+        // Wholesale clearing breaks ~64 unrelated test scenarios that
+        // share the cache across tape boundaries. Walking _entries
+        // touches only the recorded outputs of THIS tape — exactly
+        // what's at risk of being pinned across our Dispose.
+        //
+        // Only the OUTERMOST tape invalidates — nested tapes
+        // (Hvp/Hessian) must not clear their parent's pending
+        // materializers mid-backward. Detect outermost via
+        // _parent == null. Engine check gates the virtual dispatch.
+        if (_parent is null && _entries.Count > 0
+            && _engine is Engines.DirectGpuTensorEngine gpuEngine)
+        {
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var entry = ref _entries[i];
+                var output = entry.Output;
+                if (output is null) continue;
+                gpuEngine.InvalidateGpuCacheForTensor(output);
+            }
+        }
+
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
