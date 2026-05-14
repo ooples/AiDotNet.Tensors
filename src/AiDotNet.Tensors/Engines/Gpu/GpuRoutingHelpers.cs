@@ -41,7 +41,7 @@ public static class GpuRoutingHelpers
     /// Returns true when <paramref name="engine"/> is a GPU engine with a
     /// live async backend — i.e. dispatching a deferred-scope action via
     /// <see cref="DirectGpuTensorEngine.BeginDeferredScope"/> or
-    /// <see cref="AsyncGpuBackendExtensions.ExecuteDeferred{TResult}"/> would
+    /// <see cref="DeferredScopeExtensions.ExecuteDeferred{TResult}"/> would
     /// actually run on hardware rather than no-op back to a CPU path.
     /// </summary>
     /// <param name="engine">The engine to inspect. May be null.</param>
@@ -135,6 +135,18 @@ public static class GpuRoutingHelpers
         if (engine is not DirectGpuTensorEngine gpu)
         {
             reason = $"Engine '{engine.GetType().Name}' is not a GPU engine; CPU path runs.";
+            cpuFallback();
+            return false;
+        }
+        // Align with IsGpuActive(): a GPU engine whose backend can't run
+        // a deferred scope (cuGraph-incapable driver, missing runtime
+        // library, etc.) is NOT "GPU active" — fall back to CPU even if
+        // GetAsyncBackend() returns non-null. Without this gate the
+        // dispatcher would diverge from the predicate and route work
+        // that IsGpuActive(engine) just said couldn't run.
+        if (!gpu.SupportsDeferredExecution)
+        {
+            reason = "DirectGpuTensorEngine does not support deferred execution; CPU path runs.";
             cpuFallback();
             return false;
         }

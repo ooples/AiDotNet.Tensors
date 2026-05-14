@@ -5,12 +5,24 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 
 /// <summary>
+/// xUnit collection marker that disables parallel execution for
+/// tests touching <c>AiDotNetEngine.Current</c>. Any other test class
+/// that reads or overrides the process-global engine should join this
+/// collection — same pattern as <c>BlasGlobalState</c> / <c>WeightRegistry</c>.
+/// PR #342 review: without this gate, parallel tests racing on
+/// <c>AiDotNetEngine.Current</c> produce intermittent failures.
+/// </summary>
+[CollectionDefinition("AiDotNetEngineCurrentState", DisableParallelization = true)]
+public sealed class AiDotNetEngineCurrentStateCollection { }
+
+/// <summary>
 /// Issue #334: covers the Tensors-side capability surface that
 /// <c>AiDotNet.NeuralNetworkBase.Train</c> calls when deciding whether to
 /// dispatch a training step to the GPU. The actual <c>Train()</c> dispatch
 /// fix ships in a companion AiDotNet PR; this suite validates the helpers
 /// that companion PR depends on.
 /// </summary>
+[Collection("AiDotNetEngineCurrentState")]
 public class GpuRoutingHelpersTests
 {
     [Fact]
