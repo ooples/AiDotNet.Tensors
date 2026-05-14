@@ -1287,6 +1287,42 @@ public abstract class TensorBase<T> : IDisposable
         return _storage.GetDataArray();
     }
 
+    /// <summary>
+    /// Like <see cref="GetLiveBackingArrayOrNull"/> but tolerates a backing
+    /// storage that is LONGER than <see cref="Length"/> — the common case
+    /// when <c>Tensor&lt;T&gt;</c> was constructed via an ArrayPool-renting
+    /// path that rounds up to the next power-of-two bucket. Callers
+    /// MUST treat the returned array as having only the first
+    /// <see cref="Length"/> elements as the logical tensor data and
+    /// MUST NOT read or write past index <c>Length - 1</c> (the tail
+    /// is pool padding and may alias another tensor's storage).
+    ///
+    /// <para>Returns <c>null</c> only for views (non-contiguous, non-zero
+    /// offset) and non-CPU tensors — the cases where there is no single
+    /// CPU-side backing array that mutating the tensor through would be
+    /// well-defined. For pooled-padded layouts the live backing IS
+    /// well-defined as "first Length elements", which is what the fused
+    /// optimizer's per-parameter <c>fixed (T* p = …)</c> + <c>length</c>
+    /// pin contract has always relied on.</para>
+    ///
+    /// <para>This was added (issue #350) when <see cref="GetDataArray"/>
+    /// silently returned a <em>copy</em> for ArrayPool-padded tensors
+    /// (e.g. logical length 6 on a 16-slot bucket). The fused-Adam
+    /// closure in <c>ConfigureOptimizerDouble</c> / <c>ConfigureOptimizerFloat</c>
+    /// then pinned the COPY and wrote updates there, leaving the
+    /// caller-registered parameter tensor unmutated — every
+    /// <c>plan.Step()</c> returned success while training silently
+    /// flat-lined.</para>
+    /// </summary>
+    internal T[]? GetLiveBackingArrayAllowingPaddingOrNull()
+    {
+        if (!IsContiguous || _storageOffset != 0)
+            return null;
+        if (_device != TensorDevice.CPU)
+            return null;
+        return _storage.GetDataArray();
+    }
+
     // ================================================================
     // Clone and Transform
     // ================================================================

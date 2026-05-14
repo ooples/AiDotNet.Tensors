@@ -399,12 +399,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Second moment buffers (Adam, RMSprop, etc.)
         var v = new float[paramCount][];
 
+        // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
+        // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
+        // ArrayPool bucket — common on net8+ where pool rent rounds up to
+        // power-of-two). Pinning that copy and writing through fixed pointer
+        // updates the COPY, not the caller's tensor — so plan.Step() returns
+        // success and the parameter never actually moves. The live-backing
+        // accessor below is "allowing padding" because the fused kernel reads
+        // exactly `lengths[p]` elements (the logical tensor size), never
+        // touching the pool-padding tail. For non-trivial layouts (views,
+        // non-zero offset, GPU-resident) the live-backing accessor returns
+        // null and we throw — that's a "should never happen for params
+        // registered with CompileTraining" condition and a silent fallback to
+        // a copy would just resurrect this bug.
         for (int p = 0; p < paramCount; p++)
         {
-            paramArrays[p] = (float[])(object)_parameters[p].GetDataArray();
-            gradArrays[p] = _gradients[p] is not null
-                ? (float[])(object)_gradients[p].GetDataArray()
-                : Array.Empty<float>();
+            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
+            if (liveParam is null)
+                throw new InvalidOperationException(
+                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
+                    $"ConfigureOptimizer requires every registered parameter to be a contiguous CPU tensor so " +
+                    $"the fused optimizer step can mutate the caller's tensor in place. Call .Contiguous() / " +
+                    $"copy the parameter to CPU before registering it with CompileTraining.");
+            paramArrays[p] = (float[])(object)liveParam;
+            if (_gradients[p] is not null)
+            {
+                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                gradArrays[p] = liveGrad is not null
+                    ? (float[])(object)liveGrad
+                    : (float[])(object)_gradients[p].GetDataArray();
+            }
+            else
+            {
+                gradArrays[p] = Array.Empty<float>();
+            }
             lengths[p] = _parameters[p].Length;
 
             bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
@@ -484,12 +513,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
         for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
 
+        // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
         {
-            paramArrays[p] = (float[])(object)_parameters[p].GetDataArray();
-            gradArrays[p] = _gradients[p] is not null
-                ? (float[])(object)_gradients[p].GetDataArray()
-                : Array.Empty<float>();
+            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
+            if (liveParam is null)
+                throw new InvalidOperationException(
+                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
+                    $"ConfigureOptimizerGrouped requires every registered parameter to be a contiguous CPU tensor.");
+            paramArrays[p] = (float[])(object)liveParam;
+            if (_gradients[p] is not null)
+            {
+                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                gradArrays[p] = liveGrad is not null
+                    ? (float[])(object)liveGrad
+                    : (float[])(object)_gradients[p].GetDataArray();
+            }
+            else
+            {
+                gradArrays[p] = Array.Empty<float>();
+            }
             lengths[p] = _parameters[p].Length;
 
             bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
@@ -568,12 +612,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var m = new double[paramCount][];
         var v = new double[paramCount][];
 
+        // Issue #350: bind to the live backing (see ConfigureOptimizerFloat
+        // for the full reasoning) — GetDataArray()'s pool-padded copy
+        // semantics silently caused every fused-Adam Step() on T=double to
+        // be a no-op for the caller. Live-backing-allowing-padding writes
+        // straight through to _parameters[p].
         for (int p = 0; p < paramCount; p++)
         {
-            paramArrays[p] = (double[])(object)_parameters[p].GetDataArray();
-            gradArrays[p] = _gradients[p] is not null
-                ? (double[])(object)_gradients[p].GetDataArray()
-                : Array.Empty<double>();
+            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
+            if (liveParam is null)
+                throw new InvalidOperationException(
+                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
+                    $"ConfigureOptimizer requires every registered parameter to be a contiguous CPU tensor so " +
+                    $"the fused optimizer step can mutate the caller's tensor in place.");
+            paramArrays[p] = (double[])(object)liveParam;
+            if (_gradients[p] is not null)
+            {
+                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                gradArrays[p] = liveGrad is not null
+                    ? (double[])(object)liveGrad
+                    : (double[])(object)_gradients[p].GetDataArray();
+            }
+            else
+            {
+                gradArrays[p] = Array.Empty<double>();
+            }
             lengths[p] = _parameters[p].Length;
 
             bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
@@ -648,12 +712,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
         for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
 
+        // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
         {
-            paramArrays[p] = (double[])(object)_parameters[p].GetDataArray();
-            gradArrays[p] = _gradients[p] is not null
-                ? (double[])(object)_gradients[p].GetDataArray()
-                : Array.Empty<double>();
+            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
+            if (liveParam is null)
+                throw new InvalidOperationException(
+                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
+                    $"ConfigureOptimizerGrouped requires every registered parameter to be a contiguous CPU tensor.");
+            paramArrays[p] = (double[])(object)liveParam;
+            if (_gradients[p] is not null)
+            {
+                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                gradArrays[p] = liveGrad is not null
+                    ? (double[])(object)liveGrad
+                    : (double[])(object)_gradients[p].GetDataArray();
+            }
+            else
+            {
+                gradArrays[p] = Array.Empty<double>();
+            }
             lengths[p] = _parameters[p].Length;
 
             bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
