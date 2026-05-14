@@ -473,10 +473,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Convenience: builds a <see cref="GpuStreamPool"/> sized to this
-    /// engine's async backend's
-    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> and returns it
-    /// to the caller as a disposable. Caller takes ownership.
+    /// Convenience: builds a <see cref="GpuStreamPool"/> for this engine's
+    /// async backend and returns it to the caller as a disposable. Pool
+    /// capacity is bounded by the backend's
+    /// <see cref="IAsyncGpuBackend.MaxConcurrentStreams"/> and adjusted by
+    /// the supplied <see cref="GpuExecutionOptions"/>. Caller takes ownership.
     /// </summary>
     /// <param name="options">Optional execution options; defaults to
     /// <see cref="GpuExecutionOptions.FromEnvironment"/>.</param>

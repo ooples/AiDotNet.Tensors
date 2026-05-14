@@ -9151,8 +9151,10 @@ public interface IEngine
     /// throwing, so callers route to a CPU path on null.
     /// </summary>
     /// <param name="streamPool">Optional pool whose backend must match
-    /// this engine's backend. When null, implementations may create a pool
-    /// owned by the returned scheduler.</param>
+    /// this engine's backend. When null, multi-stream-capable implementations
+    /// create a fresh pool owned by the returned scheduler. When non-null,
+    /// ownership and lifetime responsibility remain with the caller.
+    /// Engines that do not support multi-streaming return null.</param>
     /// <param name="streamType">Default stream type for scheduled ops.</param>
     /// <exception cref="System.ArgumentException">If
     /// <paramref name="streamPool"/> was created with a different backend

@@ -65,8 +65,11 @@ public sealed class GpuStreamScheduler : IDisposable
     private readonly GpuStreamPool _pool;
     private readonly GpuStreamType _streamType;
     private readonly bool _ownsPool;
+    private readonly object _lifetimeLock = new();
     private readonly int _maxStreams;
     private int _nextStream;
+    private int _activeOperations;
+    private bool _disposing;
     private bool _disposed;
 
     /// <summary>
@@ -108,7 +111,7 @@ public sealed class GpuStreamScheduler : IDisposable
     /// </remarks>
     public GpuEventBatch Dispatch(IReadOnlyList<Action<IGpuStream>> launches)
     {
-        ThrowIfDisposed();
+        using var operation = EnterOperation();
         if (launches is null) throw new ArgumentNullException(nameof(launches));
         if (launches.Count == 0) return GpuEventBatch.Empty;
 
@@ -183,7 +186,7 @@ public sealed class GpuStreamScheduler : IDisposable
     /// </returns>
     public GpuEventBatch DispatchSequential(IReadOnlyList<IReadOnlyList<Action<IGpuStream>>> batches)
     {
-        ThrowIfDisposed();
+        using var operation = EnterOperation();
         if (batches is null) throw new ArgumentNullException(nameof(batches));
         if (batches.Count == 0) return GpuEventBatch.Empty;
 
@@ -297,7 +300,7 @@ public sealed class GpuStreamScheduler : IDisposable
     /// </summary>
     public void SynchronizeEvents(IReadOnlyList<IGpuEvent> events)
     {
-        ThrowIfDisposed();
+        using var operation = EnterOperation();
         if (events is null) return;
         for (int i = 0; i < events.Count; i++)
             events[i]?.Synchronize();
@@ -309,15 +312,75 @@ public sealed class GpuStreamScheduler : IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        if (_ownsPool)
-            _pool.Dispose();
+        GpuStreamPool? poolToDispose = null;
+
+        lock (_lifetimeLock)
+        {
+            if (_disposed) return;
+            if (_disposing)
+            {
+                while (!_disposed)
+                    Monitor.Wait(_lifetimeLock);
+                return;
+            }
+
+            _disposing = true;
+            while (_activeOperations > 0)
+                Monitor.Wait(_lifetimeLock);
+
+            if (_ownsPool)
+                poolToDispose = _pool;
+        }
+
+        try
+        {
+            poolToDispose?.Dispose();
+        }
+        finally
+        {
+            lock (_lifetimeLock)
+            {
+                _disposed = true;
+                Monitor.PulseAll(_lifetimeLock);
+            }
+        }
+    }
+
+    private OperationLease EnterOperation()
+    {
+        lock (_lifetimeLock)
+        {
+            ThrowIfDisposed();
+            _activeOperations++;
+            return new OperationLease(this);
+        }
+    }
+
+    private void ExitOperation()
+    {
+        lock (_lifetimeLock)
+        {
+            _activeOperations--;
+            if (_activeOperations == 0)
+                Monitor.PulseAll(_lifetimeLock);
+        }
     }
 
     private void ThrowIfDisposed()
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(GpuStreamScheduler));
+        if (_disposed || _disposing) throw new ObjectDisposedException(nameof(GpuStreamScheduler));
+    }
+
+    private readonly struct OperationLease : IDisposable
+    {
+        private readonly GpuStreamScheduler _scheduler;
+
+        public OperationLease(GpuStreamScheduler scheduler)
+        {
+            _scheduler = scheduler;
+        }
+
+        public void Dispose() => _scheduler.ExitOperation();
     }
 
     private GpuEventBatch DispatchOnSingleStream(IGpuStream stream, IReadOnlyList<Action<IGpuStream>> launches)
