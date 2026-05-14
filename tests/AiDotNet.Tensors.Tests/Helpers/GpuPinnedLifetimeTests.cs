@@ -45,11 +45,21 @@ public class GpuPinnedLifetimeTests
             || !WeightRegistry.OffloadAllocator.IsAvailable)
             return; // CPU-only host — skip; covered by the fallback test.
 
+        // PR #345 review: tighten assertion to require GpuPinned exactly.
+        // Permitting `Default` masked regressions in the new tagging
+        // behavior — the whole point of issue #336 is that pinned-on-GPU
+        // tensors are explicitly tagged as such. Also unregister the
+        // tensor afterward so each test run doesn't accumulate
+        // process-wide offload state.
         var tensor = TensorAllocator.RentPinnedOnGpu<float>(new[] { 16 });
-        Assert.True(
-            tensor.Lifetime == WeightLifetime.GpuPinned
-                || tensor.Lifetime == WeightLifetime.Default,
-            $"Expected GpuPinned or fallback Default; got {tensor.Lifetime}");
+        try
+        {
+            Assert.Equal(WeightLifetime.GpuPinned, tensor.Lifetime);
+        }
+        finally
+        {
+            WeightRegistry.UnregisterWeight(tensor);
+        }
     }
 
     [Fact]
