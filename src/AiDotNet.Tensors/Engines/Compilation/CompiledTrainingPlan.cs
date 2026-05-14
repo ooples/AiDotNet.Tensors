@@ -284,21 +284,109 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float eps = 1e-8f,
         float weightDecay = 0f)
     {
+        ConfigureOptimizer(
+            optimizerType,
+            LrSchedule.Constant(learningRate),
+            beta1, beta2, eps, weightDecay);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ConfigureOptimizer(
+        OptimizerType optimizerType,
+        LrSchedule schedule,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f)
+    {
+        if (schedule is null) throw new ArgumentNullException(nameof(schedule));
+        ValidatePlanOptimizerSupport(optimizerType);
         if (typeof(T) == typeof(float))
         {
-            ConfigureOptimizerFloat(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerFloat(optimizerType, schedule, beta1, beta2, eps, weightDecay);
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            ConfigureOptimizerDouble(optimizerType, learningRate, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
     }
 
+    /// <inheritdoc/>
+    public unsafe void ConfigureOptimizerGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f)
+    {
+        if (groupSchedules is null) throw new ArgumentNullException(nameof(groupSchedules));
+        if (paramToGroup is null) throw new ArgumentNullException(nameof(paramToGroup));
+        if (groupSchedules.Count == 0)
+            throw new ArgumentException("groupSchedules must contain at least one schedule.", nameof(groupSchedules));
+        if (paramToGroup.Count != _parameters.Length)
+            throw new ArgumentException(
+                $"paramToGroup.Count ({paramToGroup.Count}) must equal the compiled parameter count ({_parameters.Length}).",
+                nameof(paramToGroup));
+        // Validate every schedule slot up front — the grouped hot path
+        // evaluates GetLr() on ALL of them per step, not just the ones
+        // referenced by paramToGroup. A null slot that no parameter maps
+        // to today would still NRE on the first Step().
+        for (int g = 0; g < groupSchedules.Count; g++)
+        {
+            if (groupSchedules[g] is null)
+                throw new ArgumentException($"groupSchedules[{g}] is null.", nameof(groupSchedules));
+        }
+        for (int i = 0; i < paramToGroup.Count; i++)
+        {
+            int g = paramToGroup[i];
+            if (g < 0 || g >= groupSchedules.Count)
+                throw new ArgumentOutOfRangeException(
+                    nameof(paramToGroup),
+                    $"paramToGroup[{i}]={g} is out of range [0, {groupSchedules.Count}).");
+        }
+        ValidatePlanOptimizerSupport(optimizerType);
+        if (typeof(T) == typeof(float))
+        {
+            ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            ConfigureOptimizerDoubleGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay);
+            return;
+        }
+        throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
+
+    /// <summary>Gate at the plan-level dispatch surface. The closures
+    /// built by ConfigureOptimizer*Float/Double only implement SGD,
+    /// Adam, and AdamW today — accepting anything else (Lion, LAMB,
+    /// HypergradientSGD, …) would configure successfully and then throw
+    /// on the first Step(). <c>OptimizerKernels.IsFusedPathEligible</c>
+    /// is the broader semantic predicate (which kernels exist at all);
+    /// this is the narrower "what the plan can replay today" check.</summary>
+    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType)
+    {
+        bool supported = optimizerType is OptimizerType.SGD
+            or OptimizerType.Adam
+            or OptimizerType.AdamW;
+        if (!supported)
+        {
+            throw new NotSupportedException(
+                $"Optimizer type {optimizerType} is not yet supported by CompiledTrainingPlan's " +
+                "fused-update closures. Currently supported: SGD, Adam, AdamW. " +
+                "The kernel for this optimizer may still exist (see OptimizerKernels.IsFusedPathEligible); " +
+                "use eager apply via OptimizerKernels directly until a plan-level dispatch branch lands.");
+        }
+    }
+
     private unsafe void ConfigureOptimizerFloat(
-        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
     {
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
@@ -331,16 +419,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _optimizerStep = 0;
-        var lr = learningRate;
         var b1 = beta1;
         var b2 = beta2;
         var epsVal = eps;
         var wd = weightDecay;
         var optType = optimizerType;
+        var lrSchedule = schedule;
 
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // Issue #348: read lr from the schedule each step. PyTorch's
+            // LRScheduler.step() pays managed-code dispatch overhead per
+            // step; here it's an inlined Math.Cos / Math.Pow.
+            float lr = (float)lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
                 if (gradArrays[p].Length == 0) continue;
@@ -372,8 +464,96 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         };
     }
 
+    private unsafe void ConfigureOptimizerFloatGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1, float beta2, float eps, float weightDecay)
+    {
+        int paramCount = _parameters.Length;
+        int groupCount = groupSchedules.Count;
+        var paramArrays = new float[paramCount][];
+        var gradArrays = new float[paramCount][];
+        var lengths = new int[paramCount];
+        var m = new float[paramCount][];
+        var v = new float[paramCount][];
+        var paramGroup = new int[paramCount];
+        // Snapshot schedule references — concrete types so closure can
+        // see them without an extra interface dispatch per step.
+        var schedules = new LrSchedule[groupCount];
+        for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
+        for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
+
+        for (int p = 0; p < paramCount; p++)
+        {
+            paramArrays[p] = (float[])(object)_parameters[p].GetDataArray();
+            gradArrays[p] = _gradients[p] is not null
+                ? (float[])(object)_gradients[p].GetDataArray()
+                : Array.Empty<float>();
+            lengths[p] = _parameters[p].Length;
+
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
+            v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+        }
+
+        _optimizerStep = 0;
+        var b1 = beta1;
+        var b2 = beta2;
+        var epsVal = eps;
+        var wd = weightDecay;
+        var optType = optimizerType;
+        var groupLrs = new float[groupCount];
+
+        _optimizerUpdate = () =>
+        {
+            _optimizerStep++;
+            // Resolve each group's lr ONCE per step. PyTorch does N kernel
+            // launches for N groups; we do one schedule eval per group and
+            // one fused-kernel call per parameter.
+            for (int g = 0; g < groupCount; g++)
+                groupLrs[g] = (float)schedules[g].GetLr(_optimizerStep);
+
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                int len = lengths[p];
+                float lr = groupLrs[paramGroup[p]];
+
+                fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
+                       pM = m[p], pV = v[p])
+                {
+                    switch (optType)
+                    {
+                        case OptimizerType.SGD:
+                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
+                            break;
+                        case OptimizerType.Adam:
+                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
+                            break;
+                        case OptimizerType.AdamW:
+                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizerGrouped. " +
+                                $"Supported: SGD, Adam, AdamW.");
+                    }
+                }
+            }
+        };
+    }
+
     private unsafe void ConfigureOptimizerDouble(
-        OptimizerType optimizerType, float learningRate, float beta1, float beta2, float eps, float weightDecay)
+        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
     {
         // Mirror of ConfigureOptimizerFloat for double parameters. PR #319
         // follow-up: tape-trained Tensor<double> models (e.g. ViT-Base in
@@ -408,19 +588,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _optimizerStep = 0;
-        // Hyperparameters arrive as float (the kernel API was originally
-        // float-only); promote to double once at config time so the inner
-        // loop doesn't pay an implicit-conversion cost per element.
-        double lr = learningRate;
         double b1 = beta1;
         double b2 = beta2;
         double epsVal = eps;
         double wd = weightDecay;
         var optType = optimizerType;
+        var lrSchedule = schedule;
 
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            double lr = lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
                 if (gradArrays[p].Length == 0) continue;
@@ -446,6 +624,89 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             throw new NotSupportedException(
                                 $"Optimizer type {optType} is not yet supported by ConfigureOptimizer (double). " +
                                 $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
+                    }
+                }
+            }
+        };
+    }
+
+    private unsafe void ConfigureOptimizerDoubleGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1, float beta2, float eps, float weightDecay)
+    {
+        int paramCount = _parameters.Length;
+        int groupCount = groupSchedules.Count;
+        var paramArrays = new double[paramCount][];
+        var gradArrays = new double[paramCount][];
+        var lengths = new int[paramCount];
+        var m = new double[paramCount][];
+        var v = new double[paramCount][];
+        var paramGroup = new int[paramCount];
+        var schedules = new LrSchedule[groupCount];
+        for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
+        for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
+
+        for (int p = 0; p < paramCount; p++)
+        {
+            paramArrays[p] = (double[])(object)_parameters[p].GetDataArray();
+            gradArrays[p] = _gradients[p] is not null
+                ? (double[])(object)_gradients[p].GetDataArray()
+                : Array.Empty<double>();
+            lengths[p] = _parameters[p].Length;
+
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
+            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
+        }
+
+        _optimizerStep = 0;
+        double b1 = beta1;
+        double b2 = beta2;
+        double epsVal = eps;
+        double wd = weightDecay;
+        var optType = optimizerType;
+        var groupLrs = new double[groupCount];
+
+        _optimizerUpdate = () =>
+        {
+            _optimizerStep++;
+            for (int g = 0; g < groupCount; g++)
+                groupLrs[g] = schedules[g].GetLr(_optimizerStep);
+
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                int len = lengths[p];
+                double lr = groupLrs[paramGroup[p]];
+
+                fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
+                       pM = m[p], pV = v[p])
+                {
+                    switch (optType)
+                    {
+                        case OptimizerType.SGD:
+                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
+                            break;
+                        case OptimizerType.Adam:
+                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
+                            break;
+                        case OptimizerType.AdamW:
+                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizerGrouped (double). " +
+                                $"Supported: SGD, Adam, AdamW.");
                     }
                 }
             }
