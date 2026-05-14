@@ -33,6 +33,143 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 public class BatchNormGradSlotResidualTests
 {
     /// <summary>
+    /// Isolation: ONLY BN forward then ReduceSum (uniform gradOut = 1.0
+    /// across BN's output). No subtract / multiply / target. If THIS
+    /// diverges between eager and compiled per-element on T=double,
+    /// the BN backward itself produces different gradients across the
+    /// two paths despite both calling engine.BatchNormBackward. If it
+    /// passes, the divergence in BatchNorm_2D_DOUBLE_GradGamma_* must
+    /// come from upstream MultiplyBackward / SubtractBackward differences,
+    /// NOT BN backward.
+    /// </summary>
+    [Fact]
+    public void Isolation_BatchNorm_2D_DOUBLE_Then_ReduceSum_GradGamma_MatchesEager_PerElement()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, features = 4;
+        const double epsilon = 1e-5;
+
+        var rng = new System.Random(42);
+        var inputData = new double[batch * features];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+
+        var inputE = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = inputData[i];
+        var gammaE = new Tensor<double>(new[] { features });
+        var betaE = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+
+        Tensor<double> eagerGradGamma, eagerGradBeta;
+        using (var tape = new GradientTape<double>())
+        {
+            var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+            var sumE = engine.ReduceSum(bnE, null);
+            var grads = tape.ComputeGradients(sumE, sources: new[] { gammaE, betaE });
+            eagerGradGamma = grads[gammaE];
+            eagerGradBeta = grads[betaE];
+        }
+
+        var inputF = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = inputData[i];
+        var gammaF = new Tensor<double>(new[] { features });
+        var betaF = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            engine.ReduceSum(bnF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+        var fusedGradGamma = gammaF.Grad ?? throw new System.InvalidOperationException("gammaF.Grad");
+        var fusedGradBeta = betaF.Grad ?? throw new System.InvalidOperationException("betaF.Grad");
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        const double tol = 1e-12;
+        for (int p = 0; p < features; p++)
+        {
+            double dG = System.Math.Abs(eagerGradGamma[p] - fusedGradGamma[p]);
+            double dB = System.Math.Abs(eagerGradBeta[p] - fusedGradBeta[p]);
+            if (dG >= tol || dB >= tol) any = true;
+            lines.Add($"  ch[{p}]  gammaG eager={eagerGradGamma[p]:F12} fused={fusedGradGamma[p]:F12} |Δ|={dG:E3}    betaG eager={eagerGradBeta[p]:F12} fused={fusedGradBeta[p]:F12} |Δ|={dB:E3}");
+        }
+        Assert.False(any, "Isolated BN→ReduceSum on double diverges:\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// Bisect the upstream Sub→Multiply chain. BN forward is REPLACED with
+    /// a leaf parameter `xF` — eliminates BN backward as a variable.
+    /// MSE backward path: ReduceSum → Multiply(square) → Subtract(target).
+    /// If THIS diverges per-element on T=double, the divergence is purely
+    /// in the Subtract+Multiply backward chain — the multiply-with-self
+    /// gradient is being accumulated through different intermediate
+    /// allocations between tape and compiled paths.
+    /// </summary>
+    [Fact]
+    public void Isolation_DOUBLE_MseChain_GradX_MatchesEager_PerElement()
+    {
+        var engine = new CpuEngine();
+        const int n = 16;
+        var rng = new System.Random(42);
+        var xData = new double[n];
+        var tData = new double[n];
+        for (int i = 0; i < n; i++) xData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < n; i++) tData[i] = rng.NextDouble() - 0.5;
+
+        var xE = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) xE[i] = xData[i];
+        var tE = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) tE[i] = tData[i];
+
+        Tensor<double> eagerGrad;
+        using (var tape = new GradientTape<double>())
+        {
+            var diff = engine.TensorSubtract(xE, tE);
+            var sq = engine.TensorMultiply(diff, diff);
+            var loss = engine.ReduceSum(sq, null);
+            eagerGrad = tape.ComputeGradients(loss, sources: new[] { xE })[xE];
+        }
+
+        var xF = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) xF[i] = xData[i];
+        var tF = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) tF[i] = tData[i];
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var diff = engine.TensorSubtract(xF, tF);
+            var sq = engine.TensorMultiply(diff, diff);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { xF });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+        var fusedGrad = xF.Grad ?? throw new System.InvalidOperationException("xF.Grad");
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        const double tol = 1e-12;
+        for (int i = 0; i < n; i++)
+        {
+            double d = System.Math.Abs(eagerGrad[i] - fusedGrad[i]);
+            if (d >= tol) any = true;
+            lines.Add($"  x[{i}]={xE[i]:F12} t[{i}]={tE[i]:F12} eager={eagerGrad[i]:F12} fused={fusedGrad[i]:F12} |Δ|={d:E3}");
+        }
+        Assert.False(any, "MSE chain backward diverges:\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>
     /// Diagnostic: take the SAME inputF/gammaF/betaF that compile-mode
     /// captured in the lazy delegate, and run engine.BatchNorm on them
     /// directly RIGHT BEFORE plan.Step(). If THIS diverges from eager,
