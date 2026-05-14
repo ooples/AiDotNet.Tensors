@@ -446,7 +446,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="CreateStreamPool"/> for the lifetime-bundled pattern.
     /// </para>
     /// </remarks>
-    public GpuStreamScheduler? GetStreamScheduler(
+    public override GpuStreamScheduler? GetStreamScheduler(
         GpuStreamPool streamPool,
         GpuStreamType streamType = GpuStreamType.Compute)
     {
@@ -480,7 +480,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>A new <see cref="GpuStreamPool"/>, or null when no
     /// async-capable backend is available or it doesn't support multiple
     /// streams.</returns>
-    public GpuStreamPool? CreateStreamPool(GpuExecutionOptions? options = null)
+    public override GpuStreamPool? CreateStreamPool(GpuExecutionOptions? options = null)
     {
         var asyncBackend = GetAsyncBackend();
         if (asyncBackend is null) return null;
