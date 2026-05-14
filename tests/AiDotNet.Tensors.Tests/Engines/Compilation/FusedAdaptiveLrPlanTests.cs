@@ -183,6 +183,40 @@ public class FusedAdaptiveLrPlanTests
             plan.ConfigureOptimizer(OptimizerType.LBFGS, LrSchedule.Constant(0.01)));
     }
 
+    [Theory]
+    [InlineData(OptimizerType.Lion)]
+    [InlineData(OptimizerType.LAMB)]
+    [InlineData(OptimizerType.HypergradientSGD)]
+    [InlineData(OptimizerType.ScheduleFreeSGD)]
+    [InlineData(OptimizerType.DAdaptationSGD)]
+    public void ConfigureOptimizer_RejectsOptimizersPlanCantDispatch(OptimizerType opt)
+    {
+        // PR #349 review #1: the kernels for these exist (so
+        // IsFusedPathEligible says yes) but CompiledTrainingPlan's
+        // dispatch only branches SGD/Adam/AdamW today. Configuring
+        // should fail FAST at configure time, not surprise the caller
+        // with a NotSupportedException on the first Step().
+        var engine = new CpuEngine();
+        var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
+        using var plan = CompileReduceSumPlan(engine, w);
+        Assert.Throws<NotSupportedException>(() =>
+            plan.ConfigureOptimizer(opt, LrSchedule.Constant(0.01)));
+    }
+
+    [Fact]
+    public void ConfigureOptimizerGrouped_RejectsNullScheduleSlotEvenIfUnreferenced()
+    {
+        // PR #349 review #2: the grouped hot path evaluates GetLr() on
+        // every schedule slot per step (not just the ones referenced).
+        // A null slot must fail at configure, not crash inside Step().
+        var engine = new CpuEngine();
+        var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
+        using var plan = CompileReduceSumPlan(engine, w);
+        var schedules = new LrSchedule[] { LrSchedule.Constant(0.1), null! };
+        Assert.Throws<ArgumentException>(() =>
+            plan.ConfigureOptimizerGrouped(OptimizerType.SGD, schedules, new int[] { 0 }));
+    }
+
     [Fact]
     public void ConfigureOptimizer_AdamWithSchedule_DrivesProductiveTraining()
     {

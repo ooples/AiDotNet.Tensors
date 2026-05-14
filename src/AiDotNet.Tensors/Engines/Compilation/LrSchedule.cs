@@ -124,7 +124,11 @@ internal sealed class OneCycleLr : LrSchedule
         if (finalDivFactor <= 0.0) throw new ArgumentOutOfRangeException(nameof(finalDivFactor));
         _lrMax = lrMax;
         _lrInitial = lrMax / divFactor;
-        _lrFinal = lrMax / finalDivFactor;
+        // PyTorch: min_lr = initial_lr / final_div_factor (i.e. lrMax /
+        // (divFactor * finalDivFactor)) — NOT lrMax / finalDivFactor.
+        // Anchoring the floor to lrMax leaves the schedule divFactor× too
+        // high at the end. See docs.pytorch.org OneCycleLR reference.
+        _lrFinal = _lrInitial / finalDivFactor;
         _total = total;
         _warmupEnd = System.Math.Max(1, (int)System.Math.Round(pctStart * total));
     }
@@ -213,7 +217,14 @@ internal sealed class LinearWarmupCosineLr : LrSchedule
         int s = step < 1 ? 1 : step > _total ? _total : step;
         if (_warmup > 0 && s <= _warmup)
             return _lrMax * s / (double)_warmup;
-        double progress = (s - _warmup) / (double)System.Math.Max(_total - _warmup, 1);
+        // With warmupSteps == 0 the cosine half must start AT lrMax on
+        // step 1 — same convention as bare Cosine schedule. Using
+        // (s - _warmup) / (_total - _warmup) would give progress = 1/_total
+        // at step 1 (slightly below lrMax) and lrMin at step _total with
+        // _total == 1. (s-1)/(_total-1) is the right base.
+        double progress = _warmup == 0
+            ? (s - 1) / (double)System.Math.Max(_total - 1, 1)
+            : (s - _warmup) / (double)System.Math.Max(_total - _warmup, 1);
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrMin + (_lrMax - _lrMin) * cos;
     }

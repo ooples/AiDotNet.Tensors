@@ -300,14 +300,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float weightDecay = 0f)
     {
         if (schedule is null) throw new ArgumentNullException(nameof(schedule));
-        if (!OptimizerKernels.IsFusedPathEligible(optimizerType))
-        {
-            throw new NotSupportedException(
-                $"Optimizer type {optimizerType} is not eligible for the fused path " +
-                "(see OptimizerKernels.IsFusedPathEligible). LBFGS needs closure-based " +
-                "evaluation; SparseAdam needs index-pair plumbing the compiled plan does not " +
-                "yet wire. Use eager apply for these.");
-        }
+        ValidatePlanOptimizerSupport(optimizerType);
         if (typeof(T) == typeof(float))
         {
             ConfigureOptimizerFloat(optimizerType, schedule, beta1, beta2, eps, weightDecay);
@@ -339,6 +332,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new ArgumentException(
                 $"paramToGroup.Count ({paramToGroup.Count}) must equal the compiled parameter count ({_parameters.Length}).",
                 nameof(paramToGroup));
+        // Validate every schedule slot up front — the grouped hot path
+        // evaluates GetLr() on ALL of them per step, not just the ones
+        // referenced by paramToGroup. A null slot that no parameter maps
+        // to today would still NRE on the first Step().
+        for (int g = 0; g < groupSchedules.Count; g++)
+        {
+            if (groupSchedules[g] is null)
+                throw new ArgumentException($"groupSchedules[{g}] is null.", nameof(groupSchedules));
+        }
         for (int i = 0; i < paramToGroup.Count; i++)
         {
             int g = paramToGroup[i];
@@ -346,14 +348,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 throw new ArgumentOutOfRangeException(
                     nameof(paramToGroup),
                     $"paramToGroup[{i}]={g} is out of range [0, {groupSchedules.Count}).");
-            if (groupSchedules[g] is null)
-                throw new ArgumentException($"groupSchedules[{g}] is null.", nameof(groupSchedules));
         }
-        if (!OptimizerKernels.IsFusedPathEligible(optimizerType))
-        {
-            throw new NotSupportedException(
-                $"Optimizer type {optimizerType} is not eligible for the fused path.");
-        }
+        ValidatePlanOptimizerSupport(optimizerType);
         if (typeof(T) == typeof(float))
         {
             ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay);
@@ -365,6 +361,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
+
+    /// <summary>Gate at the plan-level dispatch surface. The closures
+    /// built by ConfigureOptimizer*Float/Double only implement SGD,
+    /// Adam, and AdamW today — accepting anything else (Lion, LAMB,
+    /// HypergradientSGD, …) would configure successfully and then throw
+    /// on the first Step(). <c>OptimizerKernels.IsFusedPathEligible</c>
+    /// is the broader semantic predicate (which kernels exist at all);
+    /// this is the narrower "what the plan can replay today" check.</summary>
+    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType)
+    {
+        bool supported = optimizerType is OptimizerType.SGD
+            or OptimizerType.Adam
+            or OptimizerType.AdamW;
+        if (!supported)
+        {
+            throw new NotSupportedException(
+                $"Optimizer type {optimizerType} is not yet supported by CompiledTrainingPlan's " +
+                "fused-update closures. Currently supported: SGD, Adam, AdamW. " +
+                "The kernel for this optimizer may still exist (see OptimizerKernels.IsFusedPathEligible); " +
+                "use eager apply via OptimizerKernels directly until a plan-level dispatch branch lands.");
+        }
     }
 
     private unsafe void ConfigureOptimizerFloat(

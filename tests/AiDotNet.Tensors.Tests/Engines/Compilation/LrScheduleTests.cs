@@ -71,11 +71,27 @@ public class LrScheduleTests
     }
 
     [Fact]
-    public void OneCycle_AnnealReachesLrFinal()
+    public void OneCycle_AnnealReachesPyTorchLrFinal()
     {
+        // PyTorch's OneCycleLR: min_lr = initial_lr / final_div_factor
+        //                            = (lrMax / divFactor) / finalDivFactor
+        // NOT lrMax / finalDivFactor. With default (25, 1e4) the floor is
+        // 1 / (25 * 1e4) = 4e-6, not 1e-4. PR #349 review #3.
         var s = LrSchedule.OneCycle(lrMax: 1.0, totalSteps: 100, pctStart: 0.3,
             divFactor: 25.0, finalDivFactor: 1e4);
-        Assert.Equal(1.0 / 1e4, s.GetLr(100), 1e-9);
+        Assert.Equal((1.0 / 25.0) / 1e4, s.GetLr(100), 1e-12);
+    }
+
+    [Fact]
+    public void LinearWarmupCosine_ZeroWarmup_StartsAtLrMax()
+    {
+        // With warmupSteps == 0 the cosine half must start AT lrMax on
+        // step 1 — using (s - warmup) / (total - warmup) would give
+        // progress = 1/total at step 1 (slightly below lrMax). PR #349
+        // review #4.
+        var s = LrSchedule.LinearWarmupCosine(lrMax: 1.0, warmupSteps: 0, totalSteps: 10, lrMin: 0.0);
+        Assert.Equal(1.0, s.GetLr(1), 1e-12);
+        Assert.Equal(0.0, s.GetLr(10), 1e-12);
     }
 
     [Fact]

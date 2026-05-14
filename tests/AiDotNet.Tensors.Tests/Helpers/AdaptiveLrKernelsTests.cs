@@ -115,6 +115,41 @@ public class AdaptiveLrKernelsTests
     }
 
     [Fact]
+    public void ScheduleFreeSgd_ZeroLrIsNoOp_NotNaN()
+    {
+        // PR #349 review #5: lr=0 used to produce 0/0 inside the kernel
+        // and poison x with NaN. A zero-lr call must be a no-op (z, x,
+        // weightSum unchanged) so callers can "pause" updates via a
+        // schedule that returns 0 without corrupting state.
+        var z = new Tensor<float>(new float[] { 1.0f, 2.0f, 3.0f }, new[] { 3 });
+        var x = new Tensor<float>(new float[] { 1.0f, 2.0f, 3.0f }, new[] { 3 });
+        var grad = new Tensor<float>(new float[] { 0.5f, 0.5f, 0.5f }, new[] { 3 });
+        var origZ = z.AsSpan().ToArray();
+        var origX = x.AsSpan().ToArray();
+
+        float newWeightSum = OptimizerKernels.ScheduleFreeSgdInPlace(z, x, grad, lr: 0f, weightSum: 0.5f);
+
+        Assert.Equal(0.5f, newWeightSum);
+        for (int i = 0; i < z.Length; i++)
+        {
+            Assert.Equal(origZ[i], z.AsSpan()[i]);
+            Assert.Equal(origX[i], x.AsSpan()[i]);
+            Assert.False(float.IsNaN(z.AsSpan()[i]));
+            Assert.False(float.IsNaN(x.AsSpan()[i]));
+        }
+    }
+
+    [Fact]
+    public void ScheduleFreeSgd_RejectsNegativeLr()
+    {
+        var z = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
+        var x = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
+        var grad = new Tensor<float>(new float[] { 0.5f }, new[] { 1 });
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OptimizerKernels.ScheduleFreeSgdInPlace(z, x, grad, lr: -0.1f, weightSum: 0f));
+    }
+
+    [Fact]
     public void ScheduleFreeY_BlendsCorrectly()
     {
         // y = (1-β) z + β x — pure linear blend, kernel must match scalar formula.

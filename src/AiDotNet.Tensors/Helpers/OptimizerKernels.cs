@@ -481,7 +481,14 @@ public static class OptimizerKernels
                 $"ScheduleFreeSgd requires matching lengths; z={z.Length}, x={x.Length}, grad={grad.Length}.");
         if (!z.IsContiguous || !x.IsContiguous)
             throw new ArgumentException("ScheduleFreeSgd requires z and x to be contiguous.");
+        if (lr < 0f) throw new ArgumentOutOfRangeException(nameof(lr), "lr must be >= 0.");
         if (z.Length == 0) return weightSum;
+
+        // lr == 0 is a legitimate "freeze updates" request from a
+        // schedule like Constant(0) used in tests/control runs. The
+        // kernel would compute w_t = 0, c_t = 0/0 → NaN, poisoning x.
+        // Short-circuit to a no-op: don't mutate z, x, or weightSum.
+        if (lr == 0f) return weightSum;
 
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
         using var pinZ = z.Data.Pin();
