@@ -37,8 +37,12 @@ public sealed partial class CudaBackend
         if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
         if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
         if (cFp16 is null) throw new ArgumentNullException(nameof(cFp16));
-        if (m <= 0 || n <= 0 || k <= 0)
-            throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        // PR #346 review: report the offending dimension by name so
+        // failures are diagnosable. Reporting nameof(m) for every case
+        // sent debugging down the wrong path.
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
 
         using var _ = PushContext();
         // alpha=1, beta=0 as FP16 bit patterns.
@@ -72,8 +76,12 @@ public sealed partial class CudaBackend
         if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
         if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
         if (cFp32 is null) throw new ArgumentNullException(nameof(cFp32));
-        if (m <= 0 || n <= 0 || k <= 0)
-            throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        // PR #346 review: report the offending dimension by name so
+        // failures are diagnosable. Reporting nameof(m) for every case
+        // sent debugging down the wrong path.
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
 
         using var _ = PushContext();
         // GemmEx needs alpha/beta as POINTERS to scalars in the

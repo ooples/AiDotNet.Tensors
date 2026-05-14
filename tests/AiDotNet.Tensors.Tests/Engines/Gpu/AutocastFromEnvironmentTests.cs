@@ -4,11 +4,21 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 
 /// <summary>
+/// xUnit collection marker for tests that mutate the
+/// <c>AIDOTNET_AUTOCAST</c> environment variable. Without this gate,
+/// parallel test execution can interleave SetEnvironmentVariable calls
+/// across tests, producing flaky reads. PR #346 review.
+/// </summary>
+[CollectionDefinition("AiDotNetAutocastEnv", DisableParallelization = true)]
+public sealed class AiDotNetAutocastEnvCollection { }
+
+/// <summary>
 /// Issue #337: validates the AIDOTNET_AUTOCAST env-var entry point that
 /// lets consumer code (AiDotNet's NeuralNetworkBase.Train) opt into
 /// mixed-precision training without a build-time T-parameter change to
 /// the model.
 /// </summary>
+[Collection("AiDotNetAutocastEnv")]
 public class AutocastFromEnvironmentTests
 {
     private static System.IDisposable SetEnv(string? value)
