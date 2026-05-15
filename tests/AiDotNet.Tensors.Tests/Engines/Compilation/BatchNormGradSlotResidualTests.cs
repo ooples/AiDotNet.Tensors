@@ -104,6 +104,141 @@ public class BatchNormGradSlotResidualTests
     }
 
     /// <summary>
+    /// Pinpoint: forward-only TensorSubtract bit-identity check. Eager
+    /// engine.TensorSubtract vs compile-mode lazy execute (which calls
+    /// engine.TensorSubtractInto under the hood). If THIS fails, the
+    /// SubtractInto SIMD kernel diverges from the allocating Subtract
+    /// SIMD kernel — that's where the MseChain residual 1e-7 comes from.
+    /// </summary>
+    [Fact]
+    public void Pinpoint_DOUBLE_TensorSubtract_Forward_EagerVsCompile_BitIdentical()
+    {
+        var engine = new CpuEngine();
+        const int n = 16;
+        var rng = new System.Random(42);
+        var xData = new double[n]; var tData = new double[n];
+        for (int i = 0; i < n; i++) xData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < n; i++) tData[i] = rng.NextDouble() - 0.5;
+
+        // Eager
+        var xE = new Tensor<double>(new[] { n });
+        var tE = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) { xE[i] = xData[i]; tE[i] = tData[i]; }
+        var diffE = engine.TensorSubtract(xE, tE);
+
+        // Compile (forward only — read post-Step)
+        var xF = new Tensor<double>(new[] { n });
+        var tF = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) { xF[i] = xData[i]; tF[i] = tData[i]; }
+        Tensor<double> diffF;
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            // Force the scope to bind to the CpuEngine instance the test
+            // explicitly created. Without this, scope._engine defaults to
+            // AiDotNetEngine.Current — which on auto-detect-GPU systems is
+            // DirectGpuTensorEngine, and that engine's TensorSubtractInto
+            // computes in single precision on consumer GPUs, producing the
+            // float-ULP-precision residual the MseChain test catches.
+            // Same root cause as the engine-routing fix this PR added for
+            // BatchNorm — the same plumbing is needed for every op that
+            // records into a graph from an explicit-engine caller.
+            typeof(AiDotNet.Tensors.Engines.Compilation.LazyTensorScope)
+                .GetMethod("BindEngineIfUnset", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                .Invoke(scope, new object[] { engine });
+            diffF = engine.TensorSubtract(xF, tF);
+            engine.ReduceSum(diffF, null);  // need an output to compile a plan
+            plan = scope.CompileTraining(new[] { xF });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+
+        // CRITICAL ORDER: snapshot diffF FIRST, before any other allocation
+        // could pollute the underlying pool-backed buffer.
+        var diffFSnap = new double[n];
+        for (int i = 0; i < n; i++) diffFSnap[i] = diffF[i];
+
+        // Direct TensorSubtractInto call — bypass the plan, mimic exactly
+        // what the lazy execute does.
+        var directOut = new Tensor<double>(new[] { n });
+        engine.TensorSubtractInto(directOut, xF, tF);
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        for (int i = 0; i < n; i++)
+        {
+            double dEvSnap = System.Math.Abs(diffE[i] - diffFSnap[i]);
+            double dSnapNow = System.Math.Abs(diffFSnap[i] - diffF[i]);
+            double dEvD = System.Math.Abs(diffE[i] - directOut[i]);
+            if (dEvSnap > 0 || dSnapNow > 0 || dEvD > 0) any = true;
+            lines.Add($"  [{i}]  eager={diffE[i]:F18} fusedSnap={diffFSnap[i]:F18} fusedNow={diffF[i]:F18} direct={directOut[i]:F18} |E-Snap|={dEvSnap:E3} |Snap-Now|={dSnapNow:E3} |E-D|={dEvD:E3}");
+        }
+        Assert.False(any, "TensorSubtract forward diverges between eager and compile-mode replay:\n"
+            + string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// Even-finer bisect: ONLY mul(x, x).ReduceSum() - no subtract, no
+    /// target. Tests just the Multiply-with-self backward path on T=double.
+    /// If this PASSES at 1e-12, the divergence in
+    /// Isolation_DOUBLE_MseChain_GradX is in TensorSubtract; if it FAILS,
+    /// the divergence is in TensorMultiply backward when both inputs are
+    /// the same tensor reference (a documented autodiff trap — see the
+    /// existing float-tolerance SquareSum_Backward test at line 545).
+    /// </summary>
+    [Fact]
+    public void Isolation_DOUBLE_SquareSum_GradX_MatchesEager_PerElement()
+    {
+        var engine = new CpuEngine();
+        const int n = 16;
+        var rng = new System.Random(42);
+        var xData = new double[n];
+        for (int i = 0; i < n; i++) xData[i] = rng.NextDouble() - 0.5;
+
+        var xE = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) xE[i] = xData[i];
+
+        Tensor<double> eagerGrad;
+        using (var tape = new GradientTape<double>())
+        {
+            var sq = engine.TensorMultiply(xE, xE);
+            var loss = engine.ReduceSum(sq, null);
+            eagerGrad = tape.ComputeGradients(loss, sources: new[] { xE })[xE];
+        }
+
+        var xF = new Tensor<double>(new[] { n });
+        for (int i = 0; i < n; i++) xF[i] = xData[i];
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var sq = engine.TensorMultiply(xF, xF);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { xF });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+        var fusedGrad = xF.Grad ?? throw new System.InvalidOperationException("xF.Grad");
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        const double tol = 1e-12;
+        for (int i = 0; i < n; i++)
+        {
+            double d = System.Math.Abs(eagerGrad[i] - fusedGrad[i]);
+            if (d >= tol) any = true;
+            lines.Add($"  x[{i}]={xE[i]:F12} eager={eagerGrad[i]:F12} fused={fusedGrad[i]:F12} |Δ|={d:E3}");
+        }
+        Assert.False(any, "x*x→sum backward diverges:\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>
     /// Bisect the upstream Sub→Multiply chain. BN forward is REPLACED with
     /// a leaf parameter `xF` — eliminates BN backward as a variable.
     /// MSE backward path: ReduceSum → Multiply(square) → Subtract(target).
