@@ -92,6 +92,75 @@ public class GpuPinnedLifetimeTests
     }
 
     [Fact]
+    public void GpuOptimizer_TryAdamStep_MatchesHandComputedReference_OnGpuHost()
+    {
+        // Issue #336 correctness gate. Runs a single Adam step on a tiny
+        // 4-element parameter tensor with seeds reset to zero, then
+        // compares against the closed-form one-step Adam update:
+        //   m1 = beta1*0 + (1-beta1)*g       = (1-beta1)*g
+        //   v1 = beta2*0 + (1-beta2)*g²      = (1-beta2)*g²
+        //   m̂  = m1 / (1-beta1^1) = g
+        //   v̂  = v1 / (1-beta2^1) = g²
+        //   p1 = p0 - lr * m̂ / (sqrt(v̂) + eps)
+        //      = p0 - lr * g / (|g| + eps)
+        // Skips when no GPU is present.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            if (gpu.GetBackend() is null) return;
+
+            // RentPinnedOnGpu falls back to CPU-pinned on CPU-only hosts.
+            // TryAdamStep then returns false (no GPU buffer), and the test
+            // skips. On a real CUDA host the tensors get GPU mappings and
+            // the kernel runs.
+            var p = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var g = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var m = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var v = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+
+            // Need device-resident buffers to actually run the kernel; if
+            // the tensors didn't bind to GPU buffers, TryAdamStep returns
+            // false and we treat that as skip.
+            if (p.TryGetGpuBuffer() is null) return;
+
+            // Initialize values via flat-data span.
+            var pData = p.GetDataArray();
+            var gData = g.GetDataArray();
+            pData[0] = 1.0f; pData[1] = 2.0f; pData[2] = 3.0f; pData[3] = 4.0f;
+            gData[0] = 0.1f; gData[1] = 0.2f; gData[2] = 0.3f; gData[3] = 0.4f;
+            // m, v left as zeros from RentPinnedOnGpu's zero-init contract.
+
+            const float lr = 0.01f;
+            const float beta1 = 0.9f;
+            const float beta2 = 0.999f;
+            const float eps = 1e-8f;
+
+            bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
+                p, g, m, v,
+                learningRate: lr, beta1: beta1, beta2: beta2,
+                epsilon: eps, weightDecay: 0f, step: 1);
+            if (!ran) return; // No GPU residency despite host having one — skip.
+
+            // Closed-form expected post-step values.
+            for (int i = 0; i < 4; i++)
+            {
+                float gi = gData[i];
+                float expected = (i + 1) - lr * gi / ((float)System.Math.Abs(gi) + eps);
+                // Tolerance accounts for fp32 rounding in the kernel's
+                // division + sqrt + bias-correction chain.
+                Assert.InRange(pData[i], expected - 1e-4f, expected + 1e-4f);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+            gpu.Dispose();
+        }
+    }
+
+    [Fact]
     public void AsGpuBuffer_AliasesTryGetGpuBuffer_CpuOnlyHost()
     {
         // Issue #336 names the accessor AsGpuBuffer<T>(); the impl is
