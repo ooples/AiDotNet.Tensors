@@ -1276,6 +1276,85 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Multi-head attention output projection fanout: for each head,
+    /// computes <c>output[h] = attention[h] · V[h]</c>. Companion to
+    /// <see cref="MultiHeadAttentionScoresFanout"/>; the two together
+    /// cover the bracketing GEMMs of the MHA pipeline (the middle
+    /// softmax+scaling step is element-wise and stream-parallel via the
+    /// existing Softmax helper).
+    /// <para>
+    /// Shapes (NCHW-style packed):
+    /// <list type="bullet">
+    ///   <item><paramref name="attention"/> packed as [batch, numHeads, seqLen, seqLen]</item>
+    ///   <item><paramref name="V"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="output"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public void MultiHeadAttentionOutputFanout(
+        IGpuBuffer attention, IGpuBuffer V, IGpuBuffer output,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (attention is null) throw new ArgumentNullException(nameof(attention));
+        if (V is null) throw new ArgumentNullException(nameof(V));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+
+        long perHeadA = (long)seqLen * seqLen;
+        long perHeadV = (long)seqLen * headDim;
+        long perHeadO = (long)seqLen * headDim;
+        long perBatchA = perHeadA * numHeads;
+        long perBatchV = perHeadV * numHeads;
+        long perBatchO = perHeadO * numHeads;
+        long elemBytes = sizeof(float);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr aPtr = (IntPtr)((long)attention.Handle
+                        + (batchIdx * perBatchA + headIdx * perHeadA) * elemBytes);
+                    IntPtr vPtr = (IntPtr)((long)V.Handle
+                        + (batchIdx * perBatchV + headIdx * perHeadV) * elemBytes);
+                    IntPtr oPtr = (IntPtr)((long)output.Handle
+                        + (batchIdx * perBatchO + headIdx * perHeadO) * elemBytes);
+
+                    // output[h] = attention[h] · V[h]
+                    // Row-major attention [seqLen, seqLen] · V [seqLen, headDim] = output [seqLen, headDim].
+                    // For cuBLAS column-major: V_col^T · attention_col^T -> output_col^T (which reads as row-major output).
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasSgemm(
+                            _cublasHandle,
+                            CublasOperation.None,
+                            CublasOperation.None,
+                            headDim, seqLen, seqLen,
+                            ref aVal,
+                            vPtr, headDim,
+                            aPtr, seqLen,
+                            ref bVal,
+                            oPtr, headDim),
+                        $"cublasSgemm MHA output batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
     /// Double-precision counterpart to <see cref="BatchedGemmFanout"/>.
     /// Fans <paramref name="batchCount"/> independent <c>cublasDgemm</c>
     /// launches across the scheduler's stream pool — same pattern as the
