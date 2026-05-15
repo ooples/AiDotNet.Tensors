@@ -988,9 +988,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // backward (2 GEMMs at ~30 ms total) with a couple of [D]-sized
         // reductions + broadcasts (~0.2 ms total).
         var analyticBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        // Phase G.7: when the analytic MatMul backward is engaged, the
+        // corresponding ReduceSum backward becomes a no-op — the analytic
+        // backward doesn't read the gradient buffer ReduceSum would fill
+        // (ones[M, V]), so the M*V-element fill is pure waste.
+        var skippableReduceSumIndices = new HashSet<int>();
         if (typeof(T) == typeof(float))
         {
-            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs);
+            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices);
         }
 
         // Track GCHandles for cleanup on Dispose
@@ -1050,6 +1055,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (analyticBackwardSpecs.TryGetValue(i, out var analyticAction))
             {
                 backwardActions.Add(analyticAction);
+                continue;
+            }
+            // Phase G.7: skip ReduceSum backward when its output gradient
+            // is never read (its only consumer is an analytic-backward
+            // MatMul). Saves the M*N ones-fill per step.
+            if (skippableReduceSumIndices.Contains(i))
+            {
                 continue;
             }
 
@@ -3637,7 +3649,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, int> consumerCount,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
-        Dictionary<int, Action<IEngine>> analyticBackwardSpecs)
+        Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
+        HashSet<int> skippableReduceSumIndices)
     {
         if (typeof(T) != typeof(float)) return;
         if (forwardSteps.Count < 2) return;
@@ -3693,6 +3706,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capGradA = gradA;
             var capGradW = gradW;
             var capLossGrad = lossGradTensor;
+
+            // Mark the ReduceSum step (i+1) as skippable — its gradient
+            // output (M*N ones) is never read because the analytic
+            // MatMul backward computes directly from W and A.
+            skippableReduceSumIndices.Add(i + 1);
 
             analyticBackwardSpecs[i] = eng =>
             {
