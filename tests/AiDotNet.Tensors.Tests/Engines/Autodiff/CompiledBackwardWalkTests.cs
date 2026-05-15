@@ -246,6 +246,52 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void WalkerCache_HitMissCounters_TrackLookups()
+    {
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var hitsProp = t.GetProperty("CacheHitsForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var missesProp = t.GetProperty("CacheMissesForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            var walker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+
+            // 2 misses (no entries yet)
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 200L }));
+            Assert.Equal(0L, (long)hitsProp.GetValue(null)!);
+            Assert.Equal(2L, (long)missesProp.GetValue(null)!);
+
+            // Register one walker, then 3 hits + 1 miss
+            registerMethod.Invoke(null, new object[] { 100L, walker });
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 300L }));
+            Assert.Equal(3L, (long)hitsProp.GetValue(null)!);
+            Assert.Equal(3L, (long)missesProp.GetValue(null)!);
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
     public void WalkerCache_FIFOEviction_CapsAt64Entries()
     {
         // Bounded thread-local cache. Register more than the cap; expect

@@ -108,13 +108,40 @@ internal static class CompiledBackwardWalk<T>
 
     /// <summary>
     /// Looks up the walker for a given pattern hash. Returns <c>null</c>
-    /// when no walker has been compiled for this pattern yet.
+    /// when no walker has been compiled for this pattern yet. Tracks a
+    /// hit/miss counter pair so tests + diagnostics can verify the cache
+    /// is actually being reused (a high miss rate suggests the pattern
+    /// hash is too discriminating, evicting useful entries).
     /// </summary>
     internal static CompiledWalker? TryGetWalker(long patternHash)
     {
         var walkers = s_walkers;
-        if (walkers is null) return null;
-        return walkers.TryGetValue(patternHash, out var walker) ? walker : null;
+        if (walkers is null)
+        {
+            s_missCount++;
+            return null;
+        }
+        if (walkers.TryGetValue(patternHash, out var walker))
+        {
+            s_hitCount++;
+            return walker;
+        }
+        s_missCount++;
+        return null;
+    }
+
+    [ThreadStatic] private static long s_hitCount;
+    [ThreadStatic] private static long s_missCount;
+
+    /// <summary>Diagnostic counter: walker cache hits on this thread.</summary>
+    internal static long CacheHitsForTests => s_hitCount;
+    /// <summary>Diagnostic counter: walker cache misses on this thread.</summary>
+    internal static long CacheMissesForTests => s_missCount;
+    /// <summary>Resets the hit/miss counters. Used by test isolation.</summary>
+    internal static void ResetCounters()
+    {
+        s_hitCount = 0;
+        s_missCount = 0;
     }
 
     /// <summary>
@@ -160,6 +187,7 @@ internal static class CompiledBackwardWalk<T>
         s_walkers = null;
         s_walkerInsertionOrder?.Clear();
         s_walkerInsertionOrder = null;
+        ResetCounters();
     }
 
     /// <summary>Test-visible cache size. Exposed so eviction tests can
