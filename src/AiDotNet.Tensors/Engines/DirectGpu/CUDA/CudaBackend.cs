@@ -1426,6 +1426,73 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Mixed-precision counterpart to <see cref="BatchedGemmFanout"/>:
+    /// fp16 / bf16 input A, B + fp32 accumulator output C. Routes each
+    /// slice through <c>cublasGemmEx</c> with <c>COMPUTE_32F</c> on its
+    /// own pool stream.
+    /// <para>
+    /// Combines #335 multi-stream dispatch with #337 mixed precision —
+    /// the standard AMP attention pattern in transformer backbones.
+    /// </para>
+    /// </summary>
+    /// <param name="useBFloat16">When true, A/B are bfloat16 (CUDA_R_16BF).
+    /// Otherwise fp16 (CUDA_R_16F). BF16 requires Ampere+ (cc >= 8.0).</param>
+    public unsafe void BatchedGemmExFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        bool useBFloat16 = false,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+
+        if (useBFloat16 && _ccMajor < 8)
+            throw new NotSupportedException(
+                $"BFloat16 GEMM requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
+
+        int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytesIn = 2;
+        long elemBytesOut = sizeof(float);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                float aVal = alpha, bVal = beta;
+                IntPtr alphaPtr = (IntPtr)(&aVal);
+                IntPtr betaPtr = (IntPtr)(&bVal);
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesIn);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesIn);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesOut);
+
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasGemmEx(
+                        _cublasHandle,
+                        CublasOperation.None, CublasOperation.None,
+                        N, M, K,
+                        alphaPtr,
+                        bPtr, inDtype, N,
+                        aPtr, inDtype, K,
+                        betaPtr,
+                        cPtr, CuBlasNative.CUDA_R_32F, N,
+                        CuBlasNative.CUBLAS_COMPUTE_32F,
+                        0 /* CUBLAS_GEMM_DEFAULT */),
+                    $"cublasGemmEx slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
+    }
+
+    /// <summary>
     /// Double-precision counterpart to <see cref="BatchedGemmFanout"/>.
     /// Fans <paramref name="batchCount"/> independent <c>cublasDgemm</c>
     /// launches across the scheduler's stream pool — same pattern as the
