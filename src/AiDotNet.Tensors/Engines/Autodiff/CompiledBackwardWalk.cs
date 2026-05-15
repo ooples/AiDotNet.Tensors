@@ -1502,6 +1502,28 @@ internal static class CompiledBackwardWalk<T>
         il.Emit(OpCodes.Call, s_initStateMethod);
         il.Emit(OpCodes.Stloc, stateLocal);
 
+        // Single bounds check up front: verify entries.Count is large
+        // enough to cover every baked-in index. Replaces per-entry
+        // bounds checks (was N callvirts on entries.Count for an N-entry
+        // tape; now exactly one).
+        int maxIdx = 0;
+        for (int j = 0; j < reverseTopoIndices.Length; j++)
+            if (reverseTopoIndices[j] > maxIdx) maxIdx = reverseTopoIndices[j];
+
+        var arenaTypeForCount = typeof(TapeEntryArena<T>);
+        var arenaCountGetterEarly = arenaTypeForCount.GetProperty("Count",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetGetMethod(nonPublic: true)!;
+
+        var pastBoundsCheckLabel = il.DefineLabel();
+        il.Emit(OpCodes.Ldc_I4, maxIdx);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Callvirt, arenaCountGetterEarly);
+        il.Emit(OpCodes.Blt_S, pastBoundsCheckLabel);
+        il.Emit(OpCodes.Ldnull);
+        il.Emit(OpCodes.Ret);
+        il.MarkLabel(pastBoundsCheckLabel);
+
         // Pre-resolve handles used per-entry.
         var walkStateType = typeof(CompiledBackwardWalkHelpers<T>.WalkState);
         var gradsField = walkStateType.GetField(nameof(CompiledBackwardWalkHelpers<T>.WalkState.Grads))!;
@@ -1546,11 +1568,9 @@ internal static class CompiledBackwardWalk<T>
             var savedStateDoneLabel = il.DefineLabel();
             var bailOutLabel = il.DefineLabel();
 
-            // Bounds check: idx < entries.Count else return null.
-            il.Emit(OpCodes.Ldc_I4, idx);
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Callvirt, arenaCountGetter);
-            il.Emit(OpCodes.Bge_S, bailOutLabel);  // idx >= Count
+            // Per-entry bounds check elided: the pre-loop check above
+            // verifies entries.Count > max(indices), so each baked idx
+            // is in-range without redundant per-entry checks.
 
             // Cache the entry ref in a byref local — one indexer call
             // per entry instead of four.
@@ -1621,9 +1641,11 @@ internal static class CompiledBackwardWalk<T>
 
             il.Emit(OpCodes.Br_S, skipLabel);
 
+            // bailOutLabel from the per-entry bounds check is no longer
+            // referenced (the pre-loop bounds check covers all indices),
+            // but the label still needs to be marked somewhere or
+            // Reflection.Emit complains about an unmarked defined label.
             il.MarkLabel(bailOutLabel);
-            il.Emit(OpCodes.Ldnull);
-            il.Emit(OpCodes.Ret);
 
             il.MarkLabel(skipLabel);
         }
