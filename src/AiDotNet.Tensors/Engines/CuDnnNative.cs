@@ -1414,6 +1414,114 @@ public sealed class CuDnnActivationDescriptor : IDisposable
 }
 
 /// <summary>
+/// High-level cuDNN activation operations helper. Provides FP16/BF16
+/// GPU-pointer entry points for ReLU / Sigmoid / Tanh / Clipped-ReLU
+/// activations. Closes the activation gap in #337's mixed-precision
+/// coverage — the other ops (Conv2D, BatchNorm, Softmax, Pool2D) all
+/// have dtype-parameterised helpers; activations now do too.
+/// </summary>
+public sealed class CuDnnActivation : IDisposable
+{
+    private readonly CuDnnContext _context;
+    private readonly bool _ownsContext;
+    private bool _disposed;
+
+    public CuDnnActivation(CuDnnContext context)
+    {
+        _context = context ?? throw new ArgumentNullException(nameof(context));
+        _ownsContext = false;
+    }
+
+    public CuDnnActivation()
+    {
+        _context = new CuDnnContext();
+        _ownsContext = true;
+    }
+
+    public static bool IsAvailable => CuDnnContext.IsAvailable;
+
+    /// <summary>
+    /// Activation forward y = act(x). Operates element-wise; input and
+    /// output tensors share shape. Uses fp32 compute for half / bfloat16
+    /// data — cuDNN's accuracy-preserving mixed-precision convention.
+    /// </summary>
+    public void ForwardGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        CuDnnNative.CudnnActivationMode mode,
+        double coef = 0.0,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnActivation));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var actDesc = new CuDnnActivationDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, h, w);
+        actDesc.Set(mode, coef);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnActivationForward(
+            _context.Handle, actDesc.Handle,
+            ref alpha,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            outputDesc.Handle, outputDevPtr);
+        CuDnnContext.CheckStatus(status, "ActivationForwardGpu");
+    }
+
+    /// <summary>
+    /// Activation backward dX = dY * act'(x). Takes the forward output Y,
+    /// dY, and the original input X — cuDNN's signature requires all
+    /// three for most activation modes' gradient computation.
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr outputDevPtr, IntPtr gradOutputDevPtr,
+        IntPtr inputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h, int w,
+        CuDnnNative.CudnnActivationMode mode,
+        double coef = 0.0,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnActivation));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var actDesc = new CuDnnActivationDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, h, w);
+        actDesc.Set(mode, coef);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnActivationBackward(
+            _context.Handle, actDesc.Handle,
+            ref alpha,
+            outputDesc.Handle, outputDevPtr,
+            outputDesc.Handle, gradOutputDevPtr,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            inputDesc.Handle, gradInputDevPtr);
+        CuDnnContext.CheckStatus(status, "ActivationBackwardGpu");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        if (_ownsContext) _context.Dispose();
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+
+    ~CuDnnActivation()
+    {
+        Dispose();
+    }
+}
+
+/// <summary>
 /// High-level cuDNN convolution operations helper.
 /// Provides simplified API for neural network convolutional layers.
 /// </summary>
