@@ -327,6 +327,11 @@ internal static class CompiledBackwardWalk<T>
         if (mulScalarMethod is not null)
             registry[mulScalarMethod] = new MultiplyScalarBackwardInliner();
 
+        var sqrtMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.SqrtBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (sqrtMethod is not null)
+            registry[sqrtMethod] = new SqrtBackwardInliner();
+
         return registry;
     }
 
@@ -1165,6 +1170,82 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, gradOutputLocal);
             EmitLoadSavedStateValue(il, entryRefLocal, savedStateField, 0, typeof(T));
             il.Emit(OpCodes.Callvirt, s_mulScalarMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>SqrtBackward</c>: d(sqrt(x))/dx = grad / (2 * sqrt(x))
+    /// = grad / (2 * output). Uses the cached forward output via
+    /// entry.Output. Emits TensorMultiplyScalar (×2) + TensorDivide +
+    /// AccumulateGrad.
+    /// </summary>
+    private sealed class SqrtBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_mulScalarMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiplyScalar))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly MethodInfo s_divideMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorDivide))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly Func<double, T> s_fromDouble =
+            d => MathHelper.GetNumericOperations<T>().FromDouble(d);
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // twoOutput = engine.TensorMultiplyScalar(entry.Output, (T)2)
+            // The literal "2" is constructed via FromDouble — we can't
+            // bake a T constant directly into IL because T is generic.
+            // Use a captured delegate that returns the FromDouble result
+            // for the test value 2.0; invoke at emit time and store the
+            // resulting T value as a boxed object that we unbox at run
+            // time. Simpler: use NumericOperations.FromDouble at runtime.
+            var numOpsType = typeof(MathHelper);
+            var getNumOpsMethod = numOpsType.GetMethod(nameof(MathHelper.GetNumericOperations))!
+                .MakeGenericMethod(typeof(T));
+            var fromDoubleMethod = typeof(AiDotNet.Tensors.Interfaces.INumericOperations<>)
+                .MakeGenericType(typeof(T))
+                .GetMethod("FromDouble")!;
+
+            var twoLocal = il.DeclareLocal(typeof(T));
+            il.Emit(OpCodes.Call, getNumOpsMethod);
+            il.Emit(OpCodes.Ldc_R8, 2.0);
+            il.Emit(OpCodes.Callvirt, fromDoubleMethod);
+            il.Emit(OpCodes.Stloc, twoLocal);
+
+            // twoOutput = engine.TensorMultiplyScalar(entry.Output, two)
+            var twoOutputLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, outputField);
+            il.Emit(OpCodes.Ldloc, twoLocal);
+            il.Emit(OpCodes.Callvirt, s_mulScalarMethod);
+            il.Emit(OpCodes.Stloc, twoOutputLocal);
+
+            // grad = engine.TensorDivide(gradOutput, twoOutput)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, twoOutputLocal);
+            il.Emit(OpCodes.Callvirt, s_divideMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
             il.Emit(OpCodes.Ldloca, stateLocal);
