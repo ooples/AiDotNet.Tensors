@@ -20134,6 +20134,46 @@ public partial class CpuEngine : ITensorLevelEngine
         if (value == null)
             throw new ArgumentNullException(nameof(value));
 
+        // AiDotNet#1331: under GraphMode, the eager implementation below would
+        // read Q/K/V's uninitialized lazy backings at compile time and bake a
+        // garbage result into the output buffer — which then never gets
+        // refreshed at plan.Step (no lazy node = no forward step). Every
+        // parameter upstream of this op (embedding + Q/K/V/output projection
+        // weights) silently stops training because the gradient chain through
+        // ScaledDotProductAttention's input ports gets dropped.
+        //
+        // Record a lazy node so the op participates in the compiled forward
+        // chain. The execute lambda re-runs eager SDPA at plan.Step time with
+        // the freshly-computed Q/K/V from prior forward steps, and
+        // attentionWeights is refreshed into the saved tensor on every step
+        // (mirrors the LayerNorm savedState fix pattern).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cq = query; var ck = key; var cv = value; var cm = mask; var cs = scale;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = ScaledDotProductAttention(cq, ck, cv, cm, cs, out attentionWeights);
+                GraphMode.SetCurrent(savedScope);
+                var capturedAttn = attentionWeights;
+                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "ScaledDotProductAttention",
+                    new[] { query, key, value }, eagerResult._shape,
+                    (eng, output) =>
+                    {
+                        var r = eng.ScaledDotProductAttention(cq, ck, cv, cm, cs, out var freshAttn);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        // Refresh attention-weights savedState (analogous to LayerNorm mean/var).
+                        freshAttn.AsSpan().CopyTo(capturedAttn.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+                    new object[] { attentionWeights, scale ?? (1.0 / System.Math.Sqrt(query._shape[3])), mask is null ? (object)false : mask });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         // Preserve original Q/K/V refs for tape recording (#257). The
         // .Contiguous() rebinds below would otherwise replace the strided
         // views (typical post-Permute / post-Reshape) with fresh tensors
