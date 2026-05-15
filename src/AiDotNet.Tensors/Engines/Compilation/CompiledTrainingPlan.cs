@@ -958,28 +958,49 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
         int genericBackwardCount = 0;
+        bool wrapForTiming = AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.Enabled;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
-            if (action != null)
-                backwardActions.Add(action);
-            else
+            Action<IEngine>? action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
+            bool wasSpecialized = action != null;
+            if (action == null)
             {
                 genericBackwardCount++;
                 var stepCopy = step;
                 var gradAcc = gradMap;
-                backwardActions.Add(eng =>
+                action = eng =>
                 {
                     var gradOut = gradAcc.ContainsKey(stepCopy.OutputBuffer)
                         ? gradAcc[stepCopy.OutputBuffer]
                         : gradAcc.Values.First();
                     stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
                         stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                };
+            }
+
+            // Issue #338 Phase F.2: per-op backward profile on the compiled
+            // path. Phase A captured the walker path; this captures
+            // CompiledTrainingPlan's specialized + generic delegate share.
+            // Gate at compile time on BackwardTiming.Enabled so the
+            // wrapper is only built when the env var is set.
+            if (wrapForTiming)
+            {
+                var inner = action;
+                var bucket = $"compiled:{step.OpName}:{(wasSpecialized ? "spec" : "generic")}";
+                backwardActions.Add(eng =>
+                {
+                    long start = Stopwatch.GetTimestamp();
+                    inner(eng);
+                    AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.Record(bucket, Stopwatch.GetTimestamp() - start);
                 });
+            }
+            else
+            {
+                backwardActions.Add(action);
             }
         }
         // Append fused backward actions in reverse order — TryFuseForwardBackward records

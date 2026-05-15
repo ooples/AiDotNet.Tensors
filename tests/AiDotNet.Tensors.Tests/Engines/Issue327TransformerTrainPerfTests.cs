@@ -436,6 +436,8 @@ public class Issue327TransformerTrainPerfTests
 
             // Phase F.1: forward/backward/optimizer split when AIDOTNET_STEP_TIMING=1
             AiDotNet.Tensors.Engines.Compilation.StepTiming.DumpAndReset(_output.WriteLine);
+            // Phase F.2: per-op backward breakdown on the compiled path when AIDOTNET_BWD_TIMING=1
+            AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.DumpAndReset(_output.WriteLine);
         }
         finally
         {

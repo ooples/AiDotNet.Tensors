@@ -330,3 +330,35 @@ Wall-clock for the same run: 215.7 ms — 3 ms of non-instrumented overhead is g
 1. Drill into the 143 ms backward — what's the per-function breakdown when running through CompiledTrainingPlan's specialized backward delegates? (Phase A profiled the walker path, not this one.)
 2. The MatMulBackward specialized-backward path uses `BlasProvider.TryGemmEx` directly. If OpenBLAS is the cap, Phase G.1 (MKL swap) is what closes the gap to ≤100 ms.
 3. Phase F.2 (engaging ForwardCSEPass + PointwiseFusionPass in CompiledTrainingPlan) is still worth ~10-20 ms of the 75 ms forward share, but is no longer the highest-leverage lever.
+
+### Phase F.2 — per-op backward profile on the compiled path
+
+Setting `AIDOTNET_BWD_TIMING=1` runs each compiled-backward action through `BackwardTiming.Record(bucket, ticks)` where bucket = `compiled:<OpName>:<spec|generic>`. Wrapper installed at compile time only when the env var is set; otherwise no allocation, no closure. Wall-time was 177.22 ms with both `AIDOTNET_STEP_TIMING=1` and `AIDOTNET_BWD_TIMING=1` set — same band as the un-instrumented run, so the wrapper cost is within noise.
+
+Measurement on Issue #327 workload (22 iters, post-warmup):
+
+| Op (compiled bucket) | calls / 22 iters | total ms | avg µs/call | per-iter ms | % of backward |
+|---|---:|---:|---:|---:|---:|
+| `TensorMatMul:spec` (OpenBLAS Sgemm dA + dB) | 374 | 1690.9 | 4521 | **76.86** | **68.1%** |
+| `GELU:spec` (SIMD pointwise) | 88 | 313.7 | 3565 | 14.26 | 12.6% |
+| `TensorSlice:generic` (unspecialized — Q/K/V split) | 88 | 297.7 | 3383 | 13.53 | 12.0% |
+| `ReduceSum:spec` (bias backward) | 22 | 179.0 | 8137 | 8.14 | 7.2% |
+| **TOTAL backward (recorded)** | 572 | 2481.3 | — | **112.79** | 100% |
+
+Forward 64.8 ms + backward 112.8 ms = 177.6 ms — matches the 177.22 ms wall-time.
+
+**Finding:** 68% of backward is **17 MatMul backwards × 2 GEMMs each × ~2.3 ms/GEMM** through `BlasProvider.TryGemmEx` → `cblas_sgemm`. OpenBLAS at d=128, M=2048 is the per-GEMM ceiling.
+
+**Achievable Phase F micro-opts (no new deps, low risk):**
+
+| Opt | est. saving | new floor |
+|---|---:|---|
+| Specialize TensorSlice backward (replace generic with direct copy-in-region) | ~10 ms | 167 ms |
+| Engage `ICpuOptimizationPass` pipeline in `CompiledTrainingPlan` (Phase F.2 original scope — fold `ForwardCSE`, `PointwiseFusion` into the training plan compile path, currently only in inference plan) | ~10-20 ms (forward share) | 145-155 ms |
+
+**Path to ≤100 ms requires Phase G.1 (MKL backend swap):**
+- MKL `cblas_sgemm` is 1.3–1.8× faster than OpenBLAS at d=128 on Intel CPUs (per public BLAS shootout data)
+- 1.5× faster MatMul backward = 77 ms → 51 ms ⇒ takes total to ~125 ms
+- Combined with TensorSlice + Phase F.2 wins ⇒ ~105 ms ⇒ within reach of 100 ms
+
+Phase G.1 is blocked on this dev machine (no MKL runtime locally) but is the right architectural next step. Distribution decision: either add `Intel.MKL` NuGet (multi-MB) or vendor MKL through `Microsoft.ML.OnnxRuntime`. Per CLAUDE.md, this is a load-bearing dependency decision and needs user approval.
