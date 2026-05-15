@@ -27,7 +27,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 {
-    private readonly Action<IEngine>[] _forwardActions;
+    // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
+    // a rebuilt forward-action array using allowCachedB=true.
+    private Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
     private readonly IEngine _engine;
@@ -37,6 +39,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Tensor<T> _lossGradSeed;
     private readonly List<GCHandle> _pinnedHandles = new();
     private bool _disposed;
+
+    // Phase G.4: rebuild state captured at compile time so
+    // EnableFrozenWeightOptimizations() can preserve fused-group action
+    // identity while replacing non-fused MatMul forward specializations.
+    private readonly int[]? _fusedStepIndices;
+    private readonly Action<IEngine>[]? _fusedForwardActions;
+    private bool _isFrozenWeights;
 
     // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
     private readonly int[]? _genericGradIndices;
@@ -70,7 +79,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<GCHandle>? pinnedHandles = null,
         CompiledStep<T>[]? forwardSteps = null,
         int[]? compiledInputShape = null,
-        Tensor<T>? compiledInputTensor = null)
+        Tensor<T>? compiledInputTensor = null,
+        int[]? fusedStepIndices = null,
+        Action<IEngine>[]? fusedForwardActions = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -84,6 +95,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _forwardSteps = forwardSteps;
         _compiledInputShape = compiledInputShape;
         _compiledInputTensor = compiledInputTensor;
+        _fusedStepIndices = fusedStepIndices;
+        _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
         if (pinnedHandles is not null)
             _pinnedHandles.AddRange(pinnedHandles);
@@ -104,6 +117,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public Tensor<T>[] Gradients => _gradients;
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
+
+    /// <inheritdoc/>
+    public void EnableFrozenWeightOptimizations()
+    {
+        if (_isFrozenWeights) return;
+        if (_forwardSteps is null)
+            throw new InvalidOperationException(
+                "EnableFrozenWeightOptimizations requires a compiled plan with retained forward steps. " +
+                "Plans loaded from serialization don't currently carry the step metadata.");
+
+        // Rebuild forward actions with allowCachedB=true. Walks the original
+        // step list, preserves fused-group action identity, replaces non-
+        // fused step specializations with the cached-B variant.
+        var fusedSet = _fusedStepIndices is null
+            ? null
+            : new HashSet<int>(_fusedStepIndices);
+        var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
+        int nextFusedGroupIdx = 0;
+        for (int i = 0; i < _forwardSteps.Length; i++)
+        {
+            if (fusedSet is not null && fusedSet.Contains(i))
+            {
+                bool isFirstInGroup = i == 0 || !fusedSet.Contains(i - 1);
+                if (isFirstInGroup && _fusedForwardActions is not null
+                    && nextFusedGroupIdx < _fusedForwardActions.Length)
+                {
+                    rebuiltForward.Add(_fusedForwardActions[nextFusedGroupIdx]);
+                    nextFusedGroupIdx++;
+                }
+                continue;
+            }
+
+            var step = _forwardSteps[i];
+            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: true);
+            if (specialized != null)
+            {
+                rebuiltForward.Add(specialized);
+            }
+            else
+            {
+                var output = step.OutputBuffer;
+                var exec = step.Execute;
+                rebuiltForward.Add(eng => exec(eng, output));
+            }
+        }
+        _forwardActions = rebuiltForward.ToArray();
+        _isFrozenWeights = true;
+    }
 
     /// <inheritdoc/>
     public void StepInto(Tensor<T> lossOutput)
@@ -1060,7 +1121,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             pinnedHandles,
             forwardSteps.ToArray(),
             compiledInputShape,
-            compiledInputTensor);
+            compiledInputTensor,
+            fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
+            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null);
     }
 
     /// <summary>

@@ -407,6 +407,15 @@ public class Issue327TransformerTrainPerfTests
                 },
                 parameters: weights);
 
+            // Issue #338 Phase G.4: opt into pre-packed B cache. This test
+            // does NOT update weights between Step() calls (no optimizer
+            // configured), so the cached pre-pack of B stays valid across
+            // replays. Saves PackB cost on every forward MatMul call.
+            // Opt-out gate: set AIDOTNET_FROZEN_WEIGHTS=0 to skip the opt-in
+            // (used for A/B-comparing wall-time with vs without).
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_FROZEN_WEIGHTS") != "0")
+                plan.EnableFrozenWeightOptimizations();
+
             // Warmup
             for (int i = 0; i < 2; i++)
             {
