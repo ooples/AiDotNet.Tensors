@@ -481,3 +481,39 @@ After the cleanup of debugging instrumentation and the `mklPreferred` guard:
 | **Phase G.2 (this commit)** | **162** | **-17% additional, 23% off OpenBLAS** |
 
 HARD FLOOR ≤200ms hit reliably. SOFT TARGET ≤100ms still 62ms away — closing that needs algorithmic work (mixed-precision math, FlashAttention-style memory-efficient attention, or kernel-fused MatMul+activation+MatMul without the small-strip drawback).
+
+### Phase G.3 — specialize TensorSlice + GELU backward in compiled-spec path
+
+Phase F.2 profile showed two backward ops still going through the generic delegate path while everything else was specialized:
+
+- `compiled:TensorSlice:generic` — 13.5 ms/iter (per-element index-strode scatter)
+- `compiled:GELU:spec` — actually GELU forward was spec but GELU BACKWARD went through `engine.GeluBackward` dispatch via the generic wrapper
+
+**TensorSlice spec:** detects the common case `start[d]==0 for all leading dims, slice along last dim only`. Replaces per-element flat-index scatter with parallel row-strided `Buffer.BlockCopy`. This is the QKV-split pattern in the Transformer (slice [B,Ctx,3D] → [B,Ctx,D]).
+
+**GELU backward spec:** calls `SimdKernels.GeluBackwardUnsafe` directly (skips `engine.GeluBackward`'s tensor-allocation + tape-recording path).
+
+**Measured wall-time (10 runs each):**
+
+| Stage | Median | Min | Max | Spread |
+|---|---:|---:|---:|---:|
+| Phase G.2 (prior) | 162 | 155 | 175 | 20 |
+| + slice spec | 146 | 132 | 222 | 90 |
+| + slice + GELU spec | **142** | 138 | 172 | 34 |
+
+Forward/backward split with both spec paths active:
+- Forward: 58 ms (38.3%)
+- Backward: 93 ms (61.7%)
+
+Slice spec contributed ~13 ms backward reduction (matches Phase F.2's predicted impact). GELU backward spec contributed ~5-10 ms.
+
+**Cumulative wall-time delivery (Issue #338, d=128 Transformer workload):**
+
+| Phase | Median ms | vs prior | Cumulative |
+|---|---:|---:|---:|
+| OpenBLAS baseline | 211 | — | — |
+| Phase G.1 (MKL routing) | 196 | -7% | -7% |
+| Phase G.2 (cleanup) | 162 | -17% | -23% |
+| Phase G.3 (slice + GELU spec) | **142** | **-12%** | **-33%** |
+
+HARD FLOOR ≤200ms hit on every run; SOFT TARGET ≤100ms still 42ms away. Backward MatMul (~65ms via MKL) is the remaining floor — closing further needs FP16/BF16 mixed precision, or algorithmic changes like combined-multi-head attention.

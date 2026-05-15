@@ -2471,6 +2471,117 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Issue #338 Phase G.3: Specialized GELU backward via SimdKernels.
+        // The generic GELUBackward path calls engine.GeluBackward which goes
+        // through the full dispatch chain (allocating a new tensor, tape
+        // recording paths, etc.). For the compiled-spec hot path we just
+        // need the SIMD kernel directly: gradIn = gradOut * GELU'(input).
+        if (step.OpName == "GELU" && step.Inputs.Length == 1
+            && step.Inputs[0].IsContiguous && typeof(T) == typeof(float))
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inArr = (float[])(object)input.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+                int len = input.Length;
+                unsafe
+                {
+                    fixed (float* pGO = gOutArr, pIn = inArr, pGI = gInArr)
+                    {
+                        SimdKernels.GeluBackwardUnsafe(pGO, pIn, pGI, len);
+                    }
+                }
+                input.Grad = gradIn;
+            };
+        }
+
+        // Issue #338 Phase G.3: Specialized TensorSlice backward — scatter
+        // gradOutput into the corresponding region of the input's grad
+        // buffer with zero-fill elsewhere. Phase F.2 profiled the generic
+        // SliceBackward at 13.5 ms/iter (per-element index computation
+        // with dim-stride math) for the QKV-split slices in the consumer
+        // Transformer. The fast path handles the common case "slice
+        // along last dim, start at offset 0 for all leading dims" with
+        // a parallel-row strided memcpy.
+        if (step.OpName == "TensorSlice" && step.Inputs.Length == 1
+            && typeof(T) == typeof(float)
+            && step.SavedState is not null && step.SavedState.Length >= 1
+            && step.SavedState[0] is int[] startArr)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            var inputShape = input._shape;
+            var outputShape = output._shape;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            // Fast-path conditions:
+            //   1. Same rank as input
+            //   2. All start offsets are 0 except possibly the last
+            //   3. All dims except the last match the input's shape
+            //   4. Contiguous (so flat buffer reinterpretation is valid)
+            if (startArr.Length != inputShape.Length) return null;
+            if (inputShape.Length != outputShape.Length) return null;
+            for (int d = 0; d < inputShape.Length - 1; d++)
+            {
+                if (startArr[d] != 0) return null;
+                if (inputShape[d] != outputShape[d]) return null;
+            }
+            int lastStart = startArr[inputShape.Length - 1];
+            int srcLastDim = outputShape[inputShape.Length - 1];
+            int dstLastDim = inputShape[inputShape.Length - 1];
+            if (lastStart < 0 || lastStart + srcLastDim > dstLastDim) return null;
+            if (!output.IsContiguous || !input.IsContiguous) return null;
+
+            int numRows = 1;
+            for (int d = 0; d < inputShape.Length - 1; d++) numRows *= inputShape[d];
+            int rowCopyBytes = srcLastDim * sizeof(float);
+            int rowCopyStartByte = lastStart * sizeof(float);
+            int dstRowBytes = dstLastDim * sizeof(float);
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+
+                // Zero-fill the full input grad. The fused-spec backward
+                // for upstream MatMul writes its result via the same
+                // accumulator, but in the consumer Transformer's QKV
+                // pattern the slice's input (qkv) has only one
+                // gradient contributor (this slice), so direct write
+                // is safe.
+                Array.Clear(gInArr, 0, gradIn.Length);
+
+                // Parallel-row strided memcpy: gradOut[r*srcLastDim..]
+                // → gradIn[r*dstLastDim + lastStart..]
+                CpuParallelSettings.ParallelForOrSerial(
+                    0, numRows, numRows * srcLastDim,
+                    r =>
+                    {
+                        Buffer.BlockCopy(
+                            gOutArr, r * rowCopyBytes,
+                            gInArr, r * dstRowBytes + rowCopyStartByte,
+                            rowCopyBytes);
+                    });
+
+                input.Grad = gradIn;
+            };
+        }
+
         // ReLU backward: mask = input > 0, grad = gradOut * mask
         // Phase 5.2: Use bitmask (1 bit/element) instead of full input tensor (32x memory savings)
         if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
