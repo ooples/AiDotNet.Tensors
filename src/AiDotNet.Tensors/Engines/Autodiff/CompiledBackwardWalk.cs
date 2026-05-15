@@ -870,14 +870,8 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, s_reluBackwardMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
-            // AccumulateGrad(state.Grads, entry.Input0, grad, engine)
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, input0Field);
-            il.Emit(OpCodes.Ldloc, gradLocal);
-            il.Emit(OpCodes.Ldarg_3);
-            il.Emit(OpCodes.Call, accumulateGradMethod);
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
         }
     }
 
@@ -912,13 +906,8 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, s_sigmoidBackwardMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, input0Field);
-            il.Emit(OpCodes.Ldloc, gradLocal);
-            il.Emit(OpCodes.Ldarg_3);
-            il.Emit(OpCodes.Call, accumulateGradMethod);
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
         }
     }
 
@@ -951,13 +940,8 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, s_tanhBackwardMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, input0Field);
-            il.Emit(OpCodes.Ldloc, gradLocal);
-            il.Emit(OpCodes.Ldarg_3);
-            il.Emit(OpCodes.Call, accumulateGradMethod);
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
         }
     }
 
@@ -991,13 +975,8 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, s_geluBackwardMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, input0Field);
-            il.Emit(OpCodes.Ldloc, gradLocal);
-            il.Emit(OpCodes.Ldarg_3);
-            il.Emit(OpCodes.Call, accumulateGradMethod);
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
         }
     }
 
