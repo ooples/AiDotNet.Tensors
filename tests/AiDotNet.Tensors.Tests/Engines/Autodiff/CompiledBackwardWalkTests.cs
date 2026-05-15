@@ -470,6 +470,57 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_ReshapeReduceMeanInliners_MatchesReference()
+    {
+        // Exercises the Reshape + ReduceMean inliners on a single tape.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                // Shape [2,4]; reshape to [8]; mean over axis 0 → scalar.
+                var a = new Tensor<float>(
+                    new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 2, 4 });
+                var reshaped = engine.Reshape(a, new[] { 8 });
+                var meaned = engine.ReduceMean(reshaped, axes: new[] { 0 }, keepDims: false);
+                var loss = engine.ReduceSum(meaned);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 8; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_ActivationInliners_ReluSigmoidTanhGelu_MatchesReference()
     {
         // Exercises the 4 activation backward inliners in a single tape
