@@ -253,6 +253,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     public static System.Action<string>? StepProbe { get; set; }
 
+    /// <summary>Diagnostic capture: TensorSubtract specialized forward writes
+    /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
+    /// what the kernel sees vs writes.</summary>
+    public static string SubFwdDiag = "";
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
@@ -962,6 +967,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     typed.GetInputsArray(),
                     typed.BackwardFn,
                     typed.SavedState));
+                // CRITICAL (issue #350 root cause): clear LazySource on every
+                // forward-step output BEFORE the plan starts executing. Each
+                // call to plan.Step() runs the lazy execute via the
+                // pre-compiled forward delegate, writing the correct output
+                // to typed.Output's buffer. But the LazyNode's own
+                // RecordingEngine field captured AiDotNetEngine.Current at
+                // record time — typically DirectGpuTensorEngine on
+                // auto-detect-GPU systems. Without clearing LazySource here,
+                // any subsequent caller-side read via tensor.GetFlat / [i] /
+                // .AsSpan() triggers TensorBase.EnsureMaterialized →
+                // node.Realize(node.RecordingEngine) → re-runs Execute on
+                // the GPU engine, OVERWRITING the correct double values the
+                // plan wrote with float-precision-rounded values from the
+                // GPU's TensorXxxInto kernels (consumer GPUs throttle double
+                // precision, so the kernels do float math under the hood).
+                // The plan's own forward loop runs Execute via its captured
+                // engine reference (correctly bound by BindEngineIfUnset),
+                // so clearing LazySource doesn't lose anything — the plan
+                // owns the materialization lifecycle from this point on.
+                typed.IsRealized = true;
+                typed.Output.LazySource = null;
             }
         }
 

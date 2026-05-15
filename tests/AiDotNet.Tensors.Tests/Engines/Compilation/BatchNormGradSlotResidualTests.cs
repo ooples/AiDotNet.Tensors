@@ -152,23 +152,79 @@ public class BatchNormGradSlotResidualTests
             engine.ReduceSum(sqF, null);
             plan = scope.CompileTraining(new[] { gammaF, betaF });
         }
-        using (plan)
+        // Wire StepProbe to capture diffF[0] at every phase boundary
+        var ctpType3 = typeof(AiDotNet.Tensors.LinearAlgebra.Tensor<double>).Assembly
+            .GetType("AiDotNet.Tensors.Engines.Compilation.CompiledTrainingPlan`1")!
+            .MakeGenericType(typeof(double));
+        var probeProp3 = ctpType3.GetProperty("StepProbe", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)!;
+        var phaseLog = new System.Collections.Generic.List<string>();
+        System.Action<string> probe3 = phase =>
         {
-            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
-            plan.Step();
+            phaseLog.Add($"  {phase,-40} bnF[0]={bnF[0]:F18} diffF[0]={diffF[0]:F18} sqF[0]={sqF[0]:F18}");
+        };
+        probeProp3.SetValue(null, probe3);
+        try
+        {
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                plan.Step();
+            }
         }
+        finally
+        {
+            probeProp3.SetValue(null, null);
+        }
+        phaseLog.Add($"  POST-DISPOSE                             bnF[0]={bnF[0]:F18} diffF[0]={diffF[0]:F18} sqF[0]={sqF[0]:F18}");
+
+        // EXPERIMENT: snapshot diffF four ways to find what fixes the Heisenbug.
+        var diffF_directIndex = new double[batch * features];
+        for (int i = 0; i < diffF.Length; i++) diffF_directIndex[i] = diffF[i];
+
+        // (a) Force GC.Collect to test if it's a GC-related stale read
+        var diffF_afterGC = new double[batch * features];
+        System.GC.Collect();
+        System.GC.WaitForPendingFinalizers();
+        for (int i = 0; i < diffF.Length; i++) diffF_afterGC[i] = diffF[i];
+
+        // (b) Memory barrier
+        var diffF_afterBarrier = new double[batch * features];
+        System.Threading.Thread.MemoryBarrier();
+        for (int i = 0; i < diffF.Length; i++) diffF_afterBarrier[i] = diffF[i];
+
+        // (c) Read via AsSpan instead of indexer
+        var diffF_viaSpan = new double[batch * features];
+        var diffSpan = diffF.AsSpan();
+        for (int i = 0; i < diffF.Length; i++) diffF_viaSpan[i] = diffSpan[i];
+
+        // (d) Read via GetDataArray (raw backing)
+        var diffF_viaArray = new double[batch * features];
+        var diffArr = (double[])(object)diffF.GetDataArray();
+        for (int i = 0; i < diffF.Length; i++) diffF_viaArray[i] = diffArr[i];
 
         var lines = new System.Collections.Generic.List<string>();
         bool any = false;
         for (int i = 0; i < bnE.Length; i++)
         {
             double dBn = System.Math.Abs(bnE[i] - bnF[i]);
-            double dDiff = System.Math.Abs(diffE[i] - diffF[i]);
+            double dDiff = System.Math.Abs(diffE[i] - diffF_directIndex[i]);
+            double dDiffGC = System.Math.Abs(diffE[i] - diffF_afterGC[i]);
+            double dDiffBar = System.Math.Abs(diffE[i] - diffF_afterBarrier[i]);
+            double dDiffSpan = System.Math.Abs(diffE[i] - diffF_viaSpan[i]);
+            double dDiffArr = System.Math.Abs(diffE[i] - diffF_viaArray[i]);
             double dSq = System.Math.Abs(sqE[i] - sqF[i]);
-            if (dBn > 0 || dDiff > 0 || dSq > 0) any = true;
-            lines.Add($"  [{i}]  bn |Δ|={dBn:E3}  diff |Δ|={dDiff:E3}  sq |Δ|={dSq:E3}");
+            if (dBn > 0 || dDiff > 0 || dDiffGC > 0 || dDiffBar > 0 || dDiffSpan > 0 || dDiffArr > 0) any = true;
+            lines.Add($"  [{i}]  bn={dBn:E3} diff(idx)={dDiff:E3} diff(gc)={dDiffGC:E3} diff(bar)={dDiffBar:E3} diff(span)={dDiffSpan:E3} diff(arr)={dDiffArr:E3} sq={dSq:E3}");
         }
-        Assert.False(any, "Forward chain BN→Sub→Mul diverges between eager and compile:\n"
+        // Read SubFwdDiag via reflection
+        var ctpType2 = typeof(AiDotNet.Tensors.LinearAlgebra.Tensor<double>).Assembly
+            .GetType("AiDotNet.Tensors.Engines.Compilation.CompiledTrainingPlan`1")!
+            .MakeGenericType(typeof(double));
+        var subDiagField = ctpType2.GetField("SubFwdDiag", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        var subDiag = subDiagField?.GetValue(null) as string ?? "(unset)";
+
+        Assert.False(any, $"Forward chain BN→Sub→Mul diverges (probe-mode bisect):\n  SUB-FWD diag: {subDiag}\n  eager bnE[0]={bnE[0]:F18} bnF[0]={bnF[0]:F18} targetE[0]={targetE[0]:F18} targetF[0]={targetF[0]:F18}\n  eager diffE[0]={diffE[0]:F18}  (manual: bnE[0]-targetE[0] = {bnE[0] - targetE[0]:F18})\n  diffF_directIndex[0]={diffF_directIndex[0]:F18}\n  diffF[0] (live indexer) = {diffF[0]:F18}\n  PHASE LOG:\n"
+            + string.Join("\n", phaseLog) + "\n  DIFFS:\n"
             + string.Join("\n", lines));
     }
 
