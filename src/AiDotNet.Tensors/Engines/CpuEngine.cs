@@ -17732,8 +17732,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Execute eagerly to fill out params
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
-                var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
-                GraphMode.SetCurrent(savedScope);
+                Tensor<T> eagerResult;
+                try
+                {
+                    eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
+                }
+                finally
+                {
+                    GraphMode.SetCurrent(savedScope);
+                }
                 // Bind THIS engine to the scope so the compiled plan replays on
                 // the same engine the user called the op on (issue #350: scope
                 // captures AiDotNetEngine.Current at scope-construction time,
