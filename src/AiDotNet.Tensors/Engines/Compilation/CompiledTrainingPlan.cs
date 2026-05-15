@@ -2471,6 +2471,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Issue #338 Phase G.3: Specialized ReduceSum backward for the
+        // "sum-all-to-scalar" pattern (the loss reduce at the end of the
+        // forward chain). Generic path does ExpandDims + BroadcastGradToShape
+        // (multiple allocations + memory passes) for what should be a
+        // single Array.Fill across the input's flat buffer.
+        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1
+            && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+                float seed = gOutArr[0];
+                if (seed == 1.0f)
+                {
+                    // Common case (loss seed): fill with ones via SIMD-
+                    // friendly Array.Fill. The .NET runtime intrinsic
+                    // uses memset-style stores when value is bit-trivial.
+                    int len = gradIn.Length;
+                    new Span<float>(gInArr, 0, len).Fill(1.0f);
+                }
+                else
+                {
+                    new Span<float>(gInArr, 0, gradIn.Length).Fill(seed);
+                }
+                input.Grad = gradIn;
+            };
+        }
+
         // Issue #338 Phase G.3: Specialized GELU backward via SimdKernels.
         // The generic GELUBackward path calls engine.GeluBackward which goes
         // through the full dispatch chain (allocating a new tensor, tape
