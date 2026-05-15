@@ -91,6 +91,69 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void BatchedGemmExFanout_FP16_RunsToCompletion_OnMultiStreamHost()
+    {
+        // Smoke test for the AMP batched GEMM: fp16 inputs, fp32 accumulator
+        // output. Doesn't crash + completes. Correctness gates against fp16
+        // round-tripped host data are hard without a fp16↔fp32 conversion
+        // helper; the dispatch path itself is exercised by the existing
+        // HalfPrecision backend tests.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        const int M = 16, N = 16, K = 8, batchCount = 4;
+        // ValidateBatchedGemmArgs is fp32-centric: bufA.Size must be
+        // >= M*K*batchCount. Allocate at fp32-element count even though
+        // the actual fp16 elements occupy half that bytewise — the
+        // extra space is unused.
+        using var aFp16 = backend.AllocateBuffer(M * K * batchCount);
+        using var bFp16 = backend.AllocateBuffer(K * N * batchCount);
+        using var cFp32 = backend.AllocateBuffer(M * N * batchCount);
+
+        try
+        {
+            cudaBackend.BatchedGemmExFanout(aFp16, bFp16, cFp32, M, N, K, batchCount, scheduler,
+                useBFloat16: false);
+        }
+        catch (System.Exception thrown)
+        {
+            if (thrown.Message.Contains("supported", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase))
+                return;
+            throw;
+        }
+    }
+
+    [Fact]
+    public void BatchedGemmExFanout_BFloat16PreAmpere_Throws()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        if (backend is AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend mp
+            && mp.SupportsBFloat16Conv)
+            return; // BF16 actually supported — skip rejection test.
+
+        using var a = backend.AllocateBuffer(64);
+        using var b = backend.AllocateBuffer(64);
+        using var c = backend.AllocateBuffer(64);
+
+        var ex = Assert.Throws<System.NotSupportedException>(() =>
+            cudaBackend.BatchedGemmExFanout(a, b, c, 8, 8, 8, 1, scheduler, useBFloat16: true));
+        Assert.Contains("8.0", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BatchedDgemmFanout_MatchesCPUReference_OnMultiStreamHost()
     {
         // Correctness gate for the fp64 fanout: CPU triple-loop reference.
