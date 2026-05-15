@@ -362,3 +362,35 @@ Forward 64.8 ms + backward 112.8 ms = 177.6 ms — matches the 177.22 ms wall-ti
 - Combined with TensorSlice + Phase F.2 wins ⇒ ~105 ms ⇒ within reach of 100 ms
 
 Phase G.1 is blocked on this dev machine (no MKL runtime locally) but is the right architectural next step. Distribution decision: either add `Intel.MKL` NuGet (multi-MB) or vendor MKL through `Microsoft.ML.OnnxRuntime`. Per CLAUDE.md, this is a load-bearing dependency decision and needs user approval.
+
+### Phase F.3 — in-house Sgemm A/B at d=128 backward shapes (negative result)
+
+Per the supply-chain-independence directive (`AiDotNet.Tensors.csproj:60-77` — MKL.NET removed in Issue #131), tried in-house Sgemm tuning before going the library route.
+
+**Isolated kernel timing** (`Issue338BackwardGemmKernelTests`, 200 iters at M=2048, K=N=128):
+
+| Kernel | ms / 2-gemm | vs OpenBLAS |
+|---|---:|---:|
+| OpenBLAS (TryGemmEx trans) | 4.675 | 1.00× |
+| SimdGemm (Sgemm trans) | **2.321** | **0.50×** ← 2× faster |
+| SimdGemm (materialize-transpose + NoTrans) | 5.262 | 1.13× |
+
+In ISOLATION, SimdGemm with trans flags is 2× faster than OpenBLAS at d=128 backward shapes. The previous comment in `BackwardFunctions.cs:489-498` claiming "SimdGemm-trans falls to single-threaded SgemmTiled" no longer holds — SgemmTiled gained parallel-trans support in some PR since that comment was written.
+
+**End-to-end wall-time** (swapped compiled-spec MatMul backward to SimdGemm, ran Phase D test):
+
+| Path | Run 1 | Run 2 | Run 3 |
+|---|---:|---:|---:|
+| Compiled-spec with OpenBLAS (current baseline) | 247 | 224 | 209 |
+| Compiled-spec with SimdGemm | **435** | **456** | **464** |
+
+**SimdGemm regresses end-to-end by 2-2.4× despite the per-call win.** Most likely cause:
+
+- SimdGemm uses `.NET Parallel.For` thread pool, shared with the rest of `Step()` (including the forward MatMul kernels). The forward path also runs SimdGemm.
+- OpenBLAS uses its own dedicated thread pool (P/Invoke into native).
+- Calling SimdGemm in BOTH forward and backward in a tight loop causes thread-pool contention that OpenBLAS-backward + SimdGemm-forward doesn't experience.
+- Additional issue: SimdGemm's per-thread PrePackedB caches collide between forward (`Wx`) and backward (`dC@W^T`) when targeting the same weight matrix with different trans flags — re-pack per call.
+
+**Conclusion:** in-house Sgemm CAN beat OpenBLAS per-call at d=128, but cannot be productively engaged in the compiled training plan without first solving the forward/backward thread-pool sharing problem. That's a significant kernel-level refactor.
+
+Reverted the production change; kept the kernel A/B test as future-proofing for the inevitable next round of "should we re-add MKL?" debates. Per user direction "if in-house tuning doesn't work then we can go the library route" — proceeding with `Microsoft.ML.Mkl.Redist` adoption as Phase G.1.
