@@ -13591,18 +13591,58 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        // Tape registration — only DCN v1 (mask null) for now. DCN v2 with
-        // modulation mask isn't yet wired; rather than silently drop dL on
-        // training paths that pass a mask, fail fast so the caller knows to
-        // either disable autograd for this op or wait for v2 wiring.
+        // Tape + lazy-graph registration — only DCN v1 (mask null) for now.
+        // DCN v2 with modulation mask isn't yet wired; rather than silently
+        // drop dL on training paths that pass a mask, fail fast (under
+        // EITHER active tape OR lazy graph) so the caller knows to either
+        // disable autograd for this op or wait for v2 wiring.
         if (mask is null)
         {
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(),
+            };
+            // Eager tape (RecordIfActive is internally no-op when inactive).
             DifferentiableOps.RecordIfActive("DeformableConv2D", result,
                 new[] { input, kernel, offset },
                 BackwardFunctions<T>.DeformableConv2DBackward,
-                new object[] { (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone() });
+                savedState);
+
+            // Lazy graph (GraphMode) — records a LazyNode so
+            // CompiledTrainingPlan can generate a backward step. Without
+            // this, dL/dInput, dL/dKernel, dL/dOffset all silently zero
+            // under the compiled path (cf. AiDotNet#1328).
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2D",
+                        new[] { input, kernel, offset },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2D(
+                                capturedInput, capturedKernel, capturedOffset,
+                                mask: null,
+                                capturedStride, capturedPadding, capturedDilation);
+                            replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                        },
+                        BackwardFunctions<T>.DeformableConv2DBackward,
+                        savedState);
+                }
+            }
         }
-        else if (DifferentiableOps.IsTapeActiveForThread<T>())
+        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
             throw new NotSupportedException(
                 "DeformableConv2D autograd with a modulation mask (DCN v2) is not yet wired. " +
@@ -22578,7 +22618,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // tape's T is float/double — the serializer only matches Tensor<T>
         // for the tape's own T. attentionCoeffs is a freshly-allocated
         // Tensor<T> — safe to share. leakyReluAlpha is a value type.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
             var srcArr = edgeSourceIndices.GetFlattenedData();
             var tgtArr = edgeTargetIndices.GetFlattenedData();
@@ -22588,10 +22628,56 @@ public partial class CpuEngine : ITensorLevelEngine
             Array.Copy(tgtArr, tgtSnap, tgtArr.Length);
             var srcShape = (int[])edgeSourceIndices._shape.Clone();
             var tgtShape = (int[])edgeTargetIndices._shape.Clone();
+            var savedState = new object[] { srcSnap, srcShape, tgtSnap, tgtShape, attentionCoeffs, leakyReluAlpha };
+
+            // Eager-tape path (unchanged): RecordIfActive checks the active
+            // tape internally and is a no-op when none is set, so it's safe
+            // to call from both paths.
             DifferentiableOps.RecordIfActive("GraphAttention", gatResult,
                 new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
                 BackwardFunctions<T>.GraphAttentionBackward,
-                new object[] { srcSnap, srcShape, tgtSnap, tgtShape, attentionCoeffs, leakyReluAlpha });
+                savedState);
+
+            // Lazy-graph (GraphMode) path: record a LazyNode so the
+            // compiled training plan generates a backward step for this
+            // op. Without this, the result tensor has no LazySource and
+            // CompiledTrainingPlan silently drops the gradient
+            // (cf. AiDotNet#1328 / TensorEmbeddingLookup).
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedNode = nodeFeatures;
+                    var capturedSrc = attentionWeightSource;
+                    var capturedTgt = attentionWeightTarget;
+                    var capturedSrcIdx = edgeSourceIndices;
+                    var capturedTgtIdx = edgeTargetIndices;
+                    var capturedAlpha = leakyReluAlpha;
+                    var capturedResult = gatResult;
+                    var outShape = (int[])nodeFeatures._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "GraphAttention",
+                        new[] { nodeFeatures, attentionWeightSource, attentionWeightTarget },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            // Replay: re-execute the kernel into the
+                            // pre-allocated output. We don't need the
+                            // attentionCoeffs out-param at replay since
+                            // the backward consumes it from savedState
+                            // which was captured here.
+                            var replayed = eng.GraphAttention(
+                                capturedNode, capturedSrcIdx, capturedTgtIdx,
+                                capturedSrc, capturedTgt, capturedAlpha,
+                                out _);
+                            replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                        },
+                        BackwardFunctions<T>.GraphAttentionBackward,
+                        savedState);
+                }
+            }
         }
         return gatResult;
     }
@@ -24037,12 +24123,15 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        // Tape-aware path: take the slow path that explicitly allocates a
-        // `mean` Tensor<T> we can save in savedState for backward. The fast
-        // paths below inline the mean and would need extra alloc + bookkeeping
-        // to expose it, so they're bypassed when a tape is active. This only
-        // hits during training; inference goes through the fast paths.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        // Tape-aware AND lazy-graph (GraphMode) path: take the slow path
+        // that explicitly allocates a `mean` Tensor<T> we can save in
+        // savedState for backward. The fast paths below inline the mean
+        // and would need extra alloc + bookkeeping to expose it, so they're
+        // bypassed when EITHER a gradient tape OR the GraphMode lazy-graph
+        // tracer is active. The lazy-graph branch is required for
+        // CompiledTrainingPlan — without it the compiled backward graph
+        // has no entry for this op (cf. AiDotNet#1328).
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
             return ReduceVarianceTapeAware(input, axes, keepDims);
         }
@@ -24271,6 +24360,55 @@ public partial class CpuEngine : ITensorLevelEngine
     private Tensor<T> ReduceVarianceTapeAware<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        // Lazy-graph (GraphMode) path: record a Custom-type LazyNode so
+        // the compiled training plan sees this op and produces a backward
+        // step for it. Without this branch CompiledTrainingPlan.Compile
+        // skips the op (BackwardFn null) and dL/dInput silently zeroes —
+        // same bug class as AiDotNet#1328 / TensorEmbeddingLookup.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedInput = input;
+                var capturedAxes = (int[])axes.Clone();
+                var capturedKeepDims = keepDims;
+                // Compute the output shape up-front so RecordUnary can rent
+                // the right buffer. Replay re-runs the math against the
+                // SAME capturedInput so dimensions can be derived from it.
+                var inShape = input._shape;
+                var normalizedAxesForShape = ValidateAndNormalizeAxes(capturedAxes, inShape.Length);
+                var outShapeList = new List<int>();
+                for (int d = 0; d < inShape.Length; d++)
+                {
+                    if (normalizedAxesForShape.Contains(d))
+                    { if (capturedKeepDims) outShapeList.Add(1); }
+                    else outShapeList.Add(inShape[d]);
+                }
+                if (outShapeList.Count == 0) outShapeList.Add(1);
+                var outShape = outShapeList.ToArray();
+
+                // For backward we need the `mean` tensor — compute once here
+                // (the BackwardFunction reads it from savedState).
+                var meanForBackward = ReduceMean(capturedInput, capturedAxes, keepDims: true);
+
+                return scope.RecordUnary(
+                    LazyNodeType.Custom,
+                    "ReduceVariance",
+                    input,
+                    outShape,
+                    (eng, output) =>
+                    {
+                        // Replay: re-run the math into the pre-allocated output.
+                        var replayed = eng.ReduceVariance(capturedInput, capturedAxes, capturedKeepDims);
+                        replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.ReduceVarianceBackward,
+                    new object[] { (int[])capturedAxes.Clone(), meanForBackward });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         // Preserve the caller's original tensor reference so the recorded
         // GradFn keys to the tensor the caller will look up gradients for.
@@ -26084,21 +26222,80 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         outputShape[indices.Rank] = embeddingDim;
 
+        // ---- Lazy-graph (compiled-plan) path ----
+        // Mirrors the GraphMode.IsActive branch used by every other
+        // differentiable op (Reshape, MatMul, etc.). Without this branch,
+        // the compiled-plan tracer never sees an Embedding node — the
+        // forward result is materialised eagerly here and the compiled
+        // backward graph has no way to propagate dL/dE back to the
+        // embedding table. That is the AiDotNet #1328 regression:
+        // Transformer training silently fails to update EmbeddingLayer
+        // weights when running through CompiledTrainingPlan.Step(),
+        // producing input-independent output (PPL = V exactly, top-1 = 1/V).
+        //
+        // Indices are snapshotted as long[] (not int[]) so vocabulary
+        // sizes up to long.MaxValue are supported. SavedStateSerializer
+        // gained TagInt64Array support specifically for this round-trip;
+        // narrowing to int would silently overflow on vocab sizes > 2^31
+        // (large-scale retrieval / search-corpus embeddings).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedEmb = embeddings;
+                var capturedVocab = vocabSize;
+                var capturedDim = embeddingDim;
+                int n = numIndices;
+                var idxSnap = SnapshotIndicesToLongArray(indices);
+                var idxShapeSnap = (int[])indices._shape.Clone();
+                return scope.RecordUnary(
+                    LazyNodeType.Custom,
+                    "TensorEmbeddingLookup",
+                    embeddings,
+                    outputShape,
+                    (eng, output) =>
+                    {
+                        // Replay forward: re-execute the row-gather into
+                        // the pre-allocated output buffer.
+                        var embDataLocal = capturedEmb.GetDataArray();
+                        var outDataLocal = output.GetDataArray();
+                        for (int i = 0; i < n; i++)
+                        {
+                            long tokenIdxLong = idxSnap[i];
+                            if (tokenIdxLong < 0 || tokenIdxLong >= capturedVocab)
+                                throw new ArgumentOutOfRangeException(
+                                    "indices",
+                                    $"Index {tokenIdxLong} at position {i} is out of bounds for embedding table with vocabulary size {capturedVocab}.");
+                            int tokenIdx = (int)tokenIdxLong;
+                            int srcOff = tokenIdx * capturedDim;
+                            int dstOff = i * capturedDim;
+                            Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
+                        }
+                    },
+                    BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
+                    new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim });
+            }
+        }
+
         var result = new Tensor<TValue>(outputShape);
         var embData = embeddings.GetDataArray();
         var resultData = result.GetDataArray();
         var idxData = indices.GetDataArray();
 
-        // For each index, copy the entire embedding row
+        // For each index, copy the entire embedding row. Promote to long
+        // for the bounds check so a TIndex=long input with an index that
+        // overflows int32 (>2 billion) fails the bounds check with a
+        // meaningful error instead of OverflowException from Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            int tokenIdx = Convert.ToInt32(idxData[i]);
+            long tokenIdxLong = Convert.ToInt64(idxData[i]);
 
-            // Bounds check for index
-            if (tokenIdx < 0 || tokenIdx >= vocabSize)
+            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdx} at position {i} is out of bounds for embedding table with vocabulary size {vocabSize}.");
+                    $"Index {tokenIdxLong} at position {i} is out of bounds for embedding table with vocabulary size {vocabSize}.");
 
+            int tokenIdx = (int)tokenIdxLong;
             int srcOffset = tokenIdx * embeddingDim;
             int dstOffset = i * embeddingDim;
 
@@ -26108,14 +26305,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Tape registration. Without this, dL/dE was silently dropped — see #255.
         // Indices are non-trainable; only the embedding table receives gradient.
-        // Snapshot the indices as a portable int[] (widening from long if
-        // necessary) so the savedState round-trips through SavedStateSerializer:
-        // it supports null/int/int[]/double/float/bool/string/byte[]/Tensor<T>/Enum,
-        // but not Tensor<TIndex> for TIndex != T.
+        // Snapshot the indices as long[] so the savedState round-trips through
+        // SavedStateSerializer's TagInt64Array path — supporting vocabularies
+        // up to long.MaxValue without silent overflow on TIndex=long inputs.
         if (DifferentiableOps.IsTapeActiveForThread<TValue>())
         {
-            var indicesSnap = new int[numIndices];
-            for (int i = 0; i < numIndices; i++) indicesSnap[i] = Convert.ToInt32(idxData[i]);
+            var indicesSnap = SnapshotIndicesToLongArray(indices);
             var indicesShapeSnap = (int[])indices._shape.Clone();
             DifferentiableOps.RecordUnary(
                 "TensorEmbeddingLookup",
@@ -26126,6 +26321,26 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Widens an arbitrary <c>Tensor&lt;TIndex&gt;</c> (TIndex is typically
+    /// <c>int</c> or <c>long</c>) into a portable <c>long[]</c> snapshot for
+    /// SavedState serialization. Using <c>long[]</c> end-to-end means an
+    /// embedding-lookup call with a <c>Tensor&lt;long&gt;</c> indices buffer
+    /// holding values above <c>int.MaxValue</c> serializes losslessly
+    /// (would have thrown <see cref="OverflowException"/> from
+    /// <c>Convert.ToInt32</c> before — see the AiDotNet.Tensors PR audit
+    /// note on the original int-snapshot pattern).
+    /// </summary>
+    private static long[] SnapshotIndicesToLongArray<TIndex>(Tensor<TIndex> indices)
+        where TIndex : unmanaged
+    {
+        int n = indices.Length;
+        var snap = new long[n];
+        var raw = indices.GetDataArray();
+        for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
+        return snap;
     }
 
     /// <inheritdoc/>
@@ -26147,16 +26362,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var idxData = indices.GetDataArray();
         int numIndices = indices.Length;
 
-        // Scatter-add: for each index, accumulate gradients to the embedding row
+        // Scatter-add: for each index, accumulate gradients to the embedding row.
+        // Promote to long for the bounds check so a TIndex=long input with an
+        // index that overflows int32 (>2 billion) fails with a meaningful
+        // ArgumentOutOfRangeException instead of an OverflowException buried
+        // inside Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            int tokenIdx = Convert.ToInt32(idxData[i]);
+            long tokenIdxLong = Convert.ToInt64(idxData[i]);
 
-            // Bounds check for index
-            if (tokenIdx < 0 || tokenIdx >= vocabSize)
+            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdx} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                    $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
 
+            int tokenIdx = (int)tokenIdxLong;
             int srcOffset = i * embeddingDim;
             int dstOffset = tokenIdx * embeddingDim;
 
@@ -30947,14 +31166,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
-        // Tape-aware path: the in-place ApplyBiasActivationNCHWInPlace fast
-        // paths below mutate Conv2D's recorded output buffer, leaving the
-        // tape with a GradFn pointing at pre-activation Conv2D values that
-        // no longer match the actual tensor data — backward then computes
-        // garbage gradients for input/kernel. Take the recorded sequence
-        // (Conv2D → BroadcastAdd → ApplyActivationRecorded) when a tape is
-        // active so each step's GradFn matches the actual values.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        // Tape-aware AND lazy-graph (GraphMode) path: the in-place
+        // ApplyBiasActivationNCHWInPlace fast paths below mutate Conv2D's
+        // recorded output buffer, leaving the tape with a GradFn pointing
+        // at pre-activation Conv2D values that no longer match the actual
+        // tensor data — backward then computes garbage gradients for
+        // input/kernel. Take the recorded sequence (Conv2D → BroadcastAdd
+        // → ApplyActivationRecorded) when EITHER a gradient tape OR the
+        // GraphMode lazy-graph tracer is active so each step's gradient
+        // hookup matches the actual values. The lazy-graph branch is
+        // critical for CompiledTrainingPlan — without it the compiled
+        // backward graph has no entry for this op (cf. AiDotNet#1328).
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
             var convResult = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
             if (bias != null)
@@ -31050,11 +31273,12 @@ public partial class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Activation: use the recorded variant when a tape is active so dL
-        // routes through the activation step. The in-place variant mutates
-        // tape-recorded tensor data and would silently produce wrong
-        // gradients for the conv kernel/input.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        // Activation: use the recorded variant when EITHER a gradient
+        // tape OR the GraphMode lazy-graph tracer is active so the
+        // activation step is wired into autograd / compiled-plan backward.
+        // The in-place variant mutates tape-recorded tensor data and
+        // would silently produce wrong gradients (cf. AiDotNet#1328).
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
             return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
         return result;
@@ -31084,8 +31308,10 @@ public partial class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Activation — see FusedConv3D note above.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        // Activation — see FusedConv3D note above. GraphMode included
+        // so the compiled-plan backward sees the activation step
+        // (cf. AiDotNet#1328).
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
             return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
         return result;
@@ -31116,10 +31342,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // This CPU implementation just does the batch normalization
         var result = BatchNorm(input, gamma, beta, epsilon, out saveMean, out saveVar);
 
-        // Activation: tape-aware path uses the recorded variant so the
-        // activation step is wired into autograd. In-place mutation here
-        // would silently corrupt BatchNorm's recorded output values.
-        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        // Activation: tape-aware AND lazy-graph path uses the recorded
+        // variant so the activation step is wired into autograd /
+        // compiled-plan backward. In-place mutation here would silently
+        // corrupt BatchNorm's recorded output values (cf. AiDotNet#1328).
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
             return ApplyActivationRecorded(result, activation);
         ApplyFusedActivationInPlace(result, activation);
         return result;

@@ -9,9 +9,12 @@ namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
 /// <see cref="CompiledStep{T}"/>. Each entry is type-tagged so the reader can
 /// reconstruct the original CLR type without reflection.
 ///
-/// <para>Supported types: <c>null</c>, <c>int</c>, <c>int[]</c>, <c>double</c>,
-/// <c>float</c>, <c>bool</c>, <c>string</c>, <c>byte[]</c>, and
-/// <c>Tensor&lt;T&gt;</c> (serialized as a tensor-table ID reference).</para>
+/// <para>Supported types: <c>null</c>, <c>int</c>, <c>int[]</c>, <c>long</c>,
+/// <c>long[]</c>, <c>double</c>, <c>float</c>, <c>bool</c>, <c>string</c>,
+/// <c>byte[]</c>, and <c>Tensor&lt;T&gt;</c> (serialized as a tensor-table
+/// ID reference). <c>long[]</c> support exists for index snapshots that may
+/// exceed <c>int.MaxValue</c> (e.g. large-vocab embedding lookups with
+/// <c>Tensor&lt;long&gt;</c> indices).</para>
 /// </summary>
 internal static class SavedStateSerializer
 {
@@ -71,6 +74,18 @@ internal static class SavedStateSerializer
                     writer.Write(intArr[j]);
                 break;
 
+            case long longVal:
+                writer.Write(PlanFormatConstants.TagInt64);
+                writer.Write(longVal);
+                break;
+
+            case long[] longArr:
+                writer.Write(PlanFormatConstants.TagInt64Array);
+                writer.Write(longArr.Length);
+                for (int j = 0; j < longArr.Length; j++)
+                    writer.Write(longArr[j]);
+                break;
+
             case double doubleVal:
                 writer.Write(PlanFormatConstants.TagDouble);
                 writer.Write(doubleVal);
@@ -127,7 +142,7 @@ internal static class SavedStateSerializer
                 // load never encounters a mystery tag byte.
                 throw new NotSupportedException(
                     $"SavedState entry of type {value.GetType().FullName} cannot be serialized. " +
-                    "Supported types: null, int, int[], double, float, bool, string, byte[], Tensor<T>, Enum.");
+                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], Tensor<T>, Enum.");
         }
     }
 
@@ -139,6 +154,8 @@ internal static class SavedStateSerializer
             PlanFormatConstants.TagNull       => null,
             PlanFormatConstants.TagInt32      => reader.ReadInt32(),
             PlanFormatConstants.TagInt32Array => ReadInt32Array(reader),
+            PlanFormatConstants.TagInt64      => reader.ReadInt64(),
+            PlanFormatConstants.TagInt64Array => ReadInt64Array(reader),
             PlanFormatConstants.TagDouble     => reader.ReadDouble(),
             PlanFormatConstants.TagFloat      => (object)reader.ReadSingle(),
             PlanFormatConstants.TagBool       => reader.ReadBoolean(),
@@ -203,6 +220,17 @@ internal static class SavedStateSerializer
         var arr = new int[len];
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadInt32();
+        return arr;
+    }
+
+    private static long[] ReadInt64Array(BinaryReader reader)
+    {
+        int len = reader.ReadInt32();
+        if (len < 0)
+            throw new InvalidDataException($"SavedState long[] length {len} cannot be negative. The plan file is corrupt.");
+        var arr = new long[len];
+        for (int i = 0; i < len; i++)
+            arr[i] = reader.ReadInt64();
         return arr;
     }
 
