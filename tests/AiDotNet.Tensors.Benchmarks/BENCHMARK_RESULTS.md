@@ -232,3 +232,23 @@ all benchmarks; the SciSharp library appears to have stabilized between runs.
 - **PyTorch parity (50 ms total)** requires MatMulBackward to drop to ≤30 ms, forward ≤20 ms. The BLAS-backend swap (Phase G) is unavoidable for the stretch target — OpenBLAS at 175 ms / 340 calls = 515 µs/call vs MKL's measured ~300 µs/call on equivalent shapes.
 
 To reproduce: `AIDOTNET_RUN_PERF_GATES=1 AIDOTNET_BWD_TIMING=1 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 -c Release --filter "FullyQualifiedName~Issue338_PhaseA_BackwardProfile" --logger "console;verbosity=detailed"`
+
+### Phase B negative results (do not retry)
+
+Two MatMulBackward optimization attempts were measured and reverted:
+
+1. **Direct BLAS GEMM with `transA`/`transB` flags for the ND × 2D case** (avoiding the explicit transpose allocation). Measured 272→352 ms regression. Root cause: `BlasProvider.TryGemmEx` with `transA=true` falls to the single-threaded SimdGemm path on this OpenBLAS build. Cited in PR #331 commit message as a previously-tried regression.
+
+2. **`Parallel.Invoke` wrapping the two transpose+MatMul pairs** inside MatMulBackward. The two pairs are mathematically independent. Result: test hung indefinitely. Root cause: `engine.TensorMatMul` is not safe to call concurrently — likely contention on shared cache or BLAS handle state.
+
+### Phase B threading observations
+
+`OPENBLAS_NUM_THREADS` env-var sweep on the same workload (in addition to the default ~4):
+
+| OPENBLAS_NUM_THREADS | Wall-time | Notes |
+|---|---|---|
+| 1 | 599 ms | Single-thread floor |
+| 4 (default) | 264 ms | Reference |
+| 16 | 360 ms | Oversubscribed — contention regression |
+
+GEMM math saturates ~4 OpenBLAS threads for these shapes. Adding more threads regresses due to contention. **Implication**: MKL backend swap (Phase G) is more likely to deliver the MatMul wall-time win than any per-call optimization in MatMulBackward.
