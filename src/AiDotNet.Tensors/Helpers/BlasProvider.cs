@@ -76,11 +76,86 @@ internal static class BlasProvider
         double* b, int ldb,
         double beta, double* c, int ldc);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #338 Phase G.1 — Intel MKL via Microsoft.ML.Mkl.Redist.
+    // MklImports.dll exports cblas_sgemm/cblas_dgemm directly (verified
+    // via PE symbol probe). Same CBLAS enum layout as OpenBLAS — bit-
+    // compatible call sites, different runtime. Opt-in via env var
+    // AIDOTNET_BLAS_PROVIDER=mkl at process start. Default remains
+    // OpenBLAS until MKL is verified faster on consumer's hardware.
+    // ─────────────────────────────────────────────────────────────────────
+    [DllImport("MklImports", EntryPoint = "cblas_sgemm", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe void mkl_cblas_sgemm_ptr(
+        int layout, int transA, int transB,
+        int m, int n, int k,
+        float alpha, float* a, int lda,
+        float* b, int ldb,
+        float beta, float* c, int ldc);
+
+    [DllImport("MklImports", EntryPoint = "cblas_dgemm", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe void mkl_cblas_dgemm_ptr(
+        int layout, int transA, int transB,
+        int m, int n, int k,
+        double alpha, double* a, int lda,
+        double* b, int ldb,
+        double beta, double* c, int ldc);
+
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c>|<c>true</c>|<c>yes</c> at process start.</summary>
     private static readonly bool _blasOptIn = ReadOptIn();
 
+    /// <summary>
+    /// True iff <c>AIDOTNET_BLAS_PROVIDER=mkl</c> at process start.
+    /// When false, MKL probes are skipped and OpenBLAS is the only candidate.
+    /// </summary>
+    private static readonly bool _preferMkl = string.Equals(
+        Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+        "mkl",
+        StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Resolved lazily on first use — probes libopenblas once.</summary>
     private static readonly Lazy<bool> _nativeAvailable = new(ProbeNativeLibrary);
+
+    /// <summary>Resolved lazily on first use — probes MklImports once.</summary>
+    private static readonly Lazy<bool> _mklAvailable = new(ProbeMklLibrary);
+
+#if NET5_0_OR_GREATER
+    static BlasProvider()
+    {
+        // Issue #338 Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, redirect
+        // every libopenblas P/Invoke to MklImports.dll in this assembly.
+        // Single intercept covers all 17 cblas_*_ptr / cblas_*_native call
+        // sites uniformly, so the rest of BlasProvider stays unchanged.
+        // Process-wide: registering twice in the same process is a no-op,
+        // and the resolver only fires for libopenblas DllImport names so
+        // GPU/other native deps are unaffected.
+        if (_preferMkl)
+        {
+            try
+            {
+                System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
+                    typeof(BlasProvider).Assembly,
+                    (libraryName, assembly, searchPath) =>
+                    {
+                        if (string.Equals(libraryName, "libopenblas", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                                "MklImports", assembly, searchPath, out var handle))
+                                return handle;
+                        }
+                        return IntPtr.Zero;
+                    });
+            }
+            catch (InvalidOperationException)
+            {
+                // Resolver already registered by another consumer — ignore;
+                // first registration wins, our libopenblas calls will still
+                // resolve correctly if that resolver also redirects them or
+                // if libopenblas itself is loadable from the consumer's
+                // runtime asset directory.
+            }
+        }
+    }
+#endif
 
     private static bool ReadOptIn()
     {
@@ -124,6 +199,28 @@ internal static class BlasProvider
             cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 1, 1, 1, 1.0f, a, 1, b, 1, 0.0f, c, 1);
             return c[0] == 6.0f;
+        }
+        catch (DllNotFoundException) { return false; }
+        catch (EntryPointNotFoundException) { return false; }
+        catch (BadImageFormatException) { return false; }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.1: probe MklImports cblas_sgemm. Only runs when
+    /// the user opts in via <c>AIDOTNET_BLAS_PROVIDER=mkl</c>. A successful
+    /// probe means consumer-side MKL is loadable and we can route GEMM
+    /// dispatches through MKL's threaded kernel for the d=128 transformer
+    /// shapes where OpenBLAS leaves performance on the table.
+    /// </summary>
+    private static unsafe bool ProbeMklLibrary()
+    {
+        if (!_preferMkl) return false;
+        try
+        {
+            float a = 2.0f, b = 3.0f, c = 0.0f;
+            mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                1, 1, 1, 1.0f, &a, 1, &b, 1, 0.0f, &c, 1);
+            return c == 6.0f;
         }
         catch (DllNotFoundException) { return false; }
         catch (EntryPointNotFoundException) { return false; }
@@ -367,6 +464,9 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
+        // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
+        // resolver redirects libopenblas → MklImports; the call below
+        // then dispatches into MKL's cblas_sgemm transparently.
         if (!_nativeAvailable.Value) return false;
         try
         {

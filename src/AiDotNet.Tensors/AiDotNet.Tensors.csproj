@@ -150,6 +150,29 @@
   </ItemGroup>
 
   <!--
+    Issue #338 Phase G.1 — MKL via Microsoft.ML.Mkl.Redist (~66MB win-x64).
+    The supply-chain-independence directive (Issue #131, csproj lines 60-77)
+    removed MKL.NET (110MB Intel binary). Phase F.2 measured that the
+    in-house SimdGemm CAN beat OpenBLAS per-call at d=128 transformer
+    backward shapes (2× faster in isolation) but regresses 2.4× end-to-end
+    due to .NET Parallel.For thread-pool contention between the forward
+    and backward calls. Closing the gap to ≤100ms PyTorch parity for
+    Issue #338 requires either fixing that contention (significant kernel
+    refactor) or routing through a native BLAS that uses its own thread
+    pool — exactly what MKL provides.
+    `Microsoft.ML.Mkl.Redist` is the MS-blessed MKL redist used by ML.NET
+    (`Microsoft.ML.Mkl.Components`, `Microsoft.ML.CpuMath`). Selected over
+    `Intel.MKL` (third-party, larger payload) and `Microsoft.ML.OnnxRuntime`
+    (uses MKL/oneDNN internally for graph execution but does not expose
+    cblas_sgemm at the public API surface — wrong tool for low-level GEMM).
+    Opt-in via env var `AIDOTNET_BLAS_PROVIDER=mkl`; default remains
+    OpenBLAS until MKL is verified faster on the consumer's hardware.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.Mkl.Redist" Version="5.0.0" />
+  </ItemGroup>
+
+  <!--
     GPU-side optional packages — separate supply-chain surface (users opt in
     per-hardware): AiDotNet.Native.CLBlast (OpenCL), AiDotNet.Native.CUDA
     (NVIDIA), AiDotNet.Native.ROCm (AMD), AiDotNet.Native.MoltenVK (macOS/iOS).
