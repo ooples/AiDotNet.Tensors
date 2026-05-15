@@ -958,49 +958,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
         int genericBackwardCount = 0;
-        bool wrapForTiming = AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.Enabled;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
-            Action<IEngine>? action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
-            bool wasSpecialized = action != null;
-            if (action == null)
+            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
+            if (action != null)
+                backwardActions.Add(action);
+            else
             {
                 genericBackwardCount++;
                 var stepCopy = step;
                 var gradAcc = gradMap;
-                action = eng =>
+                backwardActions.Add(eng =>
                 {
                     var gradOut = gradAcc.ContainsKey(stepCopy.OutputBuffer)
                         ? gradAcc[stepCopy.OutputBuffer]
                         : gradAcc.Values.First();
                     stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
                         stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
-                };
-            }
-
-            // Issue #338 Phase F.2: per-op backward profile on the compiled
-            // path. Phase A captured the walker path; this captures
-            // CompiledTrainingPlan's specialized + generic delegate share.
-            // Gate at compile time on BackwardTiming.Enabled so the
-            // wrapper is only built when the env var is set.
-            if (wrapForTiming)
-            {
-                var inner = action;
-                var bucket = $"compiled:{step.OpName}:{(wasSpecialized ? "spec" : "generic")}";
-                backwardActions.Add(eng =>
-                {
-                    long start = Stopwatch.GetTimestamp();
-                    inner(eng);
-                    AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.Record(bucket, Stopwatch.GetTimestamp() - start);
                 });
-            }
-            else
-            {
-                backwardActions.Add(action);
             }
         }
         // Append fused backward actions in reverse order — TryFuseForwardBackward records
@@ -2921,9 +2900,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step1 = steps[i + 1];
             var step2 = steps[i + 2];
 
-            // Pattern: MatMul[i] → ReLU[i+1] → MatMul[i+2]
-            // where ReLU's input is MatMul[i]'s output, and MatMul[i+2]'s input is ReLU's output
-            if (step0.OpName != "TensorMatMul" || step1.OpName != "ReLU" || step2.OpName != "TensorMatMul")
+            // Pattern: MatMul[i] → activation[i+1] → MatMul[i+2]
+            // where the activation's input is MatMul[i]'s output, and
+            // MatMul[i+2]'s input is the activation's output.
+            // Issue #338 Phase G.2: also accepts GELU (the Transformer FFN
+            // activation), but only engages the GELU fusion path when MKL
+            // is NOT preferred — the L1-tile strip approach (Mr=6 rows ×
+            // 342 strips per layer) issues hundreds of tiny BLAS calls
+            // that fight MKL's call-once-then-parallelize design.
+            // Empirically: with MKL active, fused MatMul→GELU→MatMul
+            // regresses 2.4× vs the unfused 3-step path. Without MKL
+            // (SimdGemm only), L1-tile fusion wins. So this branch is
+            // active only when neither MKL nor — for the GELU variant —
+            // is providing the big-GEMM win already.
+            bool isReluPattern = step1.OpName == "ReLU";
+            bool isGeluPattern = step1.OpName == "GELU";
+            bool mklPreferred = string.Equals(
+                Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+                "mkl",
+                StringComparison.OrdinalIgnoreCase);
+            // GELU fusion only when MKL is NOT preferred (see comment above).
+            if (isGeluPattern && mklPreferred) continue;
+            if (step0.OpName != "TensorMatMul" || step2.OpName != "TensorMatMul"
+                || (!isReluPattern && !isGeluPattern))
                 continue;
 
             if (step0.Inputs.Length != 2 || step2.Inputs.Length != 2)
@@ -2943,9 +2942,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (consumerCount.TryGetValue(step1.OutputBuffer, out int c1) && c1 > 1)
                 continue;
 
-            // Verify all 2D
-            if (step0.Inputs[0].Rank != 2 || step0.Inputs[1].Rank != 2 ||
+            // Verify weight matrices are 2D and input is ND (rank >= 2).
+            // Issue #338 Phase G.2: extended from 2D-only to ND×2D so the
+            // Transformer FFN (rank-3 [B, Ctx, D] input × rank-2 weights)
+            // qualifies. The leading dims of the input collapse into M
+            // for the fused kernel — same approach as the
+            // TryBuildSpecializedForward ND×2D MatMul path at line 1209.
+            if (step0.Inputs[0].Rank < 2 || step0.Inputs[1].Rank != 2 ||
                 step2.Inputs[1].Rank != 2)
+                continue;
+
+            // All operands must be contiguous for the buffer-flat
+            // reinterpretation that the fused kernel relies on.
+            if (!step0.Inputs[0].IsContiguous || !step0.Inputs[1].IsContiguous
+                || !step2.Inputs[1].IsContiguous
+                || !step1.OutputBuffer.IsContiguous
+                || !step2.OutputBuffer.IsContiguous)
                 continue;
 
             // Check hidden dim: must fit in L1 (max) AND be large enough for L1 benefit (min 128)
@@ -2954,15 +2966,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden || h < 128)
                 continue;
 
-            // Extract dimensions
-            var inputTensor = step0.Inputs[0];   // [M, K]
+            // Extract dimensions — collapse leading dims of input into M.
+            var inputTensor = step0.Inputs[0];   // [..batch, K]  (contiguous)
             var w1Tensor = step0.Inputs[1];      // [K, H]
             var w2Tensor = step2.Inputs[1];      // [H, N]
-            var outputTensor = step2.OutputBuffer; // [M, N]
+            var outputTensor = step2.OutputBuffer; // [..batch, N]
 
-            int m = inputTensor._shape[0];
-            int k = inputTensor._shape[1];
+            int inputRank = inputTensor.Rank;
+            int m = 1;
+            for (int d = 0; d < inputRank - 1; d++) m *= inputTensor._shape[d];
+            int k = inputTensor._shape[inputRank - 1];
             int n = w2Tensor._shape[1];
+
+            // The fused kernel writes [m, n] into output's flat storage —
+            // valid for contiguous output whose last dim is n.
+            if (outputTensor._shape[outputTensor.Rank - 1] != n) continue;
 
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
@@ -3103,13 +3121,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int cm = m, ck = k, ch = h, cn = n;
             var capturedGradMap = gradMap;
 
-            Func<float, float> relu = x => x > 0f ? x : 0f;
+            // Issue #338 Phase G.2: for GELU, we need pre-activation in
+            // backward (derivative isn't recoverable from post-activation
+            // values). Allocate a second buffer; for ReLU the buffer stays
+            // null and the existing code path is unchanged.
+            Tensor<T>? preActivationBuffer = isGeluPattern
+                ? TensorAllocator.RentUninitialized<T>(new[] { m, h })
+                : null;
+
+            Func<float, float> activation = isGeluPattern
+                ? new Func<float, float>(GeluTanhApprox)
+                : new Func<float, float>(x => x > 0f ? x : 0f);
 
             // Pre-allocate backward workspace at compile time (zero alloc during replay)
             var backwardWorkspace = new float[cm * ch]; // grad_h buffer
             var emptyBias = new float[0];
 
-            // Fused forward: single kernel call replaces 3 steps
+            // Capture for closure scope (locals can't be captured by reference into closures)
+            bool capturedIsGelu = isGeluPattern;
+            var capturedPreAct = preActivationBuffer;
+
+            // Fused forward: single kernel call replaces 3 steps.
+            // GELU path uses SIMD GELU (FusedGemmGeluGemm); ReLU path uses
+            // the scalar-Func variant — ReLU is cheap enough that the
+            // delegate dispatch isn't a bottleneck.
             fusedForward.Add(eng =>
             {
                 var inA = (float[])(object)capturedInput.GetDataArray();
@@ -3117,7 +3152,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var w2A = (float[])(object)capturedW2.GetDataArray();
                 var outA = (float[])(object)capturedOutput.GetDataArray();
                 var actA = (float[])(object)capturedActivated.GetDataArray();
-                FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, relu);
+                if (capturedIsGelu)
+                {
+                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
+                    FusedMultiLayerGemm.FusedGemmGeluGemm(inA, w1A, w2A, outA, actA, preA, cm, ck, ch, cn);
+                }
+                else
+                {
+                    FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, activation);
+                }
             });
 
             // Fused backward: pre-allocated workspace, zero alloc during replay
@@ -3142,11 +3185,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 Array.Clear(backwardWorkspace, 0, backwardWorkspace.Length);
 
-                FusedMultiLayerBackward.ComputeGradients(
-                    gOutArr, inA, w1A, w2A, actA,
-                    gW1, gW2, emptyBias, emptyBias, gIn,
-                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
-                    backwardWorkspace);
+                if (capturedIsGelu)
+                {
+                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
+                    FusedMultiLayerBackward.ComputeGradients(
+                        gOutArr, inA, w1A, w2A, actA, preA,
+                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        cm, ck, ch, cn, FusedMultiLayerBackward.GELUDerivative,
+                        backwardWorkspace);
+                }
+                else
+                {
+                    FusedMultiLayerBackward.ComputeGradients(
+                        gOutArr, inA, w1A, w2A, actA,
+                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
+                        backwardWorkspace);
+                }
 
                 capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
                 capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;
@@ -3160,6 +3215,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Skip past the fused group
             i += 2;
         }
+    }
+
+    /// <summary>
+    /// GELU forward — tanh approximation matching SimdKernels.GELUUnsafe so
+    /// the fused-FFN forward stays bit-equivalent to the unfused MatMul → GELU
+    /// → MatMul path. <c>GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float GeluTanhApprox(float x)
+    {
+        const float SQRT_2_OVER_PI = 0.7978845608028654f;
+        const float COEFF = 0.044715f;
+        float u = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
+        return 0.5f * x * (1f + MathF.Tanh(u));
     }
 }
 
