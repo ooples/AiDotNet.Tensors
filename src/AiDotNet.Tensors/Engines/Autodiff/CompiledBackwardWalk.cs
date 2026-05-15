@@ -353,6 +353,26 @@ internal static class CompiledBackwardWalk<T>
     }
 
     /// <summary>
+    /// Emits the <c>AccumulateGrad(state.Grads, entry.&lt;inputField&gt;,
+    /// gradLocal, engine)</c> call sequence. Common tail of every
+    /// inliner that accumulates a single computed gradient into a single
+    /// input — the bulk of them. Saves ~7 IL lines per inliner.
+    /// </summary>
+    private static void EmitAccumulateGradToInput(
+        ILGenerator il, LocalBuilder stateLocal, LocalBuilder entryRefLocal,
+        LocalBuilder gradLocal, FieldInfo gradsField, FieldInfo inputField,
+        MethodInfo accumulateGradMethod)
+    {
+        il.Emit(OpCodes.Ldloca, stateLocal);
+        il.Emit(OpCodes.Ldfld, gradsField);
+        il.Emit(OpCodes.Ldloc, entryRefLocal);
+        il.Emit(OpCodes.Ldfld, inputField);
+        il.Emit(OpCodes.Ldloc, gradLocal);
+        il.Emit(OpCodes.Ldarg_3);
+        il.Emit(OpCodes.Call, accumulateGradMethod);
+    }
+
+    /// <summary>
     /// Per-op IL emitter contract. Returns false to fall back to the
     /// generic specialised-call path; true means the inliner emitted
     /// the full per-entry IL itself.
