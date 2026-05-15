@@ -306,3 +306,27 @@ Setting `TensorCodecOptions.Current` with `EnableDataflowFusion=true, EnableAlge
 vs Phase D baseline 188 ms median: **within noise band** (or slightly slower). Either the optimization passes aren't engaging through this code path, or the workload doesn't benefit from them. Phase E does not add to Phase D's 29% win as the plan predicted.
 
 **Conclusion**: the 188 ms floor for CPU fresh-tape on this hardware is the achievable wall-time without algorithm or backend changes. Going below requires Phase G (MKL backend swap) or kernel-level inlining.
+
+### Phase F.1 — forward/backward split on CompiledModelCache path
+
+`StepTiming` (env var `AIDOTNET_STEP_TIMING=1`) wraps `CompiledTrainingPlan.Step()`'s forward/backward/optimizer phases independently. Measured on Issue #327 workload (d=128, L=4, B=32, ctx=64), 22 iters under CompiledModelCache replay:
+
+| Phase | ms/iter | % of recorded |
+|---|---:|---:|
+| Forward | 75.4 | 34.5% |
+| Backward | 142.8 | 65.5% |
+| Optimizer | 0.0 | 0% (none configured) |
+| **Total recorded** | **218.2** | — |
+
+Wall-clock for the same run: 215.7 ms — 3 ms of non-instrumented overhead is gradient-clear + loss-seed loops inside `Step()`. StepTiming wrappers are zero-cost when off (171.99 ms baseline matches pre-instrumentation 188 ms median within noise).
+
+**Plan re-direction:** the original Phase F hypothesis was "after Phase D, forward becomes the new bottleneck (~120ms forward / 30-50ms backward) — engage CSE + PointwiseFusion to shrink forward." The actual data inverts the assumption:
+
+- Backward is STILL 65.5% of wall-time on the Phase D path — 143 ms backward vs 75 ms forward.
+- The plan's predicted "1900× backward speedup via CompiledTrainingPlan" doesn't materialize on this workload. CompiledModelCache uses specialized + generic backward delegates, NOT the compiled-IL walker that the 1900× number came from.
+- Maximum saving from a perfect Phase F (forward → 0 ms) is 75 ms; Phase F.2 (engaging ICpuOptimizationPass pipeline in CompiledTrainingPlan, currently only run in CompiledInferencePlan) is bounded by this.
+
+**Next-step recommendation (data-driven, supersedes plan order):**
+1. Drill into the 143 ms backward — what's the per-function breakdown when running through CompiledTrainingPlan's specialized backward delegates? (Phase A profiled the walker path, not this one.)
+2. The MatMulBackward specialized-backward path uses `BlasProvider.TryGemmEx` directly. If OpenBLAS is the cap, Phase G.1 (MKL swap) is what closes the gap to ≤100 ms.
+3. Phase F.2 (engaging ForwardCSEPass + PointwiseFusionPass in CompiledTrainingPlan) is still worth ~10-20 ms of the 75 ms forward share, but is no longer the highest-leverage lever.

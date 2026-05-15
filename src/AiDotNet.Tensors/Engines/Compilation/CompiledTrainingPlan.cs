@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -216,8 +217,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public Tensor<T> Step()
     {
         var engine = _engine;
+        bool stepTiming = StepTiming.Enabled;
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
+        long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         if (_checkpointing is not null)
         {
             _checkpointing.ForwardWithCheckpoints();
@@ -228,6 +231,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < fwd.Length; i++)
                 fwd[i](engine);
         }
+        if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
@@ -266,12 +270,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Array.Copy(seedArr, destArr, seedArr.Length);
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
+        long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         var bwd = _backwardActions;
         for (int i = 0; i < bwd.Length; i++)
             bwd[i](engine);
+        if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
         // Fused optimizer update (if configured via ConfigureOptimizer)
+        long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         _optimizerUpdate?.Invoke();
+        if (stepTiming)
+        {
+            StepTiming.RecordOptimizer(Stopwatch.GetTimestamp() - optStart);
+            StepTiming.IncrementStepCount();
+        }
 
         return _lossOutput;
     }

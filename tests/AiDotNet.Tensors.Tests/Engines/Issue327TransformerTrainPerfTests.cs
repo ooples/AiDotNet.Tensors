@@ -433,6 +433,9 @@ public class Issue327TransformerTrainPerfTests
                 _output.WriteLine("# HARD FLOOR (≤200ms) HIT — Phase D delivers but not yet at soft target.");
             else
                 _output.WriteLine("# Phase D premise INVALID — CompiledModelCache does not deliver expected speedup on this workload.");
+
+            // Phase F.1: forward/backward/optimizer split when AIDOTNET_STEP_TIMING=1
+            AiDotNet.Tensors.Engines.Compilation.StepTiming.DumpAndReset(_output.WriteLine);
         }
         finally
         {
