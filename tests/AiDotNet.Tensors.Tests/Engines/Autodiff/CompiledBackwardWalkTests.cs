@@ -407,6 +407,60 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_ActivationInliners_ReluSigmoidTanhGelu_MatchesReference()
+    {
+        // Exercises the 4 activation backward inliners in a single tape
+        // and verifies gradients match the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { -0.5f, 0.3f, 1.2f, -0.7f }, new[] { 4 });
+
+                // Chain: GELU → Tanh → Sigmoid → ReLU all on a
+                var afterGelu = engine.GELU(a);
+                var afterTanh = engine.Tanh(afterGelu);
+                var afterSigmoid = engine.Sigmoid(afterTanh);
+                var afterRelu = engine.ReLU(afterSigmoid);
+                var loss = engine.ReduceSum(afterRelu);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 4; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_AllInliners_SubtractDivideNegateLog_MatchesReference()
     {
         // Exercises Subtract, Divide, Negate, Log inliners on one tape
