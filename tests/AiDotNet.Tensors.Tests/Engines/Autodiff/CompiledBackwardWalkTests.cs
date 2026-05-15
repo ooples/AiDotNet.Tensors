@@ -407,6 +407,64 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_AllInliners_SubtractDivideNegateLog_MatchesReference()
+    {
+        // Exercises Subtract, Divide, Negate, Log inliners on one tape
+        // and compares gradients against the reference dispatcher
+        // (override off).
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 4.0f, 8.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 1.0f, 2.0f, 4.0f }, new[] { 3 });
+
+                // y = log(neg(a - b) / b) — chains Subtract → Negate → Divide → Log
+                var diff = engine.TensorSubtract(a, b);
+                var negDiff = engine.TensorNegate(diff);
+                var ratio = engine.TensorDivide(negDiff, b);
+                // For log we need positive input; abs(ratio) keeps it positive.
+                var positive = engine.TensorAbs(ratio);
+                var y = engine.TensorLog(positive);
+                var loss = engine.ReduceSum(y);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 3; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_DoublePrecision_ProducesIdenticalGradients()
     {
         // Issue #338 Item 3: confirms the IL emitter works for closed
