@@ -1276,6 +1276,77 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Mixed-precision MHA scoring fanout via <c>cublasGemmEx</c>: input
+    /// Q / K are fp16 (or bf16), accumulator + output are fp32 — the
+    /// standard AMP pattern. Combines #335 multi-stream dispatch with
+    /// #337 mixed precision in one call.
+    /// </summary>
+    /// <param name="useBFloat16">When true, treats Q / K as bfloat16
+    /// instead of fp16. Requires compute capability >= 8.0 (Ampere+).</param>
+    public unsafe void MultiHeadAttentionScoresFanoutMixed(
+        IGpuBuffer Q, IGpuBuffer K, IGpuBuffer scores,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        bool useBFloat16 = false,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Q is null) throw new ArgumentNullException(nameof(Q));
+        if (K is null) throw new ArgumentNullException(nameof(K));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        if (useBFloat16 && _ccMajor < 8)
+            throw new NotSupportedException(
+                $"BFloat16 MHA requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
+
+        int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        long perHeadElems = (long)seqLen * headDim;
+        long perHeadScoreElems = (long)seqLen * seqLen;
+        long perBatchQK = perHeadElems * numHeads;
+        long perBatchS = perHeadScoreElems * numHeads;
+        long elemBytesIn = 2;        // fp16 / bf16
+        long elemBytesOut = sizeof(float);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr alphaPtr = (IntPtr)(&aVal);
+                    IntPtr betaPtr = (IntPtr)(&bVal);
+                    IntPtr qPtr = (IntPtr)((long)Q.Handle
+                        + (batchIdx * perBatchQK + headIdx * perHeadElems) * elemBytesIn);
+                    IntPtr kPtr = (IntPtr)((long)K.Handle
+                        + (batchIdx * perBatchQK + headIdx * perHeadElems) * elemBytesIn);
+                    IntPtr sPtr = (IntPtr)((long)scores.Handle
+                        + (batchIdx * perBatchS + headIdx * perHeadScoreElems) * elemBytesOut);
+
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasGemmEx(
+                            _cublasHandle,
+                            CublasOperation.Transpose, CublasOperation.None,
+                            seqLen, seqLen, headDim,
+                            alphaPtr,
+                            kPtr, inDtype, headDim,
+                            qPtr, inDtype, headDim,
+                            betaPtr,
+                            sPtr, CuBlasNative.CUDA_R_32F, seqLen,
+                            CuBlasNative.CUBLAS_COMPUTE_32F,
+                            0 /* CUBLAS_GEMM_DEFAULT */),
+                        $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
     /// Multi-head attention output projection fanout: for each head,
     /// computes <c>output[h] = attention[h] · V[h]</c>. Companion to
     /// <see cref="MultiHeadAttentionScoresFanout"/>; the two together
