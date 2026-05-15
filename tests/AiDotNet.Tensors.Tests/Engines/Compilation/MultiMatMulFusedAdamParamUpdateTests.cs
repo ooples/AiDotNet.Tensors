@@ -585,6 +585,11 @@ public class MultiMatMulFusedAdamParamUpdateTests
         var beta  = FilledRand(new[] { feat }, seed: 85);
         for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
 
+        var beforeW     = W    .GetDataArray().AsSpan().ToArray();
+        var beforeB     = b    .GetDataArray().AsSpan().ToArray();
+        var beforeGamma = gamma.GetDataArray().AsSpan().ToArray();
+        var beforeBeta  = beta .GetDataArray().AsSpan().ToArray();
+
         ICompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.Enable())
         {
@@ -596,17 +601,30 @@ public class MultiMatMulFusedAdamParamUpdateTests
 
         using (plan)
         {
+            plan.ConfigureOptimizer(
+                OptimizerType.Adam,
+                learningRate: 0.01f,
+                beta1: 0.9f,
+                beta2: 0.999f,
+                eps: 1e-8f,
+                weightDecay: 0f);
             plan.Step();
-            string[] names = { "W", "b", "gamma", "beta" };
-            for (int i = 0; i < plan.Gradients.Length; i++)
-            {
-                var g = plan.Gradients[i];
-                if (g is null) { _output.WriteLine($"  gradient[{i}] {names[i]} = NULL"); continue; }
-                double gL2 = 0; var gSpan = g.AsSpan();
-                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
-                gL2 = System.Math.Sqrt(gL2);
-                _output.WriteLine($"  gradient[{i}] {names[i]} L2={gL2:E6}");
-            }
+
+            double dW     = L2Delta(beforeW    , W    .GetDataArray().AsSpan().ToArray());
+            double dB     = L2Delta(beforeB    , b    .GetDataArray().AsSpan().ToArray());
+            double dGamma = L2Delta(beforeGamma, gamma.GetDataArray().AsSpan().ToArray());
+            double dBeta  = L2Delta(beforeBeta , beta .GetDataArray().AsSpan().ToArray());
+            _output.WriteLine($"L2(ΔW)={dW:E6}  L2(Δb)={dB:E6}  L2(Δγ)={dGamma:E6}  L2(Δβ)={dBeta:E6}");
+
+            // gamma is the canary for the AiDotNet#1331 fingerprint: pre-fix
+            // gradGamma was 0 because the LayerNorm savedState mean/variance
+            // were stale-from-compile-time zeros. Asserting γ moves is the
+            // direct regression check; W/b/β must also move because the loss
+            // routes through them.
+            Assert.True(dGamma > 1e-7, $"γ stuck (L2={dGamma:E6}) — LayerNorm savedState mean/variance is not being refreshed at plan.Step.");
+            Assert.True(dBeta  > 1e-7, $"β stuck (L2={dBeta:E6})");
+            Assert.True(dW     > 1e-7, $"W stuck (L2={dW:E6}) — gradient chain through LayerNorm's dL/dInput is broken.");
+            Assert.True(dB     > 1e-7, $"b stuck (L2={dB:E6})");
         }
     }
 
@@ -638,16 +656,24 @@ public class MultiMatMulFusedAdamParamUpdateTests
 
         using (plan)
         {
+            plan.ConfigureOptimizer(
+                OptimizerType.Adam,
+                learningRate: 0.01f,
+                beta1: 0.9f,
+                beta2: 0.999f,
+                eps: 1e-8f,
+                weightDecay: 0f);
             plan.Step();
-            for (int i = 0; i < plan.Gradients.Length; i++)
-            {
-                var g = plan.Gradients[i];
-                if (g is null) { _output.WriteLine($"  gradient[{i}] = NULL"); continue; }
-                double gL2 = 0; var gSpan = g.AsSpan();
-                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
-                gL2 = System.Math.Sqrt(gL2);
-                _output.WriteLine($"  gradient[{i}] L2={gL2:E6}");
-            }
+
+            double dGamma = L2Delta(beforeGamma, gamma.GetDataArray().AsSpan().ToArray());
+            double dBeta  = L2Delta(beforeBeta , beta .GetDataArray().AsSpan().ToArray());
+            _output.WriteLine($"L2(Δγ)={dGamma:E6}  L2(Δβ)={dBeta:E6}");
+
+            // Single-op LayerNorm baseline: both γ and β must update on the
+            // first Adam step. If γ doesn't move here, the AiDotNet#1331
+            // mean/variance refresh fix is broken even in the simplest case.
+            Assert.True(dGamma > 1e-7, $"γ stuck (L2={dGamma:E6})");
+            Assert.True(dBeta  > 1e-7, $"β stuck (L2={dBeta:E6})");
         }
     }
 
@@ -696,24 +722,35 @@ public class MultiMatMulFusedAdamParamUpdateTests
 
         using (plan)
         {
-            // Probe: call plan.Step() WITHOUT configuring the optimizer so we
-            // can inspect plan.Gradients directly. Then re-step with the optimizer.
+            plan.ConfigureOptimizer(
+                OptimizerType.Adam,
+                learningRate: 0.01f,
+                beta1: 0.9f,
+                beta2: 0.999f,
+                eps: 1e-8f,
+                weightDecay: 0f);
             plan.Step();
-            string[] names = { "W1", "b1", "gamma", "beta", "W2", "b2" };
-            for (int i = 0; i < plan.Gradients.Length; i++)
+
+            var deltas = new (string name, double l2)[]
             {
-                var g = plan.Gradients[i];
-                if (g is null)
-                {
-                    _output.WriteLine($"  gradient[{i}] {names[i]} = NULL");
-                    continue;
-                }
-                double gL2 = 0;
-                var gSpan = g.AsSpan();
-                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
-                gL2 = System.Math.Sqrt(gL2);
-                _output.WriteLine($"  gradient[{i}] {names[i]}  shape=[{string.Join(",", g.Shape.ToArray())}]  L2={gL2:E6}");
-            }
+                ("W1",    L2Delta(beforeW1   , W1   .GetDataArray().AsSpan().ToArray())),
+                ("b1",    L2Delta(beforeB1   , b1   .GetDataArray().AsSpan().ToArray())),
+                ("gamma", L2Delta(beforeGamma, gamma.GetDataArray().AsSpan().ToArray())),
+                ("beta",  L2Delta(beforeBeta , beta .GetDataArray().AsSpan().ToArray())),
+                ("W2",    L2Delta(beforeW2   , W2   .GetDataArray().AsSpan().ToArray())),
+                ("b2",    L2Delta(beforeB2   , b2   .GetDataArray().AsSpan().ToArray())),
+            };
+            foreach (var (name, l2) in deltas)
+                _output.WriteLine($"  [{(l2 > 1e-7 ? "MOVED" : "STUCK")}] {name}  L2(Δ)={l2:E6}");
+
+            // The exact AiDotNet#1331 fingerprint at the LayerNorm-sandwich
+            // pattern: pre-fix gradGamma=0 plus broken dL/dInput propagation
+            // froze W1, b1, γ AND left β/W2/b2 looking deceptively healthy.
+            // Every single leaf parameter MUST move on the first Adam step.
+            foreach (var (name, l2) in deltas)
+                Assert.True(l2 > 1e-7,
+                    $"{name} stuck (L2={l2:E6}). The LayerNorm savedState mean/variance " +
+                    "refresh fix (or its dL/dInput chain) regressed.");
         }
     }
 
