@@ -18395,18 +18395,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
-                        // Always go through the out-param eager LayerNorm so we
-                        // have fresh mean/variance for the backward. The
-                        // LayerNormFloatInto fast path skipped this — which
-                        // is what caused #1331. The previous "fast" path is
-                        // re-introducible later as an option once a
-                        // mean+var write-through overload exists.
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         r.AsSpan().CopyTo(output.AsWritableSpan());
-                        // Mean/variance are per-batch tensors of shape
-                        // [batchSize]; copy element-by-element into the
-                        // SAME tensors the savedState slot references so
-                        // LayerNormBackward reads the just-computed values.
                         freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
                         freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
                     },
