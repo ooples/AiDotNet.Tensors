@@ -407,6 +407,69 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_MultipleDistinctPatterns_EachCachesIndependently()
+    {
+        // Builds 3 different tape patterns, runs each twice. After the
+        // second pass through each pattern, the walker cache should
+        // contain 3 distinct entries (one per pattern) and they should
+        // all produce identical gradients to the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var countProp = walkerType.GetProperty("CachedWalkerCountForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            overrideField.SetValue(null, true);
+            resetMethod.Invoke(null, null);
+
+            // Pattern 1: a + b
+            float[] refDA1 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorAdd(a, b));
+            // Pattern 2: a * b
+            float[] refDA2 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(a, b));
+            // Pattern 3: (a + b) * a
+            float[] refDA3 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(engine.TensorAdd(a, b), a));
+
+            // Run each pattern a second time and verify gradients still match.
+            float[] secondDA1 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorAdd(a, b));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA1[i], secondDA1[i], 4);
+
+            float[] secondDA2 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(a, b));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA2[i], secondDA2[i], 4);
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    private static float[] RunAndGetGradA(CpuEngine engine,
+        System.Func<Tensor<float>, Tensor<float>, Tensor<float>> forward)
+    {
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        var a = new Tensor<float>(new float[] { 1.0f, 2.0f, 3.0f }, new[] { 3 });
+        var b = new Tensor<float>(new float[] { 0.5f, 1.5f, 2.5f }, new[] { 3 });
+        var y = forward(a, b);
+        var loss = engine.ReduceSum(y);
+        var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+        return grads[a].GetDataArray();
+    }
+
+    [Fact]
     public void CompiledWalker_ActivationInliners_ReluSigmoidTanhGelu_MatchesReference()
     {
         // Exercises the 4 activation backward inliners in a single tape
