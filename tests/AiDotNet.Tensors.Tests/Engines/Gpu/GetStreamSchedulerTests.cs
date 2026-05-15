@@ -91,6 +91,72 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void MultiHeadAttentionScoresFanout_RunsToCompletion_OnMultiStreamHost()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        // BERT-base-ish but small: B=2, H=4, S=64, D=32.
+        const int batch = 2, numHeads = 4, seqLen = 64, headDim = 32;
+        long qkElems = (long)batch * numHeads * seqLen * headDim;
+        long scoreElems = (long)batch * numHeads * seqLen * seqLen;
+
+        using var q = backend.AllocateBuffer((int)qkElems);
+        using var k = backend.AllocateBuffer((int)qkElems);
+        using var scores = backend.AllocateBuffer((int)scoreElems);
+
+        try
+        {
+            cudaBackend.MultiHeadAttentionScoresFanout(q, k, scores, batch, numHeads, seqLen, headDim, scheduler);
+        }
+        catch (System.Exception thrown)
+        {
+            if (thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
+                return;
+            throw;
+        }
+    }
+
+    [Fact]
+    public void MultiHeadAttentionOutputFanout_RunsToCompletion_OnMultiStreamHost()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        const int batch = 2, numHeads = 4, seqLen = 64, headDim = 32;
+        long attElems = (long)batch * numHeads * seqLen * seqLen;
+        long vElems = (long)batch * numHeads * seqLen * headDim;
+        long oElems = (long)batch * numHeads * seqLen * headDim;
+
+        using var attn = backend.AllocateBuffer((int)attElems);
+        using var v = backend.AllocateBuffer((int)vElems);
+        using var output = backend.AllocateBuffer((int)oElems);
+
+        try
+        {
+            cudaBackend.MultiHeadAttentionOutputFanout(attn, v, output, batch, numHeads, seqLen, headDim, scheduler);
+        }
+        catch (System.Exception thrown)
+        {
+            if (thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
+                return;
+            throw;
+        }
+    }
+
+    [Fact]
     public void BatchedGemmFanout_FansSlicesAcrossStreams_OnMultiStreamHost()
     {
         // Issue #335 items 3+4 production wiring test: CudaBackend's
