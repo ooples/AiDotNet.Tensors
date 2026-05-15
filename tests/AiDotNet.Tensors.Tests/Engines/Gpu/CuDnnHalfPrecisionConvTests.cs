@@ -132,6 +132,146 @@ public class CuDnnHalfPrecisionConvTests
     }
 
     [Fact]
+    public void Conv2DBackwardDataGpu_AcceptsHalfDtype_WithoutThrowing()
+    {
+        if (!CuDnnAvailable) return;
+
+        CuDnnContext? ctx = null;
+        try { ctx = new CuDnnContext(); }
+        catch { return; }
+
+        using (ctx)
+        using (var conv = new CuDnnConvolution(ctx))
+        {
+            const int n = 1, c = 4, h = 8, w = 8;
+            const int k = 4, fh = 3, fw = 3;
+            int outH = h - fh + 1;
+            int outW = w - fw + 1;
+
+            int dyElems = n * k * outH * outW;
+            int filterElems = k * c * fh * fw;
+            int dxElems = n * c * h * w;
+
+            using var gpuFlt = ctx.Allocate<ushort>(filterElems);
+            using var gpuDy = ctx.Allocate<ushort>(dyElems);
+            using var gpuDx = ctx.Allocate<ushort>(dxElems);
+
+            ctx.CopyToDevice(gpuFlt, new ushort[filterElems]);
+            ctx.CopyToDevice(gpuDy, new ushort[dyElems]);
+
+            var ex = Record.Exception(() =>
+                conv.Conv2DBackwardDataGpu(
+                    gpuFlt.DevicePtr, gpuDy.DevicePtr, gpuDx.DevicePtr,
+                    n, c, h, w, k, fh, fw, outH, outW,
+                    dataType: CuDnnNative.CudnnDataType.Half));
+
+            if (ex is InvalidOperationException &&
+                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
+                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+                return;
+            Assert.Null(ex);
+        }
+    }
+
+    [Fact]
+    public void Conv2DBackwardFilterGpu_AcceptsHalfDtype_WithoutThrowing()
+    {
+        if (!CuDnnAvailable) return;
+
+        CuDnnContext? ctx = null;
+        try { ctx = new CuDnnContext(); }
+        catch { return; }
+
+        using (ctx)
+        using (var conv = new CuDnnConvolution(ctx))
+        {
+            const int n = 1, c = 4, h = 8, w = 8;
+            const int k = 4, fh = 3, fw = 3;
+            int outH = h - fh + 1;
+            int outW = w - fw + 1;
+
+            int xElems = n * c * h * w;
+            int dyElems = n * k * outH * outW;
+            int dwElems = k * c * fh * fw;
+
+            using var gpuX = ctx.Allocate<ushort>(xElems);
+            using var gpuDy = ctx.Allocate<ushort>(dyElems);
+            using var gpuDw = ctx.Allocate<ushort>(dwElems);
+
+            ctx.CopyToDevice(gpuX, new ushort[xElems]);
+            ctx.CopyToDevice(gpuDy, new ushort[dyElems]);
+
+            var ex = Record.Exception(() =>
+                conv.Conv2DBackwardFilterGpu(
+                    gpuX.DevicePtr, gpuDy.DevicePtr, gpuDw.DevicePtr,
+                    n, c, h, w, k, fh, fw, outH, outW,
+                    dataType: CuDnnNative.CudnnDataType.Half));
+
+            if (ex is InvalidOperationException &&
+                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
+                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+                return;
+            Assert.Null(ex);
+        }
+    }
+
+    [Fact]
+    public void SoftmaxForwardGpu_AcceptsHalfDtype_WithoutThrowing()
+    {
+        if (!CuDnnAvailable) return;
+
+        CuDnnContext? ctx = null;
+        try { ctx = new CuDnnContext(); }
+        catch { return; }
+
+        using (ctx)
+        using (var softmax = new CuDnnSoftmax(ctx))
+        {
+            const int n = 2, c = 16, h = 1, w = 1;
+            int elems = n * c * h * w;
+
+            using var gpuIn = ctx.Allocate<ushort>(elems);
+            using var gpuOut = ctx.Allocate<ushort>(elems);
+            ctx.CopyToDevice(gpuIn, new ushort[elems]);
+
+            var ex = Record.Exception(() =>
+                softmax.ForwardGpu(
+                    gpuIn.DevicePtr, gpuOut.DevicePtr, n, c, h, w,
+                    dataType: CuDnnNative.CudnnDataType.Half));
+
+            if (ex is InvalidOperationException &&
+                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
+                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+                return;
+            Assert.Null(ex);
+        }
+    }
+
+    [Fact]
+    public void SoftmaxForwardGpu_DefaultDtype_PreservesFloatBehavior()
+    {
+        if (!CuDnnAvailable) return;
+
+        CuDnnContext? ctx = null;
+        try { ctx = new CuDnnContext(); }
+        catch { return; }
+
+        using (ctx)
+        using (var softmax = new CuDnnSoftmax(ctx))
+        {
+            const int n = 1, c = 8, h = 1, w = 1;
+            int elems = n * c;
+            using var gpuIn = ctx.Allocate<float>(elems);
+            using var gpuOut = ctx.Allocate<float>(elems);
+            ctx.CopyToDevice(gpuIn, new float[elems]);
+
+            var ex = Record.Exception(() =>
+                softmax.ForwardGpu(gpuIn.DevicePtr, gpuOut.DevicePtr, n, c, h, w));
+            Assert.Null(ex);
+        }
+    }
+
+    [Fact]
     public void Conv2DForwardGpu_DefaultDtype_IsFloat_PreservesExistingBehavior()
     {
         if (!CuDnnAvailable) return;
