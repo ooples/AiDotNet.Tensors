@@ -507,13 +507,68 @@ Forward/backward split with both spec paths active:
 
 Slice spec contributed ~13 ms backward reduction (matches Phase F.2's predicted impact). GELU backward spec contributed ~5-10 ms.
 
-**Cumulative wall-time delivery (Issue #338, d=128 Transformer workload):**
+### Phase G.4 — `EnableFrozenWeightOptimizations()` opt-in for pre-packed B
+
+Adds an unsafe opt-in API to `ICompiledTrainingPlan` that rebuilds forward MatMul fast paths with `allowCachedB=true`. Default training behaviour is unchanged — callers that hold weights frozen across `Step()` calls (eval, inference, fine-tuning with frozen layers, benchmark rigs) opt in to amortise PackB cost across replays. After opt-in, in-place weight mutation invalidates the cached pack and produces wrong outputs — unsafe contract.
+
+10-run wall-time with G.4 layered onto G.3:
+
+| Stage | Median | Min | Max | Spread |
+|---|---:|---:|---:|---:|
+| Phase G.3 prior | 142 | 138 | 172 | 34 |
+| Phase G.4 frozen-weights opt-in | **135** | 129 | 146 | 17 |
+
+7ms median improvement + halved variance.
+
+### Phase G.5 — BF16 mixed-precision GEMM via Intel MKL (opt-in, hardware-dependent)
+
+Added `intelmkl.redist.win-x64` v2026.0.0.901 NuGet (full Intel MKL, ships `mkl_rt.3.dll` ~28MB + libiomp5 + tbb + others, ~500MB win-x64 native footprint). The smaller `Microsoft.ML.Mkl.Redist` (used in G.1) strips MKL to FP32/FP64 GEMM exports only — BF16 symbols are in the full MKL distribution.
+
+Components:
+1. P/Invoke `cblas_gemm_bf16bf16f32` against `mkl_rt.3`
+2. SIMD (AVX2) `Fp32ToBf16Bulk` with round-to-nearest-even
+3. Smoke-perf probe gate (256×256×256 FP32 vs BF16, ≥1.3× requirement) auto-disables BF16 on CPUs without AVX-512-BF16
+4. Forward + backward MatMul specs route through BF16 when `BlasProvider.UseMklBf16` is true AND N ≤ 1024 (skip LM head where dC conversion dominates)
+5. Trust contract: weights are pre-converted to BF16 once and cached — in-place weight updates produce wrong outputs
+
+Measured impact on this dev machine (AMD Ryzen 7 4800H Zen 2, NO AVX-512 at all):
+- BF16 GEMM correctness verified (4×4×4 within 1% of FP32)
+- Kernel A/B (M=2048, K=N=128): FP32=0.488ms, BF16=0.442ms (1.10× speedup) — below the 1.3× gate
+- Probe correctly REFUSES BF16 → no engagement → baseline wall-time preserved (median ~150ms with `mkl`)
+- Future AVX-512-BF16 hardware (Cooper Lake/Sapphire Rapids/Granite Rapids) will pass the probe and engage BF16
+
+Deployment caveat: loading `mkl_rt.3.dll` alongside `MklImports.dll` ships competing `libiomp5md.dll` OpenMP runtimes, which on the dev machine regressed FP32 GEMM throughput substantially. The probe only runs when the user explicitly opts into `mkl-bf16`, deferring the `mkl_rt` load. Users on `mkl` (no BF16) are unaffected.
+
+### Phase G.6 — Cross-layer MatMul→MatMul fusion (opt-in, workload-dependent)
+
+Detects consecutive MatMul[i] → MatMul[i+1] chains where the intermediate has only one consumer, and pre-packs `W_fused = W1 @ W2` at compile time. Replaces the two-MatMul forward with a single `input @ W_fused` call and uses chain-rule decomposition on dW_fused for the backward:
+- `dW_fused = input^T @ gradOutput`
+- `dW1 = dW_fused @ W2^T` (small)
+- `dW2 = W1^T @ dW_fused` (small)
+- `dInput = gradOutput @ W_fused^T`
+
+For the Transformer FFN's `attnOut = qProxy @ Wo` then `f1 = attnOut @ W_ffn1`, this saves the intermediate materialization AND replaces a large (M, H, N) backward GEMM with two small (K, H, N) ones. Net theoretical: ~15% fewer MACs per fused chain.
+
+**Empirically REGRESSES on the Issue #327 d=128 workload** despite less arithmetic — likely cache-pattern disruption (the two separate MatMuls fit cache better than one bigger fused MatMul at these small shapes). 10-run median: 234 ms with fusion vs 142 ms baseline.
+
+Resolution: gate behind `AIDOTNET_CROSS_LAYER_FUSION=1` env var. Default off. Workloads with larger H (e.g., wider FFN) may benefit; ship the infrastructure but make engagement explicit pending a shape-based heuristic.
+
+All 540 GradientCorrectness + FusedLinear + Autodiff tests pass with the opt-in engaged — backward gradients via chain rule on W_fused are numerically equivalent to the unfused path.
+
+### Cumulative wall-time delivery (Issue #338, d=128 Transformer workload)
 
 | Phase | Median ms | vs prior | Cumulative |
 |---|---:|---:|---:|
 | OpenBLAS baseline | 211 | — | — |
 | Phase G.1 (MKL routing) | 196 | -7% | -7% |
 | Phase G.2 (cleanup) | 162 | -17% | -23% |
-| Phase G.3 (slice + GELU spec) | **142** | **-12%** | **-33%** |
+| Phase G.3 (slice + GELU + sum spec) | 142 | -12% | -33% |
+| **Phase G.4 (frozen-weights opt-in)** | **135** | **-5%** | **-36%** |
+| Phase G.5 (BF16, opt-in, hardware-disabled here) | 135 | 0% | -36% |
+| Phase G.6 (cross-layer fusion, opt-in, regresses here) | 137 | +1% | -35% |
 
-HARD FLOOR ≤200ms hit on every run; SOFT TARGET ≤100ms still 42ms away. Backward MatMul (~65ms via MKL) is the remaining floor — closing further needs FP16/BF16 mixed precision, or algorithmic changes like combined-multi-head attention.
+**HARD FLOOR ≤200 ms hit on every run.** SOFT TARGET ≤100 ms still 35-37ms away. The remaining gap is dominated by the LM head MatMul (2.1B MACs forward × 2 backward GEMMs) which is kernel-optimal at MKL for these shapes on this CPU.
+
+Path to ≤100ms is genuinely hardware-dependent:
+- **With AVX-512-BF16 hardware** (Cooper Lake / Sapphire Rapids / Zen 4 Genoa+): Phase G.5 BF16 would engage automatically via the smoke-perf gate, delivering an estimated 30-50ms reduction. Plus G.6 cross-layer fusion may flip from regression to benefit at larger workloads.
+- **Without AVX-512-BF16** (this AMD Zen 2 dev box, pre-Cooper-Lake Intel): the 135ms floor is the achievable wall-time without algorithmic changes specific to the loss function.

@@ -3211,6 +3211,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // 200+ line SIMD effort tracked as a follow-up.
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
 
+        // Issue #338 Phase G.6: detect consecutive MatMul→MatMul chains
+        // (no op between them) and pre-pack the fused weight at compile
+        // time. Required: float, 2D weights, ND×2D input contiguous,
+        // intermediate has only one consumer, MKL or BLAS available.
+        // The fused forward replaces two MatMuls with a single
+        // input @ (W1 @ W2) call. Fused backward recovers the intermediate
+        // gradient via chain rule on W_fused:
+        //   dW_fused = input^T @ gradOutput
+        //   dW1 = dW_fused @ W2^T   (small: K×N×H)
+        //   dW2 = W1^T @ dW_fused   (small: K×H×N)
+        //   dInput = gradOutput @ W_fused^T
+        // Net savings: skip materializing the [M, H] intermediate in
+        // forward + replace one large (M, H, N) backward GEMM with two
+        // small (K, H, N) and (K, H, N) ones.
+        //
+        // Opt-in: set AIDOTNET_CROSS_LAYER_FUSION=1. Empirically on the
+        // Issue #327 d=128 workload, fusion regresses wall-time despite
+        // doing ~15% less arithmetic work — likely cache-pattern
+        // disruption (the two separate MatMuls fit cache better than
+        // one bigger fused MatMul). Workloads with larger H may benefit;
+        // ship the infrastructure but make engagement explicit until
+        // we have a shape-based heuristic.
+        if (typeof(T) == typeof(float)
+            && Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION") == "1")
+        {
+            TryFuseMatMulMatMul(steps, gradMap, consumerCount, fusedForward, fusedBackward, consumedIndices);
+        }
+
         for (int i = 0; i + 2 < steps.Count; i++)
         {
             if (consumedIndices.Contains(i)) continue;
@@ -3548,6 +3576,171 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         const float COEFF = 0.044715f;
         float u = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
         return 0.5f * x * (1f + MathF.Tanh(u));
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.6: cross-layer MatMul→MatMul fusion. Detects
+    /// pairs of consecutive MatMul steps where the intermediate is
+    /// single-consumer and replaces them with a single fused MatMul
+    /// using a pre-packed W_fused = W1 @ W2.
+    ///
+    /// <para>Forward savings: one MatMul instead of two (saves
+    /// (M, K, H) work where H is the intermediate hidden dim) + skip
+    /// intermediate materialization.</para>
+    /// <para>Backward savings: replace the dominant intermediate-sized
+    /// (M, H, N) GEMM with two smaller (K, H, N) and (K, K, H) ones
+    /// via chain rule on W_fused. Requires the intermediate to be
+    /// single-consumer (the gradient signal flows to dW1 and dW2 only
+    /// through dW_fused, never directly).</para>
+    /// </summary>
+    private static unsafe void TryFuseMatMulMatMul(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        List<Action<IEngine>> fusedForward,
+        List<Action<IEngine>> fusedBackward,
+        HashSet<int> consumedIndices)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 1 < steps.Count; i++)
+        {
+            if (consumedIndices.Contains(i) || consumedIndices.Contains(i + 1)) continue;
+
+            var step0 = steps[i];
+            var step1 = steps[i + 1];
+
+            if (step0.OpName != "TensorMatMul" || step1.OpName != "TensorMatMul") continue;
+            if (step0.Inputs.Length != 2 || step1.Inputs.Length != 2) continue;
+            if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0])) continue;
+
+            // Intermediate must be single-consumer for chain-rule fusion
+            // to be valid; multi-consumer intermediates leak gradients
+            // through paths the fused chain can't see.
+            if (consumerCount.TryGetValue(step0.OutputBuffer, out int interCount) && interCount > 1)
+                continue;
+
+            var inputA = step0.Inputs[0];     // [...batch, K]
+            var W1 = step0.Inputs[1];         // [K, H]
+            var W2 = step1.Inputs[1];         // [H, N]
+            var output = step1.OutputBuffer;  // [...batch, N]
+
+            if (inputA.Rank < 2 || W1.Rank != 2 || W2.Rank != 2) continue;
+            if (!inputA.IsContiguous || !W1.IsContiguous || !W2.IsContiguous || !output.IsContiguous)
+                continue;
+
+            int K = inputA._shape[inputA.Rank - 1];
+            int H = W1._shape[1];
+            int N = W2._shape[1];
+            if (W1._shape[0] != K || W2._shape[0] != H) continue;
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+
+            // Pre-pack W_fused = W1 @ W2 at compile time. Allocated here
+            // so the closure captures a stable reference. ONE pre-pack
+            // cost (compile-time, never replayed).
+            var w1Data = (float[])(object)W1.GetDataArray();
+            var w2Data = (float[])(object)W2.GetDataArray();
+            var wFused = new float[K * N];
+            if (!BlasProvider.TryGemm(K, N, H, w1Data, 0, H, w2Data, 0, N, wFused, 0, N))
+            {
+                SimdGemm.Sgemm(w1Data.AsSpan(0, K * H), w2Data.AsSpan(0, H * N), wFused.AsSpan(0, K * N), K, H, N);
+            }
+
+            // Forward: single MatMul input @ W_fused → output. Skip
+            // intermediate materialization.
+            var capturedInput = inputA;
+            var capturedOutput = output;
+            var capturedW1 = W1;
+            var capturedW2 = W2;
+            int cM = M, cK = K, cH = H, cN = N;
+            float[] cWFused = wFused;
+            var capturedGradMap = gradMap;
+
+            fusedForward.Add(eng =>
+            {
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var outArr = (float[])(object)capturedOutput.GetDataArray();
+                if (!BlasProvider.TryGemm(cM, cN, cK, inArr, 0, cK, cWFused, 0, cN, outArr, 0, cN))
+                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cWFused.AsSpan(0, cK * cN),
+                        outArr.AsSpan(0, cM * cN), cM, cK, cN);
+            });
+
+            // Pre-allocate dW_fused scratch (compile-time, reused per call).
+            var dWFused = new float[K * N];
+
+            fusedBackward.Add(eng =>
+            {
+                if (!capturedGradMap.TryGetValue(capturedOutput, out var gradOut)) return;
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var w1Arr = (float[])(object)capturedW1.GetDataArray();
+                var w2Arr = (float[])(object)capturedW2.GetDataArray();
+
+                // dW_fused = input^T @ gradOut  [K, N]
+                if (!BlasProvider.TryGemmEx(cK, cN, cM,
+                        inArr, 0, cK, true,
+                        gOutArr, 0, cN, false,
+                        dWFused, 0, cN))
+                {
+                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cK, true,
+                        gOutArr.AsSpan(0, cM * cN), cN, false,
+                        dWFused.AsSpan(0, cK * cN), cK, cM, cN);
+                }
+
+                // dW1 = dW_fused @ W2^T  [K, H]  (chain rule on W_fused = W1 @ W2)
+                if (capturedGradMap.TryGetValue(capturedW1, out var gW1Tensor))
+                {
+                    var gW1 = (float[])(object)gW1Tensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cK, cH, cN,
+                            dWFused, 0, cN, false,
+                            w2Arr, 0, cN, true,
+                            gW1, 0, cH))
+                    {
+                        SimdGemm.Sgemm(dWFused.AsSpan(0, cK * cN), cN, false,
+                            w2Arr.AsSpan(0, cH * cN), cN, true,
+                            gW1.AsSpan(0, cK * cH), cK, cN, cH);
+                    }
+                    capturedW1.Grad = gW1Tensor;
+                }
+
+                // dW2 = W1^T @ dW_fused  [H, N]
+                if (capturedGradMap.TryGetValue(capturedW2, out var gW2Tensor))
+                {
+                    var gW2 = (float[])(object)gW2Tensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cH, cN, cK,
+                            w1Arr, 0, cH, true,
+                            dWFused, 0, cN, false,
+                            gW2, 0, cN))
+                    {
+                        SimdGemm.Sgemm(w1Arr.AsSpan(0, cK * cH), cH, true,
+                            dWFused.AsSpan(0, cK * cN), cN, false,
+                            gW2.AsSpan(0, cH * cN), cH, cK, cN);
+                    }
+                    capturedW2.Grad = gW2Tensor;
+                }
+
+                // dInput = gradOut @ W_fused^T  [M, K]
+                if (capturedGradMap.TryGetValue(capturedInput, out var gInTensor))
+                {
+                    var gIn = (float[])(object)gInTensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cM, cK, cN,
+                            gOutArr, 0, cN, false,
+                            cWFused, 0, cN, true,
+                            gIn, 0, cK))
+                    {
+                        SimdGemm.Sgemm(gOutArr.AsSpan(0, cM * cN), cN, false,
+                            cWFused.AsSpan(0, cK * cN), cN, true,
+                            gIn.AsSpan(0, cM * cK), cM, cN, cK);
+                    }
+                    capturedInput.Grad = gInTensor;
+                }
+            });
+
+            consumedIndices.Add(i);
+            consumedIndices.Add(i + 1);
+            i++; // Skip past i+1 — already consumed
+        }
     }
 }
 
