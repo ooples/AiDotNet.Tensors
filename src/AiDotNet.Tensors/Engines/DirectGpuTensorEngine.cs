@@ -8157,6 +8157,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
+        // lazy-graph recording branch that emits a backward node for the
+        // compiled plan. The GPU eager path below would silently bypass
+        // GraphMode, leaving the LayerNorm out of the compiled graph entirely
+        // and dropping gradients for every parameter upstream of the norm.
+        if (Compilation.GraphMode.IsActive)
+            return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
