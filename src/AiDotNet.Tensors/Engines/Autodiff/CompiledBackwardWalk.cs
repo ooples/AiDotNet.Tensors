@@ -266,6 +266,29 @@ internal static class CompiledBackwardWalk<T>
         if (divMethod is not null)
             registry[divMethod] = new DivideBackwardInliner();
 
+        // Activation backward inliners — common in deep learning hot
+        // paths (ReLU / Sigmoid / Tanh / GELU all appear in transformer
+        // FFN + attention residuals).
+        var reluMethod = bwdType.GetMethod("ReLUBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (reluMethod is not null)
+            registry[reluMethod] = new ReluBackwardInliner();
+
+        var sigmoidMethod = bwdType.GetMethod("SigmoidBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (sigmoidMethod is not null)
+            registry[sigmoidMethod] = new SigmoidBackwardInliner();
+
+        var tanhMethod = bwdType.GetMethod("TanhBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (tanhMethod is not null)
+            registry[tanhMethod] = new TanhBackwardInliner();
+
+        var geluMethod = bwdType.GetMethod("GELUBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (geluMethod is not null)
+            registry[geluMethod] = new GeluBackwardInliner();
+
         return registry;
     }
 
@@ -658,6 +681,165 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, input1Field);
             il.Emit(OpCodes.Ldloc, gradBLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>ReLUBackward</c>: dispatches via engine.ReluBackward.
+    /// Skips inputs[]/savedState/output dispatch overhead — direct
+    /// engine.ReluBackward call + AccumulateGrad.
+    /// </summary>
+    private sealed class ReluBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_reluBackwardMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.ReluBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.ReluBackward(gradOutput, entry.Input0)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Callvirt, s_reluBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            // AccumulateGrad(state.Grads, entry.Input0, grad, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>SigmoidBackward</c>: dispatches via engine.SigmoidBackward(grad, output)
+    /// — the kernel uses the cached forward output, not the input.
+    /// </summary>
+    private sealed class SigmoidBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_sigmoidBackwardMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.SigmoidBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.SigmoidBackward(gradOutput, entry.Output)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, outputField);
+            il.Emit(OpCodes.Callvirt, s_sigmoidBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>TanhBackward</c>: dispatches via engine.TanhBackward(grad, output).
+    /// </summary>
+    private sealed class TanhBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_tanhBackwardMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TanhBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, outputField);
+            il.Emit(OpCodes.Callvirt, s_tanhBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>GELUBackward</c>: dispatches via engine.GeluBackward(grad, input).
+    /// GELU uses the input, not the output, for its gradient.
+    /// </summary>
+    private sealed class GeluBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_geluBackwardMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.GeluBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Callvirt, s_geluBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Call, accumulateGradMethod);
         }
