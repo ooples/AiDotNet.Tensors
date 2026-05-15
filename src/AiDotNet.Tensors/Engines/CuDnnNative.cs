@@ -1576,11 +1576,20 @@ public sealed class CuDnnConvolution : IDisposable
     /// device memory and sizing — we only set descriptors, pick an
     /// algorithm, and launch.
     /// </summary>
-    /// <param name="inputDevPtr">Device pointer to NCHW input [n, c, h, w] floats.</param>
-    /// <param name="filterDevPtr">Device pointer to NCHW filter [k, c, fh, fw] floats.</param>
-    /// <param name="outputDevPtr">Device pointer to NCHW output [n, k, oh, ow] floats — caller allocates.</param>
+    /// <param name="inputDevPtr">Device pointer to NCHW input [n, c, h, w] in <paramref name="dataType"/> elements.</param>
+    /// <param name="filterDevPtr">Device pointer to NCHW filter [k, c, fh, fw] in <paramref name="dataType"/> elements.</param>
+    /// <param name="outputDevPtr">Device pointer to NCHW output [n, k, oh, ow] in <paramref name="dataType"/> elements — caller allocates.</param>
     /// <param name="outputHeight">Expected output height; used to sanity-check against cuDNN's shape calc.</param>
     /// <param name="outputWidth">Expected output width.</param>
+    /// <param name="dataType">cuDNN tensor element type for input / filter / output buffers.
+    /// Defaults to <see cref="CuDnnNative.CudnnDataType.Float"/> for source compatibility.
+    /// <list type="bullet">
+    ///   <item><see cref="CuDnnNative.CudnnDataType.Float"/> — fp32 data, fp32 compute. Original behaviour.</item>
+    ///   <item><see cref="CuDnnNative.CudnnDataType.Half"/> — fp16 data, fp32 compute (mixed-precision via tensor cores on Volta+, ~2× over fp32 on Ampere+).</item>
+    ///   <item><see cref="CuDnnNative.CudnnDataType.BFloat16"/> — bf16 data, fp32 compute (mixed-precision, no loss scaling needed; Ampere+).</item>
+    /// </list>
+    /// Compute type is always fp32 — matches cuDNN's accuracy-preserving mixed-precision convention.
+    /// Closes #337's "FP16/BF16 kernel variants" requirement for Conv2D forward.</param>
     public void Conv2DForwardGpu(
         IntPtr inputDevPtr, IntPtr filterDevPtr, IntPtr outputDevPtr,
         int n, int c, int h, int w,
@@ -1588,7 +1597,8 @@ public sealed class CuDnnConvolution : IDisposable
         int outputHeight, int outputWidth,
         int padH = 0, int padW = 0,
         int strideH = 1, int strideW = 1,
-        int dilationH = 1, int dilationW = 1)
+        int dilationH = 1, int dilationW = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -1597,8 +1607,12 @@ public sealed class CuDnnConvolution : IDisposable
         using var convDesc = new CuDnnConvolutionDescriptor();
         using var outputDesc = new CuDnnTensorDescriptor();
 
-        inputDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
-        filterDesc.Set4D(CuDnnNative.CudnnDataType.Float, k, c, filterH, filterW);
+        inputDesc.Set4D(dataType, n, c, h, w);
+        filterDesc.Set4D(dataType, k, c, filterH, filterW);
+        // Compute type stays fp32 for half / bfloat16 — cuDNN's recommended
+        // accuracy-preserving mixed-precision setting. For fp32 data, compute
+        // is also fp32 (TF32 on Ampere+ is governed orthogonally by cuBLAS's
+        // math mode — see CudaDispatchPolicy.AllowTF32).
         convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
 
         // Verify output shape agrees with cuDNN's internal shape calc.
@@ -1614,7 +1628,7 @@ public sealed class CuDnnConvolution : IDisposable
                 $"cuDNN output shape {cudnnOutN}x{cudnnOutC}x{cudnnOutH}x{cudnnOutW} " +
                 $"disagrees with caller's expected {n}x{k}x{outputHeight}x{outputWidth}.");
 
-        outputDesc.Set4D(CuDnnNative.CudnnDataType.Float, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
 
         // Algorithm selection — use ImplicitPrecompGemm as a stable default;
         // fall back to Gemm if workspace query fails on this size. A future
@@ -1951,13 +1965,14 @@ public sealed class CuDnnBatchNorm : IDisposable
         IntPtr inputDevPtr, IntPtr outputDevPtr,
         IntPtr scaleDevPtr, IntPtr biasDevPtr,
         IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5)
+        int n, int c, int h, int w, double epsilon = 1e-5,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
@@ -1979,19 +1994,24 @@ public sealed class CuDnnBatchNorm : IDisposable
     /// <summary>
     /// GPU-pointer training-mode BatchNorm. Writes saved mean / inv-var
     /// for the backward pass and updates running stats in place.
+    /// Pass <paramref name="dataType"/> = <see cref="CuDnnNative.CudnnDataType.Half"/>
+    /// or <see cref="CuDnnNative.CudnnDataType.BFloat16"/> for mixed-precision
+    /// training; scale/bias/running-stats remain fp32 per
+    /// <see cref="CuDnnNative.cudnnDeriveBNTensorDescriptor"/>'s convention.
     /// </summary>
     public void ForwardTrainingGpu(
         IntPtr inputDevPtr, IntPtr outputDevPtr,
         IntPtr scaleDevPtr, IntPtr biasDevPtr,
         IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
         IntPtr saveMeanDevPtr, IntPtr saveInvVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1)
+        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
@@ -2020,13 +2040,14 @@ public sealed class CuDnnBatchNorm : IDisposable
         IntPtr inputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
         IntPtr scaleDevPtr, IntPtr gradScaleDevPtr, IntPtr gradBiasDevPtr,
         IntPtr savedMeanDevPtr, IntPtr savedInvVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5)
+        int n, int c, int h, int w, double epsilon = 1e-5,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
