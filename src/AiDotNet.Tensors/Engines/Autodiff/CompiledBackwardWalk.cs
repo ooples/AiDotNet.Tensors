@@ -309,6 +309,19 @@ internal static class CompiledBackwardWalk<T>
         if (softmaxMethod is not null)
             registry[softmaxMethod] = new SoftmaxBackwardInliner();
 
+        // Trivial pass-through scalar ops: AddScalar and SubtractScalar
+        // both have gradInput = gradOutput. Identical inliner.
+        var addScalarPassThru = new PassThroughGradInliner();
+        var addScalarMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.AddScalarBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (addScalarMethod is not null)
+            registry[addScalarMethod] = addScalarPassThru;
+
+        var subScalarMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.SubtractScalarBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (subScalarMethod is not null)
+            registry[subScalarMethod] = addScalarPassThru;
+
         return registry;
     }
 
@@ -1080,6 +1093,39 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, input0Field);
             il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Pass-through gradient: input gradient = output gradient. Covers
+    /// AddScalarBackward (d(x+c)/dx = 1) and SubtractScalarBackward
+    /// (d(x-c)/dx = 1). Single AccumulateGrad call with no preceding
+    /// engine ops. The simplest possible inliner — for these two ops the
+    /// inliner-vs-generic path saves the full backward method invocation
+    /// plus the inputs[] / savedState dispatch overhead.
+    /// </summary>
+    private sealed class PassThroughGradInliner : IPerOpInliner
+    {
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Call, accumulateGradMethod);
         }
