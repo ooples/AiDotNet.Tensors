@@ -242,6 +242,77 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void MultiHeadAttentionScoresFanoutMixed_RunsToCompletion_FP16Path_OnMultiStreamHost()
+    {
+        // The mixed-precision path uses cublasGemmEx with fp16 inputs.
+        // We can't easily round-trip fp16 host bytes for a correctness
+        // gate without a fp16↔fp32 conversion helper, so this is a
+        // doesn't-crash test. Correctness of cublasGemmEx itself is
+        // exercised by the existing IGpuHalfPrecisionBackend.Hgemm tests.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        const int batch = 1, numHeads = 2, seqLen = 16, headDim = 8;
+        // fp16 = 2 bytes per element; backend.AllocateBuffer is float-shaped
+        // (4 bytes per element), so allocate float-equivalent count = fp16
+        // count / 2.
+        long qkFp16Elems = (long)batch * numHeads * seqLen * headDim;
+        long scoreFp32Elems = (long)batch * numHeads * seqLen * seqLen;
+
+        using var qFp16 = backend.AllocateBuffer((int)((qkFp16Elems + 1) / 2));
+        using var kFp16 = backend.AllocateBuffer((int)((qkFp16Elems + 1) / 2));
+        using var scoresFp32 = backend.AllocateBuffer((int)scoreFp32Elems);
+
+        try
+        {
+            cudaBackend.MultiHeadAttentionScoresFanoutMixed(
+                qFp16, kFp16, scoresFp32,
+                batch, numHeads, seqLen, headDim, scheduler,
+                useBFloat16: false);
+        }
+        catch (System.Exception thrown)
+        {
+            // GetCublasErrorString returns "Not supported" with a space —
+            // a different casing than the cuDNN-style "NotSupported".
+            // Accept both forms.
+            if (thrown.Message.Contains("supported", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase))
+                return;
+            throw;
+        }
+    }
+
+    [Fact]
+    public void MultiHeadAttentionScoresFanoutMixed_BFloat16PreAmpere_Throws()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        // Pre-Ampere hosts only — skip if BF16 is actually supported.
+        if (backend is AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend mp && mp.SupportsBFloat16Conv)
+            return;
+
+        using var q = backend.AllocateBuffer(64);
+        using var k = backend.AllocateBuffer(64);
+        using var s = backend.AllocateBuffer(64);
+
+        var ex = Assert.Throws<System.NotSupportedException>(() =>
+            cudaBackend.MultiHeadAttentionScoresFanoutMixed(
+                q, k, s, 1, 2, 4, 4, scheduler, useBFloat16: true));
+        Assert.Contains("8.0", ex.Message, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void MultiHeadAttentionScoresFanout_MatchesCPUReference_OnMultiStreamHost()
     {
         // Correctness gate: compares the per-head Q·K^T fanout result
