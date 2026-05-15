@@ -2846,6 +2846,64 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // BatchNorm backward: writes gradInput / gradGamma / gradBeta directly
+        // into pre-allocated buffers via BatchNormBackwardInto — skips the 3
+        // fresh tensor allocations + 3 chained AccumulateGrad calls that
+        // BackwardFunctions.BatchNormBackward pays per layer.
+        // GraFPrint has 18 BatchNorm layers; this saves ~3-5 ms per layer
+        // (allocator pressure + AccumulateGrad orchestration).
+        // Tier 1.4 of the compile-mode backward perf overhaul.
+        if (step.OpType == OpType.BatchNorm && step.Inputs.Length >= 3
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var gammaT = step.Inputs[1];
+            var betaT = step.Inputs[2];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output)
+                || !gradMap.ContainsKey(input)
+                || !gradMap.ContainsKey(gammaT)
+                || !gradMap.ContainsKey(betaT)) return null;
+            var savedState = step.SavedState;
+            // Saved state from BatchNorm GraphMode recording (CpuEngine.cs:17723):
+            // new object[] { mean, variance, epsilon }
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not Tensor<T> meanT
+                || savedState[1] is not Tensor<T> varianceT
+                || savedState[2] is not double epsilonD)
+                return null;
+            var gradOut = gradMap[output];
+            var gradInput = gradMap[input];
+            var gradGamma = gradMap[gammaT];
+            var gradBeta = gradMap[betaT];
+            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accumGamma = consumerCount.ContainsKey(gammaT) && consumerCount[gammaT] > 1;
+            bool accumBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
+            return eng =>
+            {
+                if (eng is CpuEngine cpu)
+                {
+                    cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
+                        gradOut, input, gammaT, meanT, varianceT, epsilonD,
+                        accumInput, accumGamma, accumBeta);
+                }
+                else
+                {
+                    var gi = eng.BatchNormBackward(gradOut, input, gammaT, meanT, varianceT, epsilonD,
+                        out var gg, out var gb);
+                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    if (accumGamma) eng.TensorAddInto(gradGamma, gradGamma, gg);
+                    else gg.AsSpan().CopyTo(gradGamma.AsWritableSpan());
+                    if (accumBeta) eng.TensorAddInto(gradBeta, gradBeta, gb);
+                    else gb.AsSpan().CopyTo(gradBeta.AsWritableSpan());
+                }
+                input.Grad = gradInput;
+                gammaT.Grad = gradGamma;
+                betaT.Grad = gradBeta;
+            };
+        }
+
         // ReduceSum backward: broadcast scalar gradient to all elements
         // Only specialize for full scalar reduction (output length == 1)
         if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1
