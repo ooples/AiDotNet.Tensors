@@ -1988,6 +1988,83 @@ public sealed class CuDnnPooling : IDisposable
         }
     }
 
+    /// <summary>
+    /// GPU-pointer Pool2D forward. Mirrors the host-array
+    /// <see cref="MaxPool2DForward"/> / <see cref="AvgPool2DForward"/> but
+    /// takes device pointers directly. Defaults to fp32; pass
+    /// <see cref="CuDnnNative.CudnnDataType.Half"/> /
+    /// <see cref="CuDnnNative.CudnnDataType.BFloat16"/> for mixed-precision.
+    /// </summary>
+    public void ForwardGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        int outputH, int outputW,
+        int windowH, int windowW,
+        int padH, int padW,
+        int strideH, int strideW,
+        CuDnnNative.CudnnPoolingMode mode,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnPooling));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var poolDesc = new CuDnnPoolingDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, outputH, outputW);
+        poolDesc.Set2D(mode, windowH, windowW, padH, padW, strideH, strideW);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnPoolingForward(
+            _context.Handle,
+            poolDesc.Handle,
+            ref alpha,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            outputDesc.Handle, outputDevPtr);
+        CuDnnContext.CheckStatus(status, "PoolingForwardGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer Pool2D backward. Produces dX from the forward output Y,
+    /// dY, and the original input X (cuDNN's pooling-backward signature
+    /// needs all three because of MaxPool's argmax tracking).
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr outputDevPtr, IntPtr gradOutputDevPtr,
+        IntPtr inputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h, int w,
+        int outputH, int outputW,
+        int windowH, int windowW,
+        int padH, int padW,
+        int strideH, int strideW,
+        CuDnnNative.CudnnPoolingMode mode,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnPooling));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var poolDesc = new CuDnnPoolingDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, outputH, outputW);
+        poolDesc.Set2D(mode, windowH, windowW, padH, padW, strideH, strideW);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnPoolingBackward(
+            _context.Handle,
+            poolDesc.Handle,
+            ref alpha,
+            outputDesc.Handle, outputDevPtr,
+            outputDesc.Handle, gradOutputDevPtr,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            inputDesc.Handle, gradInputDevPtr);
+        CuDnnContext.CheckStatus(status, "PoolingBackwardGpu");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
