@@ -125,6 +125,136 @@ internal static class BlasProvider
         ushort* b, int ldb,
         float beta, float* c, int ldc);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #338 Phase G.10 — batched GEMM via MKL cblas_sgemm_batch.
+    // Amortises per-call P/Invoke + MKL setup overhead across a group of
+    // GEMMs with possibly different shapes. Used for the "compute dA and
+    // dW backward GEMMs in one call" pattern in MatMul-backward
+    // specializations.
+    //
+    // C signature:
+    //   void cblas_sgemm_batch(
+    //     CBLAS_LAYOUT Layout,
+    //     const CBLAS_TRANSPOSE* TransA_array,
+    //     const CBLAS_TRANSPOSE* TransB_array,
+    //     const MKL_INT* M_array, const MKL_INT* N_array, const MKL_INT* K_array,
+    //     const float* alpha_array,
+    //     const float** A_array, const MKL_INT* lda_array,
+    //     const float** B_array, const MKL_INT* ldb_array,
+    //     const float* beta_array,
+    //     float** C_array, const MKL_INT* ldc_array,
+    //     MKL_INT group_count,
+    //     const MKL_INT* group_size);
+    //
+    // For our use case (2 distinct-shape GEMMs in one call), we set
+    // group_count=2, group_size=[1, 1], and pass per-group arrays.
+    // ─────────────────────────────────────────────────────────────────────
+    [DllImport("mkl_rt.3", EntryPoint = "cblas_sgemm_batch", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe void mkl_cblas_sgemm_batch_ptr(
+        int layout,
+        int* transA_array, int* transB_array,
+        int* m_array, int* n_array, int* k_array,
+        float* alpha_array,
+        float** a_array, int* lda_array,
+        float** b_array, int* ldb_array,
+        float* beta_array,
+        float** c_array, int* ldc_array,
+        int group_count,
+        int* group_size);
+
+    /// <summary>
+    /// Issue #338 Phase G.10: probe MKL's cblas_sgemm_batch availability.
+    /// Only fires when MKL is preferred AND cblas_sgemm_batch loads. Gates
+    /// the batched-GEMM dispatch in MatMul-backward specs.
+    /// </summary>
+    private static readonly Lazy<bool> _mklBatchedAvailable = new(ProbeMklBatchedLibrary);
+    internal static bool IsMklBatchedAvailable => _mklBatchedAvailable.Value;
+
+    private static unsafe bool ProbeMklBatchedLibrary()
+    {
+        if (!_preferMkl) return false;
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            // 1×1×1 GEMM with group_count=1, group_size=1
+            float a = 2f, b = 3f, c = 0f;
+            float* aP = &a, bP = &b, cP = &c;
+            int transA = CblasNoTrans, transB = CblasNoTrans;
+            int m = 1, n = 1, k = 1, lda = 1, ldb = 1, ldc = 1;
+            float alpha = 1f, beta = 0f;
+            int groupSize = 1;
+            mkl_cblas_sgemm_batch_ptr(CblasRowMajor,
+                &transA, &transB,
+                &m, &n, &k,
+                &alpha,
+                &aP, &lda,
+                &bP, &ldb,
+                &beta,
+                &cP, &ldc,
+                1, &groupSize);
+            return c == 6f;
+        }
+        catch (DllNotFoundException) { return false; }
+        catch (EntryPointNotFoundException) { return false; }
+        catch (BadImageFormatException) { return false; }
+    }
+
+    /// <summary>
+    /// Phase G.10: batch two GEMMs (dA + dW backward pair) into one MKL call.
+    /// Both GEMMs may have different M, N, K, lda, ldb, ldc and trans flags.
+    /// Returns false if MKL batched API isn't available; caller falls back
+    /// to 2 separate <see cref="TryGemmEx"/> calls.
+    /// </summary>
+    internal static unsafe bool TryGemmExBatch2(
+        int m0, int n0, int k0,
+        float[] a0, int aOff0, int lda0, bool transA0,
+        float[] b0, int bOff0, int ldb0, bool transB0,
+        float[] c0, int cOff0, int ldc0,
+        int m1, int n1, int k1,
+        float[] a1, int aOff1, int lda1, bool transA1,
+        float[] b1, int bOff1, int ldb1, bool transB1,
+        float[] c1, int cOff1, int ldc1)
+    {
+        if (!_mklBatchedAvailable.Value) return false;
+        try
+        {
+            fixed (float* pA0 = &a0[aOff0])
+            fixed (float* pB0 = &b0[bOff0])
+            fixed (float* pC0 = &c0[cOff0])
+            fixed (float* pA1 = &a1[aOff1])
+            fixed (float* pB1 = &b1[bOff1])
+            fixed (float* pC1 = &c1[cOff1])
+            {
+                int* transA = stackalloc int[2] { transA0 ? 112 : CblasNoTrans, transA1 ? 112 : CblasNoTrans };
+                int* transB = stackalloc int[2] { transB0 ? 112 : CblasNoTrans, transB1 ? 112 : CblasNoTrans };
+                int* M = stackalloc int[2] { m0, m1 };
+                int* N = stackalloc int[2] { n0, n1 };
+                int* K = stackalloc int[2] { k0, k1 };
+                float* alpha = stackalloc float[2] { 1f, 1f };
+                int* lda = stackalloc int[2] { lda0, lda1 };
+                int* ldb = stackalloc int[2] { ldb0, ldb1 };
+                float* beta = stackalloc float[2] { 0f, 0f };
+                int* ldc = stackalloc int[2] { ldc0, ldc1 };
+                float** aArr = stackalloc float*[2] { pA0, pA1 };
+                float** bArr = stackalloc float*[2] { pB0, pB1 };
+                float** cArr = stackalloc float*[2] { pC0, pC1 };
+                int* groupSize = stackalloc int[2] { 1, 1 };
+
+                mkl_cblas_sgemm_batch_ptr(CblasRowMajor,
+                    transA, transB,
+                    M, N, K,
+                    alpha,
+                    aArr, lda,
+                    bArr, ldb,
+                    beta,
+                    cArr, ldc,
+                    2, groupSize);
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
     /// <summary>True iff <c>AIDOTNET_BLAS_PROVIDER=mkl-bf16</c> at process start.</summary>
     private static readonly bool _preferMklBf16 = string.Equals(
         Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),

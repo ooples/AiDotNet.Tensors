@@ -2730,6 +2730,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Either call failed — fall through to FP32 path.
                 }
 
+                // Phase G.10: batch the two backward GEMMs (dA + dW) into a
+                // single MKL cblas_sgemm_batch call. Amortises P/Invoke +
+                // MKL setup overhead and lets MKL co-schedule. Falls back
+                // to two separate TryGemmEx calls when batch isn't
+                // available (e.g. OpenBLAS-only).
+                if (BlasProvider.IsMklBatchedAvailable
+                    && BlasProvider.TryGemmExBatch2(
+                        // dA = dC @ B^T  → [M, K]
+                        M, K, N,
+                        cachedDC, dcOff, N, false,
+                        cachedB!, bOff, N, true,
+                        cachedDestA!, destAOff, K,
+                        // dB = A^T @ dC  → [K, N]
+                        K, N, M,
+                        cachedA!, aOff, K, true,
+                        cachedDC, dcOff, N, false,
+                        cachedDestB!, destBOff, N))
+                {
+                    inputA.Grad = gradA;
+                    inputB.Grad = gradB;
+                    return;
+                }
+
                 // dA = dC @ B^T — direct BLAS with engine fallback
                 if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
