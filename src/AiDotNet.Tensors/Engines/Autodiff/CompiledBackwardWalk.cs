@@ -50,8 +50,17 @@ internal static class CompiledBackwardWalk<T>
         return true;
     });
 
+    /// <summary>
+    /// Test-only override for <see cref="Enabled"/>. When non-null,
+    /// short-circuits the env-var lookup. Production code never touches
+    /// this; tests use it to flip the gate without spawning a new
+    /// process. Reset to <c>null</c> in test cleanup to restore the
+    /// env-var-derived default.
+    /// </summary>
+    internal static bool? _testEnabledOverride;
+
     /// <summary>True when the compiled-walk path is enabled for this process.</summary>
-    internal static bool Enabled => s_enabled.Value;
+    internal static bool Enabled => _testEnabledOverride ?? s_enabled.Value;
 
     /// <summary>
     /// Walker delegate shape. Takes the same arguments as the inline

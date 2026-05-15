@@ -246,6 +246,82 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void EndToEnd_WithCompiledBackwardEnabled_ProducesIdenticalGradients()
+    {
+        // Auto-engagement gate. Flips CompiledBackwardWalk<T>._testEnabledOverride
+        // on, runs a full GradientTape.ComputeGradients flow, then turns
+        // it back off. Verifies that:
+        //   1. The flow doesn't throw (walker integrates cleanly)
+        //   2. The gradients match the env-var-off reference exactly
+        // The cache only populates AFTER a backward walk completes,
+        // so the first call hits the inline replay loop; subsequent
+        // calls hit the IL walker.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        // Flip the override on. Use reflection because the field is internal.
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(overrideField);
+
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            // First run: compute reference gradients with the override OFF.
+            float[] refDA, refDB;
+            {
+                overrideField!.SetValue(null, false);
+                resetMethod.Invoke(null, null);
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+                refDA = (float[])grads[a].GetDataArray().Clone();
+                refDB = (float[])grads[b].GetDataArray().Clone();
+            }
+
+            // Second run: same forward, override ON. Cache populates on
+            // the first compute; subsequent compute on a fresh tape with
+            // the same pattern hits the IL walker.
+            overrideField.SetValue(null, true);
+            resetMethod.Invoke(null, null);
+
+            // Two runs — first populates the cache + walker, second hits.
+            for (int run = 0; run < 2; run++)
+            {
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+
+                var ilDA = grads[a].GetDataArray();
+                var ilDB = grads[b].GetDataArray();
+                for (int i = 0; i < 3; i++)
+                {
+                    Assert.Equal(refDA[i], ilDA[i], 4);
+                    Assert.Equal(refDB[i], ilDB[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField!.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_Specialised_ProducesSameGradientsAsReference()
     {
         // Per-op-specialised IL emitter (Compile with MethodInfo[] arg).
