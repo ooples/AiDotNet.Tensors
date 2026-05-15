@@ -129,8 +129,10 @@ public class TensorEmbeddingLookupLongIndexTests
     /// is an <c>int[]</c> (plans serialised before the long widening),
     /// <see cref="Autodiff.BackwardFunctions{T}.TensorEmbeddingLookupBackward"/>
     /// widens to <c>long[]</c> internally so the backward kernel still
-    /// runs. Constructs the saved-state by hand to simulate the
-    /// pre-widening format.
+    /// runs. Drives the dispatcher directly (not the engine kernel) so
+    /// the <c>int[] → long[]</c> widening branch in BackwardFunctions is
+    /// the path actually exercised; constructs the saved-state by hand to
+    /// simulate the pre-widening format.
     /// </summary>
     [Fact]
     public void TensorEmbeddingLookupBackward_LegacyIntArraySavedState_StillWorks()
@@ -145,14 +147,29 @@ public class TensorEmbeddingLookupLongIndexTests
         var goSpan = gradOutput.AsWritableSpan();
         for (int i = 0; i < goSpan.Length; i++) goSpan[i] = 1f;
 
-        // Use the engine's typed backward directly with a Tensor<long>
-        // input, mirroring what BackwardFunctions.TensorEmbeddingLookupBackward
-        // will pass after the legacy-int[] widening branch.
-        var indices = new Tensor<long>([3]);
-        indices[0] = 1L; indices[1] = 3L; indices[2] = 0L;
+        // Synthesize a legacy savedState payload using int[] (the pre-widening
+        // format) so the BackwardFunctions int[]→long[] compatibility branch
+        // is the path under test.
+        var legacyIntIndices = new int[] { 1, 3, 0 };
+        var indicesShape = new int[] { 3 };
+        object[] savedState = new object[] { legacyIntIndices, indicesShape, vocab, dim };
 
-        var grad = engine.TensorEmbeddingLookupBackward<float, long>(gradOutput, indices, vocab, dim);
-        var gSpan = grad.AsSpan();
+        // Output tensor isn't used by the embedding-lookup backward (gradient
+        // is scattered to the embedding table from gradOutput); pass an empty
+        // sentinel of the right shape to satisfy the dispatcher signature.
+        var dummyOutput = new Tensor<float>([3, dim]);
+        var grads = new System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>>();
+
+        AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<float>.TensorEmbeddingLookupBackward(
+            gradOutput,
+            new[] { E },
+            dummyOutput,
+            savedState,
+            engine,
+            grads);
+
+        Assert.True(grads.ContainsKey(E), "BackwardFunctions did not accumulate a gradient onto the embedding table.");
+        var gSpan = grads[E].AsSpan();
         Assert.Equal(1f, gSpan[0 * dim + 0], 5);
         Assert.Equal(1f, gSpan[1 * dim + 0], 5);
         Assert.Equal(0f, gSpan[2 * dim + 0], 5);
