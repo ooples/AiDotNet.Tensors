@@ -243,6 +243,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
 
+    /// <summary>
+    /// Diagnostic hook for tracing per-step buffer mutations. When set,
+    /// fires after each forward and each backward delegate with the phase
+    /// label and the step's OpName. Used by the
+    /// Pinpoint_DOUBLE_TensorSubtract_Forward bisect test to locate which
+    /// specific backward delegate corrupts a target tensor's buffer.
+    /// Reset to null after use to avoid debug overhead in normal runs.
+    /// </summary>
+    public static System.Action<string>? StepProbe { get; set; }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
@@ -257,8 +267,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         else
         {
             var fwd = _forwardActions;
-            for (int i = 0; i < fwd.Length; i++)
-                fwd[i](engine);
+            var probe = StepProbe;
+            if (probe != null)
+            {
+                probe("BEGIN-FWD");
+                for (int i = 0; i < fwd.Length; i++)
+                {
+                    fwd[i](engine);
+                    var name = i < (_forwardSteps?.Length ?? 0) ? _forwardSteps![i].OpName : $"#{i}";
+                    probe($"AFTER-FWD-{i}:{name}");
+                }
+            }
+            else
+            {
+                for (int i = 0; i < fwd.Length; i++)
+                    fwd[i](engine);
+            }
         }
         long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -302,6 +326,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         var bwd = _backwardActions;
+        var bwdProbe = StepProbe;
+        if (bwdProbe != null) bwdProbe("BEGIN-BWD");
         if (_profileStepEnabled)
         {
             // Per-delegate timing — accumulates into _profPerStepUs[i] across calls.
@@ -318,17 +344,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bwd[i](engine);
                 long ei = System.Diagnostics.Stopwatch.GetTimestamp();
                 perStep[i] += (long)((ei - si) * tickToUsLocal);
+                if (bwdProbe != null)
+                {
+                    var name = i < (_profBackwardStepNames?.Length ?? 0) ? _profBackwardStepNames![i] : $"#{i}";
+                    bwdProbe($"AFTER-BWD-{i}:{name}");
+                }
             }
         }
         else
         {
             for (int i = 0; i < bwd.Length; i++)
+            {
                 bwd[i](engine);
+                if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
+            }
         }
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
+        if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
         _optimizerUpdate?.Invoke();
+        if (bwdProbe != null) bwdProbe("END-OPT");
         long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         if (_profileStepEnabled)

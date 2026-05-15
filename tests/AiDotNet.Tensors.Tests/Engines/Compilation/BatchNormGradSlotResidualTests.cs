@@ -104,6 +104,169 @@ public class BatchNormGradSlotResidualTests
     }
 
     /// <summary>
+    /// Bisect the divergence chain. Eager has BN→Sub→Mul→Sum (forward) +
+    /// reverse backward. Compile has same. The eager-tape gradGamma is
+    /// 8.76678034 (per the failing test). The compile gradGamma is
+    /// 8.76678046. Δ ≈ 1.19e-7. Both should give the SAME value if every
+    /// op produces bit-identical results. This test isolates the FORWARD
+    /// chain — runs both eager and compile-mode forward for BN→Sub→Mul→Sum
+    /// and asserts the diff and sq tensors are bit-identical.
+    /// </summary>
+    [Fact]
+    public void Pinpoint_DOUBLE_BNSubMul_Forward_EagerVsCompile_BitIdentical()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, features = 4;
+        const double epsilon = 1e-5;
+        var rng = new System.Random(42);
+        var inputData = new double[batch * features];
+        var targetData = new double[batch * features];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < targetData.Length; i++) targetData[i] = rng.NextDouble() - 0.5;
+
+        // EAGER
+        var inputE = new Tensor<double>(new[] { batch, features });
+        var targetE = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputE.Length; i++) { inputE[i] = inputData[i]; targetE[i] = targetData[i]; }
+        var gammaE = new Tensor<double>(new[] { features });
+        var betaE = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+        var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+        var diffE = engine.TensorSubtract(bnE, targetE);
+        var sqE = engine.TensorMultiply(diffE, diffE);
+
+        // COMPILE
+        var inputF = new Tensor<double>(new[] { batch, features });
+        var targetF = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputF.Length; i++) { inputF[i] = inputData[i]; targetF[i] = targetData[i]; }
+        var gammaF = new Tensor<double>(new[] { features });
+        var betaF = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaF[i] = 1.0; betaF[i] = 0.0; }
+        Tensor<double> bnF, diffF, sqF;
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            bnF = engine.BatchNorm(inputF, gammaF, betaF, epsilon, out _, out _);
+            diffF = engine.TensorSubtract(bnF, targetF);
+            sqF = engine.TensorMultiply(diffF, diffF);
+            engine.ReduceSum(sqF, null);
+            plan = scope.CompileTraining(new[] { gammaF, betaF });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+        }
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        for (int i = 0; i < bnE.Length; i++)
+        {
+            double dBn = System.Math.Abs(bnE[i] - bnF[i]);
+            double dDiff = System.Math.Abs(diffE[i] - diffF[i]);
+            double dSq = System.Math.Abs(sqE[i] - sqF[i]);
+            if (dBn > 0 || dDiff > 0 || dSq > 0) any = true;
+            lines.Add($"  [{i}]  bn |Δ|={dBn:E3}  diff |Δ|={dDiff:E3}  sq |Δ|={dSq:E3}");
+        }
+        Assert.False(any, "Forward chain BN→Sub→Mul diverges between eager and compile:\n"
+            + string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// Pinpoint #2: BatchNorm backward in EAGER tape mode vs DIRECT engine
+    /// call. If the tape's backward differs from the direct engine call,
+    /// the tape itself is the precision-losing path (engine routing, not
+    /// kernel arithmetic).
+    /// </summary>
+    [Fact]
+    public void Pinpoint_DOUBLE_BNBackward_TapeVsDirect_BitIdentical()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, features = 4;
+        const double epsilon = 1e-5;
+        var rng = new System.Random(42);
+        var inputData = new double[batch * features];
+        var targetData = new double[batch * features];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < targetData.Length; i++) targetData[i] = rng.NextDouble() - 0.5;
+
+        // Build identical inputs for both paths.
+        var inputE = new Tensor<double>(new[] { batch, features });
+        var targetE = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < inputE.Length; i++) { inputE[i] = inputData[i]; targetE[i] = targetData[i]; }
+        var gammaE = new Tensor<double>(new[] { features });
+        var betaE = new Tensor<double>(new[] { features });
+        for (int i = 0; i < features; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+
+        // Path 1: EAGER TAPE (existing failing path)
+        Tensor<double> tapeGradGamma;
+        using (var tape = new GradientTape<double>())
+        {
+            var bnE = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out _, out _);
+            var diffE = engine.TensorSubtract(bnE, targetE);
+            var sqE = engine.TensorMultiply(diffE, diffE);
+            var lossE = engine.ReduceSum(sqE, null);
+            tapeGradGamma = tape.ComputeGradients(lossE, sources: new[] { gammaE })[gammaE];
+        }
+
+        // Path 2: DIRECT — manually compute gradGamma without tape.
+        // Forward + manual chain rule using engine ops.
+        var bn2 = engine.BatchNorm(inputE, gammaE, betaE, epsilon, out var meanD, out var varD);
+        var diff2 = engine.TensorSubtract(bn2, targetE);
+        var sq2 = engine.TensorMultiply(diff2, diff2);
+        var loss2 = engine.ReduceSum(sq2, null);
+        // dloss/dsq = 1 (broadcast)
+        var gradSq2 = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < gradSq2.Length; i++) gradSq2[i] = 1.0;
+        // dsq/ddiff = 2*diff via TensorMultiply
+        var twoTimesDiff = new Tensor<double>(new[] { batch, features });
+        for (int i = 0; i < twoTimesDiff.Length; i++) twoTimesDiff[i] = 2.0 * diff2[i];
+        var gradDiff2 = engine.TensorMultiply(gradSq2, twoTimesDiff);
+        // ddiff/dbn = 1 → gradBn = gradDiff
+        var gradBn2 = gradDiff2;
+        // dbn/dgamma via engine.BatchNormBackward
+        engine.BatchNormBackward(gradBn2, inputE, gammaE, meanD, varD, epsilon, out var directGradGamma, out _);
+
+        var lines = new System.Collections.Generic.List<string>();
+        bool any = false;
+        for (int p = 0; p < features; p++)
+        {
+            double d = System.Math.Abs(tapeGradGamma[p] - directGradGamma[p]);
+            if (d >= 1e-12) any = true;
+            lines.Add($"  ch[{p}]  tape={tapeGradGamma[p]:F18} direct={directGradGamma[p]:F18} |Δ|={d:E3}");
+        }
+        Assert.False(any, "BN gradGamma diverges between tape backward and direct engine call:\n"
+            + string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// Diagnostic: verify that calling engine.BatchNorm on a CpuEngine
+    /// instance under an active GradientTape correctly binds the tape's
+    /// _engine to that CpuEngine (not the global ambient
+    /// DirectGpuTensorEngine).
+    /// </summary>
+    [Fact]
+    public void Diagnostic_TapeBoundEngineIsCpuEngine_AfterBatchNormCall()
+    {
+        var engine = new CpuEngine();
+        const int C = 4;
+        var inputE = new Tensor<double>(new[] { 4, C });
+        for (int i = 0; i < inputE.Length; i++) inputE[i] = i * 0.1;
+        var gammaE = new Tensor<double>(new[] { C });
+        var betaE = new Tensor<double>(new[] { C });
+        for (int i = 0; i < C; i++) { gammaE[i] = 1.0; betaE[i] = 0.0; }
+
+        using var tape = new GradientTape<double>();
+        var initialEngineType = tape.Engine.GetType().Name;
+        var bnE = engine.BatchNorm(inputE, gammaE, betaE, 1e-5, out _, out _);
+        var afterEngineType = tape.Engine.GetType().Name;
+
+        Assert.Equal("CpuEngine", afterEngineType);
+        // Initial may be DirectGpuTensorEngine on auto-detect-GPU systems;
+        // we just confirm the bind happened.
+    }
+
+    /// <summary>
     /// Pinpoint: forward-only TensorSubtract bit-identity check. Eager
     /// engine.TensorSubtract vs compile-mode lazy execute (which calls
     /// engine.TensorSubtractInto under the hood). If THIS fails, the
@@ -134,27 +297,43 @@ public class BatchNormGradSlotResidualTests
         ICompiledTrainingPlan<double> plan;
         using (var scope = GraphMode.Enable())
         {
-            // Force the scope to bind to the CpuEngine instance the test
-            // explicitly created. Without this, scope._engine defaults to
-            // AiDotNetEngine.Current — which on auto-detect-GPU systems is
-            // DirectGpuTensorEngine, and that engine's TensorSubtractInto
-            // computes in single precision on consumer GPUs, producing the
-            // float-ULP-precision residual the MseChain test catches.
-            // Same root cause as the engine-routing fix this PR added for
-            // BatchNorm — the same plumbing is needed for every op that
-            // records into a graph from an explicit-engine caller.
             typeof(AiDotNet.Tensors.Engines.Compilation.LazyTensorScope)
                 .GetMethod("BindEngineIfUnset", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
                 .Invoke(scope, new object[] { engine });
             diffF = engine.TensorSubtract(xF, tF);
-            engine.ReduceSum(diffF, null);  // need an output to compile a plan
+            engine.ReduceSum(diffF, null);
             plan = scope.CompileTraining(new[] { xF });
         }
-        using (plan)
+
+        // Wire the per-phase probe to capture diffF[12] AFTER each step.
+        // Diff in compile-mode test runs has shown diffF[12] starts as the
+        // correct double value (written by SUB-FWD) but ends up at
+        // float-precision when the test reads it post-Step. This probe
+        // pinpoints WHICH step writes the wrong value.
+        var ctpType = typeof(AiDotNet.Tensors.LinearAlgebra.Tensor<double>).Assembly
+            .GetType("AiDotNet.Tensors.Engines.Compilation.CompiledTrainingPlan`1")!
+            .MakeGenericType(typeof(double));
+        var probeProp = ctpType.GetProperty("StepProbe", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)!;
+        var probeLog = new System.Collections.Generic.List<string>();
+        System.Action<string> probe = phase =>
+        {
+            probeLog.Add($"  {phase,-40} diffF[12]={diffF[12]:F18}");
+        };
+        probeProp.SetValue(null, probe);
+        try
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
             plan.Step();
+            probeLog.Add($"  AFTER-STEP-BEFORE-DISPOSE              diffF[12]={diffF[12]:F18}");
+            plan.Dispose();
+            probeLog.Add($"  AFTER-DISPOSE                          diffF[12]={diffF[12]:F18}");
         }
+        finally
+        {
+            probeProp.SetValue(null, null);
+        }
+        System.Console.WriteLine("=== STEP PROBE LOG ===");
+        foreach (var l in probeLog) System.Console.WriteLine(l);
 
         // CRITICAL ORDER: snapshot diffF FIRST, before any other allocation
         // could pollute the underlying pool-backed buffer.

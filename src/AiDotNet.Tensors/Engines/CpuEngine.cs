@@ -2763,6 +2763,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -2770,6 +2771,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Add, "TensorAdd", a, b, a._shape,
@@ -4303,6 +4305,16 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+        // Pin the active gradient tape (if any) to THIS engine — same
+        // reasoning as the scope.BindEngineIfUnset call below, but for the
+        // eager-tape path. Without this, an active tape constructed before
+        // any explicit engine instantiation defaults to AiDotNetEngine.Current
+        // (DirectGpuTensorEngine on auto-detect-GPU systems), and the
+        // backward walk would dispatch through the GPU engine's
+        // TensorSubtractInto / TensorAddInPlace which run in single precision
+        // on consumer GPUs — silently truncating gradient values to float
+        // ULPs even though the user explicitly opted into a CpuEngine.
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -4310,6 +4322,16 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // Bind THIS engine to the scope so the compiled plan replays
+                // on the same engine instance the user invoked the op on.
+                // See LazyTensorScope.BindEngineIfUnset for the full
+                // rationale (issue #350): without this, on auto-detect-GPU
+                // hosts where AiDotNetEngine.Current is DirectGpuTensorEngine,
+                // the lazy execute would dispatch to the GPU's
+                // TensorSubtractInto which computes in single precision on
+                // consumer GPUs and silently produces float-precision-rounded
+                // results in a Tensor<double>'s buffer.
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Subtract, "TensorSubtract", a, b, a._shape,
@@ -4433,6 +4455,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
             return TensorBroadcastMultiply(a, b);
         }
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -4440,6 +4463,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Multiply, "TensorMultiply", a, b, a._shape,
@@ -6640,6 +6664,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("ReduceSum");
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -6647,6 +6672,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 // Compute output shape eagerly
                 int[] outShape;
                 if (axes == null || axes.Length == 0)
