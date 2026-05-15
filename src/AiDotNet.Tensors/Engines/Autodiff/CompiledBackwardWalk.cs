@@ -332,6 +332,11 @@ internal static class CompiledBackwardWalk<T>
         if (sqrtMethod is not null)
             registry[sqrtMethod] = new SqrtBackwardInliner();
 
+        var reshapeMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.ReshapeBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (reshapeMethod is not null)
+            registry[reshapeMethod] = new ReshapeBackwardInliner();
+
         return registry;
     }
 
@@ -1272,6 +1277,48 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, gradLocal);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>ReshapeBackward</c>: gradients flow back through Reshape
+    /// to the original shape. Reads savedState[0] as int[]. Very common
+    /// in transformer head-splitting / token reshaping.
+    /// </summary>
+    private sealed class ReshapeBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_reshapeMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.Reshape))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // originalShape = (int[])entry.SavedState[0]
+            // (cast via unbox-ref since arrays are reference types)
+            // grad = engine.Reshape(gradOutput, originalShape)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, savedStateField);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ldelem_Ref);
+            il.Emit(OpCodes.Castclass, typeof(int[]));
+            il.Emit(OpCodes.Callvirt, s_reshapeMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
         }
     }
 
