@@ -978,6 +978,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     typed.GetInputsArray(),
                     typed.BackwardFn,
                     typed.SavedState));
+                // Same fix as CompiledTrainingPlan.cs (issue #350): the
+                // plan's Execute() method runs the lazy executes through
+                // its captured engine; clearing IsRealized + LazySource
+                // here prevents downstream tensor[i] / GetFlat / AsSpan
+                // reads from re-running Execute on the GPU's
+                // RecordingEngine and silently truncating to float
+                // precision. The plan owns materialization from now on.
+                typed.IsRealized = true;
+                typed.Output.LazySource = null;
             }
         }
 
