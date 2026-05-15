@@ -62,7 +62,10 @@ public class CompiledBackwardWalkTests
         var registerMethod = t.GetMethod("Register",
             BindingFlags.NonPublic | BindingFlags.Static);
         var compileMethod = t.GetMethod("Compile",
-            BindingFlags.NonPublic | BindingFlags.Static);
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null);
         Assert.NotNull(resetMethod);
         Assert.NotNull(tryGetMethod);
         Assert.NotNull(registerMethod);
@@ -203,7 +206,10 @@ public class CompiledBackwardWalkTests
 
             var walkerType = WalkerOfFloat();
             var compileMethod = walkerType.GetMethod("Compile",
-                BindingFlags.NonPublic | BindingFlags.Static)!;
+                BindingFlags.NonPublic | BindingFlags.Static,
+                binder: null,
+                types: new[] { typeof(int[]) },
+                modifiers: null)!;
             var walker = compileMethod.Invoke(null, new object[] { indices });
             Assert.NotNull(walker);
 
@@ -240,11 +246,112 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_Specialised_ProducesSameGradientsAsReference()
+    {
+        // Per-op-specialised IL emitter (Compile with MethodInfo[] arg).
+        // Builds the same y = (a*b) + a tape, then invokes the specialised
+        // walker with each entry's backward MethodInfo passed in. The IL
+        // emits direct `call <method>` per entry instead of going through
+        // the BackwardFunction<T>.Invoke delegate, eliminating dispatch
+        // indirection. Verifies the specialised path produces identical
+        // gradients to the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+            var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+            var prod = engine.TensorMultiply(a, b);
+            var sum = engine.TensorAdd(prod, a);
+            var loss = engine.ReduceSum(sum);
+
+            // Reference (delegate-dispatch) gradients:
+            var refGrads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+            var refDA = refGrads[a].GetDataArray();
+            var refDB = refGrads[b].GetDataArray();
+
+            // Pull the tape's entries + each entry's backward MethodInfo.
+            var tapeType = typeof(GradientTape<float>);
+            var entriesField = tapeType.GetField("_entries",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(entriesField);
+            var entriesObj = entriesField!.GetValue(tape);
+            Assert.NotNull(entriesObj);
+
+            var arenaType = entriesObj!.GetType();
+            int entryCount = (int)arenaType.GetProperty("Count",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(entriesObj)!;
+            if (entryCount == 0) return;
+
+            // Walk entries via the internal Item indexer to fetch each
+            // entry's Backward delegate, then capture its MethodInfo.
+            var indexer = arenaType.GetProperty("Item",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var methods = new MethodInfo[entryCount];
+            for (int i = 0; i < entryCount; i++)
+            {
+                // Indexer returns ref TapeEntry<T>; reflection unboxes
+                // the struct copy. That's fine — we only need the
+                // Backward field's .Method.
+                var entry = indexer.GetValue(entriesObj, new object?[] { i })!;
+                var backwardField = entry.GetType().GetField("Backward")!;
+                var backwardDelegate = (Delegate)backwardField.GetValue(entry)!;
+                methods[i] = backwardDelegate.Method;
+            }
+
+            var indices = new int[entryCount];
+            for (int i = 0; i < entryCount; i++)
+                indices[i] = entryCount - 1 - i;
+
+            // Re-order methods to match the reverse-topo indices.
+            var reorderedMethods = new MethodInfo[entryCount];
+            for (int i = 0; i < entryCount; i++)
+                reorderedMethods[i] = methods[indices[i]];
+
+            var walkerType = WalkerOfFloat();
+            var compile2 = walkerType.GetMethod("Compile",
+                BindingFlags.NonPublic | BindingFlags.Static,
+                binder: null,
+                types: new[] { typeof(int[]), typeof(MethodInfo[]) },
+                modifiers: null);
+            Assert.NotNull(compile2);
+            var walker = compile2!.Invoke(null, new object?[] { indices, reorderedMethods });
+            Assert.NotNull(walker);
+
+            var sources = new List<Tensor<float>> { a, b };
+            var result = walker!.GetType().GetMethod("Invoke")!
+                .Invoke(walker, new object?[] { entriesObj, loss, sources, engine });
+            Assert.NotNull(result);
+
+            var specGrads = (Dictionary<Tensor<float>, Tensor<float>>)result!;
+            var specDA = specGrads[a].GetDataArray();
+            var specDB = specGrads[b].GetDataArray();
+
+            // Specialised IL walker MUST produce identical gradients.
+            for (int i = 0; i < 3; i++)
+            {
+                Assert.Equal(refDA[i], specDA[i], 4);
+                Assert.Equal(refDB[i], specDB[i], 4);
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void Compile_PassthroughWalker_ReturnsNonNullDelegate()
     {
         var t = WalkerOfFloat();
         var compileMethod = t.GetMethod("Compile",
-            BindingFlags.NonPublic | BindingFlags.Static);
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null);
         Assert.NotNull(compileMethod);
 
         // Pass a 3-element index array as a minimal valid input. The

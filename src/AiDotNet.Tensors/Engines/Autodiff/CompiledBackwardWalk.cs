@@ -134,16 +134,39 @@ internal static class CompiledBackwardWalk<T>
     /// from <see cref="RebindablePlanCache{T}"/>. Captured by reference;
     /// caller must not mutate after passing in.</param>
     internal static CompiledWalker Compile(int[] reverseTopoIndices)
+        => Compile(reverseTopoIndices, backwardMethods: null);
+
+    /// <summary>
+    /// Builds a compiled walker for the given plan with optional per-op
+    /// method specialisation. When <paramref name="backwardMethods"/> is
+    /// non-null (and every entry's backward function is static), the IL
+    /// emitter bakes a direct <c>call</c> to each method per entry
+    /// instead of going through <c>BackwardFunction&lt;T&gt;.Invoke</c>'s
+    /// delegate dispatch. This is the genuine per-op specialisation
+    /// described in #338 Item 3.
+    /// </summary>
+    /// <param name="reverseTopoIndices">Reverse-topo entry-index sequence.</param>
+    /// <param name="backwardMethods">Parallel array of backward method
+    /// metadata, indexed by position in <paramref name="reverseTopoIndices"/>.
+    /// Null falls back to the helper-dispatch path used by <see cref="Compile(int[])"/>.
+    /// When provided, ALL methods must be static (instance methods would
+    /// require a baked-in target reference, which we don't capture).</param>
+    internal static CompiledWalker Compile(int[] reverseTopoIndices, MethodInfo[]? backwardMethods)
     {
         if (reverseTopoIndices is null) throw new ArgumentNullException(nameof(reverseTopoIndices));
 
-        // Try IL emission first. The dynamic method bakes in each index
-        // as an Ldc.I4 constant, eliminating the closure's array access
-        // per iteration. Any IL-emit failure (e.g. restricted-IL
-        // platforms) falls through to the closure path.
+        // Per-op specialisation is only safe when every backward method is
+        // static and the array length matches indices.Length. If either
+        // fails, fall through to the helper-dispatch IL path.
+        bool specialise = backwardMethods is not null
+            && backwardMethods.Length == reverseTopoIndices.Length
+            && AllStatic(backwardMethods);
+
         try
         {
-            var dynMethod = EmitWalkerIL(reverseTopoIndices);
+            DynamicMethod dynMethod = specialise
+                ? EmitWalkerILSpecialised(reverseTopoIndices, backwardMethods!)
+                : EmitWalkerIL(reverseTopoIndices);
             return (CompiledWalker)dynMethod.CreateDelegate(typeof(CompiledWalker));
         }
         catch
@@ -152,6 +175,13 @@ internal static class CompiledBackwardWalk<T>
         }
 
         return EmitWalkerClosure(reverseTopoIndices);
+    }
+
+    private static bool AllStatic(MethodInfo[] methods)
+    {
+        for (int i = 0; i < methods.Length; i++)
+            if (methods[i] is null || !methods[i].IsStatic) return false;
+        return true;
     }
 
     /// <summary>
@@ -219,6 +249,171 @@ internal static class CompiledBackwardWalk<T>
         il.Emit(OpCodes.Ldloca, stateLocal);                   // ref state
         il.Emit(OpCodes.Ldarg_2);                              // sources
         il.Emit(OpCodes.Call, s_finalizeWalkMethod);           // -> Dictionary<Tensor<T>, Tensor<T>>
+        il.Emit(OpCodes.Ret);
+
+        return method;
+    }
+
+    /// <summary>
+    /// Per-op-specialised IL emitter. Same per-index unrolling as
+    /// <see cref="EmitWalkerIL"/> but each entry emits a direct
+    /// <c>call &lt;MethodInfo&gt;</c> to its backward function instead of
+    /// going through <see cref="CompiledBackwardWalkHelpers{T}.ProcessEntry"/>'s
+    /// helper (which still indirects through <c>entry.Backward.Invoke</c>).
+    /// This is the genuine perf-winning specialisation: the JIT sees a
+    /// direct call to a static method per entry, not a delegate dispatch.
+    /// <para>
+    /// Emitted IL for one entry:
+    /// <code>
+    /// if ((uint)idx &gt;= (uint)entries.Count) return null;
+    /// ref var entry = ref entries[idx];
+    /// if (!grads.TryGetValue(entry.Output, out gradOutput)) goto skip;
+    /// directCall(
+    ///     gradOutput,
+    ///     entry.GetInputsArrayInto(state.Buf1, state.Buf2, state.Buf3),
+    ///     entry.Output,
+    ///     entry.SavedState ?? Array.Empty&lt;object&gt;(),
+    ///     engine,
+    ///     state.Grads);
+    /// skip:
+    /// </code>
+    /// </para>
+    /// </summary>
+    private static DynamicMethod EmitWalkerILSpecialised(int[] reverseTopoIndices, MethodInfo[] backwardMethods)
+    {
+        var method = new DynamicMethod(
+            name: $"CompiledBackwardWalk_Spec_{typeof(T).Name}_{reverseTopoIndices.Length}",
+            returnType: typeof(Dictionary<Tensor<T>, Tensor<T>>),
+            parameterTypes: new[]
+            {
+                typeof(TapeEntryArena<T>),
+                typeof(Tensor<T>),
+                typeof(IReadOnlyList<Tensor<T>>),
+                typeof(IEngine),
+            },
+            restrictedSkipVisibility: true);
+        method.DefineParameter(1, ParameterAttributes.None, "entries");
+        method.DefineParameter(2, ParameterAttributes.None, "loss");
+        method.DefineParameter(3, ParameterAttributes.None, "sources");
+        method.DefineParameter(4, ParameterAttributes.None, "engine");
+
+        var il = method.GetILGenerator();
+
+        var stateLocal = il.DeclareLocal(typeof(CompiledBackwardWalkHelpers<T>.WalkState));
+        var gradOutputLocal = il.DeclareLocal(typeof(Tensor<T>));
+
+        // state = InitState(loss, reservedCount)
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ldc_I4, reverseTopoIndices.Length);
+        il.Emit(OpCodes.Call, s_initStateMethod);
+        il.Emit(OpCodes.Stloc, stateLocal);
+
+        // Pre-resolve handles used per-entry.
+        var walkStateType = typeof(CompiledBackwardWalkHelpers<T>.WalkState);
+        var gradsField = walkStateType.GetField(nameof(CompiledBackwardWalkHelpers<T>.WalkState.Grads))!;
+        var buf1Field = walkStateType.GetField(nameof(CompiledBackwardWalkHelpers<T>.WalkState.Buf1))!;
+        var buf2Field = walkStateType.GetField(nameof(CompiledBackwardWalkHelpers<T>.WalkState.Buf2))!;
+        var buf3Field = walkStateType.GetField(nameof(CompiledBackwardWalkHelpers<T>.WalkState.Buf3))!;
+
+        var arenaType = typeof(TapeEntryArena<T>);
+        var arenaIndexer = arenaType.GetProperty("Item",
+            BindingFlags.NonPublic | BindingFlags.Instance)!.GetGetMethod(nonPublic: true)!;
+        var arenaCountGetter = arenaType.GetProperty("Count",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!.GetGetMethod(nonPublic: true)!;
+
+        var entryType = typeof(TapeEntry<T>);
+        var outputField = entryType.GetField(nameof(TapeEntry<T>.Output))!;
+        var savedStateField = entryType.GetField(nameof(TapeEntry<T>.SavedState))!;
+        var getInputsArrayIntoMethod = entryType.GetMethod(nameof(TapeEntry<T>.GetInputsArrayInto))!;
+
+        var dictType = typeof(Dictionary<Tensor<T>, Tensor<T>>);
+        var tryGetValueMethod = dictType.GetMethod(nameof(Dictionary<Tensor<T>, Tensor<T>>.TryGetValue))!;
+
+        var arrayEmptyObjectMethod = typeof(Array).GetMethod(nameof(Array.Empty))!
+            .MakeGenericMethod(typeof(object));
+
+        for (int i = 0; i < reverseTopoIndices.Length; i++)
+        {
+            int idx = reverseTopoIndices[i];
+            var bwdMethod = backwardMethods[i];
+            var skipLabel = il.DefineLabel();
+            var savedStateNonNullLabel = il.DefineLabel();
+            var savedStateDoneLabel = il.DefineLabel();
+            var bailOutLabel = il.DefineLabel();
+
+            // Bounds check: idx < entries.Count else return null.
+            il.Emit(OpCodes.Ldc_I4, idx);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Callvirt, arenaCountGetter);
+            il.Emit(OpCodes.Bge_S, bailOutLabel);  // idx >= Count
+
+            // grads.TryGetValue(entries[idx].Output, out gradOutput)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldc_I4, idx);
+            il.Emit(OpCodes.Callvirt, arenaIndexer);   // ref entry
+            il.Emit(OpCodes.Ldfld, outputField);       // entry.Output
+            il.Emit(OpCodes.Ldloca, gradOutputLocal);
+            il.Emit(OpCodes.Callvirt, tryGetValueMethod);
+            il.Emit(OpCodes.Brfalse_S, skipLabel);
+
+            // arg1: gradOutput
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+
+            // arg2: entries[idx].GetInputsArrayInto(buf1, buf2, buf3)
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldc_I4, idx);
+            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf1Field);
+            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf2Field);
+            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf3Field);
+            il.Emit(OpCodes.Call, getInputsArrayIntoMethod);
+
+            // arg3: entries[idx].Output
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldc_I4, idx);
+            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            il.Emit(OpCodes.Ldfld, outputField);
+
+            // arg4: entries[idx].SavedState ?? Array.Empty<object>()
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldc_I4, idx);
+            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            il.Emit(OpCodes.Ldfld, savedStateField);
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Brtrue_S, savedStateNonNullLabel);
+            il.Emit(OpCodes.Pop);                          // pop the null
+            il.Emit(OpCodes.Call, arrayEmptyObjectMethod); // push Array.Empty<object>()
+            il.Emit(OpCodes.Br_S, savedStateDoneLabel);
+            il.MarkLabel(savedStateNonNullLabel);
+            // non-null savedState is already on the stack from Dup; nothing more to do
+            il.MarkLabel(savedStateDoneLabel);
+
+            // arg5: engine
+            il.Emit(OpCodes.Ldarg_3);
+
+            // arg6: state.Grads
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+
+            // Direct call to the entry's static backward method —
+            // this is the perf-winning step over delegate dispatch.
+            il.Emit(OpCodes.Call, bwdMethod);
+
+            il.Emit(OpCodes.Br_S, skipLabel);
+
+            il.MarkLabel(bailOutLabel);
+            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ret);
+
+            il.MarkLabel(skipLabel);
+        }
+
+        // return FinalizeWalk(state, sources);
+        il.Emit(OpCodes.Ldloca, stateLocal);
+        il.Emit(OpCodes.Ldarg_2);
+        il.Emit(OpCodes.Call, s_finalizeWalkMethod);
         il.Emit(OpCodes.Ret);
 
         return method;
