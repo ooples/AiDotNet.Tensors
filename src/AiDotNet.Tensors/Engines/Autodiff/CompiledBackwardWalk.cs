@@ -1196,9 +1196,6 @@ internal static class CompiledBackwardWalk<T>
         private static readonly MethodInfo s_divideMethod =
             typeof(IEngine).GetMethod(nameof(IEngine.TensorDivide))!
                 .MakeGenericMethod(typeof(T));
-        private static readonly Func<double, T> s_fromDouble =
-            d => MathHelper.GetNumericOperations<T>().FromDouble(d);
-
         public void Emit(
             ILGenerator il,
             LocalBuilder stateLocal,
