@@ -17396,17 +17396,22 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
-                // Execute eagerly to fill out params
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
                 var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
-                // Record in graph so compiled plan captures the dependency
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedMean = mean; var capturedVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.BatchNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                // Copy eager data into lazy output
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }
@@ -19359,6 +19364,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = GroupNorm(ci, cn, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedGNMean = mean; var capturedGNVar = variance;
                 // SavedState order MUST match BackwardFunctions<T>.GroupNormBackward's
                 // read order: [numGroups, mean, variance, epsilon]. Previously this was
                 // [mean, variance, numGroups, epsilon] causing InvalidCastException in
@@ -19367,11 +19374,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng)
-                        {
-                            cpuEng.GroupNormInto(output, ci, cn, cg, cb, ce, out _, out _);
-                        }
-                        else { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        var r = eng.GroupNorm(ci, cn, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedGNMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedGNVar.AsWritableSpan());
                     },
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
@@ -19823,8 +19829,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = RMSNorm(ci, cg, ce, out rms);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh rms on every plan.Step (was stale from compile-time).
+                var capturedRms = rms;
                 var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, eagerResult._shape,
-                    (eng, output) => { var r = eng.RMSNorm(ci, cg, ce, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshRms.AsSpan().CopyTo(capturedRms.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -23140,8 +23153,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = ScatterMean(cs, ci, out counts, cd, co);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: counts isn't currently referenced by the backward
+                // (only `indices` and `dim` are saved), but mirror the refresh
+                // pattern for safety in case ScatterMeanBackward starts consuming counts.
+                var capturedCounts = counts;
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "ScatterMean", source, eagerResult._shape,
-                    (eng, output) => { var r = eng.ScatterMean(cs, ci, out _, cd, co); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.ScatterMean(cs, ci, out var freshCounts, cd, co);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        if (capturedCounts is not null && freshCounts is not null
+                            && capturedCounts.Length == freshCounts.Length)
+                            freshCounts.AsSpan().CopyTo(capturedCounts.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -33258,9 +33282,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = InstanceNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedINMean = mean; var capturedINVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "InstanceNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.InstanceNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.InstanceNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedINMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedINVar.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -33441,8 +33473,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = Dropout(ci, cdr, ct, out mask);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mask on every plan.Step so backward
+                // sees the SAME mask as forward (compile-time mask is stale).
+                var capturedMask = mask;
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "Dropout", input, eagerResult._shape,
-                    (eng, output) => { var r = eng.Dropout(ci, cdr, ct, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.Dropout(ci, cdr, ct, out var freshMask);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMask.AsSpan().CopyTo(capturedMask.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;

@@ -8249,6 +8249,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        if (Compilation.GraphMode.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
@@ -8324,6 +8325,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -8372,6 +8374,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if (Compilation.GraphMode.IsActive) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -9325,6 +9328,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
         if (IsTapeActive<T>()) return base.Dropout(input, dropoutRate, training, out mask);
+        if (Compilation.GraphMode.IsActive) return base.Dropout(input, dropoutRate, training, out mask);
         if (!TryGetBackend(out var backend) || !training)
             return base.Dropout(input, dropoutRate, training, out mask);
 
