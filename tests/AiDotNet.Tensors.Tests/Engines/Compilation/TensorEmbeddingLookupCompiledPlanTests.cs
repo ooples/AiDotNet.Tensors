@@ -19,6 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// in <c>CpuEngine.cs</c>). These tests pin that wiring so a future
 /// op-table edit can't silently re-introduce the regression.</para>
 /// </summary>
+[Collection("EmbeddingLookupCompiledPlan")]
 public class TensorEmbeddingLookupCompiledPlanTests
 {
     /// <summary>

@@ -26232,21 +26232,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // Transformer training silently fails to update EmbeddingLayer
         // weights when running through CompiledTrainingPlan.Step(),
         // producing input-independent output (PPL = V exactly, top-1 = 1/V).
-        // We snapshot indices to int[] (matching the eager-tape branch
-        // below) so savedState round-trips through SavedStateSerializer.
+        //
+        // Indices are snapshotted as long[] (not int[]) so vocabulary
+        // sizes up to long.MaxValue are supported. SavedStateSerializer
+        // gained TagInt64Array support specifically for this round-trip;
+        // narrowing to int would silently overflow on vocab sizes > 2^31
+        // (large-scale retrieval / search-corpus embeddings).
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
             if (scope != null)
             {
                 var capturedEmb = embeddings;
-                var capturedIdx = indices;
                 var capturedVocab = vocabSize;
                 var capturedDim = embeddingDim;
                 int n = numIndices;
-                var idxSnap = new int[n];
-                var idxRaw = indices.GetDataArray();
-                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt32(idxRaw[i]);
+                var idxSnap = SnapshotIndicesToLongArray(indices);
                 var idxShapeSnap = (int[])indices._shape.Clone();
                 return scope.RecordUnary(
                     LazyNodeType.Custom,
@@ -26261,11 +26262,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         var outDataLocal = output.GetDataArray();
                         for (int i = 0; i < n; i++)
                         {
-                            int tokenIdx = idxSnap[i];
-                            if (tokenIdx < 0 || tokenIdx >= capturedVocab)
+                            long tokenIdxLong = idxSnap[i];
+                            if (tokenIdxLong < 0 || tokenIdxLong >= capturedVocab)
                                 throw new ArgumentOutOfRangeException(
                                     "indices",
-                                    $"Index {tokenIdx} at position {i} is out of bounds for embedding table with vocabulary size {capturedVocab}.");
+                                    $"Index {tokenIdxLong} at position {i} is out of bounds for embedding table with vocabulary size {capturedVocab}.");
+                            int tokenIdx = (int)tokenIdxLong;
                             int srcOff = tokenIdx * capturedDim;
                             int dstOff = i * capturedDim;
                             Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
@@ -26281,16 +26283,19 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
         var idxData = indices.GetDataArray();
 
-        // For each index, copy the entire embedding row
+        // For each index, copy the entire embedding row. Promote to long
+        // for the bounds check so a TIndex=long input with an index that
+        // overflows int32 (>2 billion) fails the bounds check with a
+        // meaningful error instead of OverflowException from Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            int tokenIdx = Convert.ToInt32(idxData[i]);
+            long tokenIdxLong = Convert.ToInt64(idxData[i]);
 
-            // Bounds check for index
-            if (tokenIdx < 0 || tokenIdx >= vocabSize)
+            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdx} at position {i} is out of bounds for embedding table with vocabulary size {vocabSize}.");
+                    $"Index {tokenIdxLong} at position {i} is out of bounds for embedding table with vocabulary size {vocabSize}.");
 
+            int tokenIdx = (int)tokenIdxLong;
             int srcOffset = tokenIdx * embeddingDim;
             int dstOffset = i * embeddingDim;
 
@@ -26300,14 +26305,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Tape registration. Without this, dL/dE was silently dropped — see #255.
         // Indices are non-trainable; only the embedding table receives gradient.
-        // Snapshot the indices as a portable int[] (widening from long if
-        // necessary) so the savedState round-trips through SavedStateSerializer:
-        // it supports null/int/int[]/double/float/bool/string/byte[]/Tensor<T>/Enum,
-        // but not Tensor<TIndex> for TIndex != T.
+        // Snapshot the indices as long[] so the savedState round-trips through
+        // SavedStateSerializer's TagInt64Array path — supporting vocabularies
+        // up to long.MaxValue without silent overflow on TIndex=long inputs.
         if (DifferentiableOps.IsTapeActiveForThread<TValue>())
         {
-            var indicesSnap = new int[numIndices];
-            for (int i = 0; i < numIndices; i++) indicesSnap[i] = Convert.ToInt32(idxData[i]);
+            var indicesSnap = SnapshotIndicesToLongArray(indices);
             var indicesShapeSnap = (int[])indices._shape.Clone();
             DifferentiableOps.RecordUnary(
                 "TensorEmbeddingLookup",
@@ -26318,6 +26321,26 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Widens an arbitrary <c>Tensor&lt;TIndex&gt;</c> (TIndex is typically
+    /// <c>int</c> or <c>long</c>) into a portable <c>long[]</c> snapshot for
+    /// SavedState serialization. Using <c>long[]</c> end-to-end means an
+    /// embedding-lookup call with a <c>Tensor&lt;long&gt;</c> indices buffer
+    /// holding values above <c>int.MaxValue</c> serializes losslessly
+    /// (would have thrown <see cref="OverflowException"/> from
+    /// <c>Convert.ToInt32</c> before — see the AiDotNet.Tensors PR audit
+    /// note on the original int-snapshot pattern).
+    /// </summary>
+    private static long[] SnapshotIndicesToLongArray<TIndex>(Tensor<TIndex> indices)
+        where TIndex : unmanaged
+    {
+        int n = indices.Length;
+        var snap = new long[n];
+        var raw = indices.GetDataArray();
+        for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
+        return snap;
     }
 
     /// <inheritdoc/>
@@ -26339,16 +26362,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var idxData = indices.GetDataArray();
         int numIndices = indices.Length;
 
-        // Scatter-add: for each index, accumulate gradients to the embedding row
+        // Scatter-add: for each index, accumulate gradients to the embedding row.
+        // Promote to long for the bounds check so a TIndex=long input with an
+        // index that overflows int32 (>2 billion) fails with a meaningful
+        // ArgumentOutOfRangeException instead of an OverflowException buried
+        // inside Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            int tokenIdx = Convert.ToInt32(idxData[i]);
+            long tokenIdxLong = Convert.ToInt64(idxData[i]);
 
-            // Bounds check for index
-            if (tokenIdx < 0 || tokenIdx >= vocabSize)
+            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdx} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                    $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
 
+            int tokenIdx = (int)tokenIdxLong;
             int srcOffset = i * embeddingDim;
             int dstOffset = tokenIdx * embeddingDim;
 
