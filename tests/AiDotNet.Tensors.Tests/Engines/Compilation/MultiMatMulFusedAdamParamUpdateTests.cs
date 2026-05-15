@@ -345,6 +345,150 @@ public class MultiMatMulFusedAdamParamUpdateTests
         }
     }
 
+    [Fact]
+    public void FusedLinearThenLayerNorm_GammaMustMove()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, dIn = 8, feat = 6;
+        var input = FilledRand(new[] { batch, dIn }, seed: 81);
+        var W = FilledRand(new[] { dIn, feat }, seed: 82);
+        var b = FilledRand(new[] { feat }, seed: 83);
+        var gamma = FilledRand(new[] { feat }, seed: 84);
+        var beta  = FilledRand(new[] { feat }, seed: 85);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var z = engine.FusedLinear(input, W, b, FusedActivationType.None);
+            var normed = engine.LayerNorm(z, gamma, beta, 1e-5, out _, out _);
+            engine.ReduceSum(normed, null);
+            plan = scope.CompileTraining(new[] { W, b, gamma, beta });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            string[] names = { "W", "b", "gamma", "beta" };
+            for (int i = 0; i < plan.Gradients.Length; i++)
+            {
+                var g = plan.Gradients[i];
+                if (g is null) { _output.WriteLine($"  gradient[{i}] {names[i]} = NULL"); continue; }
+                double gL2 = 0; var gSpan = g.AsSpan();
+                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
+                gL2 = System.Math.Sqrt(gL2);
+                _output.WriteLine($"  gradient[{i}] {names[i]} L2={gL2:E6}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Minimal isolation: a single LayerNorm op with gamma + beta as
+    /// trainable params. If the bug reproduces here, the entire LayerNorm
+    /// compiled-plan backward is the suspect, not the surrounding chain.
+    /// </summary>
+    [Fact]
+    public void LayerNormOnly_BothGammaAndBetaMustMove()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, feat = 6;
+        var input = FilledRand(new[] { batch, feat }, seed: 71);
+        var gamma = FilledRand(new[] { feat }, seed: 72);
+        var beta  = FilledRand(new[] { feat }, seed: 73);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        var beforeGamma = gamma.GetDataArray().AsSpan().ToArray();
+        var beforeBeta  = beta .GetDataArray().AsSpan().ToArray();
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var normed = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+            engine.ReduceSum(normed, null);
+            plan = scope.CompileTraining(new[] { gamma, beta });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            for (int i = 0; i < plan.Gradients.Length; i++)
+            {
+                var g = plan.Gradients[i];
+                if (g is null) { _output.WriteLine($"  gradient[{i}] = NULL"); continue; }
+                double gL2 = 0; var gSpan = g.AsSpan();
+                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
+                gL2 = System.Math.Sqrt(gL2);
+                _output.WriteLine($"  gradient[{i}] L2={gL2:E6}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// AiDotNet#1331 root-cause test: mirrors a transformer FFN block —
+    /// FusedLinear → LayerNorm → FusedLinear → ReduceSum. In the original
+    /// transformer diagnostic, every LayerNorm gain (γ) was stuck and
+    /// everything upstream of the last LayerNorm was stuck. If LayerNorm's
+    /// compiled backward drops dL/dγ or dL/dInput, this test will reproduce
+    /// the bug: upstream W1/b1 + gamma all stuck while only the LN beta
+    /// and downstream W2/b2 move.
+    /// </summary>
+    [Fact]
+    public void LayerNormBetweenFusedLinears_AllParamsMustMove()
+    {
+        var engine = new CpuEngine();
+
+        const int batch = 4, dIn = 8, dHidden = 6, dOut = 3;
+        var input = FilledRand(new[] { batch, dIn }, seed: 61);
+        var W1 = FilledRand(new[] { dIn, dHidden }, seed: 62);
+        var b1 = FilledRand(new[] { dHidden }, seed: 63);
+        var gamma = FilledRand(new[] { dHidden }, seed: 64);
+        var beta = FilledRand(new[] { dHidden }, seed: 65);
+        var W2 = FilledRand(new[] { dHidden, dOut }, seed: 66);
+        var b2 = FilledRand(new[] { dOut }, seed: 67);
+
+        // Bias gamma above zero so the layer is well-conditioned for normalization.
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        var beforeW1 = W1.GetDataArray().AsSpan().ToArray();
+        var beforeB1 = b1.GetDataArray().AsSpan().ToArray();
+        var beforeGamma = gamma.GetDataArray().AsSpan().ToArray();
+        var beforeBeta = beta.GetDataArray().AsSpan().ToArray();
+        var beforeW2 = W2.GetDataArray().AsSpan().ToArray();
+        var beforeB2 = b2.GetDataArray().AsSpan().ToArray();
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var z1 = engine.FusedLinear(input, W1, b1, FusedActivationType.None);
+            var normed = engine.LayerNorm(z1, gamma, beta, 1e-5, out _, out _);
+            var z2 = engine.FusedLinear(normed, W2, b2, FusedActivationType.None);
+            engine.ReduceSum(z2, null);
+            plan = scope.CompileTraining(new[] { W1, b1, gamma, beta, W2, b2 });
+        }
+
+        using (plan)
+        {
+            // Probe: call plan.Step() WITHOUT configuring the optimizer so we
+            // can inspect plan.Gradients directly. Then re-step with the optimizer.
+            plan.Step();
+            string[] names = { "W1", "b1", "gamma", "beta", "W2", "b2" };
+            for (int i = 0; i < plan.Gradients.Length; i++)
+            {
+                var g = plan.Gradients[i];
+                if (g is null)
+                {
+                    _output.WriteLine($"  gradient[{i}] {names[i]} = NULL");
+                    continue;
+                }
+                double gL2 = 0;
+                var gSpan = g.AsSpan();
+                for (int k = 0; k < gSpan.Length; k++) gL2 += gSpan[k] * gSpan[k];
+                gL2 = System.Math.Sqrt(gL2);
+                _output.WriteLine($"  gradient[{i}] {names[i]}  shape=[{string.Join(",", g.Shape.ToArray())}]  L2={gL2:E6}");
+            }
+        }
+    }
+
     /// <summary>
     /// Three-MatMul chain (Dense → Dense → Dense head). All six leaf params
     /// (three Ws, three bs) must move. Pre-fix only the last layer's bias

@@ -18371,31 +18371,39 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: mean/variance returned by the compile-time
+                // eager call are stale once the lazy graph replays — the
+                // forward replay re-runs LayerNorm on the freshly-computed
+                // input, but the savedState mean/variance tensors are NOT
+                // re-updated, so the backward kernel reads compile-time
+                // values (zero, since the lazy input was uninitialized at
+                // compile time). The result: gradGamma and dL/dInput silently
+                // become zero, gamma never trains, and every parameter
+                // upstream of any LayerNorm stops learning. Fix: the lazy
+                // execute callback recomputes mean/variance via the
+                // out-param overload and copies them into the SAME tensor
+                // instances the savedState slot holds, so the backward
+                // reads fresh values on every plan.Step().
+                var capturedMean = mean;
+                var capturedVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    // Path C: plan-step write-through. When the engine is
-                    // CpuEngine and T is float, call LayerNormFloatInto which
-                    // writes directly into the plan's pre-allocated output.
-                    // This skips the intermediate tensor allocation + the
-                    // 786 KB CopyTo that the generic path below would incur
-                    // for BERT's [1,256,768] LayerNorm (~130 µs saved per
-                    // call × 24 calls per BERT layer).
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
-                        {
-                            cpuEng.LayerNormFloatInto(
-                                (Tensor<float>)(object)ci,
-                                (Tensor<float>)(object)cg,
-                                (Tensor<float>)(object)cb,
-                                ce,
-                                (Tensor<float>)(object)output);
-                        }
-                        else
-                        {
-                            var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _);
-                            r.AsSpan().CopyTo(output.AsWritableSpan());
-                        }
+                        // Always go through the out-param eager LayerNorm so we
+                        // have fresh mean/variance for the backward. The
+                        // LayerNormFloatInto fast path skipped this — which
+                        // is what caused #1331. The previous "fast" path is
+                        // re-introducible later as an option once a
+                        // mean+var write-through overload exists.
+                        var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        // Mean/variance are per-batch tensors of shape
+                        // [batchSize]; copy element-by-element into the
+                        // SAME tensors the savedState slot references so
+                        // LayerNormBackward reads the just-computed values.
+                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
                     },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
