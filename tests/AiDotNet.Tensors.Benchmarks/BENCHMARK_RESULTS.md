@@ -207,3 +207,28 @@ Runtime=.NET 10.0  InvocationCount=1  IterationCount=15  WarmupCount=5
 Note: TF.NET errored out on bulk Add/Multiply and 256/512 MatMul in earlier
 runs (the original `fcb7fea` baseline shows `NA`). The fresh run completed
 all benchmarks; the SciSharp library appears to have stabilized between runs.
+
+---
+
+## #338 Phase A baseline — fresh-tape Transformer per-backward profile
+
+> **Captured**: `Issue338_PhaseA_BackwardProfile_CaptureBreakdown` test, 16-core x64, Release build, 20 timed iters after 2 warmup iters.
+> **Config**: d=128, L=4 layers, B=32, ctx=64. Matches issue #327 reference shape.
+> **Total wall-time**: 272.13 ms/iter.
+
+| function | calls (over 20 iters) | total_ms | pct_of_backward |
+|---|---:|---:|---:|
+| MatMulBackward      | 340 | 3507.218 | **86.12%** |
+| ReduceSumBackward   |  20 |  263.195 |   6.46% |
+| SliceBackward       |  80 |  156.045 |   3.83% |
+| GELUBackward        |  80 |  146.015 |   3.59% |
+
+**Headline finding**: MatMulBackward dominates at 86% of total backward time (~175 ms/iter). The remaining 14% is split across three other functions, none of which exceeds ~13 ms/iter on its own.
+
+**Implications for the #338 roadmap**:
+- **Phase B targeting is correct**: optimizing MatMulBackward is the single highest-leverage move. Even a 30% MatMul speedup (e.g. backward parallelization on the outer M dim) translates to ~50 ms wall-time savings.
+- **Phase C parallelization should target MatMulBackward first**, then ReduceSum, Slice, GELU in that order. The cumulative ceiling for "just parallelize the top 4" is ~140 ms reduction if each runs at the host's full multi-core throughput.
+- **Forward + optimizer + tape overhead is ~68 ms/iter** (272 − 204). After backward shrinks to ~50 ms (PyTorch parity backward), forward becomes the new bottleneck.
+- **PyTorch parity (50 ms total)** requires MatMulBackward to drop to ≤30 ms, forward ≤20 ms. The BLAS-backend swap (Phase G) is unavoidable for the stretch target — OpenBLAS at 175 ms / 340 calls = 515 µs/call vs MKL's measured ~300 µs/call on equivalent shapes.
+
+To reproduce: `AIDOTNET_RUN_PERF_GATES=1 AIDOTNET_BWD_TIMING=1 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 -c Release --filter "FullyQualifiedName~Issue338_PhaseA_BackwardProfile" --logger "console;verbosity=detailed"`

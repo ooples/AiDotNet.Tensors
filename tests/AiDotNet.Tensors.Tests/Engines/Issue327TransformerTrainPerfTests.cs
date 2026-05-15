@@ -205,6 +205,96 @@ public class Issue327TransformerTrainPerfTests
     }
 
     /// <summary>
+    /// Phase A (#338): captures the per-backward-function wall-time
+    /// breakdown so subsequent phases target the actual dominant
+    /// functions. Opt-in via AIDOTNET_BWD_TIMING=1 (alongside the
+    /// existing AIDOTNET_RUN_PERF_GATES=1 + 16-core x64 gates).
+    /// Output is emitted to xUnit's <c>ITestOutputHelper</c> as CSV; to
+    /// capture it for tracking, run:
+    /// <code>
+    /// AIDOTNET_BWD_TIMING=1 AIDOTNET_RUN_PERF_GATES=1 dotnet test \
+    ///   tests/AiDotNet.Tensors.Tests \
+    ///   --filter "FullyQualifiedName~Issue338_PhaseA_BackwardProfile"
+    ///   --logger "console;verbosity=detailed"
+    /// </code>
+    /// and copy the CSV section into <c>BENCHMARK_RESULTS.md</c>.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseA_BackwardProfile_CaptureBreakdown()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.GetEnvironmentVariable("AIDOTNET_BWD_TIMING") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_BWD_TIMING != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16)
+        {
+            _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16 (issue scope).");
+            return;
+        }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            _output.WriteLine($"Skip: ProcessArchitecture={RuntimeInformation.ProcessArchitecture} (issue scope is X64).");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            // Warmup — discard the timing for the first 2 passes so JIT +
+            // arena settle. BackwardTiming aggregates across calls so
+            // discard means reset after warmup.
+            for (int i = 0; i < 2; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+            // Discard warmup accumulator. The CSV dump below resets it
+            // too, but we want the timed window to start clean.
+            BackwardTiming.DumpAndReset(_ => { /* discard */ });
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            sw.Stop();
+
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase A baseline ({iters} iters after 2 warmup)");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# host_processor_count={Environment.ProcessorCount}");
+            _output.WriteLine($"# host_arch={RuntimeInformation.ProcessArchitecture}");
+            _output.WriteLine($"# config_d={D}_L={Layers}_B={B}_ctx={Ctx}");
+            _output.WriteLine(string.Empty);
+            _output.WriteLine("```csv");
+            BackwardTiming.DumpAndResetCsv(line => _output.WriteLine(line));
+            _output.WriteLine("```");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
     /// Forward pass over L stacked transformer-encoder layers. Matches
     /// the BDN harness's ForwardL so the xUnit gate and the harness
     /// measure the exact same computation.
