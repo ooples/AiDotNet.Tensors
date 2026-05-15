@@ -262,10 +262,14 @@ GEMM math saturates ~4 OpenBLAS threads for these shapes. Adding more threads re
 | Path | wall-time | Δ vs fresh-tape baseline |
 |---|---:|---:|
 | Fresh-tape `GradientTape` (Phase A baseline) | ~266 ms/iter | — |
-| `CompiledModelCache.GetOrCompileTraining` | **205.68 ms/iter** | **-23% (-60 ms)** |
-| Persistent-tape (per #327 issue body) | ~58 ms/iter | -78% |
+| `CompiledModelCache.GetOrCompileTraining` (median of 3) | **188 ms/iter** (runs: 191, 185, 190) | **-29% (-78 ms)** |
+| Persistent-tape (measured this hardware) | 335 ms/iter (failed its own ≤250ms gate) | +26% (REGRESSED) |
+| Persistent-tape (per #327 issue body) | ~58 ms/iter | -78% (not reproducible on this hardware) |
 
-**Headline finding**: the existing `CompiledModelCache` infrastructure DOES deliver a real wall-time win on the #327 workload — 23% reduction (-60 ms/iter), the largest single measured improvement in the entire Phase A-D investigation. **However**, it does not match persistent-tape's 58 ms baseline. The gap (205 → 58 ms = 147 ms) needs additional investigation.
+**Headline finding (updated after 3-run median + persistent-tape control):**
+- `CompiledModelCache` delivers a stable **29% reduction** (188 ms median over 3 runs vs 266 ms baseline). This is the largest measured wall-time win in the entire #338 effort.
+- Persistent-tape on this hardware actually ran at **335 ms** — FAILING its own 250 ms gate. The "58 ms persistent-tape baseline" cited in #327's issue body is not reproducible on this 16-core box; either the original measurement was on different hardware/config, or the persistent-tape path has regressed.
+- **`CompiledModelCache` is now the fastest path** on the reference hardware — faster than fresh-tape AND faster than persistent-tape.
 
 **Implications for the plan**:
 - Phase D's premise is validated: cache-and-replay infrastructure works for this workload.
