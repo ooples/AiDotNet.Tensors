@@ -251,6 +251,11 @@ internal static class CompiledBackwardWalk<T>
         if (expMethod is not null)
             registry[expMethod] = new ExpBackwardInliner();
 
+        var logMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.LogBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (logMethod is not null)
+            registry[logMethod] = new LogBackwardInliner();
+
         return registry;
     }
 
@@ -459,6 +464,47 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, outputField);
             il.Emit(OpCodes.Callvirt, s_multiplyMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            // AccumulateGrad(state.Grads, entry.Input0, grad, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>LogBackward</c>: d(log(x))/dx = grad / x. One
+    /// TensorDivide(gradOutput, entry.Input0) + one AccumulateGrad.
+    /// </summary>
+    private sealed class LogBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_divideMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorDivide))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.TensorDivide(gradOutput, entry.Input0)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Callvirt, s_divideMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
             // AccumulateGrad(state.Grads, entry.Input0, grad, engine)
