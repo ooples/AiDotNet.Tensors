@@ -71,6 +71,14 @@ internal static class RebindablePlanCache<T>
         _cachedPatternHash = patternHash;
         _cachedRecordedEntryCount = recordedEntryCount;
         _cachedReverseTopoIndices = reverseTopoIndices;
+
+        // Issue #338 Item 3: also register a compiled-backward walker
+        // keyed by the same pattern hash so the
+        // GradientTape.ComputeGradientsViaGraphCore IL-walker fast path
+        // (gated on AIDOTNET_COMPILED_BACKWARD) finds it. Cheap on the
+        // miss path because Register is a Dictionary insert.
+        if (CompiledBackwardWalk<T>.Enabled)
+            CompiledBackwardWalk<T>.Register(patternHash, CompiledBackwardWalk<T>.Compile(reverseTopoIndices));
     }
 
     /// <summary>

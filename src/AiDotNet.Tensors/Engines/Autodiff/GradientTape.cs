@@ -801,6 +801,27 @@ public sealed class GradientTape<T> : IDisposable
                 SetCurrentTape(null);
                 try
                 {
+                    // Issue #338 Item 3: compiled-IL backward walker. When
+                    // AIDOTNET_COMPILED_BACKWARD is enabled, route through
+                    // the pattern-keyed walker cache. The walker today is
+                    // a passthrough (same dispatch logic, just hoisted out
+                    // of the cache module); future commits replace each
+                    // walker with a DynamicMethod whose IL bakes in the
+                    // index sequence + backward delegate signatures.
+                    if (CompiledBackwardWalk<T>.Enabled)
+                    {
+                        var walker = CompiledBackwardWalk<T>.TryGetWalker(lookupHash);
+                        if (walker is not null)
+                        {
+                            var compiledResult = walker(_entries, loss, sources, _engine);
+                            if (compiledResult is not null)
+                            {
+                                CleanupAfterCachedReplay(compiledResult, sources);
+                                return compiledResult;
+                            }
+                        }
+                    }
+
                     var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
                     if (cached is not null)
                     {
