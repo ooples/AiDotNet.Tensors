@@ -13128,12 +13128,32 @@ public partial class CpuEngine : ITensorLevelEngine
         // VAE decoder — directly in the #162 timing-out list — plus diffusion
         // UNet upsample decoder blocks hit this op in every forward pass.
         // ────────────────────────────────────────────────────────────────────
+        // ────────────────────────────────────────────────────────────────────
+        // BLAS GEMM + Col2Im fast path. ConvTranspose2D is the adjoint of
+        // Conv2D, so the forward decomposes into a dense GEMM
+        // (kernel^T @ input) followed by Col2ImAccumulate — the same
+        // im2col+GEMM machinery as forward Conv2D, with the scatter step
+        // doing inverse spatial indexing. Dispatches to MKL/OpenBLAS at
+        // ~5-10 GFLOPS instead of the naive 7-nested loop at <1 GFLOPS.
+        // Falls through to the naive path if BLAS is unavailable.
+        // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
             var fInput = (float[])(object)inputData;
             var fKernel = (float[])(object)kernelData;
             var fOutput = (float[])(object)outputData;
 
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    fInput, fKernel, fOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW,
+                    outputHeight, outputWidth))
+            {
+                // BLAS path succeeded — skip the naive fallback.
+            }
+            else
+            {
             CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
             {
                 int b = idx / outChannels;
@@ -13168,6 +13188,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+            }
         }
         else if (typeof(T) == typeof(double))
         {
@@ -13175,6 +13196,17 @@ public partial class CpuEngine : ITensorLevelEngine
             var dKernel = (double[])(object)kernelData;
             var dOutput = (double[])(object)outputData;
 
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    dInput, dKernel, dOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW,
+                    outputHeight, outputWidth))
+            {
+                // BLAS path succeeded — skip the naive fallback.
+            }
+            else
+            {
             CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
             {
                 int b = idx / outChannels;
@@ -13209,6 +13241,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+            }
         }
         else
         {
