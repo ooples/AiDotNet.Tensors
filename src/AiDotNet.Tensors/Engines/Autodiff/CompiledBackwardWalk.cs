@@ -2,6 +2,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Reflection.Emit;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -12,26 +14,24 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// Issue #338 Item 3 — compiled-IL backward.
 /// <para>
 /// Replaces <see cref="RebindablePlanCache{T}.TryExecute"/>'s dispatch loop
-/// with a specialised walker per cached forward pattern. The eventual
-/// implementation emits a <see cref="System.Reflection.Emit.DynamicMethod"/>
-/// that bakes in the index sequence + per-entry backward delegate calls,
-/// eliminating the loop counter, bounds-check, and per-iteration entry
-/// lookup overhead. Equivalent to PyTorch <c>torch.compile</c>'s backward
+/// with a per-pattern <see cref="DynamicMethod"/> whose IL bakes in the
+/// reverse-topo index sequence. Each entry in the sequence becomes a
+/// straight-line <c>call</c> to <see cref="CompiledBackwardWalkHelpers{T}.ProcessEntry"/>
+/// with the index loaded as an <c>Ldc.I4</c> constant — no
+/// <c>indices[i]</c> array access, no loop counter, no per-iteration
+/// bounds check. Equivalent to PyTorch <c>torch.compile</c>'s backward
 /// codegen pass.
 /// </para>
 /// <para>
-/// Status — this commit lands the integration scaffolding:
-/// <list type="bullet">
-///   <item>Static API surface (<see cref="TryGetWalker"/> / <see cref="Register"/>) keyed by pattern hash.</item>
-///   <item>Cached walker shape (<see cref="CompiledWalker{T}"/>) that future commits replace with a JIT-emitted DynamicMethod delegate.</item>
-///   <item>Today the walker is a passthrough — it indirects to the same per-entry dispatch loop <see cref="RebindablePlanCache{T}"/> uses. The structural extraction here is the prerequisite for the IL specialisation in subsequent commits.</item>
-/// </list>
+/// Enable via <c>AIDOTNET_COMPILED_BACKWARD=1</c>. Off by default to give
+/// the env-var-gated path time to soak before flipping the default.
 /// </para>
 /// <para>
-/// Enable via <c>AIDOTNET_COMPILED_BACKWARD=1</c>. Off by default while
-/// the IL emission is incomplete; flipping the env var routes
-/// <see cref="GradientTape{T}.ComputeGradientsViaGraphCore"/> through this
-/// path instead of the inline replay loop.
+/// IL emission is wrapped in a defensive try/catch; any
+/// <c>Reflection.Emit</c> failure (rare — usually only happens on
+/// platforms with restricted IL JIT) falls back to a closure-based walker
+/// with identical semantics. The fallback path is what the test suite
+/// runs in regression checks.
 /// </para>
 /// </summary>
 internal static class CompiledBackwardWalk<T>
@@ -55,10 +55,10 @@ internal static class CompiledBackwardWalk<T>
 
     /// <summary>
     /// Walker delegate shape. Takes the same arguments as the inline
-    /// <see cref="RebindablePlanCache{T}.TryExecute"/> replay loop. Returns
-    /// the gradient dictionary (caller filters by sources). Returning
-    /// <c>null</c> signals a stale cache — fall back to the fresh-walk
-    /// dispatcher.
+    /// <see cref="RebindablePlanCache{T}.TryExecute"/> replay loop.
+    /// Returns the gradient dictionary, or <c>null</c> when a baked-in
+    /// index falls outside the current tape's bounds (stale cache —
+    /// caller falls back to the fresh-walk dispatcher).
     /// </summary>
     internal delegate Dictionary<Tensor<T>, Tensor<T>>? CompiledWalker(
         TapeEntryArena<T> entries,
@@ -107,13 +107,28 @@ internal static class CompiledBackwardWalk<T>
         s_walkers = null;
     }
 
+    // ─── IL emission targets ─────────────────────────────────────────────
+    // These MethodInfos are looked up once per closed generic T and reused
+    // for every Compile call on that T. Lookup is cheap (reflection on a
+    // closed generic type) but doing it once amortises across many
+    // pattern compilations.
+
+    private static readonly MethodInfo s_initStateMethod = typeof(CompiledBackwardWalkHelpers<T>)
+        .GetMethod(nameof(CompiledBackwardWalkHelpers<T>.InitState),
+            BindingFlags.Public | BindingFlags.Static)!;
+
+    private static readonly MethodInfo s_processEntryMethod = typeof(CompiledBackwardWalkHelpers<T>)
+        .GetMethod(nameof(CompiledBackwardWalkHelpers<T>.ProcessEntry),
+            BindingFlags.Public | BindingFlags.Static)!;
+
+    private static readonly MethodInfo s_finalizeWalkMethod = typeof(CompiledBackwardWalkHelpers<T>)
+        .GetMethod(nameof(CompiledBackwardWalkHelpers<T>.FinalizeWalk),
+            BindingFlags.Public | BindingFlags.Static)!;
+
     /// <summary>
-    /// Builds a compiled walker for the given plan. The current implementation
-    /// is a passthrough — it forwards to the same per-entry dispatch loop
-    /// <see cref="RebindablePlanCache{T}.TryExecute"/> uses. Subsequent
-    /// commits replace this body with a <see cref="System.Reflection.Emit.DynamicMethod"/>
-    /// that bakes in the index sequence + per-entry backward delegate
-    /// signatures, eliminating per-iteration loop / bounds-check overhead.
+    /// Builds a compiled walker for the given plan. Attempts IL emission
+    /// first; on failure (rare — restricted IL platforms) falls back to a
+    /// closure-based walker with identical semantics.
     /// </summary>
     /// <param name="reverseTopoIndices">Reverse-topo entry-index sequence
     /// from <see cref="RebindablePlanCache{T}"/>. Captured by reference;
@@ -122,74 +137,229 @@ internal static class CompiledBackwardWalk<T>
     {
         if (reverseTopoIndices is null) throw new ArgumentNullException(nameof(reverseTopoIndices));
 
-        // Passthrough specialisation. Captures the indices array directly
-        // into the closure; future IL-emitted version replaces this with a
-        // DynamicMethod whose IL hard-codes the entire index walk.
-        var indices = reverseTopoIndices;
+        // Try IL emission first. The dynamic method bakes in each index
+        // as an Ldc.I4 constant, eliminating the closure's array access
+        // per iteration. Any IL-emit failure (e.g. restricted-IL
+        // platforms) falls through to the closure path.
+        try
+        {
+            var dynMethod = EmitWalkerIL(reverseTopoIndices);
+            return (CompiledWalker)dynMethod.CreateDelegate(typeof(CompiledWalker));
+        }
+        catch
+        {
+            // Fallthrough to closure-based walker — defensive.
+        }
 
+        return EmitWalkerClosure(reverseTopoIndices);
+    }
+
+    /// <summary>
+    /// Emits the unrolled walker as a <see cref="DynamicMethod"/>. The
+    /// emitted IL has the shape:
+    /// <code>
+    /// var state = CompiledBackwardWalkHelpers&lt;T&gt;.InitState(loss, indices.Length);
+    /// CompiledBackwardWalkHelpers&lt;T&gt;.ProcessEntry(entries, idx_0, state, engine);
+    /// CompiledBackwardWalkHelpers&lt;T&gt;.ProcessEntry(entries, idx_1, state, engine);
+    /// ... (one call per baked index) ...
+    /// return CompiledBackwardWalkHelpers&lt;T&gt;.FinalizeWalk(state, sources);
+    /// </code>
+    /// Each index is loaded via <c>Ldc.I4</c> — no <c>indices[i]</c>
+    /// access in the JITted code.
+    /// </summary>
+    private static DynamicMethod EmitWalkerIL(int[] reverseTopoIndices)
+    {
+        var method = new DynamicMethod(
+            name: $"CompiledBackwardWalk_{typeof(T).Name}_{reverseTopoIndices.Length}",
+            returnType: typeof(Dictionary<Tensor<T>, Tensor<T>>),
+            parameterTypes: new[]
+            {
+                typeof(TapeEntryArena<T>),
+                typeof(Tensor<T>),
+                typeof(IReadOnlyList<Tensor<T>>),
+                typeof(IEngine),
+            },
+            restrictedSkipVisibility: true);
+        method.DefineParameter(1, ParameterAttributes.None, "entries");
+        method.DefineParameter(2, ParameterAttributes.None, "loss");
+        method.DefineParameter(3, ParameterAttributes.None, "sources");
+        method.DefineParameter(4, ParameterAttributes.None, "engine");
+
+        var il = method.GetILGenerator();
+
+        // Local 0: state — holds grads + per-arity buffer arrays.
+        var stateLocal = il.DeclareLocal(typeof(CompiledBackwardWalkHelpers<T>.WalkState));
+
+        // state = InitState(loss, reservedCount)
+        il.Emit(OpCodes.Ldarg_1);                              // loss
+        il.Emit(OpCodes.Ldc_I4, reverseTopoIndices.Length);    // reservedCount
+        il.Emit(OpCodes.Call, s_initStateMethod);              // -> WalkState
+        il.Emit(OpCodes.Stloc, stateLocal);
+
+        // For each baked-in index, emit:
+        //   ProcessEntry(entries, idx, ref state, engine);
+        for (int i = 0; i < reverseTopoIndices.Length; i++)
+        {
+            il.Emit(OpCodes.Ldarg_0);                          // entries
+            il.Emit(OpCodes.Ldc_I4, reverseTopoIndices[i]);    // idx
+            il.Emit(OpCodes.Ldloca, stateLocal);               // ref state
+            il.Emit(OpCodes.Ldarg_3);                          // engine
+            il.Emit(OpCodes.Call, s_processEntryMethod);       // returns bool: false = stale cache
+            // ProcessEntry returns false when idx is out of range — the
+            // walker contract says return null in that case so the caller
+            // falls back to the fresh-walk dispatcher.
+            var continueLabel = il.DefineLabel();
+            il.Emit(OpCodes.Brtrue_S, continueLabel);
+            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ret);
+            il.MarkLabel(continueLabel);
+        }
+
+        // return FinalizeWalk(state, sources);
+        il.Emit(OpCodes.Ldloca, stateLocal);                   // ref state
+        il.Emit(OpCodes.Ldarg_2);                              // sources
+        il.Emit(OpCodes.Call, s_finalizeWalkMethod);           // -> Dictionary<Tensor<T>, Tensor<T>>
+        il.Emit(OpCodes.Ret);
+
+        return method;
+    }
+
+    /// <summary>
+    /// Closure-based fallback walker. Identical semantics to the IL
+    /// version; runs on platforms that disallow <c>Reflection.Emit</c>.
+    /// Also serves as the regression-test oracle when env-var-gated
+    /// AIDOTNET_COMPILED_BACKWARD is off.
+    /// </summary>
+    private static CompiledWalker EmitWalkerClosure(int[] reverseTopoIndices)
+    {
+        var indices = reverseTopoIndices;
         return (entries, loss, sources, engine) =>
         {
-            var numOps = MathHelper.GetNumericOperations<T>();
-            var grads = new Dictionary<Tensor<T>, Tensor<T>>(
-                indices.Length + 1,
-                ReferenceEqualityComparer<Tensor<T>>.Instance);
-
-            // Seed gradient — identical to RebindablePlanCache's seeding.
-            Tensor<T> seedGrad;
-            if (loss.Length == 1)
+            var state = CompiledBackwardWalkHelpers<T>.InitState(loss, indices.Length);
+            for (int i = 0; i < indices.Length; i++)
             {
-                seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+                if (!CompiledBackwardWalkHelpers<T>.ProcessEntry(entries, indices[i], ref state, engine))
+                    return null;
             }
-            else
-            {
-                var onesData = new T[loss.Length];
-                var one = numOps.One;
-                for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
-                seedGrad = new Tensor<T>(onesData, loss._shape);
-            }
-            grads[loss] = seedGrad;
-
-            var inputsBuffer1 = new Tensor<T>[1];
-            var inputsBuffer2 = new Tensor<T>[2];
-            var inputsBuffer3 = new Tensor<T>[3];
-            try
-            {
-                for (int i = 0; i < indices.Length; i++)
-                {
-                    int idx = indices[i];
-                    if (idx < 0 || idx >= entries.Count) return null;
-                    ref var entry = ref entries[idx];
-
-                    if (!grads.TryGetValue(entry.Output, out var gradOutput))
-                        continue;
-
-                    entry.Backward(
-                        gradOutput,
-                        entry.GetInputsArrayInto(inputsBuffer1, inputsBuffer2, inputsBuffer3),
-                        entry.Output,
-                        entry.SavedState ?? Array.Empty<object>(),
-                        engine,
-                        grads);
-                }
-            }
-            finally
-            {
-                inputsBuffer1[0] = null!;
-                inputsBuffer2[0] = null!; inputsBuffer2[1] = null!;
-                inputsBuffer3[0] = null!; inputsBuffer3[1] = null!; inputsBuffer3[2] = null!;
-            }
-
-            if (sources is not null)
-            {
-                var filtered = new Dictionary<Tensor<T>, Tensor<T>>(
-                    sources.Count, ReferenceEqualityComparer<Tensor<T>>.Instance);
-                foreach (var source in sources)
-                    if (grads.TryGetValue(source, out var grad))
-                        filtered[source] = grad;
-                return filtered;
-            }
-
-            return grads;
+            return CompiledBackwardWalkHelpers<T>.FinalizeWalk(ref state, sources);
         };
+    }
+}
+
+/// <summary>
+/// Helper functions that the IL-emitted walker calls. Keeping them as a
+/// separate static class lets the IL emitter cache <see cref="MethodInfo"/>
+/// handles once per closed generic <typeparamref name="T"/>.
+/// </summary>
+internal static class CompiledBackwardWalkHelpers<T>
+{
+    /// <summary>
+    /// State threaded through every per-entry call. A struct (not a class)
+    /// so the IL emitter can pass it via <c>ldloca</c> and the JIT can
+    /// keep its fields in registers across the unrolled walk.
+    /// </summary>
+    internal struct WalkState
+    {
+        public Dictionary<Tensor<T>, Tensor<T>> Grads;
+        public Tensor<T>[] Buf1;
+        public Tensor<T>[] Buf2;
+        public Tensor<T>[] Buf3;
+    }
+
+    /// <summary>
+    /// Initializes the per-walk state. Allocates the gradient dictionary
+    /// with capacity sized to the recorded entry count, allocates the
+    /// per-arity input buffers, and seeds <paramref name="loss"/>'s
+    /// gradient to ones.
+    /// </summary>
+    public static WalkState InitState(Tensor<T> loss, int reservedCount)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+            reservedCount + 1,
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+        Tensor<T> seedGrad;
+        if (loss.Length == 1)
+        {
+            seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+        }
+        else
+        {
+            var onesData = new T[loss.Length];
+            var one = numOps.One;
+            for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
+            seedGrad = new Tensor<T>(onesData, loss._shape);
+        }
+        grads[loss] = seedGrad;
+
+        return new WalkState
+        {
+            Grads = grads,
+            Buf1 = new Tensor<T>[1],
+            Buf2 = new Tensor<T>[2],
+            Buf3 = new Tensor<T>[3],
+        };
+    }
+
+    /// <summary>
+    /// Processes one tape entry. Looks up the entry by index, checks
+    /// whether the output has an accumulated upstream gradient, and if so
+    /// invokes its backward function. Returns <c>false</c> when the index
+    /// is out of range — signal to the IL walker to bail out (stale cache).
+    /// </summary>
+    public static bool ProcessEntry(
+        TapeEntryArena<T> entries,
+        int idx,
+        ref WalkState state,
+        IEngine engine)
+    {
+        if ((uint)idx >= (uint)entries.Count) return false;
+        ref var entry = ref entries[idx];
+
+        if (!state.Grads.TryGetValue(entry.Output, out var gradOutput))
+            return true;
+
+        entry.Backward(
+            gradOutput,
+            entry.GetInputsArrayInto(state.Buf1, state.Buf2, state.Buf3),
+            entry.Output,
+            entry.SavedState ?? Array.Empty<object>(),
+            engine,
+            state.Grads);
+        return true;
+    }
+
+    /// <summary>
+    /// Filters the gradient dictionary by sources (when non-null) and
+    /// clears the per-arity buffer references so the next walk starts
+    /// fresh. Mirrors <see cref="RebindablePlanCache{T}.TryExecute"/>'s
+    /// post-loop cleanup.
+    /// </summary>
+    public static Dictionary<Tensor<T>, Tensor<T>> FinalizeWalk(
+        ref WalkState state,
+        IReadOnlyList<Tensor<T>>? sources)
+    {
+        // Clear buffer references so forward intermediates from this walk
+        // don't get pinned in the buffer arrays for the rest of the
+        // thread's lifetime. The buffers themselves are kept (small fixed
+        // allocs); only the references inside them are nulled.
+        state.Buf1[0] = null!;
+        state.Buf2[0] = null!; state.Buf2[1] = null!;
+        state.Buf3[0] = null!; state.Buf3[1] = null!; state.Buf3[2] = null!;
+
+        if (sources is not null)
+        {
+            var filtered = new Dictionary<Tensor<T>, Tensor<T>>(
+                sources.Count, ReferenceEqualityComparer<Tensor<T>>.Instance);
+            for (int i = 0; i < sources.Count; i++)
+            {
+                if (state.Grads.TryGetValue(sources[i], out var grad))
+                    filtered[sources[i]] = grad;
+            }
+            return filtered;
+        }
+
+        return state.Grads;
     }
 }
