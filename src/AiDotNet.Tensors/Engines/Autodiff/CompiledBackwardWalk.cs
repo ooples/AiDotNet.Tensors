@@ -289,6 +289,16 @@ internal static class CompiledBackwardWalk<T>
         if (geluMethod is not null)
             registry[geluMethod] = new GeluBackwardInliner();
 
+        var sinMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.SinBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (sinMethod is not null)
+            registry[sinMethod] = new SinBackwardInliner();
+
+        var cosMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.CosBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (cosMethod is not null)
+            registry[cosMethod] = new CosBackwardInliner();
+
         return registry;
     }
 
@@ -833,6 +843,109 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, input0Field);
             il.Emit(OpCodes.Callvirt, s_geluBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>SinBackward</c>: d(sin(x))/dx = grad * cos(x). One
+    /// TensorCos + one TensorMultiply + one AccumulateGrad.
+    /// </summary>
+    private sealed class SinBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_cosMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorCos))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly MethodInfo s_multiplyMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiply))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            var cosLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Callvirt, s_cosMethod);
+            il.Emit(OpCodes.Stloc, cosLocal);
+
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, cosLocal);
+            il.Emit(OpCodes.Callvirt, s_multiplyMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>CosBackward</c>: d(cos(x))/dx = -grad * sin(x).
+    /// TensorSin + TensorNegate + TensorMultiply + AccumulateGrad.
+    /// </summary>
+    private sealed class CosBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_sinMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorSin))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly MethodInfo s_negateMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorNegate))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly MethodInfo s_multiplyMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiply))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            // negSinX = engine.TensorNegate(engine.TensorSin(entry.Input0))
+            var negSinLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Callvirt, s_sinMethod);
+            il.Emit(OpCodes.Callvirt, s_negateMethod);
+            il.Emit(OpCodes.Stloc, negSinLocal);
+
+            // grad = engine.TensorMultiply(gradOutput, negSinX)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, negSinLocal);
+            il.Emit(OpCodes.Callvirt, s_multiplyMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
             il.Emit(OpCodes.Ldloca, stateLocal);
