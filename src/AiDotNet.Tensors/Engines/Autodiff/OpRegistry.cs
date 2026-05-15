@@ -437,6 +437,7 @@ internal static class OpRegistry
         "TensorBatchMatMul",   // -> BatchMatMul (records)
         "TensorLogSoftmax",    // -> LogSoftmax (records)
         "TensorEmbeddingLookup", // -> Embedding (records)
+        "TensorEmbeddingLookupFromFloatIndices", // AiDotNet#1331 — float-indices variant; lazy node captures indices by ref + records BackwardFunctions<T>.TensorEmbeddingLookupFromFloatIndicesBackward (eager path delegates to TensorEmbeddingLookup which records normally)
         "TensorScatterAdd",    // -> ScatterAdd (records)
         "TensorGather",        // -> Gather (records)
         "TensorVar",           // -> Var (records)

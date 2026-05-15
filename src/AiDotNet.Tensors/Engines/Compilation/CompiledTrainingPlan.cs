@@ -1812,67 +1812,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // LayerNorm: use FusedKernels.LayerNormUnsafe for direct SIMD
-        if (step.OpType == OpType.LayerNorm && typeof(T) == typeof(float)
-            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous)
+        // LayerNorm: previously routed through FusedKernels.LayerNormUnsafe
+        // for direct SIMD. AiDotNet#1331: that specialized fast path only
+        // wrote the forward output and didn't refresh the savedState
+        // mean/variance tensors the backward reads from. The backward then
+        // used compile-time stale (zero-init) mean/variance, producing
+        // gradGamma = 0 and dL/dInput = 0 — every LayerNorm γ stuck plus
+        // every parameter upstream of the norm stuck. Returning null here
+        // routes LayerNorm through the lazy execute lambda registered by
+        // CpuEngine.LayerNorm, which calls eng.LayerNorm(out mean, out var)
+        // and copies fresh mean/variance into the savedState tensors on
+        // every plan.Step(). A future re-specialization MUST emit mean/var
+        // alongside the output to remain correct.
+        if (step.OpType == OpType.LayerNorm)
         {
-            var input = step.Inputs[0];
-            var gamma = step.Inputs[1];
-            var beta = step.Inputs[2];
-            var output = step.OutputBuffer;
-            int normSize = gamma.Length;
-            float eps = 1e-5f;
-            if (step.SavedState is { Length: > 0 } && step.SavedState[0] is double epsD)
-                eps = (float)epsD;
-
-            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
-            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
-            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
-            int batchSize = input.Length / normSize;
-            float capturedEps = eps;
-
-            return eng =>
-            {
-                // LayerNorm per batch element. Previously serial — that
-                // capped BERT LayerNorm at ~900 µs on [1,256,768] despite
-                // the underlying kernel running in ~120 µs when dispatched
-                // in parallel. Threshold: parallelise if total work ≥50K
-                // elements (matches CpuEngine.LayerNorm's own gate).
-                int totalElems = batchSize * normSize;
-                if (totalElems >= 50_000)
-                {
-                    CpuParallelSettings.ParallelForOrSerial(0, batchSize, totalElems, b =>
-                    {
-                        unsafe
-                        {
-                            float* pIn = (float*)inH.AddrOfPinnedObject();
-                            float* pOut = (float*)outH.AddrOfPinnedObject();
-                            float* pG = (float*)gammaH.AddrOfPinnedObject();
-                            float* pB = (float*)betaH.AddrOfPinnedObject();
-                            Simd.FusedKernels.LayerNormUnsafe(
-                                pIn + b * normSize, pG, pB,
-                                pOut + b * normSize, normSize, capturedEps);
-                        }
-                    });
-                }
-                else
-                {
-                    unsafe
-                    {
-                        float* pIn = (float*)inH.AddrOfPinnedObject();
-                        float* pOut = (float*)outH.AddrOfPinnedObject();
-                        float* pG = (float*)gammaH.AddrOfPinnedObject();
-                        float* pB = (float*)betaH.AddrOfPinnedObject();
-                        for (int b = 0; b < batchSize; b++)
-                        {
-                            Simd.FusedKernels.LayerNormUnsafe(
-                                pIn + b * normSize, pG, pB,
-                                pOut + b * normSize, normSize, capturedEps);
-                        }
-                    }
-                }
-            };
+            return null;
         }
 
         // TensorDivide forward: pinned SIMD VectorDivideUnsafe
