@@ -17396,17 +17396,22 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
-                // Execute eagerly to fill out params
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
                 var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
-                // Record in graph so compiled plan captures the dependency
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedMean = mean; var capturedVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.BatchNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                // Copy eager data into lazy output
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }
@@ -18371,31 +18376,29 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: mean/variance returned by the compile-time
+                // eager call are stale once the lazy graph replays — the
+                // forward replay re-runs LayerNorm on the freshly-computed
+                // input, but the savedState mean/variance tensors are NOT
+                // re-updated, so the backward kernel reads compile-time
+                // values (zero, since the lazy input was uninitialized at
+                // compile time). The result: gradGamma and dL/dInput silently
+                // become zero, gamma never trains, and every parameter
+                // upstream of any LayerNorm stops learning. Fix: the lazy
+                // execute callback recomputes mean/variance via the
+                // out-param overload and copies them into the SAME tensor
+                // instances the savedState slot holds, so the backward
+                // reads fresh values on every plan.Step().
+                var capturedMean = mean;
+                var capturedVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    // Path C: plan-step write-through. When the engine is
-                    // CpuEngine and T is float, call LayerNormFloatInto which
-                    // writes directly into the plan's pre-allocated output.
-                    // This skips the intermediate tensor allocation + the
-                    // 786 KB CopyTo that the generic path below would incur
-                    // for BERT's [1,256,768] LayerNorm (~130 µs saved per
-                    // call × 24 calls per BERT layer).
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
-                        {
-                            cpuEng.LayerNormFloatInto(
-                                (Tensor<float>)(object)ci,
-                                (Tensor<float>)(object)cg,
-                                (Tensor<float>)(object)cb,
-                                ce,
-                                (Tensor<float>)(object)output);
-                        }
-                        else
-                        {
-                            var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _);
-                            r.AsSpan().CopyTo(output.AsWritableSpan());
-                        }
+                        var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
                     },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
@@ -19351,6 +19354,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = GroupNorm(ci, cn, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedGNMean = mean; var capturedGNVar = variance;
                 // SavedState order MUST match BackwardFunctions<T>.GroupNormBackward's
                 // read order: [numGroups, mean, variance, epsilon]. Previously this was
                 // [mean, variance, numGroups, epsilon] causing InvalidCastException in
@@ -19359,11 +19364,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng)
-                        {
-                            cpuEng.GroupNormInto(output, ci, cn, cg, cb, ce, out _, out _);
-                        }
-                        else { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        var r = eng.GroupNorm(ci, cn, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedGNMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedGNVar.AsWritableSpan());
                     },
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
@@ -19815,8 +19819,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = RMSNorm(ci, cg, ce, out rms);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh rms on every plan.Step (was stale from compile-time).
+                var capturedRms = rms;
                 var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, eagerResult._shape,
-                    (eng, output) => { var r = eng.RMSNorm(ci, cg, ce, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshRms.AsSpan().CopyTo(capturedRms.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -20122,6 +20133,50 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(key));
         if (value == null)
             throw new ArgumentNullException(nameof(value));
+
+        // AiDotNet#1331: under GraphMode, decompose into primitive ops so each
+        // records itself and the compiled plan's backward chains through the
+        // primitives' own backward functions naturally — no compound lazy
+        // node, no savedState refresh, no per-step recursive eager SDPA call.
+        //
+        // SDPA(Q, K, V) = softmax((Q @ K^T) * scale) @ V
+        //
+        // Each step here goes through Engine.* which is itself a lazy
+        // recording call: TensorPermute, TensorMatMul, TensorMultiplyScalar,
+        // Softmax. The compiled plan picks each one up as a normal forward
+        // step with its own backward delegate, so dL/dQ, dL/dK, dL/dV
+        // propagate through the recorded chain without any custom state.
+        //
+        // Performance note: previous attempt at this fix recorded a single
+        // lazy "ScaledDotProductAttention" node whose execute callback
+        // re-ran the entire eager SDPA at every plan.Step. That doubled the
+        // forward cost and prevented downstream fusion (CpuFusionPass can
+        // fuse MatMul + Softmax + MatMul into a single fused-attention
+        // kernel once the primitives are individually recorded). The
+        // decomposition here keeps the tape-only contract consistent with
+        // every other op in this engine.
+        if (GraphMode.IsActive)
+        {
+            // Expected shapes already validated by callers (4D [B, H, S, D]).
+            if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
+                throw new ArgumentException("Query, Key, and Value must be 4D tensors [batch, heads, seq, d_k/d_v]");
+            int d_k_local = query._shape[3];
+            double scaleVal_local = scale ?? (1.0 / System.Math.Sqrt(d_k_local));
+            var numOpsLocal = MathHelper.GetNumericOperations<T>();
+            T scaleT_local = numOpsLocal.FromDouble(scaleVal_local);
+
+            // K^T: permute last two dims [B, H, S_k, D] -> [B, H, D, S_k]
+            var kT = TensorPermute(key, new[] { 0, 1, 3, 2 });
+            // scores = Q @ K^T -> [B, H, S_q, S_k]
+            var scores = TensorMatMul(query, kT);
+            // scaled = scores * (1/sqrt(d_k))
+            var scaled = TensorMultiplyScalar(scores, scaleT_local);
+            // softmax over last axis (S_k) — Softmax records its own lazy node
+            // and the backward kernel handles the per-row Jacobian.
+            attentionWeights = Softmax(scaled);
+            // context = attn @ V -> [B, H, S_q, d_v]
+            return TensorMatMul(attentionWeights, value);
+        }
 
         // Preserve original Q/K/V refs for tape recording (#257). The
         // .Contiguous() rebinds below would otherwise replace the strided
@@ -23132,8 +23187,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = ScatterMean(cs, ci, out counts, cd, co);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: counts isn't currently referenced by the backward
+                // (only `indices` and `dim` are saved), but mirror the refresh
+                // pattern for safety in case ScatterMeanBackward starts consuming counts.
+                var capturedCounts = counts;
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "ScatterMean", source, eagerResult._shape,
-                    (eng, output) => { var r = eng.ScatterMean(cs, ci, out _, cd, co); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.ScatterMean(cs, ci, out var freshCounts, cd, co);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        if (capturedCounts is not null && freshCounts is not null
+                            && capturedCounts.Length == freshCounts.Length)
+                            freshCounts.AsSpan().CopyTo(capturedCounts.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -26321,6 +26387,80 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices)
+    {
+        if (embeddings == null) throw new ArgumentNullException(nameof(embeddings));
+        if (floatIndices == null) throw new ArgumentNullException(nameof(floatIndices));
+        if (embeddings.Rank != 2)
+            throw new ArgumentException($"Embeddings must be 2D [vocab_size, embedding_dim]. Got rank {embeddings.Rank}.");
+
+        int vocabSize = embeddings._shape[0];
+        int embeddingDim = embeddings._shape[1];
+        int numIndices = floatIndices.Length;
+
+        var outputShape = new int[floatIndices.Rank + 1];
+        for (int i = 0; i < floatIndices.Rank; i++) outputShape[i] = floatIndices._shape[i];
+        outputShape[floatIndices.Rank] = embeddingDim;
+
+        // ---- Lazy-graph path: capture floatIndices BY REFERENCE so that
+        // every plan.Step() reads fresh data. The standard TensorEmbeddingLookup
+        // snapshots indices at trace time, which is unsafe when the indices
+        // come from a fresh-per-call user input tensor (AiDotNet#1331).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedEmb = embeddings;
+                var capturedFloatIdx = floatIndices;
+                int dim = embeddingDim;
+                int vsz = vocabSize;
+                int n = numIndices;
+                var nops = MathHelper.GetNumericOperations<T>();
+
+                return scope.RecordBinary(
+                    LazyNodeType.Custom,
+                    "TensorEmbeddingLookupFromFloatIndices",
+                    embeddings, floatIndices, outputShape,
+                    (eng, output) =>
+                    {
+                        // Read fresh float indices each replay; convert to int
+                        // via banker's rounding (matches Convert.ToInt32(double)
+                        // semantics used by the eager path so any code that flips
+                        // between fused and eager produces identical lookups).
+                        var idxData = capturedFloatIdx.GetDataArray();
+                        var embData = capturedEmb.GetDataArray();
+                        var outData = output.GetDataArray();
+                        for (int i = 0; i < n; i++)
+                        {
+                            long tokenIdx = Convert.ToInt64(nops.ToDouble(idxData[i]));
+                            if (tokenIdx < 0 || tokenIdx >= vsz)
+                                throw new ArgumentOutOfRangeException(
+                                    nameof(floatIndices),
+                                    $"Index {tokenIdx} at position {i} out of bounds for vocab {vsz}.");
+                            int srcOff = (int)tokenIdx * dim;
+                            int dstOff = i * dim;
+                            Array.Copy(embData, srcOff, outData, dstOff, dim);
+                        }
+                    },
+                    BackwardFunctions<T>.TensorEmbeddingLookupFromFloatIndicesBackward,
+                    new object[] { capturedFloatIdx, vsz, dim });
+            }
+        }
+
+        // ---- Eager path: convert and delegate to the existing TIndex=int lookup,
+        // so eager-path callers transparently get all the work done by the
+        // tape-registration + GPU paths in TensorEmbeddingLookup.
+        var intIndices = new Tensor<int>(floatIndices._shape);
+        var floatData = floatIndices.GetDataArray();
+        var intData = intIndices.GetDataArray();
+        var nopsEager = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < numIndices; i++)
+            intData[i] = (int)Convert.ToInt64(nopsEager.ToDouble(floatData[i]));
+        return TensorEmbeddingLookup<T, int>(embeddings, intIndices);
     }
 
     /// <summary>
@@ -33250,9 +33390,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = InstanceNorm(ci, cg, cb, ce, out mean, out variance);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                var capturedINMean = mean; var capturedINVar = variance;
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "InstanceNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.InstanceNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.InstanceNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(capturedINMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(capturedINVar.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
@@ -33433,8 +33581,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = Dropout(ci, cdr, ct, out mask);
                 GraphMode.SetCurrent(savedScope);
+                // AiDotNet#1331: refresh mask on every plan.Step so backward
+                // sees the SAME mask as forward (compile-time mask is stale).
+                var capturedMask = mask;
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "Dropout", input, eagerResult._shape,
-                    (eng, output) => { var r = eng.Dropout(ci, cdr, ct, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        var r = eng.Dropout(ci, cdr, ct, out var freshMask);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMask.AsSpan().CopyTo(capturedMask.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
