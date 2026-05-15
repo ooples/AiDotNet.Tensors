@@ -322,6 +322,11 @@ internal static class CompiledBackwardWalk<T>
         if (subScalarMethod is not null)
             registry[subScalarMethod] = addScalarPassThru;
 
+        var mulScalarMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.MultiplyScalarBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (mulScalarMethod is not null)
+            registry[mulScalarMethod] = new MultiplyScalarBackwardInliner();
+
         return registry;
     }
 
@@ -1126,6 +1131,47 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, input0Field);
             il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>MultiplyScalarBackward</c>: d(c*x)/dx = c * grad.
+    /// Reads scalar c = (T)savedState[0], emits TensorMultiplyScalar +
+    /// AccumulateGrad.
+    /// </summary>
+    private sealed class MultiplyScalarBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_mulScalarMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiplyScalar))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.TensorMultiplyScalar(gradOutput, (T)savedState[0])
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            EmitLoadSavedStateValue(il, entryRefLocal, savedStateField, 0, typeof(T));
+            il.Emit(OpCodes.Callvirt, s_mulScalarMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Call, accumulateGradMethod);
         }
