@@ -1019,10 +1019,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var slicePrefixForwardSpecs = new Dictionary<int, Action<IEngine>>();
         var slicePrefixBackwardSpecs = new Dictionary<int, Action<IEngine>>();
         var consumedBySlicePrefix = new HashSet<int>();
-        // Gated behind env var until shape-based heuristic decides when
-        // the strided-B MKL GEMM beats the full-N GEMM + slice-spec
-        // memcpy. Empirically the strided GEMM at small N (128) and big
-        // ldb (384) underperforms on AMD Zen 2.
+        // Phase G.11: pre-copy the sliced weight buffer so forward and
+        // backward use CONTIGUOUS GEMMs on a smaller weight. The math
+        // savings (2/3 fewer MACs on QKV pattern) are real, but MKL's
+        // per-call setup overhead doesn't scale linearly with work —
+        // smaller-N calls don't speed up proportionally on AMD Zen 2.
+        //
+        // Empirically regresses median wall-time on the test workload.
+        // Default off; opt in via AIDOTNET_SLICE_PREFIX_FUSION=1 for
+        // workloads where the per-call MKL setup is small relative to
+        // the saved MAC work (very large M, or N_full >> N_used).
         if (typeof(T) == typeof(float)
             && Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION") == "1")
         {
@@ -4031,76 +4037,94 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capGradSliceOut = gradSliceOut;
             int cM = M, cK = K, cNfull = N_full, cNused = N_used;
 
-            // Phase G.9 FORWARD: compute sliceOut = A @ W[:, 0:N_used] directly,
-            // using ldb=N_full so cblas_sgemm reads only the first N_used cols
-            // of each row of W. ldc=N_used because sliceOut has compact stride.
+            // Phase G.11: pre-copy W[:, 0:N_used] into a CONTIGUOUS
+            // K×N_used buffer ON EACH FORWARD CALL. The forward then
+            // uses a full-stride GEMM (no ldb stride) on the smaller
+            // weight. G.9's strided-MKL approach regressed on AMD Zen 2
+            // because cblas_sgemm with ldb != N takes a slow kernel path.
+            //
+            // Per-call cost: K * N_used floats × Buffer.BlockCopy.
+            // For QKV at K=128, N_used=128 = 64 KB × 50 GB/s ≈ 1.3 µs.
+            //
+            // Why per-call instead of compile-time:
+            //   For training loops with optimizers, W changes between
+            //   Step()s, so a compile-time snapshot would go stale.
+            //   The per-call copy is negligible vs the 2/3 MAC work
+            //   saved on the smaller GEMM (~3 ms per layer).
+            //
+            // The same wPacked buffer is shared with the backward
+            // (forward writes it just before backward reads), so the
+            // backward stays in sync.
+            var wPacked = new float[cK * cNused];
+
             slicePrefixForwardSpecs[i] = eng =>
             {
                 var aArr = (float[])(object)capA.GetDataArray();
                 var wArr = (float[])(object)capW.GetDataArray();
                 var outArr = (float[])(object)capSliceOut.GetDataArray();
-                // M, N_used, K; lda=K, ldb=N_full (stride to skip K,V cols),
-                // ldc=N_used.
-                if (!BlasProvider.TryGemmEx(cM, cNused, cK,
-                        aArr, 0, cK, false,
-                        wArr, 0, cNfull, false,
+
+                // Re-copy W[:, 0:N_used] into the contiguous buffer.
+                for (int k = 0; k < cK; k++)
+                    Buffer.BlockCopy(wArr,
+                        (k * cNfull) * sizeof(float),
+                        wPacked,
+                        (k * cNused) * sizeof(float),
+                        cNused * sizeof(float));
+
+                // M, N_used, K; lda=K, ldb=N_used (CONTIGUOUS), ldc=N_used.
+                if (!BlasProvider.TryGemm(cM, cNused, cK,
+                        aArr, 0, cK,
+                        wPacked, 0, cNused,
                         outArr, 0, cNused))
                 {
-                    // Fallback: SimdGemm doesn't support ldb stride directly,
-                    // so we fall back to computing the FULL MatMul then slicing.
-                    // This path is only hit when MKL is unavailable.
-                    var fullOut = new float[cM * cNfull];
-                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), wArr.AsSpan(0, cK * cNfull),
-                        fullOut.AsSpan(0, cM * cNfull), cM, cK, cNfull);
-                    for (int m = 0; m < cM; m++)
-                        Buffer.BlockCopy(fullOut, (m * cNfull) * sizeof(float),
-                            outArr, (m * cNused) * sizeof(float), cNused * sizeof(float));
+                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), wPacked.AsSpan(0, cK * cNused),
+                        outArr.AsSpan(0, cM * cNused), cM, cK, cNused);
                 }
             };
 
-            // Phase G.9 BACKWARD: smaller GEMMs over only the used cols.
-            //   dA = dSliceOut @ W[:, 0:N_used]^T  (M*K*N_used MACs)
-            //   dW[:, 0:N_used] = A^T @ dSliceOut  (K*N_used*M MACs)
-            //   dW[:, N_used:N_full] = 0  (must zero — gradient is zero through dead cols)
+            // Phase G.11 BACKWARD: smaller GEMMs using the pre-packed W.
+            // Pre-allocate a scratch [K, N_used] buffer for dW computation,
+            // then scatter back into the full dW with zero padding.
+            var dWPackedScratch = new float[cK * cNused];
             slicePrefixBackwardSpecs[i] = eng =>
             {
                 var aArr = (float[])(object)capA.GetDataArray();
-                var wArr = (float[])(object)capW.GetDataArray();
                 var dSliceArr = (float[])(object)capGradSliceOut.GetDataArray();
                 var dA = (float[])(object)capGradA.GetDataArray();
                 var dW = (float[])(object)capGradW.GetDataArray();
 
-                // dA = dSliceOut [M, N_used] @ W[:, 0:N_used]^T [N_used, K]
-                // lda=N_used (compact), ldb=N_full (stride past K, V cols), ldc=K (compact)
+                // dA = dSliceOut [M, N_used] @ W_q^T [N_used, K]
+                // lda=N_used (compact), ldb=N_used (compact W_q), ldc=K
                 if (!BlasProvider.TryGemmEx(cM, cK, cNused,
                         dSliceArr, 0, cNused, false,
-                        wArr, 0, cNfull, true,
+                        wPacked, 0, cNused, true,
                         dA, 0, cK))
                 {
                     SimdGemm.Sgemm(dSliceArr.AsSpan(0, cM * cNused), cNused, false,
-                        wArr.AsSpan(0, cK * cNfull), cNfull, true,
+                        wPacked.AsSpan(0, cK * cNused), cNused, true,
                         dA.AsSpan(0, cM * cK), cM, cNused, cK);
                 }
 
-                // dW[:, 0:N_used] = A^T [K, M] @ dSliceOut [M, N_used]
-                // Result is [K, N_used] but stored in dW with stride N_full.
-                // lda=K, ldb=N_used (compact dSliceOut), ldc=N_full (stride past).
-                // Note: also need to zero dW[:, N_used:N_full] since those
-                // columns receive no gradient.
-                Array.Clear(dW, 0, dW.Length);  // Zero all of dW first
+                // dW_packed [K, N_used] = A^T [K, M] @ dSliceOut [M, N_used]
+                // Compute into the contiguous scratch, then scatter into full dW.
                 if (!BlasProvider.TryGemmEx(cK, cNused, cM,
                         aArr, 0, cK, true,
                         dSliceArr, 0, cNused, false,
-                        dW, 0, cNfull))
+                        dWPackedScratch, 0, cNused))
                 {
-                    var smallW = new float[cK * cNused];
                     SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), cK, true,
                         dSliceArr.AsSpan(0, cM * cNused), cNused, false,
-                        smallW.AsSpan(0, cK * cNused), cK, cM, cNused);
-                    for (int k = 0; k < cK; k++)
-                        Buffer.BlockCopy(smallW, (k * cNused) * sizeof(float),
-                            dW, (k * cNfull) * sizeof(float), cNused * sizeof(float));
+                        dWPackedScratch.AsSpan(0, cK * cNused), cK, cM, cNused);
                 }
+
+                // Scatter scratch into dW[:, 0:N_used], zero dW[:, N_used:N_full]
+                Array.Clear(dW, 0, dW.Length);
+                for (int k = 0; k < cK; k++)
+                    Buffer.BlockCopy(dWPackedScratch,
+                        (k * cNused) * sizeof(float),
+                        dW,
+                        (k * cNfull) * sizeof(float),
+                        cNused * sizeof(float));
             };
 
             consumedBySlicePrefix.Add(i + 1);  // Slice step is consumed by the fused MatMul
