@@ -295,6 +295,70 @@ public class Issue327TransformerTrainPerfTests
     }
 
     /// <summary>
+    /// Phase E feasibility test (#338): measures whether enabling
+    /// TensorCodecOptions optimization passes (DataflowFusion +
+    /// AlgebraicBackward) further accelerates CompiledModelCache.
+    /// Phase D measured 188 ms median; this experiment tests whether
+    /// the existing optimization passes can drive that lower.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseE_CompiledModelCache_WithOptimizationPasses()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16) { _output.WriteLine("Skip: ProcessorCount<16."); return; }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64) { _output.WriteLine("Skip: not X64."); return; }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var prevOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions
+        {
+            EnableDataflowFusion = true,
+            EnableAlgebraicBackward = true,
+            EnableSpectralDecomposition = false,
+        });
+
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            using var cache = new AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<float>();
+            var plan = cache.GetOrCompileTraining(
+                inputShape: input._shape,
+                forwardAndLoss: () =>
+                {
+                    var y = ForwardL(engine, input, weights);
+                    return engine.ReduceSum(y, axes: null, keepDims: false);
+                },
+                parameters: weights);
+
+            for (int i = 0; i < 2; i++) plan.Step();
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) plan.Step();
+            sw.Stop();
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase E — CompiledModelCache + optimization passes");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# baseline_phase_d_ms_per_iter=~188");
+            _output.WriteLine($"# delta_vs_phase_d={msPerIter - 188:F2} ms");
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prevOpts);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
     /// Phase D feasibility test (#338): measures whether the existing
     /// CompiledModelCache.GetOrCompileTraining API delivers wall-time
     /// reduction on the #327 fresh-tape workload. The persistent-tape

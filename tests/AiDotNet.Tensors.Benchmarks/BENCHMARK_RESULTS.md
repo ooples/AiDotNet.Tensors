@@ -291,3 +291,18 @@ for (int i = 0; i < iters; i++)
     // plan.Gradients[j] for weights[j]
 }
 ```
+
+### Phase E experiment — TensorCodecOptions (DataflowFusion + AlgebraicBackward)
+
+Setting `TensorCodecOptions.Current` with `EnableDataflowFusion=true, EnableAlgebraicBackward=true` before `CompiledModelCache.GetOrCompileTraining`:
+
+| Run | wall-time |
+|---|---:|
+| 1 | 186.47 ms |
+| 2 | 201.51 ms |
+| 3 | 229.61 ms |
+| Median | 201 ms |
+
+vs Phase D baseline 188 ms median: **within noise band** (or slightly slower). Either the optimization passes aren't engaging through this code path, or the workload doesn't benefit from them. Phase E does not add to Phase D's 29% win as the plan predicted.
+
+**Conclusion**: the 188 ms floor for CPU fresh-tape on this hardware is the achievable wall-time without algorithm or backend changes. Going below requires Phase G (MKL backend swap) or kernel-level inlining.
