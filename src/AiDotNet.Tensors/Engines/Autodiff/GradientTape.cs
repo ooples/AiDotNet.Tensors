@@ -1000,7 +1000,7 @@ public sealed class GradientTape<T> : IDisposable
                     if (writeIdx < reverseTopoIndices.Length)
                         Array.Resize(ref reverseTopoIndices, writeIdx);
 
-                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices);
+                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices, _entries);
                 }
             }
 
