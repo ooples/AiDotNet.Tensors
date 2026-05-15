@@ -1696,7 +1696,6 @@ internal static class CompiledBackwardWalk<T>
             var skipLabel = il.DefineLabel();
             var savedStateNonNullLabel = il.DefineLabel();
             var savedStateDoneLabel = il.DefineLabel();
-            var bailOutLabel = il.DefineLabel();
 
             // Per-entry bounds check elided: the pre-loop check above
             // verifies entries.Count > max(indices), so each baked idx
@@ -1770,12 +1769,6 @@ internal static class CompiledBackwardWalk<T>
             }
 
             il.Emit(OpCodes.Br_S, skipLabel);
-
-            // bailOutLabel from the per-entry bounds check is no longer
-            // referenced (the pre-loop bounds check covers all indices),
-            // but the label still needs to be marked somewhere or
-            // Reflection.Emit complains about an unmarked defined label.
-            il.MarkLabel(bailOutLabel);
 
             il.MarkLabel(skipLabel);
         }
