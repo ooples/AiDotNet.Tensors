@@ -2904,6 +2904,89 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Dropout backward: gradInput = mask * gradOutput * (1 / (1 - p))
+        // (the eager engine.DropoutBackward already applies the inverse-keep
+        // scale; we just write its result into the pre-allocated buffer).
+        // Tier 1.5 — saves the temp-tensor allocation + 1x AccumulateGrad
+        // per Dropout layer (7 in GraFPrint). Gated on OpName because
+        // Dropout doesn't have a dedicated OpType discriminant — it parses
+        // to OpType.Unknown via OpTypeParser.cs:158.
+        if (step.OpName == "Dropout" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            // CpuEngine.Dropout savedState: { mask, dropoutRate }
+            if (savedState == null || savedState.Length < 2
+                || savedState[0] is not Tensor<T> dropMask
+                || savedState[1] is not double dropRate)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            return eng =>
+            {
+                var grad = eng.DropoutBackward(gradOut, dropMask, dropRate);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // MaxPool2D backward: scatter gradOutput into gradInput at saved
+        // max-index positions. Tier 1.5 — saves the alloc + AccumulateGrad
+        // per MaxPool layer.
+        if (step.OpType == OpType.MaxPool2D && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            // CpuEngine.MaxPool2D savedState: { maxIndices (int[,,,,]), poolSize (int[]), stride (int[]) }
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not int[,,,,] maxIndices
+                || savedState[1] is not int[] poolSize
+                || savedState[2] is not int[] poolStride)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            var capInShape = (int[])input._shape.Clone();
+            return eng =>
+            {
+                var grad = eng.MaxPool2DBackward(gradOut, maxIndices, capInShape, poolSize, poolStride);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // AvgPool2D backward: distribute gradOutput / (poolH*poolW) across
+        // input positions. Tier 1.5.
+        if (step.OpType == OpType.AvgPool2D && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            if (savedState == null || savedState.Length < 2
+                || savedState[0] is not int[] poolSize
+                || savedState[1] is not int[] poolStride)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            var capInShape = (int[])input._shape.Clone();
+            return eng =>
+            {
+                var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
         // ReduceSum backward: broadcast scalar gradient to all elements
         // Only specialize for full scalar reduction (output length == 1)
         if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1
