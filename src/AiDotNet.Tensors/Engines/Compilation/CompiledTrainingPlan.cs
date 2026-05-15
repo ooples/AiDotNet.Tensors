@@ -1009,6 +1009,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
         }
 
+        // Phase G.9: detect MatMul → Slice-prefix-of-last-dim chains where
+        // the MatMul output is single-consumer (only the slice reads it).
+        // The MatMul wastes (N_full - N_used) / N_full of its work computing
+        // columns that get sliced away. Replace with a smaller MatMul using
+        // ldb stride to read only the needed columns. For Issue #327's QKV
+        // pattern (compute [BCtx, 3D] but only take Q [BCtx, D]), this
+        // saves 2/3 of the QKV MatMul forward + backward work.
+        var slicePrefixForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var slicePrefixBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var consumedBySlicePrefix = new HashSet<int>();
+        // Gated behind env var until shape-based heuristic decides when
+        // the strided-B MKL GEMM beats the full-N GEMM + slice-spec
+        // memcpy. Empirically the strided GEMM at small N (128) and big
+        // ldb (384) underperforms on AMD Zen 2.
+        if (typeof(T) == typeof(float)
+            && Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION") == "1")
+        {
+            DetectMatMulSlicePrefixFusion(forwardSteps, consumerCount, gradMap,
+                slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
+        }
+
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -1032,6 +1053,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (skippableReduceSumForwardIndices.Contains(i))
             {
                 continue;
+            }
+            // Phase G.9: slice-prefix MatMul fusion — MatMul step uses
+            // smaller-N GEMM via ldb stride, slice step is a no-op.
+            if (slicePrefixForwardSpecs.TryGetValue(i, out var slicePrefixFwd))
+            {
+                allForwardActions.Add(slicePrefixFwd);
+                continue;
+            }
+            if (consumedBySlicePrefix.Contains(i))
+            {
+                continue;  // Slice step — already handled by the fused MatMul above
             }
             if (fusedStepIndices.Contains(i))
             {
@@ -1086,6 +1118,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // is never read (its only consumer is an analytic-backward
             // MatMul). Saves the M*N ones-fill per step.
             if (skippableReduceSumIndices.Contains(i))
+            {
+                continue;
+            }
+            // Phase G.9: slice-prefix MatMul fusion — backward uses the
+            // smaller GEMM that only computes gradient for the used
+            // columns of W. Slice step's backward is no-op.
+            if (slicePrefixBackwardSpecs.TryGetValue(i, out var slicePrefixBwd))
+            {
+                backwardActions.Add(slicePrefixBwd);
+                continue;
+            }
+            if (consumedBySlicePrefix.Contains(i))
             {
                 continue;
             }
@@ -3880,6 +3924,165 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 capA.Grad = capGradA;
                 capW.Grad = capGradW;
             };
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.9: detect MatMul → Slice-prefix pattern where the
+    /// slice takes only a prefix of the MatMul output's last dim. The
+    /// MatMul is wasting (N_full - N_used) / N_full of its work computing
+    /// columns that get sliced away. Replace with a smaller-N MatMul using
+    /// ldb stride on the weight matrix.
+    /// <para>
+    /// For Issue #327's QKV pattern (compute qkv [BCtx, 3D] then slice to
+    /// qProxy [BCtx, D]), this saves 2/3 of the QKV MatMul forward AND
+    /// backward work.
+    /// </para>
+    /// </summary>
+    private static void DetectMatMulSlicePrefixFusion(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<int, Action<IEngine>> slicePrefixForwardSpecs,
+        Dictionary<int, Action<IEngine>> slicePrefixBackwardSpecs,
+        HashSet<int> consumedBySlicePrefix)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 1 < forwardSteps.Count; i++)
+        {
+            var matmul = forwardSteps[i];
+            var slice = forwardSteps[i + 1];
+
+            if (matmul.OpName != "TensorMatMul") continue;
+            if (slice.OpName != "TensorSlice") continue;
+            if (matmul.Inputs.Length != 2 || slice.Inputs.Length != 1) continue;
+            if (!ReferenceEquals(matmul.OutputBuffer, slice.Inputs[0])) continue;
+
+            // MatMul output must be single-consumer
+            if (consumerCount.TryGetValue(matmul.OutputBuffer, out int mmCount) && mmCount > 1)
+                continue;
+
+            // Slice savedState[0] = start[]; we need start[d]==0 for all dims
+            if (slice.SavedState is null || slice.SavedState.Length < 1) continue;
+            if (slice.SavedState[0] is not int[] startArr) continue;
+
+            var inputA = matmul.Inputs[0];   // [...batch, K]
+            var inputW = matmul.Inputs[1];   // [K, N_full]
+            var matmulOut = matmul.OutputBuffer;     // [...batch, N_full]
+            var sliceOut = slice.OutputBuffer;       // [...batch, N_used]
+
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (matmulOut.Rank != sliceOut.Rank) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+            if (!matmulOut.IsContiguous || !sliceOut.IsContiguous) continue;
+
+            // Verify start is 0 for all dims AND length only differs on last dim
+            if (startArr.Length != matmulOut.Rank) continue;
+            for (int d = 0; d < matmulOut.Rank; d++)
+            {
+                if (startArr[d] != 0) goto next;
+                if (d < matmulOut.Rank - 1 && matmulOut._shape[d] != sliceOut._shape[d]) goto next;
+            }
+            int N_full = inputW._shape[1];
+            int N_used = sliceOut._shape[sliceOut.Rank - 1];
+            if (N_used >= N_full) continue;  // Slice doesn't reduce anything
+            if (matmulOut._shape[matmulOut.Rank - 1] != N_full) continue;
+            int K = inputA._shape[inputA.Rank - 1];
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+            if (inputW._shape[0] != K) continue;
+
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW)) continue;
+            if (!gradMap.ContainsKey(sliceOut)) continue;
+            var gradA = gradMap[inputA];
+            var gradW = gradMap[inputW];
+            var gradSliceOut = gradMap[sliceOut];
+
+            // Capture for closures
+            var capA = inputA;
+            var capW = inputW;
+            var capSliceOut = sliceOut;
+            var capGradA = gradA;
+            var capGradW = gradW;
+            var capGradSliceOut = gradSliceOut;
+            int cM = M, cK = K, cNfull = N_full, cNused = N_used;
+
+            // Phase G.9 FORWARD: compute sliceOut = A @ W[:, 0:N_used] directly,
+            // using ldb=N_full so cblas_sgemm reads only the first N_used cols
+            // of each row of W. ldc=N_used because sliceOut has compact stride.
+            slicePrefixForwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var wArr = (float[])(object)capW.GetDataArray();
+                var outArr = (float[])(object)capSliceOut.GetDataArray();
+                // M, N_used, K; lda=K, ldb=N_full (stride to skip K,V cols),
+                // ldc=N_used.
+                if (!BlasProvider.TryGemmEx(cM, cNused, cK,
+                        aArr, 0, cK, false,
+                        wArr, 0, cNfull, false,
+                        outArr, 0, cNused))
+                {
+                    // Fallback: SimdGemm doesn't support ldb stride directly,
+                    // so we fall back to computing the FULL MatMul then slicing.
+                    // This path is only hit when MKL is unavailable.
+                    var fullOut = new float[cM * cNfull];
+                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), wArr.AsSpan(0, cK * cNfull),
+                        fullOut.AsSpan(0, cM * cNfull), cM, cK, cNfull);
+                    for (int m = 0; m < cM; m++)
+                        Buffer.BlockCopy(fullOut, (m * cNfull) * sizeof(float),
+                            outArr, (m * cNused) * sizeof(float), cNused * sizeof(float));
+                }
+            };
+
+            // Phase G.9 BACKWARD: smaller GEMMs over only the used cols.
+            //   dA = dSliceOut @ W[:, 0:N_used]^T  (M*K*N_used MACs)
+            //   dW[:, 0:N_used] = A^T @ dSliceOut  (K*N_used*M MACs)
+            //   dW[:, N_used:N_full] = 0  (must zero — gradient is zero through dead cols)
+            slicePrefixBackwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var wArr = (float[])(object)capW.GetDataArray();
+                var dSliceArr = (float[])(object)capGradSliceOut.GetDataArray();
+                var dA = (float[])(object)capGradA.GetDataArray();
+                var dW = (float[])(object)capGradW.GetDataArray();
+
+                // dA = dSliceOut [M, N_used] @ W[:, 0:N_used]^T [N_used, K]
+                // lda=N_used (compact), ldb=N_full (stride past K, V cols), ldc=K (compact)
+                if (!BlasProvider.TryGemmEx(cM, cK, cNused,
+                        dSliceArr, 0, cNused, false,
+                        wArr, 0, cNfull, true,
+                        dA, 0, cK))
+                {
+                    SimdGemm.Sgemm(dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                        wArr.AsSpan(0, cK * cNfull), cNfull, true,
+                        dA.AsSpan(0, cM * cK), cM, cNused, cK);
+                }
+
+                // dW[:, 0:N_used] = A^T [K, M] @ dSliceOut [M, N_used]
+                // Result is [K, N_used] but stored in dW with stride N_full.
+                // lda=K, ldb=N_used (compact dSliceOut), ldc=N_full (stride past).
+                // Note: also need to zero dW[:, N_used:N_full] since those
+                // columns receive no gradient.
+                Array.Clear(dW, 0, dW.Length);  // Zero all of dW first
+                if (!BlasProvider.TryGemmEx(cK, cNused, cM,
+                        aArr, 0, cK, true,
+                        dSliceArr, 0, cNused, false,
+                        dW, 0, cNfull))
+                {
+                    var smallW = new float[cK * cNused];
+                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), cK, true,
+                        dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                        smallW.AsSpan(0, cK * cNused), cK, cM, cNused);
+                    for (int k = 0; k < cK; k++)
+                        Buffer.BlockCopy(smallW, (k * cNused) * sizeof(float),
+                            dW, (k * cNfull) * sizeof(float), cNused * sizeof(float));
+                }
+            };
+
+            consumedBySlicePrefix.Add(i + 1);  // Slice step is consumed by the fused MatMul
+
+            next: ;
         }
     }
 
