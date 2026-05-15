@@ -217,8 +217,9 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
-    public void MultiHeadAttentionOutputFanout_RunsToCompletion_OnMultiStreamHost()
+    public void MultiHeadAttentionOutputFanout_MatchesCPUReference_OnMultiStreamHost()
     {
+        // Correctness gate: output[b,h,i,d] = sum_j attention[b,h,i,j] · V[b,h,j,d]
         using var engine = new DirectGpuTensorEngine();
         var asyncBackend = engine.GetAsyncBackend();
         if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
@@ -227,18 +228,25 @@ public class GetStreamSchedulerTests
         var backend = engine.GetBackend();
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
 
-        const int batch = 2, numHeads = 4, seqLen = 64, headDim = 32;
+        const int batch = 2, numHeads = 4, seqLen = 16, headDim = 8;
         long attElems = (long)batch * numHeads * seqLen * seqLen;
         long vElems = (long)batch * numHeads * seqLen * headDim;
         long oElems = (long)batch * numHeads * seqLen * headDim;
 
-        using var attn = backend.AllocateBuffer((int)attElems);
-        using var v = backend.AllocateBuffer((int)vElems);
-        using var output = backend.AllocateBuffer((int)oElems);
+        var rng = new System.Random(13);
+        var attHost = new float[attElems];
+        var vHost = new float[vElems];
+        for (int i = 0; i < attElems; i++) attHost[i] = (float)rng.NextDouble();
+        for (int i = 0; i < vElems; i++) vHost[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var attnBuf = backend.AllocateBuffer(attHost);
+        using var vBuf = backend.AllocateBuffer(vHost);
+        using var outputBuf = backend.AllocateBuffer((int)oElems);
 
         try
         {
-            cudaBackend.MultiHeadAttentionOutputFanout(attn, v, output, batch, numHeads, seqLen, headDim, scheduler);
+            cudaBackend.MultiHeadAttentionOutputFanout(attnBuf, vBuf, outputBuf,
+                batch, numHeads, seqLen, headDim, scheduler);
         }
         catch (System.Exception thrown)
         {
@@ -246,6 +254,31 @@ public class GetStreamSchedulerTests
                 || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
                 return;
             throw;
+        }
+
+        var outputGpu = new float[oElems];
+        backend.DownloadBuffer(outputBuf, outputGpu);
+
+        // CPU reference triple-loop.
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int hi = 0; hi < numHeads; hi++)
+            {
+                int attBase = ((bi * numHeads) + hi) * seqLen * seqLen;
+                int vBase = ((bi * numHeads) + hi) * seqLen * headDim;
+                int oBase = ((bi * numHeads) + hi) * seqLen * headDim;
+                for (int si = 0; si < seqLen; si++)
+                {
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        float sum = 0;
+                        for (int j = 0; j < seqLen; j++)
+                            sum += attHost[attBase + si * seqLen + j]
+                                 * vHost[vBase + j * headDim + d];
+                        Assert.Equal(sum, outputGpu[oBase + si * headDim + d], 3);
+                    }
+                }
+            }
         }
     }
 
