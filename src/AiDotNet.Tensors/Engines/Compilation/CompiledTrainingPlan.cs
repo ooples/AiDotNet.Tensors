@@ -975,6 +975,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
         }
 
+        // Issue #338 Phase G.7: detect "MatMul → ReduceSum-all → loss" pattern
+        // where the MatMul's output is consumed ONLY by the ReduceSum, and the
+        // ReduceSum is the final scalar loss. In this case the gradient
+        // flowing back into the MatMul output is mathematically `α * ones`
+        // (α = the loss-grad scalar, defaults to 1). The MatMul backward can
+        // then be computed ANALYTICALLY without materializing the M*N ones
+        // tensor or running the M*N*K GEMM:
+        //   dInput[m, k] = α * row_sum(W, k)   — same value across all m
+        //   dW[k, v]     = α * col_sum(input, k) — same value across all v
+        // For Issue #327 d=128 with V=8192, this replaces the 2.1B-MAC LM-head
+        // backward (2 GEMMs at ~30 ms total) with a couple of [D]-sized
+        // reductions + broadcasts (~0.2 ms total).
+        var analyticBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        if (typeof(T) == typeof(float))
+        {
+            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs);
+        }
+
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -1024,6 +1042,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
+
+            // Phase G.7: analytic loss-MatMul backward (replaces standard
+            // spec for MatMuls whose gradOut is `α * ones` due to a
+            // downstream ReduceSum-all-to-loss). Replaces ~30 ms of
+            // 2.1B-MAC GEMM work with ~0.2 ms of broadcast.
+            if (analyticBackwardSpecs.TryGetValue(i, out var analyticAction))
+            {
+                backwardActions.Add(analyticAction);
+                continue;
+            }
 
             var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
             if (action != null)
@@ -3593,6 +3621,150 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// single-consumer (the gradient signal flows to dW1 and dW2 only
     /// through dW_fused, never directly).</para>
     /// </summary>
+    /// <summary>
+    /// Issue #338 Phase G.7: detect MatMul steps whose output is consumed
+    /// ONLY by a ReduceSum-all-to-scalar step that produces the loss.
+    /// When this pattern matches, the gradient flowing into the MatMul's
+    /// output is mathematically <c>α * ones</c> (where α is the loss-grad
+    /// scalar, defaults to 1). The backward can be computed analytically
+    /// from W and the input directly, skipping the M*N ones materialization
+    /// and the two M*N*K GEMMs entirely.
+    ///
+    /// <para>For Issue #327's d=128 / V=8192 LM head: replaces the 6.3B-MAC
+    /// LM-head backward (~30 ms on this CPU) with ~2.5M element ops (~0.2 ms).</para>
+    /// </summary>
+    private static void DetectAnalyticLossMatMulBackward(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<int, Action<IEngine>> analyticBackwardSpecs)
+    {
+        if (typeof(T) != typeof(float)) return;
+        if (forwardSteps.Count < 2) return;
+
+        // Walk pairs (matmul, reducesum) and check the link.
+        for (int i = 0; i + 1 < forwardSteps.Count; i++)
+        {
+            var matmul = forwardSteps[i];
+            var reduce = forwardSteps[i + 1];
+
+            if (matmul.OpName != "TensorMatMul") continue;
+            if (reduce.OpName != "ReduceSum") continue;
+            if (reduce.OutputBuffer.Length != 1) continue;  // sum-to-scalar
+            if (matmul.Inputs.Length != 2 || reduce.Inputs.Length != 1) continue;
+            if (!ReferenceEquals(matmul.OutputBuffer, reduce.Inputs[0])) continue;
+
+            // MatMul output must be single-consumer (only ReduceSum). If
+            // some other op also consumes it, we need to materialize the
+            // gradient normally.
+            if (consumerCount.TryGetValue(matmul.OutputBuffer, out int mmCount) && mmCount > 1)
+                continue;
+
+            // ReduceSum must be the loss output — i.e. nothing consumes it
+            // downstream in the forward graph.
+            if (consumerCount.TryGetValue(reduce.OutputBuffer, out int rsCount) && rsCount > 0)
+                continue;
+
+            var inputA = matmul.Inputs[0];   // [...batch, K]
+            var inputW = matmul.Inputs[1];   // [K, V]
+            var output = matmul.OutputBuffer;
+
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+
+            int K = inputA._shape[inputA.Rank - 1];
+            int V = inputW._shape[1];
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+            if (inputW._shape[0] != K) continue;
+
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW)) continue;
+            var gradA = gradMap[inputA];
+            var gradW = gradMap[inputW];
+            // Loss-grad scalar value lives in gradMap[reduce.OutputBuffer]
+            // when backward replay runs. Capture the reference.
+            if (!gradMap.ContainsKey(reduce.OutputBuffer)) continue;
+            var lossGradTensor = gradMap[reduce.OutputBuffer];
+
+            // Build the analytic backward closure.
+            int cM = M, cK = K, cV = V;
+            var capA = inputA;
+            var capW = inputW;
+            var capGradA = gradA;
+            var capGradW = gradW;
+            var capLossGrad = lossGradTensor;
+
+            analyticBackwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var wArr = (float[])(object)capW.GetDataArray();
+                var gA = (float[])(object)capGradA.GetDataArray();
+                var gW = (float[])(object)capGradW.GetDataArray();
+                var lossArr = (float[])(object)capLossGrad.GetDataArray();
+                float alpha = lossArr[0];
+
+                // Compute row_sums(W): for each row k, sum across all v.
+                //   row_sum_W[k] = sum_v W[k, v]
+                // W is row-major [K, V], so row k starts at k*V and has V entries.
+                var rowSumW = ArrayPool<float>.Shared.Rent(cK);
+                try
+                {
+                    for (int k = 0; k < cK; k++)
+                    {
+                        float s = 0f;
+                        int baseIdx = k * cV;
+                        // Loop unroll-friendly stride-1 read pattern
+                        for (int v = 0; v < cV; v++) s += wArr[baseIdx + v];
+                        rowSumW[k] = alpha * s;
+                    }
+
+                    // dA[m, k] = alpha * row_sum_W[k]  — same value for all m.
+                    // Stride-K broadcast write into gA.
+                    for (int m = 0; m < cM; m++)
+                    {
+                        int baseIdx = m * cK;
+                        for (int k = 0; k < cK; k++) gA[baseIdx + k] = rowSumW[k];
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(rowSumW);
+                }
+
+                // Compute col_sums(A): for each column k of A (= K-th feature),
+                // sum across all M rows.
+                //   col_sum_A[k] = sum_m A[m, k]
+                // A is row-major [M, K], so element (m, k) is at m*K + k.
+                var colSumA = ArrayPool<float>.Shared.Rent(cK);
+                try
+                {
+                    for (int k = 0; k < cK; k++) colSumA[k] = 0f;
+                    for (int m = 0; m < cM; m++)
+                    {
+                        int baseIdx = m * cK;
+                        for (int k = 0; k < cK; k++) colSumA[k] += aArr[baseIdx + k];
+                    }
+                    for (int k = 0; k < cK; k++) colSumA[k] *= alpha;
+
+                    // dW[k, v] = alpha * col_sum_A[k]  — same value for all v.
+                    for (int k = 0; k < cK; k++)
+                    {
+                        float c = colSumA[k];
+                        int baseIdx = k * cV;
+                        for (int v = 0; v < cV; v++) gW[baseIdx + v] = c;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(colSumA);
+                }
+
+                capA.Grad = capGradA;
+                capW.Grad = capGradW;
+            };
+        }
+    }
+
     private static unsafe void TryFuseMatMulMatMul(
         List<CompiledStep<T>> steps,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
