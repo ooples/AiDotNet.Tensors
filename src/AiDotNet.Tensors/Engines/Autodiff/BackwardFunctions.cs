@@ -995,6 +995,41 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>
+    /// AiDotNet#1331 companion to <see cref="TensorEmbeddingLookupBackward"/>: scatters
+    /// the upstream gradient back to the embedding table using indices read FRESH from
+    /// the captured float-indices tensor (savedState[0]). Reading at backward time keeps
+    /// gradient routing consistent with the forward replay — both pull from the same
+    /// live tensor reference, so a plan.Step() after the user updates the float input's
+    /// data in place performs forward gather AND backward scatter against the same row IDs.
+    /// </summary>
+    internal static void TensorEmbeddingLookupFromFloatIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var capturedFloatIdx = (Tensor<T>)savedState[0];
+        int vocabSize = (int)savedState[1];
+        int embeddingDim = (int)savedState[2];
+
+        // Materialise fresh int indices for this Step. The float input may
+        // have been overwritten between forward and backward — that's the
+        // whole reason this op exists — so the int[] we build here MUST
+        // mirror exactly what the forward Custom op read on the same Step.
+        int n = capturedFloatIdx.Length;
+        var floatData = capturedFloatIdx.GetDataArray();
+        var nops = MathHelper.GetNumericOperations<T>();
+        var idxLong = new long[n];
+        for (int i = 0; i < n; i++)
+            idxLong[i] = Convert.ToInt64(nops.ToDouble(floatData[i]));
+
+        var indicesShape = (int[])capturedFloatIdx._shape.Clone();
+        var indicesTensor = new Tensor<long>(idxLong, indicesShape);
+        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+        // inputs[0] is the embedding table — the only trainable input.
+        // inputs[1] is the float-indices tensor; it carries no gradient.
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
     internal static void GeGLUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

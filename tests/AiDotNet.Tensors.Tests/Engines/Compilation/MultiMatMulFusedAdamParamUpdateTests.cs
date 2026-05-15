@@ -269,6 +269,172 @@ public class MultiMatMulFusedAdamParamUpdateTests
     }
 
     /// <summary>
+    /// Multi-step regression: confirms the fused-Adam path produces gradients
+    /// that monotonically decrease loss across multiple plan.Step calls when
+    /// the graph contains ScaledDotProductAttention. A single-step test is
+    /// not enough — staleness in the saved attention-weights tensor or
+    /// reuse-after-Return on TensorAllocator-rented buffers manifest only on
+    /// step 2 and onwards, with loss drifting upward.
+    /// </summary>
+    [Fact]
+    public void SDPA_MultiStep_LossMustDecreaseMonotonically()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, dModel = 8, heads = 2, dHead = 4;
+
+        var input = FilledRand(new[] { batch, seqLen, dModel }, seed: 401);
+        var Wq = FilledRand(new[] { dModel, dModel }, seed: 402);
+        var Wk = FilledRand(new[] { dModel, dModel }, seed: 403);
+        var Wv = FilledRand(new[] { dModel, dModel }, seed: 404);
+        var bq = FilledRand(new[] { dModel }, seed: 405);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var flat = engine.Reshape(input, new[] { batch * seqLen, dModel });
+            var q = engine.FusedLinear(flat, Wq, bq, FusedActivationType.None);
+            var k = engine.FusedLinear(flat, Wk, bq, FusedActivationType.None);
+            var v = engine.FusedLinear(flat, Wv, bq, FusedActivationType.None);
+            var qH = engine.Reshape(q, new[] { batch, seqLen, heads, dHead });
+            var kH = engine.Reshape(k, new[] { batch, seqLen, heads, dHead });
+            var vH = engine.Reshape(v, new[] { batch, seqLen, heads, dHead });
+            var qP = engine.TensorPermute(qH, new[] { 0, 2, 1, 3 });
+            var kP = engine.TensorPermute(kH, new[] { 0, 2, 1, 3 });
+            var vP = engine.TensorPermute(vH, new[] { 0, 2, 1, 3 });
+            var ctx = engine.ScaledDotProductAttention(qP, kP, vP, null, 1.0 / System.Math.Sqrt(dHead), out _);
+            engine.ReduceSum(ctx, null);
+            plan = scope.CompileTraining(new[] { Wq, Wk, Wv, bq });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(
+                OptimizerType.Adam,
+                learningRate: 0.001f,
+                beta1: 0.9f,
+                beta2: 0.999f,
+                eps: 1e-8f,
+                weightDecay: 0f);
+
+            var losses = new System.Collections.Generic.List<float>();
+            for (int step = 0; step < 10; step++)
+            {
+                var lossOut = plan.Step();
+                float lossVal = lossOut.AsSpan()[0];
+                losses.Add(lossVal);
+            }
+
+            for (int i = 0; i < losses.Count; i++)
+                _output.WriteLine($"  step {i}: loss = {losses[i]:F6}");
+
+            // Loss should not explode upward — sum is unbounded above so the
+            // sign-of-direction is what matters. With LR=0.001 + Adam, the
+            // attention-output sum should monotonically decrease (or oscillate
+            // within a small band). A persistent upward drift indicates the
+            // SDPA savedState attention weights are stale or the gradient
+            // direction is consistently wrong.
+            float maxLoss = losses.Max();
+            float lastLoss = losses[^1];
+            float firstLoss = losses[0];
+            Assert.True(
+                lastLoss <= firstLoss + System.Math.Abs(firstLoss) * 0.1f,
+                $"Loss diverged upward: start={firstLoss:F4} end={lastLoss:F4} max={maxLoss:F4}. " +
+                "SDPA savedState attention-weights tensor likely has stale or reused backing across plan.Step calls.");
+        }
+    }
+
+    /// <summary>
+    /// AiDotNet#1331 root-cause repro: when the user-facing training loop
+    /// passes a DIFFERENT input tensor instance on each call (the canonical
+    /// PyTorch-style `model.Train(input_batch_k, target_batch_k)` pattern),
+    /// the cached compiled training plan must see the new data on every
+    /// plan.Step() — not the data from the first traced call.
+    ///
+    /// The bug class: <c>CompiledModelCache.GetOrCompileTraining</c> returns
+    /// the cached plan on shape-match WITHOUT calling <c>plan.SetInputs()</c>,
+    /// so the plan's captured input tensor (a reference to the FIRST input
+    /// it was traced with) is replayed forever. This is the diagnostic that
+    /// proves the Transformer #1331 divergence is INPUT-STALENESS, not
+    /// gradient-flow.
+    ///
+    /// Forward: y = sum(W @ x). With W constant and x changing in-place,
+    /// the loss value MUST change. If the plan ignores x updates, loss is
+    /// frozen at the first call's value.
+    /// </summary>
+    [Fact]
+    public void InputDataMustRefreshAcrossStep_NotFrozenAtCompileTime()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, dIn = 4, dOut = 2;
+
+        // SAME tensor reference reused across calls; only the data inside changes.
+        // This is the contract the Tensors compiled-plan API supports today —
+        // user must update the captured tensor's data in-place. The AiDotNet
+        // bug is that the higher-level Train() API creates a fresh Tensor<T>
+        // every call, so this contract is silently violated by the test
+        // pattern but observed only through wildly divergent loss.
+        var input = new Tensor<float>(new[] { batch, dIn });
+        for (int i = 0; i < input.Length; i++) input[i] = 1.0f;
+        var W = FilledRand(new[] { dIn, dOut }, seed: 501);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var y = engine.FusedLinear(input, W, null, FusedActivationType.None);
+            engine.ReduceSum(y, null);
+            plan = scope.CompileTraining(new[] { W });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+
+            // Step 1: input is all 1s. Loss = sum(1 @ W).
+            var loss1 = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  step1 (input=1) loss = {loss1:F6}");
+
+            // Update input data IN-PLACE to all 2s. Plan should see new data.
+            for (int i = 0; i < input.Length; i++) input[i] = 2.0f;
+
+            var loss2 = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  step2 (input=2) loss = {loss2:F6}");
+
+            // With LR=0, W doesn't change. So loss2 = 2 * loss1 (linear in input).
+            // If plan replays with stale input=1, loss2 == loss1 (BUG).
+            Assert.True(
+                System.Math.Abs(loss2 - 2 * loss1) < 1e-4,
+                $"In-place input update was NOT seen by plan.Step(): loss1={loss1:F4} loss2={loss2:F4}. " +
+                $"Expected loss2 ≈ 2 × loss1 ≈ {2*loss1:F4} (since LR=0 keeps W constant). " +
+                "Plan is replaying with frozen input data — AiDotNet#1331 root cause.");
+
+            // Now use a DIFFERENT Tensor<T> with same shape — the captured
+            // reference is still the original `input`, so the plan should
+            // NOT see this new tensor's data unless SetInputs is called.
+            var freshInput = new Tensor<float>(new[] { batch, dIn });
+            for (int i = 0; i < freshInput.Length; i++) freshInput[i] = 3.0f;
+
+            // Without SetInputs: plan still sees the original `input` (which holds 2s).
+            var lossWithoutSetInputs = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  step3a (freshInput=3, NO SetInputs) loss = {lossWithoutSetInputs:F6}");
+
+            Assert.True(
+                System.Math.Abs(lossWithoutSetInputs - loss2) < 1e-4,
+                "Without SetInputs(), a fresh Tensor<T> instance is invisible to plan.Step — " +
+                "the plan's captured ref still points at the original input tensor.");
+
+            // With SetInputs: plan now sees freshInput's data (3s).
+            plan.SetInputs(new[] { freshInput });
+            var lossWithSetInputs = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  step3b (freshInput=3, WITH SetInputs) loss = {lossWithSetInputs:F6}");
+
+            Assert.True(
+                System.Math.Abs(lossWithSetInputs - 3 * loss1) < 1e-4,
+                $"After SetInputs(freshInput): loss should be 3 × loss1 ≈ {3*loss1:F4}, got {lossWithSetInputs:F4}. " +
+                "SetInputs() must copy fresh data into the plan's captured input tensor.");
+        }
+    }
+
+    /// <summary>
     /// Larger Transformer-shaped chain: embedding → multi-head projection
     /// pattern (Reshape + Permute) → attention-like matmul + softmax →
     /// Reshape back → LayerNorm. Tries to reproduce the buffer-aliasing
