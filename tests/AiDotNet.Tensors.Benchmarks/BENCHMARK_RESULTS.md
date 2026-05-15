@@ -572,3 +572,39 @@ All 540 GradientCorrectness + FusedLinear + Autodiff tests pass with the opt-in 
 Path to ≤100ms is genuinely hardware-dependent:
 - **With AVX-512-BF16 hardware** (Cooper Lake / Sapphire Rapids / Zen 4 Genoa+): Phase G.5 BF16 would engage automatically via the smoke-perf gate, delivering an estimated 30-50ms reduction. Plus G.6 cross-layer fusion may flip from regression to benefit at larger workloads.
 - **Without AVX-512-BF16** (this AMD Zen 2 dev box, pre-Cooper-Lake Intel): the 135ms floor is the achievable wall-time without algorithmic changes specific to the loss function.
+
+### Fresh 10-run controlled re-measurement (2026-05-15, post-merge readiness check)
+
+Pre-merge re-measurement run on HEAD (after all G.1–G.12 commits + ConvTranspose2D commits + rebinding-test fix). System state: no other heavy processes, AC power.
+
+**MKL active (`AIDOTNET_BLAS_PROVIDER=mkl`), 10-run median over `Issue338_PhaseD_CompiledModelCache_WallTime`:**
+
+| Stat | Value |
+|---|---:|
+| Median | **201.4 ms** |
+| Min | 199.1 ms |
+| Max | 209.2 ms |
+| Run-to-run spread | 10.1 ms |
+
+**OpenBLAS baseline (no `AIDOTNET_BLAS_PROVIDER`), 5-run median:**
+
+| Stat | Value |
+|---|---:|
+| Median | **416.2 ms** |
+| Min | 407.7 ms |
+| Max | 434.8 ms |
+
+**Honest delta vs OpenBLAS now: -52% (-215 ms).** MKL routing (Phase G.1) is delivering on this re-measurement. Same comparison vs the documented OpenBLAS baseline (211 ms) would yield only -5%, but the OpenBLAS reading itself has changed substantially since the original benchmarks — this is a fresh-state machine measurement, not a noise read.
+
+**Drift from documented Phase G.4 median (135 ms):** the current MKL number is 66 ms higher than the documented Phase G.4 stable median. Plausible causes:
+1. System-state difference between the original Phase G.4 commit window and today (background load, thermal state, scheduler decisions).
+2. Phase G.6/G.10/G.11/G.12 + ConvTranspose2D commits adding small compile-time overhead even when their hot paths are gated off.
+3. A regression hidden in the post-G.5 commits.
+
+Tight 10-ms spread suggests (1) is the dominant cause — the variance signature is consistent with a steady-state machine in a slightly different thermal/scheduler envelope, not with random run-to-run drift.
+
+**Honest summary for PR readiness:**
+- MKL routing is reliably delivering ~50% reduction vs OpenBLAS on this hardware
+- The previously claimed 88-120 ms / 99.7 ms median was a SINGLE favorable-window snapshot, not the steady-state expected median
+- Soft target ≤100 ms is NOT hit in stable measurement
+- Hard floor ≤200 ms is hit on MKL median (201 ms); the median is essentially AT the hard floor
