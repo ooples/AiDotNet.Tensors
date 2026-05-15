@@ -1192,6 +1192,56 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         scheduler.SynchronizeEvents(batch);
     }
 
+    /// <summary>
+    /// Double-precision counterpart to <see cref="BatchedGemmFanout"/>.
+    /// Fans <paramref name="batchCount"/> independent <c>cublasDgemm</c>
+    /// launches across the scheduler's stream pool — same pattern as the
+    /// fp32 variant but for <c>double</c> input/output buffers.
+    /// </summary>
+    public void BatchedDgemmFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        double alpha = 1.0, double beta = 0.0)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytes = sizeof(double);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                double aVal = alpha, bVal = beta;
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytes);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytes);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytes);
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasDgemm(
+                        _cublasHandle,
+                        CublasOperation.None,
+                        CublasOperation.None,
+                        N, M, K,
+                        ref aVal,
+                        bPtr, N,
+                        aPtr, K,
+                        ref bVal,
+                        cPtr, N),
+                    $"cublasDgemm slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
+    }
+
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
