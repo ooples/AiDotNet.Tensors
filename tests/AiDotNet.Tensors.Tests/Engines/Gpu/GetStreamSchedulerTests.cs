@@ -91,6 +91,70 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void GetStreamScheduler_ConcurrentSGEMM_RunsToCompletion()
+    {
+        // Issue #335 perf-claim test: the scheduler's design is "fan N
+        // independent SGEMMs across the stream pool, get ~2-3× the
+        // single-stream throughput on attention-shape inputs". This test
+        // exercises that pattern end-to-end on a real CUDA host: 12
+        // independent SGEMMs of BERT-attention shape ([256,64] · [64,256]).
+        // We don't assert a throughput threshold here — wall-time would be
+        // host-flaky in CI — only that the fan-out reaches the synchronize
+        // point without error. The proof that the pattern actually delivers
+        // the perf win lives in the benchmark suite, not the test suite.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream)
+            return;
+
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is null) return;
+
+        const int M = 256, N = 256, K = 64;
+        const int numLaunches = 12;
+
+        var aBufs = new System.Collections.Generic.List<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer>(numLaunches);
+        var bBufs = new System.Collections.Generic.List<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer>(numLaunches);
+        var cBufs = new System.Collections.Generic.List<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer>(numLaunches);
+        try
+        {
+            for (int i = 0; i < numLaunches; i++)
+            {
+                aBufs.Add(backend.AllocateBuffer(M * K));
+                bBufs.Add(backend.AllocateBuffer(K * N));
+            }
+
+            var launches = new System.Collections.Generic.List<System.Action<IGpuStream>>(numLaunches);
+            for (int i = 0; i < numLaunches; i++)
+            {
+                int idx = i;
+                launches.Add(stream =>
+                {
+                    // The scheduler binds cuBLAS to the lease's stream just
+                    // before invoking the launch callback (see
+                    // GpuStreamScheduler.Dispatch). MatMul on this backend
+                    // queues onto that stream as a consequence.
+                    var c = backend.MatMul(aBufs[idx], bBufs[idx], M, N, K);
+                    lock (cBufs) cBufs.Add(c);
+                });
+            }
+
+            using var batch = scheduler.Dispatch(launches);
+            Assert.NotEqual(0, batch.Count);
+            Assert.Equal(numLaunches, cBufs.Count);
+            scheduler.SynchronizeEvents(batch);
+        }
+        finally
+        {
+            foreach (var b in aBufs) b.Dispose();
+            foreach (var b in bBufs) b.Dispose();
+            foreach (var b in cBufs) b.Dispose();
+        }
+    }
+
+    [Fact]
     public void GetStreamScheduler_Dispatch_FanOutsOverMultipleStreams()
     {
         // Issue #335 items 3+4: the scheduler must accept a batch of
