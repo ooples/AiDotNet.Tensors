@@ -118,6 +118,12 @@ internal static class RebindablePlanCache<T>
             if (entry.Backward is null) return null;
             var m = entry.Backward.Method;
             if (!m.IsStatic) return null;
+            // A null Target on a static-method delegate means no captured
+            // closure object. Lambdas with captures synthesize a static
+            // method whose first arg is the closure; .Target holds that
+            // closure. Direct `call` IL would skip the closure arg and
+            // crash. Refuse those — fallback path handles them safely.
+            if (entry.Backward.Target is not null) return null;
             methods[i] = m;
         }
         return methods;
