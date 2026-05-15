@@ -92,6 +92,17 @@ public class GpuPinnedLifetimeTests
     }
 
     [Fact]
+    public void AsGpuBuffer_AliasesTryGetGpuBuffer_CpuOnlyHost()
+    {
+        // Issue #336 names the accessor AsGpuBuffer<T>(); the impl is
+        // TryGetGpuBuffer(). The alias keeps both spellings working for
+        // callers reading the issue body vs. callers reading IntelliSense.
+        var t = new Tensor<float>(new[] { 16 });
+        Assert.Null(t.AsGpuBuffer());
+        Assert.Equal(t.TryGetGpuBuffer(), t.AsGpuBuffer());
+    }
+
+    [Fact]
     public void GpuOptimizer_TryAdamStep_CpuEngine_ReturnsFalse()
     {
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
