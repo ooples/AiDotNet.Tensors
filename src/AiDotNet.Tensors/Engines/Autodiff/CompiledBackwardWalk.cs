@@ -337,6 +337,11 @@ internal static class CompiledBackwardWalk<T>
         if (reshapeMethod is not null)
             registry[reshapeMethod] = new ReshapeBackwardInliner();
 
+        var reduceMeanMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.ReduceMeanBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (reduceMeanMethod is not null)
+            registry[reduceMeanMethod] = new ReduceMeanBackwardInliner();
+
         return registry;
     }
 
@@ -1315,6 +1320,51 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldelem_Ref);
             il.Emit(OpCodes.Castclass, typeof(int[]));
             il.Emit(OpCodes.Callvirt, s_reshapeMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>ReduceMeanBackward</c>: dispatches engine.ReduceMeanBackward(
+    /// grad, inputs[0]._shape, (int[])savedState[0]).
+    /// </summary>
+    private sealed class ReduceMeanBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_reduceMeanBackwardMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.ReduceMeanBackward))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly FieldInfo s_shapeField =
+            typeof(LinearAlgebra.TensorBase<T>).GetField("_shape",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.ReduceMeanBackward(gradOutput, entry.Input0._shape, (int[])entry.SavedState[0])
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldfld, s_shapeField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, savedStateField);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Ldelem_Ref);
+            il.Emit(OpCodes.Castclass, typeof(int[]));
+            il.Emit(OpCodes.Callvirt, s_reduceMeanBackwardMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
             EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
