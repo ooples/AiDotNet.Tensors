@@ -32,7 +32,9 @@ internal static class BackwardFunctions<T>
     {
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
         var negGrad = engine.TensorNegate(gradOutput);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], negGrad, engine);
+        // Phase B.2: pool the negate scratch when accumulation consumed it.
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[1], negGrad, engine))
+            TensorPool<T>.Return(negGrad);
     }
 
     /// <summary>d(-x)/dx = -1</summary>
@@ -41,7 +43,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var negGrad = engine.TensorNegate(gradOutput);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], negGrad, engine);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], negGrad, engine))
+            TensorPool<T>.Return(negGrad);
     }
 
     /// <summary>d(x+s)/dx = 1</summary>
@@ -93,8 +96,10 @@ internal static class BackwardFunctions<T>
     {
         var gradA = engine.TensorMultiply(gradOutput, inputs[1]);
         var gradB = engine.TensorMultiply(gradOutput, inputs[0]);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], gradA, engine))
+            TensorPool<T>.Return(gradA);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[1], gradB, engine))
+            TensorPool<T>.Return(gradB);
     }
 
     /// <summary>d(a/b)/da = grad/b, d(a/b)/db = -grad*a/(b*b)</summary>
@@ -104,10 +109,19 @@ internal static class BackwardFunctions<T>
     {
         var gradA = engine.TensorDivide(gradOutput, inputs[1]);
         var bSquared = engine.TensorMultiply(inputs[1], inputs[1]);
-        var negGradA = engine.TensorNegate(engine.TensorMultiply(gradOutput, inputs[0]));
+        var posGradA = engine.TensorMultiply(gradOutput, inputs[0]);
+        var negGradA = engine.TensorNegate(posGradA);
+        // Phase B.2: bSquared, posGradA, negGradA are all local intermediates
+        // — pool them after their single use. Their fates after consumption
+        // by TensorDivide are not visible to AccumulateGrad.
         var gradB = engine.TensorDivide(negGradA, bSquared);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        TensorPool<T>.Return(bSquared);
+        TensorPool<T>.Return(posGradA);
+        TensorPool<T>.Return(negGradA);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], gradA, engine))
+            TensorPool<T>.Return(gradA);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[1], gradB, engine))
+            TensorPool<T>.Return(gradB);
     }
 
     /// <summary>d(exp(x))/dx = grad * exp(x) = grad * output</summary>
@@ -342,16 +356,33 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var alpha = numOps.FromDouble((double)savedState[0]);
         var derivative = TensorPool<T>.RentZeroed(output._shape);
-        for (int i = 0; i < output.Length; i++)
+        // Phase C.2: derivative computation is per-element independent.
+        // Chunk into rows of 1024 elements for parallel dispatch via
+        // BackwardParallel.ForRows (gated on MinWorkForParallel = 64K).
+        int len = output.Length;
+        int chunkSize = Math.Max(1024, (len + 31) / 32);
+        int numChunks = (len + chunkSize - 1) / chunkSize;
+        BackwardParallel.ForRows(numChunks, chunkSize * 2L, chunk =>
         {
-            var val = output.GetFlat(i);
-            if (numOps.GreaterThan(val, numOps.Zero))
-                derivative.SetFlat(i, numOps.One);
-            else
-                derivative.SetFlat(i, numOps.Add(val, alpha));
-        }
+            int start = chunk * chunkSize;
+            int end = Math.Min(start + chunkSize, len);
+            for (int i = start; i < end; i++)
+            {
+                var val = output.GetFlat(i);
+                if (numOps.GreaterThan(val, numOps.Zero))
+                    derivative.SetFlat(i, numOps.One);
+                else
+                    derivative.SetFlat(i, numOps.Add(val, alpha));
+            }
+        });
         var grad = engine.TensorMultiply(gradOutput, derivative);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        // Phase B.2: pool the derivative scratch — it was consumed by
+        // TensorMultiply and never referenced again. Safe regardless of
+        // accumulation outcome (this is a local intermediate, not the
+        // grad we're accumulating).
+        TensorPool<T>.Return(derivative);
+        if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], grad, engine))
+            TensorPool<T>.Return(grad);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -615,7 +646,9 @@ internal static class BackwardFunctions<T>
         var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
         var gradOutT = TransposeLastTwoDims(gradOutput, engine);
         var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
-
+        // Phase B.2: gradOutT is a local transpose buffer, consumed by
+        // TensorMatMul. Mirror the MatMulBackward ND×2D path's pool-return.
+        TensorPool<T>.Return(gradOutT);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
     }
