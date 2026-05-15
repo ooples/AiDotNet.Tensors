@@ -246,6 +246,56 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void WalkerCache_FIFOEviction_CapsAt64Entries()
+    {
+        // Bounded thread-local cache. Register more than the cap; expect
+        // the oldest insertion to drop, count to stay at the cap.
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var countProp = t.GetProperty("CachedWalkerCountForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            // Compile a single walker; reuse it as the registered object
+            // for every key — content equality doesn't matter for the
+            // eviction test, only the key bookkeeping.
+            var indices = new[] { 0 };
+            var walker = compileMethod.Invoke(null, new object[] { indices })!;
+
+            // Register 70 distinct keys (> cap of 64).
+            for (int i = 0; i < 70; i++)
+                registerMethod.Invoke(null, new object?[] { (long)i, walker });
+
+            // Cache should be at the cap.
+            int cachedCount = (int)countProp.GetValue(null)!;
+            Assert.Equal(64, cachedCount);
+
+            // First 6 keys (0..5) should have been evicted; keys 6..69
+            // should remain.
+            for (long k = 0; k < 6; k++)
+                Assert.Null(tryGetMethod.Invoke(null, new object[] { k }));
+            for (long k = 6; k < 70; k++)
+                Assert.NotNull(tryGetMethod.Invoke(null, new object[] { k }));
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_OverflowInputs_ManyInputOp_HandlesCorrectly()
     {
         // Issue #338 Item 3: TensorAddMany records a tape entry with the

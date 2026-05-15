@@ -76,12 +76,35 @@ internal static class CompiledBackwardWalk<T>
         IEngine engine);
 
     /// <summary>
+    /// Maximum number of distinct walkers cached per thread. The DFS
+    /// pattern hash is keyed by (op-type sequence × shape tuple), so a
+    /// workload that trains many different model topologies in the same
+    /// thread could otherwise grow the cache unboundedly. The bound is
+    /// generous — a complex Transformer trains ~1-5 distinct patterns
+    /// per epoch — so eviction is rare in production but the safety
+    /// guard is essential.
+    /// </summary>
+    private const int MaxCachedWalkers = 64;
+
+    /// <summary>
     /// Per-thread cache of pattern-hash → compiled walker. Mirrors
     /// <see cref="RebindablePlanCache{T}"/>'s thread-local structure so the
-    /// two caches stay in lock-step.
+    /// two caches stay in lock-step. Capped at <see cref="MaxCachedWalkers"/>;
+    /// when full, the oldest insertion order entry is evicted (simple FIFO
+    /// — full LRU would require tracking access timestamps and the extra
+    /// bookkeeping isn't worth the small workload-dependent hit-rate gain).
     /// </summary>
     [ThreadStatic]
     private static Dictionary<long, CompiledWalker>? s_walkers;
+
+    /// <summary>
+    /// Parallel insertion-order tracking for the FIFO eviction policy.
+    /// Sized to <see cref="MaxCachedWalkers"/>+1 so adds are cheap (no
+    /// resize). Index 0 is the oldest entry; new entries append, evict
+    /// removes index 0 + shifts.
+    /// </summary>
+    [ThreadStatic]
+    private static List<long>? s_walkerInsertionOrder;
 
     /// <summary>
     /// Looks up the walker for a given pattern hash. Returns <c>null</c>
@@ -98,11 +121,32 @@ internal static class CompiledBackwardWalk<T>
     /// Registers a compiled walker for a given pattern hash. Called by
     /// the JIT layer the first time a fresh-tape replay's cache key fires;
     /// subsequent fires of the same pattern hit the cache.
+    /// <para>
+    /// Enforces a <see cref="MaxCachedWalkers"/>-entry cap via FIFO
+    /// eviction. Re-registering an existing pattern hash refreshes the
+    /// walker but does NOT reset its position in the insertion-order list
+    /// (the entry was already in there; we don't want to shift older
+    /// entries around).
+    /// </para>
     /// </summary>
     internal static void Register(long patternHash, CompiledWalker walker)
     {
         if (walker is null) throw new ArgumentNullException(nameof(walker));
-        (s_walkers ??= new Dictionary<long, CompiledWalker>(8))[patternHash] = walker;
+        var walkers = s_walkers ??= new Dictionary<long, CompiledWalker>(MaxCachedWalkers + 1);
+        var insertionOrder = s_walkerInsertionOrder ??= new List<long>(MaxCachedWalkers + 1);
+
+        bool isNew = !walkers.ContainsKey(patternHash);
+        walkers[patternHash] = walker;
+        if (isNew)
+        {
+            insertionOrder.Add(patternHash);
+            if (walkers.Count > MaxCachedWalkers)
+            {
+                long evictKey = insertionOrder[0];
+                insertionOrder.RemoveAt(0);
+                walkers.Remove(evictKey);
+            }
+        }
     }
 
     /// <summary>
@@ -114,7 +158,13 @@ internal static class CompiledBackwardWalk<T>
     {
         s_walkers?.Clear();
         s_walkers = null;
+        s_walkerInsertionOrder?.Clear();
+        s_walkerInsertionOrder = null;
     }
+
+    /// <summary>Test-visible cache size. Exposed so eviction tests can
+    /// validate the cap.</summary>
+    internal static int CachedWalkerCountForTests => s_walkers?.Count ?? 0;
 
     // ─── IL emission targets ─────────────────────────────────────────────
     // These MethodInfos are looked up once per closed generic T and reused
