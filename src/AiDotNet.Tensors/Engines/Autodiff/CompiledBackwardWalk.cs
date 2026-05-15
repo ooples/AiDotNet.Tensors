@@ -230,6 +230,17 @@ internal static class CompiledBackwardWalk<T>
             BindingFlags.NonPublic | BindingFlags.Static);
         if (addMethod is not null)
             registry[addMethod] = new AddBackwardInliner();
+
+        var subMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.SubtractBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (subMethod is not null)
+            registry[subMethod] = new SubtractBackwardInliner();
+
+        var negMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.NegateBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (negMethod is not null)
+            registry[negMethod] = new NegateBackwardInliner();
+
         return registry;
     }
 
@@ -285,6 +296,99 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, input1Field);
             il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>SubtractBackward</c>: d(a-b)/da = +grad, d(a-b)/db = -grad.
+    /// Emits one AccumulateGrad for input0 with gradOutput, then a
+    /// TensorNegate(gradOutput) virtual call, then a second AccumulateGrad
+    /// for input1 with the negated gradient.
+    /// </summary>
+    private sealed class SubtractBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_negateMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorNegate))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            MethodInfo accumulateGradMethod)
+        {
+            // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+
+            // var negGrad = engine.TensorNegate(gradOutput);
+            // Reuse gradOutputLocal as the negated-grad slot — safe
+            // because subsequent uses below want -gradOutput anyway.
+            // But we must NOT lose the original gradOutput if some
+            // other entry holds it; the original tensor is referenced
+            // via grads[entry.Output] which is unchanged. Negate the
+            // local-only reference.
+            var negGradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Callvirt, s_negateMethod);
+            il.Emit(OpCodes.Stloc, negGradLocal);
+
+            // AccumulateGrad(state.Grads, entry.Input1, negGrad, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input1Field);
+            il.Emit(OpCodes.Ldloc, negGradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>NegateBackward</c>: d(-x)/dx = -grad. One TensorNegate
+    /// + one AccumulateGrad call. Unary op, only input0 is touched.
+    /// </summary>
+    private sealed class NegateBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_negateMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorNegate))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            MethodInfo accumulateGradMethod)
+        {
+            // var negGrad = engine.TensorNegate(gradOutput);
+            var negGradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Callvirt, s_negateMethod);
+            il.Emit(OpCodes.Stloc, negGradLocal);
+
+            // AccumulateGrad(state.Grads, entry.Input0, negGrad, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, negGradLocal);
             il.Emit(OpCodes.Ldarg_3);
             il.Emit(OpCodes.Call, accumulateGradMethod);
         }
