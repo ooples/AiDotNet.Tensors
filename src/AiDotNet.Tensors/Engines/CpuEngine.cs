@@ -26084,6 +26084,60 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         outputShape[indices.Rank] = embeddingDim;
 
+        // ---- Lazy-graph (compiled-plan) path ----
+        // Mirrors the GraphMode.IsActive branch used by every other
+        // differentiable op (Reshape, MatMul, etc.). Without this branch,
+        // the compiled-plan tracer never sees an Embedding node — the
+        // forward result is materialised eagerly here and the compiled
+        // backward graph has no way to propagate dL/dE back to the
+        // embedding table. That is the AiDotNet #1328 regression:
+        // Transformer training silently fails to update EmbeddingLayer
+        // weights when running through CompiledTrainingPlan.Step(),
+        // producing input-independent output (PPL = V exactly, top-1 = 1/V).
+        // We snapshot indices to int[] (matching the eager-tape branch
+        // below) so savedState round-trips through SavedStateSerializer.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedEmb = embeddings;
+                var capturedIdx = indices;
+                var capturedVocab = vocabSize;
+                var capturedDim = embeddingDim;
+                int n = numIndices;
+                var idxSnap = new int[n];
+                var idxRaw = indices.GetDataArray();
+                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt32(idxRaw[i]);
+                var idxShapeSnap = (int[])indices._shape.Clone();
+                return scope.RecordUnary(
+                    LazyNodeType.Custom,
+                    "TensorEmbeddingLookup",
+                    embeddings,
+                    outputShape,
+                    (eng, output) =>
+                    {
+                        // Replay forward: re-execute the row-gather into
+                        // the pre-allocated output buffer.
+                        var embDataLocal = capturedEmb.GetDataArray();
+                        var outDataLocal = output.GetDataArray();
+                        for (int i = 0; i < n; i++)
+                        {
+                            int tokenIdx = idxSnap[i];
+                            if (tokenIdx < 0 || tokenIdx >= capturedVocab)
+                                throw new ArgumentOutOfRangeException(
+                                    "indices",
+                                    $"Index {tokenIdx} at position {i} is out of bounds for embedding table with vocabulary size {capturedVocab}.");
+                            int srcOff = tokenIdx * capturedDim;
+                            int dstOff = i * capturedDim;
+                            Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
+                        }
+                    },
+                    BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
+                    new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim });
+            }
+        }
+
         var result = new Tensor<TValue>(outputShape);
         var embData = embeddings.GetDataArray();
         var resultData = result.GetDataArray();
