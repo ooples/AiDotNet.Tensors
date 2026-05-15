@@ -91,6 +91,65 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void BatchedGemmFanout_ProducesIdenticalResultsToStridedBatched()
+    {
+        // Correctness gate: runs the same input through the existing
+        // strided-batched BatchedGemm AND the new BatchedGemmFanout,
+        // copies both results back to host, asserts element-wise
+        // equality. Pins that the per-stream fanout doesn't drift from
+        // the trusted strided-batched reference.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        const int M = 32, N = 32, K = 16, batchCount = 4;
+        int aElems = M * K * batchCount;
+        int bElems = K * N * batchCount;
+        int cElems = M * N * batchCount;
+
+        // Fill A and B with deterministic values via host upload.
+        var aHost = new float[aElems];
+        var bHost = new float[bElems];
+        var rng = new System.Random(42);
+        for (int i = 0; i < aElems; i++) aHost[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < bElems; i++) bHost[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var aBuf = backend.AllocateBuffer(aHost);
+        using var bBuf = backend.AllocateBuffer(bHost);
+        using var cStrided = backend.AllocateBuffer(cElems);
+        using var cFanout = backend.AllocateBuffer(cElems);
+
+        try
+        {
+            cudaBackend.BatchedGemm(aBuf, bBuf, cStrided, M, N, K, batchCount);
+            cudaBackend.BatchedGemmFanout(aBuf, bBuf, cFanout, M, N, K, batchCount, scheduler);
+        }
+        catch (System.Exception thrown)
+        {
+            if (thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
+                return;
+            throw;
+        }
+
+        var stridedHost = new float[cElems];
+        var fanoutHost = new float[cElems];
+        backend.DownloadBuffer(cStrided, stridedHost);
+        backend.DownloadBuffer(cFanout, fanoutHost);
+
+        // Strided and fanout compute the same GEMM, just dispatched
+        // differently. Results should match to within fp32 ULPs — any
+        // significant drift means the fanout's offset arithmetic or
+        // alpha/beta handling is wrong.
+        for (int i = 0; i < cElems; i++)
+            Assert.Equal(stridedHost[i], fanoutHost[i], 4);
+    }
+
+    [Fact]
     public void MultiHeadAttentionScoresFanout_RunsToCompletion_OnMultiStreamHost()
     {
         using var engine = new DirectGpuTensorEngine();
