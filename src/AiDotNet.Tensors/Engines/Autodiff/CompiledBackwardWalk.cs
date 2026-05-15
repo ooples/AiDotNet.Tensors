@@ -396,6 +396,11 @@ internal static class CompiledBackwardWalk<T>
         if (reduceMeanMethod is not null)
             registry[reduceMeanMethod] = new ReduceMeanBackwardInliner();
 
+        var divScalarMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.DivideScalarBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (divScalarMethod is not null)
+            registry[divScalarMethod] = new DivideScalarBackwardInliner();
+
         return registry;
     }
 
@@ -1398,6 +1403,66 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Ldelem_Ref);
             il.Emit(OpCodes.Castclass, typeof(int[]));
             il.Emit(OpCodes.Callvirt, s_reduceMeanBackwardMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
+                gradLocal, gradsField, input0Field, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>DivideScalarBackward</c>: d(x/c)/dx = (1/c) * grad.
+    /// Computes invScalar = numOps.Divide(One, savedState[0]) at runtime,
+    /// then engine.TensorMultiplyScalar(grad, invScalar). Common in
+    /// optimizer bias-correction paths (1/(1-beta^t)).
+    /// </summary>
+    private sealed class DivideScalarBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_mulScalarMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiplyScalar))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly MethodInfo s_getNumOpsMethod =
+            typeof(MathHelper).GetMethod(nameof(MathHelper.GetNumericOperations))!
+                .MakeGenericMethod(typeof(T));
+        private static readonly Type s_numOpsType =
+            typeof(AiDotNet.Tensors.Interfaces.INumericOperations<>)
+                .MakeGenericType(typeof(T));
+        private static readonly MethodInfo s_divMethod =
+            s_numOpsType.GetMethod("Divide")!;
+        private static readonly MethodInfo s_oneGetter =
+            s_numOpsType.GetProperty("One")!.GetGetMethod()!;
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // invScalar = MathHelper.GetNumericOperations<T>().Divide(numOps.One, (T)savedState[0])
+            var numOpsLocal = il.DeclareLocal(s_numOpsType);
+            il.Emit(OpCodes.Call, s_getNumOpsMethod);
+            il.Emit(OpCodes.Stloc, numOpsLocal);
+
+            var invScalarLocal = il.DeclareLocal(typeof(T));
+            il.Emit(OpCodes.Ldloc, numOpsLocal);
+            il.Emit(OpCodes.Ldloc, numOpsLocal);
+            il.Emit(OpCodes.Callvirt, s_oneGetter);
+            EmitLoadSavedStateValue(il, entryRefLocal, savedStateField, 0, typeof(T));
+            il.Emit(OpCodes.Callvirt, s_divMethod);
+            il.Emit(OpCodes.Stloc, invScalarLocal);
+
+            // grad = engine.TensorMultiplyScalar(gradOutput, invScalar)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, invScalarLocal);
+            il.Emit(OpCodes.Callvirt, s_mulScalarMethod);
             il.Emit(OpCodes.Stloc, gradLocal);
 
             EmitAccumulateGradToInput(il, stateLocal, entryRefLocal,
