@@ -299,7 +299,34 @@ internal static class CompiledBackwardWalk<T>
         if (cosMethod is not null)
             registry[cosMethod] = new CosBackwardInliner();
 
+        var leakyReluMethod = bwdType.GetMethod("LeakyReLUBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (leakyReluMethod is not null)
+            registry[leakyReluMethod] = new LeakyReluBackwardInliner();
+
+        var softmaxMethod = bwdType.GetMethod("SoftmaxBackward",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (softmaxMethod is not null)
+            registry[softmaxMethod] = new SoftmaxBackwardInliner();
+
         return registry;
+    }
+
+    /// <summary>
+    /// Reads <c>(TSavedState)entry.SavedState[index]</c> and pushes the
+    /// resulting value onto the IL stack. Use for inliners that need
+    /// scalar params (axis ints, negativeSlope doubles, etc.) saved
+    /// during the forward pass.
+    /// </summary>
+    private static void EmitLoadSavedStateValue(
+        ILGenerator il, LocalBuilder entryRefLocal, FieldInfo savedStateField,
+        int index, Type valueType)
+    {
+        il.Emit(OpCodes.Ldloc, entryRefLocal);
+        il.Emit(OpCodes.Ldfld, savedStateField);
+        il.Emit(OpCodes.Ldc_I4, index);
+        il.Emit(OpCodes.Ldelem_Ref);
+        il.Emit(OpCodes.Unbox_Any, valueType);
     }
 
     /// <summary>
@@ -318,6 +345,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod);
     }
 
@@ -339,6 +367,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
@@ -382,6 +411,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
@@ -437,6 +467,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // gradA = engine.TensorMultiply(gradOutput, entry.Input1)
@@ -498,6 +529,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // grad = engine.TensorMultiply(gradOutput, entry.Output)
@@ -539,6 +571,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // grad = engine.TensorDivide(gradOutput, entry.Input0)
@@ -583,6 +616,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // signTensor = engine.TensorSign(entry.Input0)
@@ -636,6 +670,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // gradA = engine.TensorDivide(gradOutput, entry.Input1)
@@ -716,6 +751,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // grad = engine.ReluBackward(gradOutput, entry.Input0)
@@ -757,6 +793,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // grad = engine.SigmoidBackward(gradOutput, entry.Output)
@@ -796,6 +833,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
@@ -835,6 +873,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
@@ -877,6 +916,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             var cosLocal = il.DeclareLocal(typeof(Tensor<T>));
@@ -928,6 +968,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // negSinX = engine.TensorNegate(engine.TensorSin(entry.Input0))
@@ -959,6 +1000,92 @@ internal static class CompiledBackwardWalk<T>
     }
 
     /// <summary>
+    /// Inlines <c>LeakyReLUBackward</c>: dispatches engine.LeakyReluBackward(
+    /// grad, input, negativeSlope) where negativeSlope is the saved double
+    /// in entry.SavedState[0]. Includes the unbox-int-double cast inline.
+    /// </summary>
+    private sealed class LeakyReluBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_leakyMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.LeakyReluBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.LeakyReluBackward(gradOutput, entry.Input0, (double)entry.SavedState[0])
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            EmitLoadSavedStateValue(il, entryRefLocal, savedStateField, 0, typeof(double));
+            il.Emit(OpCodes.Callvirt, s_leakyMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
+    /// Inlines <c>SoftmaxBackward</c>: dispatches engine.SoftmaxBackward(
+    /// grad, output, axis) where axis is the saved int in entry.SavedState[0].
+    /// Critical for transformer attention hot path.
+    /// </summary>
+    private sealed class SoftmaxBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_softmaxMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.SoftmaxBackward))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            FieldInfo savedStateField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.SoftmaxBackward(gradOutput, entry.Output, (int)entry.SavedState[0])
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, outputField);
+            EmitLoadSavedStateValue(il, entryRefLocal, savedStateField, 0, typeof(int));
+            il.Emit(OpCodes.Callvirt, s_softmaxMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
     /// Inlines <c>NegateBackward</c>: d(-x)/dx = -grad. One TensorNegate
     /// + one AccumulateGrad call. Unary op, only input0 is touched.
     /// </summary>
@@ -977,6 +1104,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo input0Field,
             FieldInfo input1Field,
             FieldInfo outputField,
+            FieldInfo savedStateField,
             MethodInfo accumulateGradMethod)
         {
             // var negGrad = engine.TensorNegate(gradOutput);
@@ -1259,7 +1387,7 @@ internal static class CompiledBackwardWalk<T>
                 && s_inliners.TryGetValue(bwdMethod, out var inliner))
             {
                 inliner.Emit(il, stateLocal, entryRefLocal, gradOutputLocal,
-                    gradsField, input0Field, input1Field, outputField, accumulateGradMethod);
+                    gradsField, input0Field, input1Field, outputField, savedStateField, accumulateGradMethod);
             }
             else
             {
