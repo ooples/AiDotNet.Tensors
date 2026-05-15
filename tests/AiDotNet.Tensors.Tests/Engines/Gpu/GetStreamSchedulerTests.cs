@@ -91,6 +91,98 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void BatchedDgemmFanout_MatchesCPUReference_OnMultiStreamHost()
+    {
+        // Correctness gate for the fp64 fanout: CPU triple-loop reference.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        const int M = 16, N = 16, K = 8, batchCount = 3;
+        int aElems = M * K * batchCount;
+        int bElems = K * N * batchCount;
+        int cElems = M * N * batchCount;
+
+        var rng = new System.Random(99);
+        var aHost = new double[aElems];
+        var bHost = new double[bElems];
+        for (int i = 0; i < aElems; i++) aHost[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < bElems; i++) bHost[i] = rng.NextDouble() - 0.5;
+
+        // Allocate fp64 buffers via byte size — backend.AllocateBuffer
+        // is float-shaped, so we allocate by elementCount of doubles =
+        // raw bytes / sizeof(float). Simpler: use Allocate<double>
+        // via the context. Skip this test if that API isn't available
+        // on the backend abstraction.
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer aBuf = null!;
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer bBuf = null!;
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer cBuf = null!;
+        try
+        {
+            // Buffer size in float-equivalent elements: doubles are 2× float bytes.
+            aBuf = backend.AllocateBuffer(aElems * 2);
+            bBuf = backend.AllocateBuffer(bElems * 2);
+            cBuf = backend.AllocateBuffer(cElems * 2);
+
+            // Upload as bytes via float reinterpretation.
+            var aBytes = new float[aElems * 2];
+            var bBytes = new float[bElems * 2];
+            System.Buffer.BlockCopy(aHost, 0, aBytes, 0, aHost.Length * sizeof(double));
+            System.Buffer.BlockCopy(bHost, 0, bBytes, 0, bHost.Length * sizeof(double));
+            // Replace via fresh allocation: simpler than reuploading.
+            aBuf.Dispose();
+            bBuf.Dispose();
+            aBuf = backend.AllocateBuffer(aBytes);
+            bBuf = backend.AllocateBuffer(bBytes);
+
+            try
+            {
+                cudaBackend.BatchedDgemmFanout(aBuf, bBuf, cBuf, M, N, K, batchCount, scheduler);
+            }
+            catch (System.Exception thrown)
+            {
+                if (thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase)
+                    || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
+                    return;
+                throw;
+            }
+
+            var cBytes = new float[cElems * 2];
+            backend.DownloadBuffer(cBuf, cBytes);
+            var cGpu = new double[cElems];
+            System.Buffer.BlockCopy(cBytes, 0, cGpu, 0, cElems * sizeof(double));
+
+            // CPU reference per batch.
+            for (int b = 0; b < batchCount; b++)
+            {
+                int aBase = b * M * K;
+                int bBase = b * K * N;
+                int cBase = b * M * N;
+                for (int i = 0; i < M; i++)
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        double sum = 0;
+                        for (int kk = 0; kk < K; kk++)
+                            sum += aHost[aBase + i * K + kk] * bHost[bBase + kk * N + j];
+                        Assert.Equal(sum, cGpu[cBase + i * N + j], 5);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            aBuf?.Dispose();
+            bBuf?.Dispose();
+            cBuf?.Dispose();
+        }
+    }
+
+    [Fact]
     public void BatchedGemmFanout_ProducesIdenticalResultsToStridedBatched()
     {
         // Correctness gate: runs the same input through the existing
