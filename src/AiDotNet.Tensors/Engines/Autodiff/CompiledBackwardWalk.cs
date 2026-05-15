@@ -310,6 +310,10 @@ internal static class CompiledBackwardWalk<T>
 
         var stateLocal = il.DeclareLocal(typeof(CompiledBackwardWalkHelpers<T>.WalkState));
         var gradOutputLocal = il.DeclareLocal(typeof(Tensor<T>));
+        // Byref local for caching entries[idx] — avoids 4 redundant indexer
+        // calls per entry. CLR allows byref locals for managed pointers to
+        // struct types; the JIT keeps them in a register or stack slot.
+        var entryRefLocal = il.DeclareLocal(typeof(TapeEntry<T>).MakeByRefType());
 
         // state = InitState(loss, reservedCount)
         il.Emit(OpCodes.Ldarg_1);
@@ -356,12 +360,17 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, arenaCountGetter);
             il.Emit(OpCodes.Bge_S, bailOutLabel);  // idx >= Count
 
-            // grads.TryGetValue(entries[idx].Output, out gradOutput)
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
+            // Cache the entry ref in a byref local — one indexer call
+            // per entry instead of four.
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldc_I4, idx);
             il.Emit(OpCodes.Callvirt, arenaIndexer);   // ref entry
+            il.Emit(OpCodes.Stloc, entryRefLocal);
+
+            // grads.TryGetValue(entry.Output, out gradOutput)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, outputField);       // entry.Output
             il.Emit(OpCodes.Ldloca, gradOutputLocal);
             il.Emit(OpCodes.Callvirt, tryGetValueMethod);
@@ -370,25 +379,19 @@ internal static class CompiledBackwardWalk<T>
             // arg1: gradOutput
             il.Emit(OpCodes.Ldloc, gradOutputLocal);
 
-            // arg2: entries[idx].GetInputsArrayInto(buf1, buf2, buf3)
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldc_I4, idx);
-            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            // arg2: entry.GetInputsArrayInto(buf1, buf2, buf3)
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf1Field);
             il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf2Field);
             il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf3Field);
             il.Emit(OpCodes.Call, getInputsArrayIntoMethod);
 
-            // arg3: entries[idx].Output
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldc_I4, idx);
-            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            // arg3: entry.Output
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, outputField);
 
-            // arg4: entries[idx].SavedState ?? Array.Empty<object>()
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldc_I4, idx);
-            il.Emit(OpCodes.Callvirt, arenaIndexer);
+            // arg4: entry.SavedState ?? Array.Empty<object>()
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
             il.Emit(OpCodes.Ldfld, savedStateField);
             il.Emit(OpCodes.Dup);
             il.Emit(OpCodes.Brtrue_S, savedStateNonNullLabel);
