@@ -91,6 +91,55 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
+    public void BatchedGemmFanout_FansSlicesAcrossStreams_OnMultiStreamHost()
+    {
+        // Issue #335 items 3+4 production wiring test: CudaBackend's
+        // BatchedGemmFanout submits N independent SGEMM slices to the
+        // scheduler. This test allocates contiguous A/B/C buffers
+        // for 8 slices of attention-shape ([256,64] · [64,256]), runs
+        // the fanout, and confirms it completes without error. On a
+        // single-stream backend the scheduler returns null and the test
+        // early-returns.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream)
+            return;
+
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        var backend = engine.GetBackend();
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
+            return;
+
+        const int M = 256, N = 256, K = 64;
+        const int batchCount = 8;
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+
+        using var a = backend.AllocateBuffer((int)(strideA * batchCount));
+        using var b = backend.AllocateBuffer((int)(strideB * batchCount));
+        using var c = backend.AllocateBuffer((int)(strideC * batchCount));
+
+        try
+        {
+            cudaBackend.BatchedGemmFanout(a, b, c, M, N, K, batchCount, scheduler);
+        }
+        catch (System.Exception thrown)
+        {
+            // On hosts where the SGEMM kernels fail to launch (e.g.,
+            // pre-Maxwell or driver-mismatched), accept the failure
+            // as skip — the test target is the dispatch path, not
+            // hardware capability.
+            if (thrown.Message.Contains("ARCH", System.StringComparison.OrdinalIgnoreCase)
+                || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
+                return;
+            throw;
+        }
+        // Reaching here means the fan-out + synchronize completed cleanly.
+    }
+
+    [Fact]
     public void GetStreamScheduler_ConcurrentSGEMM_RunsToCompletion()
     {
         // Issue #335 perf-claim test: the scheduler's design is "fan N

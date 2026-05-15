@@ -1117,6 +1117,81 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             "cublasSgemmStridedBatched");
     }
 
+    /// <summary>
+    /// Issue #335 items 3+4 production wiring: fans <paramref name="batchCount"/>
+    /// independent SGEMMs of identical shape across the supplied
+    /// scheduler's stream pool. Each slice runs on its own stream, so
+    /// the cuBLAS launches overlap rather than serialising on the
+    /// default stream.
+    /// <para>
+    /// Use this in preference to <see cref="BatchedGemm"/> when:
+    /// <list type="bullet">
+    ///   <item>Per-slice work is small (M·N·K is at the attention-shape
+    ///   scale e.g. 256·256·64 — small enough that cuBLAS strided-batched
+    ///   doesn't saturate the GPU)</item>
+    ///   <item>The caller already has a <see cref="GpuStreamScheduler"/>
+    ///   live (e.g., MHA per-head dispatch, parallel ResNet branches)</item>
+    /// </list>
+    /// For large per-slice work, <see cref="BatchedGemm"/>'s strided-
+    /// batched path remains faster because the in-slice parallelism
+    /// already saturates the SMs.
+    /// </para>
+    /// </summary>
+    /// <param name="scheduler">Stream scheduler whose pool provides the
+    /// per-slice streams. Caller owns lifetime — see
+    /// <see cref="DirectGpuTensorEngine.GetStreamScheduler"/>.</param>
+    public void BatchedGemmFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytesA = sizeof(float);
+
+        // Build one launch action per slice. Each captures its slice
+        // offsets; the scheduler binds cuBLAS to the lease stream before
+        // calling each lambda, so each cublasSgemm queues onto the
+        // assigned stream.
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                // The scheduler binds cuBLAS to this stream prior to
+                // invoking the lambda (see GpuStreamScheduler.Dispatch's
+                // per-lease cublasSetStream call). We just issue the
+                // launch — it queues onto the bound stream.
+                float aVal = alpha, bVal = beta;
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesA);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesA);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesA);
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasSgemm(
+                        _cublasHandle,
+                        CublasOperation.None,
+                        CublasOperation.None,
+                        N, M, K,
+                        ref aVal,
+                        bPtr, N,
+                        aPtr, K,
+                        ref bVal,
+                        cPtr, N),
+                    $"cublasSgemm slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
+    }
+
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
