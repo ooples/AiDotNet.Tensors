@@ -993,9 +993,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // backward doesn't read the gradient buffer ReduceSum would fill
         // (ones[M, V]), so the M*V-element fill is pure waste.
         var skippableReduceSumIndices = new HashSet<int>();
+        // Phase G.8: same pattern applies to FORWARD. When MatMul → ReduceSum-all-to-loss
+        // is detected, the forward can be replaced with:
+        //   loss = sum_k(row_sum_W[k] * col_sum_x[k])
+        // which is K multiplies + K adds instead of M*N*K MACs. Replaces
+        // the 2.1B-MAC LM-head FORWARD GEMM with a 128-element dot product.
+        var analyticForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var skippableReduceSumForwardIndices = new HashSet<int>();
+        // Shared row_sums(W) cache — populated once at compile time per
+        // detected pattern, reused by both forward and backward analytic
+        // versions. Empty otherwise.
+        var sharedRowSumCache = new Dictionary<int, float[]>();
         if (typeof(T) == typeof(float))
         {
-            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices);
+            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
         }
 
         // Track GCHandles for cleanup on Dispose
@@ -1008,6 +1019,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         for (int i = 0; i < forwardSteps.Count; i++)
         {
+            // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces
+            // the full GEMM with a dot-of-sums computation.
+            if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
+            {
+                allForwardActions.Add(analyticFwdAction);
+                continue;
+            }
+            // Skip the ReduceSum's forward action when paired with an
+            // analytic MatMul forward — the analytic forward already wrote
+            // the loss into the ReduceSum's output buffer.
+            if (skippableReduceSumForwardIndices.Contains(i))
+            {
+                continue;
+            }
             if (fusedStepIndices.Contains(i))
             {
                 // A fused step starts a new group when its predecessor is NOT fused.
@@ -3650,7 +3675,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<Tensor<T>, int> consumerCount,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
-        HashSet<int> skippableReduceSumIndices)
+        HashSet<int> skippableReduceSumIndices,
+        Dictionary<int, Action<IEngine>> analyticForwardSpecs,
+        HashSet<int> skippableReduceSumForwardIndices,
+        Dictionary<int, float[]> sharedRowSumCache)
     {
         if (typeof(T) != typeof(float)) return;
         if (forwardSteps.Count < 2) return;
@@ -3711,6 +3739,78 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // output (M*N ones) is never read because the analytic
             // MatMul backward computes directly from W and A.
             skippableReduceSumIndices.Add(i + 1);
+
+            // Phase G.8: also build the analytic FORWARD. We pre-compute
+            // row_sum_W once at compile time (when weights are frozen-
+            // assumed by the caller; otherwise it runs on first call).
+            // The forward replaces the M*N*K GEMM with col_sum_x + dot.
+            // The MatMul output y is no longer materialized — y is
+            // single-consumer (the ReduceSum we're replacing), so nothing
+            // else reads it.
+            //
+            // Gated behind AIDOTNET_ANALYTIC_FORWARD=1 because measured
+            // regression on the test workload (median 100ms → 130ms).
+            // Hypothesis: the analytic forward bypasses the 2.1B-MAC
+            // GEMM that MKL handles at high effective throughput, but
+            // the col_sum + dot is scalar-strided with poor cache
+            // pattern AND removes the natural prefetcher warmup that
+            // benefits the downstream backward MatMuls. Keep the
+            // infrastructure for future SimdGemm-only environments
+            // where MKL isn't available.
+            bool enableAnalyticForward = Environment.GetEnvironmentVariable("AIDOTNET_ANALYTIC_FORWARD") == "1";
+            int matmulStepIndex = i;
+            int reduceStepIndex = i + 1;
+            var capLoss = gradMap.ContainsKey(reduce.OutputBuffer)
+                ? reduce.OutputBuffer  // reduce.OutputBuffer IS the loss tensor
+                : reduce.OutputBuffer;
+            var capRowSum = new float[cK];
+            sharedRowSumCache[matmulStepIndex] = capRowSum;
+            bool rowSumComputed = false;
+            // Reference the captures
+            int gM = cM, gK = cK, gV = cV;
+            var gA = inputA;
+            var gW = inputW;
+            var gLoss = capLoss;
+
+            if (enableAnalyticForward) analyticForwardSpecs[matmulStepIndex] = eng =>
+            {
+                var wArr = (float[])(object)gW.GetDataArray();
+                var aArr = (float[])(object)gA.GetDataArray();
+                var lossArr = (float[])(object)gLoss.GetDataArray();
+
+                // Compute row_sum_W on first call (or whenever weights might
+                // have changed — for the FrozenWeights opt-in this stays
+                // cached forever). For non-frozen training the cost is K*V
+                // reads per Step, dominated by memory bandwidth (~1ms).
+                if (!rowSumComputed)
+                {
+                    for (int k = 0; k < gK; k++)
+                    {
+                        float s = 0f;
+                        int baseIdx = k * gV;
+                        for (int v = 0; v < gV; v++) s += wArr[baseIdx + v];
+                        capRowSum[k] = s;
+                    }
+                    rowSumComputed = true;
+                }
+
+                // col_sum_x[k] = sum_m A[m, k]. M*K reads, K writes.
+                // Then loss = dot(row_sum_W, col_sum_x). K multiplies + adds.
+                Span<float> colSum = stackalloc float[gK];
+                for (int k = 0; k < gK; k++) colSum[k] = 0f;
+                for (int m = 0; m < gM; m++)
+                {
+                    int baseIdx = m * gK;
+                    for (int k = 0; k < gK; k++) colSum[k] += aArr[baseIdx + k];
+                }
+                float loss = 0f;
+                for (int k = 0; k < gK; k++) loss += capRowSum[k] * colSum[k];
+                lossArr[0] = loss;
+            };
+            // The ReduceSum forward becomes a no-op — its result has
+            // already been computed and written by the analytic forward.
+            // Only skip when the analytic forward is enabled.
+            if (enableAnalyticForward) skippableReduceSumForwardIndices.Add(reduceStepIndex);
 
             analyticBackwardSpecs[i] = eng =>
             {
