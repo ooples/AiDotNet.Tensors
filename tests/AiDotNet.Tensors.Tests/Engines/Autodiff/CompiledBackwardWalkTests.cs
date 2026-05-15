@@ -246,6 +246,127 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void CompiledWalker_OverflowInputs_ManyInputOp_HandlesCorrectly()
+    {
+        // Issue #338 Item 3: TensorAddMany records a tape entry with the
+        // InputsOverflow array set (≥4 inputs). The IL walker calls
+        // GetInputsArrayInto which returns InputsOverflow directly for
+        // that path. This test exercises that branch end-to-end —
+        // gradients computed via the IL walker must match the reference
+        // dispatcher for an op that uses the overflow array.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refGradA = null!, refGradB = null!, refGradC = null!, refGradD = null!;
+
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 1.0f, 1.0f, 1.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 2.0f, 2.0f, 2.0f }, new[] { 3 });
+                var c = new Tensor<float>(new float[] { 3.0f, 3.0f, 3.0f }, new[] { 3 });
+                var d = new Tensor<float>(new float[] { 4.0f, 4.0f, 4.0f }, new[] { 3 });
+                var sum4 = engine.TensorAddMany(a, b, c, d); // 4 inputs → overflow path
+                var loss = engine.ReduceSum(sum4);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b, c, d });
+                if (pass == 0)
+                {
+                    refGradA = (float[])grads[a].GetDataArray().Clone();
+                    refGradB = (float[])grads[b].GetDataArray().Clone();
+                    refGradC = (float[])grads[c].GetDataArray().Clone();
+                    refGradD = (float[])grads[d].GetDataArray().Clone();
+                }
+                else
+                {
+                    // dL/da = dL/db = dL/dc = dL/dd = 1 (identity per element since loss = sum)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Assert.Equal(refGradA[i], grads[a].GetDataArray()[i], 4);
+                        Assert.Equal(refGradB[i], grads[b].GetDataArray()[i], 4);
+                        Assert.Equal(refGradC[i], grads[c].GetDataArray()[i], 4);
+                        Assert.Equal(refGradD[i], grads[d].GetDataArray()[i], 4);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_DoublePrecision_ProducesIdenticalGradients()
+    {
+        // Issue #338 Item 3: confirms the IL emitter works for closed
+        // generic types other than float. Reflection-builds the same
+        // smoke-test flow but for CompiledBackwardWalk<double>.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = typeof(CompiledBackwardWalk<>).MakeGenericType(typeof(double));
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            double[] refDA = null!, refDB = null!;
+
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<double>(new double[] { 2.0, 3.0, 4.0 }, new[] { 3 });
+                var b = new Tensor<double>(new double[] { 5.0, 6.0, 7.0 }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<double>> { a, b });
+                if (pass == 0)
+                {
+                    refDA = (double[])grads[a].GetDataArray().Clone();
+                    refDB = (double[])grads[b].GetDataArray().Clone();
+                }
+                else
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Assert.Equal(refDA[i], grads[a].GetDataArray()[i], 6);
+                        Assert.Equal(refDB[i], grads[b].GetDataArray()[i], 6);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_LongTape_ManyOps_ProducesIdenticalGradients()
     {
         // Stress test for the IL emitter — verifies the unrolled
