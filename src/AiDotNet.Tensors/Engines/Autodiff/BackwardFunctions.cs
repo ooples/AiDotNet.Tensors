@@ -984,23 +984,82 @@ internal static class BackwardFunctions<T>
     /// <summary>
     /// TensorEmbeddingLookup backward: scatter-add gradOutput rows back into
     /// the embedding table at the saved index positions. The forward stores
-    /// indices as a snapshotted int[] + the original index shape so the
+    /// indices as a snapshotted long[] (widened from whatever TIndex was
+    /// originally — typically int or long) + the original index shape so the
     /// savedState array sticks to types the SavedStateSerializer supports
     /// (Tensor&lt;TIndex&gt; for non-T would throw on serialization). long
-    /// indices are widened to int at save time, since the engine's
-    /// EmbeddingBackward path indexes by int internally.
+    /// is used end-to-end so vocabulary sizes above int.MaxValue (large-scale
+    /// retrieval embeddings) round-trip losslessly.
+    ///
+    /// <para>A legacy int[] saved-state slot is still supported on the read
+    /// path so plans serialized before the long widening continue to load —
+    /// CompiledPlanLoader.LoadTrainingAsync on existing artifacts must not
+    /// break. The int[] entries are widened to long[] at materialisation
+    /// time.</para>
     /// </summary>
     internal static void TensorEmbeddingLookupBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var indicesData = (int[])savedState[0];
+        // savedState[0] is the indices buffer. Accept either the new
+        // long[] format (current writers) or the legacy int[] format
+        // (plans saved before the widening) so existing serialised
+        // artifacts continue to load cleanly.
+        long[] indicesData;
+        switch (savedState[0])
+        {
+            case long[] l:
+                indicesData = l;
+                break;
+            case int[] i32:
+                indicesData = new long[i32.Length];
+                for (int k = 0; k < i32.Length; k++) indicesData[k] = i32[k];
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"TensorEmbeddingLookup backward saved-state[0] must be long[] or int[]; got {savedState[0]?.GetType().FullName ?? "null"}.");
+        }
         var indicesShape = (int[])savedState[1];
         var vocabSize = (int)savedState[2];
         var embeddingDim = (int)savedState[3];
 
-        var indices = new Tensor<int>(indicesData, indicesShape);
-        var grad = engine.TensorEmbeddingLookupBackward<T, int>(gradOutput, indices, vocabSize, embeddingDim);
+        var indices = new Tensor<long>(indicesData, indicesShape);
+        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indices, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// AiDotNet#1331 companion to <see cref="TensorEmbeddingLookupBackward"/>: scatters
+    /// the upstream gradient back to the embedding table using indices read FRESH from
+    /// the captured float-indices tensor (savedState[0]). Reading at backward time keeps
+    /// gradient routing consistent with the forward replay — both pull from the same
+    /// live tensor reference, so a plan.Step() after the user updates the float input's
+    /// data in place performs forward gather AND backward scatter against the same row IDs.
+    /// </summary>
+    internal static void TensorEmbeddingLookupFromFloatIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var capturedFloatIdx = (Tensor<T>)savedState[0];
+        int vocabSize = (int)savedState[1];
+        int embeddingDim = (int)savedState[2];
+
+        // Materialise fresh int indices for this Step. The float input may
+        // have been overwritten between forward and backward — that's the
+        // whole reason this op exists — so the int[] we build here MUST
+        // mirror exactly what the forward Custom op read on the same Step.
+        int n = capturedFloatIdx.Length;
+        var floatData = capturedFloatIdx.GetDataArray();
+        var nops = MathHelper.GetNumericOperations<T>();
+        var idxLong = new long[n];
+        for (int i = 0; i < n; i++)
+            idxLong[i] = Convert.ToInt64(nops.ToDouble(floatData[i]));
+
+        var indicesShape = (int[])capturedFloatIdx._shape.Clone();
+        var indicesTensor = new Tensor<long>(idxLong, indicesShape);
+        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+        // inputs[0] is the embedding table — the only trainable input.
+        // inputs[1] is the float-indices tensor; it carries no gradient.
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

@@ -82,6 +82,8 @@ internal static class PlanFormatConstants
     internal const byte TagString     = 0x07;
     internal const byte TagByteArray  = 0x08;
     internal const byte TagEnum       = 0x09; // assembly-qualified type name + int value
+    internal const byte TagInt64      = 0x0A;
+    internal const byte TagInt64Array = 0x0B; // long[] — used by index snapshots that may exceed int.MaxValue (large-vocab embeddings)
 
     // ── Tensor table flags ──────────────────────────────────────────────────
     internal const byte TensorFlagWeight       = 0x01; // model parameter
