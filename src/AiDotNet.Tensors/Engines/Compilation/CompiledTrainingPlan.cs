@@ -212,10 +212,42 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _checkpointing = new GradientCheckpointing<T>(wrappedSteps, _engine, segmentSize);
     }
 
+    // Per-phase profiling counters — wall time accumulators in microseconds
+    // collected when AIDOTNET_PROFILE_STEP=1 is set in the environment. Read
+    // them from a test/diag harness via the static accessors below to break
+    // down where Step's wall time is going (forward / grad-zero / backward /
+    // optimizer). Zero overhead in hot path when disabled — single env-var
+    // read at static init, then a single bool check per Step.
+    private static readonly bool _profileStepEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
+    private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
+    private static int _profStepCount;
+    private static long[]? _profPerStepUs;
+    private static string[]? _profBackwardStepNames;
+    public static long[] ProfPerStepUs => _profPerStepUs ?? Array.Empty<long>();
+    public static string[] ProfBackwardStepNames => _profBackwardStepNames ?? Array.Empty<string>();
+    public static long ProfForwardUs => System.Threading.Interlocked.Read(ref _profForwardUs);
+    public static long ProfGradZeroUs => System.Threading.Interlocked.Read(ref _profGradZeroUs);
+    public static long ProfBackwardUs => System.Threading.Interlocked.Read(ref _profBackwardUs);
+    public static long ProfOptimUs => System.Threading.Interlocked.Read(ref _profOptimUs);
+    public static int ProfStepCount => System.Threading.Interlocked.CompareExchange(ref _profStepCount, 0, 0);
+    public static void ResetProf()
+    {
+        System.Threading.Interlocked.Exchange(ref _profForwardUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profGradZeroUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profBackwardUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profOptimUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profStepCount, 0);
+        var ps = _profPerStepUs;
+        if (ps != null) System.Array.Clear(ps, 0, ps.Length);
+    }
+
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
         var engine = _engine;
+        long t0 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
         if (_checkpointing is not null)
@@ -228,6 +260,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < fwd.Length; i++)
                 fwd[i](engine);
         }
+        long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
@@ -265,13 +298,49 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (seedArr != null && destArr != null)
             Array.Copy(seedArr, destArr, seedArr.Length);
 
+        long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         var bwd = _backwardActions;
-        for (int i = 0; i < bwd.Length; i++)
-            bwd[i](engine);
+        if (_profileStepEnabled)
+        {
+            // Per-delegate timing — accumulates into _profPerStepUs[i] across calls.
+            var perStep = _profPerStepUs;
+            if (perStep == null || perStep.Length != bwd.Length)
+            {
+                perStep = new long[bwd.Length];
+                _profPerStepUs = perStep;
+            }
+            double tickToUsLocal = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+            for (int i = 0; i < bwd.Length; i++)
+            {
+                long si = System.Diagnostics.Stopwatch.GetTimestamp();
+                bwd[i](engine);
+                long ei = System.Diagnostics.Stopwatch.GetTimestamp();
+                perStep[i] += (long)((ei - si) * tickToUsLocal);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < bwd.Length; i++)
+                bwd[i](engine);
+        }
+        long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Fused optimizer update (if configured via ConfigureOptimizer)
         _optimizerUpdate?.Invoke();
+        long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+        if (_profileStepEnabled)
+        {
+            // Stopwatch.Frequency is ticks/sec; we want microseconds
+            double tickToUs = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+            System.Threading.Interlocked.Add(ref _profForwardUs,  (long)((t1 - t0) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profGradZeroUs, (long)((t2 - t1) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profBackwardUs, (long)((t3 - t2) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profOptimUs,    (long)((t4 - t3) * tickToUs));
+            System.Threading.Interlocked.Increment(ref _profStepCount);
+        }
 
         return _lossOutput;
     }
@@ -945,6 +1014,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
+        var backwardStepNames = new List<string>();
         int genericBackwardCount = 0;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
@@ -954,10 +1024,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
             if (action != null)
+            {
                 backwardActions.Add(action);
+                backwardStepNames.Add($"specialized:{step.OpName}");
+            }
             else
             {
                 genericBackwardCount++;
+                backwardStepNames.Add($"generic:{step.OpName}");
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -973,7 +1047,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Append fused backward actions in reverse order — TryFuseForwardBackward records
         // them in forward order, but autodiff requires backward (reverse) order.
         for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
+        {
             backwardActions.Add(fusedBackwardActions[i]);
+            backwardStepNames.Add($"fused-backward-{i}");
+        }
+        // Publish names for the perf-diag harness (last writer wins; only ever
+        // useful when AIDOTNET_PROFILE_STEP=1).
+        if (_profileStepEnabled)
+            _profBackwardStepNames = backwardStepNames.ToArray();
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
