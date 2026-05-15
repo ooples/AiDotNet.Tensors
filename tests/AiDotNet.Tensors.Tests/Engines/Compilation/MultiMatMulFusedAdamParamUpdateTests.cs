@@ -197,6 +197,234 @@ public class MultiMatMulFusedAdamParamUpdateTests
     }
 
     /// <summary>
+    /// AiDotNet#1331 buffer-aliasing repro: mirrors the EXACT compiled-plan
+    /// forward-step chain observed in the Transformer trace —
+    /// FusedLinear [4,32] → Reshape [1,4,32] → Reshape [1,4,32] (etc.) →
+    /// LayerNorm. Reads back the LayerNorm's INPUT tensor data immediately
+    /// before the LayerNorm forward step runs and asserts it's NON-ZERO
+    /// (i.e. the upstream FusedLinear's compiled forward DID write to the
+    /// backing array LayerNorm reads from). If the buffer-aliasing bug is
+    /// in Tensors, this test reproduces the L2=0 fingerprint from the
+    /// Transformer trace in isolation.
+    /// </summary>
+    [Fact]
+    public void FusedLinear_Reshape_Reshape_LayerNorm_InputBufferMustPropagate()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, dIn = 8, dHidden = 32;
+
+        var input = FilledRand(new[] { batch, seqLen, dIn }, seed: 101);
+        var W = FilledRand(new[] { dIn, dHidden }, seed: 102);
+        var b = FilledRand(new[] { dHidden }, seed: 103);
+        var gamma = FilledRand(new[] { dHidden }, seed: 104);
+        var beta  = FilledRand(new[] { dHidden }, seed: 105);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        // Track the LayerNorm's input ref and its observed L2 at forward time.
+        // The probe lambda runs INSIDE the lazy execute callback chain — it
+        // observes the tensor that the LayerNorm's forward step sees.
+        Tensor<float>? layerNormInputRef = null;
+        double layerNormInputL2AtForwardTime = -1;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            // Flatten rank-3 → rank-2 for FusedLinear (DenseLayer's pattern).
+            var flat = engine.Reshape(input, new[] { batch * seqLen, dIn });
+            var z = engine.FusedLinear(flat, W, b, FusedActivationType.None);
+            // Reshape back to rank-3 (DenseLayer's pattern again).
+            var rank3 = engine.Reshape(z, new[] { batch, seqLen, dHidden });
+            // Second reshape: identity reshape (no-op) to mimic the Transformer
+            // chain having multiple consecutive reshapes between FusedLinear
+            // and LayerNorm (the FWDSTEP dump showed 4 reshape ops between
+            // FusedLinear and LayerNorm).
+            var rank3b = engine.Reshape(rank3, new[] { batch, seqLen, dHidden });
+            layerNormInputRef = rank3b;
+
+            var normed = engine.LayerNorm(rank3b, gamma, beta, 1e-5, out _, out _);
+            engine.ReduceSum(normed, null);
+            plan = scope.CompileTraining(new[] { W, b, gamma, beta });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            // After forward replay, read the LayerNorm-input tensor's data.
+            double s = 0;
+            var sp = layerNormInputRef!.AsSpan();
+            for (int i = 0; i < sp.Length; i++) s += sp[i] * sp[i];
+            layerNormInputL2AtForwardTime = System.Math.Sqrt(s);
+            _output.WriteLine($"After plan.Step(): layerNormInput.L2 = {layerNormInputL2AtForwardTime:E6}");
+
+            // Sanity: input tensor data should be non-zero (FusedLinear+bias of
+            // random W,b on random input is overwhelmingly likely non-zero).
+            Assert.True(
+                layerNormInputL2AtForwardTime > 1e-6,
+                $"layerNormInputRef.AsSpan() L2 = {layerNormInputL2AtForwardTime:E6} after plan.Step(). " +
+                "The upstream FusedLinear's compiled forward did not write to the backing array " +
+                "that LayerNorm's input tensor reference reads from. This is AiDotNet#1331's deeper " +
+                "buffer-aliasing root cause: producer's step.OutputBuffer.GetDataArray() ≠ " +
+                "consumer's step.Inputs[i].GetDataArray() backing array.");
+        }
+    }
+
+    /// <summary>
+    /// Larger Transformer-shaped chain: embedding → multi-head projection
+    /// pattern (Reshape + Permute) → attention-like matmul + softmax →
+    /// Reshape back → LayerNorm. Tries to reproduce the buffer-aliasing
+    /// observed in the Transformer trace where LayerNorm's input ends up
+    /// L2=0 at plan.Step forward time.
+    /// </summary>
+    [Fact]
+    public void Embedding_MultiHeadShape_LayerNorm_InputBufferMustPropagate()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, vocab = 8, dModel = 32, numHeads = 4, dHead = 8;
+
+        var indices = new Tensor<int>(new[] { batch, seqLen });
+        indices[0, 0] = 0; indices[0, 1] = 2; indices[0, 2] = 4; indices[0, 3] = 6;
+
+        var E = FilledRand(new[] { vocab, dModel }, seed: 201);
+        var Wq = FilledRand(new[] { dModel, dModel }, seed: 202);
+        var Wk = FilledRand(new[] { dModel, dModel }, seed: 203);
+        var Wv = FilledRand(new[] { dModel, dModel }, seed: 204);
+        var Wo = FilledRand(new[] { dModel, dModel }, seed: 205);
+        var attBias = FilledRand(new[] { dModel }, seed: 206);
+        var gamma = FilledRand(new[] { dModel }, seed: 207);
+        var beta  = FilledRand(new[] { dModel }, seed: 208);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        Tensor<float>? layerNormInputRef = null;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            // Embedding lookup → [batch, seqLen, dModel]
+            var emb = engine.TensorEmbeddingLookup<float, int>(E, indices);
+            // Flatten for projections
+            var flat = engine.Reshape(emb, new[] { batch * seqLen, dModel });
+            // Q, K, V projections
+            var q = engine.FusedLinear(flat, Wq, attBias, FusedActivationType.None);
+            var k = engine.FusedLinear(flat, Wk, attBias, FusedActivationType.None);
+            var v = engine.FusedLinear(flat, Wv, attBias, FusedActivationType.None);
+            // Reshape for multi-head: [batch*seqLen, dModel] -> [batch, seqLen, numHeads, dHead]
+            var qHeads = engine.Reshape(q, new[] { batch, seqLen, numHeads, dHead });
+            var kHeads = engine.Reshape(k, new[] { batch, seqLen, numHeads, dHead });
+            var vHeads = engine.Reshape(v, new[] { batch, seqLen, numHeads, dHead });
+            // Permute to [batch, numHeads, seqLen, dHead]
+            var qPerm = engine.TensorPermute(qHeads, new[] { 0, 2, 1, 3 });
+            var kPerm = engine.TensorPermute(kHeads, new[] { 0, 2, 1, 3 });
+            var vPerm = engine.TensorPermute(vHeads, new[] { 0, 2, 1, 3 });
+            // Reshape Q,K,V to [batch*numHeads, seqLen, dHead] for batched matmul
+            var qFlat = engine.Reshape(qPerm, new[] { batch * numHeads, seqLen, dHead });
+            var kFlat = engine.Reshape(kPerm, new[] { batch * numHeads, seqLen, dHead });
+            var vFlat = engine.Reshape(vPerm, new[] { batch * numHeads, seqLen, dHead });
+            // Attention scores: Q @ K^T  →  [batch*numHeads, seqLen, seqLen]
+            var kT = engine.TensorPermute(kFlat, new[] { 0, 2, 1 });
+            var scores = engine.TensorMatMul(qFlat, kT);
+            // Softmax over last axis
+            var attn = engine.Softmax(scores);
+            // Attended values: scores @ V  →  [batch*numHeads, seqLen, dHead]
+            var attended = engine.TensorMatMul(attn, vFlat);
+            // Reshape back to [batch, numHeads, seqLen, dHead]
+            var attendedShaped = engine.Reshape(attended, new[] { batch, numHeads, seqLen, dHead });
+            // Permute back to [batch, seqLen, numHeads, dHead]
+            var attendedPerm = engine.TensorPermute(attendedShaped, new[] { 0, 2, 1, 3 });
+            // Flatten multi-head: [batch, seqLen, dModel]
+            var attendedFlat = engine.Reshape(attendedPerm, new[] { batch, seqLen, dModel });
+            // Output projection: flatten → FusedLinear → reshape
+            var attendedFlat2D = engine.Reshape(attendedFlat, new[] { batch * seqLen, dModel });
+            var attnOut2D = engine.FusedLinear(attendedFlat2D, Wo, attBias, FusedActivationType.None);
+            var attnOut = engine.Reshape(attnOut2D, new[] { batch, seqLen, dModel });
+            layerNormInputRef = attnOut;
+
+            var normed = engine.LayerNorm(attnOut, gamma, beta, 1e-5, out _, out _);
+            engine.ReduceSum(normed, null);
+            plan = scope.CompileTraining(new[] { E, Wq, Wk, Wv, Wo, attBias, gamma, beta });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            double s = 0;
+            var sp = layerNormInputRef!.AsSpan();
+            for (int i = 0; i < sp.Length; i++) s += sp[i] * sp[i];
+            double l2 = System.Math.Sqrt(s);
+            _output.WriteLine($"After plan.Step(): layerNormInput.L2 = {l2:E6}");
+
+            Assert.True(
+                l2 > 1e-6,
+                $"layerNormInputRef.AsSpan() L2 = {l2:E6} after plan.Step(). " +
+                "Upstream attention chain didn't propagate data to the LayerNorm input tensor. " +
+                "Buffer-aliasing bug in compiled-plan forward.");
+        }
+    }
+
+    /// <summary>
+    /// Direct repro of the Transformer trace pattern:
+    /// FusedLinear [4,32] → Reshape [1,4,32] x 2 → LayerNorm.
+    /// Plus a Multiply downstream (which the trace showed at FWDSTEP 13,14
+    /// after LayerNorm — residual or scale). Try inserting an Add between
+    /// FusedLinear and LayerNorm — the residual connection — that uses
+    /// TensorBroadcastAdd or TensorAdd, since the Transformer's residual
+    /// path goes: MHA_out + input → LayerNorm.
+    /// </summary>
+    [Fact]
+    public void Embedding_FusedLinear_Residual_LayerNorm_InputBufferMustPropagate()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, vocab = 8, dModel = 32;
+
+        var indices = new Tensor<int>(new[] { batch, seqLen });
+        indices[0, 0] = 0; indices[0, 1] = 2; indices[0, 2] = 4; indices[0, 3] = 6;
+
+        var E = FilledRand(new[] { vocab, dModel }, seed: 301);
+        var W = FilledRand(new[] { dModel, dModel }, seed: 302);
+        var b = FilledRand(new[] { dModel }, seed: 303);
+        var gamma = FilledRand(new[] { dModel }, seed: 304);
+        var beta  = FilledRand(new[] { dModel }, seed: 305);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+
+        Tensor<float>? layerNormInputRef = null;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var emb = engine.TensorEmbeddingLookup<float, int>(E, indices);
+            // Reshape rank-3 → rank-2 for FusedLinear
+            var emb2D = engine.Reshape(emb, new[] { batch * seqLen, dModel });
+            // FusedLinear (simulates MHA's output projection)
+            var attn2D = engine.FusedLinear(emb2D, W, b, FusedActivationType.None);
+            // Reshape back to rank-3
+            var attn3D = engine.Reshape(attn2D, new[] { batch, seqLen, dModel });
+            // Reshape original embedding back too (residual branch)
+            var emb3D = engine.Reshape(emb2D, new[] { batch, seqLen, dModel });
+            // Residual add (RANK-3 + RANK-3)
+            var residual = engine.TensorAdd(attn3D, emb3D);
+            layerNormInputRef = residual;
+
+            var normed = engine.LayerNorm(residual, gamma, beta, 1e-5, out _, out _);
+            engine.ReduceSum(normed, null);
+            plan = scope.CompileTraining(new[] { E, W, b, gamma, beta });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            double s = 0;
+            var sp = layerNormInputRef!.AsSpan();
+            for (int i = 0; i < sp.Length; i++) s += sp[i] * sp[i];
+            double l2 = System.Math.Sqrt(s);
+            _output.WriteLine($"After plan.Step(): residual.L2 = {l2:E6}");
+
+            Assert.True(
+                l2 > 1e-6,
+                $"residual.AsSpan() L2 = {l2:E6} after plan.Step(). " +
+                "The TensorAdd (residual) didn't write to LayerNorm's input backing array.");
+        }
+    }
+
+    /// <summary>
     /// Mirrors what AiDotNet's <c>DenseLayer.Forward</c> does on a rank-3
     /// [batch, seq, features] input: flatten via Reshape, FusedLinear,
     /// Reshape back. Two stacked DenseLayer-style passes. If the Reshape
