@@ -246,6 +246,11 @@ internal static class CompiledBackwardWalk<T>
         if (mulMethod is not null)
             registry[mulMethod] = new MultiplyBackwardInliner();
 
+        var expMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.ExpBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (expMethod is not null)
+            registry[expMethod] = new ExpBackwardInliner();
+
         return registry;
     }
 
@@ -264,6 +269,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo gradsField,
             FieldInfo input0Field,
             FieldInfo input1Field,
+            FieldInfo outputField,
             MethodInfo accumulateGradMethod);
     }
 
@@ -284,6 +290,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo gradsField,
             FieldInfo input0Field,
             FieldInfo input1Field,
+            FieldInfo outputField,
             MethodInfo accumulateGradMethod)
         {
             // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
@@ -326,6 +333,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo gradsField,
             FieldInfo input0Field,
             FieldInfo input1Field,
+            FieldInfo outputField,
             MethodInfo accumulateGradMethod)
         {
             // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
@@ -380,6 +388,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo gradsField,
             FieldInfo input0Field,
             FieldInfo input1Field,
+            FieldInfo outputField,
             MethodInfo accumulateGradMethod)
         {
             // gradA = engine.TensorMultiply(gradOutput, entry.Input1)
@@ -421,6 +430,49 @@ internal static class CompiledBackwardWalk<T>
     }
 
     /// <summary>
+    /// Inlines <c>ExpBackward</c>: d(exp(x))/dx = grad * exp(x) = grad * output.
+    /// One TensorMultiply with entry.Output + one AccumulateGrad. Unary op
+    /// but uses output (the cached forward result) instead of input — the
+    /// "saved tensor" optimisation that PyTorch / TF also exploit.
+    /// </summary>
+    private sealed class ExpBackwardInliner : IPerOpInliner
+    {
+        private static readonly MethodInfo s_multiplyMethod =
+            typeof(IEngine).GetMethod(nameof(IEngine.TensorMultiply))!
+                .MakeGenericMethod(typeof(T));
+
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            FieldInfo outputField,
+            MethodInfo accumulateGradMethod)
+        {
+            // grad = engine.TensorMultiply(gradOutput, entry.Output)
+            var gradLocal = il.DeclareLocal(typeof(Tensor<T>));
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, outputField);
+            il.Emit(OpCodes.Callvirt, s_multiplyMethod);
+            il.Emit(OpCodes.Stloc, gradLocal);
+
+            // AccumulateGrad(state.Grads, entry.Input0, grad, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
     /// Inlines <c>NegateBackward</c>: d(-x)/dx = -grad. One TensorNegate
     /// + one AccumulateGrad call. Unary op, only input0 is touched.
     /// </summary>
@@ -438,6 +490,7 @@ internal static class CompiledBackwardWalk<T>
             FieldInfo gradsField,
             FieldInfo input0Field,
             FieldInfo input1Field,
+            FieldInfo outputField,
             MethodInfo accumulateGradMethod)
         {
             // var negGrad = engine.TensorNegate(gradOutput);
@@ -720,7 +773,7 @@ internal static class CompiledBackwardWalk<T>
                 && s_inliners.TryGetValue(bwdMethod, out var inliner))
             {
                 inliner.Emit(il, stateLocal, entryRefLocal, gradOutputLocal,
-                    gradsField, input0Field, input1Field, accumulateGradMethod);
+                    gradsField, input0Field, input1Field, outputField, accumulateGradMethod);
             }
             else
             {
