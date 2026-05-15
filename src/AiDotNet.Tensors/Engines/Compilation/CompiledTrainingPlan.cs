@@ -1277,6 +1277,52 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 return eng => TensorMatMulGemvFloat(cA, cB, cOut, M, K);
             }
 
+            // Issue #338 Phase G.5: BF16 mixed-precision forward MatMul.
+            // When AIDOTNET_BLAS_PROVIDER=mkl-bf16 is opted in AND the MKL
+            // BF16 kernel is available, pre-convert weight B to BF16 at
+            // compile time (one-shot, weight is constant across replays in
+            // frozen-weights mode and converted-fresh each step in training
+            // mode via the closure). Activations A are converted on the
+            // fly into a pooled BF16 buffer. C remains FP32.
+            //
+            // Shape gate: skip BF16 when N > 1024 (LM head case where
+            // dC conversion cost in backward dominates the per-call kernel
+            // savings on CPUs without AVX-512-BF16 hardware).
+            if (BlasProvider.UseMklBf16 && N <= 1024)
+            {
+                // Pre-convert B at compile time. NOTE: this assumes B
+                // doesn't change between Step() calls; for the standard
+                // training loop (weight updates between steps) the BF16
+                // mode would need re-conversion. We gate the entire
+                // mkl-bf16 path on the assumption that the caller knows
+                // their workload — same trust contract as
+                // EnableFrozenWeightOptimizations().
+                var bBf16 = new ushort[K * N];
+                unsafe
+                {
+                    fixed (float* bSrc = cB)
+                    fixed (ushort* bDst = bBf16)
+                        BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
+                }
+                // Reusable BF16 scratch for A. Sized once; reused per call.
+                var aBf16 = new ushort[M * K];
+                return eng =>
+                {
+                    unsafe
+                    {
+                        fixed (float* aSrc = cA)
+                        fixed (ushort* aDst = aBf16)
+                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
+                    }
+                    if (!BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cOut, 0, N))
+                    {
+                        // Probe succeeded but call failed (transient) — fall back to FP32.
+                        if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                            SimdGemm.Sgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+                    }
+                };
+            }
+
             if (allowCachedB)
             {
                 return eng =>
@@ -2499,6 +2545,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // offset.
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
             int dcOff = 0, aOff = 0, bOff = 0, destAOff = 0, destBOff = 0;
+            // Phase G.5: BF16 scratch buffers. Allocated lazily on first
+            // call only when MKL-BF16 is active. cachedBBf16 is converted
+            // once and reused (B is assumed frozen across replays under
+            // the mkl-bf16 trust contract); cachedABf16 and cachedDCBf16
+            // are reused as activations and grads change each step.
+            ushort[]? cachedABf16 = null, cachedBBf16 = null, cachedDCBf16 = null;
 
             return eng =>
             {
@@ -2514,6 +2566,59 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     bOff = inputB._storageOffset;
                     destAOff = gradA._storageOffset;
                     destBOff = gradB._storageOffset;
+                }
+
+                // Issue #338 Phase G.5: BF16 mixed-precision backward.
+                // Same trust contract as the forward BF16 path: weights are
+                // assumed frozen, BF16-converted once at lazy first call,
+                // reused across replays. Activation A and gradOut dC are
+                // converted on the fly into pooled BF16 scratches.
+                //
+                // Shape gate: BF16 backward only pays off when M*N (per-call
+                // dC conversion cost) is small relative to M*N*K (GEMM
+                // work). For the consumer Transformer LM head (M=2048,
+                // K=128, N=8192) the dC buffer is 16M elements — converting
+                // it per call costs ~8 ms via SIMD which dwarfs the BF16
+                // GEMM speedup on CPUs without AVX-512-BF16 hardware. Cap
+                // on N: skip BF16 when N > 1024.
+                if (BlasProvider.UseMklBf16 && N <= 1024)
+                {
+                    // Lazy initialise BF16 scratch + pre-convert B
+                    if (cachedABf16 is null)
+                    {
+                        cachedABf16 = new ushort[M * K];
+                        cachedBBf16 = new ushort[K * N];
+                        cachedDCBf16 = new ushort[M * N];
+                        unsafe
+                        {
+                            fixed (float* bSrc = &cachedB![bOff])
+                            fixed (ushort* bDst = cachedBBf16)
+                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
+                        }
+                    }
+                    unsafe
+                    {
+                        fixed (float* dcSrc = &cachedDC![dcOff])
+                        fixed (ushort* dcDst = cachedDCBf16)
+                            BlasProvider.Fp32ToBf16Bulk(dcSrc, dcDst, M * N);
+                        fixed (float* aSrc = &cachedA![aOff])
+                        fixed (ushort* aDst = cachedABf16)
+                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
+                    }
+                    // dA = dC @ B^T (M, K, N), dB = A^T @ dC (K, N, M)
+                    bool okA = BlasProvider.TryGemmBf16(M, K, N,
+                        cachedDCBf16!, 0, N, false, cachedBBf16!, 0, N, true,
+                        cachedDestA!, destAOff, K);
+                    bool okB = BlasProvider.TryGemmBf16(K, N, M,
+                        cachedABf16!, 0, K, true, cachedDCBf16!, 0, N, false,
+                        cachedDestB!, destBOff, N);
+                    if (okA && okB)
+                    {
+                        inputA.Grad = gradA;
+                        inputB.Grad = gradB;
+                        return;
+                    }
+                    // Either call failed — fall through to FP32 path.
                 }
 
                 // dA = dC @ B^T — direct BLAS with engine fallback

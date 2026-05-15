@@ -24,10 +24,15 @@
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+    <!-- NU1603: intelmkl.redist transitive deps reference exact versions
+         that get bumped to next patch (e.g. intelopenmp 2026.0.0 →
+         2026.0.0.944). Higher within the same major is fine. -->
+    <NoWarn>$(NoWarn);NU1603</NoWarn>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);NU1603</NoWarn>
   </PropertyGroup>
 
   <!-- Define WINDOWS for correct DLL names on Windows -->
@@ -170,6 +175,52 @@
   -->
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.Mkl.Redist" Version="5.0.0" />
+  </ItemGroup>
+
+  <!--
+    Issue #338 Phase G.5 — full Intel MKL redist for BF16 mixed-precision
+    GEMM. `Microsoft.ML.Mkl.Redist` (above) strips MKL to a small set of
+    FP32/FP64 GEMM exports for ML.NET; `intelmkl.redist.win-x64` ships
+    the full `mkl_rt.3.dll` (28MB) which exports `cblas_gemm_bf16bf16f32`,
+    the mixed-precision GEMM that closes the f32 GEMM throughput gap on
+    AVX-512-BF16 capable Intel CPUs (Cooper Lake, Sapphire Rapids, etc.).
+    Win-x64 only — the equivalent linux-x64/osx-x64 packages exist
+    (`intelmkl.redist.linux-x64`, `intelmkl.redist.osx-x64`) but are gated
+    on consumer demand; add them when needed.
+    Total native payload on win-x64: ~500MB. Gated entirely behind
+    `AIDOTNET_BLAS_PROVIDER=mkl-bf16`; users who don't opt in pay nothing
+    at runtime beyond the native asset deployment.
+  -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <!-- NU1603: Intel's transitive deps occasionally reference exact
+         versions that get bumped to next patch (e.g. intelopenmp 2026.0.0
+         → 2026.0.0.944). Higher within the same major is fine. -->
+    <PackageReference Include="intelmkl.redist.win-x64" Version="2026.0.0.901" NoWarn="NU1603" />
+  </ItemGroup>
+
+  <!-- intelmkl.redist's MSBuild targets gate Content-item generation on
+       legacy `packages.config` detection, so SDK-style projects don't get
+       the native DLLs auto-copied to bin. Replicate the deployment
+       manually using NuGetPackageRoot. -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <None Include="$(NuGetPackageRoot)intelmkl.redist.win-x64\2026.0.0.901\runtimes\win-x64\native\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </None>
+    <None Include="$(NuGetPackageRoot)intelopenmp.redist.win\2026.0.0.944\runtimes\win-x64\native\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </None>
+    <None Include="$(NuGetPackageRoot)inteltbb.redist.win\2023.0.0.716\runtimes\win-x64\native\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </None>
   </ItemGroup>
 
   <!--

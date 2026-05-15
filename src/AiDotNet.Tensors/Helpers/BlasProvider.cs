@@ -100,17 +100,61 @@ internal static class BlasProvider
         double* b, int ldb,
         double beta, double* c, int ldc);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #338 Phase G.5 — BF16 mixed-precision GEMM via full Intel MKL.
+    // cblas_gemm_bf16bf16f32 is exported by mkl_rt.3.dll (from
+    // intelmkl.redist.win-x64). NOT exported by Microsoft.ML.Mkl.Redist's
+    // stripped MklImports.dll. Computes:
+    //   C[m,n] = alpha * op(A_bf16) * op(B_bf16) + beta * C[m,n]
+    // where A and B are BF16 (uint16 top-16-bits-of-FP32) and C is FP32.
+    // On AVX-512-BF16 capable Intel CPUs (Cooper Lake, Sapphire Rapids,
+    // etc.) this is ~2× faster than the FP32 sgemm via the dedicated
+    // BF16 ALU path. On older CPUs MKL falls back to FP32 internally
+    // (correctness preserved, no speedup).
+    //
+    // Opt-in via env var AIDOTNET_BLAS_PROVIDER=mkl-bf16. Distinct from
+    // the `mkl` setting because BF16 requires the full Intel MKL redist
+    // (intelmkl.redist.*, ~500MB on win-x64); the smaller Microsoft.ML.Mkl.Redist
+    // path stays available under `AIDOTNET_BLAS_PROVIDER=mkl`.
+    // ─────────────────────────────────────────────────────────────────────
+    [DllImport("mkl_rt.3", EntryPoint = "cblas_gemm_bf16bf16f32", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe void mkl_cblas_gemm_bf16bf16f32_ptr(
+        int layout, int transA, int transB,
+        int m, int n, int k,
+        float alpha, ushort* a, int lda,
+        ushort* b, int ldb,
+        float beta, float* c, int ldc);
+
+    /// <summary>True iff <c>AIDOTNET_BLAS_PROVIDER=mkl-bf16</c> at process start.</summary>
+    private static readonly bool _preferMklBf16 = string.Equals(
+        Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+        "mkl-bf16",
+        StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Resolved lazily on first use — probes mkl_rt.3 BF16 GEMM once.</summary>
+    private static readonly Lazy<bool> _mklBf16Available = new(ProbeMklBf16Library);
+
+    internal static bool IsMklBf16Available => _mklBf16Available.Value;
+
+    /// <summary>True iff <c>AIDOTNET_BLAS_PROVIDER=mkl-bf16</c> AND the probe succeeded.</summary>
+    internal static bool UseMklBf16 => _preferMklBf16 && _mklBf16Available.Value;
+
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c>|<c>true</c>|<c>yes</c> at process start.</summary>
     private static readonly bool _blasOptIn = ReadOptIn();
 
     /// <summary>
-    /// True iff <c>AIDOTNET_BLAS_PROVIDER=mkl</c> at process start.
+    /// True iff <c>AIDOTNET_BLAS_PROVIDER=mkl</c> OR any value that starts
+    /// with <c>mkl-</c> (e.g. <c>mkl-bf16</c> implies MKL routing).
     /// When false, MKL probes are skipped and OpenBLAS is the only candidate.
     /// </summary>
-    private static readonly bool _preferMkl = string.Equals(
-        Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
-        "mkl",
-        StringComparison.OrdinalIgnoreCase);
+    private static readonly bool _preferMkl = PreferMklFromEnv();
+    private static bool PreferMklFromEnv()
+    {
+        var raw = Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER");
+        if (raw is null) return false;
+        return string.Equals(raw, "mkl", StringComparison.OrdinalIgnoreCase)
+            || raw.StartsWith("mkl-", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>Resolved lazily on first use — probes libopenblas once.</summary>
     private static readonly Lazy<bool> _nativeAvailable = new(ProbeNativeLibrary);
@@ -225,6 +269,186 @@ internal static class BlasProvider
         catch (DllNotFoundException) { return false; }
         catch (EntryPointNotFoundException) { return false; }
         catch (BadImageFormatException) { return false; }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.5: probe mkl_rt.3 cblas_gemm_bf16bf16f32.
+    /// Only runs when AIDOTNET_BLAS_PROVIDER=mkl-bf16. Tests with:
+    /// (a) 1×1×1 correctness GEMM (2.0 * 3.0 = 6.0 within BF16 tolerance)
+    /// (b) 256×256×256 speed smoke test vs FP32 sgemm — BF16 must be
+    ///     ≥1.3× faster to count as available. On CPUs without
+    ///     AVX-512-BF16 instructions (Zen 2/3 AMD, pre-Cooper-Lake Intel)
+    ///     MKL software-emulates BF16 with FP32 lowering, which is
+    ///     SLOWER than direct FP32 sgemm — opt-in correctly refuses
+    ///     so users don't accidentally pay a regression.
+    /// Skip the speed smoke with AIDOTNET_BLAS_PROVIDER=mkl-bf16-force
+    /// (for testing the kernel path on slow CPUs).
+    /// <para>
+    /// IMPORTANT: this probe LOADS mkl_rt.3.dll into the process. On
+    /// systems where Microsoft.ML.Mkl.Redist's MklImports.dll is already
+    /// loaded (via the `mkl` routing), the two MKL builds ship competing
+    /// libiomp5md.dll OpenMP runtimes and the loader collision REGRESSES
+    /// FP32 GEMM throughput substantially — even when BF16 itself is
+    /// never called. To avoid this, the probe is only run when BF16 is
+    /// explicitly opted into AND the user accepts the deployment caveat.
+    /// Set <c>AIDOTNET_BLAS_PROVIDER=mkl</c> for the safer "MKL routing
+    /// only, no BF16" path; use <c>mkl-bf16</c> only when targeting
+    /// AVX-512-BF16 hardware and ready to manage the OpenMP loader
+    /// hygiene (typically by removing MklImports.dll from the deploy
+    /// directory or building a project that excludes
+    /// Microsoft.ML.Mkl.Redist).
+    /// </para>
+    /// </summary>
+    private static unsafe bool ProbeMklBf16Library()
+    {
+        if (!_preferMklBf16) return false;
+        try
+        {
+            ushort a = Fp32ToBf16(2.0f);
+            ushort b = Fp32ToBf16(3.0f);
+            float c = 0.0f;
+            mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                1, 1, 1, 1.0f, &a, 1, &b, 1, 0.0f, &c, 1);
+            if (Math.Abs(c - 6.0f) > 0.01f) return false;
+
+            // Force-on bypass for testing on slow CPUs.
+            if (string.Equals(
+                Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+                "mkl-bf16-force",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Speed smoke test: 256×256×256 GEMM, FP32 vs BF16.
+            const int K = 256;
+            var aFp32 = new float[K * K];
+            var bFp32 = new float[K * K];
+            for (int i = 0; i < K * K; i++) { aFp32[i] = 0.001f * (i & 0xff); bFp32[i] = 0.002f * (i & 0xff); }
+            var aBf = new ushort[K * K];
+            var bBf = new ushort[K * K];
+            fixed (float* aSrc = aFp32) fixed (ushort* aDst = aBf) Fp32ToBf16Bulk(aSrc, aDst, K * K);
+            fixed (float* bSrc = bFp32) fixed (ushort* bDst = bBf) Fp32ToBf16Bulk(bSrc, bDst, K * K);
+            var cOut = new float[K * K];
+
+            // Warmup
+            for (int w = 0; w < 3; w++)
+            {
+                fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
+                    mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
+                    mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 20; i++)
+                fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
+                    mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+            sw.Stop();
+            double fp32Ms = sw.Elapsed.TotalMilliseconds;
+
+            sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 20; i++)
+                fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
+                    mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+            sw.Stop();
+            double bf16Ms = sw.Elapsed.TotalMilliseconds;
+
+            // Require BF16 to be ≥1.3× faster than FP32. On AVX-512-BF16
+            // capable Intel CPUs this gate passes easily; on CPUs without
+            // dedicated BF16 hardware it fails and we fall back to FP32.
+            bool fastEnough = bf16Ms * 1.3 < fp32Ms;
+            if (Environment.GetEnvironmentVariable("AIDOTNET_BF16_PROBE_DEBUG") == "1")
+                Console.WriteLine($"[BF16 Probe] FP32={fp32Ms:F2}ms, BF16={bf16Ms:F2}ms, 1.3× gate: {fastEnough} (need BF16 × 1.3 < FP32)");
+            return fastEnough;
+        }
+        catch (DllNotFoundException) { return false; }
+        catch (EntryPointNotFoundException) { return false; }
+        catch (BadImageFormatException) { return false; }
+    }
+
+    /// <summary>
+    /// FP32 → BF16 conversion: take the top 16 bits of the float bit pattern.
+    /// Uses round-to-nearest-even for better numerical accuracy than naive
+    /// truncation. Matches the IEEE 754 BF16 (8-bit exp, 7-bit mantissa).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe ushort Fp32ToBf16(float x)
+    {
+        uint bits = *(uint*)&x;
+        // Round to nearest even: add half-ULP plus odd-bit detector.
+        uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+        uint rounded = bits + rounding_bias;
+        return (ushort)(rounded >> 16);
+    }
+
+    /// <summary>
+    /// Bulk FP32 → BF16 conversion. Vectorized via AVX2 when available.
+    /// At Issue #338 d=128 transformer shapes the scalar loop costs ~7ns
+    /// per element; the AVX2 vector path drops this to ~0.5ns per element,
+    /// which keeps the conversion overhead a fraction of the BF16 GEMM
+    /// speedup instead of dominating it.
+    /// </summary>
+    internal static unsafe void Fp32ToBf16Bulk(float* src, ushort* dst, int count)
+    {
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            int i = 0;
+            // Process 8 floats per Vector256<float>, output 8 ushorts per
+            // Vector128<ushort>. The conversion is "take top 16 bits with
+            // round-to-nearest-even" — vectorized as:
+            //   r = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+            var c7fff = System.Runtime.Intrinsics.Vector256.Create((int)0x7FFF);
+            var c1 = System.Runtime.Intrinsics.Vector256.Create((int)1);
+            for (; i + 8 <= count; i += 8)
+            {
+                var bits = System.Runtime.Intrinsics.X86.Avx.LoadVector256((int*)(src + i));
+                var shifted = System.Runtime.Intrinsics.X86.Avx2.ShiftRightLogical(bits, 16);
+                var oddBit = System.Runtime.Intrinsics.X86.Avx2.And(shifted, c1);
+                var bias = System.Runtime.Intrinsics.X86.Avx2.Add(c7fff, oddBit);
+                var rounded = System.Runtime.Intrinsics.X86.Avx2.Add(bits, bias);
+                var hi16 = System.Runtime.Intrinsics.X86.Avx2.ShiftRightLogical(rounded, 16);
+                // Pack 8 ints (low 16 bits each) into 8 ushorts via shuffle.
+                // PackUnsignedSaturate handles the narrowing.
+                var lo = System.Runtime.Intrinsics.Vector256.GetLower(hi16);
+                var hi = System.Runtime.Intrinsics.Vector256.GetUpper(hi16);
+                var packed = System.Runtime.Intrinsics.X86.Sse41.PackUnsignedSaturate(lo, hi);
+                System.Runtime.Intrinsics.X86.Sse2.Store(dst + i, packed);
+            }
+            for (; i < count; i++) dst[i] = Fp32ToBf16(src[i]);
+            return;
+        }
+#endif
+        for (int i = 0; i < count; i++)
+            dst[i] = Fp32ToBf16(src[i]);
+    }
+
+    /// <summary>
+    /// BF16 GEMM with FP32 accumulation: C[m,n] = alpha * A_bf16 @ B_bf16 + beta * C[m,n].
+    /// Returns false when MKL BF16 is unavailable or env var not opted in;
+    /// caller falls back to FP32 sgemm.
+    /// </summary>
+    internal static unsafe bool TryGemmBf16(int m, int n, int k,
+        ushort[] a, int aOffset, int lda, bool transA,
+        ushort[] b, int bOffset, int ldb, bool transB,
+        float[] c, int cOffset, int ldc, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!_preferMklBf16 || !_mklBf16Available.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            fixed (ushort* pa = &a[aOffset])
+            fixed (ushort* pb = &b[bOffset])
+            fixed (float* pc = &c[cOffset])
+            {
+                mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, cblasTA, cblasTB,
+                    m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
+            }
+            return true;
+        }
+        catch { return false; }
     }
     // Defaults to true (issue #164): deterministic-by-default. After the MKL.NET removal
     // in #131/#163, every BLAS dispatch in this stub returns false anyway and routes the
