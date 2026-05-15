@@ -213,6 +213,84 @@ internal static class CompiledBackwardWalk<T>
             BindingFlags.Public | BindingFlags.Static)!;
 
     /// <summary>
+    /// Per-op-pattern inliner lookup. When EmitWalkerILSpecialised
+    /// recognises an entry's backward method as one with a known inliner,
+    /// the inliner emits the actual gradient math directly (eliding
+    /// inputs[] array construction, savedState handling, and the
+    /// BackwardFunction<T> invocation) instead of the generic 6-arg call.
+    /// </summary>
+    private static readonly Dictionary<MethodInfo, IPerOpInliner> s_inliners
+        = BuildInlinerRegistry();
+
+    private static Dictionary<MethodInfo, IPerOpInliner> BuildInlinerRegistry()
+    {
+        var registry = new Dictionary<MethodInfo, IPerOpInliner>();
+        var bwdType = typeof(BackwardFunctions<T>);
+        var addMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.AddBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (addMethod is not null)
+            registry[addMethod] = new AddBackwardInliner();
+        return registry;
+    }
+
+    /// <summary>
+    /// Per-op IL emitter contract. Returns false to fall back to the
+    /// generic specialised-call path; true means the inliner emitted
+    /// the full per-entry IL itself.
+    /// </summary>
+    private interface IPerOpInliner
+    {
+        void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            MethodInfo accumulateGradMethod);
+    }
+
+    /// <summary>
+    /// Inlines <c>AddBackward</c>'s gradient math: two
+    /// <c>AccumulateGrad(grads, input_i, gradOutput, engine)</c> calls
+    /// for i in {0, 1}. Skips inputs[] array construction + savedState
+    /// null-coalescing + the BackwardFunction<T>.Invoke dispatch — net
+    /// ~12 IL instructions saved per AddBackward entry.
+    /// </summary>
+    private sealed class AddBackwardInliner : IPerOpInliner
+    {
+        public void Emit(
+            ILGenerator il,
+            LocalBuilder stateLocal,
+            LocalBuilder entryRefLocal,
+            LocalBuilder gradOutputLocal,
+            FieldInfo gradsField,
+            FieldInfo input0Field,
+            FieldInfo input1Field,
+            MethodInfo accumulateGradMethod)
+        {
+            // AccumulateGrad(state.Grads, entry.Input0, gradOutput, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input0Field);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+
+            // AccumulateGrad(state.Grads, entry.Input1, gradOutput, engine)
+            il.Emit(OpCodes.Ldloca, stateLocal);
+            il.Emit(OpCodes.Ldfld, gradsField);
+            il.Emit(OpCodes.Ldloc, entryRefLocal);
+            il.Emit(OpCodes.Ldfld, input1Field);
+            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            il.Emit(OpCodes.Ldarg_3);
+            il.Emit(OpCodes.Call, accumulateGradMethod);
+        }
+    }
+
+    /// <summary>
     /// Builds a compiled walker for the given plan. Attempts IL emission
     /// first; on failure (rare — restricted IL platforms) falls back to a
     /// closure-based walker with identical semantics.
@@ -414,6 +492,8 @@ internal static class CompiledBackwardWalk<T>
 
         var entryType = typeof(TapeEntry<T>);
         var outputField = entryType.GetField(nameof(TapeEntry<T>.Output))!;
+        var input0Field = entryType.GetField(nameof(TapeEntry<T>.Input0))!;
+        var input1Field = entryType.GetField(nameof(TapeEntry<T>.Input1))!;
         var savedStateField = entryType.GetField(nameof(TapeEntry<T>.SavedState))!;
         var getInputsArrayIntoMethod = entryType.GetMethod(nameof(TapeEntry<T>.GetInputsArrayInto))!;
 
@@ -422,6 +502,15 @@ internal static class CompiledBackwardWalk<T>
 
         var arrayEmptyObjectMethod = typeof(Array).GetMethod(nameof(Array.Empty))!
             .MakeGenericMethod(typeof(object));
+
+        // AccumulateGrad is called by inliners (e.g. AddBackward) that
+        // emit the gradient math directly instead of going through the
+        // backward method dispatch.
+        var diffOpsType = typeof(DifferentiableOps);
+        var accumulateGradMethod = diffOpsType.GetMethod(
+            "AccumulateGrad",
+            BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)
+            ?.MakeGenericMethod(typeof(T));
 
         for (int i = 0; i < reverseTopoIndices.Length; i++)
         {
@@ -454,42 +543,56 @@ internal static class CompiledBackwardWalk<T>
             il.Emit(OpCodes.Callvirt, tryGetValueMethod);
             il.Emit(OpCodes.Brfalse_S, skipLabel);
 
-            // arg1: gradOutput
-            il.Emit(OpCodes.Ldloc, gradOutputLocal);
+            // Inliner registry check: if this backward method has a
+            // per-op IL inliner, let it emit the gradient math directly
+            // instead of building the 6-arg call. The inliner skips
+            // inputs[] array construction + savedState null-coalescing
+            // entirely.
+            if (accumulateGradMethod is not null
+                && s_inliners.TryGetValue(bwdMethod, out var inliner))
+            {
+                inliner.Emit(il, stateLocal, entryRefLocal, gradOutputLocal,
+                    gradsField, input0Field, input1Field, accumulateGradMethod);
+            }
+            else
+            {
+                // arg1: gradOutput
+                il.Emit(OpCodes.Ldloc, gradOutputLocal);
 
-            // arg2: entry.GetInputsArrayInto(buf1, buf2, buf3)
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf1Field);
-            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf2Field);
-            il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf3Field);
-            il.Emit(OpCodes.Call, getInputsArrayIntoMethod);
+                // arg2: entry.GetInputsArrayInto(buf1, buf2, buf3)
+                il.Emit(OpCodes.Ldloc, entryRefLocal);
+                il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf1Field);
+                il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf2Field);
+                il.Emit(OpCodes.Ldloca, stateLocal); il.Emit(OpCodes.Ldfld, buf3Field);
+                il.Emit(OpCodes.Call, getInputsArrayIntoMethod);
 
-            // arg3: entry.Output
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, outputField);
+                // arg3: entry.Output
+                il.Emit(OpCodes.Ldloc, entryRefLocal);
+                il.Emit(OpCodes.Ldfld, outputField);
 
-            // arg4: entry.SavedState ?? Array.Empty<object>()
-            il.Emit(OpCodes.Ldloc, entryRefLocal);
-            il.Emit(OpCodes.Ldfld, savedStateField);
-            il.Emit(OpCodes.Dup);
-            il.Emit(OpCodes.Brtrue_S, savedStateNonNullLabel);
-            il.Emit(OpCodes.Pop);                          // pop the null
-            il.Emit(OpCodes.Call, arrayEmptyObjectMethod); // push Array.Empty<object>()
-            il.Emit(OpCodes.Br_S, savedStateDoneLabel);
-            il.MarkLabel(savedStateNonNullLabel);
-            // non-null savedState is already on the stack from Dup; nothing more to do
-            il.MarkLabel(savedStateDoneLabel);
+                // arg4: entry.SavedState ?? Array.Empty<object>()
+                il.Emit(OpCodes.Ldloc, entryRefLocal);
+                il.Emit(OpCodes.Ldfld, savedStateField);
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Brtrue_S, savedStateNonNullLabel);
+                il.Emit(OpCodes.Pop);                          // pop the null
+                il.Emit(OpCodes.Call, arrayEmptyObjectMethod); // push Array.Empty<object>()
+                il.Emit(OpCodes.Br_S, savedStateDoneLabel);
+                il.MarkLabel(savedStateNonNullLabel);
+                // non-null savedState is already on the stack from Dup; nothing more to do
+                il.MarkLabel(savedStateDoneLabel);
 
-            // arg5: engine
-            il.Emit(OpCodes.Ldarg_3);
+                // arg5: engine
+                il.Emit(OpCodes.Ldarg_3);
 
-            // arg6: state.Grads
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
+                // arg6: state.Grads
+                il.Emit(OpCodes.Ldloca, stateLocal);
+                il.Emit(OpCodes.Ldfld, gradsField);
 
-            // Direct call to the entry's static backward method —
-            // this is the perf-winning step over delegate dispatch.
-            il.Emit(OpCodes.Call, bwdMethod);
+                // Direct call to the entry's static backward method —
+                // this is the perf-winning step over delegate dispatch.
+                il.Emit(OpCodes.Call, bwdMethod);
+            }
 
             il.Emit(OpCodes.Br_S, skipLabel);
 
