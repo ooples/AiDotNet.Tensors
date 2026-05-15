@@ -1193,6 +1193,89 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Issue #335 item 4: Multi-head attention scoring fanout. Computes
+    /// scores[h] = Q[h] · K[h]^T for each of <paramref name="numHeads"/>
+    /// attention heads, with each head's GEMM running on its own stream
+    /// from the scheduler's pool. Use the result tensor as input to a
+    /// scaled-softmax + value projection pipeline.
+    /// <para>
+    /// Shapes (NCHW-style packed):
+    /// <list type="bullet">
+    ///   <item><paramref name="Q"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="K"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="scores"/> output packed as [batch, numHeads, seqLen, seqLen]</item>
+    /// </list>
+    /// One head per stream = numHeads concurrent SGEMMs of shape
+    /// [seqLen, headDim] · [headDim, seqLen]. The cuBLAS launches overlap
+    /// rather than serialising on the default stream.
+    /// </para>
+    /// </summary>
+    public void MultiHeadAttentionScoresFanout(
+        IGpuBuffer Q, IGpuBuffer K, IGpuBuffer scores,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Q is null) throw new ArgumentNullException(nameof(Q));
+        if (K is null) throw new ArgumentNullException(nameof(K));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+
+        long perHeadQ = (long)seqLen * headDim;
+        long perHeadK = (long)seqLen * headDim;
+        long perHeadS = (long)seqLen * seqLen;
+        long perBatchQ = perHeadQ * numHeads;
+        long perBatchK = perHeadK * numHeads;
+        long perBatchS = perHeadS * numHeads;
+        long elemBytes = sizeof(float);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr qPtr = (IntPtr)((long)Q.Handle
+                        + (batchIdx * perBatchQ + headIdx * perHeadQ) * elemBytes);
+                    IntPtr kPtr = (IntPtr)((long)K.Handle
+                        + (batchIdx * perBatchK + headIdx * perHeadK) * elemBytes);
+                    IntPtr sPtr = (IntPtr)((long)scores.Handle
+                        + (batchIdx * perBatchS + headIdx * perHeadS) * elemBytes);
+
+                    // scores[h] = Q[h] · K[h]^T
+                    // cuBLAS is column-major; for row-major Q · K^T we
+                    // ask cuBLAS for K^T_col · Q_col which is K_row · Q_row^T.
+                    // Result is stored in column-major scores; reading
+                    // it as row-major gives the row-major Q · K^T we want.
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasSgemm(
+                            _cublasHandle,
+                            CublasOperation.Transpose,  // K^T
+                            CublasOperation.None,        // Q
+                            seqLen, seqLen, headDim,
+                            ref aVal,
+                            kPtr, headDim,
+                            qPtr, headDim,
+                            ref bVal,
+                            sPtr, seqLen),
+                        $"cublasSgemm MHA score batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
     /// Double-precision counterpart to <see cref="BatchedGemmFanout"/>.
     /// Fans <paramref name="batchCount"/> independent <c>cublasDgemm</c>
     /// launches across the scheduler's stream pool — same pattern as the
