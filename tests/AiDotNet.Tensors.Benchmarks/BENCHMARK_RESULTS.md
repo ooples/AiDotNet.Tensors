@@ -252,3 +252,38 @@ Two MatMulBackward optimization attempts were measured and reverted:
 | 16 | 360 ms | Oversubscribed — contention regression |
 
 GEMM math saturates ~4 OpenBLAS threads for these shapes. Adding more threads regresses due to contention. **Implication**: MKL backend swap (Phase G) is more likely to deliver the MatMul wall-time win than any per-call optimization in MatMulBackward.
+
+---
+
+## #338 Phase D feasibility — CompiledModelCache wall-time
+
+> **Captured**: `Issue338_PhaseD_CompiledModelCache_WallTime` test on the same 16-core x64 host, Release build, 20 timed iters after 2 warmup iters. Same #327 config (d=128, L=4, B=32, ctx=64).
+
+| Path | wall-time | Δ vs fresh-tape baseline |
+|---|---:|---:|
+| Fresh-tape `GradientTape` (Phase A baseline) | ~266 ms/iter | — |
+| `CompiledModelCache.GetOrCompileTraining` | **205.68 ms/iter** | **-23% (-60 ms)** |
+| Persistent-tape (per #327 issue body) | ~58 ms/iter | -78% |
+
+**Headline finding**: the existing `CompiledModelCache` infrastructure DOES deliver a real wall-time win on the #327 workload — 23% reduction (-60 ms/iter), the largest single measured improvement in the entire Phase A-D investigation. **However**, it does not match persistent-tape's 58 ms baseline. The gap (205 → 58 ms = 147 ms) needs additional investigation.
+
+**Implications for the plan**:
+- Phase D's premise is validated: cache-and-replay infrastructure works for this workload.
+- The full plan-estimate (Phase D delivering 170 → 70 ms) is too optimistic. Actual delivery here is 266 → 205 ms.
+- The remaining gap (205 → 100 ms soft target = -105 ms) requires investigating why persistent-tape is so much faster than `CompiledModelCache`. Candidates: dataflow fusion engagement, backward-graph CSE, additional kernel specializations.
+- A **transparent fresh-tape → `CompiledModelCache` migration** (the Phase D wiring work) would unlock 23% wall-time reduction for existing consumer code without API changes. This is concrete value.
+
+**Migration pattern** (manual, API-level):
+```csharp
+using var cache = new CompiledModelCache<float>();
+var plan = cache.GetOrCompileTraining(
+    inputShape: input._shape,
+    forwardAndLoss: () => { /* same as before */ },
+    parameters: weights);
+for (int i = 0; i < iters; i++)
+{
+    plan.SetInputs(new[] { input });
+    plan.Step();
+    // plan.Gradients[j] for weights[j]
+}
+```

@@ -295,6 +295,88 @@ public class Issue327TransformerTrainPerfTests
     }
 
     /// <summary>
+    /// Phase D feasibility test (#338): measures whether the existing
+    /// CompiledModelCache.GetOrCompileTraining API delivers wall-time
+    /// reduction on the #327 fresh-tape workload. The persistent-tape
+    /// path achieves ~58 ms/iter via this compilation; if the cache
+    /// behaves correctly for the same forward pattern across iterations,
+    /// fresh-tape callers could migrate to this API and unlock the same
+    /// speedup.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseD_CompiledModelCache_WallTime()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16)
+        {
+            _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16.");
+            return;
+        }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            _output.WriteLine($"Skip: ProcessArchitecture={RuntimeInformation.ProcessArchitecture}.");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            using var cache = new AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<float>();
+
+            // Compile (cache miss on first call, hit on subsequent).
+            var plan = cache.GetOrCompileTraining(
+                inputShape: input._shape,
+                forwardAndLoss: () =>
+                {
+                    var y = ForwardL(engine, input, weights);
+                    return engine.ReduceSum(y, axes: null, keepDims: false);
+                },
+                parameters: weights);
+
+            // Warmup
+            for (int i = 0; i < 2; i++)
+            {
+                plan.Step();
+            }
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                plan.Step();
+            }
+            sw.Stop();
+
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase D — CompiledModelCache wall-time");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# config_d={D}_L={Layers}_B={B}_ctx={Ctx}");
+            _output.WriteLine($"# baseline_fresh_tape_ms_per_iter=~266 (from Phase A)");
+            _output.WriteLine($"# expected_persistent_tape_ms_per_iter=~58 (per issue body)");
+            if (msPerIter < 100)
+                _output.WriteLine("# SOFT TARGET (≤100ms) HIT — Phase D premise validated.");
+            else if (msPerIter < 200)
+                _output.WriteLine("# HARD FLOOR (≤200ms) HIT — Phase D delivers but not yet at soft target.");
+            else
+                _output.WriteLine("# Phase D premise INVALID — CompiledModelCache does not deliver expected speedup on this workload.");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
     /// Forward pass over L stacked transformer-encoder layers. Matches
     /// the BDN harness's ForwardL so the xUnit gate and the harness
     /// measure the exact same computation.
