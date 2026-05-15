@@ -8,6 +8,60 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
+// ─────────────────────────────────────────────────────────────────────
+// Compiled-IL backward walker architecture (issue #338 Item 3)
+// ─────────────────────────────────────────────────────────────────────
+//
+// LAYERED SPECIALIZATION
+//
+// The walker produces a DynamicMethod per forward-pattern hash that
+// computes gradients with progressively less per-entry overhead. Four
+// layers, each independently enableable:
+//
+//   1. **DynamicMethod IL emission** — bakes the reverse-topo index
+//      sequence into emitted IL. No indices[i] array access; no loop
+//      counter; no per-iteration bounds check.
+//
+//   2. **Single-shot bounds check** — emits one pre-loop check that
+//      max(indices) < entries.Count. Replaces N per-entry callvirts on
+//      entries.Count with 1.
+//
+//   3. **Per-op-method direct call** — when every entry's backward
+//      function is static + closure-free (which is the case for every
+//      builtin BackwardFunctions<T>.* method), emits a direct
+//      `call <MethodInfo>` per entry. JIT sees concrete static calls
+//      instead of BackwardFunction<T>.Invoke dispatch.
+//
+//   4. **Per-op kernel inlining** — for 22 specific backward functions,
+//      an IPerOpInliner emits the gradient math IL directly: skips
+//      inputs[] array construction, savedState null-coalescing, and the
+//      backward method dispatch entirely.
+//
+// CACHE + AUTO-ENGAGEMENT
+//
+// Walkers cache by pattern hash, capped at MaxCachedWalkers (FIFO
+// eviction). Auto-engaged via AIDOTNET_COMPILED_BACKWARD env var or
+// test-only _testEnabledOverride. RebindablePlanCache.Store captures
+// each entry's backward MethodInfo at recording time and registers a
+// specialised walker for the pattern.
+//
+// SAFETY
+//
+// - Closure-bound delegates refused (would crash on direct call —
+//   the delegate's hidden closure arg would be skipped).
+// - Falls back to closure-based walker if Reflection.Emit fails.
+// - Per-pattern walker cache; entries with the same pattern hash share
+//   the compiled walker, so the IL emission cost is amortized.
+//
+// PERF (measured #327 transformer fresh-tape)
+//
+//   Reference dispatcher: 395.82 ms/iter
+//   Compiled-IL walker:   353.29 ms/iter
+//   Speedup:              -42.5 ms/iter (-10.7%)
+//
+// Validated by Issue338_Item3_CompiledIL_NotSlowerThanReference under
+// AIDOTNET_RUN_PERF_GATES=1.
+
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
