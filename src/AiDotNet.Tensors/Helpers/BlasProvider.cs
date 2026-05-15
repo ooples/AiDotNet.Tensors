@@ -200,6 +200,125 @@ internal static class BlasProvider
     }
 
     /// <summary>
+    /// Issue #338 Phase G.12: batch N same-shape GEMMs via cblas_sgemm_batch.
+    /// Array-based variant — pins arrays internally so the caller doesn't
+    /// pay per-call GCHandle overhead. Used for layer-level dW batching
+    /// where 4 layers' weight gradients share (M, N, K).
+    /// </summary>
+    internal static unsafe bool TryGemmBatchSameShapeArrays(
+        int m, int n, int k,
+        bool transA, bool transB,
+        float[][] aArrays, int[] aOffsets, int lda,
+        float[][] bArrays, int[] bOffsets, int ldb,
+        float[][] cArrays, int[] cOffsets, int ldc,
+        int batchSize)
+    {
+        if (!_mklBatchedAvailable.Value) return false;
+        if (batchSize <= 0) return true;
+        try
+        {
+            float** aArr = stackalloc float*[batchSize];
+            float** bArr = stackalloc float*[batchSize];
+            float** cArr = stackalloc float*[batchSize];
+
+            // Pin each array via fixed inside a recursive-style scope.
+            // Since the count is dynamic (1..N batched specs), we can't
+            // use multiple `fixed` keywords statically; use GCHandle here
+            // BUT only for the pointer extraction — MKL grabs the
+            // pointers and runs synchronously, so we can free immediately
+            // after the call returns. This is faster than per-array
+            // GCHandle.Pinned with try/finally cycles since we batch the
+            // allocation in a single loop.
+            var handles = stackalloc System.Runtime.InteropServices.GCHandle[batchSize * 3];
+            for (int i = 0; i < batchSize; i++)
+            {
+                handles[i * 3 + 0] = System.Runtime.InteropServices.GCHandle.Alloc(aArrays[i], System.Runtime.InteropServices.GCHandleType.Pinned);
+                handles[i * 3 + 1] = System.Runtime.InteropServices.GCHandle.Alloc(bArrays[i], System.Runtime.InteropServices.GCHandleType.Pinned);
+                handles[i * 3 + 2] = System.Runtime.InteropServices.GCHandle.Alloc(cArrays[i], System.Runtime.InteropServices.GCHandleType.Pinned);
+                aArr[i] = (float*)handles[i * 3 + 0].AddrOfPinnedObject() + aOffsets[i];
+                bArr[i] = (float*)handles[i * 3 + 1].AddrOfPinnedObject() + bOffsets[i];
+                cArr[i] = (float*)handles[i * 3 + 2].AddrOfPinnedObject() + cOffsets[i];
+            }
+
+            try
+            {
+                int tA = transA ? 112 : CblasNoTrans;
+                int tB = transB ? 112 : CblasNoTrans;
+                int mPlain = m, nPlain = n, kPlain = k;
+                float alpha = 1f, beta = 0f;
+                int ldaPlain = lda, ldbPlain = ldb, ldcPlain = ldc;
+                int groupSize = batchSize;
+
+                mkl_cblas_sgemm_batch_ptr(CblasRowMajor,
+                    &tA, &tB,
+                    &mPlain, &nPlain, &kPlain,
+                    &alpha,
+                    aArr, &ldaPlain,
+                    bArr, &ldbPlain,
+                    &beta,
+                    cArr, &ldcPlain,
+                    1, &groupSize);
+            }
+            finally
+            {
+                for (int i = 0; i < batchSize * 3; i++)
+                    handles[i].Free();
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: batch N same-shape GEMMs into a single
+    /// MKL call via cblas_sgemm_batch with group_count=1. Used for the
+    /// "compute dW across all layers' MatMul backwards" pattern — all
+    /// share (M, N, K) and trans flags. Caller pre-pins arrays.
+    /// </summary>
+    internal static unsafe bool TryGemmBatchSameShape(
+        int m, int n, int k,
+        bool transA, bool transB,
+        System.Runtime.InteropServices.GCHandle[] aHandles, int[] aOffsets, int lda,
+        System.Runtime.InteropServices.GCHandle[] bHandles, int[] bOffsets, int ldb,
+        System.Runtime.InteropServices.GCHandle[] cHandles, int[] cOffsets, int ldc,
+        int batchSize)
+    {
+        if (!_mklBatchedAvailable.Value) return false;
+        if (batchSize <= 0) return true;
+        try
+        {
+            float** aArr = stackalloc float*[batchSize];
+            float** bArr = stackalloc float*[batchSize];
+            float** cArr = stackalloc float*[batchSize];
+            for (int i = 0; i < batchSize; i++)
+            {
+                aArr[i] = (float*)aHandles[i].AddrOfPinnedObject() + aOffsets[i];
+                bArr[i] = (float*)bHandles[i].AddrOfPinnedObject() + bOffsets[i];
+                cArr[i] = (float*)cHandles[i].AddrOfPinnedObject() + cOffsets[i];
+            }
+
+            int tA = transA ? 112 : CblasNoTrans;
+            int tB = transB ? 112 : CblasNoTrans;
+            int mPlain = m, nPlain = n, kPlain = k;
+            float alpha = 1f, beta = 0f;
+            int ldaPlain = lda, ldbPlain = ldb, ldcPlain = ldc;
+            int groupSize = batchSize;
+
+            mkl_cblas_sgemm_batch_ptr(CblasRowMajor,
+                &tA, &tB,
+                &mPlain, &nPlain, &kPlain,
+                &alpha,
+                aArr, &ldaPlain,
+                bArr, &ldbPlain,
+                &beta,
+                cArr, &ldcPlain,
+                1, &groupSize);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
     /// Phase G.10: batch two GEMMs (dA + dW backward pair) into one MKL call.
     /// Both GEMMs may have different M, N, K, lda, ldb, ldc and trans flags.
     /// Returns false if MKL batched API isn't available; caller falls back

@@ -1036,6 +1036,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
         }
 
+        // Phase G.12: layer-level dW batching. Detect MatMul backward
+        // steps with identical (M, N, K) shapes, peel out their dW
+        // computation, and dispatch all same-shape dW GEMMs in a
+        // single cblas_sgemm_batch call (group_size = N).
+        //
+        // Empirically REGRESSES on AMD Zen 2 + MKL 2026.0.0.901 (median
+        // 88 → 131 ms). Two suspected causes:
+        //   1. MKL's cblas_sgemm_batch internally serializes same-shape
+        //      group elements at small/medium N — no parallelism win.
+        //   2. Batched access pattern (4 layers' dW computed back-to-back)
+        //      walks through 4 disjoint memory regions, hurting L3 reuse
+        //      vs the interleaved (dA, dW, dA, dW, ...) sequential pattern
+        //      where each layer's dY and A stay hot in cache across the
+        //      dA + dW pair.
+        //
+        // Gated as OPT-IN via AIDOTNET_DW_BATCHING=1. The infrastructure
+        // is ready for workloads/hardware where the batched API delivers
+        // real parallelism (Sapphire Rapids+ with AMX, e.g.).
+        var peeledDwSpecs = new List<DwBatchSpec>();
+        var dWPeeledIndices = new HashSet<int>();
+        bool enableDwBatching = typeof(T) == typeof(float)
+            && BlasProvider.IsMklBatchedAvailable
+            && Environment.GetEnvironmentVariable("AIDOTNET_DW_BATCHING") == "1";
+        if (enableDwBatching)
+        {
+            DetectDwBatchingCandidates(forwardSteps, consumerCount, gradMap,
+                fusedStepIndices, consumedBySlicePrefix, analyticBackwardSpecs,
+                dWPeeledIndices, peeledDwSpecs);
+        }
+
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -1162,6 +1192,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // them in forward order, but autodiff requires backward (reverse) order.
         for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
             backwardActions.Add(fusedBackwardActions[i]);
+
+        // Phase G.12: append batched dW actions. Group peeled dW specs
+        // by (M, N, K) shape; each shape group with size ≥ 2 emits one
+        // cblas_sgemm_batch call.
+        if (enableDwBatching && peeledDwSpecs.Count > 0)
+        {
+            AppendBatchedDwActions(peeledDwSpecs, backwardActions);
+        }
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -2535,7 +2573,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
-        List<GCHandle>? handleTracker = null)
+        List<GCHandle>? handleTracker = null,
+        bool dWPeeled = false)
     {
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
@@ -2737,11 +2776,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
 
                 // Phase G.10: batch the two backward GEMMs (dA + dW) into a
-                // single MKL cblas_sgemm_batch call. Amortises P/Invoke +
-                // MKL setup overhead and lets MKL co-schedule. Falls back
-                // to two separate TryGemmEx calls when batch isn't
-                // available (e.g. OpenBLAS-only).
-                if (BlasProvider.IsMklBatchedAvailable
+                // single MKL cblas_sgemm_batch call. Skipped when dW
+                // peeling is active for this step (Phase G.12) — the
+                // dW computation is deferred to a layer-batched call.
+                if (!dWPeeled
+                    && BlasProvider.IsMklBatchedAvailable
                     && BlasProvider.TryGemmExBatch2(
                         // dA = dC @ B^T  → [M, K]
                         M, K, N,
@@ -2765,15 +2804,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
                     dA.AsSpan().CopyTo(gradA.AsWritableSpan());
                 }
-                // dB = A^T @ dC — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
+                // dB = A^T @ dC — when dW peeling is active for this
+                // step (Phase G.12), skip this GEMM entirely; the dW
+                // computation is deferred to the batched-dW phase
+                // appended after the main backward loop.
+                if (!dWPeeled)
                 {
-                    var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
-                    dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                    if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
+                    {
+                        var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
+                        dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                    }
                 }
 
                 inputA.Grad = gradA;
-                inputB.Grad = gradB;
+                if (!dWPeeled) inputB.Grad = gradB;
             };
         }
 
@@ -4130,6 +4175,200 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             consumedBySlicePrefix.Add(i + 1);  // Slice step is consumed by the fused MatMul
 
             next: ;
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: layer-level dW batching info. Each entry
+    /// describes one MatMul-backward step's dW GEMM (dW = A^T @ dY)
+    /// in enough detail for later grouping by shape and batched dispatch.
+    /// </summary>
+    private struct DwBatchSpec
+    {
+        public int M;
+        public int N;
+        public int K;
+        public int LdaPlain;  // == K (A is [M, K] row-major contiguous)
+        public int LdaDy;     // == N (dY is [M, N] row-major contiguous)
+        public int LdcDw;     // == N (dW dest is [K, N])
+        public int AOffset;
+        public int DyOffset;
+        public int DwOffset;
+        public Tensor<T> AStorage;   // source for A^T (use .GetDataArray())
+        public Tensor<T> DyStorage;  // source for dY
+        public Tensor<T> DwTensor;   // dW destination (whose Grad we set)
+        public Tensor<T> WTensor;    // the weight tensor (for .Grad assignment)
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: walk forward steps, identify MatMul-backward
+    /// candidates whose shapes are identical to ≥ 1 other MatMul-backward
+    /// step in the plan, mark them for dW peeling and record the spec.
+    /// </summary>
+    private static void DetectDwBatchingCandidates(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        HashSet<int> fusedStepIndices,
+        HashSet<int> consumedBySlicePrefix,
+        Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
+        HashSet<int> dWPeeledIndices,
+        List<DwBatchSpec> peeledDwSpecs)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        // First pass: collect every candidate MatMul-backward step's
+        // (M, N, K) signature.
+        var candidates = new List<(int idx, int M, int N, int K)>();
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            if (fusedStepIndices.Contains(i)) continue;
+            if (consumedBySlicePrefix.Contains(i)) continue;
+            if (analyticBackwardSpecs.ContainsKey(i)) continue;
+
+            var step = forwardSteps[i];
+            if (step.OpName != "TensorMatMul") continue;
+            if (step.Inputs.Length != 2) continue;
+
+            var inputA = step.Inputs[0];
+            var inputW = step.Inputs[1];
+            var output = step.OutputBuffer;
+
+            // Same gating as the existing ND×2D float MatMul-backward spec.
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+            if (!output.IsContiguous) continue;
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW) || !gradMap.ContainsKey(output))
+                continue;
+
+            int aRank = inputA.Rank;
+            int M = 1;
+            for (int d = 0; d < aRank - 1; d++) M *= inputA._shape[d];
+            int K = inputA._shape[aRank - 1];
+            int N = inputW._shape[1];
+            if (inputW._shape[0] != K) continue;
+
+            candidates.Add((i, M, N, K));
+        }
+
+        // Second pass: group by (M, N, K). Groups of size ≥ 2 get peeled
+        // for batching; single-occurrence shapes stay in the unpeeled
+        // (dA+dW combined) path.
+        var groupSizes = new Dictionary<(int, int, int), int>();
+        foreach (var (_, m, n, k) in candidates)
+        {
+            var key = (m, n, k);
+            groupSizes.TryGetValue(key, out int count);
+            groupSizes[key] = count + 1;
+        }
+
+        foreach (var (idx, M, N, K) in candidates)
+        {
+            if (groupSizes[(M, N, K)] < 2) continue;  // No batching benefit
+
+            var step = forwardSteps[idx];
+            var inputA = step.Inputs[0];
+            var inputW = step.Inputs[1];
+            var output = step.OutputBuffer;
+            var gradOut = gradMap[output];
+            var gradW = gradMap[inputW];
+
+            // dW = A^T @ dY → C[K, N].
+            // lda_plain=K (A in [M, K] row-major), ldb_dy=N (dY in [M, N]),
+            // ldc_dw=N (dW dest [K, N]).
+            peeledDwSpecs.Add(new DwBatchSpec
+            {
+                M = M, N = N, K = K,
+                LdaPlain = K, LdaDy = N, LdcDw = N,
+                AOffset = inputA._storageOffset,
+                DyOffset = gradOut._storageOffset,
+                DwOffset = gradW._storageOffset,
+                AStorage = inputA,
+                DyStorage = gradOut,
+                DwTensor = gradW,
+                WTensor = inputW,
+            });
+            dWPeeledIndices.Add(idx);
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: append batched dW actions to the backward
+    /// action list. Groups specs by (M, N, K) shape, emits one
+    /// cblas_sgemm_batch call per group.
+    /// </summary>
+    private static unsafe void AppendBatchedDwActions(
+        List<DwBatchSpec> specs,
+        List<Action<IEngine>> backwardActions)
+    {
+        // Group by shape
+        var groups = new Dictionary<(int, int, int), List<DwBatchSpec>>();
+        foreach (var spec in specs)
+        {
+            var key = (spec.M, spec.N, spec.K);
+            if (!groups.TryGetValue(key, out var list))
+            {
+                list = new List<DwBatchSpec>();
+                groups[key] = list;
+            }
+            list.Add(spec);
+        }
+
+        foreach (var kv in groups)
+        {
+            var group = kv.Value;
+            var captured = group.ToArray();  // immutable snapshot for the closure
+            int batchSize = captured.Length;
+            int K = captured[0].K, N = captured[0].N, M = captured[0].M;
+
+            // Pre-allocate offset arrays at compile time so the hot
+            // closure doesn't ToArray() per call.
+            var aOffs = new int[batchSize];
+            var bOffs = new int[batchSize];
+            var cOffs = new int[batchSize];
+            for (int i = 0; i < batchSize; i++)
+            {
+                aOffs[i] = captured[i].AOffset;
+                bOffs[i] = captured[i].DyOffset;
+                cOffs[i] = captured[i].DwOffset;
+            }
+
+            backwardActions.Add(eng =>
+            {
+                // Resolve underlying float[] for each batch element.
+                // Use storage-based GetDataArray() so views and slices
+                // see the live shape-stable buffer.
+                var aArrs = new float[batchSize][];
+                var bArrs = new float[batchSize][];
+                var cArrs = new float[batchSize][];
+                for (int i = 0; i < batchSize; i++)
+                {
+                    aArrs[i] = (float[])(object)captured[i].AStorage.GetDataArray();
+                    bArrs[i] = (float[])(object)captured[i].DyStorage.GetDataArray();
+                    cArrs[i] = (float[])(object)captured[i].DwTensor.GetDataArray();
+                }
+
+                if (!BlasProvider.TryGemmBatchSameShapeArrays(
+                    K, N, M,
+                    transA: true, transB: false,
+                    aArrs, aOffs, K,
+                    bArrs, bOffs, N,
+                    cArrs, cOffs, N,
+                    batchSize))
+                {
+                    // Fallback: individual TryGemmEx calls
+                    for (int i = 0; i < batchSize; i++)
+                    {
+                        BlasProvider.TryGemmEx(K, N, M,
+                            aArrs[i], aOffs[i], K, true,
+                            bArrs[i], bOffs[i], N, false,
+                            cArrs[i], cOffs[i], N);
+                    }
+                }
+
+                for (int i = 0; i < batchSize; i++)
+                    captured[i].WTensor.Grad = captured[i].DwTensor;
+            });
         }
     }
 
