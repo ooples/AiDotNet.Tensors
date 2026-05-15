@@ -150,8 +150,11 @@ public class GetStreamSchedulerTests
     }
 
     [Fact]
-    public void MultiHeadAttentionScoresFanout_RunsToCompletion_OnMultiStreamHost()
+    public void MultiHeadAttentionScoresFanout_MatchesCPUReference_OnMultiStreamHost()
     {
+        // Correctness gate: compares the per-head Q·K^T fanout result
+        // against a CPU-computed reference. Pins that the fanout's
+        // offset arithmetic + cuBLAS transpose handling are correct.
         using var engine = new DirectGpuTensorEngine();
         var asyncBackend = engine.GetAsyncBackend();
         if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
@@ -160,18 +163,24 @@ public class GetStreamSchedulerTests
         var backend = engine.GetBackend();
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
 
-        // BERT-base-ish but small: B=2, H=4, S=64, D=32.
-        const int batch = 2, numHeads = 4, seqLen = 64, headDim = 32;
+        const int batch = 2, numHeads = 4, seqLen = 16, headDim = 8;
         long qkElems = (long)batch * numHeads * seqLen * headDim;
         long scoreElems = (long)batch * numHeads * seqLen * seqLen;
 
-        using var q = backend.AllocateBuffer((int)qkElems);
-        using var k = backend.AllocateBuffer((int)qkElems);
-        using var scores = backend.AllocateBuffer((int)scoreElems);
+        var rng = new System.Random(7);
+        var qHost = new float[qkElems];
+        var kHost = new float[qkElems];
+        for (int i = 0; i < qkElems; i++) qHost[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < qkElems; i++) kHost[i] = (float)(rng.NextDouble() - 0.5);
+
+        using var qBuf = backend.AllocateBuffer(qHost);
+        using var kBuf = backend.AllocateBuffer(kHost);
+        using var scoresBuf = backend.AllocateBuffer((int)scoreElems);
 
         try
         {
-            cudaBackend.MultiHeadAttentionScoresFanout(q, k, scores, batch, numHeads, seqLen, headDim, scheduler);
+            cudaBackend.MultiHeadAttentionScoresFanout(qBuf, kBuf, scoresBuf,
+                batch, numHeads, seqLen, headDim, scheduler);
         }
         catch (System.Exception thrown)
         {
@@ -179,6 +188,31 @@ public class GetStreamSchedulerTests
                 || thrown.Message.Contains("NotSupported", System.StringComparison.Ordinal))
                 return;
             throw;
+        }
+
+        var scoresGpu = new float[scoreElems];
+        backend.DownloadBuffer(scoresBuf, scoresGpu);
+
+        // CPU reference: scores[b,h,i,j] = sum_d Q[b,h,i,d] * K[b,h,j,d]
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int hi = 0; hi < numHeads; hi++)
+            {
+                int qBase = ((bi * numHeads) + hi) * seqLen * headDim;
+                int kBase = ((bi * numHeads) + hi) * seqLen * headDim;
+                int sBase = ((bi * numHeads) + hi) * seqLen * seqLen;
+                for (int si = 0; si < seqLen; si++)
+                {
+                    for (int sj = 0; sj < seqLen; sj++)
+                    {
+                        float sum = 0;
+                        for (int d = 0; d < headDim; d++)
+                            sum += qHost[qBase + si * headDim + d]
+                                 * kHost[kBase + sj * headDim + d];
+                        Assert.Equal(sum, scoresGpu[sBase + si * seqLen + sj], 3);
+                    }
+                }
+            }
         }
     }
 
