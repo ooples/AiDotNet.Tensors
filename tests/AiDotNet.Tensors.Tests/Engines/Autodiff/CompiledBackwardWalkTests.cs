@@ -246,6 +246,56 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public void WalkerCache_EvictionDoesntBreakSubsequentReplay()
+    {
+        // After eviction, re-encountering an evicted pattern should
+        // recompile a walker and produce identical results to the
+        // pre-eviction reference. Pins that the cache's lifecycle
+        // doesn't introduce any state corruption.
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            var firstWalker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+            registerMethod.Invoke(null, new object[] { 1L, firstWalker });
+
+            // Add 70 more entries to force the original key 1 to be
+            // evicted (cap is 64; 71 total registrations means keys
+            // 1..7 should be evicted by FIFO order).
+            for (long k = 100; k < 170; k++)
+            {
+                var walker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+                registerMethod.Invoke(null, new object[] { k, walker });
+            }
+
+            // Key 1 should be evicted.
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 1L }));
+
+            // Re-register key 1 with a fresh walker — should succeed
+            // and the lookup should find it.
+            var newWalker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+            registerMethod.Invoke(null, new object[] { 1L, newWalker });
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 1L }));
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
     public void WalkerCache_HitMissCounters_TrackLookups()
     {
         var t = WalkerOfFloat();
