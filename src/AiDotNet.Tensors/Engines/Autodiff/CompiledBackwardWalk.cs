@@ -401,6 +401,18 @@ internal static class CompiledBackwardWalk<T>
         if (divScalarMethod is not null)
             registry[divScalarMethod] = new DivideScalarBackwardInliner();
 
+        // Additional pass-through gradient methods (gradient flows
+        // through unchanged): StraightThrough estimator, Frac.
+        var straightThroughMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.StraightThroughBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (straightThroughMethod is not null)
+            registry[straightThroughMethod] = addScalarPassThru;
+
+        var fracMethod = bwdType.GetMethod(nameof(BackwardFunctions<T>.FracBackward),
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (fracMethod is not null)
+            registry[fracMethod] = addScalarPassThru;
+
         return registry;
     }
 
