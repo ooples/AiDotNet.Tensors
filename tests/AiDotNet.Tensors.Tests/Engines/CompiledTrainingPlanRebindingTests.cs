@@ -10,8 +10,32 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// Tests that CompiledTrainingPlan.Step() sees in-place parameter updates.
 /// Repro for: compiled plan returning constant loss after SGD updates.
 /// </summary>
-public class CompiledTrainingPlanRebindingTests
+public class CompiledTrainingPlanRebindingTests : IDisposable
 {
+    // PR #333's [ModuleInitializer] auto-promotes AiDotNetEngine.Current to a
+    // GPU engine when a GPU is present. Tensor<T>.CreateRandom dispatches
+    // through Current, so it produces GPU-resident tensors. The compiled
+    // plan's TryBuildSpecializedForward captures parameter data via
+    // GetDataArray(), which for GPU-resident tensors returns a COPY (via
+    // ToArray()) instead of the live backing array — so subsequent CPU
+    // in-place updates never reach the compiled forward closure. These
+    // tests specifically validate the in-place-mutation-rebinding contract,
+    // which only holds for CPU-resident parameters. Pin Current to CPU for
+    // the duration of each test, restoring on dispose. Same pattern used in
+    // Issue327TransformerTrainPerfTests.
+    private readonly IEngine _priorEngine;
+
+    public CompiledTrainingPlanRebindingTests()
+    {
+        _priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+    }
+
+    public void Dispose()
+    {
+        AiDotNetEngine.Current = _priorEngine;
+    }
+
     [Fact]
     public void Step_SeesInPlaceParameterUpdates()
     {
