@@ -2784,6 +2784,68 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Conv2D backward: writes gradInput + gradKernel directly into the
+        // pre-allocated gradient buffers via Conv2DBackwardInputInto /
+        // Conv2DBackwardKernelInto — skips the 2 fresh tensor allocations +
+        // 2 chained AccumulateGrad calls that BackwardFunctions.Conv2DBackward
+        // pays per call. On a 19-Conv-layer net like GraFPrint this saves
+        // ~10 ms per Conv backward (allocator pressure + dispatch overhead).
+        // Tier 1.2 of the compile-mode backward perf overhaul (plan in
+        // ~/.claude/plans/misty-wandering-moth.md).
+        if (step.OpType == OpType.Conv2D && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var kernel = step.Inputs[1];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input) || !gradMap.ContainsKey(kernel))
+                return null;
+            // Saved state shape mirrors what BackwardFunctions.Conv2DBackward
+            // expects: [stride: int[], padding: int[], dilation: int[]].
+            // Some call paths extend savedState past index 2; same as the
+            // Conv2D forward specialization we tolerate that.
+            var savedState = step.SavedState;
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not int[] stride
+                || savedState[1] is not int[] padding
+                || savedState[2] is not int[] dilation)
+                return null;
+            var gradOut = gradMap[output];
+            var gradInput = gradMap[input];
+            var gradKernel = gradMap[kernel];
+            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accumKernel = consumerCount.ContainsKey(kernel) && consumerCount[kernel] > 1;
+            // Capture shapes so the closure doesn't walk Tensor.Shape every
+            // Step (microoptimization but matters at 19+ Conv calls per iter).
+            var inShape = (int[])input._shape.Clone();
+            var kShape = (int[])kernel._shape.Clone();
+            var capStride = stride;
+            var capPadding = padding;
+            var capDilation = dilation;
+            return eng =>
+            {
+                if (eng is CpuEngine cpu)
+                {
+                    cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
+                        capStride, capPadding, capDilation, accumInput);
+                    cpu.Conv2DBackwardKernelInto(gradKernel, gradOut, input, kShape,
+                        capStride, capPadding, capDilation, accumKernel);
+                }
+                else
+                {
+                    // Non-CpuEngine fallback — match the eager path semantics.
+                    var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
+                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, capStride, capPadding, capDilation);
+                    if (accumKernel) eng.TensorAddInto(gradKernel, gradKernel, gk);
+                    else gk.AsSpan().CopyTo(gradKernel.AsWritableSpan());
+                }
+                input.Grad = gradInput;
+                kernel.Grad = gradKernel;
+            };
+        }
+
         // ReduceSum backward: broadcast scalar gradient to all elements
         // Only specialize for full scalar reduction (output length == 1)
         if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1
