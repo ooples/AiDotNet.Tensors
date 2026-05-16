@@ -54,7 +54,7 @@ public readonly struct KernelKey : IEquatable<KernelKey>
     /// <summary>Bit-packed presence flags for the fused epilogue chain (bias / activation / skip / dropout / scale).</summary>
     public byte EpilogueFlags { get; init; }
     /// <summary>Element type — typically <see cref="float"/> or <see cref="double"/>.</summary>
-    public Type ElemType { get; init; }
+    public Type? ElemType { get; init; }
     /// <summary>CPU architecture path resolved by the dispatcher.</summary>
     public CpuArch Arch { get; init; }
 

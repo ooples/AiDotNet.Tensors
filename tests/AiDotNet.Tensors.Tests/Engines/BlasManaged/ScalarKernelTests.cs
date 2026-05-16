@@ -105,6 +105,21 @@ public class ScalarKernelTests
         Assert.Equal(k1, k2);
         Assert.Equal(k1.GetHashCode(), k2.GetHashCode());
         Assert.True(k1.Equals(k2));
+
+        // Verify by-value equality with an independently-constructed key,
+        // not just struct copy. Catches Equals/GetHashCode bugs that skip
+        // fields (which struct-copy comparison wouldn't surface).
+        var k3 = new KernelKey
+        {
+            M = 4, N = 4, K = 4, Lda = 4, Ldb = 4, Ldc = 4,
+            TransA = true, TransB = false,
+            Packing = PackingMode.ForcePackBoth,
+            EpilogueFlags = 0,
+            ElemType = typeof(double),
+            Arch = CpuArch.Avx512,
+        };
+        Assert.Equal(k1, k3);
+        Assert.Equal(k1.GetHashCode(), k3.GetHashCode());
     }
 
     [Fact]
