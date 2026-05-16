@@ -1238,12 +1238,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
 
-        long perHeadQ = (long)seqLen * headDim;
-        long perHeadK = (long)seqLen * headDim;
-        long perHeadS = (long)seqLen * seqLen;
-        long perBatchQ = perHeadQ * numHeads;
-        long perBatchK = perHeadK * numHeads;
-        long perBatchS = perHeadS * numHeads;
+        // Compute capacity math inside a `checked` block so an overflow
+        // (e.g. seqLen=65536, headDim=65536 wrapping past long.MaxValue)
+        // throws OverflowException instead of silently producing a
+        // negative `required*` that would bypass the buffer guards below
+        // and feed overflowed offsets into the raw cuBLAS pointer math.
+        long perHeadQ, perHeadK, perHeadS, perBatchQ, perBatchK, perBatchS;
+        long requiredQ, requiredK, requiredS;
+        try
+        {
+            checked
+            {
+                perHeadQ = (long)seqLen * headDim;
+                perHeadK = (long)seqLen * headDim;
+                perHeadS = (long)seqLen * seqLen;
+                perBatchQ = perHeadQ * numHeads;
+                perBatchK = perHeadK * numHeads;
+                perBatchS = perHeadS * numHeads;
+                requiredQ = (long)batch * perBatchQ;
+                requiredK = (long)batch * perBatchK;
+                requiredS = (long)batch * perBatchS;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"MHA shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
         long elemBytes = sizeof(float);
 
         // Validate buffer capacity BEFORE the per-head offset math. Without
@@ -1252,9 +1273,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // typically a use-after-free or another tensor's data. The required
         // element count is (batch * perBatchX); IGpuBuffer.Size returns the
         // element count, so we compare directly.
-        long requiredQ = (long)batch * perBatchQ;
-        long requiredK = (long)batch * perBatchK;
-        long requiredS = (long)batch * perBatchS;
         if (Q.Size < requiredQ)
             throw new ArgumentException(
                 $"Q buffer too small: capacity={Q.Size} elements, required={requiredQ} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
@@ -1341,18 +1359,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 $"BFloat16 MHA requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
 
         int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
-        long perHeadElems = (long)seqLen * headDim;
-        long perHeadScoreElems = (long)seqLen * seqLen;
-        long perBatchQK = perHeadElems * numHeads;
-        long perBatchS = perHeadScoreElems * numHeads;
+        // Checked arithmetic — see MultiHeadAttentionScoresFanout for the
+        // overflow-mode rationale. Mixed-precision adds a *elemBytesIn
+        // factor that can also overflow on huge shapes.
+        long perHeadElems, perHeadScoreElems, perBatchQK, perBatchS;
+        long requiredQkBytes, requiredS;
         long elemBytesIn = 2;        // fp16 / bf16
         long elemBytesOut = sizeof(float);
+        try
+        {
+            checked
+            {
+                perHeadElems = (long)seqLen * headDim;
+                perHeadScoreElems = (long)seqLen * seqLen;
+                perBatchQK = perHeadElems * numHeads;
+                perBatchS = perHeadScoreElems * numHeads;
+                requiredQkBytes = (long)batch * perBatchQK * elemBytesIn;
+                requiredS = (long)batch * perBatchS;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"Mixed-precision MHA shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
 
         // Validate buffer capacity BEFORE per-head offset math. Q/K are
         // 2-byte (fp16/bf16) so SizeInBytes is the right surface here;
         // scores is fp32 so element count suffices.
-        long requiredQkBytes = (long)batch * perBatchQK * elemBytesIn;
-        long requiredS = (long)batch * perBatchS;
         if (Q.SizeInBytes < requiredQkBytes)
             throw new ArgumentException(
                 $"Q buffer too small: capacity={Q.SizeInBytes} bytes, required={requiredQkBytes} for mixed-precision shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
@@ -1437,19 +1471,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
 
-        long perHeadA = (long)seqLen * seqLen;
-        long perHeadV = (long)seqLen * headDim;
-        long perHeadO = (long)seqLen * headDim;
-        long perBatchA = perHeadA * numHeads;
-        long perBatchV = perHeadV * numHeads;
-        long perBatchO = perHeadO * numHeads;
+        // Checked arithmetic — see MultiHeadAttentionScoresFanout for the
+        // overflow-mode rationale.
+        long perHeadA, perHeadV, perHeadO, perBatchA, perBatchV, perBatchO;
+        long requiredA, requiredV, requiredO;
+        try
+        {
+            checked
+            {
+                perHeadA = (long)seqLen * seqLen;
+                perHeadV = (long)seqLen * headDim;
+                perHeadO = (long)seqLen * headDim;
+                perBatchA = perHeadA * numHeads;
+                perBatchV = perHeadV * numHeads;
+                perBatchO = perHeadO * numHeads;
+                requiredA = (long)batch * perBatchA;
+                requiredV = (long)batch * perBatchV;
+                requiredO = (long)batch * perBatchO;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"MHA output shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
         long elemBytes = sizeof(float);
 
         // Validate buffer capacity BEFORE the per-head offset math (see
         // MultiHeadAttentionScoresFanout for the rationale).
-        long requiredA = (long)batch * perBatchA;
-        long requiredV = (long)batch * perBatchV;
-        long requiredO = (long)batch * perBatchO;
         if (attention.Size < requiredA)
             throw new ArgumentException(
                 $"attention buffer too small: capacity={attention.Size} elements, required={requiredA} for shape [B={batch}, H={numHeads}, S={seqLen}].",
@@ -3730,13 +3779,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (B is null) throw new ArgumentNullException(nameof(B));
         if (C is null) throw new ArgumentNullException(nameof(C));
 
-        long requiredAElems = (long)batchCount * M * K;
-        long requiredBElems = (long)batchCount * K * N;
-        long requiredCElems = (long)batchCount * M * N;
-
-        long requiredABytes = requiredAElems * elemBytesA;
-        long requiredBBytes = requiredBElems * elemBytesB;
-        long requiredCBytes = requiredCElems * elemBytesC;
+        // Overflow-safe checked arithmetic — the element-count overload
+        // had an `> int.MaxValue` upper-bound guard but this byte-aware
+        // overload doesn't, and an unchecked long * long multiplication
+        // can wrap negative (e.g. batchCount=1B × M=1B × K=4 = ~4×10^18,
+        // past long.MaxValue / 2). A wrapped requiredXBytes would let an
+        // impossibly small buffer pass validation and walk into wrapped
+        // pointer math inside cuBLAS.
+        long requiredAElems, requiredBElems, requiredCElems;
+        long requiredABytes, requiredBBytes, requiredCBytes;
+        try
+        {
+            checked
+            {
+                requiredAElems = (long)batchCount * M * K;
+                requiredBElems = (long)batchCount * K * N;
+                requiredCElems = (long)batchCount * M * N;
+                requiredABytes = requiredAElems * elemBytesA;
+                requiredBBytes = requiredBElems * elemBytesB;
+                requiredCBytes = requiredCElems * elemBytesC;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"Batched GEMM dimensions too large for fanout dispatch: M={M}, N={N}, K={K}, batchCount={batchCount}.");
+        }
 
         if (A.SizeInBytes < requiredABytes)
             throw new ArgumentException(

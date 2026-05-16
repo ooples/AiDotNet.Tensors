@@ -2,14 +2,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
 /// Interface for direct GPU backend implementations (OpenCL, CUDA, etc.).
-/// All operations use float32 for optimal GPU performance.
+/// The core surface is float32; backends that ship cuDNN-equivalent
+/// half/bfloat16 paths expose them through the
+/// <see cref="MixedPrecisionConv"/> escape hatch (Issue #337).
 /// </summary>
 /// <remarks>
 /// <para><b>Design Philosophy:</b></para>
 /// <para>
-/// This interface abstracts vendor-specific GPU implementations while enforcing
-/// float32-only operations for maximum performance. Generic type conversion
-/// happens at a higher level (DirectGpuEngine), keeping backends simple and fast.
+/// This interface abstracts vendor-specific GPU implementations. The
+/// core method surface (Conv2D, BatchNorm, GEMM, etc.) is float32 for
+/// maximum portable performance — every backend implements it. Generic
+/// type conversion happens at a higher level (DirectGpuEngine), keeping
+/// backends simple and fast.
+/// </para>
+/// <para><b>Mixed precision (Issue #337):</b></para>
+/// <para>
+/// Backends are no longer strictly float32-only. The
+/// <see cref="MixedPrecisionConv"/> property returns a typed accessor
+/// to the <see cref="AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend"/>
+/// surface when the backend ships half/bfloat16 convolution kernels
+/// (CUDA + cuDNN), and <c>null</c> otherwise (Vulkan, WebGpu, Metal,
+/// HIP, OpenCL today). Consumers null-check the accessor and skip
+/// mixed-precision dispatch when it's absent.
 /// </para>
 /// <para><b>Performance Targets:</b></para>
 /// <list type="bullet">

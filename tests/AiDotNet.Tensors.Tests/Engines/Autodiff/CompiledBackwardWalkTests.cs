@@ -46,21 +46,35 @@ public class CompiledBackwardWalkTests
     [Fact]
     public void Enabled_DefaultsToFalse_WithoutEnvVar()
     {
-        var t = WalkerOfFloat();
-        var prop = t.GetProperty("Enabled",
-            BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
-        Assert.NotNull(prop);
-        var value = (bool)prop!.GetValue(null)!;
-        // The default for AIDOTNET_COMPILED_BACKWARD is unset → Enabled false.
-        // If a CI runner sets the env var, this test legitimately reflects
-        // that — the assertion validates the parse logic, not a hard "must
-        // be off" rule. So we only assert the parse: when env var is empty
-        // or "0", we get false.
-        var raw = System.Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD");
-        if (string.IsNullOrEmpty(raw) || raw == "0")
-            Assert.False(value);
-        else
-            Assert.True(value);
+        // Make the test self-contained: clear the env var so we're
+        // actually exercising the "without env var" default path
+        // regardless of the runner's ambient state. The previous
+        // implementation accepted any non-empty / non-"0" value as
+        // enabled, which meant a runner with AIDOTNET_COMPILED_BACKWARD=
+        // "false" or "no" would silently pass while testing the wrong
+        // branch.
+        var prior = System.Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD");
+        System.Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD", null);
+        try
+        {
+            var t = WalkerOfFloat();
+            // ResetForTests forces the Lazy-style cached env-var read to
+            // re-evaluate; without it, a previous test that toggled the
+            // override could leave the property cached.
+            var resetMethod = t.GetMethod("ResetForTests",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            resetMethod?.Invoke(null, null);
+
+            var prop = t.GetProperty("Enabled",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+            Assert.NotNull(prop);
+            var value = (bool)prop!.GetValue(null)!;
+            Assert.False(value, "Enabled should default to false when AIDOTNET_COMPILED_BACKWARD is unset.");
+        }
+        finally
+        {
+            System.Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD", prior);
+        }
     }
 
     [Fact]
