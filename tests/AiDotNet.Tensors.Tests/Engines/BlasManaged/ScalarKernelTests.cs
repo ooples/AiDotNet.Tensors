@@ -210,4 +210,107 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], c[i], precision: 6);
     }
+
+    [Fact]
+    public void PackA_NonTransposed_FP64_MatchesLogicalLayout()
+    {
+        // Logical A is 8×4 row-major [M=8, K=4]:
+        //   row 0: [1.0, 2.0, 3.0, 4.0]
+        //   row 1: [5.0, 6.0, 7.0, 8.0]
+        //   ...
+        //   row 7: [29.0, 30.0, 31.0, 32.0]
+        int m = 8, k = 4;
+        double[] a = new double[m * k];
+        for (int r = 0; r < m; r++)
+            for (int c = 0; c < k; c++)
+                a[r * k + c] = r * k + c + 1;  // 1..32
+
+        // Pack into 2 stripes (Mc=8, Mr=4) × Kc=4 × Mr=4 = 32 elements.
+        int mc = 8, kc = 4, mr = 4;
+        double[] packed = new double[mc * kc];
+        ScalarPack.PackA<double>(a, lda: k, transA: false, packed, mc, kc, mr);
+
+        // For each packed cell, the value must equal the corresponding logical A cell.
+        for (int stripe = 0; stripe < mc / mr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    int packedIndex = stripe * kc * mr + kk * mr + row;
+                    int logicalRow = stripe * mr + row;
+                    int logicalCol = kk;
+                    double expected = a[logicalRow * k + logicalCol];
+                    Assert.Equal(expected, packed[packedIndex]);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void PackA_Transposed_FP64_MatchesLogicalLayout()
+    {
+        // Logical A is 8×4 but stored transposed [K=4, M=8] row-major:
+        //   memory row 0 (k=0): [A[0,0], A[1,0], A[2,0], ..., A[7,0]]
+        //   memory row 1 (k=1): [A[0,1], A[1,1], A[2,1], ..., A[7,1]]
+        //   memory row 2 (k=2): ...
+        //   memory row 3 (k=3): ...
+        // So a[k * M + m] = logical A[m, k].
+        int m = 8, k = 4;
+        double[] a = new double[k * m];
+        for (int r = 0; r < m; r++)
+            for (int c = 0; c < k; c++)
+                a[c * m + r] = r * k + c + 1;  // logical A[r, c] = r*k + c + 1
+
+        int mc = 8, kc = 4, mr = 4;
+        double[] packed = new double[mc * kc];
+        ScalarPack.PackA<double>(a, lda: m, transA: true, packed, mc, kc, mr);
+
+        // Same verification as the non-transposed test: each packed cell must equal
+        // its corresponding logical A cell. The pack routine handles the
+        // memory-layout difference transparently.
+        for (int stripe = 0; stripe < mc / mr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    int packedIndex = stripe * kc * mr + kk * mr + row;
+                    int logicalRow = stripe * mr + row;
+                    int logicalCol = kk;
+                    double expectedLogical = logicalRow * k + logicalCol + 1;
+                    Assert.Equal(expectedLogical, packed[packedIndex]);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void PackA_NonTransposed_FP32_MatchesLogicalLayout()
+    {
+        int m = 8, k = 4;
+        float[] a = new float[m * k];
+        for (int r = 0; r < m; r++)
+            for (int c = 0; c < k; c++)
+                a[r * k + c] = r * k + c + 1f;
+
+        int mc = 8, kc = 4, mr = 4;
+        float[] packed = new float[mc * kc];
+        ScalarPack.PackA<float>(a, lda: k, transA: false, packed, mc, kc, mr);
+
+        for (int stripe = 0; stripe < mc / mr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    int packedIndex = stripe * kc * mr + kk * mr + row;
+                    int logicalRow = stripe * mr + row;
+                    int logicalCol = kk;
+                    float expected = a[logicalRow * k + logicalCol];
+                    Assert.Equal(expected, packed[packedIndex]);
+                }
+            }
+        }
+    }
 }
