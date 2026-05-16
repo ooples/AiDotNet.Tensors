@@ -240,6 +240,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Threading.Interlocked.Exchange(ref _profStepCount, 0);
         var ps = _profPerStepUs;
         if (ps != null) System.Array.Clear(ps, 0, ps.Length);
+        // Drop the previous plan's backward-step name table. Without this,
+        // a fresh ResetProf-then-rebuild cycle (e.g. test reruns) leaves
+        // the stale name array around and any future Step() that reads
+        // it can mis-attribute timings to the wrong delegate.
+        _profBackwardStepNames = null;
     }
 
 
@@ -1113,10 +1118,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             backwardActions.Add(fusedBackwardActions[i]);
             backwardStepNames.Add($"fused-backward-{i}");
         }
-        // Publish names for the perf-diag harness (last writer wins; only ever
-        // useful when AIDOTNET_PROFILE_STEP=1).
-        if (_profileStepEnabled)
-            _profBackwardStepNames = backwardStepNames.ToArray();
+        // Name publication is deferred until AFTER BackwardPruningPass
+        // runs (line below) — Prune is a no-op today, but it's allowed
+        // to shrink the actions list, and publishing here would leave
+        // names indexed against the un-pruned position while Step()
+        // walks the pruned array.
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -1150,6 +1156,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
         var paramSet = new HashSet<Tensor<T>>(parameters);
         backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
+
+        // Publish names AFTER pruning so they index 1:1 with the actually-
+        // replayed delegate array. Defensive count check: if Prune ever
+        // starts removing entries, fall back to numeric labels rather
+        // than serving stale labels that point at the wrong delegates.
+        if (_profileStepEnabled)
+        {
+            if (backwardActions.Count == backwardStepNames.Count)
+            {
+                _profBackwardStepNames = backwardStepNames.ToArray();
+            }
+            else
+            {
+                var fallback = new string[backwardActions.Count];
+                for (int i = 0; i < fallback.Length; i++) fallback[i] = $"#{i}";
+                _profBackwardStepNames = fallback;
+            }
+        }
 
         // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
         int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
