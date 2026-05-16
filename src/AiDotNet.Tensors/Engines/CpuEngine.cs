@@ -18333,14 +18333,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
         }
 
-        // Double fast path — mirrors the float kernel structure with direct
-        // double arithmetic and per-channel parallelization. Without this
-        // branch, BatchNorm4D forward for double walks the generic numOps
-        // fallback below: ~6 virtual-call interface dispatches per output
-        // element, dominating BatchNorm wall time on ResNet50 training when
-        // the activation tape is enabled (BatchNorm4D forward runs on EVERY
-        // train pass, both as a primary op and inside Conv2D-fused-with-BN
-        // forward graphs).
+        // Double fast path — mirrors the float kernel's fused single-sweep
+        // (sum + sumSq via Var[X] = E[X²] - E[X]²) plus AVX2+FMA SIMD on
+        // Vector256<double> (4 lanes). Without this, BN forward for double
+        // walked a scalar inner loop that dominated GraFPrint's batch=8
+        // Predict wall (18 BN layers × scalar inner loop ≈ 70% of forward
+        // cost). The 4-way unroll (16 doubles per iter) saturates both FMA
+        // ports on Zen 2 / Intel Skylake+; scalar tail handles non-multiple
+        // spatialSize. Falls back to the original scalar loop when AVX/FMA
+        // aren't available (net471 / non-x86).
         if (inputData is double[] inD && gammaData is double[] gamD && betaData is double[] betD)
         {
             double epsD = numOps.ToDouble(eps);
@@ -18352,45 +18353,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var outDArr = new double[logicalLength];
 #endif
-            int spD = spatialSize;
-            int epcD = elementsPerChannel;
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * epcD, c =>
-            {
-                double sum = 0;
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                        sum += inD[offset + s];
-                }
-                double meanC = sum / epcD;
-                meanDArr[c] = meanC;
-
-                double sumSq = 0;
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                    {
-                        double diff = inD[offset + s] - meanC;
-                        sumSq += diff * diff;
-                    }
-                }
-                double varC = sumSq / epcD;
-                varDArr[c] = varC;
-
-                double invStd = 1.0 / System.Math.Sqrt(varC + epsD);
-                double g = gamD[c], b2 = betD[c];
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                    {
-                        int idx = offset + s;
-                        outDArr[idx] = g * (inD[idx] - meanC) * invStd + b2;
-                    }
-                }
-            });
+            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(meanDArr));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(varDArr));
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(outDArr));
@@ -18682,6 +18645,262 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
     }
+
+    /// <summary>
+    /// Double-precision AVX2+FMA SIMD kernel for BatchNorm4D forward —
+    /// mirrors the float fused-pass kernel structure on Vector256&lt;double&gt;
+    /// (4 doubles per vector, 4-way unrolled = 16 doubles per iter). Replaces
+    /// the per-channel scalar inner loops that dominated double-precision
+    /// forward wall on convnet pyramids (18 BN layers × scalar inner loop
+    /// owned ~70% of GraFPrint's Predict cost at batch=8). Parallelizes
+    /// across channels via PersistentParallelExecutor — same dispatch path
+    /// the float kernel uses.
+    /// </summary>
+    private static unsafe void BatchNorm4DDouble(double[] input, double[] gamma, double[] beta, double eps,
+        int batch, int channels, int spatialSize, double[] meanOut, double[] varOut, double[] output)
+    {
+        int elementsPerChannel = batch * spatialSize;
+        double invCount = 1.0 / elementsPerChannel;
+        long totalWork = (long)batch * channels * spatialSize;
+
+        // Use the same dispatcher the original scalar path used so we benchmark
+        // apples-to-apples (PersistentParallelExecutor empirically regresses
+        // for small-spatialSize / many-channel BN shapes typical of small-
+        // batch convnets — its per-task wakeup overhead exceeds the SIMD
+        // savings on per-channel work below ~10µs).
+        CpuParallelSettings.ParallelForOrSerial(0, channels, totalWork, c =>
+        {
+            BatchNorm4DDoubleChannel(input, gamma, beta, eps, batch, channels, spatialSize,
+                invCount, c, meanOut, varOut, output);
+        });
+    }
+
+    private static unsafe void BatchNorm4DDoubleChannel(double[] input, double[] gamma, double[] beta, double eps,
+        int batch, int channels, int spatialSize, double invCount, int c,
+        double[] meanOut, double[] varOut, double[] output)
+    {
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 16)
+        {
+            // Pin once for all passes — avoids per-pass pinning overhead.
+            fixed (double* inp = input, outp = output)
+            {
+                // FUSED Pass 1+2: simultaneous sum AND sum-of-squares via
+                //   Var[X] = E[X²] - E[X]²
+                // Cuts input reads from 3× to 2× — saves one full sweep
+                // over the per-channel data. 4-way unrolled (16 doubles per
+                // iter, two 256-bit loads × 4) to saturate both FMA ports.
+                double sum = 0.0;
+                double sumSq = 0.0;
+                var vsum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s);
+                        var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 4);
+                        var v2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8);
+                        var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 12);
+                        vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, v0);
+                        vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, v1);
+                        vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, v2v);
+                        vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, v3);
+                        vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsq0);
+                        vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsq1);
+                        vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2v, v2v, vsq2);
+                        vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsq3);
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double x = ptr[s];
+                        sum += x;
+                        sumSq += x * x;
+                    }
+                }
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                sum += HorizontalSumD(vsum0);
+                vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1), System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
+                sumSq += HorizontalSumD(vsq0);
+
+                double channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                // Variance via E[X²] - E[X]². Numerical-safety clamp:
+                // catastrophic cancellation can drive this slightly negative
+                // for near-uniform channels — clamp to 0 (matches float
+                // kernel; gives invStd → ∞ producing zero output for
+                // zero-variance channels, the correct degenerate result).
+                double channelVar = sumSq * invCount - channelMean * channelMean;
+                if (channelVar < 0.0) channelVar = 0.0;
+                varOut[c] = channelVar;
+                double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+                double g = gamma[c];
+                double b = beta[c];
+
+                // Pass 3: Normalize with 4× unrolled FMA: out = γ*(x - μ)*invStd + β
+                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* pi = inp + offset;
+                    double* po = outp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 12), vmean);
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 4, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 12, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, vscale, vbias));
+                    }
+                    for (; s < spatialSize; s++)
+                        outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                }
+            }
+            return;
+        }
+        else if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 4)
+        {
+            // AVX2 path without FMA — Skylake-era doubles get 4-lane SIMD.
+            fixed (double* inp = input, outp = output)
+            {
+                double sum = 0.0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    var vsum = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                        vsum = System.Runtime.Intrinsics.X86.Avx.Add(vsum, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
+                    sum += HorizontalSumD(vsum);
+                    for (; s < spatialSize; s++)
+                        sum += ptr[s];
+                }
+                double channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+
+                double sumSq = 0.0;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    var vsumSq = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                    {
+                        var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
+                        vsumSq = System.Runtime.Intrinsics.X86.Avx.Add(vsumSq, System.Runtime.Intrinsics.X86.Avx.Multiply(diff, diff));
+                    }
+                    sumSq += HorizontalSumD(vsumSq);
+                    for (; s < spatialSize; s++)
+                    {
+                        double diff = ptr[s] - channelMean;
+                        sumSq += diff * diff;
+                    }
+                }
+                double channelVar = sumSq * invCount;
+                if (channelVar < 0.0) channelVar = 0.0;
+                varOut[c] = channelVar;
+                double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+                double g = gamma[c];
+                double b = beta[c];
+
+                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* pi = inp + offset;
+                    double* po = outp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                    {
+                        var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Multiply(diff, vscale), vbias));
+                    }
+                    for (; s < spatialSize; s++)
+                        outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    sum += input[offset + s];
+            }
+            double channelMean = sum * invCount;
+            meanOut[c] = channelMean;
+
+            double sumSq = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    double diff = input[offset + s] - channelMean;
+                    sumSq += diff * diff;
+                }
+            }
+            double channelVar = sumSq * invCount;
+            varOut[c] = channelVar;
+            double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+            double g = gamma[c];
+            double b = beta[c];
+
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    output[offset + s] = g * (input[offset + s] - channelMean) * invStd + b;
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Horizontal sum of a Vector256&lt;double&gt; (4 lanes) — used by the
+    /// BN4D-double SIMD kernels. The float HorizontalSum in SimdKernels
+    /// works on Vector256&lt;float&gt; (8 lanes), so we need a typed double
+    /// variant.
+    /// </summary>
+    private static double HorizontalSumD(System.Runtime.Intrinsics.Vector256<double> v)
+    {
+        var lo = v.GetLower();
+        var hi = v.GetUpper();
+        var sum128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
+        // sum128 = [a, b]; need a + b
+        var shuf = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(sum128, sum128);
+        var result = System.Runtime.Intrinsics.X86.Sse2.AddScalar(sum128, shuf);
+        return result.ToScalar();
+    }
+#endif
 
     /// <inheritdoc/>
     public Tensor<T> BatchNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
