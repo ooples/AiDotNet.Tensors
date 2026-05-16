@@ -5,10 +5,30 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 public readonly ref struct BlasOptions<T> where T : unmanaged
 {
+    /// <summary>Packing strategy for A and B. <see cref="PackingMode.Auto"/> is safe for all shapes.</summary>
     public PackingMode PackingMode { get; init; }
+
+    /// <summary>Epilogue operations applied after the matrix multiply (bias, activation, skip, dropout, output scale).</summary>
     public Epilogue<T> Epilogue { get; init; }
+
+    /// <summary>
+    /// Caller-supplied scratch memory. Empty (default) = allocate internally via the
+    /// allocator layers (per-thread pool, ArrayPool, etc.). When supplied, must be
+    /// large enough to hold packed A + packed B + any per-thread partials — exact
+    /// minimum depends on packing mode and (M, N, K) shape.
+    /// </summary>
     public Span<byte> Workspace { get; init; }
+
+    /// <summary>
+    /// Pre-packed A buffer from <see cref="BlasManaged.PrePackA"/>. Null = pack on
+    /// first call. Reuse across training iterations to amortize pack cost.
+    /// </summary>
     public WeightPackHandle? PackedA { get; init; }
+
+    /// <summary>
+    /// Pre-packed B buffer from <see cref="BlasManaged.PrePackB"/>. Null = pack on
+    /// first call. Reuse across training iterations to amortize pack cost.
+    /// </summary>
     public WeightPackHandle? PackedB { get; init; }
 
     /// <summary>0 = autotune; -1 = single-thread (deterministic); positive = pin to N.</summary>
@@ -41,6 +61,9 @@ public readonly ref struct Epilogue<T> where T : unmanaged
 {
     /// <summary>Bias vector of length N. Empty = no bias.</summary>
     public ReadOnlySpan<T> BiasN { get; init; }
+    /// <summary>
+    /// Fused post-multiplication activation. <see cref="FusedActivationType.None"/> = identity (no activation).
+    /// </summary>
     public FusedActivationType Activation { get; init; }
     /// <summary>Skip-connection tensor of shape (M, N) in row-major. Empty = no skip.</summary>
     public ReadOnlySpan<T> SkipMxN { get; init; }

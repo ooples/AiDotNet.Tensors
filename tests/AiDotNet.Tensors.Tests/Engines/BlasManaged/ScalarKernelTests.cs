@@ -83,5 +83,9 @@ public class ScalarKernelTests
         Assert.Equal(FusedActivationType.ReLU, options.Epilogue.Activation);
         Assert.Equal(2.0, options.Epilogue.OutputScale);
         Assert.Equal(-1, options.NumThreads);
+        Assert.Equal(42UL, options.AutotuneKey);
+        Assert.Equal(1024L * 1024, options.MaxJitCacheBytes);
+        Assert.False(options.Workspace.IsEmpty);
+        Assert.False(options.Epilogue.BiasN.IsEmpty);
     }
 }
