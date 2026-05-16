@@ -516,6 +516,69 @@ public class ScalarKernelTests
     }
 
     [Theory]
+    [InlineData(8, 8, 8, false, false)]   // NN
+    [InlineData(8, 8, 8, true, false)]    // TN
+    [InlineData(8, 8, 8, false, true)]    // NT
+    [InlineData(8, 8, 8, true, true)]     // TT
+    [InlineData(16, 4, 8, false, false)]  // rectangular
+    [InlineData(4, 16, 8, false, false)]
+    [InlineData(8, 8, 4, false, false)]   // small K
+    [InlineData(8, 8, 16, false, false)]  // larger K
+    public void Streaming_MatchesNaiveReference_FP64(int m, int n, int k, bool transA, bool transB)
+    {
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+        int aRows = transA ? k : m;
+        int bRows = transB ? n : k;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, bRows, bCols, transB);
+
+        double[] actual = new double[m * n];
+        StreamingStrategy.Run<double>(
+            a, lda, transA,
+            b, ldb, transB,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Streaming_MatchesNaiveReference_FP32_SquareNoTrans()
+    {
+        int m = 8, n = 8, k = 8;
+        var rng = new Random(42);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Reference: naive triple-loop FP32 GEMM (no trans).
+        float[] expected = new float[m * n];
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                float sum = 0;
+                for (int kk = 0; kk < k; kk++) sum += a[i * k + kk] * b[kk * n + j];
+                expected[i * n + j] = sum;
+            }
+
+        float[] actual = new float[m * n];
+        StreamingStrategy.Run<float>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 4);  // FP32 K=8 accumulation
+    }
+
+    [Theory]
     [InlineData(8, 8, 8, false, false)]    // square, no trans
     [InlineData(8, 8, 8, true, false)]     // transA
     [InlineData(8, 8, 8, false, true)]     // transB
