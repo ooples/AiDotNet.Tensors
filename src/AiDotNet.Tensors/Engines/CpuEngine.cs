@@ -19128,13 +19128,13 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<float>(giF));
         }
 
-        // Double fast path — mirrors the float branch directly above. ResNet50 /
-        // VGG / every CNN trained at double precision spends a significant
-        // fraction of backward time in BatchNorm; the generic numOps path below
-        // does ~10 virtual-call-per-element interface dispatches and pays an
-        // allocation per .Add/.Multiply call. Direct double arithmetic is
-        // 4-8× faster, matching the float branch's measured win on the same
-        // BDN sweep.
+        // Double fast path — replaces the per-channel scalar inner loops with
+        // an AVX2+FMA SIMD kernel on Vector256<double>. Algorithmic note:
+        // the original scalar code computed redundant accumulators (gGamma =
+        // sumGradX*invStd, gBeta = sumGrad) — collapsed here so each element
+        // contributes to only two reductions (sumGrad, sumGradX). Per-channel
+        // parallelization unchanged; SIMD inner loops 4-way unrolled (16
+        // doubles per iter) saturate both FMA ports.
         if (typeof(T) == typeof(double)
             && gradOutputData is double[] goD && inputData is double[] inD
             && gammaData is double[] gaD && meanData is double[] meD && varData is double[] vaD)
@@ -19144,46 +19144,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var gbD = new double[channels];
             var giD = new double[input.Length];
             double elemD = elementsPerChannel;
-
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
-            {
-                double invStd = 1.0 / System.Math.Sqrt(vaD[c] + epsD);
-                double mean_c = meD[c];
-                double gGamma = 0, gBeta = 0, sumGrad = 0, sumGradX = 0;
-
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = baseIdx + s;
-                        double diff = inD[idx] - mean_c;
-                        gGamma += goD[idx] * diff * invStd;
-                        gBeta += goD[idx];
-                        sumGrad += goD[idx];
-                        sumGradX += goD[idx] * diff;
-                    }
-                }
-
-                ggD[c] = gGamma;
-                gbD[c] = gBeta;
-                double gamma_c = gaD[c];
-                double gammaSumGrad = gamma_c * sumGrad;
-                double gammaSumGradX = gamma_c * sumGradX;
-
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx2 = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = baseIdx2 + s;
-                        double normalized = (inD[idx] - mean_c) * invStd;
-                        double gradNorm = gamma_c * goD[idx];
-                        giD[idx] = invStd / elemD * (elemD * gradNorm - gammaSumGrad - normalized * invStd * gammaSumGradX);
-                    }
-                }
-            });
-
+            BatchNormBackward4DDouble(goD, inD, gaD, meD, vaD, epsD,
+                batch, channels, spatialSize, elemD,
+                ggD, gbD, giD);
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(ggD));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(gbD));
             return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(giD));
@@ -19264,6 +19227,186 @@ public partial class CpuEngine : ITensorLevelEngine
         gradGamma = TensorAllocator.Rent<T>([channels], gradGammaData);
         gradBeta = TensorAllocator.Rent<T>([channels], gradBetaData);
         return TensorAllocator.Rent<T>(input._shape, gradInputData);
+    }
+
+    /// <summary>
+    /// Double-precision AVX2+FMA SIMD kernel for BatchNorm4D backward.
+    /// Two-pass per-channel: (1) FMA-fused reductions for sumGrad / sumGradX,
+    /// (2) FMA-fused gradInput write using the standard BN-backward formula
+    /// <c>dx = (γ · invStd / N) · (N · dy − Σdy − norm · invStd · Σ(dy·diff))</c>.
+    /// 4-way unrolled (16 doubles per iter) to saturate both FMA ports.
+    /// Falls back to a scalar inner loop when AVX/FMA aren't available.
+    /// </summary>
+    private static unsafe void BatchNormBackward4DDouble(
+        double[] gradOutput, double[] input, double[] gamma, double[] mean, double[] variance,
+        double eps,
+        int batch, int channels, int spatialSize, double elemN,
+        double[] gradGammaOut, double[] gradBetaOut, double[] gradInputOut)
+    {
+        long totalWork = (long)batch * channels * spatialSize;
+        CpuParallelSettings.ParallelForOrSerial(0, channels, totalWork, c =>
+        {
+            BatchNormBackward4DDoubleChannel(gradOutput, input, gamma, mean, variance, eps,
+                batch, channels, spatialSize, elemN, c, gradGammaOut, gradBetaOut, gradInputOut);
+        });
+    }
+
+    private static unsafe void BatchNormBackward4DDoubleChannel(
+        double[] gradOutput, double[] input, double[] gamma, double[] mean, double[] variance,
+        double eps,
+        int batch, int channels, int spatialSize, double elemN, int c,
+        double[] gradGammaOut, double[] gradBetaOut, double[] gradInputOut)
+    {
+        double invStd = 1.0 / System.Math.Sqrt(variance[c] + eps);
+        double mean_c = mean[c];
+        double gamma_c = gamma[c];
+
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 16)
+        {
+            fixed (double* inp = input, gop = gradOutput, gip = gradInputOut)
+            {
+                // ── Pass 1: reductions for sumGrad and sumGradX ─────────────
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(mean_c);
+                var vsg0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    double* xp = inp + baseIdx;
+                    double* yp = gop + baseIdx;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var y0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s);
+                        var y1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 4);
+                        var y2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 8);
+                        var y3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 12), vmean);
+                        vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(vsg0, y0);
+                        vsg1 = System.Runtime.Intrinsics.X86.Avx.Add(vsg1, y1);
+                        vsg2 = System.Runtime.Intrinsics.X86.Avx.Add(vsg2, y2v);
+                        vsg3 = System.Runtime.Intrinsics.X86.Avx.Add(vsg3, y3);
+                        vsgx0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y0, d0, vsgx0);
+                        vsgx1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y1, d1, vsgx1);
+                        vsgx2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y2v, d2, vsgx2);
+                        vsgx3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y3, d3, vsgx3);
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double y = yp[s];
+                        double diff = xp[s] - mean_c;
+                        sumGrad += y;
+                        sumGradX += y * diff;
+                    }
+                }
+                vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsg0, vsg1), System.Runtime.Intrinsics.X86.Avx.Add(vsg2, vsg3));
+                sumGrad += HorizontalSumD(vsg0);
+                vsgx0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsgx0, vsgx1), System.Runtime.Intrinsics.X86.Avx.Add(vsgx2, vsgx3));
+                sumGradX += HorizontalSumD(vsgx0);
+
+                gradGammaOut[c] = sumGradX * invStd;
+                gradBetaOut[c] = sumGrad;
+
+                // ── Pass 2: gradInput write ─────────────────────────────────
+                // Per element: gi = invStd/N * (N*γ*y − γ*sumGrad − norm*invStd*γ*sumGradX)
+                // Rearrange to a 3-term FMA chain on (y, diff):
+                //   gi = (γ*invStd) * y                                  [a]
+                //      − (γ*invStd*sumGrad/N)                            [b]
+                //      − (γ*invStd*invStd*invStd*sumGradX/N) * diff      [c]
+                // Constants are scalar precomputed; a is γ·invStd·y, c
+                // contributes via FMA with diff.
+                double gammaInv = gamma_c * invStd;
+                double termB = gammaInv * sumGrad / elemN;
+                double termCcoef = gammaInv * invStd * invStd * sumGradX / elemN;
+                var vgammaInv = System.Runtime.Intrinsics.Vector256.Create(gammaInv);
+                var vtermB = System.Runtime.Intrinsics.Vector256.Create(termB);
+                var vtermCcoef = System.Runtime.Intrinsics.Vector256.Create(termCcoef);
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    double* xp = inp + baseIdx;
+                    double* yp = gop + baseIdx;
+                    double* gp = gip + baseIdx;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var y0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s);
+                        var y1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 4);
+                        var y2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 8);
+                        var y3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 12), vmean);
+                        // tmp = γ·invStd·y − termB
+                        var t0 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y0, vgammaInv, vtermB);
+                        var t1 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y1, vgammaInv, vtermB);
+                        var t2 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y2v, vgammaInv, vtermB);
+                        var t3 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y3, vgammaInv, vtermB);
+                        // gi = tmp − termCcoef·diff   (= FNMA(termCcoef, diff, tmp))
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d0, vtermCcoef, t0));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 4, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d1, vtermCcoef, t1));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d2, vtermCcoef, t2));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 12, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d3, vtermCcoef, t3));
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double y = yp[s];
+                        double diff = xp[s] - mean_c;
+                        gp[s] = gammaInv * y - termB - termCcoef * diff;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86)
+        {
+            double sumGrad = 0.0;
+            double sumGradX = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = baseIdx + s;
+                    double y = gradOutput[idx];
+                    double diff = input[idx] - mean_c;
+                    sumGrad += y;
+                    sumGradX += y * diff;
+                }
+            }
+            gradGammaOut[c] = sumGradX * invStd;
+            gradBetaOut[c] = sumGrad;
+            double gammaInv = gamma_c * invStd;
+            double termB = gammaInv * sumGrad / elemN;
+            double termCcoef = gammaInv * invStd * invStd * sumGradX / elemN;
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = baseIdx + s;
+                    double y = gradOutput[idx];
+                    double diff = input[idx] - mean_c;
+                    gradInputOut[idx] = gammaInv * y - termB - termCcoef * diff;
+                }
+            }
+        }
     }
 
     /// <summary>
