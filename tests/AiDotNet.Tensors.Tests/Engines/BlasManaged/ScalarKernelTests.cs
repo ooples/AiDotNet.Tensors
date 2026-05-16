@@ -155,14 +155,12 @@ public class ScalarKernelTests
     [Fact]
     public void ScalarFp64_4x4_Computes_4x4_Tile_From_Packed_Inputs()
     {
-        // Packed-A layout: 4 rows × Kc=2 columns, K-contiguous within row.
-        //   packedA[row*Kc + k] = A[row, k]
-        // For a single stripe with Mr=4 rows and Kc=2:
-        //   row 0: [1, 2]
-        //   row 1: [3, 4]
-        //   row 2: [5, 6]
-        //   row 3: [7, 8]
-        double[] packedA = { 1, 2,   3, 4,   5, 6,   7, 8 };
+        // Packed-A vpanel layout: [Kc × Mr]. Mr-contiguous within each k-slice.
+        //   packedA[k*Mr + row] = A[row, k]
+        // For a single stripe with Mr=4 rows and Kc=2 K-steps:
+        //   k=0 slice: A[0,0]=1, A[1,0]=3, A[2,0]=5, A[3,0]=7
+        //   k=1 slice: A[0,1]=2, A[1,1]=4, A[2,1]=6, A[3,1]=8
+        double[] packedA = { 1, 3, 5, 7,   2, 4, 6, 8 };
 
         // Packed-B layout: Kc=2 × Nr=4 cols, col-contiguous within k.
         //   packedB[k*Nr + col] = B[k, col]
@@ -180,6 +178,7 @@ public class ScalarKernelTests
         // A = [[1,2],[3,4],[5,6],[7,8]],  B = [[1,0,0,0],[0,1,0,0]]
         // → C = [[1,2,0,0],[3,4,0,0],[5,6,0,0],[7,8,0,0]]
         double[] expected = { 1, 2, 0, 0,   3, 4, 0, 0,   5, 6, 0, 0,   7, 8, 0, 0 };
+        // FP64 has 15–17 significant decimal digits; precision: 12 leaves margin for FMA reordering.
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], c[i], precision: 12);
     }

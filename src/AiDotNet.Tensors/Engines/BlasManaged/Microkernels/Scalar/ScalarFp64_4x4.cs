@@ -4,10 +4,11 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
 /// Scalar reference microkernel: 4×4 output tile, FP64.
-/// Reads packed-A in [Mr=4, Kc] layout (K-contiguous within each row) and
-/// packed-B in [Kc, Nr=4] layout (col-contiguous within each k). Accumulates
-/// over the K-loop and writes C[0..4, 0..4] += packedA · packedB. Caller is
-/// responsible for zero-initializing C before the first kernel call.
+/// Reads packed-A in [Kc × Mr=4] vpanel layout (Mr-contiguous within each k-slice;
+/// SIMD-friendly multi-row loads per K-step) and packed-B in [Kc × Nr=4] layout
+/// (Nr-contiguous within each k-slice). Accumulates over the K-loop and writes
+/// C[0..Mr, 0..Nr] += packedA · packedB. Caller is responsible for zero-initializing
+/// C before the first kernel call.
 ///
 /// This kernel is the ground truth — AVX2, AVX-512, and Neon microkernels
 /// assert their output against this scalar reference in unit tests. Used at
@@ -16,16 +17,17 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 internal static class ScalarFp64_4x4
 {
     /// <summary>The row-tile width of this microkernel (output rows per invocation).</summary>
-    public const int Mr = 4;
+    internal const int Mr = 4;
     /// <summary>The column-tile width of this microkernel (output cols per invocation).</summary>
-    public const int Nr = 4;
+    internal const int Nr = 4;
 
     /// <summary>
     /// Accumulate packedA · packedB into the C[0..Mr, 0..Nr] tile, summing over
     /// kc K-steps. C must be pre-zeroed if a fresh result is desired; otherwise
     /// values accumulate into existing C entries.
+    /// When <paramref name="kc"/> is 0 the kernel reads + writes C unchanged (no-op accumulation).
     /// </summary>
-    /// <param name="packedA">Packed-A stripe, layout [Mr × Kc] row-major.</param>
+    /// <param name="packedA">Packed-A vpanel, layout [Kc × Mr] row-major (Mr-contiguous within each k).</param>
     /// <param name="packedB">Packed-B stripe, layout [Kc × Nr] row-major.</param>
     /// <param name="c">Output buffer; the kernel reads + writes the C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C (cols of the full C matrix, ≥ Nr).</param>
@@ -48,10 +50,10 @@ internal static class ScalarFp64_4x4
 
         for (int k = 0; k < kc; k++)
         {
-            double a0 = packedA[0 * kc + k];
-            double a1 = packedA[1 * kc + k];
-            double a2 = packedA[2 * kc + k];
-            double a3 = packedA[3 * kc + k];
+            double a0 = packedA[k * Mr + 0];
+            double a1 = packedA[k * Mr + 1];
+            double a2 = packedA[k * Mr + 2];
+            double a3 = packedA[k * Mr + 3];
 
             double b0 = packedB[k * Nr + 0];
             double b1 = packedB[k * Nr + 1];

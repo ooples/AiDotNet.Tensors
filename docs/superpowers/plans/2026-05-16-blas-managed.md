@@ -668,9 +668,12 @@ Implements every code path at scalar (non-SIMD) precision for both FP32 and FP64
 [Fact]
 public void ScalarFp64_4x4_Computes_4x4_Tile_From_Packed_Inputs()
 {
-    // Packed-A layout: 4 rows × Kc=2 columns, K-contiguous within row.
-    // packedA[row*Kc + k] = A[row, k]
-    double[] packedA = { 1, 2,    3, 4,    5, 6,    7, 8 };  // 4 rows × Kc=2
+    // Packed-A vpanel layout: [Kc × Mr]. Mr-contiguous within each k-slice.
+    //   packedA[k*Mr + row] = A[row, k]
+    // For a single stripe with Mr=4 rows and Kc=2 K-steps:
+    //   k=0 slice: A[0,0]=1, A[1,0]=3, A[2,0]=5, A[3,0]=7
+    //   k=1 slice: A[0,1]=2, A[1,1]=4, A[2,1]=6, A[3,1]=8
+    double[] packedA = { 1, 3, 5, 7,   2, 4, 6, 8 };
     // Packed-B layout: Kc=2 × 4 cols, col-contiguous within k.
     // packedB[k*4 + col] = B[k, col]
     double[] packedB = { 1, 0, 0, 0,    0, 1, 0, 0 };       // Kc=2 × 4 cols
@@ -683,6 +686,7 @@ public void ScalarFp64_4x4_Computes_4x4_Tile_From_Packed_Inputs()
     // A = [[1,2],[3,4],[5,6],[7,8]];  B = [[1,0,0,0],[0,1,0,0]];
     // C = [[1,2,0,0],[3,4,0,0],[5,6,0,0],[7,8,0,0]]
     double[] expected = { 1, 2, 0, 0,    3, 4, 0, 0,    5, 6, 0, 0,    7, 8, 0, 0 };
+    // FP64 has 15–17 significant decimal digits; precision: 12 leaves margin for FMA reordering.
     for (int i = 0; i < expected.Length; i++)
         Assert.Equal(expected[i], c[i], precision: 12);
 }
@@ -705,17 +709,19 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
 /// Scalar reference microkernel: 4×4 output tile, FP64.
-/// Reads packed-A in [Mr=4, Kc] layout and packed-B in [Kc, Nr=4] layout.
-/// Computes C[0..4, 0..4] += packedA · packedB. Caller is responsible for
-/// zero-initializing C before the first kernel call.
+/// Reads packed-A in [Kc × Mr=4] vpanel layout (Mr-contiguous within each k-slice;
+/// SIMD-friendly multi-row loads per K-step) and packed-B in [Kc × Nr=4] layout
+/// (Nr-contiguous within each k-slice). Accumulates over the K-loop and writes
+/// C[0..Mr, 0..Nr] += packedA · packedB. Caller is responsible for zero-initializing
+/// C before the first kernel call.
 ///
 /// This kernel is the ground truth — AVX2/AVX-512/Neon kernels assert their
 /// output against this in unit tests.
 /// </summary>
 internal static class ScalarFp64_4x4
 {
-    public const int Mr = 4;
-    public const int Nr = 4;
+    internal const int Mr = 4;
+    internal const int Nr = 4;
 
     public static void Run(
         ReadOnlySpan<double> packedA,
@@ -732,10 +738,10 @@ internal static class ScalarFp64_4x4
 
         for (int k = 0; k < kc; k++)
         {
-            double a0 = packedA[0 * kc + k];
-            double a1 = packedA[1 * kc + k];
-            double a2 = packedA[2 * kc + k];
-            double a3 = packedA[3 * kc + k];
+            double a0 = packedA[k * Mr + 0];
+            double a1 = packedA[k * Mr + 1];
+            double a2 = packedA[k * Mr + 2];
+            double a3 = packedA[k * Mr + 3];
 
             double b0 = packedB[k * Nr + 0];
             double b1 = packedB[k * Nr + 1];
