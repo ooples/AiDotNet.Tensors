@@ -1172,8 +1172,12 @@ internal static class Im2ColHelper
 
                 if (!usedBlas)
                 {
-                    pool.Return(tempBuffer);
-                    if (kernelT != null) pool.Return(kernelT);
+                    // Pool buffers are returned by the finally block on
+                    // every exit path — do not return them here too. A
+                    // double-Return corrupts the pool's internal state
+                    // and lets a later Rent hand the same array to two
+                    // callers simultaneously, which surfaces as silent
+                    // data corruption miles away from this code.
                     return false;
                 }
 
@@ -1290,8 +1294,9 @@ internal static class Im2ColHelper
 
                 if (!usedBlas)
                 {
-                    pool.Return(tempBuffer);
-                    if (kernelT != null) pool.Return(kernelT);
+                    // Pool returns are handled by the finally block on
+                    // every exit path — double-returning corrupts the
+                    // pool. Matches the fix in the float overload.
                     return false;
                 }
 
