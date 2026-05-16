@@ -88,4 +88,52 @@ public class ScalarKernelTests
         Assert.False(options.Workspace.IsEmpty);
         Assert.False(options.Epilogue.BiasN.IsEmpty);
     }
+
+    [Fact]
+    public void KernelKey_EqualKeysHaveEqualHashCodes()
+    {
+        var k1 = new KernelKey
+        {
+            M = 4, N = 4, K = 4, Lda = 4, Ldb = 4, Ldc = 4,
+            TransA = true, TransB = false,
+            Packing = PackingMode.ForcePackBoth,
+            EpilogueFlags = 0,
+            ElemType = typeof(double),
+            Arch = CpuArch.Avx512,
+        };
+        var k2 = k1;
+        Assert.Equal(k1, k2);
+        Assert.Equal(k1.GetHashCode(), k2.GetHashCode());
+        Assert.True(k1.Equals(k2));
+    }
+
+    [Fact]
+    public void KernelKey_DifferentKeysAreNotEqual()
+    {
+        var k1 = new KernelKey
+        {
+            M = 4, N = 4, K = 4, Lda = 4, Ldb = 4, Ldc = 4,
+            TransA = true, TransB = false,
+            Packing = PackingMode.ForcePackBoth,
+            EpilogueFlags = 0,
+            ElemType = typeof(double),
+            Arch = CpuArch.Avx512,
+        };
+        var k2 = k1 with { M = 8 };
+        Assert.NotEqual(k1, k2);
+        Assert.False(k1.Equals(k2));
+    }
+
+    [Fact]
+    public void BlasManagedStats_DefaultIsZero()
+    {
+        var stats = new BlasManagedStats();
+        Assert.Equal(0L, stats.AutotuneHits);
+        Assert.Equal(0L, stats.AutotuneMisses);
+        Assert.Equal(0L, stats.JitEmissions);
+        Assert.Equal(0L, stats.JitCacheHits);
+        Assert.Equal(0L, stats.PackCacheHits);
+        Assert.Equal(0L, stats.PackCacheMisses);
+        Assert.Equal(0L, stats.PackCacheBytes);
+    }
 }
